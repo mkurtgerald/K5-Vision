@@ -21,6 +21,7 @@ class OnvifProfileSnapshot(BaseModel):
     height: int = Field(gt=0)
     fps: float | None = Field(default=None, gt=0)
     bitrate_kbps: int | None = Field(default=None, gt=0)
+    connection_uri: str | None = None
 
 
 class OnvifDeviceSnapshot(BaseModel):
@@ -76,6 +77,7 @@ def normalize_onvif_snapshot(snapshot: OnvifDeviceSnapshot) -> DeviceCapabilitie
                 height=profile.height,
                 fps=profile.fps,
                 bitrate_kbps=profile.bitrate_kbps,
+                connection_uri=profile.connection_uri,
             )
         )
 
