@@ -85,8 +85,7 @@ class OnvifAdapter:
             _validate_stream_uri(media_service, profile.token)
 
         supports_audio = any(
-            _value(profile, "AudioEncoderConfiguration") is not None
-            for profile in raw_profiles
+            _value(profile, "AudioEncoderConfiguration") is not None for profile in raw_profiles
         )
         snapshot = OnvifDeviceSnapshot(
             manufacturer=_text(info, "Manufacturer"),
@@ -216,9 +215,7 @@ def _probe_error(exc: Exception) -> DeviceProbeError:
         "network is unreachable",
         "name or service not known",
     )
-    if isinstance(exc, ConnectionError) or any(
-        marker in message for marker in unreachable_markers
-    ):
+    if isinstance(exc, ConnectionError) or any(marker in message for marker in unreachable_markers):
         return DeviceProbeError(ProbeErrorCode.UNREACHABLE, "endpoint is unreachable")
 
     auth_markers = (
