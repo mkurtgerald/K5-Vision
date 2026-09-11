@@ -1,0 +1,149 @@
+import pytest
+from pydantic import ValidationError
+
+from k5vision.adapters.runtime import (
+    CandidateReview,
+    QualificationResult,
+    RuntimeQualificationError,
+    RuntimeSample,
+)
+from k5vision.adapters.stage03_evidence import (
+    ResourceMeasurement,
+    ResourceProfile,
+    Stage03Evidence,
+)
+
+
+def runtime_sample(candidate: str, *, latency: float) -> RuntimeSample:
+    return RuntimeSample(
+        candidate=candidate,
+        startup_ms=20,
+        latency_ms=latency,
+        cpu_percent=10,
+        memory_mb=64,
+        bytes_processed=1024,
+        recovered=True,
+        completed=True,
+    )
+
+
+def result(candidate: str, *, latency: float = 10) -> QualificationResult:
+    return QualificationResult(
+        candidate=candidate,
+        samples=[runtime_sample(candidate, latency=latency) for _ in range(5)],
+        recovery_sample=runtime_sample(candidate, latency=20),
+    )
+
+
+def review(candidate: str) -> CandidateReview:
+    return CandidateReview(
+        candidate=candidate,
+        component_version="1.0.0",
+        license_id="MIT",
+        source_reference="immutable-source-ref",
+        commercial_use_approved=True,
+        redistribution_approved=True,
+        windows_supported=True,
+        linux_supported=True,
+    )
+
+
+def resource_profile(
+    candidate: str,
+    *,
+    cpu_values: tuple[float, float, float] = (10, 20, 30),
+    completed: bool = True,
+    loads: tuple[int, int, int] = (1, 2, 4),
+) -> ResourceProfile:
+    return ResourceProfile(
+        candidate=candidate,
+        samples=[
+            ResourceMeasurement(
+                candidate=candidate,
+                load_units=load,
+                cpu_percent=cpu,
+                memory_mb=64 + load,
+                completed=completed,
+            )
+            for load, cpu in zip(loads, cpu_values, strict=True)
+        ],
+    )
+
+
+def test_resource_profile_requires_strictly_increasing_unique_loads() -> None:
+    with pytest.raises(ValidationError):
+        resource_profile("candidate-a", loads=(1, 4, 2))
+
+    with pytest.raises(ValidationError):
+        resource_profile("candidate-a", loads=(1, 2, 2))
+
+
+def test_stage03_evidence_requires_same_candidate_set() -> None:
+    with pytest.raises(ValidationError):
+        Stage03Evidence(
+            results=[result("candidate-a")],
+            reviews=[review("candidate-a")],
+            resources=[resource_profile("candidate-b")],
+        )
+
+
+def test_stage03_evidence_requires_comparable_load_ladder() -> None:
+    with pytest.raises(ValidationError):
+        Stage03Evidence(
+            results=[result("candidate-a"), result("candidate-b")],
+            reviews=[review("candidate-a"), review("candidate-b")],
+            resources=[
+                resource_profile("candidate-a", loads=(1, 2, 4)),
+                resource_profile("candidate-b", loads=(1, 3, 4)),
+            ],
+        )
+
+
+def test_stage03_ranking_uses_high_load_resource_measurement_on_latency_tie() -> None:
+    evidence = Stage03Evidence(
+        results=[result("candidate-a"), result("candidate-b")],
+        reviews=[review("candidate-a"), review("candidate-b")],
+        resources=[
+            resource_profile("candidate-a", cpu_values=(10, 30, 80)),
+            resource_profile("candidate-b", cpu_values=(10, 20, 40)),
+        ],
+    )
+
+    ranked = evidence.rank()
+
+    assert [item.candidate for item in ranked] == ["candidate-b", "candidate-a"]
+    assert ranked[0].max_load_units == 4
+    assert ranked[0].high_load_cpu_percent == 40
+    assert evidence.select().candidate == "candidate-b"
+
+
+def test_stage03_selection_excludes_incomplete_resource_profile() -> None:
+    evidence = Stage03Evidence(
+        results=[result("candidate-a")],
+        reviews=[review("candidate-a")],
+        resources=[resource_profile("candidate-a", completed=False)],
+    )
+
+    with pytest.raises(RuntimeQualificationError):
+        evidence.select()
+
+
+def test_resource_evidence_rejects_unbounded_or_unexpected_values() -> None:
+    with pytest.raises(ValidationError):
+        ResourceMeasurement(
+            candidate="candidate-a",
+            load_units=1,
+            cpu_percent=float("inf"),
+            memory_mb=1,
+            completed=True,
+        )
+
+    with pytest.raises(ValidationError):
+        ResourceMeasurement(
+            candidate="candidate-a",
+            load_units=1,
+            cpu_percent=1,
+            memory_mb=1,
+            completed=True,
+            source_uri="rtsp://private.example/live",
+        )
