@@ -35,7 +35,12 @@ def _profile(
 
 
 class _DeviceService:
-    def __init__(self, *, capabilities: Any | None = None, capability_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        capabilities: Any | None = None,
+        capability_error: Exception | None = None,
+    ) -> None:
         self._capabilities = capabilities
         self._capability_error = capability_error
 
@@ -62,7 +67,12 @@ class _MediaService:
     def GetProfiles(self) -> list[Any]:
         return self._profiles
 
-    def GetStreamUri(self, *, ProfileToken: str, StreamSetup: dict[str, Any]) -> dict[str, str]:
+    def GetStreamUri(
+        self,
+        *,
+        ProfileToken: str,
+        StreamSetup: dict[str, Any],
+    ) -> dict[str, str]:
         assert StreamSetup["Transport"]["Protocol"] == "RTSP"
         self.uri_tokens.append(ProfileToken)
         return {"Uri": f"rtsp://user:secret@192.168.10.20/{ProfileToken}"}
@@ -154,7 +164,10 @@ def test_probe_allows_missing_optional_capabilities() -> None:
         (RuntimeError("bad payload"), ProbeErrorCode.INVALID_RESPONSE),
     ],
 )
-def test_probe_maps_failures_to_stable_error_codes(raised: Exception, expected: ProbeErrorCode) -> None:
+def test_probe_maps_failures_to_stable_error_codes(
+    raised: Exception,
+    expected: ProbeErrorCode,
+) -> None:
     def factory(**_: Any) -> Any:
         raise raised
 
@@ -184,7 +197,12 @@ def test_probe_rejects_malformed_profile_as_invalid_response() -> None:
 
 def test_probe_rejects_missing_stream_metadata_as_invalid_response() -> None:
     class MissingUriMedia(_MediaService):
-        def GetStreamUri(self, *, ProfileToken: str, StreamSetup: dict[str, Any]) -> dict[str, str]:
+        def GetStreamUri(
+            self,
+            *,
+            ProfileToken: str,
+            StreamSetup: dict[str, Any],
+        ) -> dict[str, str]:
             return {}
 
     client = _Client(
