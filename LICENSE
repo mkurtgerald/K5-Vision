@@ -1,21 +1,68 @@
-MIT License
+K5 Vision Source-Available License
+Version 1.0 — September 2026
 
-Copyright (c) 2026 mkurtgerald
+Copyright (c) 2026 Kurt Gerald. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. K5-owned material
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Except for Third-Party Material described below, the original source code,
+documentation, configuration, tests, interfaces, modifications, and other
+material authored specifically for K5 Vision ("K5 Material") are copyrighted
+works owned by their respective K5 copyright owner(s).
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Permission is granted to view, download, compile, and run K5 Material solely
+for personal evaluation, testing, security review, interoperability review,
+and non-production development.
+
+Unless separately authorized in writing by the copyright owner, no permission
+is granted to:
+
+- sell, sublicense, commercially distribute, or commercially exploit K5 Material;
+- incorporate K5 Material into a commercial or competing product or service;
+- deploy K5 Material in production for the benefit of a third party;
+- remove or alter copyright, attribution, provenance, or license notices; or
+- represent K5 Material as wholly authored by another person or organization.
+
+2. Third-Party Material
+
+This repository may contain, depend upon, adapt, or incorporate material from
+third parties ("Third-Party Material"). Third-Party Material remains governed
+by its original license and copyright terms. Nothing in this license reduces,
+replaces, revokes, or restricts rights granted by an applicable third-party
+license, including permissive licenses such as MIT, BSD, ISC, or Apache-2.0.
+
+Required third-party copyright, attribution, patent, and license notices must
+be preserved. The project maintains provenance records and notices separately
+from this license.
+
+3. Contributions
+
+No contributor may submit code or other material unless they have the legal
+right to do so. Acceptance of a contribution does not transfer third-party
+copyright to K5 Vision. Contribution rights are governed by CONTRIBUTING.md
+and any contributor agreement expressly accepted for the contribution.
+
+4. Historical releases
+
+Material previously distributed by its copyright owner under another license,
+including the MIT License, remains available under the rights already granted
+for that historical version. This license applies prospectively to K5 Material
+released under these terms and does not revoke previously granted licenses.
+
+5. No trademark license
+
+No permission is granted to use the K5 Vision name, logos, product identity,
+or other trademarks except as reasonably necessary to identify the software
+when complying with attribution requirements.
+
+6. Disclaimer
+
+THE K5 MATERIAL IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. TO THE MAXIMUM EXTENT
+PERMITTED BY LAW, THE COPYRIGHT OWNER(S) SHALL NOT BE LIABLE FOR ANY CLAIM,
+DAMAGES, OR OTHER LIABILITY ARISING FROM THE K5 MATERIAL OR ITS USE.
+
+This license is intended to define repository permissions and is not legal
+advice. Third-party material must always be evaluated under its own governing
+terms.
