@@ -23,6 +23,14 @@ Then open `http://127.0.0.1:8000/docs`.
 
 Work proceeds through strict precursor gates. A downstream stage does not begin until its required predecessor is complete, accepted, and green. See `docs/DELIVERY_GATES.md`.
 
-## License
+## Licensing and donor code
 
-K5 Vision is currently distributed under the MIT License. See `LICENSE`.
+K5 Vision is publicly viewable but is not, as a whole, an open-source project.
+
+Original K5-authored material released under the current repository license is governed by the K5 Vision Source-Available License in `LICENSE`.
+
+Third-party and donor material remains governed by its original license. K5 Vision may use permissively licensed donor components such as MIT, BSD, ISC, and Apache-2.0 material when reviewed under `docs/COMMERCIAL_DEPENDENCY_POLICY.md`. Required donor notices and provenance must be preserved.
+
+Historical K5 material that was previously published under the MIT License retains the rights already granted for that historical version.
+
+See `docs/DONOR_LEDGER.md` and `THIRD_PARTY_NOTICES.md` for provenance and attribution records.
