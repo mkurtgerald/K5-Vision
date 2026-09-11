@@ -84,6 +84,10 @@ class OnvifAdapter:
         for profile in snapshots:
             _validate_stream_uri(media_service, profile.token)
 
+        supports_audio = any(
+            _value(profile, "AudioEncoderConfiguration") is not None
+            for profile in raw_profiles
+        )
         snapshot = OnvifDeviceSnapshot(
             manufacturer=_text(info, "Manufacturer"),
             model=_text(info, "Model"),
@@ -93,7 +97,7 @@ class OnvifAdapter:
             profiles=snapshots,
             supports_ptz=_has_service(capabilities, "PTZ"),
             supports_events=_has_service(capabilities, "Events"),
-            supports_audio=any(_value(profile, "AudioEncoderConfiguration") is not None for profile in raw_profiles),
+            supports_audio=supports_audio,
             supports_digital_io=_has_device_io(capabilities),
         )
         return normalize_onvif_snapshot(snapshot)
@@ -205,19 +209,42 @@ def _probe_error(exc: Exception) -> DeviceProbeError:
 
     if isinstance(exc, TimeoutError) or "timeout" in class_name or "timed out" in message:
         return DeviceProbeError(ProbeErrorCode.TIMEOUT, "endpoint probe timed out")
+
+    unreachable_markers = (
+        "connection refused",
+        "no route to host",
+        "network is unreachable",
+        "name or service not known",
+    )
     if isinstance(exc, ConnectionError) or any(
-        marker in message
-        for marker in ("connection refused", "no route to host", "network is unreachable", "name or service not known")
+        marker in message for marker in unreachable_markers
     ):
         return DeviceProbeError(ProbeErrorCode.UNREACHABLE, "endpoint is unreachable")
-    if any(
-        marker in message
-        for marker in ("notauthorized", "not authorized", "unauthorized", "authentication", "http 401", "http 403")
-    ):
-        return DeviceProbeError(ProbeErrorCode.AUTHENTICATION_FAILED, "endpoint authentication failed")
+
+    auth_markers = (
+        "notauthorized",
+        "not authorized",
+        "unauthorized",
+        "authentication",
+        "http 401",
+        "http 403",
+    )
+    if any(marker in message for marker in auth_markers):
+        return DeviceProbeError(
+            ProbeErrorCode.AUTHENTICATION_FAILED,
+            "endpoint authentication failed",
+        )
+
     if _is_unsupported(exc):
-        return DeviceProbeError(ProbeErrorCode.UNSUPPORTED, "endpoint operation is unsupported")
-    return DeviceProbeError(ProbeErrorCode.INVALID_RESPONSE, "endpoint returned an invalid response")
+        return DeviceProbeError(
+            ProbeErrorCode.UNSUPPORTED,
+            "endpoint operation is unsupported",
+        )
+
+    return DeviceProbeError(
+        ProbeErrorCode.INVALID_RESPONSE,
+        "endpoint returned an invalid response",
+    )
 
 
 def _is_unsupported(exc: Exception) -> bool:
