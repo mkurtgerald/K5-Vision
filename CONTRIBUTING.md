@@ -1,6 +1,6 @@
 # Contributing to K5 Vision
 
-K5 Vision is developed publicly with commercial use in mind. Public documentation should contain only the detail needed to implement, test, or review the current stage.
+K5 Vision is developed publicly with commercial use in mind. Public documentation should contain only the detail needed to implement, test, harden, or review the current stage.
 
 ## Conduct
 
@@ -57,23 +57,34 @@ Each PR should:
 - pass install, lint, format, and test CI checks
 - document public contract changes
 - complete the external dependency/IP checklist
+- include the applicable stage-hardening evidence
+- add regression coverage for defects fixed by the PR
 - avoid unnecessary disclosure of future scope or product intent
 
-Do not merge forward with a red quality gate.
+Do not merge forward with a red quality gate or an unresolved hardening weakness at the active boundary.
 
 ## Strict precursor gating
 
-Follow `docs/DELIVERY_GATES.md`.
+Follow `docs/DELIVERY_GATES.md` and `docs/HARDENING_STANDARD.md`.
 
-The critical-path rule is absolute: **nothing downstream becomes active implementation work until its precursor is complete, accepted, and green.**
+The critical-path rule is absolute: **nothing downstream becomes active implementation work until its precursor is complete, accepted, hardened, and green.**
 
 - keep one active critical-path gate at a time
 - keep downstream issues as blocked planning items
 - fix failures at the earliest layer that violates its contract
 - add regression coverage before resuming forward work
+- harden the affected boundary before progression
 - do not hide upstream defects with downstream special cases
 - hardware-dependent gates require physical validation
-- a mock or partial implementation does not unlock the next gate
+- a mock, happy-path pass, or partial implementation does not unlock the next gate
+
+## Stage hardening expectations
+
+Hardening is part of implementation, not a cleanup sprint.
+
+For the active stage, exercise the applicable negative and recovery conditions defined in `docs/HARDENING_STANDARD.md`, including malformed or unsupported input, dependency failure, timeout, interruption, invalid state, bounded-resource behavior, diagnostic quality, security boundaries, compatibility variation, and regression behavior.
+
+If a hardening dimension is not relevant to the current stage, document why rather than silently skipping it.
 
 ## External dependencies, donor code, and artifacts
 
@@ -101,10 +112,14 @@ By opening a pull request, you represent that the contribution is either your ow
 - secrets must not enter the repository or ordinary logs
 - lasting architecture choices require an ADR
 - physical acceptance is required when the gate depends on physical integration
+- retries, timeouts, resource limits, and failure states must be explicit where applicable
+- downstream consumers must not compensate for unresolved upstream defects
 
 ## Sprint workflow
 
 Use short, independently testable increments. Efficiency is measured by stable completed capability—not simultaneous workstreams, files changed, commits, or issue count.
+
+Each increment should leave the active boundary at least as reliable as it was before the change. The stage is not finished until its hardening pass is complete.
 
 ## Commit and push
 
