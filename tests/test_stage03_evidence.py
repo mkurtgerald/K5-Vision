@@ -3,15 +3,31 @@ from pydantic import ValidationError
 
 from k5vision.adapters.runtime import (
     CandidateReview,
+    QualificationPlan,
     QualificationResult,
     RuntimeQualificationError,
     RuntimeSample,
 )
 from k5vision.adapters.stage03_evidence import (
+    QualificationContext,
     ResourceMeasurement,
     ResourceProfile,
     Stage03Evidence,
 )
+
+
+DIGEST_A = "a" * 64
+DIGEST_B = "b" * 64
+
+
+def qualification_context(*, scored_runs: int = 5) -> QualificationContext:
+    return QualificationContext(
+        input_fingerprint=DIGEST_A,
+        host_fingerprint=DIGEST_B,
+        platform="windows",
+        architecture="x86_64",
+        plan=QualificationPlan(scored_runs=scored_runs, timeout_seconds=10),
+    )
 
 
 def runtime_sample(candidate: str, *, latency: float) -> RuntimeSample:
@@ -27,10 +43,10 @@ def runtime_sample(candidate: str, *, latency: float) -> RuntimeSample:
     )
 
 
-def result(candidate: str, *, latency: float = 10) -> QualificationResult:
+def result(candidate: str, *, latency: float = 10, runs: int = 5) -> QualificationResult:
     return QualificationResult(
         candidate=candidate,
-        samples=[runtime_sample(candidate, latency=latency) for _ in range(5)],
+        samples=[runtime_sample(candidate, latency=latency) for _ in range(runs)],
         recovery_sample=runtime_sample(candidate, latency=20),
     )
 
@@ -70,6 +86,27 @@ def resource_profile(
     )
 
 
+def test_qualification_context_requires_safe_fixed_fingerprints() -> None:
+    with pytest.raises(ValidationError):
+        QualificationContext(
+            input_fingerprint="rtsp://private.example/live",
+            host_fingerprint=DIGEST_B,
+            platform="windows",
+            architecture="x86_64",
+            plan=QualificationPlan(),
+        )
+
+    with pytest.raises(ValidationError):
+        QualificationContext(
+            input_fingerprint=DIGEST_A,
+            host_fingerprint=DIGEST_B,
+            platform="windows",
+            architecture="x86_64",
+            plan=QualificationPlan(),
+            source_uri="rtsp://private.example/live",
+        )
+
+
 def test_resource_profile_requires_strictly_increasing_unique_loads() -> None:
     with pytest.raises(ValidationError):
         resource_profile("candidate-a", loads=(1, 4, 2))
@@ -81,15 +118,27 @@ def test_resource_profile_requires_strictly_increasing_unique_loads() -> None:
 def test_stage03_evidence_requires_same_candidate_set() -> None:
     with pytest.raises(ValidationError):
         Stage03Evidence(
+            context=qualification_context(),
             results=[result("candidate-a")],
             reviews=[review("candidate-a")],
             resources=[resource_profile("candidate-b")],
         )
 
 
+def test_stage03_evidence_requires_retained_plan_run_count() -> None:
+    with pytest.raises(ValidationError):
+        Stage03Evidence(
+            context=qualification_context(scored_runs=6),
+            results=[result("candidate-a", runs=5)],
+            reviews=[review("candidate-a")],
+            resources=[resource_profile("candidate-a")],
+        )
+
+
 def test_stage03_evidence_requires_comparable_load_ladder() -> None:
     with pytest.raises(ValidationError):
         Stage03Evidence(
+            context=qualification_context(),
             results=[result("candidate-a"), result("candidate-b")],
             reviews=[review("candidate-a"), review("candidate-b")],
             resources=[
@@ -101,6 +150,7 @@ def test_stage03_evidence_requires_comparable_load_ladder() -> None:
 
 def test_stage03_ranking_uses_high_load_resource_measurement_on_latency_tie() -> None:
     evidence = Stage03Evidence(
+        context=qualification_context(),
         results=[result("candidate-a"), result("candidate-b")],
         reviews=[review("candidate-a"), review("candidate-b")],
         resources=[
@@ -111,6 +161,7 @@ def test_stage03_ranking_uses_high_load_resource_measurement_on_latency_tie() ->
 
     ranked = evidence.rank()
 
+    assert evidence.schema_version == "2"
     assert [item.candidate for item in ranked] == ["candidate-b", "candidate-a"]
     assert ranked[0].max_load_units == 4
     assert ranked[0].high_load_cpu_percent == 40
@@ -119,6 +170,7 @@ def test_stage03_ranking_uses_high_load_resource_measurement_on_latency_tie() ->
 
 def test_stage03_selection_excludes_incomplete_resource_profile() -> None:
     evidence = Stage03Evidence(
+        context=qualification_context(),
         results=[result("candidate-a")],
         reviews=[review("candidate-a")],
         resources=[resource_profile("candidate-a", completed=False)],
