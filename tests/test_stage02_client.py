@@ -148,9 +148,7 @@ def test_probe_returns_canonical_capabilities_and_strips_uri_credentials() -> No
     assert result.supports_audio is True
     assert result.supports_digital_io is True
     assert result.stream_profiles[0].role is StreamRole.MAIN
-    assert result.stream_profiles[0].connection_uri == (
-        "rtsp://10.0.0.9:8554/main?transport=tcp"
-    )
+    assert result.stream_profiles[0].connection_uri == ("rtsp://10.0.0.9:8554/main?transport=tcp")
     assert "secret" not in result.model_dump_json()
 
 
