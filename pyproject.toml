@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "k5-vision"
 version = "0.1.0"
-description = "Open security sensor management and intelligence platform"
+description = "Modular integration and orchestration framework"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
