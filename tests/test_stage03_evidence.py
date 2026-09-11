@@ -1,37 +1,25 @@
 import pytest
 from pydantic import ValidationError
 
-from k5vision.adapters.runtime import (
-    CandidateReview,
-    QualificationPlan,
-    QualificationResult,
-    RuntimeQualificationError,
-    RuntimeSample,
-)
-from k5vision.adapters.stage03_evidence import (
-    QualificationContext,
-    ResourceMeasurement,
-    ResourceProfile,
-    Stage03Evidence,
-)
+from k5vision.adapters import runtime, stage03_evidence
 
 
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
 
 
-def qualification_context(*, scored_runs: int = 5) -> QualificationContext:
-    return QualificationContext(
+def qualification_context(*, scored_runs: int = 5) -> stage03_evidence.QualificationContext:
+    return stage03_evidence.QualificationContext(
         input_fingerprint=DIGEST_A,
         host_fingerprint=DIGEST_B,
         platform="windows",
         architecture="x86_64",
-        plan=QualificationPlan(scored_runs=scored_runs, timeout_seconds=10),
+        plan=runtime.QualificationPlan(scored_runs=scored_runs, timeout_seconds=10),
     )
 
 
-def runtime_sample(candidate: str, *, latency: float) -> RuntimeSample:
-    return RuntimeSample(
+def runtime_sample(candidate: str, *, latency: float) -> runtime.RuntimeSample:
+    return runtime.RuntimeSample(
         candidate=candidate,
         startup_ms=20,
         latency_ms=latency,
@@ -43,16 +31,16 @@ def runtime_sample(candidate: str, *, latency: float) -> RuntimeSample:
     )
 
 
-def result(candidate: str, *, latency: float = 10, runs: int = 5) -> QualificationResult:
-    return QualificationResult(
+def result(candidate: str, *, latency: float = 10, runs: int = 5) -> runtime.QualificationResult:
+    return runtime.QualificationResult(
         candidate=candidate,
         samples=[runtime_sample(candidate, latency=latency) for _ in range(runs)],
         recovery_sample=runtime_sample(candidate, latency=20),
     )
 
 
-def review(candidate: str) -> CandidateReview:
-    return CandidateReview(
+def review(candidate: str) -> runtime.CandidateReview:
+    return runtime.CandidateReview(
         candidate=candidate,
         component_version="1.0.0",
         license_id="MIT",
@@ -70,11 +58,11 @@ def resource_profile(
     cpu_values: tuple[float, float, float] = (10, 20, 30),
     completed: bool = True,
     loads: tuple[int, int, int] = (1, 2, 4),
-) -> ResourceProfile:
-    return ResourceProfile(
+) -> stage03_evidence.ResourceProfile:
+    return stage03_evidence.ResourceProfile(
         candidate=candidate,
         samples=[
-            ResourceMeasurement(
+            stage03_evidence.ResourceMeasurement(
                 candidate=candidate,
                 load_units=load,
                 cpu_percent=cpu,
@@ -88,21 +76,21 @@ def resource_profile(
 
 def test_qualification_context_requires_safe_fixed_fingerprints() -> None:
     with pytest.raises(ValidationError):
-        QualificationContext(
+        stage03_evidence.QualificationContext(
             input_fingerprint="rtsp://private.example/live",
             host_fingerprint=DIGEST_B,
             platform="windows",
             architecture="x86_64",
-            plan=QualificationPlan(),
+            plan=runtime.QualificationPlan(),
         )
 
     with pytest.raises(ValidationError):
-        QualificationContext(
+        stage03_evidence.QualificationContext(
             input_fingerprint=DIGEST_A,
             host_fingerprint=DIGEST_B,
             platform="windows",
             architecture="x86_64",
-            plan=QualificationPlan(),
+            plan=runtime.QualificationPlan(),
             source_uri="rtsp://private.example/live",
         )
 
@@ -117,7 +105,7 @@ def test_resource_profile_requires_strictly_increasing_unique_loads() -> None:
 
 def test_stage03_evidence_requires_same_candidate_set() -> None:
     with pytest.raises(ValidationError):
-        Stage03Evidence(
+        stage03_evidence.Stage03Evidence(
             context=qualification_context(),
             results=[result("candidate-a")],
             reviews=[review("candidate-a")],
@@ -127,7 +115,7 @@ def test_stage03_evidence_requires_same_candidate_set() -> None:
 
 def test_stage03_evidence_requires_retained_plan_run_count() -> None:
     with pytest.raises(ValidationError):
-        Stage03Evidence(
+        stage03_evidence.Stage03Evidence(
             context=qualification_context(scored_runs=6),
             results=[result("candidate-a", runs=5)],
             reviews=[review("candidate-a")],
@@ -137,7 +125,7 @@ def test_stage03_evidence_requires_retained_plan_run_count() -> None:
 
 def test_stage03_evidence_requires_comparable_load_ladder() -> None:
     with pytest.raises(ValidationError):
-        Stage03Evidence(
+        stage03_evidence.Stage03Evidence(
             context=qualification_context(),
             results=[result("candidate-a"), result("candidate-b")],
             reviews=[review("candidate-a"), review("candidate-b")],
@@ -149,7 +137,7 @@ def test_stage03_evidence_requires_comparable_load_ladder() -> None:
 
 
 def test_stage03_ranking_uses_high_load_resource_measurement_on_latency_tie() -> None:
-    evidence = Stage03Evidence(
+    evidence = stage03_evidence.Stage03Evidence(
         context=qualification_context(),
         results=[result("candidate-a"), result("candidate-b")],
         reviews=[review("candidate-a"), review("candidate-b")],
@@ -169,20 +157,20 @@ def test_stage03_ranking_uses_high_load_resource_measurement_on_latency_tie() ->
 
 
 def test_stage03_selection_excludes_incomplete_resource_profile() -> None:
-    evidence = Stage03Evidence(
+    evidence = stage03_evidence.Stage03Evidence(
         context=qualification_context(),
         results=[result("candidate-a")],
         reviews=[review("candidate-a")],
         resources=[resource_profile("candidate-a", completed=False)],
     )
 
-    with pytest.raises(RuntimeQualificationError):
+    with pytest.raises(runtime.RuntimeQualificationError):
         evidence.select()
 
 
 def test_resource_evidence_rejects_unbounded_or_unexpected_values() -> None:
     with pytest.raises(ValidationError):
-        ResourceMeasurement(
+        stage03_evidence.ResourceMeasurement(
             candidate="candidate-a",
             load_units=1,
             cpu_percent=float("inf"),
@@ -191,7 +179,7 @@ def test_resource_evidence_rejects_unbounded_or_unexpected_values() -> None:
         )
 
     with pytest.raises(ValidationError):
-        ResourceMeasurement(
+        stage03_evidence.ResourceMeasurement(
             candidate="candidate-a",
             load_units=1,
             cpu_percent=1,
