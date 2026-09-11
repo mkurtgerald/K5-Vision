@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from enum import Enum
-from typing import Awaitable, Literal, Protocol, Self
+from collections.abc import Awaitable
+from enum import StrEnum
+from typing import Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -52,7 +53,7 @@ class QualificationResult(BaseModel):
         return self
 
 
-class QualificationErrorCode(str, Enum):
+class QualificationErrorCode(StrEnum):
     """Stable failure classes exposed by the qualification boundary."""
 
     TIMEOUT = "timeout"
