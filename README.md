@@ -1,10 +1,10 @@
 # K5 Vision
 
-K5 Vision is an open security-sensor management platform designed to unify video, telemetry, analytics, AI-assisted search, and autonomous decision support across vendor boundaries.
+K5 Vision is an open security-sensor management platform designed to unify video, telemetry, analytics, 
 
 ## Product direction
 
-K5 Vision is being developed in public during its early sprint phase with commercial deployment as an explicit design requirement. Public development does not mean "prototype-only": architecture, dependencies, testing, and interfaces should be chosen so the same codebase can mature into a commercially deployable product.
+K5 Vision is being developed in public during its early sprint phase with commercial intention
 
 Core goals:
 
@@ -14,8 +14,6 @@ Core goals:
 - Main/substream policy for bandwidth-aware viewing
 - GPS/telemetry-aware mapping for mobile, body-worn, drone, and fixed sensors
 - Computer-vision inference and event generation
-- Natural-language investigation and search
-- Agentic decision support with human-governed autonomy
 - Edge, VM, Windows, Linux, and cloud-capable deployment patterns
 
 ## Architecture principle
