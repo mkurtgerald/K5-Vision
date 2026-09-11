@@ -58,9 +58,7 @@ class FakeCandidate:
             raise RuntimeError("dependency failure with private detail")
         return sample(self.candidate, latency=10 + self.measure_calls)
 
-    async def measure_recovery(
-        self, source_uri: str, *, timeout_seconds: float
-    ) -> RuntimeSample:
+    async def measure_recovery(self, source_uri: str, *, timeout_seconds: float) -> RuntimeSample:
         del source_uri, timeout_seconds
         self.recovery_calls += 1
         return sample(
