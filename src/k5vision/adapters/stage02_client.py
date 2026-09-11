@@ -79,7 +79,9 @@ def _sanitize_uri(value: Any) -> str | None:
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"
         port = f":{parsed.port}" if parsed.port is not None else ""
-        return urlunsplit((parsed.scheme, f"{host}{port}", parsed.path, parsed.query, parsed.fragment))
+        return urlunsplit(
+            (parsed.scheme, f"{host}{port}", parsed.path, parsed.query, parsed.fragment)
+        )
     except ValueError:
         return None
 
