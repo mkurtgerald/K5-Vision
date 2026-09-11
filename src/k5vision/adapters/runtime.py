@@ -254,9 +254,7 @@ def rank_qualification_results(
     scores = []
     for result in results:
         review = reviews_by_candidate[result.candidate]
-        measurements_pass = all(
-            sample.completed and sample.recovered for sample in result.samples
-        )
+        measurements_pass = all(sample.completed and sample.recovered for sample in result.samples)
         recovery_pass = result.recovery_sample.completed and result.recovery_sample.recovered
         if review.is_eligible() and measurements_pass and recovery_pass:
             scores.append(_aggregate_result(result))
