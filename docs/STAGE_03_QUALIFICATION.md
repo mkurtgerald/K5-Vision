@@ -8,6 +8,8 @@ This stage uses measured behavior to qualify a replaceable runtime behind projec
 
 `QualificationPlan` bounds scored-run count and per-operation timeout. `QualificationResult` requires one candidate identity across every retained sample. The candidate boundary includes both normal measurement and an explicit interruption/re-entry measurement.
 
+`CandidateReview` records the minimum commercial, redistribution, and supported-platform review required before a measured candidate may be ranked. `CandidateScore` is derived only from retained scored measurements. Candidate selection cannot succeed when review evidence is missing, recovery evidence fails, scored runs fail, or the candidate is not approved for the required distribution boundary.
+
 ## Reproducible method
 
 For each candidate under review:
@@ -18,12 +20,13 @@ For each candidate under review:
 4. capture at least five scored runs;
 5. record startup time, latency, CPU use, memory use, bytes processed, completion, and recovery outcome;
 6. perform and retain one interruption/re-entry case;
-7. retain raw samples so the result can be independently re-ranked.
+7. retain raw samples so the result can be independently re-ranked;
+8. attach the candidate's versioned dependency/distribution review before selection.
 
-The project-owned qualification runner enforces the warm-up, scored-run minimum, bounded per-operation timeout, candidate identity consistency, and explicit recovery measurement. It does not retry implicitly after timeout or dependency failure. Timeouts, candidate failures, and invalid samples are exposed through stable sanitized failure classes.
+The project-owned qualification runner enforces the warm-up, scored-run minimum, bounded per-operation timeout, candidate identity consistency, and explicit recovery measurement. It does not retry implicitly after timeout or dependency failure. Timeouts, candidate failures, invalid samples, and incomplete selection evidence are exposed through stable sanitized failure classes.
 
-Only completed runs that recover cleanly are eligible for ranking. Eligible samples are ordered by captured latency, CPU use, memory use, startup time, then a stable candidate identifier. A runtime is not accepted from preference or a single successful run.
+Only candidates with complete successful scored runs, successful recovery evidence, and an approved review are eligible for aggregate ranking. Aggregate values use the median retained measurements and are ordered by latency, CPU use, memory use, startup time, then a stable candidate identifier. This keeps selection tied to captured evidence rather than preference or a single successful run.
 
 ## Gate status
 
-The qualification boundary and bounded execution method are now defined. No runtime is selected by this document. Stage 03 remains open until real candidate measurements, recovery evidence, dependency review, applicable resource testing, hardening evidence, and green CI are all recorded at the accepted revision.
+The qualification boundary, bounded execution method, and evidence-gated selection rule are defined. No runtime is selected by this document. Stage 03 remains open until real candidate measurements, applicable resource testing, completed candidate reviews, hardening evidence, and green CI are all recorded at the accepted revision.
