@@ -4,12 +4,16 @@ import pytest
 from pydantic import ValidationError
 
 from k5vision.adapters.runtime import (
+    CandidateReview,
     QualificationErrorCode,
     QualificationPlan,
+    QualificationResult,
     RuntimeQualificationError,
     RuntimeSample,
     qualify_candidate,
+    rank_qualification_results,
     rank_samples,
+    select_qualified_candidate,
 )
 
 
@@ -30,6 +34,44 @@ def sample(
         bytes_processed=1024,
         recovered=recovered,
         completed=completed,
+    )
+
+
+def qualification_result(
+    candidate: str,
+    latencies: list[float],
+    *,
+    recovery_succeeds: bool = True,
+) -> QualificationResult:
+    return QualificationResult(
+        candidate=candidate,
+        samples=[sample(candidate, latency=value) for value in latencies],
+        recovery_sample=sample(
+            candidate,
+            latency=25,
+            recovered=recovery_succeeds,
+            completed=recovery_succeeds,
+        ),
+    )
+
+
+def review(
+    candidate: str,
+    *,
+    commercial: bool = True,
+    redistribution: bool = True,
+    windows: bool = True,
+    linux: bool = True,
+) -> CandidateReview:
+    return CandidateReview(
+        candidate=candidate,
+        component_version="1.0.0",
+        license_id="MIT",
+        source_reference="immutable-source-ref",
+        commercial_use_approved=commercial,
+        redistribution_approved=redistribution,
+        windows_supported=windows,
+        linux_supported=linux,
     )
 
 
@@ -235,3 +277,69 @@ def test_runtime_sample_does_not_retain_source_or_credentials() -> None:
     assert "source_uri" not in result
     assert "username" not in result
     assert "password" not in result
+
+
+def test_candidate_review_rejects_unexpected_fields() -> None:
+    data = review("candidate-a").model_dump()
+    data["private_note"] = "do not retain"
+
+    with pytest.raises(ValidationError):
+        CandidateReview.model_validate(data)
+
+
+def test_rank_qualification_results_uses_median_measurements() -> None:
+    results = [
+        qualification_result("candidate-a", [30, 30, 30, 30, 30]),
+        qualification_result("candidate-b", [9, 9, 9, 9, 9]),
+    ]
+    reviews = [review("candidate-b"), review("candidate-a")]
+
+    ranked = rank_qualification_results(results, reviews)
+
+    assert [item.candidate for item in ranked] == ["candidate-b", "candidate-a"]
+    assert ranked[0].median_latency_ms == 9
+    assert select_qualified_candidate(results, reviews).candidate == "candidate-b"
+
+
+def test_rank_qualification_results_excludes_failed_recovery_or_review() -> None:
+    results = [
+        qualification_result("candidate-fast", [1, 1, 1, 1, 1], recovery_succeeds=False),
+        qualification_result("candidate-reviewed-out", [2, 2, 2, 2, 2]),
+        qualification_result("candidate-good", [20, 20, 20, 20, 20]),
+    ]
+    reviews = [
+        review("candidate-fast"),
+        review("candidate-reviewed-out", commercial=False),
+        review("candidate-good"),
+    ]
+
+    ranked = rank_qualification_results(results, reviews)
+
+    assert [item.candidate for item in ranked] == ["candidate-good"]
+
+
+def test_rank_qualification_results_requires_review_for_every_result() -> None:
+    results = [qualification_result("candidate-a", [10, 10, 10, 10, 10])]
+
+    with pytest.raises(RuntimeQualificationError) as caught:
+        rank_qualification_results(results, [])
+
+    assert caught.value.code is QualificationErrorCode.INSUFFICIENT_EVIDENCE
+
+
+def test_rank_qualification_results_rejects_duplicate_result_identity() -> None:
+    result = qualification_result("candidate-a", [10, 10, 10, 10, 10])
+
+    with pytest.raises(RuntimeQualificationError) as caught:
+        rank_qualification_results([result, result], [review("candidate-a")])
+
+    assert caught.value.code is QualificationErrorCode.INSUFFICIENT_EVIDENCE
+
+
+def test_selection_fails_when_no_candidate_has_complete_evidence() -> None:
+    result = qualification_result("candidate-a", [10, 10, 10, 10, 10])
+
+    with pytest.raises(RuntimeQualificationError) as caught:
+        select_qualified_candidate([result], [review("candidate-a", linux=False)])
+
+    assert caught.value.code is QualificationErrorCode.INSUFFICIENT_EVIDENCE
