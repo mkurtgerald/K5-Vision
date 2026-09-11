@@ -75,11 +75,23 @@ The critical-path rule is absolute: **nothing downstream becomes active implemen
 - hardware-dependent gates require physical validation
 - a mock or partial implementation does not unlock the next gate
 
-## External dependencies and artifacts
+## External dependencies, donor code, and artifacts
 
-Any PR that adds or changes an external dependency or artifact must follow `docs/COMMERCIAL_DEPENDENCY_POLICY.md`.
+Any PR that adds or changes an external dependency, donor source, or artifact must follow `docs/COMMERCIAL_DEPENDENCY_POLICY.md` and update `docs/DONOR_LEDGER.md` when source or substantial copied material is incorporated.
 
-Record only what is needed for review: component/version, source, governing terms, purpose, runtime/development use, notice obligations, distribution method, and commercial-use conclusion.
+Preserve all upstream copyright, attribution, patent, and license notices. Do not relicense third-party material or remove rights granted by its original license.
+
+Record only what is needed for review: component/version or commit, source, governing terms, files or functionality used, modifications, purpose, runtime/development use, notice obligations, distribution method, and commercial-use conclusion.
+
+## Contribution rights
+
+Do not submit code, documentation, media, models, datasets, or other material unless you have the legal right to contribute it.
+
+Unless a separate written contributor agreement applies, contributors retain copyright in their own original contributions and grant the K5 Vision project owner a perpetual, worldwide, non-exclusive, royalty-free license to use, reproduce, modify, distribute, sublicense, and commercialize those contributions as part of K5 Vision.
+
+Third-party material remains governed by its original license and must be identified as such. Submission of third-party material does not transfer its copyright to K5 Vision.
+
+By opening a pull request, you represent that the contribution is either your own original work or properly identified third-party material that may lawfully be contributed under its governing terms.
 
 ## Architecture discipline
 
@@ -104,4 +116,4 @@ git push origin feature/your-feature-name
 
 ## License
 
-By contributing, you agree your contribution will be licensed under the repository's current MIT License unless a formally documented licensing change states otherwise.
+K5-owned material is governed by the repository's current K5 Vision Source-Available License unless a file or directory states otherwise. Third-party material remains under its original license.
