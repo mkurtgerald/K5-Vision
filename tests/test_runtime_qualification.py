@@ -4,7 +4,14 @@ from pydantic import ValidationError
 from k5vision.adapters.runtime import RuntimeSample, rank_samples
 
 
-def sample(candidate: str, *, latency: float, cpu: float = 10, recovered: bool = True, completed: bool = True) -> RuntimeSample:
+def sample(
+    candidate: str,
+    *,
+    latency: float,
+    cpu: float = 10,
+    recovered: bool = True,
+    completed: bool = True,
+) -> RuntimeSample:
     return RuntimeSample(
         candidate=candidate,
         startup_ms=20,
