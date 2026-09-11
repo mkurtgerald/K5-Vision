@@ -224,3 +224,95 @@ def test_stream_profile_rejects_embedded_credentials() -> None:
             height=1080,
             connection_uri="rtsp://admin:secret@10.0.0.9/live",
         )
+
+
+def test_notauthorized_fault_maps_to_authentication_failure() -> None:
+    error = RuntimeError(
+        "SOAP Error: code=SOAP-ENV:Sender, subcode=NotAuthorized, "
+        "msg=The requested action requires authorization"
+    )
+
+    mapped = _map_exception(error)
+
+    assert mapped.code is ProbeErrorCode.AUTHENTICATION_FAILED
+    assert "authorization" not in str(mapped).lower()
+
+
+def test_repeated_probe_is_deterministic_and_stateless() -> None:
+    adapter = Stage02Adapter(client_factory=lambda **kwargs: FakeClient())
+    device = Device(name="endpoint", host="10.0.0.9")
+
+    first = asyncio.run(adapter.probe(device))
+    second = asyncio.run(adapter.probe(device))
+
+    assert first.model_dump() == second.model_dump()
+
+
+def test_transient_timeout_does_not_retry_implicitly_and_next_probe_recovers() -> None:
+    calls = 0
+
+    def client_factory(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("timed out")
+        return FakeClient()
+
+    adapter = Stage02Adapter(client_factory=client_factory)
+    device = Device(name="endpoint", host="10.0.0.9")
+
+    with pytest.raises(DeviceProbeError) as caught:
+        asyncio.run(adapter.probe(device))
+
+    assert caught.value.code is ProbeErrorCode.TIMEOUT
+    assert calls == 1
+
+    recovered = asyncio.run(adapter.probe(device))
+
+    assert calls == 2
+    assert recovered.stream_profiles
+
+
+def test_contradictory_profile_dimensions_are_rejected() -> None:
+    bad_media = SimpleNamespace(
+        GetProfiles=lambda: [
+            SimpleNamespace(
+                token="bad",
+                Name="Bad",
+                VideoEncoderConfiguration=SimpleNamespace(
+                    Encoding="H264",
+                    Resolution=SimpleNamespace(Width=0, Height=1080),
+                    RateControl=SimpleNamespace(FrameRateLimit=30, BitrateLimit=2048),
+                ),
+                AudioEncoderConfiguration=None,
+            )
+        ],
+        GetStreamUri=lambda **kwargs: {"Uri": "rtsp://10.0.0.9/live"},
+    )
+    client = SimpleNamespace(
+        devicemgmt=lambda: FakeManagement(),
+        media=lambda: bad_media,
+    )
+    adapter = Stage02Adapter(client_factory=lambda **kwargs: client)
+    device = Device(name="endpoint", host="10.0.0.9")
+
+    with pytest.raises(DeviceProbeError) as caught:
+        asyncio.run(adapter.probe(device))
+
+    assert caught.value.code is ProbeErrorCode.INVALID_RESPONSE
+
+
+def test_malformed_connection_metadata_is_rejected() -> None:
+    malformed_media = FakeMedia()
+    malformed_media.GetStreamUri = lambda **kwargs: {"Uri": "not-a-uri"}
+    client = SimpleNamespace(
+        devicemgmt=lambda: FakeManagement(),
+        media=lambda: malformed_media,
+    )
+    adapter = Stage02Adapter(client_factory=lambda **kwargs: client)
+    device = Device(name="endpoint", host="10.0.0.9")
+
+    with pytest.raises(DeviceProbeError) as caught:
+        asyncio.run(adapter.probe(device))
+
+    assert caught.value.code is ProbeErrorCode.INVALID_RESPONSE
