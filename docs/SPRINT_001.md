@@ -1,52 +1,43 @@
-# Sprint 001 — Platform Foundation
+# Stage 01 — Foundation
 
 ## Objective
 
-Create a small, executable, testable control-plane foundation without prematurely locking K5 into a media implementation that has not been benchmarked.
+Create a small, executable, testable foundation with stable project-owned contracts and a working quality gate.
 
 ## In scope
 
-- Typed control-plane API
-- Canonical initial device model
-- In-memory device registry behind a service boundary
-- Health endpoint
-- Device create/list/get API
+- typed API/service skeleton
+- canonical initial entity model
+- replaceable in-memory registry boundary
+- health/version endpoint
+- basic create/list/get behavior
 - CI lint/format/test gate
-- 80% minimum coverage gate
-- Architecture boundaries
-- Commercial dependency policy
-- Initial public-repo secret hygiene
+- minimum coverage gate
+- architecture boundaries
+- external dependency/artifact policy
+- public-repository secret hygiene
 
 ## Acceptance criteria
 
-- `pip install -e ".[dev]"` succeeds on Python 3.12
-- `ruff check src tests` passes
-- `ruff format --check src tests` passes
-- `pytest` passes at >=80% branch-aware coverage
-- `GET /api/v1/health` returns healthy status and version
-- A camera can be registered with canonical protocols/tags and retrieved by ID
+- local development install succeeds on the supported Python version
+- lint and format checks pass
+- tests meet the repository coverage gate
+- health/version behavior works
+- canonical registration and retrieval round-trip works
 - CI runs for pull requests and pushes to main
-- No sustained media-frame processing is implemented in Python
+- no sustained high-throughput processing is introduced into the orchestration layer
 
 ## Explicitly deferred
 
-- ONVIF network discovery/authentication
-- RTSP ingest
-- Recording/playback
-- Persistent database
-- Authentication/authorization
+- external integration specifics
+- sustained transport/runtime work
+- durable persistence
+- authorization features
 - UI
-- Computer vision
-- Agentic automation
+- advanced processing
 
-Those are not removed from the vision; they are sequenced after the platform contract and CI gate exist.
+Deferred scope remains intentionally outside the public roadmap until its precursor gates are ready.
 
-## Next vertical slice
+## Next stage
 
-Sprint 002 should prove one real-camera path:
-
-1. Discover/probe an ONVIF camera
-2. Normalize capabilities into K5's domain model
-3. Acquire stream profile/URI metadata
-4. Hand the URI to a benchmarkable media-worker boundary
-5. Report connection/stream health back through the control plane
+Stage 02 proves one standards-based physical endpoint path through project-owned contracts and required integration validation.
