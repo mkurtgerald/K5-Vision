@@ -31,6 +31,7 @@ class DeviceCreate(BaseModel):
 
     name: str = Field(min_length=1, max_length=128)
     host: IPvAnyAddress
+    management_port: int = Field(default=80, ge=1, le=65535)
     kind: DeviceKind = DeviceKind.CAMERA
     protocols: set[DeviceProtocol] = Field(default_factory=lambda: {DeviceProtocol.ONVIF})
     tags: set[str] = Field(default_factory=set)
