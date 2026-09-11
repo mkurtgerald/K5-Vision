@@ -1,6 +1,20 @@
 # Security Policy
 
-K5 Vision is currently an early public development project.
+K5 Vision is currently an early public development project. Security hardening is performed continuously as part of each delivery gate rather than deferred to a final stabilization phase.
+
+## Stage security hardening
+
+Every active gate must apply the relevant security requirements in `docs/HARDENING_STANDARD.md` before it can close.
+
+At minimum:
+- validate trust boundaries and externally supplied data
+- fail explicitly on unsupported or malformed external behavior
+- keep credentials and sensitive values out of source, exceptions, diagnostics, and ordinary logs
+- use bounded retry/timeout behavior at external boundaries
+- minimize sensitive-data retention
+- review new dependencies and artifacts before acceptance
+- add regression coverage for security-relevant defects
+- resolve known exploitable behavior at the earliest responsible layer before downstream progression
 
 ## Never commit
 
