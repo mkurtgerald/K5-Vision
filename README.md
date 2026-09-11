@@ -1,8 +1,20 @@
 # K5 Vision
 
-K5 Vision is an experimental modular integration platform focused on stable interfaces, deterministic behavior, and reproducible validation.
+K5 Vision is an early-stage systems project developed publicly with commercial use in mind.
 
-Public repository material is intentionally limited to information required to build, test, and review the current stage. Forward-looking product scope and internal roadmap details are not maintained here.
+Public documentation intentionally exposes only the detail required to implement, test, harden, and review the current delivery stage.
+
+## Delivery discipline
+
+K5 Vision uses strict precursor gating: downstream implementation does not begin until its precursor is complete, accepted, hardened, and green.
+
+See:
+- `docs/DELIVERY_GATES.md`
+- `docs/HARDENING_STANDARD.md`
+- `docs/COMMERCIAL_DEPENDENCY_POLICY.md`
+- `docs/DONOR_LEDGER.md`
+
+Hardening is not a final cleanup phase. Every active stage must prove relevant negative-path, recovery, security, resource, compatibility, observability, and regression behavior before the next stage is unlocked.
 
 ## Development
 
@@ -13,24 +25,19 @@ python -m venv .venv
 # Windows: .venv\Scripts\activate
 # Linux/macOS: source .venv/bin/activate
 pip install -e ".[dev]"
+ruff check src tests
+ruff format --check src tests
 pytest
-uvicorn k5vision.main:app --reload
 ```
 
-Then open `http://127.0.0.1:8000/docs`.
+## Contributions
 
-## Delivery model
+See `CONTRIBUTING.md` before opening a pull request. Contributions must respect the active delivery gate, applicable hardening requirements, project-owned architecture boundaries, and third-party licensing/provenance rules.
 
-Work proceeds through strict precursor gates. A downstream stage does not begin until its required predecessor is complete, accepted, and green. See `docs/DELIVERY_GATES.md`.
+## Security
 
-## Licensing and donor code
+See `SECURITY.md`. Do not disclose credentials, protected data, private infrastructure details, or exploitable vulnerability details in public issues.
 
-K5 Vision is publicly viewable but is not, as a whole, an open-source project.
+## Licensing
 
-Original K5-authored material released under the current repository license is governed by the K5 Vision Source-Available License in `LICENSE`.
-
-Third-party and donor material remains governed by its original license. K5 Vision may use permissively licensed donor components such as MIT, BSD, ISC, and Apache-2.0 material when reviewed under `docs/COMMERCIAL_DEPENDENCY_POLICY.md`. Required donor notices and provenance must be preserved.
-
-Historical K5 material that was previously published under the MIT License retains the rights already granted for that historical version.
-
-See `docs/DONOR_LEDGER.md` and `THIRD_PARTY_NOTICES.md` for provenance and attribution records.
+K5-owned material is governed by the repository's current K5 Vision Source-Available License unless a file or directory states otherwise. Third-party material remains governed by its original license and must retain required notices and attribution.
