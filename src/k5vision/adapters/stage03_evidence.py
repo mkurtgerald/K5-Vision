@@ -1,4 +1,4 @@
-"""Resource evidence required for Stage 03 candidate selection."""
+"""Resource and reproducibility evidence required for Stage 03 selection."""
 
 from __future__ import annotations
 
@@ -10,10 +10,24 @@ from k5vision.adapters.runtime import (
     CandidateReview,
     CandidateScore,
     QualificationErrorCode,
+    QualificationPlan,
     QualificationResult,
     RuntimeQualificationError,
     rank_qualification_results,
 )
+
+
+class QualificationContext(BaseModel):
+    """Safe retained context proving candidates were measured comparably."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    input_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    host_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    platform: Literal["windows", "linux"]
+    architecture: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    plan: QualificationPlan
 
 
 class ResourceMeasurement(BaseModel):
@@ -68,11 +82,12 @@ class Stage03CandidateScore(BaseModel):
 
 
 class Stage03Evidence(BaseModel):
-    """Complete evidence set required before Stage 03 may select a candidate."""
+    """Complete comparable evidence required before Stage 03 may select a candidate."""
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
+    context: QualificationContext
     results: list[QualificationResult] = Field(min_length=1, max_length=32)
     reviews: list[CandidateReview] = Field(min_length=1, max_length=32)
     resources: list[ResourceProfile] = Field(min_length=1, max_length=32)
@@ -89,6 +104,9 @@ class Stage03Evidence(BaseModel):
 
         if not (set(result_names) == set(review_names) == set(resource_names)):
             raise ValueError("stage 03 evidence must cover the same candidate set")
+
+        if any(len(result.samples) != self.context.plan.scored_runs for result in self.results):
+            raise ValueError("qualification results must match the retained scored-run plan")
 
         ladders = {profile.load_ladder for profile in self.resources}
         if len(ladders) != 1:
