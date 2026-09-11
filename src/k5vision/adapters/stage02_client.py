@@ -84,7 +84,7 @@ def _sanitize_uri(value: Any) -> str | None:
         return None
 
 
-def _map_exception(exc: BaseException) -> DeviceProbeError:
+def _map_exception(exc: Exception) -> DeviceProbeError:
     parts: list[str] = []
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -144,7 +144,7 @@ class Stage02Adapter:
             )
         except DeviceProbeError:
             raise
-        except BaseException as exc:
+        except Exception as exc:
             raise _map_exception(exc) from exc
 
     def _discover_sync(self) -> list[DiscoveredEndpoint]:
@@ -183,7 +183,7 @@ class Stage02Adapter:
             )
         except DeviceProbeError:
             raise
-        except BaseException as exc:
+        except Exception as exc:
             raise _map_exception(exc) from exc
 
     def _probe_sync(
@@ -208,14 +208,14 @@ class Stage02Adapter:
         management = client.devicemgmt()
         info = management.GetDeviceInformation()
         try:
-            raw_capabilities = management.GetCapabilities(Category="All")
-        except BaseException:
+            raw_capabilities = management.GetCapabilities()
+        except Exception:
             raw_capabilities = None
 
         media = client.media()
         raw_profiles = media.GetProfiles() or []
         profiles: list[OnvifProfileSnapshot] = []
-        stream_error: BaseException | None = None
+        stream_error: Exception | None = None
         supports_audio = False
 
         for raw_profile in raw_profiles:
@@ -235,7 +235,7 @@ class Stage02Adapter:
                     StreamSetup={"Stream": "RTP-Unicast", "Transport": {"Protocol": "RTSP"}},
                 )
                 connection_uri = _sanitize_uri(_get(stream, "Uri", "URI", "uri"))
-            except BaseException as exc:
+            except Exception as exc:
                 stream_error = stream_error or exc
 
             supports_audio = supports_audio or bool(
