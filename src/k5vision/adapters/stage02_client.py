@@ -251,9 +251,7 @@ class Stage02Adapter:
                     width=width,
                     height=height,
                     fps=_positive_number(_get(rate, "FrameRateLimit", "frame_rate_limit"), float),
-                    bitrate_kbps=_positive_number(
-                        _get(rate, "BitrateLimit", "bitrate_limit"), int
-                    ),
+                    bitrate_kbps=_positive_number(_get(rate, "BitrateLimit", "bitrate_limit"), int),
                     connection_uri=connection_uri,
                 )
             )
