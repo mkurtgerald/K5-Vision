@@ -76,9 +76,7 @@ class RuntimeCandidate(Protocol):
         """Measure one bounded run and return only project-owned data."""
         ...
 
-    async def measure_recovery(
-        self, source_uri: str, *, timeout_seconds: float
-    ) -> RuntimeSample:
+    async def measure_recovery(self, source_uri: str, *, timeout_seconds: float) -> RuntimeSample:
         """Measure one explicit interruption and re-entry case."""
         ...
 
