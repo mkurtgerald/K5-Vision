@@ -60,6 +60,22 @@ Each PR should:
 
 Do not merge forward with a red quality gate.
 
+## Strict precursor gating
+
+K5 follows `docs/DELIVERY_GATES.md`.
+
+The critical-path rule is absolute: **nothing downstream becomes active implementation work until its precursor is complete, accepted, and green.**
+
+- Keep one active critical-path gate at a time.
+- Treat downstream issues as blocked planning items until their precursor closes.
+- Fix failures at the earliest layer that violates its contract.
+- Add regression coverage before resuming forward work.
+- Do not hide upstream defects with downstream retries, special cases, fallbacks, or exception swallowing.
+- Hardware-dependent gates require actual hardware validation before close.
+- A partial implementation, mock, or locally passing subset does not unlock the next gate.
+
+If a current gate fails, forward critical-path feature work stops until that failure is resolved and the gate is revalidated.
+
 ## Dependencies and commercial compatibility
 
 K5 Vision is open source during its public sprint phase, but the product is intended for commercial distribution. Any PR that adds or changes a dependency must follow `docs/COMMERCIAL_DEPENDENCY_POLICY.md`.
@@ -88,6 +104,8 @@ Do not introduce non-commercial, research-only, field-of-use, unclear/custom, or
 ## Sprint workflow
 
 K5 uses short, independently testable increments. Keep active implementation work narrow enough that failures are attributable and reversible. A new feature should not bypass a failing current gate simply to maintain velocity.
+
+Efficiency is measured by stable, completed capability—not simultaneous workstreams, files changed, commits, or issue count.
 
 ## Commit and push
 
