@@ -23,8 +23,7 @@ class FakeManagement:
             "HardwareId": "HW-1",
         }
 
-    def GetCapabilities(self, **kwargs):
-        assert kwargs == {"Category": "All"}
+    def GetCapabilities(self):
         if self.fail_capabilities:
             raise RuntimeError("optional capability query unsupported")
         return {
@@ -35,7 +34,7 @@ class FakeManagement:
 
 
 class FakeMedia:
-    def __init__(self, *, stream_error: BaseException | None = None, no_profiles: bool = False):
+    def __init__(self, *, stream_error: Exception | None = None, no_profiles: bool = False):
         self.stream_error = stream_error
         self.no_profiles = no_profiles
 
@@ -76,7 +75,7 @@ class FakeClient:
     def __init__(
         self,
         *,
-        stream_error: BaseException | None = None,
+        stream_error: Exception | None = None,
         no_profiles: bool = False,
         fail_capabilities: bool = False,
     ) -> None:
@@ -213,7 +212,7 @@ def test_discovery_failure_is_normalized() -> None:
         (RuntimeError("malformed payload"), ProbeErrorCode.INVALID_RESPONSE),
     ],
 )
-def test_exception_mapping_is_stable(error: BaseException, expected: ProbeErrorCode) -> None:
+def test_exception_mapping_is_stable(error: Exception, expected: ProbeErrorCode) -> None:
     assert _map_exception(error).code is expected
 
 
