@@ -1,14 +1,15 @@
 # Contributing to K5 Vision
 
-Thank you for contributing to K5 Vision. The project is developed publicly with commercial deployment as an explicit design requirement, so quality, dependency licensing, security hygiene, and stable interfaces are part of the engineering definition of done.
+K5 Vision is developed publicly with commercial use in mind. Public documentation should contain only the detail needed to implement, test, or review the current stage.
 
-## Code of Conduct
+## Conduct
 
 - Be respectful and professional.
-- Prefer small, reviewable changes over large mixed-purpose PRs.
+- Prefer small, reviewable changes.
 - Test before submitting a PR.
-- Document public APIs and lasting architecture decisions.
+- Document public contract changes and lasting architecture decisions.
 - Do not commit secrets, customer data, production credentials, or proprietary third-party source.
+- Do not add forward-looking product-roadmap detail to public issues, PRs, comments, or docs unless it is required for the current gate.
 
 ## Development setup
 
@@ -45,76 +46,62 @@ To apply Ruff formatting locally:
 ruff format src tests
 ```
 
-The repository-wide coverage gate is currently 80% minimum. New behavior should include tests for normal paths and meaningful failure states.
+The repository-wide coverage gate is 80% minimum. New behavior should test normal paths and meaningful failure states.
 
 ## Pull requests
 
 Each PR should:
-
-- Deliver one coherent outcome.
-- Link the relevant issue when one exists.
-- Keep unrelated refactors out of the change.
-- Pass install, lint, format, and test CI checks.
-- Document public API/contract changes.
-- Complete the commercial/IP checklist in the PR template.
+- deliver one coherent outcome
+- link the relevant current-stage issue when appropriate
+- keep unrelated refactors out of the change
+- pass install, lint, format, and test CI checks
+- document public contract changes
+- complete the external dependency/IP checklist
+- avoid unnecessary disclosure of future scope or product intent
 
 Do not merge forward with a red quality gate.
 
 ## Strict precursor gating
 
-K5 follows `docs/DELIVERY_GATES.md`.
+Follow `docs/DELIVERY_GATES.md`.
 
 The critical-path rule is absolute: **nothing downstream becomes active implementation work until its precursor is complete, accepted, and green.**
 
-- Keep one active critical-path gate at a time.
-- Treat downstream issues as blocked planning items until their precursor closes.
-- Fix failures at the earliest layer that violates its contract.
-- Add regression coverage before resuming forward work.
-- Do not hide upstream defects with downstream retries, special cases, fallbacks, or exception swallowing.
-- Hardware-dependent gates require actual hardware validation before close.
-- A partial implementation, mock, or locally passing subset does not unlock the next gate.
+- keep one active critical-path gate at a time
+- keep downstream issues as blocked planning items
+- fix failures at the earliest layer that violates its contract
+- add regression coverage before resuming forward work
+- do not hide upstream defects with downstream special cases
+- hardware-dependent gates require physical validation
+- a mock or partial implementation does not unlock the next gate
 
-If a current gate fails, forward critical-path feature work stops until that failure is resolved and the gate is revalidated.
+## External dependencies and artifacts
 
-## Dependencies and commercial compatibility
+Any PR that adds or changes an external dependency or artifact must follow `docs/COMMERCIAL_DEPENDENCY_POLICY.md`.
 
-K5 Vision is open source during its public sprint phase, but the product is intended for commercial distribution. Any PR that adds or changes a dependency must follow `docs/COMMERCIAL_DEPENDENCY_POLICY.md`.
-
-At minimum, record:
-
-1. Component and version range.
-2. Upstream project URL.
-3. License identifier.
-4. Runtime vs development-only use.
-5. Why the dependency is needed.
-6. Any attribution/notice obligations.
-7. Whether the dependency is linked, bundled, modified, or invoked externally.
-
-Do not introduce non-commercial, research-only, field-of-use, unclear/custom, or reciprocal licensing obligations without explicit review.
+Record only what is needed for review: component/version, source, governing terms, purpose, runtime/development use, notice obligations, distribution method, and commercial-use conclusion.
 
 ## Architecture discipline
 
-- Vendor-specific camera objects stay inside adapters.
-- The Python control plane must not become the sustained video-frame/transcode hot path.
-- Recording integrity must not depend on AI availability.
-- Secrets must not enter the repository or logs.
-- Lasting architecture choices require an ADR before they become difficult to reverse.
-- A sprint is not complete merely because contracts or mocks exist; hardware-dependent acceptance requires hardware validation.
+- implementation-specific objects stay behind adapters
+- sustained high-throughput work stays out of the orchestration layer
+- optional advanced processing cannot become a hidden dependency of baseline operation
+- secrets must not enter the repository or ordinary logs
+- lasting architecture choices require an ADR
+- physical acceptance is required when the gate depends on physical integration
 
 ## Sprint workflow
 
-K5 uses short, independently testable increments. Keep active implementation work narrow enough that failures are attributable and reversible. A new feature should not bypass a failing current gate simply to maintain velocity.
-
-Efficiency is measured by stable, completed capability—not simultaneous workstreams, files changed, commits, or issue count.
+Use short, independently testable increments. Efficiency is measured by stable completed capability—not simultaneous workstreams, files changed, commits, or issue count.
 
 ## Commit and push
 
 ```bash
 git add .
-git commit -m "feat: describe the outcome"
+git commit -m "feat: describe the engineering outcome"
 git push origin feature/your-feature-name
 ```
 
 ## License
 
-By contributing, you agree your contribution will be licensed under the repository's current MIT License unless a formally documented project licensing change states otherwise.
+By contributing, you agree your contribution will be licensed under the repository's current MIT License unless a formally documented licensing change states otherwise.
