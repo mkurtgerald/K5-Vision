@@ -1,8 +1,9 @@
 """Canonical media profile contracts independent of camera vendors."""
 
 from enum import StrEnum
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class VideoCodec(StrEnum):
@@ -33,6 +34,18 @@ class StreamProfile(BaseModel):
     height: int = Field(gt=0)
     fps: float | None = Field(default=None, gt=0)
     bitrate_kbps: int | None = Field(default=None, gt=0)
+    connection_uri: str | None = None
+
+    @field_validator("connection_uri")
+    @classmethod
+    def reject_embedded_credentials(cls, value: str | None) -> str | None:
+        """Keep credentials out of canonical connection metadata."""
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("connection_uri must not contain embedded credentials")
+        return value
 
     @property
     def pixel_count(self) -> int:
