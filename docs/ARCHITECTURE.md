@@ -1,101 +1,64 @@
-# K5 Vision Architecture
+# Architecture Notes
 
-## Architectural intent
+## Intent
 
-K5 Vision is a vendor-neutral security platform, not a single-camera application. The architecture therefore separates device integration, control-plane state, media transport, analytics/inference, investigation, and user experience so each can scale independently.
+K5 Vision uses project-owned contracts and replaceable implementation boundaries so external integrations and high-throughput components can evolve without forcing changes through the rest of the system.
 
-## Logical planes
+## Logical boundaries
 
-### 1. Control plane
-
-Initial implementation: Python 3.12 + FastAPI + typed Pydantic contracts.
+### 1. Orchestration layer
 
 Responsibilities:
-- Device inventory and capabilities
-- Configuration and policy
-- User/API orchestration
-- Health/state aggregation
-- Jobs and command dispatch
-- Stable northbound API contracts
+- canonical state and configuration
+- API orchestration
+- health aggregation
+- jobs and command dispatch
+- stable external contracts
 
-The control plane must not become the sustained video transport or transcoding path.
+The orchestration layer should remain lightweight and should not become the sustained high-throughput data path.
 
-### 2. Device adapter layer
+### 2. Adapter layer
 
-Vendor-specific behavior is isolated behind canonical K5 interfaces. ONVIF is the primary standards path for compatible cameras; vendor adapters are allowed when standards do not expose required capabilities.
+Implementation-specific behavior remains behind canonical project interfaces. External-library or vendor-specific objects must not leak into higher layers.
 
-Adapters eventually cover:
-- Discovery
-- Authentication/session handling
-- Capability probing
-- Profiles and stream URIs
-- PTZ/events where supported
-- Device configuration
-- Firmware/vendor metadata
+Typical responsibilities:
+- discovery/probing
+- authentication/session handling
+- capability normalization
+- profile/connection metadata
+- implementation-specific configuration
 
-### 3. Media plane
+### 3. Transport/worker layer
 
-Responsibilities:
-- RTSP/other ingest
-- Main/substream selection
-- Live fan-out
-- Recording segmentation
-- Playback assembly
-- Transcode only when required
-- Media health metrics
+High-throughput work belongs behind a replaceable worker boundary. Runtime selection is benchmark-driven and must account for reconnect behavior, latency, resource use, packaging, isolation, and distribution suitability.
 
-The native implementation language/runtime is intentionally not locked in Sprint 001. Selection requires a benchmark covering sustained streams, reconnect behavior, memory, CPU/GPU path, packaging on Windows/Linux, and license suitability. Stable interfaces come first.
+### 4. Event/state layer
 
-### 4. Event and telemetry plane
+Normalized state changes and events remain source-attributed, timestamped, and observable. Higher layers consume project-owned event contracts rather than bypassing the platform.
 
-Normalizes time-series events from fixed cameras, body-worn cameras, drones, GPS-enabled sources, analytics, access/security sensors, and external systems. Events should remain source-attributed and timestamped so autonomous decisions can be audited.
+### 5. Advanced processing boundary
 
-### 5. Inference plane
+Optional advanced processing is implemented behind replaceable provider/runtime interfaces. Its availability must not become a hidden dependency of baseline platform operation.
 
-Computer-vision models run as replaceable workers/services. NVIDIA acceleration is a target, not a hard dependency for basic platform operation. Model lifecycle, GPU scheduling, batching, and inference results remain separate from recording integrity.
+Any externally sourced model, artifact, runtime, SDK, dataset, index, binary, or hosted service must pass the project dependency/provenance policy before adoption.
 
-#### Commercial biometric recognition subsystem
+### 6. Persistence
 
-Face recognition is a required commercial capability, but it is downstream of the proven media/event/inference foundation and does not bypass precursor gates.
-
-The biometric subsystem must remain modular and replaceable:
-- face detection / quality / alignment
-- embedding generation
-- 1:1 verification and 1:N identification
-- configurable decision thresholds with explicit `no_match`
-- versioned model/runtime metadata on recognition results
-- normalized event output into the event plane
-- secure identity enrollment and biometric-template persistence
-
-The identity database must use stable identity identifiers, support multiple enrollment samples/templates, version templates for future model migration/re-embedding, maintain provenance, support watchlist/allowlist/group membership, and provide auditable enrollment/update/delete/search workflows.
-
-Biometric templates and enrollment images are sensitive data. They must not be written to ordinary application logs. Storage and APIs require explicit authorization boundaries, encryption in transit and at rest, configurable retention/deletion behavior, and complete auditability.
-
-No face-recognition model, weights, SDK, vector-search dependency, or training/evaluation dataset may enter the shipping product merely because it is publicly downloadable. Each must pass the commercial dependency policy and provenance review before adoption.
-
-Third-party hosted face-recognition services may be optional adapters, but K5 core operation and its biometric architecture must not depend on a single external provider.
-
-### 6. Investigation / agentic intelligence
-
-Natural-language investigation and autonomous decision support consume authorized K5 APIs and normalized events rather than bypassing the platform. Autonomous actions must be policy-bounded, observable, and auditable.
-
-### 7. Persistence
-
-Sprint 001 uses an in-memory registry solely to establish contracts. Durable storage will be introduced behind repository interfaces. Video/object storage, relational configuration/state, time-series/event data, and biometric identity/template data may use different stores based on measured needs and security requirements.
+Durable stores are introduced behind repository interfaces. Different data classes may use different storage technologies when justified by measured requirements.
 
 ## Non-negotiable boundaries
 
-1. Camera/vendor code does not leak directly into UI/business logic.
-2. Python is not used as the high-bandwidth frame-copy/transcode hot path.
-3. Recording continuity is not coupled to AI availability.
-4. External AI providers are optional integrations, never required for core VMS operation.
-5. Every dependency, model, weight file, SDK, and externally sourced dataset must pass the commercial dependency policy before merge/use.
-6. Secrets never enter the public repository.
-7. New architecture decisions with lasting impact require an ADR before implementation.
-8. Face recognition cannot become a hidden dependency of recording, live view, or basic camera health.
+1. Third-party implementation types do not leak into project-wide contracts.
+2. The orchestration layer does not become the sustained high-throughput hot path.
+3. Optional advanced processing cannot compromise baseline availability or data integrity.
+4. External providers remain replaceable.
+5. Every external dependency/artifact must pass project review before merge/use.
+6. Secrets never enter the public repository or ordinary logs.
+7. Lasting architecture decisions require an ADR before they become difficult to reverse.
+8. Hardware-dependent acceptance requires physical validation.
 
-## Near-term vertical slice
+## Current staged path
 
-Device registration -> ONVIF discovery/capability probe -> RTSP URI acquisition -> media worker ingest -> health/event reporting -> live-view session contract.
+Endpoint compatibility -> transport/runtime qualification -> session/profile contract.
 
-That vertical slice is intentionally narrower than the full vision and is the fastest path to proving the architecture with real cameras. Face recognition and the biometric identity database remain planned downstream capabilities until their required precursors are accepted.
+Only the current active gate is implementation work. Downstream stages remain blocked until their precursor closes.
