@@ -3,7 +3,6 @@ from pydantic import ValidationError
 
 from k5vision.adapters import runtime, stage03_evidence
 
-
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
 
