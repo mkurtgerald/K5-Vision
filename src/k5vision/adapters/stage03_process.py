@@ -41,6 +41,8 @@ class ProcessCandidateSpec(BaseModel):
     def validate_argv(self) -> Self:
         if sum(arg == _SOURCE_TOKEN for arg in self.argv) != 1:
             raise ValueError("process argv must contain exactly one {source} token")
+        if self.argv[0] == _SOURCE_TOKEN:
+            raise ValueError("process executable must be fixed and may not use {source}")
         if any(not arg for arg in self.argv):
             raise ValueError("process argv entries must not be empty")
         return self
