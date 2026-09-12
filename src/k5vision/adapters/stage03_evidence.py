@@ -176,8 +176,16 @@ class Stage03Evidence(BaseModel):
             ),
         )
 
+    def _require_comparative_evidence(self) -> None:
+        if len(self.results) < 2:
+            raise RuntimeQualificationError(
+                QualificationErrorCode.INSUFFICIENT_EVIDENCE,
+                "stage 03 selection requires comparable evidence from at least two candidates",
+            )
+
     def selection_record(self) -> Stage03SelectionRecord:
         """Bind the deterministic winning rank to the exact retained evidence digest."""
+        self._require_comparative_evidence()
         ranked = self.rank()
         if not ranked:
             raise RuntimeQualificationError(
@@ -193,6 +201,7 @@ class Stage03Evidence(BaseModel):
 
     def select(self) -> Stage03CandidateScore:
         """Select only when every required Stage 03 evidence class is satisfied."""
+        self._require_comparative_evidence()
         ranked = self.rank()
         if not ranked:
             raise RuntimeQualificationError(
