@@ -56,6 +56,7 @@ class Stage03Capture(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal["1"] = "1"
+    plan: QualificationPlan
     results: list[QualificationResult] = Field(min_length=2, max_length=32)
     resources: list[ResourceProfile] = Field(min_length=2, max_length=32)
 
@@ -69,6 +70,11 @@ class Stage03Capture(BaseModel):
             raise ValueError("capture contains duplicate candidate resource profiles")
         if set(result_names) != set(resource_names):
             raise ValueError("capture results and resources must cover the same candidates")
+        if any(len(result.samples) != self.plan.scored_runs for result in self.results):
+            raise ValueError("capture results must match the retained scored-run plan")
+        ladders = {profile.load_ladder for profile in self.resources}
+        if len(ladders) != 1:
+            raise ValueError("capture resources must use one comparable load ladder")
         return self
 
 
@@ -97,7 +103,7 @@ class ProcessRuntimeCandidate(RuntimeCandidate):
     ) -> RuntimeSample:
         argv = self.spec.build_argv(source_uri)
         started = time.perf_counter()
-        process = subprocess.Popen(  # noqa: S603
+        process = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -142,7 +148,6 @@ class ProcessRuntimeCandidate(RuntimeCandidate):
                         raise RuntimeError("candidate exited before the interruption boundary")
                     interrupted = True
                     self._stop_process(process)
-                    return_code = process.returncode
                     break
 
                 if return_code is not None:
@@ -154,9 +159,7 @@ class ProcessRuntimeCandidate(RuntimeCandidate):
             self._stop_process(process)
 
         elapsed = max(time.perf_counter() - started, 1e-9)
-        startup_ms = (
-            max((first_observed or started) - started, 0.0) * 1000
-        )
+        startup_ms = max((first_observed or started) - started, 0.0) * 1000
         completed = not interrupted and process.returncode == 0
         return RuntimeSample(
             candidate=self.spec.candidate,
@@ -268,4 +271,4 @@ async def capture_candidate_set(
                 timeout_seconds=plan.timeout_seconds,
             )
         )
-    return Stage03Capture(results=results, resources=resources)
+    return Stage03Capture(plan=plan, results=results, resources=resources)
