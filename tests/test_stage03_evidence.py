@@ -186,3 +186,52 @@ def test_resource_evidence_rejects_unbounded_or_unexpected_values() -> None:
             completed=True,
             source_uri="rtsp://private.example/live",
         )
+
+
+def test_evidence_digest_and_selection_record_are_candidate_order_stable() -> None:
+    first = stage03_evidence.Stage03Evidence(
+        context=qualification_context(),
+        results=[result("candidate-a"), result("candidate-b")],
+        reviews=[review("candidate-a"), review("candidate-b")],
+        resources=[resource_profile("candidate-a"), resource_profile("candidate-b")],
+    )
+    second = stage03_evidence.Stage03Evidence(
+        context=qualification_context(),
+        results=[result("candidate-b"), result("candidate-a")],
+        reviews=[review("candidate-b"), review("candidate-a")],
+        resources=[resource_profile("candidate-b"), resource_profile("candidate-a")],
+    )
+
+    assert first.digest() == second.digest()
+    assert first.selection_record() == second.selection_record()
+    assert first.selection_record().selected_candidate == "candidate-a"
+
+
+def test_evidence_digest_changes_when_retained_measurement_changes() -> None:
+    first = stage03_evidence.Stage03Evidence(
+        context=qualification_context(),
+        results=[result("candidate-a", latency=10)],
+        reviews=[review("candidate-a")],
+        resources=[resource_profile("candidate-a")],
+    )
+    second = stage03_evidence.Stage03Evidence(
+        context=qualification_context(),
+        results=[result("candidate-a", latency=11)],
+        reviews=[review("candidate-a")],
+        resources=[resource_profile("candidate-a")],
+    )
+
+    assert first.digest() != second.digest()
+    assert first.selection_record().ranking_sha256 != second.selection_record().ranking_sha256
+
+
+def test_selection_record_requires_complete_eligible_evidence() -> None:
+    evidence = stage03_evidence.Stage03Evidence(
+        context=qualification_context(),
+        results=[result("candidate-a")],
+        reviews=[review("candidate-a")],
+        resources=[resource_profile("candidate-a", completed=False)],
+    )
+
+    with pytest.raises(runtime.RuntimeQualificationError):
+        evidence.selection_record()
