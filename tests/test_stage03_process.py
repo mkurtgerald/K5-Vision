@@ -1,6 +1,7 @@
 import asyncio
 import sys
 
+import psutil
 import pytest
 from pydantic import ValidationError
 
@@ -73,6 +74,49 @@ def test_process_candidate_recovery_interrupts_then_reenters() -> None:
 
     assert sample.completed is True
     assert sample.recovered is True
+
+
+def test_process_candidate_includes_descendant_resource_usage() -> None:
+    child_code = "import time; payload=bytearray(32 * 1024 * 1024); payload[0]=1; time.sleep(0.15)"
+    parent_code = (
+        "import subprocess, sys; "
+        f"child=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        "child.wait()"
+    )
+    spec = ProcessCandidateSpec(
+        candidate="candidate-a",
+        argv=[sys.executable, "-c", parent_code, "{source}"],
+        interruption_seconds=0.02,
+        poll_interval_seconds=0.01,
+    )
+
+    sample = asyncio.run(ProcessRuntimeCandidate(spec).measure("input", timeout_seconds=1))
+
+    assert sample.completed is True
+    assert sample.memory_mb >= 24
+
+
+def test_process_candidate_cleans_orphan_descendants(tmp_path) -> None:
+    pid_path = tmp_path / "child.pid"
+    child_code = "import time; time.sleep(5)"
+    parent_code = (
+        "import subprocess, sys, time; "
+        f"child=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"open({str(pid_path)!r}, 'w', encoding='utf-8').write(str(child.pid)); "
+        "time.sleep(0.08)"
+    )
+    spec = ProcessCandidateSpec(
+        candidate="candidate-a",
+        argv=[sys.executable, "-c", parent_code, "{source}"],
+        interruption_seconds=0.02,
+        poll_interval_seconds=0.01,
+    )
+
+    sample = asyncio.run(ProcessRuntimeCandidate(spec).measure("input", timeout_seconds=1))
+
+    child_pid = int(pid_path.read_text(encoding="utf-8"))
+    assert sample.completed is False
+    assert not psutil.pid_exists(child_pid)
 
 
 def test_resource_profile_uses_bounded_comparable_load_ladder() -> None:
