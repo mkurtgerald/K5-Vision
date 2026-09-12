@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from hashlib import sha256
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -15,6 +17,11 @@ from k5vision.adapters.runtime import (
     RuntimeQualificationError,
     rank_qualification_results,
 )
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return sha256(payload.encode("utf-8")).hexdigest()
 
 
 class QualificationContext(BaseModel):
@@ -81,6 +88,17 @@ class Stage03CandidateScore(BaseModel):
     high_load_memory_mb: float = Field(ge=0)
 
 
+class Stage03SelectionRecord(BaseModel):
+    """Tamper-evident record binding a final selection to retained evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    selected_candidate: str = Field(min_length=1, max_length=128)
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    ranking_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class Stage03Evidence(BaseModel):
     """Complete comparable evidence required before Stage 03 may select a candidate."""
 
@@ -112,6 +130,17 @@ class Stage03Evidence(BaseModel):
         if len(ladders) != 1:
             raise ValueError("resource evidence must use one comparable load ladder")
         return self
+
+    def canonical_payload(self) -> dict[str, object]:
+        """Return order-stable retained evidence suitable for hashing or archival."""
+        payload = self.model_dump(mode="json")
+        for key in ("results", "reviews", "resources"):
+            payload[key] = sorted(payload[key], key=lambda item: item["candidate"])
+        return payload
+
+    def digest(self) -> str:
+        """Return a stable SHA-256 digest for the complete retained evidence bundle."""
+        return _canonical_sha256(self.canonical_payload())
 
     def rank(self) -> list[Stage03CandidateScore]:
         """Rank only candidates with complete review, recovery, and resource evidence."""
@@ -145,6 +174,21 @@ class Stage03Evidence(BaseModel):
                 score.qualification.median_startup_ms,
                 score.candidate,
             ),
+        )
+
+    def selection_record(self) -> Stage03SelectionRecord:
+        """Bind the deterministic winning rank to the exact retained evidence digest."""
+        ranked = self.rank()
+        if not ranked:
+            raise RuntimeQualificationError(
+                QualificationErrorCode.INSUFFICIENT_EVIDENCE,
+                "no candidate has complete accepted stage 03 evidence",
+            )
+        ranking_payload = [score.model_dump(mode="json") for score in ranked]
+        return Stage03SelectionRecord(
+            selected_candidate=ranked[0].candidate,
+            evidence_sha256=self.digest(),
+            ranking_sha256=_canonical_sha256(ranking_payload),
         )
 
     def select(self) -> Stage03CandidateScore:
