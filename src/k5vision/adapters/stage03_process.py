@@ -135,8 +135,7 @@ class ProcessRuntimeCandidate(RuntimeCandidate):
                         io = monitored.io_counters()
                         io_bytes = max(
                             io_bytes,
-                            int(getattr(io, "read_bytes", 0))
-                            + int(getattr(io, "write_bytes", 0)),
+                            int(getattr(io, "read_bytes", 0)) + int(getattr(io, "write_bytes", 0)),
                         )
                     except (psutil.AccessDenied, NotImplementedError):
                         pass
