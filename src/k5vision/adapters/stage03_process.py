@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Literal, Self
 
 import psutil
@@ -84,15 +84,103 @@ class ProcessRuntimeCandidate(RuntimeCandidate):
     def __init__(self, spec: ProcessCandidateSpec) -> None:
         self.spec = spec
 
-    def _stop_process(self, process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            return
-        process.terminate()
+    @staticmethod
+    def _is_live(process: psutil.Process) -> bool:
         try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=1)
+            return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            return False
+        except psutil.AccessDenied:
+            return True
+
+    def _stop_process(
+        self,
+        process: subprocess.Popen[bytes],
+        known_processes: Iterable[psutil.Process] = (),
+    ) -> bool:
+        targets = {item.pid: item for item in known_processes}
+        try:
+            root = psutil.Process(process.pid)
+            targets[root.pid] = root
+            for child in root.children(recursive=True):
+                targets[child.pid] = child
+        except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+            pass
+
+        descendants = [
+            target
+            for pid, target in targets.items()
+            if pid != process.pid and self._is_live(target)
+        ]
+        descendant_cleanup_required = bool(descendants)
+
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+        for target in descendants:
+            try:
+                target.terminate()
+            except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+                pass
+
+        if descendants:
+            _, alive = psutil.wait_procs(descendants, timeout=1)
+            for target in alive:
+                try:
+                    target.kill()
+                except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+                    pass
+            if alive:
+                psutil.wait_procs(alive, timeout=1)
+
+        if process.poll() is None:
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1)
+
+        return descendant_cleanup_required
+
+    @staticmethod
+    def _resource_snapshot(
+        monitored: psutil.Process,
+        known_processes: dict[int, psutil.Process],
+    ) -> tuple[bool, int, float, int]:
+        try:
+            members = [monitored, *monitored.children(recursive=True)]
+        except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+            members = [monitored]
+
+        observed = False
+        rss_bytes = 0
+        cpu_seconds = 0.0
+        io_bytes = 0
+        for member in members:
+            known_processes[member.pid] = member
+            try:
+                member.status()
+                observed = True
+                rss_bytes += member.memory_info().rss
+                cpu = member.cpu_times()
+                cpu_seconds += cpu.user + cpu.system
+                try:
+                    io = member.io_counters()
+                    io_bytes += int(getattr(io, "read_bytes", 0)) + int(
+                        getattr(io, "write_bytes", 0)
+                    )
+                except (psutil.AccessDenied, NotImplementedError):
+                    pass
+            except (
+                psutil.AccessDenied,
+                psutil.NoSuchProcess,
+                psutil.ZombieProcess,
+            ):
+                pass
+        return observed, rss_bytes, cpu_seconds, io_bytes
 
     def _measure_sync(
         self,
@@ -111,11 +199,13 @@ class ProcessRuntimeCandidate(RuntimeCandidate):
             shell=False,
         )
         monitored = psutil.Process(process.pid)
+        known_processes = {monitored.pid: monitored}
         first_observed: float | None = None
         peak_rss = 0
         cpu_seconds = 0.0
         io_bytes = 0
         interrupted = False
+        descendant_cleanup_required = False
 
         try:
             while True:
@@ -123,30 +213,21 @@ class ProcessRuntimeCandidate(RuntimeCandidate):
                 elapsed = now - started
                 return_code = process.poll()
 
-                try:
-                    if first_observed is None:
-                        monitored.status()
-                        first_observed = now
-                    memory = monitored.memory_info()
-                    peak_rss = max(peak_rss, memory.rss)
-                    cpu = monitored.cpu_times()
-                    cpu_seconds = max(cpu_seconds, cpu.user + cpu.system)
-                    try:
-                        io = monitored.io_counters()
-                        io_bytes = max(
-                            io_bytes,
-                            int(getattr(io, "read_bytes", 0)) + int(getattr(io, "write_bytes", 0)),
-                        )
-                    except (psutil.AccessDenied, NotImplementedError):
-                        pass
-                except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                    pass
+                observed, rss, cpu, io = self._resource_snapshot(
+                    monitored,
+                    known_processes,
+                )
+                if observed and first_observed is None:
+                    first_observed = now
+                peak_rss = max(peak_rss, rss)
+                cpu_seconds = max(cpu_seconds, cpu)
+                io_bytes = max(io_bytes, io)
 
                 if interrupt_after is not None and not interrupted and elapsed >= interrupt_after:
                     if return_code is not None:
                         raise RuntimeError("candidate exited before the interruption boundary")
                     interrupted = True
-                    self._stop_process(process)
+                    self._stop_process(process, known_processes.values())
                     break
 
                 if return_code is not None:
@@ -155,11 +236,18 @@ class ProcessRuntimeCandidate(RuntimeCandidate):
                     raise TimeoutError("candidate process exceeded its bounded timeout")
                 time.sleep(self.spec.poll_interval_seconds)
         finally:
-            self._stop_process(process)
+            descendant_cleanup_required = self._stop_process(
+                process,
+                known_processes.values(),
+            )
 
         elapsed = max(time.perf_counter() - started, 1e-9)
         startup_ms = max((first_observed or started) - started, 0.0) * 1000
-        completed = not interrupted and process.returncode == 0
+        completed = (
+            not interrupted
+            and process.returncode == 0
+            and not descendant_cleanup_required
+        )
         return RuntimeSample(
             candidate=self.spec.candidate,
             startup_ms=startup_ms,
