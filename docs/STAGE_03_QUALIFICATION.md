@@ -16,6 +16,8 @@ The retained plan is authoritative for the evidence bundle: every candidate resu
 
 `Stage03SelectionRecord` schema version `1` binds the deterministic winning candidate to SHA-256 digests of the complete retained evidence and the derived ordered ranking. Candidate collections are normalized by stable identifier before evidence hashing so equivalent bundles do not acquire different identities merely from list ordering. Any retained measurement or review change produces a different evidence identity.
 
+Final selection also requires comparative evidence from at least two candidates. A single candidate may be retained and inspected while evidence is being assembled, but it cannot produce a final selection or selection record by itself.
+
 ## Reproducible method
 
 For each candidate under review:
@@ -36,8 +38,8 @@ The project-owned qualification runner enforces the warm-up, scored-run minimum,
 
 Only candidates with complete successful scored runs, successful recovery evidence, complete comparable resource evidence, and an approved review are eligible for final Stage 03 selection. Qualification aggregates use median retained measurements. Final ordering uses latency, highest-load CPU use, highest-load memory use, median CPU use, median memory use, startup time, then a stable candidate identifier. This keeps selection tied to captured evidence rather than preference or a single successful run.
 
-The final selection record is derived only after eligible evidence exists. Its evidence digest and ranking digest make the acceptance decision independently re-checkable against the retained record rather than relying on a mutable summary or prose claim.
+The final selection record is derived only after eligible comparative evidence exists. Its evidence digest and ranking digest make the acceptance decision independently re-checkable against the retained record rather than relying on a mutable summary or prose claim.
 
 ## Gate status
 
-The qualification boundary, bounded execution method, evidence-gated selection rule, comparable resource-evidence contract, reproducibility context, and tamper-evident final-selection record are defined. No runtime is selected by this document. Stage 03 remains open until real candidate measurements, real increasing-load resource evidence, completed candidate reviews, hardening evidence, and green CI are all recorded at the accepted revision.
+The qualification boundary, bounded execution method, evidence-gated selection rule, comparable resource-evidence contract, reproducibility context, comparative-selection guard, and tamper-evident final-selection record are defined. No runtime is selected by this document. Stage 03 remains open until real candidate measurements, real increasing-load resource evidence, completed candidate reviews, hardening evidence, and green CI are all recorded at the accepted revision.
