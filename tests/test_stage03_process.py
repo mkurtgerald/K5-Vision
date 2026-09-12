@@ -77,10 +77,7 @@ def test_process_candidate_recovery_interrupts_then_reenters() -> None:
 
 
 def test_process_candidate_includes_descendant_resource_usage() -> None:
-    child_code = (
-        "import time; payload=bytearray(32 * 1024 * 1024); "
-        "payload[0]=1; time.sleep(0.15)"
-    )
+    child_code = "import time; payload=bytearray(32 * 1024 * 1024); payload[0]=1; time.sleep(0.15)"
     parent_code = (
         "import subprocess, sys; "
         f"child=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
