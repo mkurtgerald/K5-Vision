@@ -243,11 +243,7 @@ class ProcessRuntimeCandidate(RuntimeCandidate):
 
         elapsed = max(time.perf_counter() - started, 1e-9)
         startup_ms = max((first_observed or started) - started, 0.0) * 1000
-        completed = (
-            not interrupted
-            and process.returncode == 0
-            and not descendant_cleanup_required
-        )
+        completed = not interrupted and process.returncode == 0 and not descendant_cleanup_required
         return RuntimeSample(
             candidate=self.spec.candidate,
             startup_ms=startup_ms,
