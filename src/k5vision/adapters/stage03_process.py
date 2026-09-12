@@ -12,9 +12,11 @@ import psutil
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from k5vision.adapters.runtime import (
+    QualificationErrorCode,
     QualificationPlan,
     QualificationResult,
     RuntimeCandidate,
+    RuntimeQualificationError,
     RuntimeSample,
     qualify_candidate,
 )
@@ -240,6 +242,18 @@ class ProcessRuntimeCandidate(RuntimeCandidate):
                 process,
                 known_processes.values(),
             )
+
+        if not interrupted:
+            if descendant_cleanup_required:
+                raise RuntimeQualificationError(
+                    QualificationErrorCode.CANDIDATE_FAILURE,
+                    "candidate process left descendant processes after exit",
+                )
+            if process.returncode != 0:
+                raise RuntimeQualificationError(
+                    QualificationErrorCode.CANDIDATE_FAILURE,
+                    f"candidate process exited with status {process.returncode}",
+                )
 
         elapsed = max(time.perf_counter() - started, 1e-9)
         startup_ms = max((first_observed or started) - started, 0.0) * 1000
