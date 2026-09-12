@@ -146,6 +146,8 @@ async def _run_bounded(
             QualificationErrorCode.TIMEOUT,
             "runtime candidate measurement timed out",
         ) from None
+    except RuntimeQualificationError:
+        raise
     except Exception:
         raise RuntimeQualificationError(
             QualificationErrorCode.CANDIDATE_FAILURE,
