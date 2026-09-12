@@ -135,6 +135,23 @@ def test_stage03_evidence_requires_comparable_load_ladder() -> None:
         )
 
 
+def test_stage03_selection_requires_comparative_evidence() -> None:
+    evidence = stage03_evidence.Stage03Evidence(
+        context=qualification_context(),
+        results=[result("candidate-a")],
+        reviews=[review("candidate-a")],
+        resources=[resource_profile("candidate-a")],
+    )
+
+    with pytest.raises(runtime.RuntimeQualificationError) as selected:
+        evidence.select()
+    with pytest.raises(runtime.RuntimeQualificationError) as recorded:
+        evidence.selection_record()
+
+    assert selected.value.code is runtime.QualificationErrorCode.INSUFFICIENT_EVIDENCE
+    assert recorded.value.code is runtime.QualificationErrorCode.INSUFFICIENT_EVIDENCE
+
+
 def test_stage03_ranking_uses_high_load_resource_measurement_on_latency_tie() -> None:
     evidence = stage03_evidence.Stage03Evidence(
         context=qualification_context(),
@@ -155,16 +172,19 @@ def test_stage03_ranking_uses_high_load_resource_measurement_on_latency_tie() ->
     assert evidence.select().candidate == "candidate-b"
 
 
-def test_stage03_selection_excludes_incomplete_resource_profile() -> None:
+def test_stage03_ranking_excludes_incomplete_resource_profile() -> None:
     evidence = stage03_evidence.Stage03Evidence(
         context=qualification_context(),
-        results=[result("candidate-a")],
-        reviews=[review("candidate-a")],
-        resources=[resource_profile("candidate-a", completed=False)],
+        results=[result("candidate-a"), result("candidate-b")],
+        reviews=[review("candidate-a"), review("candidate-b")],
+        resources=[
+            resource_profile("candidate-a", completed=False),
+            resource_profile("candidate-b"),
+        ],
     )
 
-    with pytest.raises(runtime.RuntimeQualificationError):
-        evidence.select()
+    assert [item.candidate for item in evidence.rank()] == ["candidate-b"]
+    assert evidence.select().candidate == "candidate-b"
 
 
 def test_resource_evidence_rejects_unbounded_or_unexpected_values() -> None:
@@ -210,15 +230,15 @@ def test_evidence_digest_and_selection_record_are_candidate_order_stable() -> No
 def test_evidence_digest_changes_when_retained_measurement_changes() -> None:
     first = stage03_evidence.Stage03Evidence(
         context=qualification_context(),
-        results=[result("candidate-a", latency=10)],
-        reviews=[review("candidate-a")],
-        resources=[resource_profile("candidate-a")],
+        results=[result("candidate-a", latency=10), result("candidate-b", latency=20)],
+        reviews=[review("candidate-a"), review("candidate-b")],
+        resources=[resource_profile("candidate-a"), resource_profile("candidate-b")],
     )
     second = stage03_evidence.Stage03Evidence(
         context=qualification_context(),
-        results=[result("candidate-a", latency=11)],
-        reviews=[review("candidate-a")],
-        resources=[resource_profile("candidate-a")],
+        results=[result("candidate-a", latency=11), result("candidate-b", latency=20)],
+        reviews=[review("candidate-a"), review("candidate-b")],
+        resources=[resource_profile("candidate-a"), resource_profile("candidate-b")],
     )
 
     assert first.digest() != second.digest()
@@ -228,9 +248,12 @@ def test_evidence_digest_changes_when_retained_measurement_changes() -> None:
 def test_selection_record_requires_complete_eligible_evidence() -> None:
     evidence = stage03_evidence.Stage03Evidence(
         context=qualification_context(),
-        results=[result("candidate-a")],
-        reviews=[review("candidate-a")],
-        resources=[resource_profile("candidate-a", completed=False)],
+        results=[result("candidate-a"), result("candidate-b")],
+        reviews=[review("candidate-a"), review("candidate-b")],
+        resources=[
+            resource_profile("candidate-a", completed=False),
+            resource_profile("candidate-b", completed=False),
+        ],
     )
 
     with pytest.raises(runtime.RuntimeQualificationError):
