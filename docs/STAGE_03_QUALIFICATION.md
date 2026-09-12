@@ -40,6 +40,14 @@ Only candidates with complete successful scored runs, successful recovery eviden
 
 The final selection record is derived only after eligible comparative evidence exists. Its evidence digest and ranking digest make the acceptance decision independently re-checkable against the retained record rather than relying on a mutable summary or prose claim.
 
+## Local capture harness
+
+`ProcessRuntimeCandidate` provides an argv-only, shell-free process boundary for measuring externally installed candidates without adding candidate-specific implementation objects to project contracts. It captures bounded wall time, process CPU use, peak resident memory, available process I/O counters, completion state, and explicit interruption/re-entry behavior. `measure_resource_profile` runs the same candidate at one strictly increasing, bounded concurrent-load ladder. The maximum harness concurrency is intentionally capped at 32 units.
+
+`Stage03Capture` retains the exact qualification plan plus comparative qualification and resource measurements. It never retains the configured source value. This capture is intentionally incomplete for final selection: candidate review records and the safe host/input fingerprints still must be assembled into `Stage03Evidence` before a selection can exist.
+
+The opt-in integration harness reads the source and command specifications only from local environment variables. Candidate command specifications are JSON objects containing a stable candidate identifier and an argv array with exactly one literal `{source}` element. Commands are executed directly with `shell=False`; source data is substituted as one argument and candidate stdout/stderr are not retained. `K5_STAGE03_OUTPUT` is required when the physical harness is enabled so the measured, source-free capture is written to a local evidence file rather than existing only in terminal output.
+
 ## Gate status
 
-The qualification boundary, bounded execution method, evidence-gated selection rule, comparable resource-evidence contract, reproducibility context, comparative-selection guard, and tamper-evident final-selection record are defined. No runtime is selected by this document. Stage 03 remains open until real candidate measurements, real increasing-load resource evidence, completed candidate reviews, hardening evidence, and green CI are all recorded at the accepted revision.
+The qualification boundary, bounded execution method, evidence-gated selection rule, comparable resource-evidence contract, reproducibility context, comparative-selection guard, tamper-evident final-selection record, and bounded local capture path are defined. No runtime is selected by this document. Stage 03 remains open until real comparative candidate measurements, real increasing-load resource evidence, completed candidate reviews, safe reproducibility context, hardening evidence, and green CI are all recorded at the accepted revision.
