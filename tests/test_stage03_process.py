@@ -5,7 +5,12 @@ import psutil
 import pytest
 from pydantic import ValidationError
 
-from k5vision.adapters.runtime import QualificationPlan
+from k5vision.adapters.runtime import (
+    QualificationErrorCode,
+    QualificationPlan,
+    RuntimeQualificationError,
+    qualify_candidate,
+)
 from k5vision.adapters.stage03_process import (
     ProcessCandidateSpec,
     ProcessRuntimeCandidate,
@@ -54,17 +59,27 @@ def test_process_candidate_measurement_is_bounded_and_project_owned() -> None:
     assert "local-test-input" not in sample.model_dump_json()
 
 
-def test_process_candidate_nonzero_exit_is_retained_as_failure() -> None:
+def test_process_candidate_nonzero_exit_fails_fast_with_sanitized_status() -> None:
     spec = ProcessCandidateSpec(
         candidate="candidate-a",
         argv=[sys.executable, "-c", "raise SystemExit(3)", "{source}"],
         interruption_seconds=0.02,
         poll_interval_seconds=0.01,
     )
-    sample = asyncio.run(ProcessRuntimeCandidate(spec).measure("input", timeout_seconds=1))
 
-    assert sample.completed is False
-    assert sample.recovered is False
+    with pytest.raises(RuntimeQualificationError) as caught:
+        asyncio.run(
+            qualify_candidate(
+                "candidate-a",
+                ProcessRuntimeCandidate(spec),
+                "rtsp://user:secret@example/live",
+                plan=QualificationPlan(timeout_seconds=1),
+            )
+        )
+
+    assert caught.value.code is QualificationErrorCode.CANDIDATE_FAILURE
+    assert "status 3" in str(caught.value)
+    assert "secret" not in str(caught.value)
 
 
 def test_process_candidate_recovery_interrupts_then_reenters() -> None:
@@ -112,10 +127,12 @@ def test_process_candidate_cleans_orphan_descendants(tmp_path) -> None:
         poll_interval_seconds=0.01,
     )
 
-    sample = asyncio.run(ProcessRuntimeCandidate(spec).measure("input", timeout_seconds=1))
+    with pytest.raises(RuntimeQualificationError) as caught:
+        asyncio.run(ProcessRuntimeCandidate(spec).measure("input", timeout_seconds=1))
 
     child_pid = int(pid_path.read_text(encoding="utf-8"))
-    assert sample.completed is False
+    assert caught.value.code is QualificationErrorCode.CANDIDATE_FAILURE
+    assert "descendant" in str(caught.value)
     assert not psutil.pid_exists(child_pid)
 
 
