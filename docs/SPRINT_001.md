@@ -29,15 +29,8 @@ Create a small, executable, testable foundation with stable project-owned contra
 
 ## Explicitly deferred
 
-- external integration specifics
-- sustained transport/runtime work
-- durable persistence
-- authorization features
-- UI
-- advanced processing
-
-Deferred scope remains intentionally outside the public roadmap until its precursor gates are ready.
+All downstream capability work remains outside this completed foundation stage and is activated only through the precursor-gate process.
 
 ## Next stage
 
-Stage 02 proves one standards-based physical endpoint path through project-owned contracts and required integration validation.
+The immediate successor proved one standards-based physical endpoint path through project-owned contracts and required integration validation.
