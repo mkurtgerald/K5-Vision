@@ -36,11 +36,11 @@ High-throughput work belongs behind a replaceable worker boundary. Runtime selec
 
 Normalized state changes and events remain source-attributed, timestamped, and observable. Higher layers consume project-owned event contracts rather than bypassing the platform.
 
-### 5. Advanced processing boundary
+### 5. Optional external-processing boundary
 
-Optional advanced processing is implemented behind replaceable provider/runtime interfaces. Its availability must not become a hidden dependency of baseline platform operation.
+Optional external processing is implemented behind replaceable provider/runtime interfaces. Its availability must not become a hidden dependency of baseline platform operation.
 
-Any externally sourced model, artifact, runtime, SDK, dataset, index, binary, or hosted service must pass the project dependency/provenance policy before adoption.
+Externally sourced artifacts, runtimes, SDKs, datasets, binaries, or hosted services must pass the project dependency/provenance policy before adoption.
 
 ### 6. Persistence
 
@@ -50,7 +50,7 @@ Durable stores are introduced behind repository interfaces. Different data class
 
 1. Third-party implementation types do not leak into project-wide contracts.
 2. The orchestration layer does not become the sustained high-throughput hot path.
-3. Optional advanced processing cannot compromise baseline availability or data integrity.
+3. Optional external processing cannot compromise baseline availability or data integrity.
 4. External providers remain replaceable.
 5. Every external dependency/artifact must pass project review before merge/use.
 6. Secrets never enter the public repository or ordinary logs.
@@ -59,6 +59,4 @@ Durable stores are introduced behind repository interfaces. Different data class
 
 ## Current staged path
 
-Endpoint compatibility -> transport/runtime qualification -> session/profile contract.
-
-Only the current active gate is implementation work. Downstream stages remain blocked until their precursor closes.
+Only the active gate requires public implementation detail. Its immediate successor remains blocked and later capability detail is intentionally omitted until required for execution.
