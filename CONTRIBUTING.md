@@ -50,6 +50,8 @@ The repository-wide coverage gate is 80% minimum. New behavior should test norma
 
 ## Pull requests
 
+Every repository change must land through a pull request; do not push directly to `main`.
+
 Each PR should:
 - deliver one coherent outcome
 - link the relevant current-stage issue when appropriate
