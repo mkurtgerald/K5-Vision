@@ -14,11 +14,11 @@ At any moment there is one active critical-path gate. Future gates may exist as 
 
 Current public sequence:
 
-1. Stage 02 — endpoint compatibility
-2. Stage 03 — transport/runtime qualification
-3. Stage 04 — session/profile contract
+1. completed precursor gate
+2. active qualification gate
+3. blocked immediate successor
 
-Later stages are intentionally not enumerated in the public repository until they become necessary to execute.
+Later stages and blocked capability detail are intentionally not enumerated in the public repository until they become necessary to execute.
 
 ## Mandatory stage hardening
 
