@@ -11,8 +11,6 @@ jobs:
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 30
     env:
-      K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
-      K5_STAGE03_CANDIDATES_JSON: ${{ secrets.K5_STAGE03_CANDIDATES_JSON }}
       K5_STAGE03_OUTPUT: ${{ github.workspace }}\artifacts\stage03-physical.json
       K5_STAGE03_SCORED_RUNS: "5"
       K5_STAGE03_TIMEOUT: "10"
@@ -24,6 +22,9 @@ jobs:
 
       - name: Verify physical configuration
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CANDIDATES_JSON: ${{ secrets.K5_STAGE03_CANDIDATES_JSON }}
         run: |
           $missing = @()
           if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_SOURCE)) { $missing += "K5_STAGE03_SOURCE" }
@@ -46,6 +47,9 @@ jobs:
 
       - name: Run Stage 03 physical qualification
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CANDIDATES_JSON: ${{ secrets.K5_STAGE03_CANDIDATES_JSON }}
         run: pytest tests/integration/test_stage03_physical.py -q
 
       - name: Upload retained qualification evidence
