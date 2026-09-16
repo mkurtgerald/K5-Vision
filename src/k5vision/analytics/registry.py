@@ -4,11 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from k5vision.analytics.contracts import ANALYTICS_API_VERSION, AnalyticManifest, AnalyticState
+from k5vision.analytics.contracts import (
+    ANALYTICS_API_VERSION,
+    AnalyticEvent,
+    AnalyticManifest,
+    AnalyticState,
+)
 
 
 class AnalyticRegistrationError(ValueError):
     """Raised when an analytic cannot be registered safely."""
+
+
+class AnalyticEventValidationError(ValueError):
+    """Raised when a worker emits an event outside its registered contract."""
 
 
 @dataclass(slots=True)
@@ -37,9 +46,11 @@ class AnalyticRegistry:
         existing = self._items.get(manifest.analytic_id)
         if existing is not None:
             if existing.manifest.version == manifest.version:
-                raise AnalyticRegistrationError(
-                    f"analytic {manifest.analytic_id!r} version {manifest.version!r} is already registered"
+                message = (
+                    f"analytic {manifest.analytic_id!r} version {manifest.version!r} "
+                    "is already registered"
                 )
+                raise AnalyticRegistrationError(message)
             raise AnalyticRegistrationError(
                 f"analytic {manifest.analytic_id!r} is already registered at "
                 f"version {existing.manifest.version!r}; explicit upgrade is required"
@@ -60,6 +71,29 @@ class AnalyticRegistry:
         if item is None:
             raise KeyError(analytic_id)
         item.state = state
+        return item
+
+    def validate_event(
+        self, event: AnalyticEvent, *, require_enabled: bool = True
+    ) -> RegisteredAnalytic:
+        item = self._items.get(event.analytic_id)
+        if item is None:
+            raise AnalyticEventValidationError(
+                f"event references unregistered analytic {event.analytic_id!r}"
+            )
+        if event.analytic_version != item.manifest.version:
+            raise AnalyticEventValidationError(
+                f"event version {event.analytic_version!r} does not match registered "
+                f"version {item.manifest.version!r}"
+            )
+        if event.event_type not in item.manifest.event_types:
+            raise AnalyticEventValidationError(
+                f"event type {event.event_type!r} is not declared by {event.analytic_id!r}"
+            )
+        if require_enabled and item.state is not AnalyticState.ENABLED:
+            raise AnalyticEventValidationError(
+                f"analytic {event.analytic_id!r} is not enabled (state={item.state.value!r})"
+            )
         return item
 
     def unregister(self, analytic_id: str) -> RegisteredAnalytic:
