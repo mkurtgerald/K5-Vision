@@ -18,15 +18,19 @@ _GST_NEGOTIATION_FAILURE = 43
 _GST_SOURCE_FAILURE = 44
 _GST_PIPELINE_FAILURE = 45
 _GST_OTHER_FAILURE = 46
+_GST_WRAPPER_OS_FAILURE = 47
+_GST_WRAPPER_INTERNAL_FAILURE = 48
 
 
 def build_gst_argv(transport: str, source_uri: str) -> list[str]:
-    """Build one bounded GStreamer receive/decode pipeline without invoking a shell."""
+    """Build one bounded RTP receive path without invoking a command shell."""
     if transport not in _ALLOWED_TRANSPORTS:
         raise ValueError("unsupported transport candidate")
     if not source_uri.strip():
         raise ValueError("source_uri must not be empty")
 
+    # Stage 03 qualifies the transport/runtime boundary. Keep this path codec
+    # agnostic so decoder availability cannot masquerade as a transport result.
     return [
         _GST_LAUNCH,
         "-q",
@@ -41,11 +45,9 @@ def build_gst_argv(transport: str, source_uri: str) -> list[str]:
         "!",
         "queue",
         "!",
-        "decodebin",
-        "!",
         "fakesink",
         "sync=false",
-        "num-buffers=30",
+        "num-buffers=60",
     ]
 
 
@@ -117,20 +119,25 @@ def run_candidate(transport: str, source_uri: str) -> int:
     """Run one candidate and expose only a coarse, source-free failure status."""
     if shutil.which(_GST_LAUNCH) is None:
         return 127
-    completed = subprocess.run(
-        build_gst_argv(transport, source_uri),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        shell=False,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            build_gst_argv(transport, source_uri),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            shell=False,
+            check=False,
+        )
+    except OSError:
+        return _GST_WRAPPER_OS_FAILURE
+    except Exception:
+        # Do not propagate exception text because it may embed argv/source data.
+        return _GST_WRAPPER_INTERNAL_FAILURE
+
     if completed.returncode == 0:
         return 0
-    return classify_gst_failure(completed.stderr or "")
+    stderr = (completed.stderr or b"").decode("utf-8", errors="replace")
+    return classify_gst_failure(stderr)
 
 
 def main() -> int:
