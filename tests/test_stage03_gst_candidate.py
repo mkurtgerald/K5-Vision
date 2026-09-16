@@ -13,7 +13,12 @@ def test_build_gst_argv_keeps_source_in_one_shell_free_argument() -> None:
     assert argv[0] == "gst-launch-1.0"
     assert f"location={source}" in argv
     assert "protocols=tcp" in argv
+    assert "tcp-timeout=5000000" in argv
+    assert "teardown-timeout=0" in argv
     assert "decodebin" not in argv
+    assert "application/x-rtp,media=video" not in argv
+    assert "identity" in argv
+    assert "eos-after=60" in argv
     assert "fakesink" in argv
     assert argv.count("!") >= 1
 
