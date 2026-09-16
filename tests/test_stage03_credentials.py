@@ -1,4 +1,5 @@
 import os
+import sys
 
 import pytest
 
@@ -80,6 +81,29 @@ def test_probe_does_not_treat_connectivity_failure_as_authenticated(monkeypatch)
         )
         is None
     )
+
+
+def test_probe_failure_emits_only_deduplicated_sanitized_statuses(
+    monkeypatch,
+    capsys,
+) -> None:
+    statuses = iter((42, 41, 42))
+    monkeypatch.setenv("K5_STAGE03_CAM_CRED", "viewer\n\nfirst\n\nsecond!\n\nthird")
+    monkeypatch.setattr(sys, "argv", ["stage03_credential_probe", "rtsp://example/stream1"])
+    monkeypatch.setattr(
+        stage03_credential_probe,
+        "run_gst_uri",
+        lambda _transport, _uri: next(statuses),
+    )
+
+    assert stage03_credential_probe.main() == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "credential_probe_statuses=41,42\n"
+    assert "viewer" not in captured.err
+    assert "first" not in captured.err
+    assert "second" not in captured.err
+    assert "rtsp://" not in captured.err
 
 
 def test_wrapper_applies_selected_credential_without_logging(monkeypatch) -> None:
