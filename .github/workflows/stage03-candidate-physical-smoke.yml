@@ -59,35 +59,39 @@ jobs:
 
           $selectedSource = $null
           $selectedIndex = 0
+          $ErrorActionPreference = "Continue"
           for ($index = 1; $index -lt $credentialValues.Count; $index++) {
             $builder = [System.UriBuilder]::new($sourceTemplate)
             $builder.UserName = $credentialValues[0]
             $builder.Password = $credentialValues[$index]
             $candidateSource = $builder.Uri.AbsoluteUri
 
-            python tools/stage03/opencv_ffmpeg_probe.py $candidateSource *> $null
+            python tools/stage03/opencv_ffmpeg_probe.py $candidateSource 1>$null 2>$null
             if ($LASTEXITCODE -eq 0) {
               $selectedSource = $candidateSource
               $selectedIndex = $index
               break
             }
           }
+          $ErrorActionPreference = "Stop"
 
           if ([string]::IsNullOrWhiteSpace($selectedSource)) {
             throw "No configured credential candidate authenticated the physical source."
           }
           Write-Output "credential_candidate_match=$selectedIndex"
 
-          python tools/stage03/gstreamer_probe.py $selectedSource *> $null
+          $ErrorActionPreference = "Continue"
+          python tools/stage03/gstreamer_probe.py $selectedSource 1>$null 2>$null
           $gstStatus = $LASTEXITCODE
+          python tools/stage03/opencv_ffmpeg_probe.py $selectedSource 1>$null 2>$null
+          $opencvStatus = $LASTEXITCODE
+          $ErrorActionPreference = "Stop"
+
           if ($gstStatus -eq 0) {
             Write-Output "gstreamer_physical_smoke=success"
           } else {
             Write-Output "gstreamer_physical_smoke=failed code=$gstStatus"
           }
-
-          python tools/stage03/opencv_ffmpeg_probe.py $selectedSource *> $null
-          $opencvStatus = $LASTEXITCODE
           if ($opencvStatus -eq 0) {
             Write-Output "opencv_ffmpeg_physical_smoke=success"
           } else {
