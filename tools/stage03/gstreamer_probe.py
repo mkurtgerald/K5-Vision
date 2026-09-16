@@ -16,18 +16,16 @@ def main() -> int:
     if len(sys.argv) != 2 or not sys.argv[1].strip():
         return 64
 
-    executable = shutil.which("gst-launch-1.0")
+    executable = shutil.which("gst-play-1.0")
     if executable is None:
         return 69
 
-    source = sys.argv[1]
     command = [
         executable,
-        "-q",
-        "playbin",
-        f"uri={source}",
-        "video-sink=fakesink",
-        "audio-sink=fakesink",
+        "--no-interactive",
+        "--videosink=fakesink",
+        "--audiosink=fakesink",
+        sys.argv[1],
     ]
 
     try:
