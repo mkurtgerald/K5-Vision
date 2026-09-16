@@ -13,39 +13,34 @@ jobs:
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 5
     steps:
-      - name: Inspect GStreamer provenance and CLI boundary
+      - name: Inspect local GStreamer installation provenance
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          foreach ($name in @("gst-launch-1.0", "gst-play-1.0", "gst-discoverer-1.0", "gst-inspect-1.0")) {
-            $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -eq $command) {
-              Write-Output "$name=absent"
-            } else {
-              Write-Output "$name=present path=$($command.Source)"
-            }
-          }
+          $exe = (Get-Command gst-launch-1.0 -ErrorAction Stop).Source
+          $info = (Get-Item -LiteralPath $exe).VersionInfo
+          Write-Output "exe=$exe"
+          Write-Output "file_version=$($info.FileVersion)"
+          Write-Output "product_version=$($info.ProductVersion)"
+          Write-Output "company=$($info.CompanyName)"
+          Write-Output "product=$($info.ProductName)"
 
-          if (Get-Command gst-inspect-1.0 -ErrorAction SilentlyContinue) {
-            foreach ($plugin in @("rtspsrc", "rtph264depay", "h264parse")) {
-              $text = & gst-inspect-1.0 $plugin 2>$null
-              foreach ($label in @("Version", "License", "Source module", "Source release date", "Binary package", "Origin URL")) {
-                $match = $text | Select-String -Pattern "^\s*$([regex]::Escape($label))\s+" | Select-Object -First 1
-                if ($null -ne $match) {
-                  Write-Output ("plugin:{0}:{1}" -f $plugin, $match.Line.Trim())
-                }
+          $roots = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+          )
+          foreach ($root in $roots) {
+            Get-ItemProperty $root -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -like "*GStreamer*" } |
+              ForEach-Object {
+                Write-Output "registry:name=$($_.DisplayName) version=$($_.DisplayVersion) publisher=$($_.Publisher) install=$($_.InstallLocation)"
               }
-            }
           }
 
-          if (Get-Command gst-play-1.0 -ErrorAction SilentlyContinue) {
-            Write-Output "gst-play-help-begin"
-            & gst-play-1.0 --help 2>$null | Select-String -Pattern "URI|sink|interactive|volume|video|audio" | Select-Object -First 20
-            Write-Output "gst-play-help-end"
-          }
-
-          if (Get-Command gst-discoverer-1.0 -ErrorAction SilentlyContinue) {
-            Write-Output "gst-discoverer-help-begin"
-            & gst-discoverer-1.0 --help 2>$null | Select-String -Pattern "URI|timeout|TOC|verbose" | Select-Object -First 20
-            Write-Output "gst-discoverer-help-end"
-          }
+          $installRoot = Split-Path (Split-Path $exe -Parent) -Parent
+          Write-Output "install_root=$installRoot"
+          Get-ChildItem -LiteralPath $installRoot -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match "^(COPYING|LICENSE|LICENSES|NOTICE)(\.|$)" } |
+            Select-Object -First 40 -ExpandProperty FullName |
+            ForEach-Object { Write-Output "notice=$_" }
