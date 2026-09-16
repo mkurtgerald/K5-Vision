@@ -12,14 +12,14 @@ def test_parse_cam_cred_ignores_blank_lines_and_preserves_bang() -> None:
     assert passwords == ("12345", "67890!")
 
 
-def test_credentialized_uri_replaces_stale_userinfo_and_encodes_password() -> None:
+def test_credentialized_uri_replaces_stale_userinfo_and_preserves_bang() -> None:
     uri = stage03_credentials.credentialized_uri(
         "rtsp://old:wrong@192.0.2.10:554/stream1",
         "viewer",
         "12! 34",
     )
 
-    assert uri == "rtsp://viewer:12%21%2034@192.0.2.10:554/stream1"
+    assert uri == "rtsp://viewer:12!%2034@192.0.2.10:554/stream1"
     assert "old:wrong" not in uri
 
 
@@ -70,5 +70,5 @@ def test_wrapper_applies_selected_credential_without_logging(monkeypatch) -> Non
 
     assert result == 0
     assert captured["transport"] == "tcp"
-    assert captured["uri"] == "rtsp://viewer:second%21@192.0.2.10/stream1"
+    assert captured["uri"] == "rtsp://viewer:second!@192.0.2.10/stream1"
     assert os.getenv("K5_STAGE03_CREDENTIAL_INDEX") == "1"
