@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
+
+from k5vision.stage03_credentials import selected_source_uri
 
 _GST_LAUNCH = "gst-launch-1.0"
 _ALLOWED_TRANSPORTS = ("tcp", "udp")
@@ -115,17 +118,12 @@ def classify_gst_failure(stderr: str) -> int:
     return _GST_OTHER_FAILURE
 
 
-def run_candidate(transport: str, source_uri: str) -> int:
-    """Run one candidate and expose only a coarse, source-free failure status."""
+def run_gst_uri(transport: str, source_uri: str) -> int:
+    """Run GStreamer against one already-resolved URI and return only a safe status."""
     executable = shutil.which(_GST_LAUNCH)
     if executable is None:
         return 127
 
-    # On Windows, the logical command name contains a dot (gst-launch-1.0),
-    # which can prevent CreateProcess from appending .exe. Execute the exact
-    # resolved path returned by shutil.which rather than relying on extension
-    # inference. The resolved path is local runner configuration, not retained
-    # qualification evidence.
     argv = build_gst_argv(transport, source_uri)
     argv[0] = executable
 
@@ -148,6 +146,18 @@ def run_candidate(transport: str, source_uri: str) -> int:
         return 0
     stderr = (completed.stderr or b"").decode("utf-8", errors="replace")
     return classify_gst_failure(stderr)
+
+
+def run_candidate(transport: str, source_uri: str) -> int:
+    """Run one candidate using the preselected private credential when configured."""
+    cam_cred = os.getenv("K5_STAGE03_CAM_CRED")
+    credential_index = os.getenv("K5_STAGE03_CREDENTIAL_INDEX")
+    if cam_cred and credential_index is not None:
+        try:
+            source_uri = selected_source_uri(source_uri, cam_cred, int(credential_index))
+        except (TypeError, ValueError):
+            return _GST_AUTH_FAILURE
+    return run_gst_uri(transport, source_uri)
 
 
 def main() -> int:
