@@ -13,37 +13,38 @@ jobs:
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 5
     steps:
-      - name: Inventory candidate runtime executables
+      - name: Inspect available GStreamer qualification surface
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $names = @(
-            "ffmpeg",
-            "ffprobe",
-            "ffplay",
-            "vlc",
-            "cvlc",
-            "gst-launch-1.0",
-            "gst-discoverer-1.0",
-            "mpv",
-            "mediamtx"
-          )
-
-          foreach ($name in $names) {
+          $commands = @("gst-launch-1.0", "gst-inspect-1.0", "gst-discoverer-1.0", "gst-play-1.0")
+          foreach ($name in $commands) {
             $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($null -eq $command) {
               Write-Output "$name=absent"
-              continue
+            } else {
+              Write-Output "$name=present"
             }
+          }
 
-            $version = "unknown"
-            try {
-              $candidateVersion = (Get-Item -LiteralPath $command.Source -ErrorAction Stop).VersionInfo.ProductVersion
-              if (-not [string]::IsNullOrWhiteSpace($candidateVersion)) {
-                $version = $candidateVersion -replace "[\r\n]+", " "
+          if (Get-Command gst-launch-1.0 -ErrorAction SilentlyContinue) {
+            & gst-launch-1.0 --version | Select-Object -First 3
+          }
+
+          if (Get-Command gst-inspect-1.0 -ErrorAction SilentlyContinue) {
+            & gst-inspect-1.0 --version | Select-Object -First 3
+            foreach ($plugin in @("rtspsrc", "decodebin", "fakesink", "identity", "rtph264depay", "h264parse")) {
+              & gst-inspect-1.0 $plugin *> $null
+              if ($LASTEXITCODE -eq 0) {
+                Write-Output "plugin:$plugin=present"
+              } else {
+                Write-Output "plugin:$plugin=absent"
               }
-            } catch {
-              $version = "unknown"
             }
-            Write-Output "$name=present version=$version"
+            $identity = & gst-inspect-1.0 identity 2>$null
+            if ($identity -match "eos-after") {
+              Write-Output "identity:eos-after=present"
+            } else {
+              Write-Output "identity:eos-after=absent"
+            }
           }
