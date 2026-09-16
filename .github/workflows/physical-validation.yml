@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/physical-validation.yml
       - config/stage03-gstreamer-candidates.json
+      - scripts/provision-stage03-gstreamer.ps1
       - src/k5vision/stage03_gst_candidate.py
       - src/k5vision/stage03_credentials.py
       - src/k5vision/stage03_credential_probe.py
@@ -27,6 +28,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Provision isolated reviewed GStreamer runtime
+        shell: powershell
+        run: .\scripts\provision-stage03-gstreamer.ps1
 
       - name: Load versioned runtime candidate configuration
         shell: powershell
@@ -57,6 +62,11 @@ jobs:
             if ($null -eq (Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1)) {
               throw "Required Stage 03 GStreamer executable is unavailable."
             }
+          }
+
+          $versionOutput = @(& gst-launch-1.0 --version 2>$null)
+          if ($LASTEXITCODE -ne 0 -or -not ($versionOutput -join "`n").Contains("GStreamer 1.28.7")) {
+            throw "Stage 03 did not resolve the reviewed GStreamer 1.28.7 runtime."
           }
 
           foreach ($plugin in @("rtspsrc", "queue", "identity", "fakesink")) {

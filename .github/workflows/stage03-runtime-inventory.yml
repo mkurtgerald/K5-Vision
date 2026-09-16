@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/stage03-runtime-inventory.yml
+      - scripts/provision-stage03-gstreamer.ps1
 
 permissions:
   contents: read
@@ -13,8 +14,15 @@ permissions:
 jobs:
   inventory:
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Provision isolated reviewed GStreamer runtime
+        shell: powershell
+        run: .\scripts\provision-stage03-gstreamer.ps1
+
       - name: Inventory candidate executables and GStreamer metadata
         shell: powershell
         run: |
@@ -118,6 +126,7 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
           [pscustomobject]@{
+            reviewed_runtime_root = $env:K5_GSTREAMER_ROOT
             executables = $results
             gstreamer_plugins = $pluginResults
             gstreamer_packages = $registryPackages
