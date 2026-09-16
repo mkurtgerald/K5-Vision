@@ -45,11 +45,6 @@ function Assert-ExpectedRuntime {
 }
 
 if (-not (Assert-ExpectedRuntime)) {
-    $winget = Get-Command "winget" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $winget) {
-        throw "Windows Package Manager is required to integrity-verify the reviewed Stage 03 runtime installer."
-    }
-
     New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
     $downloadRoot = Join-Path $env:RUNNER_TEMP "k5-stage03-gstreamer-$Version"
     if (Test-Path -LiteralPath $downloadRoot) {
@@ -57,29 +52,30 @@ if (-not (Assert-ExpectedRuntime)) {
     }
     New-Item -ItemType Directory -Force -Path $downloadRoot | Out-Null
 
-    $packageId = "GStreamerProject.GStreamer"
     $installerName = "gstreamer-1.0-msvc-x86_64-$Version.exe"
+    $installerPath = Join-Path $downloadRoot $installerName
+    $checksumPath = "$installerPath.sha256sum"
+    $baseUri = "https://gstreamer.freedesktop.org/data/pkg/windows/$Version/msvc"
+    $installerUri = "$baseUri/$installerName"
+    $checksumUri = "$installerUri.sha256sum"
 
-    & $winget.Source download `
-        --id $packageId `
-        --exact `
-        --version $Version `
-        --architecture x64 `
-        --source winget `
-        --download-directory $downloadRoot `
-        --accept-source-agreements `
-        --disable-interactivity
-    if ($LASTEXITCODE -ne 0) {
-        throw "Windows Package Manager could not download and integrity-verify GStreamer $Version."
+    Invoke-WebRequest -Uri $checksumUri -OutFile $checksumPath -UseBasicParsing
+    Invoke-WebRequest -Uri $installerUri -OutFile $installerPath -UseBasicParsing
+
+    $checksumText = (Get-Content -LiteralPath $checksumPath -Raw).Trim()
+    if ($checksumText -notmatch '^(?<hash>[0-9A-Fa-f]{64})\s+\*?(?<name>\S+)$') {
+        throw "Official Stage 03 GStreamer checksum file had an unexpected format."
+    }
+    if ($Matches['name'] -ne $installerName) {
+        throw "Official Stage 03 GStreamer checksum did not name the expected installer."
     }
 
-    $installer = Get-ChildItem -LiteralPath $downloadRoot -Filter $installerName -File -Recurse |
-        Select-Object -First 1
-    if ($null -eq $installer) {
-        throw "Windows Package Manager did not return the reviewed Stage 03 GStreamer installer."
+    $expectedSha256 = $Matches['hash'].ToLowerInvariant()
+    $installerSha256 = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($installerSha256 -ne $expectedSha256) {
+        Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+        throw "Downloaded Stage 03 GStreamer installer failed the official upstream SHA-256 check."
     }
-
-    $installerSha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 
     $arguments = @(
         "/CURRENTUSER",
@@ -89,7 +85,7 @@ if (-not (Assert-ExpectedRuntime)) {
         "/NORESTART",
         "/SP-"
     )
-    $process = Start-Process -FilePath $installer.FullName -ArgumentList $arguments -Wait -PassThru
+    $process = Start-Process -FilePath $installerPath -ArgumentList $arguments -Wait -PassThru
     if ($process.ExitCode -ne 0) {
         throw "Isolated Stage 03 GStreamer installer failed."
     }
@@ -118,4 +114,4 @@ if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
     }
 }
 
-Write-Host "Provisioned isolated Stage 03 GStreamer runtime $Version with package-manager integrity verification."
+Write-Host "Provisioned isolated Stage 03 GStreamer runtime $Version with official upstream SHA-256 verification."
