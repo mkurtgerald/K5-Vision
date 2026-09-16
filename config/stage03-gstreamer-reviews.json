@@ -1,0 +1,24 @@
+[
+  {
+    "schema_version": "1",
+    "candidate": "gstreamer-tcp",
+    "component_version": "1.28.7",
+    "license_id": "LGPL-2.1-or-later",
+    "source_reference": "https://gstreamer.freedesktop.org/data/pkg/windows/1.28.7/msvc/gstreamer-1.0-msvc-x86_64-1.28.7.exe.sha256sum",
+    "commercial_use_approved": true,
+    "redistribution_approved": true,
+    "windows_supported": true,
+    "linux_supported": true
+  },
+  {
+    "schema_version": "1",
+    "candidate": "gstreamer-udp",
+    "component_version": "1.28.7",
+    "license_id": "LGPL-2.1-or-later",
+    "source_reference": "https://gstreamer.freedesktop.org/data/pkg/windows/1.28.7/msvc/gstreamer-1.0-msvc-x86_64-1.28.7.exe.sha256sum",
+    "commercial_use_approved": true,
+    "redistribution_approved": true,
+    "windows_supported": true,
+    "linux_supported": true
+  }
+]
