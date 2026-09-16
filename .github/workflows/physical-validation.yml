@@ -26,19 +26,67 @@ jobs:
           K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
           K5_STAGE03_CANDIDATES_JSON: ${{ secrets.K5_STAGE03_CANDIDATES_JSON }}
         run: |
+          $ErrorActionPreference = "Stop"
           $missing = @()
           if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_SOURCE)) { $missing += "K5_STAGE03_SOURCE" }
           if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_CANDIDATES_JSON)) { $missing += "K5_STAGE03_CANDIDATES_JSON" }
           if ($missing.Count -gt 0) {
             throw ("Required physical configuration is missing: " + ($missing -join ", "))
           }
+
           try {
             $candidateConfig = $env:K5_STAGE03_CANDIDATES_JSON | ConvertFrom-Json -ErrorAction Stop
           } catch {
-            throw "Required physical candidate configuration is invalid."
+            throw "Required physical candidate configuration is not valid JSON."
           }
-          if (@($candidateConfig).Count -lt 2) {
-            throw "Required physical candidate configuration is invalid."
+
+          try {
+            $candidates = @($candidateConfig)
+            if ($candidates.Count -lt 2) {
+              throw "invalid"
+            }
+
+            $allowed = @(
+              "schema_version",
+              "candidate",
+              "argv",
+              "interruption_seconds",
+              "poll_interval_seconds"
+            )
+            $seen = @{}
+
+            foreach ($candidate in $candidates) {
+              if ($null -eq $candidate -or $candidate -is [string]) { throw "invalid" }
+              $propertyNames = @($candidate.PSObject.Properties.Name)
+              if (@($propertyNames | Where-Object { $_ -notin $allowed }).Count -gt 0) { throw "invalid" }
+              if ($propertyNames -notcontains "candidate" -or $propertyNames -notcontains "argv") { throw "invalid" }
+              if ($propertyNames -contains "schema_version" -and [string]$candidate.schema_version -ne "1") { throw "invalid" }
+
+              $candidateName = [string]$candidate.candidate
+              if ([string]::IsNullOrWhiteSpace($candidateName) -or $candidateName.Length -gt 128) { throw "invalid" }
+              if ($seen.ContainsKey($candidateName)) { throw "invalid" }
+              $seen[$candidateName] = $true
+
+              if ($candidate.argv -isnot [System.Array]) { throw "invalid" }
+              $argv = @($candidate.argv)
+              if ($argv.Count -lt 1 -or $argv.Count -gt 64) { throw "invalid" }
+              foreach ($arg in $argv) {
+                if ($arg -isnot [string] -or [string]::IsNullOrWhiteSpace($arg)) { throw "invalid" }
+              }
+              if (@($argv | Where-Object { $_ -eq "{source}" }).Count -ne 1) { throw "invalid" }
+              if ($argv[0] -eq "{source}") { throw "invalid" }
+
+              if ($propertyNames -contains "interruption_seconds") {
+                $interruption = [double]$candidate.interruption_seconds
+                if ($interruption -le 0 -or $interruption -gt 30) { throw "invalid" }
+              }
+              if ($propertyNames -contains "poll_interval_seconds") {
+                $poll = [double]$candidate.poll_interval_seconds
+                if ($poll -le 0 -or $poll -gt 1) { throw "invalid" }
+              }
+            }
+          } catch {
+            throw "Required physical candidate configuration failed schema validation."
           }
 
       - name: Set up Python
