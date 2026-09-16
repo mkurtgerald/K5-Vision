@@ -127,6 +127,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
           [pscustomobject]@{
             reviewed_runtime_root = $env:K5_GSTREAMER_ROOT
+            reviewed_installer_sha256 = $env:K5_GSTREAMER_INSTALLER_SHA256
             executables = $results
             gstreamer_plugins = $pluginResults
             gstreamer_packages = $registryPackages

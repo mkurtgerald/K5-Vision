@@ -18,6 +18,8 @@ $installRoot = Join-Path $installBase "k5-gstreamer\$Version\msvc_x86_64"
 $binPath = Join-Path $installRoot "bin"
 $gstLaunch = Join-Path $binPath "gst-launch-1.0.exe"
 $gstInspect = Join-Path $binPath "gst-inspect-1.0.exe"
+$hashRecord = Join-Path $installRoot "k5-installer.sha256"
+$installerSha256 = $null
 
 function Assert-ExpectedRuntime {
     if (-not (Test-Path -LiteralPath $gstLaunch) -or -not (Test-Path -LiteralPath $gstInspect)) {
@@ -43,21 +45,41 @@ function Assert-ExpectedRuntime {
 }
 
 if (-not (Assert-ExpectedRuntime)) {
+    $winget = Get-Command "winget" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $winget) {
+        throw "Windows Package Manager is required to integrity-verify the reviewed Stage 03 runtime installer."
+    }
+
     New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
+    $downloadRoot = Join-Path $env:RUNNER_TEMP "k5-stage03-gstreamer-$Version"
+    if (Test-Path -LiteralPath $downloadRoot) {
+        Remove-Item -LiteralPath $downloadRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $downloadRoot | Out-Null
 
+    $packageId = "GStreamerProject.GStreamer"
     $installerName = "gstreamer-1.0-msvc-x86_64-$Version.exe"
-    $installerPath = Join-Path $env:RUNNER_TEMP $installerName
-    $downloadUri = "https://gstreamer.freedesktop.org/data/pkg/windows/$Version/msvc/$installerName"
 
-    if (-not (Test-Path -LiteralPath $installerPath)) {
-        Invoke-WebRequest -Uri $downloadUri -OutFile $installerPath -UseBasicParsing
+    & $winget.Source download `
+        --id $packageId `
+        --exact `
+        --version $Version `
+        --architecture x64 `
+        --source winget `
+        --download-directory $downloadRoot `
+        --accept-source-agreements `
+        --disable-interactivity
+    if ($LASTEXITCODE -ne 0) {
+        throw "Windows Package Manager could not download and integrity-verify GStreamer $Version."
     }
 
-    $signature = Get-AuthenticodeSignature -LiteralPath $installerPath
-    if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-        Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
-        throw "Downloaded Stage 03 GStreamer installer did not have a valid Authenticode signature."
+    $installer = Get-ChildItem -LiteralPath $downloadRoot -Filter $installerName -File -Recurse |
+        Select-Object -First 1
+    if ($null -eq $installer) {
+        throw "Windows Package Manager did not return the reviewed Stage 03 GStreamer installer."
     }
+
+    $installerSha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 
     $arguments = @(
         "/CURRENTUSER",
@@ -67,13 +89,20 @@ if (-not (Assert-ExpectedRuntime)) {
         "/NORESTART",
         "/SP-"
     )
-    $process = Start-Process -FilePath $installerPath -ArgumentList $arguments -Wait -PassThru
+    $process = Start-Process -FilePath $installer.FullName -ArgumentList $arguments -Wait -PassThru
     if ($process.ExitCode -ne 0) {
         throw "Isolated Stage 03 GStreamer installer failed."
     }
 
     if (-not (Assert-ExpectedRuntime)) {
         throw "Isolated Stage 03 GStreamer runtime failed post-install verification."
+    }
+
+    Set-Content -LiteralPath $hashRecord -Value $installerSha256 -Encoding Ascii -NoNewline
+} elseif (Test-Path -LiteralPath $hashRecord) {
+    $recordedHash = (Get-Content -LiteralPath $hashRecord -Raw).Trim().ToLowerInvariant()
+    if ($recordedHash -match '^[0-9a-f]{64}$') {
+        $installerSha256 = $recordedHash
     }
 }
 
@@ -84,6 +113,9 @@ if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_PATH)) {
 if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
     Add-Content -LiteralPath $env:GITHUB_ENV -Value "K5_GSTREAMER_ROOT=$installRoot"
     Add-Content -LiteralPath $env:GITHUB_ENV -Value "GST_REGISTRY_1_0=$registryPath"
+    if (-not [string]::IsNullOrWhiteSpace([string]$installerSha256)) {
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "K5_GSTREAMER_INSTALLER_SHA256=$installerSha256"
+    }
 }
 
-Write-Host "Provisioned isolated Stage 03 GStreamer runtime $Version."
+Write-Host "Provisioned isolated Stage 03 GStreamer runtime $Version with package-manager integrity verification."
