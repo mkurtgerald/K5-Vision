@@ -30,7 +30,14 @@ def test_stage03_physical_capture() -> None:
         if value.strip()
     )
 
-    specs = [ProcessCandidateSpec.model_validate(item) for item in json.loads(raw_specs)]
+    try:
+        decoded_specs = json.loads(raw_specs)
+        if not isinstance(decoded_specs, list):
+            raise ValueError("candidate configuration must be a list")
+        specs = [ProcessCandidateSpec.model_validate(item) for item in decoded_specs]
+    except (TypeError, ValueError):
+        pytest.fail("Physical candidate configuration is invalid", pytrace=False)
+
     capture = asyncio.run(
         capture_candidate_set(
             specs,
