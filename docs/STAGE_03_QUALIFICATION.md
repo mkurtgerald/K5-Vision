@@ -46,7 +46,11 @@ The final selection record is derived only after eligible comparative evidence e
 
 `Stage03Capture` retains the exact qualification plan plus comparative qualification and resource measurements. It never retains the configured source value. This capture is intentionally incomplete for final selection: candidate review records and the safe host/input fingerprints still must be assembled into `Stage03Evidence` before a selection can exist.
 
-The opt-in integration harness reads the source and command specifications only from local environment variables. Candidate command specifications are JSON objects containing a stable candidate identifier and an argv array with exactly one literal `{source}` element. Commands are executed directly with `shell=False`; source data is substituted as one argument and candidate stdout/stderr are not retained. `K5_STAGE03_OUTPUT` is required when the physical harness is enabled so the measured, source-free capture is written to a local evidence file rather than existing only in terminal output.
+The opt-in integration harness reads the source and command specifications only from local environment variables. `K5_STAGE03_SOURCE` is the sensitive validation source. `K5_STAGE03_CANDIDATES_JSON` is different: it describes the external runtime processes being compared and must not be populated with camera usernames, passwords, RTSP credentials, or source URIs.
+
+Candidate command specifications are a JSON array with at least two objects. Each object contains a stable `candidate` identifier and an `argv` array with exactly one literal `{source}` element. Optional `schema_version`, `interruption_seconds`, and `poll_interval_seconds` fields are bounded by the project-owned schema. Commands are executed directly with `shell=False`; source data is substituted as one argument and candidate stdout/stderr are not retained. The workflow validates this structure before dependency setup so malformed local configuration fails cheaply without touching the physical source.
+
+`K5_STAGE03_OUTPUT` is required when the physical harness is enabled so the measured, source-free capture is written to a local evidence file rather than existing only in terminal output.
 
 ## Gate status
 
