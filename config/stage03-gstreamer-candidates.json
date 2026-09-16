@@ -1,0 +1,30 @@
+[
+  {
+    "schema_version": "1",
+    "candidate": "gstreamer-tcp",
+    "argv": [
+      "python",
+      "-m",
+      "k5vision.stage03_gst_candidate",
+      "--transport",
+      "tcp",
+      "{source}"
+    ],
+    "interruption_seconds": 0.5,
+    "poll_interval_seconds": 0.05
+  },
+  {
+    "schema_version": "1",
+    "candidate": "gstreamer-udp",
+    "argv": [
+      "python",
+      "-m",
+      "k5vision.stage03_gst_candidate",
+      "--transport",
+      "udp",
+      "{source}"
+    ],
+    "interruption_seconds": 0.5,
+    "poll_interval_seconds": 0.05
+  }
+]
