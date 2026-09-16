@@ -39,13 +39,21 @@ jobs:
           }
 
           python tools/stage03/gstreamer_probe.py $env:K5_STAGE03_SOURCE
-          if ($LASTEXITCODE -ne 0) {
-            throw "GStreamer physical candidate smoke failed."
+          $gstStatus = $LASTEXITCODE
+          if ($gstStatus -eq 0) {
+            Write-Output "gstreamer_physical_smoke=success"
+          } else {
+            Write-Output "gstreamer_physical_smoke=failed code=$gstStatus"
           }
-          Write-Output "gstreamer_physical_smoke=success"
 
           python tools/stage03/opencv_ffmpeg_probe.py $env:K5_STAGE03_SOURCE
-          if ($LASTEXITCODE -ne 0) {
-            throw "OpenCV/FFmpeg physical candidate smoke failed."
+          $opencvStatus = $LASTEXITCODE
+          if ($opencvStatus -eq 0) {
+            Write-Output "opencv_ffmpeg_physical_smoke=success"
+          } else {
+            Write-Output "opencv_ffmpeg_physical_smoke=failed code=$opencvStatus"
           }
-          Write-Output "opencv_ffmpeg_physical_smoke=success"
+
+          if ($gstStatus -ne 0 -or $opencvStatus -ne 0) {
+            throw "One or more Stage 03 physical candidate smokes failed."
+          }
