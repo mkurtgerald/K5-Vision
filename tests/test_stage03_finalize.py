@@ -144,12 +144,16 @@ def test_build_context_rejects_invalid_private_or_runtime_inputs(
 
     monkeypatch.setattr(stage03_finalize.platform, "system", lambda: "Darwin")
     with pytest.raises(ValueError, match="Windows or Linux"):
-        stage03_finalize.build_context(**common, source_uri="rtsp://camera", secret_material="secret")
+        stage03_finalize.build_context(
+            **common, source_uri="rtsp://camera", secret_material="secret"
+        )
 
     monkeypatch.setattr(stage03_finalize.platform, "system", lambda: "Windows")
     monkeypatch.setattr(stage03_finalize.platform, "machine", lambda: "")
     with pytest.raises(ValueError, match="architecture"):
-        stage03_finalize.build_context(**common, source_uri="rtsp://camera", secret_material="secret")
+        stage03_finalize.build_context(
+            **common, source_uri="rtsp://camera", secret_material="secret"
+        )
 
 
 def test_finalize_writes_complete_source_free_selection(
