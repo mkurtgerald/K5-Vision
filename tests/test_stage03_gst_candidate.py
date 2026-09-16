@@ -24,7 +24,7 @@ def test_build_gst_argv_rejects_invalid_transport_and_empty_source() -> None:
         stage03_gst_candidate.build_gst_argv("tcp", " ")
 
 
-def test_run_candidate_suppresses_child_output_and_never_uses_shell(monkeypatch) -> None:
+def test_run_candidate_captures_child_error_privately_and_never_uses_shell(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(stage03_gst_candidate.shutil, "which", lambda _: "gst-launch-1.0")
@@ -32,14 +32,15 @@ def test_run_candidate_suppresses_child_output_and_never_uses_shell(monkeypatch)
     def fake_run(argv, **kwargs):
         captured["argv"] = argv
         captured.update(kwargs)
-        return subprocess.CompletedProcess(argv, 0)
+        return subprocess.CompletedProcess(argv, 0, stdout=None, stderr="")
 
     monkeypatch.setattr(stage03_gst_candidate.subprocess, "run", fake_run)
 
     assert stage03_gst_candidate.run_candidate("udp", "rtsp://example/live") == 0
     assert captured["shell"] is False
     assert captured["stdout"] is subprocess.DEVNULL
-    assert captured["stderr"] is subprocess.DEVNULL
+    assert captured["stderr"] is subprocess.PIPE
+    assert captured["text"] is True
     assert "protocols=udp" in captured["argv"]
 
 
@@ -47,3 +48,38 @@ def test_run_candidate_returns_sanitized_missing_runtime_status(monkeypatch) -> 
     monkeypatch.setattr(stage03_gst_candidate.shutil, "which", lambda _: None)
 
     assert stage03_gst_candidate.run_candidate("tcp", "rtsp://user:secret@example/live") == 127
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        ("RTSP error: 401 Unauthorized for rtsp://user:secret@example/live", 41),
+        ("failed to connect: connection refused", 42),
+        ("streaming stopped, reason not-negotiated", 43),
+        ("RTSP error: 404 Not Found", 44),
+        ("WARNING: erroneous pipeline: no property foo", 45),
+        ("opaque GStreamer failure rtsp://user:secret@example/live", 46),
+    ],
+)
+def test_classify_gst_failure_returns_only_coarse_status(stderr: str, expected: int) -> None:
+    assert stage03_gst_candidate.classify_gst_failure(stderr) == expected
+
+
+def test_run_candidate_never_returns_raw_diagnostic_content(monkeypatch) -> None:
+    source = "rtsp://user:secret@example/live"
+    monkeypatch.setattr(stage03_gst_candidate.shutil, "which", lambda _: "gst-launch-1.0")
+    monkeypatch.setattr(
+        stage03_gst_candidate.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv,
+            1,
+            stdout=None,
+            stderr=f"401 Unauthorized while opening {source}",
+        ),
+    )
+
+    result = stage03_gst_candidate.run_candidate("tcp", source)
+
+    assert result == 41
+    assert isinstance(result, int)
