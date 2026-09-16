@@ -19,7 +19,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $names = @("ffmpeg", "ffprobe", "gst-launch-1.0", "vlc", "mpv")
+          $names = @("ffmpeg", "ffprobe", "gst-launch-1.0", "gst-inspect-1.0", "vlc", "mpv")
           $results = @()
 
           foreach ($name in $names) {
@@ -41,6 +41,16 @@ jobs:
                 $version = $null
               }
             }
+            if ([string]::IsNullOrWhiteSpace([string]$version) -and $name -eq "gst-launch-1.0") {
+              try {
+                $versionLine = & $command.Source --version 2>$null | Select-Object -First 1
+                if (-not [string]::IsNullOrWhiteSpace([string]$versionLine)) {
+                  $version = [string]$versionLine
+                }
+              } catch {
+                $version = $null
+              }
+            }
 
             $results += [pscustomobject]@{
               candidate = $name
@@ -49,14 +59,37 @@ jobs:
             }
           }
 
-          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          $results | ConvertTo-Json -Depth 3 | Set-Content -Path artifacts/stage03-runtime-inventory.json -Encoding UTF8
+          $pluginResults = @()
+          $gstInspect = Get-Command "gst-inspect-1.0" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $pluginNames = @("rtspsrc", "queue", "decodebin", "fakesink", "rtph264depay", "rtph265depay", "h264parse", "h265parse")
+          foreach ($pluginName in $pluginNames) {
+            $present = $false
+            if ($null -ne $gstInspect) {
+              & $gstInspect.Source $pluginName *> $null
+              $present = ($LASTEXITCODE -eq 0)
+            }
+            $pluginResults += [pscustomobject]@{
+              plugin = $pluginName
+              present = $present
+            }
+          }
 
-          $present = @($results | Where-Object { $_.present } | ForEach-Object { $_.candidate })
-          if ($present.Count -eq 0) {
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          [pscustomobject]@{
+            executables = $results
+            gstreamer_plugins = $pluginResults
+          } | ConvertTo-Json -Depth 4 | Set-Content -Path artifacts/stage03-runtime-inventory.json -Encoding UTF8
+
+          $presentExecutables = @($results | Where-Object { $_.present } | ForEach-Object { $_.candidate })
+          if ($presentExecutables.Count -eq 0) {
             Write-Host "No known Stage 03 runtime executables were detected on the physical runner."
           } else {
-            Write-Host ("Detected Stage 03 runtime executable names: " + ($present -join ", "))
+            Write-Host ("Detected Stage 03 runtime executable names: " + ($presentExecutables -join ", "))
+          }
+
+          $presentPlugins = @($pluginResults | Where-Object { $_.present } | ForEach-Object { $_.plugin })
+          if ($presentPlugins.Count -gt 0) {
+            Write-Host ("Detected GStreamer plugin names: " + ($presentPlugins -join ", "))
           }
 
       - name: Upload sanitized runtime inventory
