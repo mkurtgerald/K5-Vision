@@ -32,7 +32,7 @@ jobs:
               foreach ($label in @("Version", "License", "Source module", "Source release date", "Binary package", "Origin URL")) {
                 $match = $text | Select-String -Pattern "^\s*$([regex]::Escape($label))\s+" | Select-Object -First 1
                 if ($null -ne $match) {
-                  Write-Output "plugin:$plugin:$($match.Line.Trim())"
+                  Write-Output ("plugin:{0}:{1}" -f $plugin, $match.Line.Trim())
                 }
               }
             }
