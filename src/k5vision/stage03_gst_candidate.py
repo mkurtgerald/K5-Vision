@@ -62,7 +62,9 @@ def classify_gst_failure(stderr: str) -> int:
         marker in normalized
         for marker in (
             "401",
+            "403",
             "unauthorized",
+            "forbidden",
             "not authorized",
             "authentication",
             "authentication required",
@@ -87,6 +89,11 @@ def classify_gst_failure(stderr: str) -> int:
         for marker in (
             "not-negotiated",
             "not negotiated",
+            "not-linked",
+            "not linked",
+            "failed delayed linking",
+            "internal data stream error",
+            "streaming stopped",
             "missing plugin",
             "no suitable plugins",
             "no decoder",
