@@ -26,14 +26,18 @@ _GST_WRAPPER_INTERNAL_FAILURE = 48
 
 
 def build_gst_argv(transport: str, source_uri: str) -> list[str]:
-    """Build one bounded RTP receive path without invoking a command shell."""
+    """Build one bounded raw-RTP receive path without invoking a command shell."""
     if transport not in _ALLOWED_TRANSPORTS:
         raise ValueError("unsupported transport candidate")
     if not source_uri.strip():
         raise ValueError("source_uri must not be empty")
 
-    # Stage 03 qualifies the transport/runtime boundary. Keep this path codec
-    # agnostic so decoder availability cannot masquerade as a transport result.
+    # Stage 03 qualifies the RTSP/RTP transport/runtime boundary, not decode.
+    # Avoid media-specific dynamic-pad selection here: cameras may advertise
+    # video, audio, and metadata RTP streams, and unselected pads can otherwise
+    # masquerade as transport failures. The identity element produces EOS after
+    # a finite number of received RTP buffers so every successful measurement
+    # terminates deterministically without retaining media.
     return [
         _GST_LAUNCH,
         "-q",
@@ -41,16 +45,16 @@ def build_gst_argv(transport: str, source_uri: str) -> list[str]:
         f"location={source_uri}",
         f"protocols={transport}",
         "latency=100",
-        "name=src",
-        "src.",
-        "!",
-        "application/x-rtp,media=video",
+        "tcp-timeout=5000000",
+        "teardown-timeout=0",
         "!",
         "queue",
         "!",
+        "identity",
+        "eos-after=60",
+        "!",
         "fakesink",
         "sync=false",
-        "num-buffers=60",
     ]
 
 
