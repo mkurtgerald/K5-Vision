@@ -117,11 +117,21 @@ def classify_gst_failure(stderr: str) -> int:
 
 def run_candidate(transport: str, source_uri: str) -> int:
     """Run one candidate and expose only a coarse, source-free failure status."""
-    if shutil.which(_GST_LAUNCH) is None:
+    executable = shutil.which(_GST_LAUNCH)
+    if executable is None:
         return 127
+
+    # On Windows, the logical command name contains a dot (gst-launch-1.0),
+    # which can prevent CreateProcess from appending .exe. Execute the exact
+    # resolved path returned by shutil.which rather than relying on extension
+    # inference. The resolved path is local runner configuration, not retained
+    # qualification evidence.
+    argv = build_gst_argv(transport, source_uri)
+    argv[0] = executable
+
     try:
         completed = subprocess.run(
-            build_gst_argv(transport, source_uri),
+            argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,

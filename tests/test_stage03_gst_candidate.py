@@ -28,8 +28,9 @@ def test_build_gst_argv_rejects_invalid_transport_and_empty_source() -> None:
 
 def test_run_candidate_captures_child_error_privately_and_never_uses_shell(monkeypatch) -> None:
     captured: dict[str, object] = {}
+    resolved = r"C:\\GStreamer\\bin\\gst-launch-1.0.exe"
 
-    monkeypatch.setattr(stage03_gst_candidate.shutil, "which", lambda _: "gst-launch-1.0")
+    monkeypatch.setattr(stage03_gst_candidate.shutil, "which", lambda _: resolved)
 
     def fake_run(argv, **kwargs):
         captured["argv"] = argv
@@ -42,6 +43,7 @@ def test_run_candidate_captures_child_error_privately_and_never_uses_shell(monke
     assert captured["shell"] is False
     assert captured["stdout"] is subprocess.DEVNULL
     assert captured["stderr"] is subprocess.PIPE
+    assert captured["argv"][0] == resolved
     assert "protocols=udp" in captured["argv"]
 
 
@@ -68,7 +70,11 @@ def test_classify_gst_failure_returns_only_coarse_status(stderr: str, expected: 
 
 def test_run_candidate_never_returns_raw_diagnostic_content(monkeypatch) -> None:
     source = "rtsp://user:secret@example/live"
-    monkeypatch.setattr(stage03_gst_candidate.shutil, "which", lambda _: "gst-launch-1.0")
+    monkeypatch.setattr(
+        stage03_gst_candidate.shutil,
+        "which",
+        lambda _: r"C:\\GStreamer\\bin\\gst-launch-1.0.exe",
+    )
     monkeypatch.setattr(
         stage03_gst_candidate.subprocess,
         "run",
@@ -87,7 +93,11 @@ def test_run_candidate_never_returns_raw_diagnostic_content(monkeypatch) -> None
 
 
 def test_run_candidate_maps_wrapper_failures_without_exception_text(monkeypatch) -> None:
-    monkeypatch.setattr(stage03_gst_candidate.shutil, "which", lambda _: "gst-launch-1.0")
+    monkeypatch.setattr(
+        stage03_gst_candidate.shutil,
+        "which",
+        lambda _: r"C:\\GStreamer\\bin\\gst-launch-1.0.exe",
+    )
     monkeypatch.setattr(
         stage03_gst_candidate.subprocess,
         "run",
