@@ -11,36 +11,73 @@ permissions:
 jobs:
   inventory:
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - name: Inspect local GStreamer installation provenance
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Smoke candidate runtimes without camera access
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = (Get-Command gst-launch-1.0 -ErrorAction Stop).Source
-          $info = (Get-Item -LiteralPath $exe).VersionInfo
-          Write-Output "exe=$exe"
-          Write-Output "file_version=$($info.FileVersion)"
-          Write-Output "product_version=$($info.ProductVersion)"
-          Write-Output "company=$($info.CompanyName)"
-          Write-Output "product=$($info.ProductName)"
-
-          $roots = @(
-            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
-            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
-          )
-          foreach ($root in $roots) {
-            Get-ItemProperty $root -ErrorAction SilentlyContinue |
-              Where-Object { $_.DisplayName -like "*GStreamer*" } |
-              ForEach-Object {
-                Write-Output "registry:name=$($_.DisplayName) version=$($_.DisplayVersion) publisher=$($_.Publisher) install=$($_.InstallLocation)"
-              }
+          foreach ($plugin in @("videotestsrc", "avimux", "uridecodebin", "videoconvert", "identity", "fakesink", "avdec_h264")) {
+            & gst-inspect-1.0 $plugin *> $null
+            if ($LASTEXITCODE -eq 0) {
+              Write-Output "plugin:$plugin=present"
+            } else {
+              Write-Output "plugin:$plugin=absent"
+            }
           }
 
-          $installRoot = Split-Path (Split-Path $exe -Parent) -Parent
-          Write-Output "install_root=$installRoot"
-          Get-ChildItem -LiteralPath $installRoot -File -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match "^(COPYING|LICENSE|LICENSES|NOTICE)(\.|$)" } |
-            Select-Object -First 40 -ExpandProperty FullName |
-            ForEach-Object { Write-Output "notice=$_" }
+          $avdec = & gst-inspect-1.0 avdec_h264 2>$null
+          foreach ($label in @("Version", "License", "Source module", "Binary package", "Origin URL")) {
+            $match = $avdec | Select-String -Pattern "^\s*$([regex]::Escape($label))\s+" | Select-Object -First 1
+            if ($null -ne $match) {
+              Write-Output ("plugin:avdec_h264:{0}" -f $match.Line.Trim())
+            }
+          }
+
+          $sample = Join-Path $env:RUNNER_TEMP "k5-stage03-local.avi"
+          Remove-Item -LiteralPath $sample -Force -ErrorAction SilentlyContinue
+          & gst-launch-1.0 -q videotestsrc num-buffers=120 ! "video/x-raw,width=320,height=240,framerate=30/1" ! avimux ! filesink "location=$sample"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $sample)) {
+            throw "Failed to create local source-free candidate smoke input."
+          }
+
+          $uri = ([System.Uri]$sample).AbsoluteUri
+          & gst-launch-1.0 -q uridecodebin "uri=$uri" ! videoconvert ! identity eos-after=60 ! fakesink sync=false
+          if ($LASTEXITCODE -ne 0) {
+            throw "GStreamer bounded decode smoke failed."
+          }
+          Write-Output "gstreamer_bounded_decode=success"
+
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: "opencv-python-headless==4.14.0.94"
+          @'
+          import cv2
+          import os
+          import sys
+
+          path = os.environ["K5_STAGE03_LOCAL_SAMPLE"]
+          cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
+          if not cap.isOpened():
+              raise SystemExit(21)
+          frames = 0
+          while frames < 60:
+              ok, frame = cap.read()
+              if not ok or frame is None:
+                  cap.release()
+                  raise SystemExit(22)
+              frames += 1
+          cap.release()
+          print(f"opencv_ffmpeg_bounded_decode=success frames={frames}")
+          '@ | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP "k5_stage03_opencv_smoke.py") -Encoding UTF8
+          $env:K5_STAGE03_LOCAL_SAMPLE = $sample
+          python (Join-Path $env:RUNNER_TEMP "k5_stage03_opencv_smoke.py")
+          if ($LASTEXITCODE -ne 0) {
+            throw "OpenCV/FFmpeg bounded decode smoke failed."
+          }
+
+          Remove-Item -LiteralPath $sample -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP "k5_stage03_opencv_smoke.py") -Force -ErrorAction SilentlyContinue
