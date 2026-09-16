@@ -22,7 +22,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          foreach ($plugin in @("videotestsrc", "avimux", "uridecodebin", "videoconvert", "identity", "fakesink", "avdec_h264")) {
+          foreach ($plugin in @("videotestsrc", "jpegenc", "avimux", "uridecodebin", "videoconvert", "identity", "fakesink", "avdec_h264")) {
             & gst-inspect-1.0 $plugin *> $null
             if ($LASTEXITCODE -eq 0) {
               Write-Output "plugin:$plugin=present"
@@ -41,10 +41,11 @@ jobs:
 
           $sample = Join-Path $env:RUNNER_TEMP "k5-stage03-local.avi"
           Remove-Item -LiteralPath $sample -Force -ErrorAction SilentlyContinue
-          & gst-launch-1.0 -q videotestsrc num-buffers=120 ! "video/x-raw,width=320,height=240,framerate=30/1" ! avimux ! filesink "location=$sample"
+          & gst-launch-1.0 -q videotestsrc num-buffers=120 ! "video/x-raw,width=320,height=240,framerate=30/1" ! jpegenc ! avimux ! filesink "location=$sample"
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $sample)) {
             throw "Failed to create local source-free candidate smoke input."
           }
+          Write-Output "local_mjpeg_source=success"
 
           $uri = ([System.Uri]$sample).AbsoluteUri
           & gst-launch-1.0 -q uridecodebin "uri=$uri" ! videoconvert ! identity eos-after=60 ! fakesink sync=false
@@ -57,7 +58,6 @@ jobs:
           @'
           import cv2
           import os
-          import sys
 
           path = os.environ["K5_STAGE03_LOCAL_SAMPLE"]
           cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
