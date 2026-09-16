@@ -20,11 +20,48 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Load versioned runtime candidate configuration
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = Join-Path $env:GITHUB_WORKSPACE "config\stage03-gstreamer-candidates.json"
+          if (-not (Test-Path -LiteralPath $path)) {
+            throw "Versioned Stage 03 runtime candidate configuration is missing."
+          }
+
+          $raw = Get-Content -LiteralPath $path -Raw
+          try {
+            $null = $raw | ConvertFrom-Json -ErrorAction Stop
+          } catch {
+            throw "Versioned Stage 03 runtime candidate configuration is not valid JSON."
+          }
+
+          $delimiter = "K5_STAGE03_CANDIDATES_$([guid]::NewGuid().ToString('N'))"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "K5_STAGE03_CANDIDATES_JSON<<$delimiter"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value $raw
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value $delimiter
+
+      - name: Verify GStreamer runtime boundary
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($name in @("gst-launch-1.0", "gst-inspect-1.0")) {
+            if ($null -eq (Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+              throw "Required Stage 03 GStreamer executable is unavailable."
+            }
+          }
+
+          foreach ($plugin in @("rtspsrc", "queue", "decodebin", "fakesink")) {
+            & gst-inspect-1.0 $plugin *> $null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Required Stage 03 GStreamer plugin is unavailable."
+            }
+          }
+
       - name: Verify physical configuration
         shell: powershell
         env:
           K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
-          K5_STAGE03_CANDIDATES_JSON: ${{ secrets.K5_STAGE03_CANDIDATES_JSON }}
         run: |
           $ErrorActionPreference = "Stop"
           $missing = @()
@@ -105,7 +142,6 @@ jobs:
         shell: powershell
         env:
           K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
-          K5_STAGE03_CANDIDATES_JSON: ${{ secrets.K5_STAGE03_CANDIDATES_JSON }}
         run: pytest tests/integration/test_stage03_physical.py -q --no-cov
 
       - name: Upload retained qualification evidence
