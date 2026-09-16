@@ -31,14 +31,54 @@ jobs:
       - name: Exercise physical source without media retention
         shell: powershell
         env:
+          CAM_CRED: ${{ secrets.CAM_CRED }}
           K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
         run: |
           $ErrorActionPreference = "Stop"
           if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_SOURCE)) {
             throw "Physical source is not configured."
           }
+          if ([string]::IsNullOrWhiteSpace($env:CAM_CRED)) {
+            throw "Physical credential candidates are not configured."
+          }
 
-          python tools/stage03/gstreamer_probe.py $env:K5_STAGE03_SOURCE
+          $credentialValues = @(
+            $env:CAM_CRED -split "\r?\n" |
+              ForEach-Object { $_.Trim() } |
+              Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+          )
+          if ($credentialValues.Count -lt 2) {
+            throw "Physical credential candidate structure is invalid."
+          }
+
+          try {
+            $sourceTemplate = [System.Uri]$env:K5_STAGE03_SOURCE
+          } catch {
+            throw "Physical source configuration is not a valid URI."
+          }
+
+          $selectedSource = $null
+          $selectedIndex = 0
+          for ($index = 1; $index -lt $credentialValues.Count; $index++) {
+            $builder = [System.UriBuilder]::new($sourceTemplate)
+            $builder.UserName = $credentialValues[0]
+            $builder.Password = $credentialValues[$index]
+            $candidateSource = $builder.Uri.AbsoluteUri
+
+            python tools/stage03/opencv_ffmpeg_probe.py $candidateSource *> $null
+            if ($LASTEXITCODE -eq 0) {
+              $selectedSource = $candidateSource
+              $selectedIndex = $index
+              break
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($selectedSource)) {
+            throw "No configured credential candidate authenticated the physical source."
+          }
+          Write-Output "credential_candidate_match=$selectedIndex"
+
+          python tools/stage03/gstreamer_probe.py $selectedSource *> $null
           $gstStatus = $LASTEXITCODE
           if ($gstStatus -eq 0) {
             Write-Output "gstreamer_physical_smoke=success"
@@ -46,7 +86,7 @@ jobs:
             Write-Output "gstreamer_physical_smoke=failed code=$gstStatus"
           }
 
-          python tools/stage03/opencv_ffmpeg_probe.py $env:K5_STAGE03_SOURCE
+          python tools/stage03/opencv_ffmpeg_probe.py $selectedSource *> $null
           $opencvStatus = $LASTEXITCODE
           if ($opencvStatus -eq 0) {
             Write-Output "opencv_ffmpeg_physical_smoke=success"
