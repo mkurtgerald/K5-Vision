@@ -51,7 +51,9 @@ def test_probe_returns_only_working_index(monkeypatch) -> None:
     assert all("old:stale" not in uri for uri in seen)
 
 
-def test_probe_accepts_authenticated_session_with_downstream_negotiation_failure(monkeypatch) -> None:
+def test_probe_accepts_authenticated_session_with_downstream_negotiation_failure(
+    monkeypatch,
+) -> None:
     statuses = iter((41, 43))
     monkeypatch.setattr(
         stage03_credential_probe,
