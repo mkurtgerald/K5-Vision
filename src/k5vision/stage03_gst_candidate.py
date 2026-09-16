@@ -9,6 +9,16 @@ import subprocess
 _GST_LAUNCH = "gst-launch-1.0"
 _ALLOWED_TRANSPORTS = ("tcp", "udp")
 
+# Exit statuses intentionally expose only a coarse failure class to the outer
+# qualification harness. Raw GStreamer stderr may contain a sensitive RTSP URI
+# and is therefore never emitted or retained.
+_GST_AUTH_FAILURE = 41
+_GST_CONNECT_FAILURE = 42
+_GST_NEGOTIATION_FAILURE = 43
+_GST_SOURCE_FAILURE = 44
+_GST_PIPELINE_FAILURE = 45
+_GST_OTHER_FAILURE = 46
+
 
 def build_gst_argv(transport: str, source_uri: str) -> list[str]:
     """Build one bounded GStreamer receive/decode pipeline without invoking a shell."""
@@ -39,19 +49,88 @@ def build_gst_argv(transport: str, source_uri: str) -> list[str]:
     ]
 
 
+def classify_gst_failure(stderr: str) -> int:
+    """Map raw GStreamer diagnostics to a bounded secret-safe exit status."""
+    normalized = stderr.casefold()
+
+    if any(
+        marker in normalized
+        for marker in (
+            "401",
+            "unauthorized",
+            "not authorized",
+            "authentication",
+            "authentication required",
+        )
+    ):
+        return _GST_AUTH_FAILURE
+    if any(
+        marker in normalized
+        for marker in (
+            "could not connect",
+            "connection refused",
+            "connection timed out",
+            "timed out",
+            "network is unreachable",
+            "no route to host",
+            "failed to connect",
+        )
+    ):
+        return _GST_CONNECT_FAILURE
+    if any(
+        marker in normalized
+        for marker in (
+            "not-negotiated",
+            "not negotiated",
+            "missing plugin",
+            "no suitable plugins",
+            "no decoder",
+            "could not link",
+            "caps",
+        )
+    ):
+        return _GST_NEGOTIATION_FAILURE
+    if any(
+        marker in normalized
+        for marker in (
+            "404",
+            "not found",
+            "resource not found",
+            "no such resource",
+        )
+    ):
+        return _GST_SOURCE_FAILURE
+    if any(
+        marker in normalized
+        for marker in (
+            "erroneous pipeline",
+            "no property",
+            "syntax error",
+            "no element",
+        )
+    ):
+        return _GST_PIPELINE_FAILURE
+    return _GST_OTHER_FAILURE
+
+
 def run_candidate(transport: str, source_uri: str) -> int:
-    """Run one candidate with stdout/stderr suppressed and return only its exit status."""
+    """Run one candidate and expose only a coarse, source-free failure status."""
     if shutil.which(_GST_LAUNCH) is None:
         return 127
     completed = subprocess.run(
         build_gst_argv(transport, source_uri),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         shell=False,
         check=False,
     )
-    return int(completed.returncode)
+    if completed.returncode == 0:
+        return 0
+    return classify_gst_failure(completed.stderr or "")
 
 
 def main() -> int:
