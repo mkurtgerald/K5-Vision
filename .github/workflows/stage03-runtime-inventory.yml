@@ -15,7 +15,7 @@ jobs:
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 5
     steps:
-      - name: Inventory candidate executables
+      - name: Inventory candidate executables and GStreamer metadata
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -61,24 +61,67 @@ jobs:
 
           $pluginResults = @()
           $gstInspect = Get-Command "gst-inspect-1.0" -ErrorAction SilentlyContinue | Select-Object -First 1
-          $pluginNames = @("rtspsrc", "queue", "decodebin", "fakesink", "rtph264depay", "rtph265depay", "h264parse", "h265parse")
+          $pluginNames = @("rtspsrc", "queue", "identity", "fakesink")
           foreach ($pluginName in $pluginNames) {
             $present = $false
+            $pluginVersion = $null
+            $license = $null
+            $sourceModule = $null
+            $origin = $null
+
             if ($null -ne $gstInspect) {
-              & $gstInspect.Source $pluginName *> $null
+              $inspectOutput = @(& $gstInspect.Source $pluginName 2>$null)
               $present = ($LASTEXITCODE -eq 0)
+              if ($present) {
+                foreach ($line in $inspectOutput) {
+                  if ($line -match '^\s*Version\s+(.+?)\s*$' -and [string]::IsNullOrWhiteSpace([string]$pluginVersion)) {
+                    $pluginVersion = $Matches[1].Trim()
+                  } elseif ($line -match '^\s*License\s+(.+?)\s*$' -and [string]::IsNullOrWhiteSpace([string]$license)) {
+                    $license = $Matches[1].Trim()
+                  } elseif ($line -match '^\s*Source module\s+(.+?)\s*$' -and [string]::IsNullOrWhiteSpace([string]$sourceModule)) {
+                    $sourceModule = $Matches[1].Trim()
+                  } elseif ($line -match '^\s*Origin URL\s+(.+?)\s*$' -and [string]::IsNullOrWhiteSpace([string]$origin)) {
+                    $origin = $Matches[1].Trim()
+                  }
+                }
+              }
             }
+
             $pluginResults += [pscustomobject]@{
               plugin = $pluginName
               present = $present
+              version = $pluginVersion
+              license = $license
+              source_module = $sourceModule
+              origin = $origin
             }
           }
+
+          $registryPackages = @()
+          $roots = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+          )
+          foreach ($root in $roots) {
+            Get-ItemProperty $root -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -like "GStreamer 1.0*" } |
+              ForEach-Object {
+                $registryPackages += [pscustomobject]@{
+                  name = [string]$_.DisplayName
+                  version = [string]$_.DisplayVersion
+                  publisher = [string]$_.Publisher
+                }
+              }
+          }
+          $registryPackages = @($registryPackages | Sort-Object name, version -Unique)
 
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
           [pscustomobject]@{
             executables = $results
             gstreamer_plugins = $pluginResults
-          } | ConvertTo-Json -Depth 4 | Set-Content -Path artifacts/stage03-runtime-inventory.json -Encoding UTF8
+            gstreamer_packages = $registryPackages
+          } | ConvertTo-Json -Depth 5 | Set-Content -Path artifacts/stage03-runtime-inventory.json -Encoding UTF8
 
           $presentExecutables = @($results | Where-Object { $_.present } | ForEach-Object { $_.candidate })
           if ($presentExecutables.Count -eq 0) {
@@ -89,7 +132,7 @@ jobs:
 
           $presentPlugins = @($pluginResults | Where-Object { $_.present } | ForEach-Object { $_.plugin })
           if ($presentPlugins.Count -gt 0) {
-            Write-Host ("Detected GStreamer plugin names: " + ($presentPlugins -join ", "))
+            Write-Host ("Detected required GStreamer plugin names: " + ($presentPlugins -join ", "))
           }
 
       - name: Upload sanitized runtime inventory
