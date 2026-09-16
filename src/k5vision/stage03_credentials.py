@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 
 def parse_cam_cred(raw: str) -> tuple[str, tuple[str, ...]]:
@@ -18,8 +18,8 @@ def parse_cam_cred(raw: str) -> tuple[str, tuple[str, ...]]:
     return username, tuple(passwords)
 
 
-def credentialized_uri(source_uri: str, username: str, password: str) -> str:
-    """Replace any existing RTSP userinfo with one transient credential candidate."""
+def source_without_userinfo(source_uri: str) -> str:
+    """Return the private RTSP endpoint with any stale embedded userinfo removed."""
     parsed = urlsplit(source_uri)
     if parsed.scheme.casefold() not in {"rtsp", "rtsps"} or not parsed.netloc:
         raise ValueError("Stage 03 source must be an RTSP URI")
@@ -27,19 +27,12 @@ def credentialized_uri(source_uri: str, username: str, password: str) -> str:
     host_port = parsed.netloc.rsplit("@", 1)[-1]
     if not host_port:
         raise ValueError("Stage 03 source is missing a host")
-
-    # `!` is valid URI userinfo and is used literally by the physical camera
-    # credential bundle. Preserve it rather than converting it to %21; encode
-    # characters such as spaces that cannot safely appear in the URI.
-    userinfo = f"{quote(username, safe='')}:{quote(password, safe='!')}"
-    return urlunsplit(
-        (parsed.scheme, f"{userinfo}@{host_port}", parsed.path, parsed.query, parsed.fragment)
-    )
+    return urlunsplit((parsed.scheme, host_port, parsed.path, parsed.query, parsed.fragment))
 
 
-def selected_source_uri(source_uri: str, cam_cred: str, index: int) -> str:
-    """Build the selected transient authenticated URI entirely in memory."""
+def selected_credentials(cam_cred: str, index: int) -> tuple[str, str]:
+    """Return one private username/password pair for transient runtime use."""
     username, passwords = parse_cam_cred(cam_cred)
     if index < 0 or index >= len(passwords):
         raise ValueError("camera credential candidate index is out of range")
-    return credentialized_uri(source_uri, username, passwords[index])
+    return username, passwords[index]
