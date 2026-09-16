@@ -9,7 +9,9 @@ def parse_cam_cred(raw: str) -> tuple[str, tuple[str, ...]]:
     """Parse the private CAM_CRED note without retaining blank-line layout."""
     values = tuple(line.strip() for line in raw.splitlines() if line.strip())
     if len(values) < 3:
-        raise ValueError("camera credential bundle must include a username and at least two passwords")
+        raise ValueError(
+            "camera credential bundle must include a username and at least two passwords"
+        )
     username, *passwords = values
     if len(passwords) > 8:
         raise ValueError("camera credential bundle contains too many password candidates")
@@ -27,7 +29,9 @@ def credentialized_uri(source_uri: str, username: str, password: str) -> str:
         raise ValueError("Stage 03 source is missing a host")
 
     userinfo = f"{quote(username, safe='')}:{quote(password, safe='')}"
-    return urlunsplit((parsed.scheme, f"{userinfo}@{host_port}", parsed.path, parsed.query, parsed.fragment))
+    return urlunsplit(
+        (parsed.scheme, f"{userinfo}@{host_port}", parsed.path, parsed.query, parsed.fragment)
+    )
 
 
 def selected_source_uri(source_uri: str, cam_cred: str, index: int) -> str:
