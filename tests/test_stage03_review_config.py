@@ -22,7 +22,11 @@ def test_versioned_stage03_reviews_match_runtime_candidates() -> None:
     assert all(item.is_eligible() for item in reviews)
     assert all(item.license_id == "LGPL-2.1-or-later" for item in reviews)
     assert all("1.28.7" in item.component_version for item in reviews)
-    assert all("032fc6062b8539838fc8da22589cb9b24c5d820baa7f8cc160af9ea08395badf" in item.source_reference for item in reviews)
+    assert all(
+        "032fc6062b8539838fc8da22589cb9b24c5d820baa7f8cc160af9ea08395badf"
+        in item.source_reference
+        for item in reviews
+    )
 
 
 def test_versioned_review_file_contains_no_private_source_fields() -> None:
