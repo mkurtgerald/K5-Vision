@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import sys
 from hashlib import sha256
@@ -27,7 +28,9 @@ _HARDENING_FILES = (
     "scripts/provision-stage03-gstreamer.ps1",
     "config/stage03-gstreamer-candidates.json",
     "config/stage03-gstreamer-reviews.json",
+    "src/k5vision/adapters/stage03_evidence.py",
     "src/k5vision/adapters/stage03_process.py",
+    "src/k5vision/stage03_acceptance.py",
     "src/k5vision/stage03_credential_probe.py",
     "tests/integration/test_stage03_physical.py",
 )
@@ -214,7 +217,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--reviews", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--source-uri", required=True)
     parser.add_argument("--runtime-version", required=True)
     parser.add_argument("--runtime-installer-sha256", required=True)
     parser.add_argument("--revision-sha", required=True)
@@ -225,13 +227,17 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    source_uri = os.getenv("K5_STAGE03_SOURCE")
+    if not source_uri:
+        raise SystemExit("Stage 03 acceptance evidence could not be assembled safely")
+
     try:
         capture = Stage03Capture.model_validate_json(args.capture.read_text(encoding="utf-8-sig"))
         reviews = load_reviews(args.reviews, runtime_version=args.runtime_version)
         bundle = build_acceptance_bundle(
             capture=capture,
             reviews=reviews,
-            source_uri=args.source_uri,
+            source_uri=source_uri,
             runtime_version=args.runtime_version,
             runtime_installer_sha256=args.runtime_installer_sha256.lower(),
             revision_sha=args.revision_sha.lower(),
