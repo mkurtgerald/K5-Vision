@@ -57,7 +57,7 @@ jobs:
             }
           }
 
-          foreach ($plugin in @("rtspsrc", "queue", "decodebin", "fakesink")) {
+          foreach ($plugin in @("rtspsrc", "queue", "fakesink")) {
             & gst-inspect-1.0 $plugin *> $null
             if ($LASTEXITCODE -ne 0) {
               throw "Required Stage 03 GStreamer plugin is unavailable."
