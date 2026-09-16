@@ -7,7 +7,9 @@ on:
     paths:
       - .github/workflows/physical-validation.yml
       - config/stage03-gstreamer-candidates.json
+      - config/stage03-gstreamer-reviews.json
       - scripts/provision-stage03-gstreamer.ps1
+      - src/k5vision/stage03_finalize.py
       - src/k5vision/stage03_gst_candidate.py
       - src/k5vision/stage03_credentials.py
       - src/k5vision/stage03_credential_probe.py
@@ -29,10 +31,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Provision isolated reviewed GStreamer runtime
-        shell: powershell
-        run: .\scripts\provision-stage03-gstreamer.ps1
-
       - name: Load versioned runtime candidate configuration
         shell: powershell
         run: |
@@ -53,6 +51,27 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "K5_STAGE03_CANDIDATES_JSON<<$delimiter"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value $raw
           Add-Content -LiteralPath $env:GITHUB_ENV -Value $delimiter
+
+      - name: Verify versioned candidate review configuration
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = Join-Path $env:GITHUB_WORKSPACE "config\stage03-gstreamer-reviews.json"
+          if (-not (Test-Path -LiteralPath $path)) {
+            throw "Versioned Stage 03 candidate review configuration is missing."
+          }
+          try {
+            $reviews = @(Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -ErrorAction Stop)
+          } catch {
+            throw "Versioned Stage 03 candidate review configuration is not valid JSON."
+          }
+          if ($reviews.Count -lt 2) {
+            throw "Stage 03 requires at least two reviewed candidates."
+          }
+
+      - name: Provision isolated reviewed GStreamer runtime
+        shell: powershell
+        run: .\scripts\provision-stage03-gstreamer.ps1
 
       - name: Verify GStreamer runtime boundary
         shell: powershell
@@ -178,11 +197,24 @@ jobs:
           K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: pytest tests/integration/test_stage03_physical.py -q --no-cov
 
+      - name: Assemble final Stage 03 selection evidence
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          python -m k5vision.stage03_finalize `
+            --capture artifacts/stage03-physical.json `
+            --reviews config/stage03-gstreamer-reviews.json `
+            --candidate-config config/stage03-gstreamer-candidates.json `
+            --evidence-output artifacts/stage03-final-evidence.json `
+            --selection-output artifacts/stage03-selection.json
+
       - name: Upload retained qualification evidence
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: stage03-physical-evidence
-          path: artifacts/stage03-physical.json
+          path: artifacts/stage03-*.json
           if-no-files-found: warn
           retention-days: 14
