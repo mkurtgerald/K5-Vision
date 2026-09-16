@@ -13,6 +13,8 @@ def test_build_gst_argv_keeps_source_in_one_shell_free_argument() -> None:
     assert argv[0] == "gst-launch-1.0"
     assert f"location={source}" in argv
     assert "protocols=tcp" in argv
+    assert "decodebin" not in argv
+    assert "fakesink" in argv
     assert argv.count("!") >= 1
 
 
@@ -32,7 +34,7 @@ def test_run_candidate_captures_child_error_privately_and_never_uses_shell(monke
     def fake_run(argv, **kwargs):
         captured["argv"] = argv
         captured.update(kwargs)
-        return subprocess.CompletedProcess(argv, 0, stdout=None, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=None, stderr=b"")
 
     monkeypatch.setattr(stage03_gst_candidate.subprocess, "run", fake_run)
 
@@ -40,7 +42,6 @@ def test_run_candidate_captures_child_error_privately_and_never_uses_shell(monke
     assert captured["shell"] is False
     assert captured["stdout"] is subprocess.DEVNULL
     assert captured["stderr"] is subprocess.PIPE
-    assert captured["text"] is True
     assert "protocols=udp" in captured["argv"]
 
 
@@ -75,7 +76,7 @@ def test_run_candidate_never_returns_raw_diagnostic_content(monkeypatch) -> None
             argv,
             1,
             stdout=None,
-            stderr=f"401 Unauthorized while opening {source}",
+            stderr=f"401 Unauthorized while opening {source}".encode(),
         ),
     )
 
@@ -83,3 +84,14 @@ def test_run_candidate_never_returns_raw_diagnostic_content(monkeypatch) -> None
 
     assert result == 41
     assert isinstance(result, int)
+
+
+def test_run_candidate_maps_wrapper_failures_without_exception_text(monkeypatch) -> None:
+    monkeypatch.setattr(stage03_gst_candidate.shutil, "which", lambda _: "gst-launch-1.0")
+    monkeypatch.setattr(
+        stage03_gst_candidate.subprocess,
+        "run",
+        lambda argv, **kwargs: (_ for _ in ()).throw(OSError("rtsp://user:secret@example/live")),
+    )
+
+    assert stage03_gst_candidate.run_candidate("tcp", "rtsp://user:secret@example/live") == 47
