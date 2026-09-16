@@ -28,7 +28,10 @@ def credentialized_uri(source_uri: str, username: str, password: str) -> str:
     if not host_port:
         raise ValueError("Stage 03 source is missing a host")
 
-    userinfo = f"{quote(username, safe='')}:{quote(password, safe='')}"
+    # `!` is valid URI userinfo and is used literally by the physical camera
+    # credential bundle. Preserve it rather than converting it to %21; encode
+    # characters such as spaces that cannot safely appear in the URI.
+    userinfo = f"{quote(username, safe='')}:{quote(password, safe='!')}"
     return urlunsplit(
         (parsed.scheme, f"{userinfo}@{host_port}", parsed.path, parsed.query, parsed.fragment)
     )
