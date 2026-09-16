@@ -1,0 +1,49 @@
+name: Stage 03 Runner Inventory
+
+on:
+  push:
+    branches:
+      - automation/stage03-runner-inventory-1
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
+    timeout-minutes: 5
+    steps:
+      - name: Inventory candidate runtime executables
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $names = @(
+            "ffmpeg",
+            "ffprobe",
+            "ffplay",
+            "vlc",
+            "cvlc",
+            "gst-launch-1.0",
+            "gst-discoverer-1.0",
+            "mpv",
+            "mediamtx"
+          )
+
+          foreach ($name in $names) {
+            $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $command) {
+              Write-Output "$name=absent"
+              continue
+            }
+
+            $version = "unknown"
+            try {
+              $candidateVersion = (Get-Item -LiteralPath $command.Source -ErrorAction Stop).VersionInfo.ProductVersion
+              if (-not [string]::IsNullOrWhiteSpace($candidateVersion)) {
+                $version = $candidateVersion -replace "[\r\n]+", " "
+              }
+            } catch {
+              $version = "unknown"
+            }
+            Write-Output "$name=present version=$version"
+          }
