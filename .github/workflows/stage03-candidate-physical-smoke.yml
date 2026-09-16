@@ -1,0 +1,51 @@
+name: Stage 03 Candidate Physical Smoke
+
+on:
+  push:
+    branches:
+      - automation/stage03-versioned-candidates-1
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Install candidate-only dependencies
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          pip install --only-binary=:all: --require-hashes `
+            -r config/stage03-candidate-requirements.txt
+
+      - name: Exercise physical source without media retention
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_SOURCE)) {
+            throw "Physical source is not configured."
+          }
+
+          python tools/stage03/gstreamer_probe.py $env:K5_STAGE03_SOURCE
+          if ($LASTEXITCODE -ne 0) {
+            throw "GStreamer physical candidate smoke failed."
+          }
+          Write-Output "gstreamer_physical_smoke=success"
+
+          python tools/stage03/opencv_ffmpeg_probe.py $env:K5_STAGE03_SOURCE
+          if ($LASTEXITCODE -ne 0) {
+            throw "OpenCV/FFmpeg physical candidate smoke failed."
+          }
+          Write-Output "opencv_ffmpeg_physical_smoke=success"
