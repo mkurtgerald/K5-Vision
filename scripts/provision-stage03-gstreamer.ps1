@@ -18,6 +18,7 @@ $installRoot = Join-Path $installBase "k5-gstreamer\$Version\msvc_x86_64"
 $binPath = Join-Path $installRoot "bin"
 $gstLaunch = Join-Path $binPath "gst-launch-1.0.exe"
 $gstInspect = Join-Path $binPath "gst-inspect-1.0.exe"
+$hashRecord = Join-Path $installRoot "k5-installer.sha256"
 $installerSha256 = $null
 
 function Assert-ExpectedRuntime {
@@ -95,6 +96,13 @@ if (-not (Assert-ExpectedRuntime)) {
 
     if (-not (Assert-ExpectedRuntime)) {
         throw "Isolated Stage 03 GStreamer runtime failed post-install verification."
+    }
+
+    Set-Content -LiteralPath $hashRecord -Value $installerSha256 -Encoding Ascii -NoNewline
+} elseif (Test-Path -LiteralPath $hashRecord) {
+    $recordedHash = (Get-Content -LiteralPath $hashRecord -Raw).Trim().ToLowerInvariant()
+    if ($recordedHash -match '^[0-9a-f]{64}$') {
+        $installerSha256 = $recordedHash
     }
 }
 
