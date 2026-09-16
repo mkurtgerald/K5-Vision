@@ -1,0 +1,92 @@
+name: Stage 03 Config Audit
+
+on:
+  push:
+    branches:
+      - automation/stage03-recovery-1
+
+permissions:
+  contents: read
+
+jobs:
+  audit-config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+      K5_STAGE03_CANDIDATES_JSON: ${{ secrets.K5_STAGE03_CANDIDATES_JSON }}
+    steps:
+      - name: Validate Stage 03 configuration shape
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          source = os.environ.get("K5_STAGE03_SOURCE", "")
+          raw = os.environ.get("K5_STAGE03_CANDIDATES_JSON", "")
+
+          if not source.strip():
+              print("source_configured=no")
+              sys.exit(10)
+          print("source_configured=yes")
+
+          if not raw.strip():
+              print("candidate_config=missing")
+              sys.exit(11)
+
+          try:
+              data = json.loads(raw)
+          except (TypeError, ValueError):
+              print("candidate_config=parse_error")
+              sys.exit(12)
+
+          if not isinstance(data, list) or len(data) < 2:
+              print("candidate_config=not_comparative_list")
+              sys.exit(13)
+
+          allowed = {
+              "schema_version",
+              "candidate",
+              "argv",
+              "interruption_seconds",
+              "poll_interval_seconds",
+          }
+          seen = set()
+          for item in data:
+              if not isinstance(item, dict) or set(item) - allowed:
+                  print("candidate_config=schema_error")
+                  sys.exit(14)
+              if item.get("schema_version", "1") != "1":
+                  print("candidate_config=schema_error")
+                  sys.exit(14)
+              candidate = item.get("candidate")
+              argv = item.get("argv")
+              if not isinstance(candidate, str) or not candidate or len(candidate) > 128:
+                  print("candidate_config=schema_error")
+                  sys.exit(14)
+              if candidate in seen:
+                  print("candidate_config=duplicate_candidate")
+                  sys.exit(15)
+              seen.add(candidate)
+              if not isinstance(argv, list) or not 1 <= len(argv) <= 64:
+                  print("candidate_config=schema_error")
+                  sys.exit(14)
+              if any(not isinstance(arg, str) or not arg for arg in argv):
+                  print("candidate_config=schema_error")
+                  sys.exit(14)
+              if argv.count("{source}") != 1 or argv[0] == "{source}":
+                  print("candidate_config=source_token_error")
+                  sys.exit(16)
+              interruption = item.get("interruption_seconds", 0.25)
+              poll = item.get("poll_interval_seconds", 0.05)
+              if not isinstance(interruption, (int, float)) or not 0 < interruption <= 30:
+                  print("candidate_config=schema_error")
+                  sys.exit(14)
+              if not isinstance(poll, (int, float)) or not 0 < poll <= 1:
+                  print("candidate_config=schema_error")
+                  sys.exit(14)
+
+          print(f"candidate_config=valid comparative_count={len(data)}")
+          PY
