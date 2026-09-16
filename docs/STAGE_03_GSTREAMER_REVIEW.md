@@ -1,23 +1,32 @@
 # Stage 03 GStreamer Candidate Review
 
-Status: **BLOCKED FOR FINAL SELECTION — refresh and re-qualify the runtime before Gate 03 may close.**
+Status: **APPROVED FOR STAGE 03 SELECTION AT THE PINNED 1.28.7 RUNTIME SURFACE.**
 
 This record covers only the GStreamer surface exercised by the Stage 03 transport/runtime qualification. It does not approve unrelated codecs, demuxers, optional plugins, or the full contents of a general-purpose GStreamer bundle.
 
-## Measured runner identity
+## Accepted runtime identity
 
-The source-free runner inventory at the accepted physical-test host recorded:
+The accepted source-free runner inventory at revision `7b2ebc413be1d104a7eaaa8d38147ce6101b5015` recorded the K5-isolated reviewed runtime as:
 
 - Windows x86_64 physical runner
-- `GStreamer 1.0` package version `1.20.4`, publisher `GStreamer Project`
-- `GStreamer 1.0 (Development Files)` package version `1.20.4`, publisher `GStreamer Project`
-- `gst-launch-1.0 version 1.20.4`
-- `rtspsrc`: present, effective license `LGPL`, source module `gst-plugins-good`, plugin version `1.20.4.3`
-- `queue`: present, effective license `LGPL`, source module `gstreamer`, plugin version `1.20.4.3`
-- `identity`: present, effective license `LGPL`, source module `gstreamer`, plugin version `1.20.4.3`
-- `fakesink`: present, effective license `LGPL`, source module `gstreamer`, plugin version `1.20.4.3`
+- `gst-launch-1.0 version 1.28.7`
+- official upstream installer SHA-256 `032fc6062b8539838fc8da22589cb9b24c5d820baa7f8cc160af9ea08395badf`
+- `rtspsrc`: present, effective license `LGPL`, source module `gst-plugins-good`, plugin version `1.28.7`
+- `queue`: present, effective license `LGPL`, source module `gstreamer`, plugin version `1.28.7`
+- `identity`: present, effective license `LGPL`, source module `gstreamer`, plugin version `1.28.7`
+- `fakesink`: present, effective license `LGPL`, source module `gstreamer`, plugin version `1.28.7`
 
-The inventory is intentionally source-free: it does not read camera credentials, contact the camera, retain an RTSP URI, or retain media.
+The host also retains older machine-wide GStreamer 1.20.4 packages. Those packages are not the reviewed Stage 03 runtime. The qualification workflow prepends and verifies the isolated K5 runtime, requires `gst-launch-1.0` to report 1.28.7, and verifies every required plugin before the physical source is touched.
+
+The runtime inventory is intentionally source-free: it does not read camera credentials, contact the camera, retain an RTSP URI, or retain media.
+
+## Integrity and provenance
+
+The Stage 03 provisioning script downloads the exact GStreamer 1.28.7 MSVC x86_64 runtime installer and its adjacent upstream `.sha256sum` file from:
+
+`https://gstreamer.freedesktop.org/data/pkg/windows/1.28.7/msvc/`
+
+Provisioning rejects a checksum record with an unexpected filename or format and rejects an installer whose calculated SHA-256 does not equal the official upstream value. The verified hash is retained in the isolated runtime provenance record and propagated to final Stage 03 evidence as part of the secret-bound host configuration fingerprint.
 
 ## Governing license and commercial suitability
 
@@ -27,11 +36,13 @@ Primary upstream references:
 - GStreamer licensing advisory: `https://gstreamer.freedesktop.org/documentation/plugin-development/appendix/licensing-advisory.html`
 - GStreamer Good Plug-ins module: `https://gstreamer.freedesktop.org/modules/gst-plugins-good.html`
 
-Upstream states that GStreamer and its own plugin code use the LGPL, with the framework intended to support applications under licenses of their choice. The installed runner itself reports the effective license of every Stage 03 element used here as `LGPL`.
+Upstream states that GStreamer and its own plugin code use the GNU LGPL 2.1, and GStreamer documentation describes the framework as intended to support applications under licenses of their choice. The accepted runner inventory independently reports the effective license of every Stage 03 element used here as `LGPL`.
 
-**Commercial-use conclusion:** the Stage 03 GStreamer surface is commercially usable subject to the governing LGPL obligations and any applicable third-party component obligations.
+The versioned review records therefore identify the reviewed surface as `LGPL-2.1-or-later` for engineering dependency tracking.
 
-**Redistribution conclusion:** redistribution of the required GStreamer surface is permitted subject to LGPL compliance and release-time reconciliation of the exact binaries, notices, source-offer/relinking obligations where applicable, and any separately licensed supporting components that are actually shipped. K5 must not treat approval of these four elements as blanket approval to redistribute every plugin installed by a full GStreamer bundle.
+**Commercial-use conclusion:** the Stage 03 GStreamer surface is approved for commercial K5 use subject to the governing LGPL obligations and any applicable third-party component obligations.
+
+**Redistribution conclusion:** redistribution of the required GStreamer surface is approved subject to LGPL compliance and release-time reconciliation of the exact binaries, notices, source/relinking obligations where applicable, and any separately licensed supporting components that are actually shipped. This is not blanket approval to redistribute every plugin installed by a general-purpose GStreamer bundle.
 
 This is an engineering dependency review, not legal advice.
 
@@ -42,7 +53,7 @@ Primary upstream references:
 - GStreamer downloads: `https://gstreamer.freedesktop.org/download/`
 - Windows installation: `https://gstreamer.freedesktop.org/documentation/installing/on-windows.html`
 
-Upstream provides official Windows binaries and documents Windows support. Linux is a first-class supported platform through distribution packages and upstream source builds. The Stage 03 required surface is therefore suitable for the project requirement to support Windows and Linux, subject to re-running platform-specific qualification as those packaging targets are implemented.
+Upstream provides official Windows binaries and documents Windows support. Linux is a first-class supported platform through distribution packages and upstream source builds. The Stage 03 required surface is therefore accepted for the project requirement to support Windows and Linux, with platform-specific physical qualification still required when a Linux packaging target is implemented.
 
 ## Security and update posture
 
@@ -51,18 +62,24 @@ Primary upstream references:
 - Current releases: `https://gstreamer.freedesktop.org/releases/`
 - GStreamer 1.28 stable-series notes: `https://gstreamer.freedesktop.org/releases/1.28/`
 
-As of 2026-09-16, upstream identifies `1.28.7` as the current stable release. It was released on 2026-09-07 and includes important security fixes. The physical runner is on `1.20.4`, an older stable series.
+As reviewed on 2026-09-16, upstream identifies 1.28.7 as the current stable release. K5 now provisions that version into an isolated runner-owned path and verifies it against the upstream SHA-256 before use. The earlier 1.20.4 security-baseline blocker is therefore resolved for Stage 03 qualification.
 
-The Stage 03 hardening standard requires dependency/security posture to be resolved before gate exit. Therefore the physically measured `1.20.4` runtime is **not approved for final K5 runtime selection**, even though its physical transport measurements passed. This avoids turning a successful camera test into an implicit approval of stale runtime binaries.
+A future runtime update is not implicitly approved by this record. A different GStreamer version or materially different plugin surface requires an explicit review and re-qualification before it can replace this accepted baseline.
 
-## Required closure action
+## Physical re-qualification result
 
-Before a `CandidateReview` may be attached as approved and a final `Stage03SelectionRecord` may be generated:
+At revision `7b2ebc413be1d104a7eaaa8d38147ce6101b5015`:
 
-1. provision a K5-isolated, pinned supported GStreamer build at the accepted current stable/security baseline (currently `1.28.7`) or a newer explicitly reviewed stable build;
-2. capture the same source-free package/plugin provenance inventory;
-3. rerun the complete physical Stage 03 comparative qualification on that exact runtime revision;
-4. confirm the required Stage 03 elements still report acceptable effective licenses;
-5. retain the source-free evidence and generate the deterministic selection record only after all review fields are approved.
+1. CI completed successfully;
+2. the source-free runtime inventory completed successfully against isolated GStreamer 1.28.7;
+3. physical qualification completed successfully on the accepted camera-lab runner;
+4. both versioned transport candidates completed five scored runs, interruption/re-entry recovery, and the common `1,2,3` increasing-load resource ladder;
+5. no camera source, username, password, frame, clip, or retained media was added to the evidence artifact.
 
-No Gate 04 implementation is authorized by this review. The current blocker is the runtime security baseline, not the camera, credentials, physical runner, candidate configuration, or qualification harness.
+The versioned `CandidateReview` records for `gstreamer-tcp` and `gstreamer-udp` are maintained in `config/stage03-gstreamer-reviews.json` and apply only to this reviewed runtime surface.
+
+## Remaining Gate 03 closure condition
+
+This dependency review no longer blocks Stage 03. Gate 03 still must not close until the exact accepted revision retains a complete `Stage03Evidence` bundle with safe source/host fingerprints and a deterministic `Stage03SelectionRecord`, and CI plus physical qualification are green for that revision.
+
+No Gate 04 implementation is authorized by this review.
