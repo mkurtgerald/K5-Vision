@@ -1,0 +1,68 @@
+name: Stage 03 Runtime Inventory
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/stage03-runtime-inventory.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
+    timeout-minutes: 5
+    steps:
+      - name: Inventory candidate executables
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $names = @("ffmpeg", "ffprobe", "gst-launch-1.0", "vlc", "mpv")
+          $results = @()
+
+          foreach ($name in $names) {
+            $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $command) {
+              $results += [pscustomobject]@{
+                candidate = $name
+                present = $false
+                version = $null
+              }
+              continue
+            }
+
+            $version = $null
+            if ($command.CommandType -eq "Application" -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
+              try {
+                $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($command.Source).ProductVersion
+              } catch {
+                $version = $null
+              }
+            }
+
+            $results += [pscustomobject]@{
+              candidate = $name
+              present = $true
+              version = $version
+            }
+          }
+
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $results | ConvertTo-Json -Depth 3 | Set-Content -Path artifacts/stage03-runtime-inventory.json -Encoding UTF8
+
+          $present = @($results | Where-Object { $_.present } | ForEach-Object { $_.candidate })
+          if ($present.Count -eq 0) {
+            Write-Host "No known Stage 03 runtime executables were detected on the physical runner."
+          } else {
+            Write-Host ("Detected Stage 03 runtime executable names: " + ($present -join ", "))
+          }
+
+      - name: Upload sanitized runtime inventory
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: stage03-runtime-inventory
+          path: artifacts/stage03-runtime-inventory.json
+          if-no-files-found: error
+          retention-days: 2
