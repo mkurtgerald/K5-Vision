@@ -8,13 +8,19 @@ import sys
 from k5vision.stage03_credentials import credentialized_uri, parse_cam_cred
 from k5vision.stage03_gst_candidate import run_gst_uri
 
+# A completed RTSP/RTP run proves authentication. A downstream caps/negotiation
+# failure also proves that RTSP authentication and session setup got far enough
+# to reach the media boundary; that failure belongs to runtime qualification,
+# not credential selection. Other failures do not prove authentication.
+_AUTHENTICATED_STATUSES = frozenset({0, 43})
+
 
 def resolve_credential_index(source_uri: str, cam_cred: str) -> int | None:
-    """Return the first credential index that authenticates the RTSP source."""
+    """Return the first credential index proven to authenticate the RTSP source."""
     username, passwords = parse_cam_cred(cam_cred)
     for index, password in enumerate(passwords):
         candidate_uri = credentialized_uri(source_uri, username, password)
-        if run_gst_uri("tcp", candidate_uri) == 0:
+        if run_gst_uri("tcp", candidate_uri) in _AUTHENTICATED_STATUSES:
             return index
     return None
 

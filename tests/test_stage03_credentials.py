@@ -51,6 +51,37 @@ def test_probe_returns_only_working_index(monkeypatch) -> None:
     assert all("old:stale" not in uri for uri in seen)
 
 
+def test_probe_accepts_authenticated_session_with_downstream_negotiation_failure(
+    monkeypatch,
+) -> None:
+    statuses = iter((41, 43))
+    monkeypatch.setattr(
+        stage03_credential_probe,
+        "run_gst_uri",
+        lambda _transport, _uri: next(statuses),
+    )
+
+    assert (
+        stage03_credential_probe.resolve_credential_index(
+            "rtsp://192.0.2.10/stream1",
+            "viewer\n\nfirst\n\nsecond!",
+        )
+        == 1
+    )
+
+
+def test_probe_does_not_treat_connectivity_failure_as_authenticated(monkeypatch) -> None:
+    monkeypatch.setattr(stage03_credential_probe, "run_gst_uri", lambda _transport, _uri: 42)
+
+    assert (
+        stage03_credential_probe.resolve_credential_index(
+            "rtsp://192.0.2.10/stream1",
+            "viewer\n\nfirst\n\nsecond!",
+        )
+        is None
+    )
+
+
 def test_wrapper_applies_selected_credential_without_logging(monkeypatch) -> None:
     captured: dict[str, str] = {}
     monkeypatch.setenv("K5_STAGE03_CAM_CRED", "viewer\n\nfirst\n\nsecond!")
