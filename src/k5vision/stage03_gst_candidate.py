@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 
-from k5vision.stage03_credentials import selected_source_uri
+from k5vision.stage03_credentials import selected_credentials, source_without_userinfo
 
 _GST_LAUNCH = "gst-launch-1.0"
 _ALLOWED_TRANSPORTS = ("tcp", "udp")
@@ -25,33 +25,50 @@ _GST_WRAPPER_OS_FAILURE = 47
 _GST_WRAPPER_INTERNAL_FAILURE = 48
 
 
-def build_gst_argv(transport: str, source_uri: str) -> list[str]:
+def build_gst_argv(
+    transport: str,
+    source_uri: str,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+) -> list[str]:
     """Build one bounded RTP receive path without invoking a command shell."""
     if transport not in _ALLOWED_TRANSPORTS:
         raise ValueError("unsupported transport candidate")
     if not source_uri.strip():
         raise ValueError("source_uri must not be empty")
+    if (username is None) != (password is None):
+        raise ValueError("username and password must be supplied together")
 
-    # Stage 03 qualifies the transport/runtime boundary. Keep this path codec
-    # agnostic so decoder availability cannot masquerade as a transport result.
-    return [
+    argv = [
         _GST_LAUNCH,
         "-q",
         "rtspsrc",
         f"location={source_uri}",
-        f"protocols={transport}",
-        "latency=100",
-        "name=src",
-        "src.",
-        "!",
-        "application/x-rtp,media=video",
-        "!",
-        "queue",
-        "!",
-        "fakesink",
-        "sync=false",
-        "num-buffers=60",
     ]
+    if username is not None and password is not None:
+        # Use native rtspsrc auth properties rather than URI userinfo. This
+        # avoids password punctuation/escaping ambiguity while keeping both
+        # values transient in the child argv and out of retained evidence.
+        argv.extend((f"user-id={username}", f"user-pw={password}"))
+
+    argv.extend(
+        (
+            f"protocols={transport}",
+            "latency=100",
+            "name=src",
+            "src.",
+            "!",
+            "application/x-rtp,media=video",
+            "!",
+            "queue",
+            "!",
+            "fakesink",
+            "sync=false",
+            "num-buffers=60",
+        )
+    )
+    return argv
 
 
 def classify_gst_failure(stderr: str) -> int:
@@ -118,13 +135,24 @@ def classify_gst_failure(stderr: str) -> int:
     return _GST_OTHER_FAILURE
 
 
-def run_gst_uri(transport: str, source_uri: str) -> int:
-    """Run GStreamer against one already-resolved URI and return only a safe status."""
+def run_gst_uri(
+    transport: str,
+    source_uri: str,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+) -> int:
+    """Run GStreamer against one endpoint and return only a safe status."""
     executable = shutil.which(_GST_LAUNCH)
     if executable is None:
         return 127
 
-    argv = build_gst_argv(transport, source_uri)
+    argv = build_gst_argv(
+        transport,
+        source_uri,
+        username=username,
+        password=password,
+    )
     argv[0] = executable
 
     try:
@@ -154,9 +182,16 @@ def run_candidate(transport: str, source_uri: str) -> int:
     credential_index = os.getenv("K5_STAGE03_CREDENTIAL_INDEX")
     if cam_cred and credential_index is not None:
         try:
-            source_uri = selected_source_uri(source_uri, cam_cred, int(credential_index))
+            source_uri = source_without_userinfo(source_uri)
+            username, password = selected_credentials(cam_cred, int(credential_index))
         except (TypeError, ValueError):
             return _GST_AUTH_FAILURE
+        return run_gst_uri(
+            transport,
+            source_uri,
+            username=username,
+            password=password,
+        )
     return run_gst_uri(transport, source_uri)
 
 
