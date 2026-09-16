@@ -2,6 +2,12 @@ name: Physical Qualification
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/physical-validation.yml
+      - config/stage03-gstreamer-candidates.json
+      - src/k5vision/stage03_gst_candidate.py
 
 permissions:
   contents: read
