@@ -57,8 +57,12 @@ def test_run_candidate_returns_sanitized_missing_runtime_status(monkeypatch) -> 
     ("stderr", "expected"),
     [
         ("RTSP error: 401 Unauthorized for rtsp://user:secret@example/live", 41),
+        ("RTSP error: 403 Forbidden", 41),
         ("failed to connect: connection refused", 42),
         ("streaming stopped, reason not-negotiated", 43),
+        ("streaming stopped, reason not-linked (-1)", 43),
+        ("Internal data stream error", 43),
+        ("failed delayed linking some pad of GstRTSPSrc", 43),
         ("RTSP error: 404 Not Found", 44),
         ("WARNING: erroneous pipeline: no property foo", 45),
         ("opaque GStreamer failure rtsp://user:secret@example/live", 46),
