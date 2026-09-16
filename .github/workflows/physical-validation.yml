@@ -11,6 +11,7 @@ jobs:
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 30
     env:
+      K5_STAGE03_CANDIDATES_PATH: ${{ github.workspace }}\config\stage03-candidates.windows.json
       K5_STAGE03_OUTPUT: ${{ github.workspace }}\artifacts\stage03-physical.json
       K5_STAGE03_SCORED_RUNS: "5"
       K5_STAGE03_TIMEOUT: "10"
@@ -24,20 +25,20 @@ jobs:
         shell: powershell
         env:
           K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
-          K5_STAGE03_CANDIDATES_JSON: ${{ secrets.K5_STAGE03_CANDIDATES_JSON }}
         run: |
           $ErrorActionPreference = "Stop"
-          $missing = @()
-          if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_SOURCE)) { $missing += "K5_STAGE03_SOURCE" }
-          if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_CANDIDATES_JSON)) { $missing += "K5_STAGE03_CANDIDATES_JSON" }
-          if ($missing.Count -gt 0) {
-            throw ("Required physical configuration is missing: " + ($missing -join ", "))
+          if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_SOURCE)) {
+            throw "Required physical source configuration is missing."
+          }
+          if (-not (Test-Path -LiteralPath $env:K5_STAGE03_CANDIDATES_PATH -PathType Leaf)) {
+            throw "Versioned physical candidate configuration is missing."
           }
 
           try {
-            $candidateConfig = $env:K5_STAGE03_CANDIDATES_JSON | ConvertFrom-Json -ErrorAction Stop
+            $candidateConfig = Get-Content -LiteralPath $env:K5_STAGE03_CANDIDATES_PATH -Raw |
+              ConvertFrom-Json -ErrorAction Stop
           } catch {
-            throw "Required physical candidate configuration is not valid JSON."
+            throw "Versioned physical candidate configuration is not valid JSON."
           }
 
           try {
@@ -58,12 +59,26 @@ jobs:
             foreach ($candidate in $candidates) {
               if ($null -eq $candidate -or $candidate -is [string]) { throw "invalid" }
               $propertyNames = @($candidate.PSObject.Properties.Name)
-              if (@($propertyNames | Where-Object { $_ -notin $allowed }).Count -gt 0) { throw "invalid" }
-              if ($propertyNames -notcontains "candidate" -or $propertyNames -notcontains "argv") { throw "invalid" }
-              if ($propertyNames -contains "schema_version" -and [string]$candidate.schema_version -ne "1") { throw "invalid" }
+              if (@($propertyNames | Where-Object { $_ -notin $allowed }).Count -gt 0) {
+                throw "invalid"
+              }
+              if ($propertyNames -notcontains "candidate" -or $propertyNames -notcontains "argv") {
+                throw "invalid"
+              }
+              if (
+                $propertyNames -contains "schema_version" -and
+                [string]$candidate.schema_version -ne "1"
+              ) {
+                throw "invalid"
+              }
 
               $candidateName = [string]$candidate.candidate
-              if ([string]::IsNullOrWhiteSpace($candidateName) -or $candidateName.Length -gt 128) { throw "invalid" }
+              if (
+                [string]::IsNullOrWhiteSpace($candidateName) -or
+                $candidateName.Length -gt 128
+              ) {
+                throw "invalid"
+              }
               if ($seen.ContainsKey($candidateName)) { throw "invalid" }
               $seen[$candidateName] = $true
 
@@ -71,9 +86,13 @@ jobs:
               $argv = @($candidate.argv)
               if ($argv.Count -lt 1 -or $argv.Count -gt 64) { throw "invalid" }
               foreach ($arg in $argv) {
-                if ($arg -isnot [string] -or [string]::IsNullOrWhiteSpace($arg)) { throw "invalid" }
+                if ($arg -isnot [string] -or [string]::IsNullOrWhiteSpace($arg)) {
+                  throw "invalid"
+                }
               }
-              if (@($argv | Where-Object { $_ -eq "{source}" }).Count -ne 1) { throw "invalid" }
+              if (@($argv | Where-Object { $_ -eq "{source}" }).Count -ne 1) {
+                throw "invalid"
+              }
               if ($argv[0] -eq "{source}") { throw "invalid" }
 
               if ($propertyNames -contains "interruption_seconds") {
@@ -86,7 +105,7 @@ jobs:
               }
             }
           } catch {
-            throw "Required physical candidate configuration failed schema validation."
+            throw "Versioned physical candidate configuration failed schema validation."
           }
 
       - name: Set up Python
@@ -95,18 +114,45 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install
+      - name: Install qualification dependencies
         shell: powershell
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+          pip install --only-binary=:all: --require-hashes `
+            -r config/stage03-candidate-requirements.txt
+
+      - name: Verify candidate runtime dependencies
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $gst = Get-Command gst-launch-1.0 -ErrorAction SilentlyContinue
+          if ($null -eq $gst) {
+            throw "Required GStreamer candidate runtime is unavailable."
+          }
+
+          $versionText = (& gst-launch-1.0 --version | Out-String)
+          if ($versionText -notmatch "gst-launch-1\.0 version 1\.20\.4") {
+            throw "GStreamer candidate runtime version does not match the reviewed version."
+          }
+
+          foreach ($plugin in @("playbin", "fakesink")) {
+            & gst-inspect-1.0 $plugin *> $null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Required GStreamer candidate plugin is unavailable."
+            }
+          }
+
+          python -c "import cv2, numpy; assert cv2.__version__ == '4.14.0'; assert numpy.__version__ == '2.2.6'"
 
       - name: Run Stage 03 physical qualification
         shell: powershell
         env:
           K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
-          K5_STAGE03_CANDIDATES_JSON: ${{ secrets.K5_STAGE03_CANDIDATES_JSON }}
-        run: pytest tests/integration/test_stage03_physical.py -q --no-cov
+        run: |
+          $env:K5_STAGE03_CANDIDATES_JSON = Get-Content `
+            -LiteralPath $env:K5_STAGE03_CANDIDATES_PATH -Raw
+          pytest tests/integration/test_stage03_physical.py -q --no-cov
 
       - name: Upload retained qualification evidence
         if: always()
