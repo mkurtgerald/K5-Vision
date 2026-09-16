@@ -10,7 +10,11 @@ from k5vision.analytics.contracts import (
     AnalyticState,
     BoundingBox,
 )
-from k5vision.analytics.registry import AnalyticRegistrationError, AnalyticRegistry
+from k5vision.analytics.registry import (
+    AnalyticEventValidationError,
+    AnalyticRegistrationError,
+    AnalyticRegistry,
+)
 
 
 def _manifest(**overrides: object) -> AnalyticManifest:
@@ -25,6 +29,20 @@ def _manifest(**overrides: object) -> AnalyticManifest:
     }
     values.update(overrides)
     return AnalyticManifest(**values)
+
+
+def _event(**overrides: object) -> AnalyticEvent:
+    values: dict[str, object] = {
+        "event_id": "evt-1",
+        "analytic_id": "k5.slip-fall",
+        "analytic_version": "0.1.0",
+        "event_type": "person.fall",
+        "occurred_at": datetime.now(UTC),
+        "source_id": "camera-17",
+        "confidence": 0.93,
+    }
+    values.update(overrides)
+    return AnalyticEvent(**values)
 
 
 def test_manifest_defaults_to_current_contract() -> None:
@@ -50,6 +68,14 @@ def test_registry_rejects_incompatible_api() -> None:
 
     with pytest.raises(AnalyticRegistrationError, match="unsupported analytics API"):
         registry.register(_manifest(api_version="k5.analytics/v99"))
+
+
+def test_registry_rejects_duplicate_version() -> None:
+    registry = AnalyticRegistry()
+    registry.register(_manifest())
+
+    with pytest.raises(AnalyticRegistrationError, match="already registered"):
+        registry.register(_manifest())
 
 
 def test_registry_requires_explicit_upgrade() -> None:
@@ -81,6 +107,41 @@ def test_registry_missing_analytic_raises_key_error() -> None:
         registry.unregister("missing")
 
 
+def test_event_gate_accepts_declared_event_only_when_enabled() -> None:
+    registry = AnalyticRegistry()
+    registry.register(_manifest())
+
+    with pytest.raises(AnalyticEventValidationError, match="is not enabled"):
+        registry.validate_event(_event())
+
+    registry.set_state("k5.slip-fall", AnalyticState.ENABLED)
+
+    assert registry.validate_event(_event()).manifest.analytic_id == "k5.slip-fall"
+
+
+def test_event_gate_rejects_unregistered_wrong_version_and_undeclared_type() -> None:
+    registry = AnalyticRegistry()
+
+    with pytest.raises(AnalyticEventValidationError, match="unregistered analytic"):
+        registry.validate_event(_event())
+
+    registry.register(_manifest())
+    registry.set_state("k5.slip-fall", AnalyticState.ENABLED)
+
+    with pytest.raises(AnalyticEventValidationError, match="does not match registered"):
+        registry.validate_event(_event(analytic_version="9.9.9"))
+
+    with pytest.raises(AnalyticEventValidationError, match="is not declared"):
+        registry.validate_event(_event(event_type="person.weapon"))
+
+
+def test_event_gate_can_validate_during_pre_enable_canary() -> None:
+    registry = AnalyticRegistry()
+    registry.register(_manifest())
+
+    assert registry.validate_event(_event(), require_enabled=False).state is AnalyticState.STAGED
+
+
 def test_bounding_box_must_remain_inside_frame() -> None:
     with pytest.raises(ValidationError):
         BoundingBox(x=0.8, y=0.1, width=0.3, height=0.2)
@@ -90,14 +151,7 @@ def test_bounding_box_must_remain_inside_frame() -> None:
 
 
 def test_event_accepts_extensible_attributes() -> None:
-    event = AnalyticEvent(
-        event_id="evt-1",
-        analytic_id="k5.slip-fall",
-        analytic_version="0.1.0",
-        event_type="person.fall",
-        occurred_at=datetime.now(UTC),
-        source_id="camera-17",
-        confidence=0.93,
+    event = _event(
         bbox=BoundingBox(x=0.1, y=0.2, width=0.3, height=0.4),
         attributes={"posture": "prone"},
         severity="high",
