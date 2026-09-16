@@ -61,12 +61,12 @@ jobs:
             throw "Versioned Stage 03 candidate review configuration is missing."
           }
           try {
-            $reviews = @(Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -ErrorAction Stop)
+            $reviewDocument = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -ErrorAction Stop
           } catch {
             throw "Versioned Stage 03 candidate review configuration is not valid JSON."
           }
-          if ($reviews.Count -lt 2) {
-            throw "Stage 03 requires at least two reviewed candidates."
+          if ($reviewDocument -isnot [System.Array] -or $reviewDocument.Length -lt 2) {
+            throw "Stage 03 requires an array containing at least two reviewed candidates."
           }
 
       - name: Provision isolated reviewed GStreamer runtime
