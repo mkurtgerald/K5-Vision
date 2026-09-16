@@ -45,7 +45,9 @@ def build_context(
     if not source_uri.strip():
         raise ValueError("Stage 03 source is required")
     installer_sha256 = installer_sha256.strip().lower()
-    if len(installer_sha256) != 64 or any(char not in "0123456789abcdef" for char in installer_sha256):
+    if len(installer_sha256) != 64 or any(
+        char not in "0123456789abcdef" for char in installer_sha256
+    ):
         raise ValueError("Reviewed runtime SHA-256 is required")
 
     key = _secret_key(secret_material)
