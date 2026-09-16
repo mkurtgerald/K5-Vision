@@ -1,0 +1,8 @@
+# Stage 03 candidate-only dependencies. Not product runtime dependencies.
+# Hashes cover the accepted CPython 3.12 x86-64 Windows and Linux wheels.
+numpy==2.2.6 \
+    --hash=sha256:c1f9540be57940698ed329904db803cf7a402f3fc200bfe599334c9bd84a40b2 \
+    --hash=sha256:fd83c01228a688733f1ded5201c678f0c53ecc1006ffbc404db9f7a899ac6249
+opencv-python-headless==4.14.0.94 \
+    --hash=sha256:cbed65415b8f6a9541c705afe3e64795840524d0ff3bc58f507826284a1dc64b \
+    --hash=sha256:211e581f5a4670acbbe08fff36a35e9946039d2eea28b80394632d036d1be527
