@@ -9,11 +9,11 @@ outside this module.
 from __future__ import annotations
 
 import asyncio
+import enum
 import os
+import pathlib
 import re
 import typing
-from enum import StrEnum
-from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 _RECORDING_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
-class FileSinkState(StrEnum):
+class FileSinkState(enum.StrEnum):
     CREATED = "created"
     OPEN = "open"
     FINALIZED = "finalized"
@@ -29,7 +29,7 @@ class FileSinkState(StrEnum):
     FAILED = "failed"
 
 
-class FileSinkErrorCode(StrEnum):
+class FileSinkErrorCode(enum.StrEnum):
     INVALID_RECORDING_ID = "invalid_recording_id"
     INVALID_STATE = "invalid_state"
     CONFLICT = "conflict"
@@ -60,7 +60,7 @@ class AtomicLocalRecordingSink:
 
     def __init__(
         self,
-        root: Path,
+        root: pathlib.Path,
         recording_id: str,
         *,
         max_bytes: int = 8 * 1024 * 1024 * 1024,
@@ -73,7 +73,7 @@ class AtomicLocalRecordingSink:
         if not 1 <= max_bytes <= 8 * 1024 * 1024 * 1024:
             raise ValueError("max_bytes must be between 1 and 8589934592")
 
-        self._root = Path(root).expanduser().resolve(strict=False)
+        self._root = pathlib.Path(root).expanduser().resolve(strict=False)
         self._recording_id = recording_id
         self._max_bytes = max_bytes
         self._part_path = self._root / f".{recording_id}.part"
