@@ -3,6 +3,7 @@
 Runtime-specific RTSP/GStreamer mechanics stay behind this contract. Observable
 state intentionally retains no source URI, credentials, address, frame, or media.
 """
+
 from __future__ import annotations
 
 from enum import StrEnum
@@ -29,6 +30,7 @@ class MediaSessionErrorCode(StrEnum):
 
 class MediaSessionError(RuntimeError):
     """Sanitized error that never carries source material."""
+
     def __init__(self, code: MediaSessionErrorCode, message: str) -> None:
         super().__init__(message)
         self.code = code
@@ -36,7 +38,9 @@ class MediaSessionError(RuntimeError):
 
 class MediaRuntime(Protocol):
     async def start(self, source_uri: str) -> None: ...
+
     async def stop(self) -> None: ...
+
     async def close(self) -> None: ...
 
 
@@ -49,6 +53,7 @@ class MediaSessionSnapshot(BaseModel):
 
 class MediaSession:
     """Deterministic lifecycle wrapper around one selected media runtime."""
+
     def __init__(self, runtime: MediaRuntime) -> None:
         self._runtime = runtime
         self._state = MediaSessionState.CREATED
@@ -60,17 +65,28 @@ class MediaSession:
 
     async def start(self, source_uri: str) -> MediaSessionSnapshot:
         if not source_uri.strip():
-            raise MediaSessionError(MediaSessionErrorCode.INVALID_SOURCE, "media source is empty")
+            raise MediaSessionError(
+                MediaSessionErrorCode.INVALID_SOURCE,
+                "media source is empty",
+            )
         if self._state == MediaSessionState.RUNNING:
             return self.snapshot
         if self._state not in {MediaSessionState.CREATED, MediaSessionState.STOPPED}:
-            raise MediaSessionError(MediaSessionErrorCode.INVALID_STATE, "session cannot start from current state")
+            raise MediaSessionError(
+                MediaSessionErrorCode.INVALID_STATE,
+                "session cannot start from current state",
+            )
+
         self._state = MediaSessionState.OPENING
         try:
             await self._runtime.start(source_uri)
-        except BaseException:
+        except Exception:
             self._state = MediaSessionState.FAILED
-            raise MediaSessionError(MediaSessionErrorCode.RUNTIME_FAILURE, "media runtime failed to start") from None
+            raise MediaSessionError(
+                MediaSessionErrorCode.RUNTIME_FAILURE,
+                "media runtime failed to start",
+            ) from None
+
         self._generation += 1
         self._state = MediaSessionState.RUNNING
         return self.snapshot
@@ -80,13 +96,21 @@ class MediaSession:
             self._state = MediaSessionState.STOPPED
             return self.snapshot
         if self._state != MediaSessionState.RUNNING:
-            raise MediaSessionError(MediaSessionErrorCode.INVALID_STATE, "session cannot stop from current state")
+            raise MediaSessionError(
+                MediaSessionErrorCode.INVALID_STATE,
+                "session cannot stop from current state",
+            )
+
         self._state = MediaSessionState.STOPPING
         try:
             await self._runtime.stop()
-        except BaseException:
+        except Exception:
             self._state = MediaSessionState.FAILED
-            raise MediaSessionError(MediaSessionErrorCode.RUNTIME_FAILURE, "media runtime failed to stop") from None
+            raise MediaSessionError(
+                MediaSessionErrorCode.RUNTIME_FAILURE,
+                "media runtime failed to stop",
+            ) from None
+
         self._state = MediaSessionState.STOPPED
         return self.snapshot
 
@@ -95,10 +119,20 @@ class MediaSession:
             return self.snapshot
         if self._state == MediaSessionState.RUNNING:
             await self.stop()
+        if self._state == MediaSessionState.FAILED:
+            raise MediaSessionError(
+                MediaSessionErrorCode.INVALID_STATE,
+                "failed session requires explicit runtime cleanup",
+            )
+
         try:
             await self._runtime.close()
-        except BaseException:
+        except Exception:
             self._state = MediaSessionState.FAILED
-            raise MediaSessionError(MediaSessionErrorCode.RUNTIME_FAILURE, "media runtime failed to close") from None
+            raise MediaSessionError(
+                MediaSessionErrorCode.RUNTIME_FAILURE,
+                "media runtime failed to close",
+            ) from None
+
         self._state = MediaSessionState.CLOSED
         return self.snapshot
