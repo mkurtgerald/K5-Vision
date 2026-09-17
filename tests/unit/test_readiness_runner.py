@@ -41,7 +41,7 @@ def run(coro):  # type: ignore[no-untyped-def]
     return asyncio.run(coro)
 
 
-def test_runner_executes_complete_increasing_workload_without_source_retention() -> None:
+def test_runner_executes_complete_increasing_reentry_workload_without_source_retention() -> None:
     created: list[FakeRuntime] = []
 
     def factory() -> FakeRuntime:
@@ -68,8 +68,8 @@ def test_runner_executes_complete_increasing_workload_without_source_retention()
 
     run(scenario())
     assert len(created) == 6
-    assert all(runtime.starts == 1 for runtime in created)
-    assert all(runtime.stops == 1 for runtime in created)
+    assert all(runtime.starts == 2 for runtime in created)
+    assert all(runtime.stops == 2 for runtime in created)
     assert all(runtime.closes == 1 for runtime in created)
 
 
@@ -113,7 +113,7 @@ def test_runner_normalizes_stop_failure_and_performs_recovery_cleanup() -> None:
         )
         assert not evidence.accepted
         assert evidence.observations[0].outcome == ReadinessOutcome.STOP_FAILURE
-        assert evidence.observations[0].completed_sessions == 1
+        assert evidence.observations[0].completed_sessions == 0
 
     run(scenario())
     assert created[0].closes == 2
