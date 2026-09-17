@@ -22,22 +22,25 @@ _RECORD_HEADER = struct.Struct(">II")
 
 
 def _rtp(payload: bytes = b"x", *, sequence: int = 1) -> bytes:
-    return bytes(
-        [
-            0x80,
-            96,
-            (sequence >> 8) & 0xFF,
-            sequence & 0xFF,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            1,
-        ]
-    ) + payload
+    return (
+        bytes(
+            [
+                0x80,
+                96,
+                (sequence >> 8) & 0xFF,
+                sequence & 0xFF,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                1,
+            ]
+        )
+        + payload
+    )
 
 
 def _record(packet: bytes, *, checksum: int | None = None) -> bytes:
