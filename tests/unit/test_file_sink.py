@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,35 @@ def test_existing_final_recording_is_never_overwritten(tmp_path: Path) -> None:
         assert caught.value.code == FileSinkErrorCode.CONFLICT
         assert str(tmp_path) not in str(caught.value)
         assert final.read_bytes() == b"original"
+
+    asyncio.run(exercise())
+
+
+def test_finalize_race_never_overwrites_new_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        sink = AtomicLocalRecordingSink(tmp_path, "race")
+        await sink.open()
+        await sink.write(memoryview(b"candidate"))
+        part = tmp_path / ".race.part"
+        final = tmp_path / "race.rtp"
+        real_link = os.link
+
+        def raced_link(src: os.PathLike[str], dst: os.PathLike[str]) -> None:
+            final.write_bytes(b"winner")
+            real_link(src, dst)
+
+        monkeypatch.setattr(os, "link", raced_link)
+
+        with pytest.raises(FileSinkError) as caught:
+            await sink.finalize()
+
+        assert caught.value.code == FileSinkErrorCode.CONFLICT
+        assert final.read_bytes() == b"winner"
+        assert not part.exists()
+        assert sink.snapshot.state == FileSinkState.FAILED
 
     asyncio.run(exercise())
 
