@@ -8,6 +8,8 @@ payload in observable state or retained evidence.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import secrets
 from collections.abc import Awaitable
 from enum import StrEnum
 from typing import Literal, TypeVar
@@ -31,6 +33,7 @@ class LiveViewErrorCode(StrEnum):
     CAPACITY = "capacity"
     INVALID_LEASE = "invalid_lease"
     INVALID_STATE = "invalid_state"
+    SOURCE_MISMATCH = "source_mismatch"
     OPERATION_TIMEOUT = "operation_timeout"
     SESSION_FAILURE = "session_failure"
 
@@ -68,10 +71,10 @@ class LiveViewSnapshot(BaseModel):
 class LiveViewBoundary:
     """Serialize bounded consumers onto one project-owned media session.
 
-    Multiple consumers share one underlying MediaSession start. The final release
-    stops the runtime, preventing consumer fan-out from multiplying camera/runtime
-    connections. Source material is passed through only for the first start and is
-    never copied into lease or snapshot state.
+    Multiple consumers for the same source share one underlying MediaSession start.
+    A process-local keyed fingerprint prevents a second source from joining an active
+    boundary without retaining or exposing the source URI itself. The final release
+    stops the runtime and discards the ephemeral fingerprint.
     """
 
     def __init__(
@@ -89,6 +92,8 @@ class LiveViewBoundary:
         self._max_consumers = max_consumers
         self._operation_timeout_seconds = operation_timeout_seconds
         self._leases: set[UUID] = set()
+        self._source_secret = secrets.token_bytes(32)
+        self._active_source_fingerprint: bytes | None = None
         self._state = LiveViewState.IDLE
         self._lock = asyncio.Lock()
 
@@ -101,6 +106,13 @@ class LiveViewBoundary:
             max_consumers=self._max_consumers,
             generation=session_snapshot.generation,
         )
+
+    def _fingerprint(self, source_uri: str) -> bytes:
+        return hashlib.blake2b(
+            source_uri.encode("utf-8"),
+            key=self._source_secret,
+            digest_size=16,
+        ).digest()
 
     async def _bounded(self, operation: Awaitable[_T]) -> _T:
         try:
@@ -143,8 +155,16 @@ class LiveViewBoundary:
                     "live-view consumer capacity reached",
                 )
 
-            if not self._leases:
+            source_fingerprint = self._fingerprint(source_uri)
+            if self._leases:
+                if source_fingerprint != self._active_source_fingerprint:
+                    raise LiveViewError(
+                        LiveViewErrorCode.SOURCE_MISMATCH,
+                        "live-view boundary is active for another source",
+                    )
+            else:
                 await self._bounded(self._session.start(source_uri))
+                self._active_source_fingerprint = source_fingerprint
                 self._state = LiveViewState.RUNNING
 
             lease_id = uuid4()
@@ -167,6 +187,7 @@ class LiveViewBoundary:
             if self._leases:
                 return self.snapshot
 
+            self._active_source_fingerprint = None
             try:
                 await self._bounded(self._session.stop())
             except Exception:
@@ -184,6 +205,7 @@ class LiveViewBoundary:
                     "live-view recovery requires failed state",
                 )
             self._leases.clear()
+            self._active_source_fingerprint = None
             if self._session.snapshot.state == MediaSessionState.FAILED:
                 await self._bounded(self._session.recover())
             self._state = LiveViewState.IDLE
@@ -195,6 +217,7 @@ class LiveViewBoundary:
             if self._state == LiveViewState.CLOSED:
                 return self.snapshot
             self._leases.clear()
+            self._active_source_fingerprint = None
             try:
                 if self._session.snapshot.state == MediaSessionState.RUNNING:
                     await self._bounded(self._session.stop())
