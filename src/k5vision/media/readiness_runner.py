@@ -98,6 +98,7 @@ async def qualify_readiness(
     source_uri: str,
     *,
     revision: str,
+    execution_context: str = "simulated",
     plan: ReadinessPlan | None = None,
 ) -> ReadinessEvidence:
     """Execute the complete deterministic workload and return source-free evidence."""
@@ -120,6 +121,7 @@ async def qualify_readiness(
 
     return ReadinessEvidence(
         revision=revision,
+        execution_context=execution_context,
         plan=active_plan,
         observations=tuple(observations),
     )
