@@ -58,7 +58,7 @@ jobs:
             throw "Stage 06 did not resolve the reviewed GStreamer 1.28.7 runtime."
           }
 
-          foreach ($plugin in @("rtspsrc", "queue", "fakesink")) {
+          foreach ($plugin in @("rtspsrc", "capsfilter", "queue", "fakesink", "udpsink")) {
             & gst-inspect-1.0 $plugin *> $null
             if ($LASTEXITCODE -ne 0) {
               throw "Required Stage 06 GStreamer plugin is unavailable."
@@ -104,7 +104,7 @@ jobs:
           }
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "K5_STAGE03_CREDENTIAL_INDEX=$index"
 
-      - name: Run Stage 06 live-view lifecycle qualification
+      - name: Run Stage 06 live-view delivery qualification
         shell: powershell
         env:
           K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
@@ -116,6 +116,8 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: stage06-live-view-evidence
-          path: artifacts/stage06-live-view.json
+          path: |
+            artifacts/stage06-live-view.json
+            artifacts/stage06-rtp-delivery.json
           if-no-files-found: warn
           retention-days: 14
