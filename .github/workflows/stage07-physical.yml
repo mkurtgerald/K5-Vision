@@ -1,0 +1,127 @@
+name: Stage 07 Physical Recording Ingest
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/stage07-physical.yml
+      - scripts/provision-stage03-gstreamer.ps1
+      - src/k5vision/media/gstreamer_rtp_relay.py
+      - src/k5vision/media/recording.py
+      - src/k5vision/media/recording_evidence.py
+      - src/k5vision/media/rtp_delivery.py
+      - src/k5vision/stage03_credentials.py
+      - src/k5vision/stage03_credential_probe.py
+      - tests/integration/test_stage07_physical.py
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/stage07-physical.yml
+      - scripts/provision-stage03-gstreamer.ps1
+      - src/k5vision/media/gstreamer_rtp_relay.py
+      - src/k5vision/media/recording.py
+      - src/k5vision/media/recording_evidence.py
+      - src/k5vision/media/rtp_delivery.py
+      - src/k5vision/stage03_credentials.py
+      - src/k5vision/stage03_credential_probe.py
+      - tests/integration/test_stage07_physical.py
+
+permissions:
+  contents: read
+
+jobs:
+  stage07-physical:
+    runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
+    timeout-minutes: 20
+    env:
+      K5_STAGE07_PHYSICAL: "1"
+      K5_STAGE07_OUTPUT: ${{ github.workspace }}\artifacts\stage07-recording-ingest.json
+      K5_STAGE07_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - name: Checkout exact Stage 07 revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Provision isolated reviewed GStreamer runtime
+        shell: powershell
+        run: .\scripts\provision-stage03-gstreamer.ps1
+
+      - name: Verify reviewed runtime surface
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($name in @("gst-launch-1.0", "gst-inspect-1.0")) {
+            if ($null -eq (Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+              throw "Required Stage 07 GStreamer executable is unavailable."
+            }
+          }
+
+          $versionOutput = @(& gst-launch-1.0 --version 2>$null)
+          if ($LASTEXITCODE -ne 0 -or -not ($versionOutput -join "`n").Contains("GStreamer 1.28.7")) {
+            throw "Stage 07 did not resolve the reviewed GStreamer 1.28.7 runtime."
+          }
+
+          foreach ($plugin in @("rtspsrc", "capsfilter", "queue", "fakesink", "udpsink")) {
+            & gst-inspect-1.0 $plugin *> $null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Required Stage 07 GStreamer plugin is unavailable."
+            }
+          }
+
+      - name: Verify private physical configuration
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_SOURCE)) {
+            throw "Required Stage 07 physical source configuration is missing."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_CAM_CRED)) {
+            throw "Required Stage 07 physical credential configuration is missing."
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Resolve private camera credential candidate
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $index = & python -m k5vision.stage03_credential_probe $env:K5_STAGE03_SOURCE
+          if ($LASTEXITCODE -ne 0 -or $index -notmatch '^\d+$') {
+            throw "No supplied camera credential candidate authenticated the Stage 07 source."
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "K5_STAGE03_CREDENTIAL_INDEX=$index"
+
+      - name: Run Stage 07 non-retaining recording-ingest qualification
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: pytest tests/integration/test_stage07_physical.py -q --no-cov
+
+      - name: Upload source-free Stage 07 evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: stage07-recording-ingest-evidence
+          path: artifacts/stage07-recording-ingest.json
+          if-no-files-found: warn
+          retention-days: 14

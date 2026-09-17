@@ -1,0 +1,52 @@
+"""Source-free evidence for Stage-07 recording-ingest qualification."""
+
+from __future__ import annotations
+
+from ipaddress import ip_address
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from k5vision.media.recording import RecordingState
+
+
+class RecordingIngestEvidence(BaseModel):
+    """Retained proof that live RTP reached the bounded recording sink boundary."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1"] = "1"
+    revision: str = Field(pattern=r"^(?:[0-9a-f]{40}|local)$")
+    execution_context: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9][a-z0-9._-]*$",
+    )
+    runtime: Literal["GStreamer 1.28.7"] = "GStreamer 1.28.7"
+    source_transport: Literal["rtsp-udp"] = "rtsp-udp"
+    ingest_transport: Literal["loopback-udp-rtp"] = "loopback-udp-rtp"
+    sink_mode: Literal["non-retaining-qualification"] = "non-retaining-qualification"
+    delivered_packets: int = Field(ge=1, le=4096)
+    delivered_bytes: int = Field(ge=1)
+    sink_packets: int = Field(ge=1, le=4096)
+    sink_bytes: int = Field(ge=1)
+    final_state: RecordingState
+    elapsed_ms: int = Field(ge=0, le=600_000)
+
+    @field_validator("execution_context")
+    @classmethod
+    def reject_network_identity(cls, value: str) -> str:
+        try:
+            ip_address(value)
+        except ValueError:
+            return value
+        raise ValueError("execution context must not contain a literal network address")
+
+    @property
+    def accepted(self) -> bool:
+        return (
+            self.final_state == RecordingState.FINALIZED
+            and self.delivered_packets == self.sink_packets
+            and self.delivered_bytes == self.sink_bytes
+            and self.sink_packets > 0
+        )
