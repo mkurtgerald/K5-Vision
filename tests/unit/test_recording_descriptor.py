@@ -49,12 +49,15 @@ def test_descriptor_serialization_is_deterministic_and_round_trips() -> None:
     second = descriptor.to_json_bytes()
 
     assert first == second
-    assert first == json.dumps(
-        descriptor.model_dump(mode="json"),
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
+    assert (
+        first
+        == json.dumps(
+            descriptor.model_dump(mode="json"),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
 
     parsed = parse_recording_descriptor(first)
     assert parsed == descriptor
@@ -121,9 +124,7 @@ def test_timestamp_contract_requires_utc_order_and_millisecond_precision() -> No
     with pytest.raises(ValidationError):
         _descriptor(
             started_at_utc=_START.astimezone(timezone(timedelta(hours=-4))),
-            ended_at_utc=(_START + timedelta(seconds=1)).astimezone(
-                timezone(timedelta(hours=-4))
-            ),
+            ended_at_utc=(_START + timedelta(seconds=1)).astimezone(timezone(timedelta(hours=-4))),
         )
 
     with pytest.raises(ValidationError):
