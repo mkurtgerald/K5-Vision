@@ -78,9 +78,7 @@ class RecordingStreamDescriptor(BaseModel):
         if self.ended_at_utc < self.started_at_utc:
             raise ValueError("recording end precedes start")
 
-        expected_duration_ms = int(
-            (self.ended_at_utc - self.started_at_utc).total_seconds() * 1000
-        )
+        expected_duration_ms = int((self.ended_at_utc - self.started_at_utc).total_seconds() * 1000)
         if self.duration_ms != expected_duration_ms:
             raise ValueError("recording duration does not match timestamps")
 
@@ -96,9 +94,7 @@ class RecordingStreamDescriptor(BaseModel):
             raise ValueError("supported video RTP clock rate is 90000 Hz")
 
         expected_file_bytes = (
-            _FORMAT_MAGIC_BYTES
-            + (self.packet_count * _RECORD_OVERHEAD_BYTES)
-            + self.payload_bytes
+            _FORMAT_MAGIC_BYTES + (self.packet_count * _RECORD_OVERHEAD_BYTES) + self.payload_bytes
         )
         if self.file_bytes != expected_file_bytes:
             raise ValueError("recording byte counts do not match format framing")
