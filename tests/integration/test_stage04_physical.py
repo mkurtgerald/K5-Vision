@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 import os
 from pathlib import Path
@@ -24,7 +22,7 @@ def test_stage04_selected_udp_runtime_lifecycle() -> None:
     credentials = os.environ["K5_STAGE03_CAM_CRED"]
     credential_index = int(os.environ["K5_STAGE03_CREDENTIAL_INDEX"])
     output = Path(os.environ["K5_STAGE04_OUTPUT"])
-    revision = os.getenv("GITHUB_SHA", "local").casefold()
+    revision = os.getenv("K5_STAGE04_REVISION", "local").casefold()
     authenticated_source = selected_source_uri(source, credentials, credential_index)
 
     # Reuse the Stage-03 finite, secret-safe receive proof before exercising
