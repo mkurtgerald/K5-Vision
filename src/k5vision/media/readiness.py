@@ -66,12 +66,18 @@ class ReadinessObservation(BaseModel):
 
 
 class ReadinessEvidence(BaseModel):
-    """Evidence bound to one revision without source or runner identity."""
+    """Evidence bound to one revision and sanitized execution context."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: Literal["1"] = "1"
     revision: str = Field(pattern=r"^(?:[0-9a-f]{40}|local)$")
+    execution_context: str = Field(
+        default="simulated",
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9][a-z0-9._-]*$",
+    )
     runtime: Literal["GStreamer 1.28.7"] = "GStreamer 1.28.7"
     transport: Literal["udp"] = "udp"
     plan: ReadinessPlan
