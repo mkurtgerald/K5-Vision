@@ -1,3 +1,5 @@
+"""Physical Stage-05 readiness qualification for the reviewed transport/session surface."""
+
 import asyncio
 import os
 from pathlib import Path
