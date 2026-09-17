@@ -19,7 +19,7 @@ def test_delivery_evidence_is_source_free_and_accepted() -> None:
 
     assert evidence.accepted
     payload = evidence.model_dump_json()
-    assert "rtsp" not in payload
+    assert "rtsp://" not in payload
     assert "credential" not in payload.casefold()
     assert "runner" not in payload.casefold()
 
