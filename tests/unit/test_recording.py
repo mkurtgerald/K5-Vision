@@ -47,100 +47,115 @@ class FakeSink:
         self.aborts += 1
 
 
-@pytest.mark.asyncio
-async def test_recording_lifecycle_is_bounded_and_finalize_is_idempotent() -> None:
-    sink = FakeSink()
-    recorder = BoundedRtpRecorder(sink, max_packets=2, max_bytes=4096)
+def test_recording_lifecycle_is_bounded_and_finalize_is_idempotent() -> None:
+    async def exercise() -> None:
+        sink = FakeSink()
+        recorder = BoundedRtpRecorder(sink, max_packets=2, max_bytes=4096)
 
-    await recorder.start()
-    await recorder.start()
-    await recorder.consume(memoryview(rtp_packet(b"one")))
-    await recorder.consume(memoryview(rtp_packet(b"two")))
-    first = await recorder.finalize()
-    second = await recorder.finalize()
+        await recorder.start()
+        await recorder.start()
+        await recorder.consume(memoryview(rtp_packet(b"one")))
+        await recorder.consume(memoryview(rtp_packet(b"two")))
+        first = await recorder.finalize()
+        second = await recorder.finalize()
 
-    assert first == second
-    assert first.state == RecordingState.FINALIZED
-    assert first.packets_written == 2
-    assert sink.opens == 1
-    assert sink.writes == 2
-    assert sink.finalizes == 1
-    assert "payload" not in first.model_dump_json()
+        assert first == second
+        assert first.state == RecordingState.FINALIZED
+        assert first.packets_written == 2
+        assert sink.opens == 1
+        assert sink.writes == 2
+        assert sink.finalizes == 1
+        assert "payload" not in first.model_dump_json()
 
-
-@pytest.mark.asyncio
-async def test_invalid_rtp_is_rejected_before_sink_write() -> None:
-    sink = FakeSink()
-    recorder = BoundedRtpRecorder(sink)
-    await recorder.start()
-
-    with pytest.raises(RecordingError) as caught:
-        await recorder.consume(memoryview(b"not-rtp"))
-
-    assert caught.value.code == RecordingErrorCode.INVALID_PACKET
-    assert sink.writes == 0
-    assert recorder.snapshot.state == RecordingState.RECORDING
+    asyncio.run(exercise())
 
 
-@pytest.mark.asyncio
-async def test_packet_limit_aborts_without_undefined_state() -> None:
-    sink = FakeSink()
-    recorder = BoundedRtpRecorder(sink, max_packets=1)
-    await recorder.start()
-    await recorder.consume(memoryview(rtp_packet()))
+def test_invalid_rtp_is_rejected_before_sink_write() -> None:
+    async def exercise() -> None:
+        sink = FakeSink()
+        recorder = BoundedRtpRecorder(sink)
+        await recorder.start()
 
-    with pytest.raises(RecordingError) as caught:
+        with pytest.raises(RecordingError) as caught:
+            await recorder.consume(memoryview(b"not-rtp"))
+
+        assert caught.value.code == RecordingErrorCode.INVALID_PACKET
+        assert sink.writes == 0
+        assert recorder.snapshot.state == RecordingState.RECORDING
+
+    asyncio.run(exercise())
+
+
+def test_packet_limit_aborts_without_undefined_state() -> None:
+    async def exercise() -> None:
+        sink = FakeSink()
+        recorder = BoundedRtpRecorder(sink, max_packets=1)
+        await recorder.start()
         await recorder.consume(memoryview(rtp_packet()))
 
-    assert caught.value.code == RecordingErrorCode.LIMIT_EXCEEDED
-    assert recorder.snapshot.state == RecordingState.ABORTED
-    assert recorder.snapshot.packets_written == 1
-    assert sink.aborts == 1
+        with pytest.raises(RecordingError) as caught:
+            await recorder.consume(memoryview(rtp_packet()))
+
+        assert caught.value.code == RecordingErrorCode.LIMIT_EXCEEDED
+        assert recorder.snapshot.state == RecordingState.ABORTED
+        assert recorder.snapshot.packets_written == 1
+        assert sink.aborts == 1
+
+    asyncio.run(exercise())
 
 
-@pytest.mark.asyncio
-async def test_sink_failure_is_sanitized_and_aborted() -> None:
-    sink = FakeSink()
-    sink.fail_write = True
-    recorder = BoundedRtpRecorder(sink)
-    packet = rtp_packet(b"super-secret-payload")
-    await recorder.start()
+def test_sink_failure_is_sanitized_and_aborted() -> None:
+    async def exercise() -> None:
+        sink = FakeSink()
+        sink.fail_write = True
+        recorder = BoundedRtpRecorder(sink)
+        packet = rtp_packet(b"super-secret-payload")
+        await recorder.start()
 
-    with pytest.raises(RecordingError) as caught:
-        await recorder.consume(memoryview(packet))
+        with pytest.raises(RecordingError) as caught:
+            await recorder.consume(memoryview(packet))
 
-    assert caught.value.code == RecordingErrorCode.SINK_FAILURE
-    assert "super-secret" not in str(caught.value)
-    assert recorder.snapshot.state == RecordingState.FAILED
-    assert recorder.snapshot.packets_written == 0
-    assert sink.aborts == 1
+        assert caught.value.code == RecordingErrorCode.SINK_FAILURE
+        assert "super-secret" not in str(caught.value)
+        assert recorder.snapshot.state == RecordingState.FAILED
+        assert recorder.snapshot.packets_written == 0
+        assert sink.aborts == 1
 
-
-@pytest.mark.asyncio
-async def test_concurrent_writes_are_serialized() -> None:
-    sink = FakeSink()
-    recorder = BoundedRtpRecorder(sink, max_packets=8)
-    await recorder.start()
-
-    await asyncio.gather(
-        *(recorder.consume(memoryview(rtp_packet(bytes([index])))) for index in range(8))
-    )
-
-    assert recorder.snapshot.packets_written == 8
-    assert sink.writes == 8
-    assert sink.max_active_writes == 1
+    asyncio.run(exercise())
 
 
-@pytest.mark.asyncio
-async def test_abort_is_idempotent_and_finalize_after_abort_is_rejected() -> None:
-    sink = FakeSink()
-    recorder = BoundedRtpRecorder(sink)
-    await recorder.start()
-    await recorder.abort()
-    await recorder.abort()
+def test_concurrent_writes_are_serialized() -> None:
+    async def exercise() -> None:
+        sink = FakeSink()
+        recorder = BoundedRtpRecorder(sink, max_packets=8)
+        await recorder.start()
 
-    assert recorder.snapshot.state == RecordingState.ABORTED
-    assert sink.aborts == 1
-    with pytest.raises(RecordingError) as caught:
-        await recorder.finalize()
-    assert caught.value.code == RecordingErrorCode.INVALID_STATE
+        await asyncio.gather(
+            *(
+                recorder.consume(memoryview(rtp_packet(bytes([index]))))
+                for index in range(8)
+            )
+        )
+
+        assert recorder.snapshot.packets_written == 8
+        assert sink.writes == 8
+        assert sink.max_active_writes == 1
+
+    asyncio.run(exercise())
+
+
+def test_abort_is_idempotent_and_finalize_after_abort_is_rejected() -> None:
+    async def exercise() -> None:
+        sink = FakeSink()
+        recorder = BoundedRtpRecorder(sink)
+        await recorder.start()
+        await recorder.abort()
+        await recorder.abort()
+
+        assert recorder.snapshot.state == RecordingState.ABORTED
+        assert sink.aborts == 1
+        with pytest.raises(RecordingError) as caught:
+            await recorder.finalize()
+        assert caught.value.code == RecordingErrorCode.INVALID_STATE
+
+    asyncio.run(exercise())
