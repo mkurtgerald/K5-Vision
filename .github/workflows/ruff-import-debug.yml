@@ -1,0 +1,22 @@
+name: Stage 08 Ruff Import Diagnostic
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ruff-import-diff:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Install exact observed Ruff
+        run: python -m pip install ruff==0.16.8
+      - name: Show required import fix
+        run: ruff check --select I001 --diff src/k5vision/media/file_sink.py
