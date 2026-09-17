@@ -159,9 +159,18 @@ class AtomicLocalRecordingSink:
         os.fsync(self._file.fileno())
         self._file.close()
         self._file = None
-        if self._final_path.exists():
-            raise FileExistsError
-        os.replace(self._part_path, self._final_path)
+
+        os.link(self._part_path, self._final_path)
+        try:
+            self._part_path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError:
+            try:
+                self._final_path.unlink()
+            except OSError:
+                pass
+            raise
 
     async def finalize(self) -> None:
         if self._state == FileSinkState.FINALIZED:
