@@ -124,7 +124,9 @@ def test_timestamp_origin_mismatch_fails_closed(tmp_path: Path) -> None:
     assert playback.snapshot.descriptor_verified is False
 
 
-def test_descriptor_count_mismatch_is_detected_before_extra_packet_is_exposed(tmp_path: Path) -> None:
+def test_descriptor_count_mismatch_is_detected_before_extra_packet_is_exposed(
+    tmp_path: Path,
+) -> None:
     packets = [
         _rtp(b"a", sequence=1),
         _rtp(b"b", sequence=2, timestamp=124_456),
