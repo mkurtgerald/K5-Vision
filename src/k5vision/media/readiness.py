@@ -57,7 +57,10 @@ class ReadinessObservation(BaseModel):
     def validate_counts(self) -> Self:
         if self.completed_sessions > self.attempted_sessions:
             raise ValueError("completed session count cannot exceed attempted count")
-        if self.outcome == ReadinessOutcome.PASS and self.completed_sessions != self.attempted_sessions:
+        if (
+            self.outcome == ReadinessOutcome.PASS
+            and self.completed_sessions != self.attempted_sessions
+        ):
             raise ValueError("passing observation must complete every attempted session")
         return self
 
