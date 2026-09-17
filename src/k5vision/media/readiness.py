@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from ipaddress import ip_address
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ReadinessOutcome(StrEnum):
@@ -82,6 +83,16 @@ class ReadinessEvidence(BaseModel):
     transport: Literal["udp"] = "udp"
     plan: ReadinessPlan
     observations: tuple[ReadinessObservation, ...]
+
+    @field_validator("execution_context")
+    @classmethod
+    def reject_network_identity(cls, value: str) -> str:
+        """Keep retained context generic by rejecting literal IP addresses."""
+        try:
+            ip_address(value)
+        except ValueError:
+            return value
+        raise ValueError("execution context must not contain a literal network address")
 
     @model_validator(mode="after")
     def validate_observations(self) -> Self:
