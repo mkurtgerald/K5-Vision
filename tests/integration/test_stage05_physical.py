@@ -41,6 +41,7 @@ def test_stage05_transport_session_readiness_workload() -> None:
         )
     )
     assert evidence.accepted
+    assert evidence.revision == revision
     assert evidence.execution_context == "camera-lab-windows-x64"
 
     payload = evidence.model_dump_json(indent=2) + "\n"
