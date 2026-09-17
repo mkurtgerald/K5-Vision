@@ -8,13 +8,16 @@ payload in observable state or retained evidence.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, TypeVar
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from k5vision.media.session import MediaSession, MediaSessionError
+from k5vision.media.session import MediaSession, MediaSessionError, MediaSessionState
+
+_T = TypeVar("_T")
 
 
 class LiveViewState(StrEnum):
@@ -99,12 +102,15 @@ class LiveViewBoundary:
             generation=session_snapshot.generation,
         )
 
-    async def _bounded(self, operation: object) -> object:
+    async def _bounded(self, operation: Awaitable[_T]) -> _T:
         try:
-            return await asyncio.wait_for(  # type: ignore[arg-type]
+            return await asyncio.wait_for(
                 operation,
                 timeout=self._operation_timeout_seconds,
             )
+        except asyncio.CancelledError:
+            self._state = LiveViewState.FAILED
+            raise
         except TimeoutError:
             self._state = LiveViewState.FAILED
             raise LiveViewError(
@@ -125,6 +131,11 @@ class LiveViewBoundary:
                 raise LiveViewError(
                     LiveViewErrorCode.INVALID_STATE,
                     "live-view boundary is closed",
+                )
+            if self._state == LiveViewState.FAILED:
+                raise LiveViewError(
+                    LiveViewErrorCode.INVALID_STATE,
+                    "live-view boundary requires recovery",
                 )
             if len(self._leases) >= self._max_consumers:
                 raise LiveViewError(
@@ -164,6 +175,20 @@ class LiveViewBoundary:
             self._state = LiveViewState.IDLE
             return self.snapshot
 
+    async def recover(self) -> LiveViewSnapshot:
+        """Clean a failed session and return to an idle, restartable boundary."""
+        async with self._lock:
+            if self._state != LiveViewState.FAILED:
+                raise LiveViewError(
+                    LiveViewErrorCode.INVALID_STATE,
+                    "live-view recovery requires failed state",
+                )
+            self._leases.clear()
+            if self._session.snapshot.state == MediaSessionState.FAILED:
+                await self._bounded(self._session.recover())
+            self._state = LiveViewState.IDLE
+            return self.snapshot
+
     async def close(self) -> LiveViewSnapshot:
         """Bounded cleanup for all consumers and the underlying session."""
         async with self._lock:
@@ -171,8 +196,10 @@ class LiveViewBoundary:
                 return self.snapshot
             self._leases.clear()
             try:
-                if self._session.snapshot.state.value == "running":
+                if self._session.snapshot.state == MediaSessionState.RUNNING:
                     await self._bounded(self._session.stop())
+                elif self._session.snapshot.state == MediaSessionState.FAILED:
+                    await self._bounded(self._session.recover())
                 await self._bounded(self._session.close())
             except Exception:
                 self._state = LiveViewState.FAILED
