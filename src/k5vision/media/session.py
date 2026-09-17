@@ -6,8 +6,9 @@ state intentionally retains no source URI, credentials, address, frame, or media
 
 from __future__ import annotations
 
+import asyncio
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
@@ -45,19 +46,23 @@ class MediaRuntime(Protocol):
 
 
 class MediaSessionSnapshot(BaseModel):
+    """Versioned source-free observable session state."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
-    schema_version: str = "1"
+
+    schema_version: Literal["1"] = "1"
     state: MediaSessionState
     generation: int
 
 
 class MediaSession:
-    """Deterministic lifecycle wrapper around one selected media runtime."""
+    """Serialized deterministic lifecycle wrapper around one media runtime."""
 
     def __init__(self, runtime: MediaRuntime) -> None:
         self._runtime = runtime
         self._state = MediaSessionState.CREATED
         self._generation = 0
+        self._lock = asyncio.Lock()
 
     @property
     def snapshot(self) -> MediaSessionSnapshot:
@@ -69,29 +74,34 @@ class MediaSession:
                 MediaSessionErrorCode.INVALID_SOURCE,
                 "media source is empty",
             )
-        if self._state == MediaSessionState.RUNNING:
+
+        async with self._lock:
+            if self._state == MediaSessionState.RUNNING:
+                return self.snapshot
+            if self._state not in {MediaSessionState.CREATED, MediaSessionState.STOPPED}:
+                raise MediaSessionError(
+                    MediaSessionErrorCode.INVALID_STATE,
+                    "session cannot start from current state",
+                )
+
+            self._state = MediaSessionState.OPENING
+            try:
+                await self._runtime.start(source_uri)
+            except asyncio.CancelledError:
+                self._state = MediaSessionState.FAILED
+                raise
+            except Exception:
+                self._state = MediaSessionState.FAILED
+                raise MediaSessionError(
+                    MediaSessionErrorCode.RUNTIME_FAILURE,
+                    "media runtime failed to start",
+                ) from None
+
+            self._generation += 1
+            self._state = MediaSessionState.RUNNING
             return self.snapshot
-        if self._state not in {MediaSessionState.CREATED, MediaSessionState.STOPPED}:
-            raise MediaSessionError(
-                MediaSessionErrorCode.INVALID_STATE,
-                "session cannot start from current state",
-            )
 
-        self._state = MediaSessionState.OPENING
-        try:
-            await self._runtime.start(source_uri)
-        except Exception:
-            self._state = MediaSessionState.FAILED
-            raise MediaSessionError(
-                MediaSessionErrorCode.RUNTIME_FAILURE,
-                "media runtime failed to start",
-            ) from None
-
-        self._generation += 1
-        self._state = MediaSessionState.RUNNING
-        return self.snapshot
-
-    async def stop(self) -> MediaSessionSnapshot:
+    async def _stop_locked(self) -> MediaSessionSnapshot:
         if self._state in {MediaSessionState.CREATED, MediaSessionState.STOPPED}:
             self._state = MediaSessionState.STOPPED
             return self.snapshot
@@ -104,6 +114,9 @@ class MediaSession:
         self._state = MediaSessionState.STOPPING
         try:
             await self._runtime.stop()
+        except asyncio.CancelledError:
+            self._state = MediaSessionState.FAILED
+            raise
         except Exception:
             self._state = MediaSessionState.FAILED
             raise MediaSessionError(
@@ -114,25 +127,56 @@ class MediaSession:
         self._state = MediaSessionState.STOPPED
         return self.snapshot
 
-    async def close(self) -> MediaSessionSnapshot:
-        if self._state == MediaSessionState.CLOSED:
+    async def stop(self) -> MediaSessionSnapshot:
+        async with self._lock:
+            return await self._stop_locked()
+
+    async def recover(self) -> MediaSessionSnapshot:
+        """Clean a failed runtime and return the session to a restartable stopped state."""
+        async with self._lock:
+            if self._state != MediaSessionState.FAILED:
+                raise MediaSessionError(
+                    MediaSessionErrorCode.INVALID_STATE,
+                    "session recovery requires failed state",
+                )
+            try:
+                await self._runtime.close()
+            except asyncio.CancelledError:
+                self._state = MediaSessionState.FAILED
+                raise
+            except Exception:
+                self._state = MediaSessionState.FAILED
+                raise MediaSessionError(
+                    MediaSessionErrorCode.RUNTIME_FAILURE,
+                    "media runtime cleanup failed",
+                ) from None
+
+            self._state = MediaSessionState.STOPPED
             return self.snapshot
-        if self._state == MediaSessionState.RUNNING:
-            await self.stop()
-        if self._state == MediaSessionState.FAILED:
-            raise MediaSessionError(
-                MediaSessionErrorCode.INVALID_STATE,
-                "failed session requires explicit runtime cleanup",
-            )
 
-        try:
-            await self._runtime.close()
-        except Exception:
-            self._state = MediaSessionState.FAILED
-            raise MediaSessionError(
-                MediaSessionErrorCode.RUNTIME_FAILURE,
-                "media runtime failed to close",
-            ) from None
+    async def close(self) -> MediaSessionSnapshot:
+        async with self._lock:
+            if self._state == MediaSessionState.CLOSED:
+                return self.snapshot
+            if self._state == MediaSessionState.RUNNING:
+                await self._stop_locked()
+            if self._state == MediaSessionState.FAILED:
+                raise MediaSessionError(
+                    MediaSessionErrorCode.INVALID_STATE,
+                    "failed session requires recovery before close",
+                )
 
-        self._state = MediaSessionState.CLOSED
-        return self.snapshot
+            try:
+                await self._runtime.close()
+            except asyncio.CancelledError:
+                self._state = MediaSessionState.FAILED
+                raise
+            except Exception:
+                self._state = MediaSessionState.FAILED
+                raise MediaSessionError(
+                    MediaSessionErrorCode.RUNTIME_FAILURE,
+                    "media runtime failed to close",
+                ) from None
+
+            self._state = MediaSessionState.CLOSED
+            return self.snapshot
