@@ -25,9 +25,7 @@ class LocalPersistenceEvidence(BaseModel):
     runtime: Literal["GStreamer 1.28.7"] = "GStreamer 1.28.7"
     source_transport: Literal["rtsp-udp"] = "rtsp-udp"
     ingest_transport: Literal["loopback-udp-rtp"] = "loopback-udp-rtp"
-    persistence_mode: Literal["temporary-local-qualification"] = (
-        "temporary-local-qualification"
-    )
+    persistence_mode: Literal["temporary-local-qualification"] = "temporary-local-qualification"
     delivered_packets: int = Field(ge=1, le=4096)
     delivered_bytes: int = Field(ge=1)
     persisted_bytes: int = Field(ge=1)
