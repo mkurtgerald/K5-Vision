@@ -1,8 +1,8 @@
 """Bounded local persistence sink for the K5 recording boundary.
 
-The sink is intentionally small and project-owned.  It persists opaque packet bytes
+The sink is intentionally small and project-owned. It persists opaque packet bytes
 behind the Stage-07 ``RecordingSink`` protocol while keeping paths and payloads out
-of observable state and exception text.  Playback/container interpretation remains
+of observable state and exception text. Playback/container interpretation remains
 outside this module.
 """
 
@@ -11,9 +11,9 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import typing
 from enum import StrEnum
 from pathlib import Path
-from typing import BinaryIO, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -50,7 +50,7 @@ class FileSinkSnapshot(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1"] = "1"
+    schema_version: typing.Literal["1"] = "1"
     state: FileSinkState
     bytes_written: int = Field(ge=0)
 
@@ -65,10 +65,7 @@ class AtomicLocalRecordingSink:
         *,
         max_bytes: int = 8 * 1024 * 1024 * 1024,
     ) -> None:
-        if (
-            not _RECORDING_ID.fullmatch(recording_id)
-            or recording_id in {".", ".."}
-        ):
+        if not _RECORDING_ID.fullmatch(recording_id) or recording_id in {".", ".."}:
             raise FileSinkError(
                 FileSinkErrorCode.INVALID_RECORDING_ID,
                 "recording identifier is invalid",
@@ -81,7 +78,7 @@ class AtomicLocalRecordingSink:
         self._max_bytes = max_bytes
         self._part_path = self._root / f".{recording_id}.part"
         self._final_path = self._root / f"{recording_id}.rtp"
-        self._file: BinaryIO | None = None
+        self._file: typing.BinaryIO | None = None
         self._state = FileSinkState.CREATED
         self._bytes_written = 0
 
@@ -89,7 +86,7 @@ class AtomicLocalRecordingSink:
     def snapshot(self) -> FileSinkSnapshot:
         return FileSinkSnapshot(state=self._state, bytes_written=self._bytes_written)
 
-    def _open_sync(self) -> BinaryIO:
+    def _open_sync(self) -> typing.BinaryIO:
         self._root.mkdir(parents=True, exist_ok=True)
         if self._final_path.exists():
             raise FileExistsError
