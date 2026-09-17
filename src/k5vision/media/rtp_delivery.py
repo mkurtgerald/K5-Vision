@@ -11,13 +11,22 @@ import socket
 import time
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from k5vision.media.gstreamer_rtp_relay import GStreamerRtpRelayRuntime
 
 RtpConsumer = Callable[[memoryview], Awaitable[None]]
+
+
+class RtpRelay(Protocol):
+    async def start(self, source_uri: str) -> None: ...
+
+    async def close(self) -> None: ...
+
+
+RtpRelayFactory = Callable[[int], RtpRelay]
 
 
 class RtpDeliveryErrorCode(StrEnum):
@@ -75,6 +84,7 @@ class EphemeralRtpDelivery:
         max_datagram_bytes: int = 65_535,
         receive_buffer_bytes: int = 262_144,
         relay_startup_probe_seconds: float = 0.15,
+        relay_factory: RtpRelayFactory | None = None,
     ) -> None:
         if not 1 <= packet_goal <= 4096:
             raise ValueError("packet_goal must be between 1 and 4096")
@@ -92,6 +102,15 @@ class EphemeralRtpDelivery:
         self._max_datagram_bytes = max_datagram_bytes
         self._receive_buffer_bytes = receive_buffer_bytes
         self._relay_startup_probe_seconds = relay_startup_probe_seconds
+        self._relay_factory = relay_factory
+
+    def _make_relay(self, port: int) -> RtpRelay:
+        if self._relay_factory is not None:
+            return self._relay_factory(port)
+        return GStreamerRtpRelayRuntime(
+            port,
+            startup_probe_seconds=self._relay_startup_probe_seconds,
+        )
 
     async def deliver(self, source_uri: str, consumer: RtpConsumer) -> RtpDeliveryResult:
         """Deliver a bounded packet sample; payload bytes are never retained."""
@@ -100,10 +119,7 @@ class EphemeralRtpDelivery:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self._receive_buffer_bytes)
         sock.bind(("127.0.0.1", 0))
         port = int(sock.getsockname()[1])
-        relay = GStreamerRtpRelayRuntime(
-            port,
-            startup_probe_seconds=self._relay_startup_probe_seconds,
-        )
+        relay = self._make_relay(port)
         loop = asyncio.get_running_loop()
         started = time.monotonic()
         valid_packets = 0
@@ -168,6 +184,6 @@ class EphemeralRtpDelivery:
             )
         finally:
             try:
-                await asyncio.shield(relay.close())
+                await relay.close()
             finally:
                 sock.close()
