@@ -38,6 +38,7 @@ async def _run_observation(
     cycle: int,
     timeout_seconds: float,
 ) -> ReadinessObservation:
+    """Run one bounded start/stop/re-entry/stop observation at a concurrency level."""
     sessions = [MediaSession(runtime_factory()) for _ in range(level)]
     started = time.perf_counter()
     completed = 0
@@ -45,20 +46,35 @@ async def _run_observation(
 
     try:
         async with asyncio.timeout(timeout_seconds):
-            start_results = await asyncio.gather(
+            first_start = await asyncio.gather(
                 *(session.start(source_uri) for session in sessions),
                 return_exceptions=True,
             )
-            completed = sum(not isinstance(item, BaseException) for item in start_results)
-            if completed != level:
+            if any(isinstance(item, BaseException) for item in first_start):
                 outcome = ReadinessOutcome.START_FAILURE
             else:
-                stop_results = await asyncio.gather(
+                first_stop = await asyncio.gather(
                     *(session.stop() for session in sessions),
                     return_exceptions=True,
                 )
-                if any(isinstance(item, BaseException) for item in stop_results):
+                if any(isinstance(item, BaseException) for item in first_stop):
                     outcome = ReadinessOutcome.STOP_FAILURE
+                else:
+                    second_start = await asyncio.gather(
+                        *(session.start(source_uri) for session in sessions),
+                        return_exceptions=True,
+                    )
+                    if any(isinstance(item, BaseException) for item in second_start):
+                        outcome = ReadinessOutcome.START_FAILURE
+                    else:
+                        second_stop = await asyncio.gather(
+                            *(session.stop() for session in sessions),
+                            return_exceptions=True,
+                        )
+                        if any(isinstance(item, BaseException) for item in second_stop):
+                            outcome = ReadinessOutcome.STOP_FAILURE
+                        else:
+                            completed = level
     except TimeoutError:
         outcome = ReadinessOutcome.TIMEOUT
     finally:
