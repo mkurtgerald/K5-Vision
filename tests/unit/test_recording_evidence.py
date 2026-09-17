@@ -25,10 +25,12 @@ def evidence(**changes: object) -> RecordingIngestEvidence:
 def test_recording_evidence_accepts_matching_source_free_counts() -> None:
     item = evidence()
     assert item.accepted
-    payload = item.model_dump_json()
-    assert "rtsp" not in payload.casefold()
-    assert "credential" not in payload.casefold()
-    assert "runner" not in payload.casefold()
+    payload = item.model_dump_json().casefold()
+    assert "://" not in payload
+    assert "username" not in payload
+    assert "password" not in payload
+    assert "credential" not in payload
+    assert "runner" not in payload
 
 
 def test_recording_evidence_rejects_literal_network_identity() -> None:
