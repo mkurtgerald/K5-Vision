@@ -36,10 +36,12 @@ def test_stage05_transport_session_readiness_workload() -> None:
             lambda: GStreamerUdpRuntime(startup_probe_seconds=0.5),
             authenticated_source,
             revision=revision,
+            execution_context="camera-lab-windows-x64",
             plan=plan,
         )
     )
     assert evidence.accepted
+    assert evidence.execution_context == "camera-lab-windows-x64"
 
     payload = evidence.model_dump_json(indent=2) + "\n"
     assert authenticated_source not in payload
