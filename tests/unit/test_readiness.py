@@ -64,14 +64,36 @@ def test_evidence_accepts_complete_ordered_source_free_workload() -> None:
     plan = ReadinessPlan(cycles_per_level=2, concurrency_ladder=(1, 2, 4))
     evidence = ReadinessEvidence(
         revision="a" * 40,
+        execution_context="camera-lab-windows-x64",
         plan=plan,
         observations=passing_observations(plan),
     )
     assert evidence.accepted
+    assert evidence.execution_context == "camera-lab-windows-x64"
     payload = evidence.model_dump_json()
     assert "rtsp://" not in payload
     assert "credential" not in payload.casefold()
     assert "runner" not in payload.casefold()
+
+
+@pytest.mark.parametrize(
+    "execution_context",
+    [
+        "Camera Lab",
+        "runner@host",
+        "192.0.2.15",
+        "camera/lab",
+    ],
+)
+def test_evidence_rejects_unsanitized_execution_context(execution_context: str) -> None:
+    plan = ReadinessPlan(cycles_per_level=2)
+    with pytest.raises(ValidationError):
+        ReadinessEvidence(
+            revision="f" * 40,
+            execution_context=execution_context,
+            plan=plan,
+            observations=passing_observations(plan),
+        )
 
 
 def test_evidence_rejects_incomplete_workload() -> None:
