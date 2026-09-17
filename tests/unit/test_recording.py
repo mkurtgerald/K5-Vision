@@ -131,10 +131,7 @@ def test_concurrent_writes_are_serialized() -> None:
         await recorder.start()
 
         await asyncio.gather(
-            *(
-                recorder.consume(memoryview(rtp_packet(bytes([index]))))
-                for index in range(8)
-            )
+            *(recorder.consume(memoryview(rtp_packet(bytes([index])))) for index in range(8))
         )
 
         assert recorder.snapshot.packets_written == 8
