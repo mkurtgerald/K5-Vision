@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from uuid import uuid4
 
 import pytest
 
@@ -95,8 +96,6 @@ async def test_invalid_lease_is_sanitized_and_does_not_stop_active_session() -> 
     boundary = LiveViewBoundary(MediaSession(runtime))
     lease = await boundary.acquire("rtsp://example.invalid/live")
 
-    from uuid import uuid4
-
     with pytest.raises(LiveViewError) as caught:
         await boundary.release(uuid4())
 
@@ -124,7 +123,7 @@ async def test_runtime_failure_does_not_leak_source_or_create_lease() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_timeout_is_bounded_and_source_free() -> None:
+async def test_start_timeout_recovers_then_allows_clean_reentry() -> None:
     source = "rtsp://username:password@192.0.2.55/private"
     runtime = FakeRuntime(start_delay=0.1)
     boundary = LiveViewBoundary(
@@ -139,6 +138,51 @@ async def test_start_timeout_is_bounded_and_source_free() -> None:
     assert source not in str(caught.value)
     assert boundary.snapshot.active_consumers == 0
     assert boundary.snapshot.state == LiveViewState.FAILED
+
+    runtime.start_delay = 0.0
+    recovered = await boundary.recover()
+    assert recovered.state == LiveViewState.IDLE
+    assert runtime.closes == 1
+
+    lease = await boundary.acquire(source)
+    assert lease.generation == 1
+    assert boundary.snapshot.state == LiveViewState.RUNNING
+    await boundary.release(lease.lease_id)
+
+
+@pytest.mark.asyncio
+async def test_failed_boundary_requires_recovery_before_new_acquire() -> None:
+    runtime = FakeRuntime(fail_start=True)
+    boundary = LiveViewBoundary(MediaSession(runtime))
+
+    with pytest.raises(LiveViewError):
+        await boundary.acquire("rtsp://example.invalid/live")
+
+    runtime.fail_start = False
+    with pytest.raises(LiveViewError) as caught:
+        await boundary.acquire("rtsp://example.invalid/live")
+
+    assert caught.value.code == LiveViewErrorCode.INVALID_STATE
+    assert runtime.starts == 1
+
+    await boundary.recover()
+    lease = await boundary.acquire("rtsp://example.invalid/live")
+    assert lease.generation == 1
+
+
+@pytest.mark.asyncio
+async def test_close_recovers_failed_session_before_final_cleanup() -> None:
+    runtime = FakeRuntime(fail_start=True)
+    boundary = LiveViewBoundary(MediaSession(runtime))
+
+    with pytest.raises(LiveViewError):
+        await boundary.acquire("rtsp://example.invalid/live")
+
+    snapshot = await boundary.close()
+
+    assert snapshot.state == LiveViewState.CLOSED
+    assert snapshot.active_consumers == 0
+    assert runtime.closes == 2
 
 
 @pytest.mark.asyncio
