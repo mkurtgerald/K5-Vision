@@ -1,13 +1,28 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from k5vision.media.session import MediaSession, MediaSessionError, MediaSessionState
+from k5vision.media.session import (
+    MediaSession,
+    MediaSessionError,
+    MediaSessionErrorCode,
+    MediaSessionState,
+)
 
 
 class FakeRuntime:
-    def __init__(self, fail_start: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_start: bool = False,
+        fail_stop: bool = False,
+        fail_close: bool = False,
+    ) -> None:
         self.fail_start = fail_start
+        self.fail_stop = fail_stop
+        self.fail_close = fail_close
         self.starts = 0
         self.stops = 0
         self.closes = 0
@@ -19,51 +34,116 @@ class FakeRuntime:
 
     async def stop(self) -> None:
         self.stops += 1
+        if self.fail_stop:
+            raise RuntimeError("unsafe stop detail")
 
     async def close(self) -> None:
         self.closes += 1
+        if self.fail_close:
+            raise RuntimeError("unsafe close detail")
 
 
-@pytest.mark.asyncio
-async def test_session_lifecycle_is_deterministic_and_idempotent() -> None:
-    runtime = FakeRuntime()
-    session = MediaSession(runtime)
-    assert session.snapshot.state == MediaSessionState.CREATED
-
-    first = await session.start("rtsp://secret@example.invalid/stream")
-    second = await session.start("rtsp://secret@example.invalid/stream")
-    assert first.state == second.state == MediaSessionState.RUNNING
-    assert runtime.starts == 1
-
-    await session.stop()
-    await session.stop()
-    assert session.snapshot.state == MediaSessionState.STOPPED
-    assert runtime.stops == 1
-
-    await session.start("rtsp://secret@example.invalid/stream")
-    assert session.snapshot.generation == 2
-    await session.close()
-    await session.close()
-    assert session.snapshot.state == MediaSessionState.CLOSED
-    assert runtime.closes == 1
+def run(coro):  # type: ignore[no-untyped-def]
+    return asyncio.run(coro)
 
 
-@pytest.mark.asyncio
-async def test_runtime_failure_is_sanitized() -> None:
-    source = "rtsp://username:password@192.0.2.1/stream"
-    session = MediaSession(FakeRuntime(fail_start=True))
-    with pytest.raises(MediaSessionError) as caught:
-        await session.start(source)
-    assert session.snapshot.state == MediaSessionState.FAILED
-    assert source not in str(caught.value)
-    assert "username" not in str(caught.value)
-    assert "password" not in str(caught.value)
+def test_session_lifecycle_is_deterministic_and_idempotent() -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        session = MediaSession(runtime)
+        assert session.snapshot.state == MediaSessionState.CREATED
+
+        first = await session.start("rtsp://secret@example.invalid/stream")
+        second = await session.start("rtsp://secret@example.invalid/stream")
+        assert first.state == second.state == MediaSessionState.RUNNING
+        assert first.generation == second.generation == 1
+        assert runtime.starts == 1
+
+        await session.stop()
+        await session.stop()
+        assert session.snapshot.state == MediaSessionState.STOPPED
+        assert runtime.stops == 1
+
+        await session.start("rtsp://secret@example.invalid/stream")
+        assert session.snapshot.generation == 2
+        await session.close()
+        await session.close()
+        assert session.snapshot.state == MediaSessionState.CLOSED
+        assert runtime.stops == 2
+        assert runtime.closes == 1
+
+    run(scenario())
 
 
-@pytest.mark.asyncio
-async def test_empty_source_rejected_before_runtime() -> None:
-    runtime = FakeRuntime()
-    session = MediaSession(runtime)
-    with pytest.raises(MediaSessionError):
-        await session.start("   ")
-    assert runtime.starts == 0
+def test_runtime_start_failure_is_sanitized_and_terminal() -> None:
+    async def scenario() -> None:
+        source = "rtsp://username:password@192.0.2.1/stream"
+        session = MediaSession(FakeRuntime(fail_start=True))
+        with pytest.raises(MediaSessionError) as caught:
+            await session.start(source)
+        assert caught.value.code == MediaSessionErrorCode.RUNTIME_FAILURE
+        assert session.snapshot.state == MediaSessionState.FAILED
+        assert source not in str(caught.value)
+        assert "username" not in str(caught.value)
+        assert "password" not in str(caught.value)
+
+        with pytest.raises(MediaSessionError) as restart:
+            await session.start(source)
+        assert restart.value.code == MediaSessionErrorCode.INVALID_STATE
+
+        with pytest.raises(MediaSessionError) as close:
+            await session.close()
+        assert close.value.code == MediaSessionErrorCode.INVALID_STATE
+
+    run(scenario())
+
+
+def test_stop_failure_is_sanitized() -> None:
+    async def scenario() -> None:
+        session = MediaSession(FakeRuntime(fail_stop=True))
+        await session.start("rtsp://example.invalid/stream")
+        with pytest.raises(MediaSessionError) as caught:
+            await session.stop()
+        assert caught.value.code == MediaSessionErrorCode.RUNTIME_FAILURE
+        assert "unsafe stop detail" not in str(caught.value)
+        assert session.snapshot.state == MediaSessionState.FAILED
+
+    run(scenario())
+
+
+def test_close_failure_is_sanitized() -> None:
+    async def scenario() -> None:
+        session = MediaSession(FakeRuntime(fail_close=True))
+        with pytest.raises(MediaSessionError) as caught:
+            await session.close()
+        assert caught.value.code == MediaSessionErrorCode.RUNTIME_FAILURE
+        assert "unsafe close detail" not in str(caught.value)
+        assert session.snapshot.state == MediaSessionState.FAILED
+
+    run(scenario())
+
+
+def test_empty_source_rejected_before_runtime() -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        session = MediaSession(runtime)
+        with pytest.raises(MediaSessionError) as caught:
+            await session.start("   ")
+        assert caught.value.code == MediaSessionErrorCode.INVALID_SOURCE
+        assert runtime.starts == 0
+
+    run(scenario())
+
+
+def test_closed_session_rejects_restart_and_stop() -> None:
+    async def scenario() -> None:
+        session = MediaSession(FakeRuntime())
+        await session.close()
+        with pytest.raises(MediaSessionError) as restart:
+            await session.start("rtsp://example.invalid/stream")
+        assert restart.value.code == MediaSessionErrorCode.INVALID_STATE
+        with pytest.raises(MediaSessionError) as stop:
+            await session.stop()
+        assert stop.value.code == MediaSessionErrorCode.INVALID_STATE
+
+    run(scenario())
