@@ -10,7 +10,6 @@ from k5vision.media.stage04_evidence import Stage04PhysicalEvidence
 from k5vision.stage03_credentials import selected_source_uri
 from k5vision.stage03_gst_candidate import run_gst_uri
 
-
 pytestmark = pytest.mark.skipif(
     os.getenv("K5_STAGE04_PHYSICAL") != "1",
     reason="Stage 04 physical qualification is opt-in",
