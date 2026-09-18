@@ -132,7 +132,7 @@ class _Win32DibSurfaceApi:
         if sys.platform != "win32":
             raise _NativeSurfaceError(_NativeSurfaceFailure.UNSUPPORTED_PLATFORM)
         try:
-            loader = getattr(ctypes, "WinDLL")
+            loader = ctypes.WinDLL
             self._gdi32 = loader("gdi32", use_last_error=True)
             self._create_dib_section = self._gdi32.CreateDIBSection
             self._delete_object = self._gdi32.DeleteObject
@@ -398,7 +398,10 @@ class BoundedWindowsPresentationSurface:
                     WindowsPresentationSurfaceErrorCode.INVALID_STATE,
                     "presentation surface is not open",
                 )
-            if not isinstance(frame, PresentationVideoFrame) or frame.pixel_format != PixelFormat.BGRX:
+            if (
+                not isinstance(frame, PresentationVideoFrame)
+                or frame.pixel_format != PixelFormat.BGRX
+            ):
                 self._fail_and_release()
                 raise WindowsPresentationSurfaceError(
                     WindowsPresentationSurfaceErrorCode.INVALID_FRAME,
