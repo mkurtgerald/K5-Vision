@@ -180,8 +180,7 @@ class BoundedMixedPresentation:
                 "mixed presentation stream count is outside the configured bound",
             )
         if any(
-            not isinstance(stream, (MixedLiveStream, MixedPlaybackStream))
-            for stream in selected
+            not isinstance(stream, (MixedLiveStream, MixedPlaybackStream)) for stream in selected
         ):
             raise MixedPresentationError(
                 MixedPresentationErrorCode.INVALID_STREAM_SET,
