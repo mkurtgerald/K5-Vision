@@ -34,9 +34,7 @@ def test_dispatch_routes_frames_and_retains_only_aggregate_state() -> None:
     async def second(frame: PresentationVideoFrame) -> None:
         observed[1].append(frame.source_elapsed_ms)
 
-    dispatcher = BoundedViewportDispatcher(
-        [ViewportBinding(0, first), ViewportBinding(1, second)]
-    )
+    dispatcher = BoundedViewportDispatcher([ViewportBinding(0, first), ViewportBinding(1, second)])
 
     async def exercise() -> object:
         await dispatcher.dispatch(0, _frame(10))
@@ -69,9 +67,7 @@ def test_unknown_duplicate_and_out_of_range_slots_fail_closed_or_validate() -> N
     assert dispatcher.snapshot.state == ViewportDispatchState.OPEN
 
     with pytest.raises(ViewportDispatchError) as duplicate_exc:
-        BoundedViewportDispatcher(
-            [ViewportBinding(1, consume), ViewportBinding(1, consume)]
-        )
+        BoundedViewportDispatcher([ViewportBinding(1, consume), ViewportBinding(1, consume)])
     assert duplicate_exc.value.code == ViewportDispatchErrorCode.INVALID_BINDINGS
 
     with pytest.raises(ValueError):
