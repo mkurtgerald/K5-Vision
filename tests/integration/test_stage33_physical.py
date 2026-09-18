@@ -17,7 +17,10 @@ from k5vision.media.mixed_presentation import MixedLiveStream, MixedPlaybackStre
 from k5vision.media.playback_schedule import PlaybackRate
 from k5vision.media.presentation_frame import PixelFormat, PresentationVideoFrame
 from k5vision.media.presentation_host import BoundedPresentationHost, PresentationHostState
-from k5vision.media.presentation_host_evidence import PresentationHostPhysicalEvidence, write_evidence
+from k5vision.media.presentation_host_evidence import (
+    PresentationHostPhysicalEvidence,
+    write_evidence,
+)
 from k5vision.media.presentation_playback import BoundedPresentationPlaybackDelivery
 from k5vision.media.presentation_runtime import BoundedPresentationRuntime
 from k5vision.media.recording_descriptor import RecordingStreamDescriptor, VideoCodec
