@@ -99,9 +99,10 @@ def test_multiview_playback_serializes_consumer_and_retains_aggregate_state() ->
     assert snapshot.delivered_frame_bytes == 16
     assert snapshot.max_source_span_ms == 100
     payload = snapshot.model_dump_json()
-    assert "recording" not in payload
-    assert "source" not in payload
-    assert "path" not in payload
+    assert "recording_id" not in payload
+    assert "source_id" not in payload
+    assert "rtsp://" not in payload
+    assert "SECRET" not in payload
     assert "abcd" not in payload
 
 
