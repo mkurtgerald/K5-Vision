@@ -165,7 +165,7 @@ def test_navigation_failure_is_sanitized(tmp_path: Path) -> None:
         list(window.iter_packets())
 
     assert exc.value.code == PlaybackWindowErrorCode.NAVIGATION_FAILURE
-    assert exc.value.navigation_error_code == PlaybackNavigationErrorCode.NAVIGATION_FAILURE
+    assert exc.value.navigation_error_code == PlaybackNavigationErrorCode.TIMELINE_FAILURE
     assert "SECRET" not in str(exc.value)
     assert str(tmp_path) not in str(exc.value)
     assert window.snapshot.state == PlaybackWindowState.FAILED
