@@ -164,7 +164,7 @@ class BoundedPlaybackPump:
                     remaining = started + (item.due_ms / 1000.0) - now
                     if remaining > 0:
                         await self._sleep(remaining)
-                    elif item.due_ms > 0:
+                    elif remaining < 0:
                         self._late_packets += 1
                 except asyncio.CancelledError:
                     self._state = PlaybackPumpState.CANCELLED
