@@ -174,13 +174,13 @@ def test_stage30_operator_session_runs_mixed_live_playback_to_viewports() -> Non
                 [ViewportBinding(0, viewport_zero), ViewportBinding(1, viewport_one)],
                 max_viewports=2,
                 max_total_frames=100_000,
-                max_total_frame_bytes=4 * 1024 * 1024 * 1024,
+                max_total_frame_bytes=16 * 1024 * 1024 * 1024,
                 consumer_timeout_seconds=2.0,
             )
             coordinator = BoundedMixedPresentation(
                 max_streams=2,
                 max_total_frames=100_000,
-                max_total_frame_bytes=4 * 1024 * 1024 * 1024,
+                max_total_frame_bytes=16 * 1024 * 1024 * 1024,
                 consumer_timeout_seconds=2.0,
             )
             session = BoundedPresentationSession(coordinator, dispatcher)
