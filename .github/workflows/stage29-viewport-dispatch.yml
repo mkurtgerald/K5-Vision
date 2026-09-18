@@ -1,0 +1,188 @@
+name: Stage 29 Viewport Dispatch Qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/stage29-viewport-dispatch.yml
+      - scripts/provision-stage03-gstreamer.ps1
+      - src/k5vision/media/framed_recording.py
+      - src/k5vision/media/gstreamer_native_abi.py
+      - src/k5vision/media/gstreamer_playback_decoder.py
+      - src/k5vision/media/gstreamer_rtp_relay.py
+      - src/k5vision/media/live_presentation.py
+      - src/k5vision/media/mixed_presentation.py
+      - src/k5vision/media/playback_pump.py
+      - src/k5vision/media/playback_schedule.py
+      - src/k5vision/media/presentation_decoder.py
+      - src/k5vision/media/presentation_frame.py
+      - src/k5vision/media/presentation_playback.py
+      - src/k5vision/media/recording_descriptor.py
+      - src/k5vision/media/rtp_delivery.py
+      - src/k5vision/media/viewport_dispatch.py
+      - src/k5vision/media/viewport_dispatch_evidence.py
+      - src/k5vision/stage03_credentials.py
+      - src/k5vision/stage03_credential_probe.py
+      - tests/integration/test_stage29_physical.py
+      - tests/unit/test_viewport_dispatch.py
+      - docs/stage29-dependency-review.md
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/stage29-viewport-dispatch.yml
+      - scripts/provision-stage03-gstreamer.ps1
+      - src/k5vision/media/framed_recording.py
+      - src/k5vision/media/gstreamer_native_abi.py
+      - src/k5vision/media/gstreamer_playback_decoder.py
+      - src/k5vision/media/gstreamer_rtp_relay.py
+      - src/k5vision/media/live_presentation.py
+      - src/k5vision/media/mixed_presentation.py
+      - src/k5vision/media/playback_pump.py
+      - src/k5vision/media/playback_schedule.py
+      - src/k5vision/media/presentation_decoder.py
+      - src/k5vision/media/presentation_frame.py
+      - src/k5vision/media/presentation_playback.py
+      - src/k5vision/media/recording_descriptor.py
+      - src/k5vision/media/rtp_delivery.py
+      - src/k5vision/media/viewport_dispatch.py
+      - src/k5vision/media/viewport_dispatch_evidence.py
+      - src/k5vision/stage03_credentials.py
+      - src/k5vision/stage03_credential_probe.py
+      - tests/integration/test_stage29_physical.py
+      - tests/unit/test_viewport_dispatch.py
+      - docs/stage29-dependency-review.md
+
+permissions:
+  contents: read
+
+jobs:
+  stage29-viewport-dispatch:
+    runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
+    timeout-minutes: 45
+    env:
+      K5_STAGE29_PHYSICAL: "1"
+      K5_STAGE29_OUTPUT: ${{ github.workspace }}\artifacts\stage29-viewport-dispatch.json
+      K5_STAGE29_ABI_OUTPUT: ${{ github.workspace }}\artifacts\stage29-native-abi.json
+      K5_STAGE29_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - name: Checkout exact Stage 29 revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Provision isolated reviewed GStreamer runtime
+        shell: powershell
+        run: .\scripts\provision-stage03-gstreamer.ps1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Requalify accepted native decoder ABI
+        shell: powershell
+        run: |
+          python -m k5vision.media.gstreamer_native_abi `
+            --revision $env:K5_STAGE29_REVISION `
+            --output $env:K5_STAGE29_ABI_OUTPUT
+          if ($LASTEXITCODE -ne 0) {
+            throw "Stage 29 native ABI qualification failed."
+          }
+
+      - name: Run Stage 29 unit regression
+        shell: powershell
+        run: pytest tests/unit/test_viewport_dispatch.py -q --no-cov
+
+      - name: Verify private physical configuration
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_SOURCE)) {
+            throw "Required Stage 29 physical source configuration is missing."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_CAM_CRED)) {
+            throw "Required Stage 29 physical credential configuration is missing."
+          }
+
+      - name: Resolve private camera credential candidate
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $index = & python -m k5vision.stage03_credential_probe $env:K5_STAGE03_SOURCE
+          if ($LASTEXITCODE -ne 0 -or $index -notmatch '^\d+$') {
+            throw "No supplied camera credential candidate authenticated the Stage 29 source."
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "K5_STAGE03_CREDENTIAL_INDEX=$index"
+
+      - name: Run Stage 29 mixed-path viewport qualification
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: pytest tests/integration/test_stage29_physical.py -q --no-cov
+
+      - name: Assert no qualification payload remains
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $leaks = Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Filter "k5-stage29-*" -Force -ErrorAction SilentlyContinue
+          if ($leaks) {
+            $leaks | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            throw "Stage 29 qualification temporary payload cleanup was incomplete."
+          }
+
+      - name: Assert retained evidence is source-free
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($path in @($env:K5_STAGE29_OUTPUT, $env:K5_STAGE29_ABI_OUTPUT)) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Stage 29 required evidence was not produced."
+            }
+            $text = Get-Content -LiteralPath $path -Raw
+            foreach ($pattern in @(
+              'rtsp://',
+              '(?i)username',
+              '(?i)password',
+              '(?i)credential',
+              '(?i)runner[_ -]?name',
+              '(?i)recording_id',
+              '(?i)source_id',
+              '(?i)payload',
+              '[A-Za-z]:\\',
+              '\\Users\\',
+              '(?<![0-9])(?:10\.|127\.|169\.254\.|192\.168\.)'
+            )) {
+              if ($text -match $pattern) {
+                throw "Stage 29 retained evidence violated the source-free contract."
+              }
+            }
+          }
+
+      - name: Upload source-free Stage 29 evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: stage29-viewport-dispatch-evidence
+          path: |
+            artifacts/stage29-viewport-dispatch.json
+            artifacts/stage29-native-abi.json
+          if-no-files-found: warn
+          retention-days: 14
