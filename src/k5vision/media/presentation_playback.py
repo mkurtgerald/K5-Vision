@@ -342,13 +342,19 @@ class BoundedPresentationPlaybackDelivery:
         self._state = PresentationPlaybackState.RUNNING
         decoder: PresentationDecoder | None = None
         primary_error: BaseException | None = None
+        boundary_error: PresentationPlaybackError | None = None
 
         try:
             decoder = self._new_decoder()
 
             async def packet_consumer(packet: memoryview, source_elapsed_ms: int) -> None:
-                frames = await self._decode(decoder, packet, source_elapsed_ms)
-                await self._emit_frames(frames, consumer)
+                nonlocal boundary_error
+                try:
+                    frames = await self._decode(decoder, packet, source_elapsed_ms)
+                    await self._emit_frames(frames, consumer)
+                except PresentationPlaybackError as exc:
+                    boundary_error = exc
+                    raise
 
             try:
                 pump_snapshot = await self._pump.run(packet_consumer)
@@ -368,6 +374,9 @@ class BoundedPresentationPlaybackDelivery:
                 raise
             except PlaybackPumpError:
                 self._state = PresentationPlaybackState.FAILED
+                if boundary_error is not None:
+                    primary_error = boundary_error
+                    raise boundary_error from None
                 wrapped = PresentationPlaybackError(
                     PresentationPlaybackErrorCode.PUMP_FAILURE,
                     "presentation playback pump failed",
