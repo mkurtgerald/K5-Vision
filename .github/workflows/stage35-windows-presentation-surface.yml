@@ -1,0 +1,151 @@
+name: Stage 35 Windows Presentation Surface Qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/stage35-windows-presentation-surface.yml
+      - scripts/provision-stage03-gstreamer.ps1
+      - src/k5vision/media/**
+      - src/k5vision/stage03_credentials.py
+      - src/k5vision/stage03_credential_probe.py
+      - tests/integration/test_stage35_physical.py
+      - tests/unit/test_windows_presentation_surface.py
+      - docs/stage35-dependency-review.md
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/stage35-windows-presentation-surface.yml
+      - scripts/provision-stage03-gstreamer.ps1
+      - src/k5vision/media/**
+      - src/k5vision/stage03_credentials.py
+      - src/k5vision/stage03_credential_probe.py
+      - tests/integration/test_stage35_physical.py
+      - tests/unit/test_windows_presentation_surface.py
+      - docs/stage35-dependency-review.md
+
+permissions:
+  contents: read
+
+jobs:
+  stage35-windows-presentation-surface:
+    runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
+    timeout-minutes: 35
+    env:
+      K5_STAGE35_PHYSICAL: "1"
+      K5_STAGE35_OUTPUT: ${{ github.workspace }}\artifacts\stage35-windows-presentation-surface.json
+      K5_STAGE35_ABI_OUTPUT: ${{ github.workspace }}\artifacts\stage35-native-abi.json
+      K5_STAGE35_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - name: Checkout exact Stage 35 revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Provision isolated reviewed GStreamer runtime
+        shell: powershell
+        run: .\scripts\provision-stage03-gstreamer.ps1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Requalify accepted native decoder ABI
+        shell: powershell
+        run: |
+          python -m k5vision.media.gstreamer_native_abi `
+            --revision $env:K5_STAGE35_REVISION `
+            --output $env:K5_STAGE35_ABI_OUTPUT
+          if ($LASTEXITCODE -ne 0) {
+            throw "Stage 35 native decoder ABI qualification failed."
+          }
+
+      - name: Run Stage 35 unit regression
+        shell: powershell
+        run: pytest tests/unit/test_windows_presentation_surface.py -q --no-cov
+
+      - name: Verify private physical configuration
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_SOURCE)) {
+            throw "Required Stage 35 physical source configuration is missing."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_CAM_CRED)) {
+            throw "Required Stage 35 physical credential configuration is missing."
+          }
+
+      - name: Resolve private camera credential candidate
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $index = & python -m k5vision.stage03_credential_probe $env:K5_STAGE03_SOURCE
+          if ($LASTEXITCODE -ne 0 -or $index -notmatch '^\d+$') {
+            throw "No supplied camera credential candidate authenticated the Stage 35 source."
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "K5_STAGE03_CREDENTIAL_INDEX=$index"
+
+      - name: Run Stage 35 Windows presentation-surface qualification
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: pytest tests/integration/test_stage35_physical.py -q --no-cov
+
+      - name: Assert retained evidence is source-free
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($path in @($env:K5_STAGE35_OUTPUT, $env:K5_STAGE35_ABI_OUTPUT)) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Stage 35 required evidence was not produced."
+            }
+            $text = Get-Content -LiteralPath $path -Raw
+            foreach ($pattern in @(
+              'rtsp://',
+              '(?i)username',
+              '(?i)password',
+              '(?i)credential',
+              '(?i)runner[_ -]?name',
+              '(?i)recording_id',
+              '(?i)source_id',
+              '(?i)payload',
+              '(?i)handle',
+              '(?i)pointer',
+              '[A-Za-z]:\\',
+              '\\Users\\',
+              '(?<![0-9])(?:10\.|127\.|169\.254\.|192\.168\.)'
+            )) {
+              if ($text -match $pattern) {
+                throw "Stage 35 retained evidence violated the source-free contract."
+              }
+            }
+          }
+
+      - name: Upload source-free Stage 35 evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: stage35-windows-presentation-surface-evidence
+          path: |
+            artifacts/stage35-windows-presentation-surface.json
+            artifacts/stage35-native-abi.json
+          if-no-files-found: warn
+          retention-days: 14
