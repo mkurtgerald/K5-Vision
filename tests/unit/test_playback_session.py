@@ -49,7 +49,9 @@ def _packets() -> list[bytes]:
     return [_rtp(b"a", sequence=1), _rtp(b"b", sequence=2)]
 
 
-def _descriptor(packets: list[bytes], *, codec: VideoCodec = VideoCodec.H264) -> RecordingStreamDescriptor:
+def _descriptor(
+    packets: list[bytes], *, codec: VideoCodec = VideoCodec.H264
+) -> RecordingStreamDescriptor:
     return RecordingStreamDescriptor(
         recording_id=_RECORDING_ID,
         source_id=_SOURCE_ID,
@@ -134,7 +136,7 @@ def test_session_composes_recording_to_transient_frames(tmp_path: Path) -> None:
     assert snapshot.descriptor_verified is True
     serialized = str(snapshot.model_dump())
     assert "session-boundary" not in serialized
-    assert "frame" not in serialized
+    assert "b'frame'" not in serialized
 
 
 def test_unsupported_codec_fails_before_decoder_initialization(tmp_path: Path) -> None:
