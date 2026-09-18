@@ -150,9 +150,7 @@ def test_plan_must_match_viewport_slots_before_child_execution() -> None:
 
     async def exercise() -> None:
         with pytest.raises(PresentationRuntimeError) as exc:
-            await runtime.start(
-                _streams(live=live, playback=playback, playback_slot=2)
-            )
+            await runtime.start(_streams(live=live, playback=playback, playback_slot=2))
         assert exc.value.code == PresentationRuntimeErrorCode.INVALID_PLAN
         assert runtime.snapshot.state == PresentationRuntimeState.CREATED
 
