@@ -139,7 +139,8 @@ class BoundedPlaybackDecodeBridge:
                 raise ValueError(f"{name} must be between zero and 10")
         if not 0 < pump_consumer_timeout_seconds <= 10:
             raise ValueError("pump_consumer_timeout_seconds must be between zero and 10")
-        if not all(callable(getattr(decoder, name, None)) for name in ("decode", "flush", "close")):
+        methods = ("decode", "flush", "close")
+        if not all(callable(getattr(decoder, name, None)) for name in methods):
             raise PlaybackDecodeError(
                 PlaybackDecodeErrorCode.INVALID_DECODER,
                 "playback decoder does not satisfy the required boundary",
@@ -255,6 +256,26 @@ class BoundedPlaybackDecodeBridge:
             self._decoded_bytes += frame_bytes
             self._source_span_ms = max(self._source_span_ms, frame.source_elapsed_ms)
 
+    async def _flush(self, consumer: FrameConsumer) -> None:
+        try:
+            frames = await asyncio.wait_for(
+                self._decoder.flush(),
+                timeout=self._decoder_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            raise PlaybackDecodeError(
+                PlaybackDecodeErrorCode.DECODER_TIMEOUT,
+                "playback decoder flush timed out",
+            ) from None
+        except Exception:
+            raise PlaybackDecodeError(
+                PlaybackDecodeErrorCode.DECODER_FAILURE,
+                "playback decoder flush failed",
+            ) from None
+        await self._emit_frames(frames, consumer)
+
     async def _close_decoder(self) -> None:
         try:
             await asyncio.wait_for(
@@ -281,32 +302,21 @@ class BoundedPlaybackDecodeBridge:
 
         self._state = PlaybackDecodeState.RUNNING
         primary_error: BaseException | None = None
+        boundary_error: PlaybackDecodeError | None = None
 
         async def packet_consumer(packet: memoryview, source_elapsed_ms: int) -> None:
-            frames = await self._decode(packet, source_elapsed_ms)
-            await self._emit_frames(frames, consumer)
+            nonlocal boundary_error
+            try:
+                frames = await self._decode(packet, source_elapsed_ms)
+                await self._emit_frames(frames, consumer)
+            except PlaybackDecodeError as exc:
+                boundary_error = exc
+                raise
 
         try:
             try:
                 pump_snapshot = await self._pump.run(packet_consumer)
-                try:
-                    flush_frames = await asyncio.wait_for(
-                        self._decoder.flush(),
-                        timeout=self._decoder_timeout_seconds,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except TimeoutError:
-                    raise PlaybackDecodeError(
-                        PlaybackDecodeErrorCode.DECODER_TIMEOUT,
-                        "playback decoder flush timed out",
-                    ) from None
-                except Exception:
-                    raise PlaybackDecodeError(
-                        PlaybackDecodeErrorCode.DECODER_FAILURE,
-                        "playback decoder flush failed",
-                    ) from None
-                await self._emit_frames(flush_frames, consumer)
+                await self._flush(consumer)
                 self._pump_delivered_packets = pump_snapshot.delivered_packets
                 self._descriptor_verified = pump_snapshot.descriptor_verified
                 self._state = PlaybackDecodeState.COMPLETE
@@ -320,6 +330,9 @@ class BoundedPlaybackDecodeBridge:
                 raise
             except PlaybackPumpError as exc:
                 self._state = PlaybackDecodeState.FAILED
+                if boundary_error is not None:
+                    primary_error = boundary_error
+                    raise boundary_error from None
                 wrapped = PlaybackDecodeError(
                     PlaybackDecodeErrorCode.PUMP_FAILURE,
                     "playback pump failed",
