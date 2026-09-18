@@ -8,6 +8,7 @@ never written to the retained evidence contract.
 from __future__ import annotations
 
 import argparse
+import enum
 import json
 import pathlib
 import re
@@ -23,7 +24,7 @@ _DECODER = "d3d11h264dec"
 _MAX_INSPECT_BYTES = 1_048_576
 
 
-class DecoderRuntimeErrorCode(typing.StrEnum):
+class DecoderRuntimeErrorCode(enum.StrEnum):
     RUNTIME_UNAVAILABLE = "runtime_unavailable"
     INSPECT_FAILURE = "inspect_failure"
     METADATA_INVALID = "metadata_invalid"
