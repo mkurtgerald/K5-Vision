@@ -148,7 +148,7 @@ def test_stage28_live_and_playback_present_concurrently_to_serialized_consumer()
             coordinator = BoundedMixedPresentation(
                 max_streams=2,
                 max_total_frames=100_000,
-                max_total_frame_bytes=4 * 1024 * 1024 * 1024,
+                max_total_frame_bytes=16 * 1024 * 1024 * 1024,
                 consumer_timeout_seconds=2.0,
             )
             streams = [

@@ -1,4 +1,4 @@
-"""Physical qualification for renderer-neutral viewport dispatch over mixed presentation."""
+"""Physical qualification for the bounded operator presentation session."""
 
 from __future__ import annotations
 
@@ -21,22 +21,22 @@ from k5vision.media.mixed_presentation import (
 from k5vision.media.playback_schedule import PlaybackRate
 from k5vision.media.presentation_frame import PixelFormat, PresentationVideoFrame
 from k5vision.media.presentation_playback import BoundedPresentationPlaybackDelivery
-from k5vision.media.recording_descriptor import RecordingStreamDescriptor, VideoCodec
-from k5vision.media.rtp_delivery import EphemeralRtpDelivery
-from k5vision.media.viewport_dispatch import (
-    BoundedViewportDispatcher,
-    ViewportBinding,
-    ViewportDispatchState,
+from k5vision.media.presentation_session import (
+    BoundedPresentationSession,
+    PresentationSessionState,
 )
-from k5vision.media.viewport_dispatch_evidence import (
-    ViewportDispatchPhysicalEvidence,
+from k5vision.media.presentation_session_evidence import (
+    PresentationSessionPhysicalEvidence,
     write_evidence,
 )
+from k5vision.media.recording_descriptor import RecordingStreamDescriptor, VideoCodec
+from k5vision.media.rtp_delivery import EphemeralRtpDelivery
+from k5vision.media.viewport_dispatch import BoundedViewportDispatcher, ViewportBinding
 from k5vision.stage03_credentials import selected_source_uri
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("K5_STAGE29_PHYSICAL") != "1",
-    reason="Stage 29 physical qualification is opt-in",
+    os.getenv("K5_STAGE30_PHYSICAL") != "1",
+    reason="Stage 30 physical qualification is opt-in",
 )
 
 
@@ -44,8 +44,8 @@ def _physical_context() -> tuple[str, str, Path, str, Path]:
     source = os.environ["K5_STAGE03_SOURCE"]
     credentials = os.environ["K5_STAGE03_CAM_CRED"]
     credential_index = int(os.environ["K5_STAGE03_CREDENTIAL_INDEX"])
-    output = Path(os.environ["K5_STAGE29_OUTPUT"])
-    revision = os.environ["K5_STAGE29_REVISION"].casefold()
+    output = Path(os.environ["K5_STAGE30_OUTPUT"])
+    revision = os.environ["K5_STAGE30_REVISION"].casefold()
     runner_temp = Path(os.environ["RUNNER_TEMP"])
     authenticated_source = selected_source_uri(source, credentials, credential_index)
     return source, authenticated_source, output, revision, runner_temp
@@ -71,11 +71,11 @@ def _rtp_timestamp(packet: memoryview) -> int:
     return int.from_bytes(packet[4:8], "big")
 
 
-def test_stage29_mixed_frames_cross_transient_viewport_dispatch() -> None:
+def test_stage30_operator_session_runs_mixed_live_playback_to_viewports() -> None:
     source, authenticated_source, output, revision, runner_temp = _physical_context()
-    scratch = runner_temp / f"k5-stage29-{uuid4().hex}"
+    scratch = runner_temp / f"k5-stage30-{uuid4().hex}"
 
-    async def qualify() -> ViewportDispatchPhysicalEvidence:
+    async def qualify() -> PresentationSessionPhysicalEvidence:
         recording_id = uuid4()
         source_id = uuid4()
         sink = FramedAtomicRecordingSink(scratch, str(recording_id), max_packets=2048)
@@ -149,12 +149,6 @@ def test_stage29_mixed_frames_cross_transient_viewport_dispatch() -> None:
                 pump_consumer_timeout_seconds=4.0,
                 cleanup_timeout_seconds=2.0,
             )
-            mixed = BoundedMixedPresentation(
-                max_streams=2,
-                max_total_frames=100_000,
-                max_total_frame_bytes=16 * 1024 * 1024 * 1024,
-                consumer_timeout_seconds=2.0,
-            )
             frames_by_slot = {0: 0, 1: 0}
             geometry: dict[int, tuple[int, int, int]] = {}
 
@@ -183,28 +177,42 @@ def test_stage29_mixed_frames_cross_transient_viewport_dispatch() -> None:
                 max_total_frame_bytes=16 * 1024 * 1024 * 1024,
                 consumer_timeout_seconds=2.0,
             )
+            coordinator = BoundedMixedPresentation(
+                max_streams=2,
+                max_total_frames=100_000,
+                max_total_frame_bytes=16 * 1024 * 1024 * 1024,
+                consumer_timeout_seconds=2.0,
+            )
+            session = BoundedPresentationSession(coordinator, dispatcher)
             streams = [
                 MixedLiveStream(0, authenticated_source, live_delivery),
                 MixedPlaybackStream(1, playback_delivery),
             ]
-            mixed_snapshot = await mixed.run(streams, dispatcher.dispatch)
-            assert mixed_snapshot.completed_streams == 2
+            snapshot = await session.run(streams)
+
+            assert snapshot.state == PresentationSessionState.COMPLETE
+            assert snapshot.stream_count == 2
+            assert snapshot.live_streams == 1
+            assert snapshot.playback_streams == 1
+            assert snapshot.viewport_count == 2
+            assert snapshot.completed_streams == 2
             assert frames_by_slot[0] >= 1
             assert frames_by_slot[1] >= 1
-            open_snapshot = dispatcher.snapshot
-            assert open_snapshot.delivered_frames == mixed_snapshot.delivered_frames
-            assert open_snapshot.delivered_frame_bytes == mixed_snapshot.delivered_frame_bytes
-            closed_snapshot = await dispatcher.close()
-            assert closed_snapshot.state == ViewportDispatchState.CLOSED
+            assert snapshot.delivered_frames == frames_by_slot[0] + frames_by_slot[1]
+            assert snapshot.delivered_frame_bytes >= snapshot.delivered_frames
 
-            return ViewportDispatchPhysicalEvidence(
+            return PresentationSessionPhysicalEvidence(
                 revision=revision,
                 execution_context="camera-lab-windows-x64",
-                viewport_count=closed_snapshot.viewport_count,
-                delivered_frames=closed_snapshot.delivered_frames,
-                delivered_frame_bytes=closed_snapshot.delivered_frame_bytes,
-                max_source_span_ms=closed_snapshot.max_source_span_ms,
-                final_state=closed_snapshot.state,
+                stream_count=snapshot.stream_count,
+                live_streams=snapshot.live_streams,
+                playback_streams=snapshot.playback_streams,
+                viewport_count=snapshot.viewport_count,
+                completed_streams=snapshot.completed_streams,
+                delivered_frames=snapshot.delivered_frames,
+                delivered_frame_bytes=snapshot.delivered_frame_bytes,
+                max_source_span_ms=snapshot.max_source_span_ms,
+                final_state=snapshot.state,
             )
         finally:
             if sink.snapshot.state not in {
