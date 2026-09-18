@@ -175,11 +175,7 @@ def test_child_failure_is_sanitized_and_dispatcher_is_released() -> None:
     dispatcher = _dispatcher()
     session = BoundedPresentationSession(BoundedMixedPresentation(), dispatcher)
     with pytest.raises(PresentationSessionError) as exc:
-        asyncio.run(
-            session.run(
-                _streams(live=FakeLiveDelivery([], fail=True))
-            )
-        )
+        asyncio.run(session.run(_streams(live=FakeLiveDelivery([], fail=True))))
     assert exc.value.code == PresentationSessionErrorCode.PRESENTATION_FAILURE
     assert "SECRET" not in str(exc.value)
     assert session.snapshot.state == PresentationSessionState.FAILED
