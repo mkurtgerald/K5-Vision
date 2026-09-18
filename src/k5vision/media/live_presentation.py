@@ -181,6 +181,7 @@ class BoundedLivePresentationDelivery:
         self._delivered_frames = 0
         self._delivered_frame_bytes = 0
         self._source_span_ms = 0
+        self._last_packet_elapsed_ms = 0
         self._rtp_timestamp_origin: int | None = None
 
     @property
@@ -244,6 +245,7 @@ class BoundedLivePresentationDelivery:
                 LivePresentationErrorCode.INVALID_RTP,
                 "live presentation RTP timing exceeded the bounded source span",
             )
+        self._last_packet_elapsed_ms = elapsed_ms
         return elapsed_ms
 
     async def _decode(
@@ -344,7 +346,25 @@ class BoundedLivePresentationDelivery:
                 LivePresentationErrorCode.DECODER_FAILURE,
                 "live presentation decoder flush failed",
             ) from None
-        await self._emit_frames(frames, self._source_span_ms, consumer)
+
+        rebound: list[PresentationVideoFrame] = []
+        for frame in frames:
+            if not isinstance(frame, PresentationVideoFrame):
+                raise LivePresentationError(
+                    LivePresentationErrorCode.INVALID_FRAME,
+                    "live presentation decoder emitted an invalid flush frame",
+                )
+            rebound.append(
+                PresentationVideoFrame(
+                    payload=frame.payload,
+                    width=frame.width,
+                    height=frame.height,
+                    stride_bytes=frame.stride_bytes,
+                    pixel_format=frame.pixel_format,
+                    source_elapsed_ms=self._last_packet_elapsed_ms,
+                )
+            )
+        await self._emit_frames(rebound, self._last_packet_elapsed_ms, consumer)
 
     async def _close_decoder(self, decoder: LivePresentationDecoder) -> None:
         try:
