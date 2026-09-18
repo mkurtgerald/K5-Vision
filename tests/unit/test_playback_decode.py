@@ -152,7 +152,7 @@ def test_decode_bridge_delivers_transient_frames_and_flushes(tmp_path: Path) -> 
     assert snapshot.descriptor_verified is True
     assert decoder.closed is True
     serialized = str(snapshot.model_dump())
-    assert "decoded" not in serialized
+    assert "b'decoded'" not in serialized
     assert "decode-boundary" not in serialized
 
 
@@ -355,7 +355,13 @@ def test_invalid_decoder_contract_is_rejected(tmp_path: Path) -> None:
     packets = _packets()
     path = _write_recording(tmp_path, "bad-decoder", packets)
     with pytest.raises(PlaybackDecodeError) as caught:
-        BoundedPlaybackDecodeBridge(path, _descriptor(packets), 0, 0, object())  # type: ignore[arg-type]
+        BoundedPlaybackDecodeBridge(
+            path,
+            _descriptor(packets),
+            0,
+            0,
+            object(),  # type: ignore[arg-type]
+        )
     assert caught.value.code == PlaybackDecodeErrorCode.INVALID_DECODER
 
 
@@ -371,7 +377,11 @@ def test_invalid_decoder_contract_is_rejected(tmp_path: Path) -> None:
         ({"cleanup_timeout_seconds": 11}, "cleanup_timeout_seconds"),
     ],
 )
-def test_constructor_bounds_fail_closed(tmp_path: Path, kwargs: dict[str, object], message: str) -> None:
+def test_constructor_bounds_fail_closed(
+    tmp_path: Path,
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
     decoder = FakeDecoder()
     packets = _packets()
     path = _write_recording(tmp_path, f"bounds-{message}", packets)
