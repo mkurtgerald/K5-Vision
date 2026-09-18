@@ -170,7 +170,11 @@ class _CtypesGStreamerBackend:
         self._core.gst_element_set_state.restype = ctypes.c_int
         self._core.gst_object_unref.argtypes = [ctypes.c_void_p]
         self._core.gst_object_unref.restype = None
-        self._core.gst_buffer_new_allocate.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        self._core.gst_buffer_new_allocate.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        ]
         self._core.gst_buffer_new_allocate.restype = ctypes.c_void_p
         self._core.gst_buffer_fill.argtypes = [
             ctypes.c_void_p,
@@ -210,7 +214,8 @@ class _CtypesGStreamerBackend:
             )
         description = (
             "appsrc name=k5src is-live=false block=true format=time "
-            f"caps=application/x-rtp,media=video,encoding-name=H264,clock-rate=90000,payload={payload_type} "
+            f"caps=application/x-rtp,media=video,encoding-name=H264,"
+            f"clock-rate=90000,payload={payload_type} "
             "! rtph264depay ! h264parse ! d3d11h264dec ! videoconvert "
             "! video/x-raw,format=BGRx "
             "! appsink name=k5sink sync=false max-buffers=4 drop=true"
@@ -289,7 +294,11 @@ class _CtypesGStreamerBackend:
             idle_polls += 1
             if idle_polls >= 4:
                 break
-        if len(frames) >= self._max_frames_per_push and flush and not self._app.gst_app_sink_is_eos(self._sink):
+        if (
+            len(frames) >= self._max_frames_per_push
+            and flush
+            and not self._app.gst_app_sink_is_eos(self._sink)
+        ):
             raise NativePlaybackDecoderError(
                 NativePlaybackDecoderErrorCode.FRAME_LIMIT,
                 "native decoder flush exceeded the frame bound",
@@ -479,7 +488,10 @@ class GStreamerNativePlaybackDecoder:
         packet: memoryview,
         source_elapsed_ms: int,
     ) -> Sequence[DecodedVideoFrame]:
-        if self._state not in {NativePlaybackDecoderState.CREATED, NativePlaybackDecoderState.RUNNING}:
+        if self._state not in {
+            NativePlaybackDecoderState.CREATED,
+            NativePlaybackDecoderState.RUNNING,
+        }:
             raise NativePlaybackDecoderError(
                 NativePlaybackDecoderErrorCode.INVALID_STATE,
                 "native decoder cannot accept input from current state",
@@ -502,7 +514,10 @@ class GStreamerNativePlaybackDecoder:
     async def flush(self) -> Sequence[DecodedVideoFrame]:
         if self._state == NativePlaybackDecoderState.EOS:
             return []
-        if self._state not in {NativePlaybackDecoderState.CREATED, NativePlaybackDecoderState.RUNNING}:
+        if self._state not in {
+            NativePlaybackDecoderState.CREATED,
+            NativePlaybackDecoderState.RUNNING,
+        }:
             raise NativePlaybackDecoderError(
                 NativePlaybackDecoderErrorCode.INVALID_STATE,
                 "native decoder cannot flush from current state",
