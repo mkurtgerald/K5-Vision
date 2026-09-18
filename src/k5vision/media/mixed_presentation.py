@@ -12,7 +12,7 @@ import enum
 import typing
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Protocol, TypeAlias
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -76,7 +76,7 @@ class MixedPlaybackStream:
             raise TypeError("delivery must implement the playback presentation boundary")
 
 
-MixedPresentationStream: TypeAlias = MixedLiveStream | MixedPlaybackStream
+type MixedPresentationStream = MixedLiveStream | MixedPlaybackStream
 MixedPresentationFrameConsumer = Callable[[int, PresentationVideoFrame], Awaitable[None]]
 
 
@@ -179,7 +179,10 @@ class BoundedMixedPresentation:
                 MixedPresentationErrorCode.INVALID_STREAM_SET,
                 "mixed presentation stream count is outside the configured bound",
             )
-        if any(not isinstance(stream, (MixedLiveStream, MixedPlaybackStream)) for stream in selected):
+        if any(
+            not isinstance(stream, (MixedLiveStream, MixedPlaybackStream))
+            for stream in selected
+        ):
             raise MixedPresentationError(
                 MixedPresentationErrorCode.INVALID_STREAM_SET,
                 "mixed presentation stream set is invalid",
