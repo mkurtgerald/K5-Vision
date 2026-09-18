@@ -152,7 +152,7 @@ def test_stage29_mixed_frames_cross_transient_viewport_dispatch() -> None:
             mixed = BoundedMixedPresentation(
                 max_streams=2,
                 max_total_frames=100_000,
-                max_total_frame_bytes=4 * 1024 * 1024 * 1024,
+                max_total_frame_bytes=16 * 1024 * 1024 * 1024,
                 consumer_timeout_seconds=2.0,
             )
             frames_by_slot = {0: 0, 1: 0}
@@ -180,7 +180,7 @@ def test_stage29_mixed_frames_cross_transient_viewport_dispatch() -> None:
                 [ViewportBinding(0, viewport_zero), ViewportBinding(1, viewport_one)],
                 max_viewports=2,
                 max_total_frames=100_000,
-                max_total_frame_bytes=4 * 1024 * 1024 * 1024,
+                max_total_frame_bytes=16 * 1024 * 1024 * 1024,
                 consumer_timeout_seconds=2.0,
             )
             streams = [
