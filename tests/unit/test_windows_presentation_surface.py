@@ -42,9 +42,7 @@ class FakeNativeApi:
     ) -> None:
         if self.fail_copy:
             raise surface_module._NativeSurfaceError(surface_module._NativeSurfaceFailure.COPY)
-        self.copy_calls.append(
-            (bits_pointer, native_stride_bytes, frame.width, len(frame.payload))
-        )
+        self.copy_calls.append((bits_pointer, native_stride_bytes, frame.width, len(frame.payload)))
 
     def destroy_surface(self, handle: int) -> None:
         self.destroy_calls.append(handle)
