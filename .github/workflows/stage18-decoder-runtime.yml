@@ -1,0 +1,111 @@
+name: Stage 18 Decoder Runtime Qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/stage18-decoder-runtime.yml
+      - scripts/provision-stage03-gstreamer.ps1
+      - src/k5vision/media/decoder_runtime.py
+      - tests/unit/test_decoder_runtime.py
+      - docs/stage18-dependency-review.md
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/stage18-decoder-runtime.yml
+      - scripts/provision-stage03-gstreamer.ps1
+      - src/k5vision/media/decoder_runtime.py
+      - tests/unit/test_decoder_runtime.py
+      - docs/stage18-dependency-review.md
+
+permissions:
+  contents: read
+
+jobs:
+  stage18-decoder-runtime:
+    runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
+    timeout-minutes: 15
+    env:
+      K5_STAGE18_OUTPUT: ${{ github.workspace }}\artifacts\stage18-decoder-runtime.json
+      K5_STAGE18_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - name: Checkout exact Stage 18 revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Provision isolated reviewed GStreamer runtime
+        shell: powershell
+        run: .\scripts\provision-stage03-gstreamer.ps1
+
+      - name: Verify pinned GStreamer runtime identity
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $versionOutput = @(& gst-launch-1.0 --version 2>$null)
+          if ($LASTEXITCODE -ne 0 -or -not ($versionOutput -join "`n").Contains("GStreamer 1.28.7")) {
+            throw "Stage 18 did not resolve the pinned GStreamer 1.28.7 runtime."
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Qualify source-free decoder runtime surface
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $qualifyArgs = @(
+            "-m", "k5vision.media.decoder_runtime",
+            "--revision", $env:K5_STAGE18_REVISION,
+            "--output", $env:K5_STAGE18_OUTPUT
+          )
+          if (-not [string]::IsNullOrWhiteSpace($env:K5_GSTREAMER_INSTALLER_SHA256)) {
+            $qualifyArgs += @("--installer-sha256", $env:K5_GSTREAMER_INSTALLER_SHA256)
+          }
+          & python @qualifyArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "Stage 18 decoder runtime qualification failed closed."
+          }
+
+      - name: Assert retained evidence is source-free
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path -LiteralPath $env:K5_STAGE18_OUTPUT)) {
+            throw "Stage 18 evidence was not produced."
+          }
+          $text = Get-Content -LiteralPath $env:K5_STAGE18_OUTPUT -Raw
+          foreach ($pattern in @(
+            'rtsp://',
+            '(?i)username',
+            '(?i)password',
+            '(?i)credential',
+            '(?i)runner[_ -]?name',
+            '[A-Za-z]:\\',
+            '\\Users\\',
+            '(?<![0-9])(?:10\.|127\.|169\.254\.|192\.168\.)'
+          )) {
+            if ($text -match $pattern) {
+              throw "Stage 18 retained evidence violated the source-free contract."
+            }
+          }
+
+      - name: Upload source-free Stage 18 evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: stage18-decoder-runtime-evidence
+          path: artifacts/stage18-decoder-runtime.json
+          if-no-files-found: warn
+          retention-days: 14
