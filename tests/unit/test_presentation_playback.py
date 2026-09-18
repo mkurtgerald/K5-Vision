@@ -24,22 +24,25 @@ _START = datetime(2026, 9, 18, 1, 0, 0, tzinfo=UTC)
 
 
 def _rtp(*, sequence: int, timestamp: int, payload: bytes = b"x") -> bytes:
-    return bytes(
-        [
-            0x80,
-            96,
-            (sequence >> 8) & 0xFF,
-            sequence & 0xFF,
-            (timestamp >> 24) & 0xFF,
-            (timestamp >> 16) & 0xFF,
-            (timestamp >> 8) & 0xFF,
-            timestamp & 0xFF,
-            0,
-            0,
-            0,
-            1,
-        ]
-    ) + payload
+    return (
+        bytes(
+            [
+                0x80,
+                96,
+                (sequence >> 8) & 0xFF,
+                sequence & 0xFF,
+                (timestamp >> 24) & 0xFF,
+                (timestamp >> 16) & 0xFF,
+                (timestamp >> 8) & 0xFF,
+                timestamp & 0xFF,
+                0,
+                0,
+                0,
+                1,
+            ]
+        )
+        + payload
+    )
 
 
 def _packets() -> list[bytes]:
@@ -49,7 +52,9 @@ def _packets() -> list[bytes]:
     ]
 
 
-def _descriptor(packets: list[bytes], *, codec: VideoCodec = VideoCodec.H264) -> RecordingStreamDescriptor:
+def _descriptor(
+    packets: list[bytes], *, codec: VideoCodec = VideoCodec.H264
+) -> RecordingStreamDescriptor:
     return RecordingStreamDescriptor(
         recording_id=_RECORDING_ID,
         source_id=_SOURCE_ID,
