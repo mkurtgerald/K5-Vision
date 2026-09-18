@@ -158,17 +158,23 @@ def test_inspection_timeout_is_sanitized(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "private" not in str(caught.value)
 
 
+def _run_with_output(
+    output: bytes,
+):
+    def fake_run(
+        args: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(args, 0, stdout=output)
+
+    return fake_run
+
+
 def test_non_utf8_or_oversized_output_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     outputs = [b"\xff", b"x" * (decoder_runtime._MAX_INSPECT_BYTES + 1)]
 
     for output in outputs:
-        def fake_run(
-            args: list[str],
-            **_kwargs: object,
-        ) -> subprocess.CompletedProcess[bytes]:
-            return subprocess.CompletedProcess(args, 0, stdout=output)
-
-        monkeypatch.setattr(decoder_runtime.subprocess, "run", fake_run)
+        monkeypatch.setattr(decoder_runtime.subprocess, "run", _run_with_output(output))
         with pytest.raises(DecoderRuntimeError) as caught:
             qualify_decoder_runtime(_REVISION, inspect_executable="gst-inspect-1.0")
         assert caught.value.code == DecoderRuntimeErrorCode.METADATA_INVALID
