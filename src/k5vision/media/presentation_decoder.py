@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import os
 import pathlib
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -49,6 +50,13 @@ class _PresentationBackend(Protocol):
 
 class _PresentationCtypesBackend(_CtypesGStreamerBackend):
     """Accepted decoder pipeline with bounded sample geometry extraction."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        # Backend calls run in worker threads. A timed-out asyncio waiter cannot
+        # cancel an already-running native call, so cleanup must never unref the
+        # pipeline/appsink until that call has actually left the native surface.
+        self._native_operation_lock = threading.RLock()
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
 
     def _bind_signatures(self) -> None:
         super()._bind_signatures()
@@ -143,6 +151,18 @@ class _PresentationCtypesBackend(_CtypesGStreamerBackend):
             )
         finally:
             self._core.gst_mini_object_unref(sample)
+
+    def push(self, packet: bytes) -> Sequence[_PresentationPayload]:
+        with self._native_operation_lock:
+            return super().push(packet)  # type: ignore[return-value]
+
+    def end_of_stream(self) -> Sequence[_PresentationPayload]:
+        with self._native_operation_lock:
+            return super().end_of_stream()  # type: ignore[return-value]
+
+    def close(self) -> None:
+        with self._native_operation_lock:
+            super().close()
 
 
 class GStreamerPresentationDecoder(GStreamerNativePlaybackDecoder):
