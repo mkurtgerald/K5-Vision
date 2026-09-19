@@ -9,8 +9,8 @@ import pytest
 from k5vision.media.presentation_frame import PixelFormat, PresentationVideoFrame
 from k5vision.media.windows_presentation_surface import (
     _HGDI_ERROR,
-    _Win32DibSurfaceApi,
     BoundedWindowsPresentationSurface,
+    _Win32DibSurfaceApi,
 )
 
 
