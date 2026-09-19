@@ -272,9 +272,7 @@ class _Win32DibSurfaceApi:
         target_dc: int,
     ) -> None:
         try:
-            source_dc = int(
-                self._create_compatible_dc(ctypes.c_void_p(target_dc)) or 0
-            )
+            source_dc = int(self._create_compatible_dc(ctypes.c_void_p(target_dc)) or 0)
         except Exception:
             raise _NativeSurfaceError(_NativeSurfaceFailure.BLIT) from None
         if source_dc == 0:
