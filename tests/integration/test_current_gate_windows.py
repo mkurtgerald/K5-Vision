@@ -6,15 +6,15 @@ import sys
 
 import pytest
 
-from k5vision.media.presentation_frame import PixelFormat, PresentationVideoFrame
-from k5vision.media.windows_presentation_surface import BoundedWindowsPresentationSurface
-
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only gate qualification")
 
 
 def test_real_gdi_target_receives_exact_surface_bytes() -> None:
     async def scenario() -> None:
+        from k5vision.media.presentation_frame import PixelFormat, PresentationVideoFrame
+        from k5vision.media.windows_presentation_surface import BoundedWindowsPresentationSurface
+
         surface_module = __import__(
             "k5vision.media.windows_presentation_surface",
             fromlist=["*"],
