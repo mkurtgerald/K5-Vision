@@ -23,8 +23,12 @@ _MAX_TOTAL_FRAME_BYTES = 64 * 1024 * 1024 * 1024
 _MAX_FRAMES = 1_000_000
 _MAX_SURFACE_REPLACEMENTS = 1024
 _MAX_SOURCE_SPAN_MS = 2_147_483_647
+_MAX_BLITS = 1_000_000
 _BI_RGB = 0
 _DIB_RGB_COLORS = 0
+_SRCCOPY = 0x00CC0020
+_HGDI_ERROR = ctypes.c_void_p(-1).value
+_MAX_POINTER = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
 
 
 class WindowsPresentationSurfaceState(enum.StrEnum):
@@ -42,6 +46,9 @@ class WindowsPresentationSurfaceErrorCode(enum.StrEnum):
     NATIVE_LOAD_FAILURE = "native_load_failure"
     SURFACE_CREATE_FAILURE = "surface_create_failure"
     SURFACE_COPY_FAILURE = "surface_copy_failure"
+    INVALID_TARGET = "invalid_target"
+    BLIT_FAILURE = "blit_failure"
+    BLIT_LIMIT = "blit_limit"
     SURFACE_REPLACEMENT_LIMIT = "surface_replacement_limit"
     FRAME_LIMIT = "frame_limit"
     FRAME_BYTES_LIMIT = "frame_bytes_limit"
@@ -72,6 +79,7 @@ class WindowsPresentationSurfaceSnapshot(BaseModel):
     presented_frame_bytes: int = Field(ge=0, le=_MAX_TOTAL_FRAME_BYTES)
     surface_replacements: int = Field(ge=0, le=_MAX_SURFACE_REPLACEMENTS)
     max_source_span_ms: int = Field(ge=0, le=_MAX_SOURCE_SPAN_MS)
+    blits: int = Field(ge=0, le=_MAX_BLITS)
 
 
 class _NativeSurfaceFailure(enum.StrEnum):
@@ -79,6 +87,7 @@ class _NativeSurfaceFailure(enum.StrEnum):
     LOAD = "load"
     CREATE = "create"
     COPY = "copy"
+    BLIT = "blit"
     DESTROY = "destroy"
 
 
@@ -97,6 +106,14 @@ class _NativeSurfaceBoundary(typing.Protocol):
         bits_pointer: int,
         native_stride_bytes: int,
         frame: PresentationVideoFrame,
+    ) -> None: ...
+
+    def blit_surface(
+        self,
+        handle: int,
+        width: int,
+        height: int,
+        target_dc: int,
     ) -> None: ...
 
     def destroy_surface(self, handle: int) -> None: ...
@@ -147,6 +164,28 @@ class _Win32DibSurfaceApi:
             self._create_dib_section.restype = ctypes.c_void_p
             self._delete_object.argtypes = [ctypes.c_void_p]
             self._delete_object.restype = ctypes.c_int
+            self._create_compatible_dc = self._gdi32.CreateCompatibleDC
+            self._delete_dc = self._gdi32.DeleteDC
+            self._select_object = self._gdi32.SelectObject
+            self._bit_blt = self._gdi32.BitBlt
+            self._create_compatible_dc.argtypes = [ctypes.c_void_p]
+            self._create_compatible_dc.restype = ctypes.c_void_p
+            self._delete_dc.argtypes = [ctypes.c_void_p]
+            self._delete_dc.restype = ctypes.c_int
+            self._select_object.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self._select_object.restype = ctypes.c_void_p
+            self._bit_blt.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint32,
+            ]
+            self._bit_blt.restype = ctypes.c_int
         except Exception:
             raise _NativeSurfaceError(_NativeSurfaceFailure.LOAD) from None
 
@@ -225,6 +264,77 @@ class _Win32DibSurfaceApi:
         except Exception:
             raise _NativeSurfaceError(_NativeSurfaceFailure.COPY) from None
 
+    def blit_surface(
+        self,
+        handle: int,
+        width: int,
+        height: int,
+        target_dc: int,
+    ) -> None:
+        try:
+            source_dc = int(self._create_compatible_dc(ctypes.c_void_p(target_dc)) or 0)
+        except Exception:
+            raise _NativeSurfaceError(_NativeSurfaceFailure.BLIT) from None
+        if source_dc == 0:
+            raise _NativeSurfaceError(_NativeSurfaceFailure.BLIT)
+
+        try:
+            previous = int(
+                self._select_object(
+                    ctypes.c_void_p(source_dc),
+                    ctypes.c_void_p(handle),
+                )
+                or 0
+            )
+        except Exception:
+            try:
+                self._delete_dc(ctypes.c_void_p(source_dc))
+            except Exception:
+                pass
+            raise _NativeSurfaceError(_NativeSurfaceFailure.BLIT) from None
+
+        if previous in {0, _HGDI_ERROR}:
+            try:
+                self._delete_dc(ctypes.c_void_p(source_dc))
+            except Exception:
+                pass
+            raise _NativeSurfaceError(_NativeSurfaceFailure.BLIT)
+
+        try:
+            copied = bool(
+                self._bit_blt(
+                    ctypes.c_void_p(target_dc),
+                    0,
+                    0,
+                    width,
+                    height,
+                    ctypes.c_void_p(source_dc),
+                    0,
+                    0,
+                    _SRCCOPY,
+                )
+            )
+        except Exception:
+            copied = False
+
+        try:
+            restored = int(
+                self._select_object(
+                    ctypes.c_void_p(source_dc),
+                    ctypes.c_void_p(previous),
+                )
+                or 0
+            )
+        except Exception:
+            restored = 0
+        try:
+            deleted_dc = bool(self._delete_dc(ctypes.c_void_p(source_dc)))
+        except Exception:
+            deleted_dc = False
+
+        if not copied or restored in {0, _HGDI_ERROR} or not deleted_dc:
+            raise _NativeSurfaceError(_NativeSurfaceFailure.BLIT)
+
     def destroy_surface(self, handle: int) -> None:
         try:
             deleted = self._delete_object(ctypes.c_void_p(handle))
@@ -244,6 +354,7 @@ class BoundedWindowsPresentationSurface:
         max_frame_bytes: int = 64 * 1024 * 1024,
         max_total_frame_bytes: int = 16 * 1024 * 1024 * 1024,
         max_surface_replacements: int = 64,
+        max_blits: int = 100_000,
         native_api: _NativeSurfaceBoundary | None = None,
     ) -> None:
         if not 1 <= max_frames <= _MAX_FRAMES:
@@ -254,11 +365,14 @@ class BoundedWindowsPresentationSurface:
             raise ValueError("max_total_frame_bytes must be between 1 and 68719476736")
         if not 0 <= max_surface_replacements <= _MAX_SURFACE_REPLACEMENTS:
             raise ValueError("max_surface_replacements must be between 0 and 1024")
+        if not 1 <= max_blits <= _MAX_BLITS:
+            raise ValueError("max_blits must be between 1 and 1000000")
 
         self._max_frames = max_frames
         self._max_frame_bytes = max_frame_bytes
         self._max_total_frame_bytes = max_total_frame_bytes
         self._max_surface_replacements = max_surface_replacements
+        self._max_blits = max_blits
         self._native_api = native_api
         self._state = WindowsPresentationSurfaceState.READY
         self._surface_handle: int | None = None
@@ -270,6 +384,7 @@ class BoundedWindowsPresentationSurface:
         self._presented_frame_bytes = 0
         self._surface_replacements = 0
         self._max_source_span_ms = 0
+        self._blits = 0
         self._lock = asyncio.Lock()
 
     @property
@@ -284,6 +399,7 @@ class BoundedWindowsPresentationSurface:
             presented_frame_bytes=self._presented_frame_bytes,
             surface_replacements=self._surface_replacements,
             max_source_span_ms=self._max_source_span_ms,
+            blits=self._blits,
         )
 
     async def open(self) -> WindowsPresentationSurfaceSnapshot:
@@ -450,6 +566,55 @@ class BoundedWindowsPresentationSurface:
             self._presented_frames += 1
             self._presented_frame_bytes += frame_bytes
             self._max_source_span_ms = max(self._max_source_span_ms, frame.source_elapsed_ms)
+
+    async def blit(self, target_dc: int) -> None:
+        """Copy the current private surface into one caller-owned GDI device context."""
+        async with self._lock:
+            if (
+                self._state != WindowsPresentationSurfaceState.OPEN
+                or self._surface_handle is None
+                or self._width < 1
+                or self._height < 1
+            ):
+                raise WindowsPresentationSurfaceError(
+                    WindowsPresentationSurfaceErrorCode.INVALID_STATE,
+                    "presentation surface is not ready for target presentation",
+                )
+            if (
+                isinstance(target_dc, bool)
+                or not isinstance(target_dc, int)
+                or not 1 <= target_dc <= _MAX_POINTER
+            ):
+                raise WindowsPresentationSurfaceError(
+                    WindowsPresentationSurfaceErrorCode.INVALID_TARGET,
+                    "presentation target is invalid",
+                )
+            if self._blits >= self._max_blits:
+                self._fail_and_release()
+                raise WindowsPresentationSurfaceError(
+                    WindowsPresentationSurfaceErrorCode.BLIT_LIMIT,
+                    "presentation target operation limit exceeded",
+                )
+            if self._native_api is None:
+                self._fail_and_release()
+                raise WindowsPresentationSurfaceError(
+                    WindowsPresentationSurfaceErrorCode.NATIVE_LOAD_FAILURE,
+                    "Windows presentation native surface is unavailable",
+                )
+            try:
+                self._native_api.blit_surface(
+                    self._surface_handle,
+                    self._width,
+                    self._height,
+                    target_dc,
+                )
+            except _NativeSurfaceError:
+                self._fail_and_release()
+                raise WindowsPresentationSurfaceError(
+                    WindowsPresentationSurfaceErrorCode.BLIT_FAILURE,
+                    "presentation target operation failed",
+                ) from None
+            self._blits += 1
 
     async def __call__(self, frame: PresentationVideoFrame) -> None:
         await self.present(frame)
