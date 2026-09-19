@@ -6,9 +6,12 @@ import sys
 
 import pytest
 
-import k5vision.media.windows_presentation_surface as surface_module
 from k5vision.media.presentation_frame import PixelFormat, PresentationVideoFrame
-from k5vision.media.windows_presentation_surface import BoundedWindowsPresentationSurface
+from k5vision.media.windows_presentation_surface import (
+    _HGDI_ERROR,
+    _Win32DibSurfaceApi,
+    BoundedWindowsPresentationSurface,
+)
 
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only gate qualification")
@@ -16,7 +19,7 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only ga
 
 def test_real_gdi_target_receives_exact_surface_bytes() -> None:
     async def scenario() -> None:
-        native = surface_module._Win32DibSurfaceApi()
+        native = _Win32DibSurfaceApi()
         surface = BoundedWindowsPresentationSurface(native_api=native)
         payload = bytes(
             [
@@ -71,7 +74,7 @@ def test_real_gdi_target_receives_exact_surface_bytes() -> None:
             )
             or 0
         )
-        assert previous not in {0, surface_module._HGDI_ERROR}
+        assert previous not in {0, _HGDI_ERROR}
 
         try:
             await surface.blit(target_dc)
