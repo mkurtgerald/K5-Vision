@@ -1,0 +1,51 @@
+name: Current Gate Windows Qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/current-gate-windows.yml
+      - src/k5vision/media/windows_presentation_surface.py
+      - tests/unit/test_current_gate_surface.py
+      - tests/integration/test_current_gate_windows.py
+      - docs/current-gate-dependency-review.md
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/current-gate-windows.yml
+      - src/k5vision/media/windows_presentation_surface.py
+      - tests/unit/test_current_gate_surface.py
+      - tests/integration/test_current_gate_windows.py
+      - docs/current-gate-dependency-review.md
+
+permissions:
+  contents: read
+
+jobs:
+  current-gate-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run exact gate regression
+        shell: powershell
+        run: |
+          pytest tests/unit/test_current_gate_surface.py tests/integration/test_current_gate_windows.py -q --no-cov
