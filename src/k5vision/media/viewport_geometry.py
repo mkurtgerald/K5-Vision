@@ -24,7 +24,7 @@ class ViewportGeometry(BaseModel):
     z_index: int = Field(default=0, ge=0, le=_MAX_Z_INDEX)
 
     @model_validator(mode="after")
-    def validate_bounds(self) -> "ViewportGeometry":
+    def validate_bounds(self) -> ViewportGeometry:
         if self.x + self.width > _MAX_COORDINATE + _MAX_DIMENSION:
             raise ValueError("viewport horizontal extent is invalid")
         if self.y + self.height > _MAX_COORDINATE + _MAX_DIMENSION:
@@ -55,7 +55,7 @@ class ViewportLayout(BaseModel):
     placements: tuple[ViewportPlacement, ...] = Field(min_length=1, max_length=64)
 
     @model_validator(mode="after")
-    def validate_unique_slots(self) -> "ViewportLayout":
+    def validate_unique_slots(self) -> ViewportLayout:
         slots = [item.logical_slot for item in self.placements]
         if len(slots) != len(set(slots)):
             raise ValueError("viewport logical slots must be unique")
