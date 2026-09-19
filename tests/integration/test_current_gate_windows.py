@@ -6,7 +6,6 @@ import sys
 
 import pytest
 
-
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only gate qualification")
 
 
