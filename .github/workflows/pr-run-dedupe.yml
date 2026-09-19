@@ -1,0 +1,65 @@
+name: PR Run Dedupe
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cancel-stale:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CURRENT_HEAD: ${{ github.event.pull_request.head.sha }}
+      HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Cancel stale pull-request runs for this branch
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          current_head = os.environ["CURRENT_HEAD"]
+          branch = urllib.parse.quote(os.environ["HEAD_BRANCH"], safe="")
+          token = os.environ["GH_TOKEN"]
+          api = f"https://api.github.com/repos/{repository}"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "k5-ci",
+          }
+          runs_url = f"{api}/actions/runs?branch={branch}&event=pull_request&per_page=100"
+          with urllib.request.urlopen(
+              urllib.request.Request(runs_url, headers=headers),
+              timeout=30,
+          ) as response:
+              runs = json.load(response)["workflow_runs"]
+
+          for run in runs:
+              if run["head_sha"] == current_head:
+                  continue
+              if run["status"] not in {"queued", "in_progress"}:
+                  continue
+              request = urllib.request.Request(
+                  f"{api}/actions/runs/{run['id']}/cancel",
+                  headers=headers,
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30):
+                      pass
+              except urllib.error.HTTPError as exc:
+                  if exc.code != 409:
+                      raise
+          PY
