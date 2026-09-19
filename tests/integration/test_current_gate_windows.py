@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
-import importlib
 import sys
 
 import pytest
@@ -16,7 +15,10 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only ga
 
 def test_real_gdi_target_receives_exact_surface_bytes() -> None:
     async def scenario() -> None:
-        surface_module = importlib.import_module("k5vision.media.windows_presentation_surface")
+        surface_module = __import__(
+            "k5vision.media.windows_presentation_surface",
+            fromlist=["*"],
+        )
         native = surface_module._Win32DibSurfaceApi()
         surface = BoundedWindowsPresentationSurface(native_api=native)
         payload = bytes(
