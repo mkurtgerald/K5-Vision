@@ -13,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field
 _MAX_COORDINATE = 1_000_000
 _MAX_DIMENSION = 16_384
 _MAX_PRESENTATIONS = 1_000_000
+_WS_CHILD = 0x40000000
+_WS_VISIBLE = 0x10000000
 _WS_POPUP = 0x80000000
 
 
@@ -92,9 +94,10 @@ class _NativeTargetBoundary(typing.Protocol):
 class _Win32WindowTargetApi:
     """Narrow Win32 boundary for one toolkit-free target window."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, parent_handle: int | None = None) -> None:
         if sys.platform != "win32":
             raise _NativeTargetError(_NativeTargetFailure.UNSUPPORTED_PLATFORM)
+        self._parent_handle = parent_handle
         try:
             loader = ctypes.WinDLL
             self._user32 = loader("user32", use_last_error=True)
@@ -138,17 +141,23 @@ class _Win32WindowTargetApi:
     def create_target(self, x: int, y: int, width: int, height: int) -> int:
         try:
             instance = int(self._get_module_handle(None) or 0)
+            if self._parent_handle is None:
+                style = _WS_POPUP
+                parent = None
+            else:
+                style = _WS_CHILD | _WS_VISIBLE
+                parent = ctypes.c_void_p(self._parent_handle)
             target = int(
                 self._create_window(
                     0,
                     "STATIC",
                     "",
-                    _WS_POPUP,
+                    style,
                     x,
                     y,
                     width,
                     height,
-                    None,
+                    parent,
                     None,
                     ctypes.c_void_p(instance),
                     None,
@@ -200,11 +209,19 @@ class BoundedWindowsPresentationTarget:
         *,
         max_presentations: int = 100_000,
         native_api: _NativeTargetBoundary | None = None,
+        parent_handle: int | None = None,
     ) -> None:
         if not 1 <= max_presentations <= _MAX_PRESENTATIONS:
             raise ValueError("max_presentations must be between 1 and 1000000")
+        if parent_handle is not None and (
+            isinstance(parent_handle, bool)
+            or not isinstance(parent_handle, int)
+            or parent_handle <= 0
+        ):
+            raise ValueError("parent_handle must be a positive integer")
         self._max_presentations = max_presentations
         self._native_api = native_api
+        self._parent_handle = parent_handle
         self._state = WindowsPresentationTargetState.READY
         self._target: int | None = None
         self._x = 0
@@ -293,7 +310,9 @@ class BoundedWindowsPresentationTarget:
 
             if self._native_api is None:
                 try:
-                    self._native_api = _Win32WindowTargetApi()
+                    self._native_api = _Win32WindowTargetApi(
+                        parent_handle=self._parent_handle,
+                    )
                 except _NativeTargetError as exc:
                     self._state = WindowsPresentationTargetState.FAILED
                     if exc.failure == _NativeTargetFailure.UNSUPPORTED_PLATFORM:
