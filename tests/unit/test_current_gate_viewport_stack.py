@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from k5vision.media.viewport_geometry import ViewportGeometry, ViewportLayout, ViewportPlacement
+from k5vision.media.viewport_geometry import (
+    ViewportGeometry,
+    ViewportLayout,
+    ViewportPlacement,
+)
 from k5vision.media.viewport_stack import (
     ViewportStackAction,
     ViewportStackEdit,
@@ -14,7 +18,9 @@ from k5vision.media.windows_operator_control import (
     WindowsOperatorControlError,
     WindowsOperatorControlErrorCode,
 )
-from k5vision.media.windows_operator_selection import BoundedSelectableWindowsOperatorControl
+from k5vision.media.windows_operator_selection import (
+    BoundedSelectableWindowsOperatorControl,
+)
 from k5vision.media.windows_operator_session import WindowsOperatorSessionState
 
 
@@ -23,15 +29,33 @@ def _layout() -> ViewportLayout:
         placements=(
             ViewportPlacement(
                 logical_slot=7,
-                geometry=ViewportGeometry(x=10, y=20, width=300, height=200, z_index=5),
+                geometry=ViewportGeometry(
+                    x=10,
+                    y=20,
+                    width=300,
+                    height=200,
+                    z_index=5,
+                ),
             ),
             ViewportPlacement(
                 logical_slot=4095,
-                geometry=ViewportGeometry(x=40, y=50, width=90, height=80, z_index=5),
+                geometry=ViewportGeometry(
+                    x=40,
+                    y=50,
+                    width=90,
+                    height=80,
+                    z_index=5,
+                ),
             ),
             ViewportPlacement(
                 logical_slot=2,
-                geometry=ViewportGeometry(x=5, y=6, width=70, height=60, z_index=1),
+                geometry=ViewportGeometry(
+                    x=5,
+                    y=6,
+                    width=70,
+                    height=60,
+                    z_index=1,
+                ),
             ),
         )
     )
@@ -69,7 +93,10 @@ def test_send_sparse_slot_to_back_preserves_non_z_geometry() -> None:
 
     candidate = apply_viewport_stack(
         layout,
-        ViewportStackEdit(logical_slot=4095, action=ViewportStackAction.SEND_TO_BACK),
+        ViewportStackEdit(
+            logical_slot=4095,
+            action=ViewportStackAction.SEND_TO_BACK,
+        ),
     )
 
     assert _geometry_without_z(candidate) == _geometry_without_z(layout)
@@ -94,7 +121,10 @@ def test_already_top_or_bottom_stack_request_is_noop() -> None:
     assert (
         apply_viewport_stack(
             layout,
-            ViewportStackEdit(logical_slot=2, action=ViewportStackAction.SEND_TO_BACK),
+            ViewportStackEdit(
+                logical_slot=2,
+                action=ViewportStackAction.SEND_TO_BACK,
+            ),
         )
         is layout
     )
@@ -107,7 +137,10 @@ def test_missing_stack_slot_fails_without_mutation() -> None:
     with pytest.raises(ViewportStackError) as exc_info:
         apply_viewport_stack(
             layout,
-            ViewportStackEdit(logical_slot=99, action=ViewportStackAction.BRING_TO_FRONT),
+            ViewportStackEdit(
+                logical_slot=99,
+                action=ViewportStackAction.BRING_TO_FRONT,
+            ),
         )
 
     assert exc_info.value.code == ViewportStackErrorCode.SLOT_NOT_FOUND
@@ -129,7 +162,9 @@ def test_selected_stack_queues_source_free_relayout() -> None:
     request = control._controls.get_nowait()
     assert request.layout is not None
     assert request.layout.by_slot()[7].z_index == 2
-    assert _geometry_without_z(request.layout) == _geometry_without_z(control._active_layout)
+    assert _geometry_without_z(request.layout) == _geometry_without_z(
+        control._active_layout
+    )
 
 
 def test_selected_stack_noop_does_not_queue_or_count() -> None:
