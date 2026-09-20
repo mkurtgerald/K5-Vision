@@ -73,6 +73,9 @@ class WindowsOperatorRuntimeSnapshot(BaseModel):
 @typing.runtime_checkable
 class _WindowsRuntimeBoundary(typing.Protocol):
     @property
+    def snapshot(self) -> WindowsViewportRuntimeSnapshot: ...
+
+    @property
     def bindings(self) -> tuple[ViewportBinding, ...]: ...
 
     async def open(self) -> WindowsViewportRuntimeSnapshot: ...
@@ -82,6 +85,9 @@ class _WindowsRuntimeBoundary(typing.Protocol):
 
 @typing.runtime_checkable
 class _PresentationRuntimeBoundary(typing.Protocol):
+    @property
+    def snapshot(self) -> PresentationRuntimeSnapshot: ...
+
     async def start(
         self,
         streams: Sequence[MixedPresentationStream],
@@ -130,8 +136,16 @@ class BoundedWindowsOperatorRuntime:
 
     @property
     def snapshot(self) -> WindowsOperatorRuntimeSnapshot:
-        windows = self._windows_snapshot
-        presentation = self._presentation_snapshot
+        windows = (
+            self._windows_runtime.snapshot
+            if self._windows_runtime is not None
+            else self._windows_snapshot
+        )
+        presentation = (
+            self._presentation_runtime.snapshot
+            if self._presentation_runtime is not None
+            else self._presentation_snapshot
+        )
         return WindowsOperatorRuntimeSnapshot(
             state=self._state,
             viewport_count=len(self._layout.placements),
