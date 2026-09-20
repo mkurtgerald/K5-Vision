@@ -98,7 +98,9 @@ def test_save_apply_delete_dispatch_preserves_arbitrary_geometry_and_generation(
     assert control._active_layout == _layout(11)
     assert control._application.snapshot.generation == generation
 
-    deleted = control.dispatch_catalog_command(_command(WindowsOperatorCatalogCommandKind.DELETE, 9))
+    deleted = control.dispatch_catalog_command(
+        _command(WindowsOperatorCatalogCommandKind.DELETE, 9)
+    )
 
     assert saved.catalog_commands == 1
     assert saved.catalog_save_commands == 1
