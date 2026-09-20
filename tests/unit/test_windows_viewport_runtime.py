@@ -119,7 +119,7 @@ def test_dispatch_bridge_routes_sparse_slot_without_fixed_grid_or_identity_snaps
     )
 
     async def scenario() -> tuple[object, object]:
-        opened = await runtime.open()
+        await runtime.open()
         dispatcher = BoundedViewportDispatcher(runtime.bindings)
         await dispatcher.dispatch(4095, _frame())
         dispatch_snapshot = await dispatcher.close()
