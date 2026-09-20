@@ -1,0 +1,105 @@
+"""Versioned, transport-neutral contracts for the K5 Vision neural boundary.
+
+These models define the seam between production K5 Vision and any reasoning,
+learning, or inference subsystem. They intentionally do not grant execution
+authority. Device actions remain owned by the K5 authority/policy layer.
+"""
+
+from datetime import datetime
+from enum import StrEnum
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+ContractVersion = Literal["1.0"]
+
+
+class AuthorityLevel(StrEnum):
+    OBSERVE = "observe"
+    RECOMMEND = "recommend"
+    CONFIRM = "confirm"
+    BOUNDED = "bounded"
+    HIGH = "high"
+    EMERGENCY = "emergency"
+
+
+class RuntimeMode(StrEnum):
+    EMBEDDED = "embedded"
+    LOCAL_SERVICE = "local-service"
+    REMOTE_SERVICE = "remote-service"
+
+
+class ContractModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: ContractVersion = "1.0"
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def reject_naive_datetimes(cls, value: Any) -> Any:
+        if isinstance(value, datetime) and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("timezone-aware timestamp required")
+        return value
+
+
+class ObservationEnvelope(ContractModel):
+    observation_id: str = Field(min_length=1, max_length=128)
+    source_id: str = Field(min_length=1, max_length=128)
+    observed_at: datetime
+    kind: str = Field(min_length=1, max_length=128)
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    provenance: tuple[str, ...] = ()
+    evidence_ref: str | None = None
+
+
+class ActionProposal(ContractModel):
+    proposal_id: str = Field(min_length=1, max_length=128)
+    created_at: datetime
+    expires_at: datetime
+    action_type: str = Field(min_length=1, max_length=128)
+    target_ref: str = Field(min_length=1, max_length=256)
+    rationale: str = Field(min_length=1, max_length=4096)
+    confidence: float = Field(ge=0.0, le=1.0)
+    requested_authority: AuthorityLevel = AuthorityLevel.RECOMMEND
+    correlation_id: str | None = None
+    producer_version: str = Field(min_length=1, max_length=128)
+    evidence_refs: tuple[str, ...] = ()
+    constraints: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "ActionProposal":
+        if self.expires_at <= self.created_at:
+            raise ValueError("proposal expiration must be after creation")
+        return self
+
+
+class AuthorityDecision(ContractModel):
+    proposal_id: str = Field(min_length=1, max_length=128)
+    decided_at: datetime
+    decision: Literal["allow", "deny", "modify"]
+    policy_version: str = Field(min_length=1, max_length=128)
+    decided_by: str = Field(min_length=1, max_length=256)
+    execution_token: str | None = None
+    modifications: dict[str, Any] = Field(default_factory=dict)
+
+
+class ActionReceipt(ContractModel):
+    receipt_id: str = Field(min_length=1, max_length=128)
+    proposal_id: str = Field(min_length=1, max_length=128)
+    completed_at: datetime
+    decision: Literal["allow", "deny", "modify"]
+    executed: bool
+    result: str = Field(min_length=1, max_length=4096)
+    policy_version: str = Field(min_length=1, max_length=128)
+    authority_ref: str = Field(min_length=1, max_length=256)
+    failure_reason: str | None = None
+
+
+class CapabilityHandshake(ContractModel):
+    generated_at: datetime
+    producer_version: str = Field(min_length=1, max_length=128)
+    contract_versions: tuple[str, ...] = ("1.0",)
+    capabilities: frozenset[str] = frozenset()
+    runtime_mode: RuntimeMode
