@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import typing
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -122,7 +122,10 @@ class BoundedWindowsViewportRuntime:
             presentations=self._presentations,
         )
 
-    def _consumer_for(self, logical_slot: int) -> Callable[[PresentationVideoFrame], typing.Awaitable[None]]:
+    def _consumer_for(
+        self,
+        logical_slot: int,
+    ) -> Callable[[PresentationVideoFrame], Awaitable[None]]:
         async def consume(frame: PresentationVideoFrame) -> None:
             await self.present(logical_slot, frame)
 
@@ -223,7 +226,7 @@ class BoundedWindowsViewportRuntime:
         logical_slot: int,
         frame: PresentationVideoFrame,
     ) -> WindowsViewportRuntimeSnapshot:
-        """Copy one transient frame into its slot surface and present it to the positioned target."""
+        """Copy a transient frame to its slot surface and positioned target."""
         async with self._lock:
             if self._state != WindowsViewportRuntimeState.OPEN:
                 raise WindowsViewportRuntimeError(
@@ -267,7 +270,7 @@ class BoundedWindowsViewportRuntime:
             return self.snapshot
 
     async def close(self) -> WindowsViewportRuntimeSnapshot:
-        """Close the positioned layout and every per-slot surface, attempting all cleanup paths."""
+        """Close the positioned layout and all per-slot surfaces."""
         async with self._lock:
             if self._state == WindowsViewportRuntimeState.CLOSED:
                 return self.snapshot
