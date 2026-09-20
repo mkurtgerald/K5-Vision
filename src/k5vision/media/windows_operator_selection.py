@@ -10,6 +10,13 @@ from dataclasses import dataclass
 from pydantic import BaseModel, ConfigDict, Field
 
 from k5vision.media.mixed_presentation import MixedPresentationStream
+from k5vision.media.viewport_catalog import (
+    ViewportCatalog,
+    ViewportCatalogError,
+    ViewportCatalogErrorCode,
+    catalog_view_for_active_layout,
+    parse_viewport_catalog,
+)
 from k5vision.media.viewport_geometry import ViewportLayout
 from k5vision.media.viewport_stack import (
     ViewportStackAction,
@@ -30,6 +37,7 @@ from k5vision.media.windows_operator_interaction import WindowsPointerEvent, Win
 from k5vision.media.windows_operator_session import WindowsOperatorSessionState
 
 _MAX_LAYOUT_PRESETS = 16
+_MAX_CATALOG_VIEWS = 64
 
 
 class WindowsOperatorSelectionSnapshot(BaseModel):
@@ -45,6 +53,9 @@ class WindowsOperatorSelectionSnapshot(BaseModel):
     preset_count: int = Field(default=0, ge=0, le=_MAX_LAYOUT_PRESETS)
     preset_saves: int = Field(default=0, ge=0)
     preset_restores: int = Field(default=0, ge=0)
+    catalog_view_count: int = Field(default=0, ge=0, le=_MAX_CATALOG_VIEWS)
+    catalog_installs: int = Field(default=0, ge=0)
+    catalog_applies: int = Field(default=0, ge=0)
 
 
 @dataclass(slots=True)
@@ -66,6 +77,9 @@ class BoundedSelectableWindowsOperatorControl(BoundedWindowsOperatorControl):
         self._presets: dict[int, ViewportLayout] = {}
         self._preset_saves = 0
         self._preset_restores = 0
+        self._catalog = ViewportCatalog()
+        self._catalog_installs = 0
+        self._catalog_applies = 0
         self._selection_candidate: _SelectionCandidate | None = None
 
     @property
@@ -78,6 +92,9 @@ class BoundedSelectableWindowsOperatorControl(BoundedWindowsOperatorControl):
             preset_count=len(self._presets),
             preset_saves=self._preset_saves,
             preset_restores=self._preset_restores,
+            catalog_view_count=len(self._catalog.views),
+            catalog_installs=self._catalog_installs,
+            catalog_applies=self._catalog_applies,
         )
 
     def _set_selection(self, logical_slot: int | None) -> None:
@@ -151,6 +168,71 @@ class BoundedSelectableWindowsOperatorControl(BoundedWindowsOperatorControl):
             return self.selection_snapshot
         self.request_relayout(candidate)
         self._preset_restores += 1
+        return self.selection_snapshot
+
+    def install_catalog(self, payload: bytes | str) -> WindowsOperatorSelectionSnapshot:
+        """Atomically install one validated source-free view catalog while running."""
+        if (
+            self._state != WindowsOperatorSessionState.RUNNING
+            or self._application is None
+            or self._active_layout is None
+        ):
+            raise WindowsOperatorControlError(
+                WindowsOperatorControlErrorCode.INVALID_STATE,
+                "operator view catalog cannot install from current state",
+            )
+        try:
+            candidate = parse_viewport_catalog(payload)
+        except ViewportCatalogError:
+            raise WindowsOperatorControlError(
+                WindowsOperatorControlErrorCode.INVALID_CONFIGURATION,
+                "operator view catalog is invalid",
+            ) from None
+
+        active_slots = {item.logical_slot for item in self._active_layout.placements}
+        for entry in candidate.views:
+            entry_slots = {item.logical_slot for item in entry.layout.placements}
+            if entry_slots != active_slots:
+                raise WindowsOperatorControlError(
+                    WindowsOperatorControlErrorCode.INVALID_EDIT,
+                    "operator view catalog is incompatible with active layout",
+                )
+
+        self._catalog = candidate
+        self._catalog_installs += 1
+        return self.selection_snapshot
+
+    def apply_catalog_view(self, view_id: int) -> WindowsOperatorSelectionSnapshot:
+        """Queue one installed catalog view through the accepted relayout path."""
+        if (
+            self._state != WindowsOperatorSessionState.RUNNING
+            or self._application is None
+            or self._active_layout is None
+        ):
+            raise WindowsOperatorControlError(
+                WindowsOperatorControlErrorCode.INVALID_STATE,
+                "operator catalog view cannot apply from current state",
+            )
+        try:
+            candidate = catalog_view_for_active_layout(
+                self._catalog,
+                view_id,
+                self._active_layout,
+            )
+        except ViewportCatalogError as exc:
+            code = (
+                WindowsOperatorControlErrorCode.INVALID_CONFIGURATION
+                if exc.code == ViewportCatalogErrorCode.INVALID_CONFIGURATION
+                else WindowsOperatorControlErrorCode.INVALID_EDIT
+            )
+            raise WindowsOperatorControlError(
+                code,
+                "operator catalog view request is invalid",
+            ) from None
+        if candidate == self._active_layout:
+            return self.selection_snapshot
+        self.request_relayout(candidate)
+        self._catalog_applies += 1
         return self.selection_snapshot
 
     def request_stack(
