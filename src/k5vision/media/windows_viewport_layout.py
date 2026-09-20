@@ -139,6 +139,7 @@ class BoundedWindowsViewportLayout:
                     target = self._target_factory()
                     if not isinstance(target, _TargetBoundary):
                         raise TypeError("invalid target boundary")
+                    self._targets[placement.logical_slot] = target
                     geometry = placement.geometry
                     await target.open(
                         geometry.width,
@@ -146,7 +147,6 @@ class BoundedWindowsViewportLayout:
                         x=geometry.x,
                         y=geometry.y,
                     )
-                    self._targets[placement.logical_slot] = target
                 except asyncio.CancelledError:
                     await self._close_targets()
                     self._state = WindowsViewportLayoutState.FAILED
