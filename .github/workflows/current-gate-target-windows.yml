@@ -8,6 +8,7 @@ on:
       - .github/workflows/current-gate-target-windows.yml
       - src/k5vision/media/viewport_dispatch.py
       - src/k5vision/media/viewport_geometry.py
+      - src/k5vision/media/windows_operator_application.py
       - src/k5vision/media/windows_operator_host.py
       - src/k5vision/media/windows_operator_runtime.py
       - src/k5vision/media/windows_presentation_surface.py
@@ -16,12 +17,14 @@ on:
       - src/k5vision/media/windows_viewport_runtime.py
       - tests/unit/test_viewport_dispatch.py
       - tests/unit/test_viewport_geometry.py
+      - tests/unit/test_windows_operator_application.py
       - tests/unit/test_windows_operator_host.py
       - tests/unit/test_windows_operator_runtime.py
       - tests/unit/test_windows_presentation_surface.py
       - tests/unit/test_windows_presentation_target.py
       - tests/unit/test_windows_viewport_layout.py
       - tests/unit/test_windows_viewport_runtime.py
+      - tests/integration/test_current_gate_application_windows.py
       - tests/integration/test_current_gate_operator_host_windows.py
       - tests/integration/test_current_gate_operator_windows.py
       - tests/integration/test_current_gate_target_windows.py
@@ -34,6 +37,7 @@ on:
       - .github/workflows/current-gate-target-windows.yml
       - src/k5vision/media/viewport_dispatch.py
       - src/k5vision/media/viewport_geometry.py
+      - src/k5vision/media/windows_operator_application.py
       - src/k5vision/media/windows_operator_host.py
       - src/k5vision/media/windows_operator_runtime.py
       - src/k5vision/media/windows_presentation_surface.py
@@ -42,12 +46,14 @@ on:
       - src/k5vision/media/windows_viewport_runtime.py
       - tests/unit/test_viewport_dispatch.py
       - tests/unit/test_viewport_geometry.py
+      - tests/unit/test_windows_operator_application.py
       - tests/unit/test_windows_operator_host.py
       - tests/unit/test_windows_operator_runtime.py
       - tests/unit/test_windows_presentation_surface.py
       - tests/unit/test_windows_presentation_target.py
       - tests/unit/test_windows_viewport_layout.py
       - tests/unit/test_windows_viewport_runtime.py
+      - tests/integration/test_current_gate_application_windows.py
       - tests/integration/test_current_gate_operator_host_windows.py
       - tests/integration/test_current_gate_operator_windows.py
       - tests/integration/test_current_gate_target_windows.py
@@ -84,4 +90,4 @@ jobs:
       - name: Run exact gate regression
         shell: powershell
         run: |
-          pytest tests/unit/test_viewport_dispatch.py tests/unit/test_viewport_geometry.py tests/unit/test_windows_operator_host.py tests/unit/test_windows_operator_runtime.py tests/unit/test_windows_presentation_surface.py tests/unit/test_windows_presentation_target.py tests/unit/test_windows_viewport_layout.py tests/unit/test_windows_viewport_runtime.py tests/integration/test_current_gate_operator_host_windows.py tests/integration/test_current_gate_operator_windows.py tests/integration/test_current_gate_target_windows.py tests/integration/test_current_gate_layout_windows.py tests/integration/test_current_gate_runtime_windows.py -q --no-cov
+          pytest tests/unit/test_viewport_dispatch.py tests/unit/test_viewport_geometry.py tests/unit/test_windows_operator_application.py tests/unit/test_windows_operator_host.py tests/unit/test_windows_operator_runtime.py tests/unit/test_windows_presentation_surface.py tests/unit/test_windows_presentation_target.py tests/unit/test_windows_viewport_layout.py tests/unit/test_windows_viewport_runtime.py tests/integration/test_current_gate_application_windows.py tests/integration/test_current_gate_operator_host_windows.py tests/integration/test_current_gate_operator_windows.py tests/integration/test_current_gate_target_windows.py tests/integration/test_current_gate_layout_windows.py tests/integration/test_current_gate_runtime_windows.py -q --no-cov
