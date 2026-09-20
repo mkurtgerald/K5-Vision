@@ -51,6 +51,7 @@ class WindowsOperatorControlSnapshot(BaseModel):
 
     schema_version: typing.Literal["1"] = "1"
     session: WindowsOperatorSessionSnapshot
+    active_layout: ViewportLayout | None = None
     queued_controls: int = Field(ge=0, le=_MAX_PENDING_CONTROLS)
     processed_controls: int = Field(ge=0)
     replacements: int = Field(ge=0)
@@ -138,11 +139,13 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
         self._processed_controls = 0
         self._replacements = 0
         self._stop_requests = 0
+        self._active_layout: ViewportLayout | None = None
 
     @property
     def control_snapshot(self) -> WindowsOperatorControlSnapshot:
         return WindowsOperatorControlSnapshot(
             session=super().snapshot,
+            active_layout=self._active_layout,
             queued_controls=self._controls.qsize(),
             processed_controls=self._processed_controls,
             replacements=self._replacements,
@@ -220,6 +223,7 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
                 request.layout,
                 request.streams,
             )
+            self._active_layout = request.layout
             self._processed_controls += 1
             self._replacements += 1
             wait_task = asyncio.create_task(application.wait())
@@ -260,6 +264,7 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
         try:
             self._application_snapshot = await application.open(width, height)
             self._application_snapshot = await application.start(layout, streams)
+            self._active_layout = layout
             wait_task = asyncio.create_task(application.wait())
 
             while self._cycles < self._max_cycles:
