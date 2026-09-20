@@ -106,9 +106,7 @@ class _SelectorFeedbackCatalogWin32OperatorShellApi(_FeedbackOverlayCatalogWin32
             offset = 1 if forward else -1
             selected = view_ids[(index + offset) % len(view_ids)]
         try:
-            updated = bool(
-                self._set_window_text(ctypes.c_void_p(self._view_editor), str(selected))
-            )
+            updated = bool(self._set_window_text(ctypes.c_void_p(self._view_editor), str(selected)))
         except Exception:
             raise _NativeShellError(_NativeShellFailure.PUMP) from None
         if not updated:
