@@ -6,7 +6,10 @@ from collections.abc import Sequence
 import pytest
 
 from k5vision.media.mixed_presentation import MixedPresentationStream
-from k5vision.media.presentation_runtime import PresentationRuntimeSnapshot, PresentationRuntimeState
+from k5vision.media.presentation_runtime import (
+    PresentationRuntimeSnapshot,
+    PresentationRuntimeState,
+)
 from k5vision.media.viewport_dispatch import ViewportBinding
 from k5vision.media.viewport_geometry import ViewportGeometry, ViewportLayout, ViewportPlacement
 from k5vision.media.windows_operator_runtime import (
