@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import typing
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -32,7 +33,7 @@ class ViewportStackEdit(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: str = "1"
+    schema_version: typing.Literal["1"] = "1"
     logical_slot: int = Field(ge=0, le=4095)
     action: ViewportStackAction
 
@@ -44,7 +45,10 @@ def _stack_order(layout: ViewportLayout) -> list[int]:
     )
 
 
-def apply_viewport_stack(layout: ViewportLayout, edit: ViewportStackEdit) -> ViewportLayout:
+def apply_viewport_stack(
+    layout: ViewportLayout,
+    edit: ViewportStackEdit,
+) -> ViewportLayout:
     """Move one logical viewport to the front/back while preserving its geometry."""
     if not isinstance(layout, ViewportLayout) or not isinstance(edit, ViewportStackEdit):
         raise ViewportStackError(
