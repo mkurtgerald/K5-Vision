@@ -183,9 +183,7 @@ class _FeedbackCatalogApplicationBoundary(typing.Protocol):
     def set_catalog_feedback(self, feedback: WindowsOperatorCatalogFeedback) -> None: ...
 
 
-class BoundedFeedbackCatalogUiWindowsOperatorControl(
-    BoundedOverlayCatalogUiWindowsOperatorControl
-):
+class BoundedFeedbackCatalogUiWindowsOperatorControl(BoundedOverlayCatalogUiWindowsOperatorControl):
     """Show one fixed visible outcome after each accepted native catalog action."""
 
     def __init__(
