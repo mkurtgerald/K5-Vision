@@ -14,6 +14,10 @@ from k5vision.media.viewport_stack import (
     ViewportStackErrorCode,
     apply_viewport_stack,
 )
+from k5vision.media.windows_operator_application import (
+    WindowsOperatorApplicationSnapshot,
+    WindowsOperatorApplicationState,
+)
 from k5vision.media.windows_operator_control import (
     WindowsOperatorControlError,
     WindowsOperatorControlErrorCode,
@@ -71,6 +75,30 @@ def _geometry_without_z(layout: ViewportLayout) -> dict[int, tuple[int, int, int
         )
         for placement in layout.placements
     }
+
+
+class _FakeApplication:
+    @property
+    def snapshot(self) -> WindowsOperatorApplicationSnapshot:
+        return WindowsOperatorApplicationSnapshot(
+            state=WindowsOperatorApplicationState.RUNNING,
+            shell_open=True,
+            pump_cycles=0,
+            pumped_messages=0,
+            generation=1,
+            viewport_count=3,
+            open_surface_count=3,
+            delivered_frames=0,
+            presentations=0,
+        )
+
+
+def _running_control() -> BoundedSelectableWindowsOperatorControl:
+    control = BoundedSelectableWindowsOperatorControl()
+    control._state = WindowsOperatorSessionState.RUNNING
+    control._application = _FakeApplication()
+    control._active_layout = _layout()
+    return control
 
 
 def test_bring_to_front_is_deterministic_for_equal_z_and_sparse_slot() -> None:
@@ -148,10 +176,7 @@ def test_missing_stack_slot_fails_without_mutation() -> None:
 
 
 def test_selected_stack_queues_source_free_relayout() -> None:
-    control = BoundedSelectableWindowsOperatorControl()
-    control._state = WindowsOperatorSessionState.RUNNING
-    control._application = object()
-    control._active_layout = _layout()
+    control = _running_control()
     control._set_selection(7)
 
     snapshot = control.request_stack(ViewportStackAction.BRING_TO_FRONT)
@@ -162,16 +187,11 @@ def test_selected_stack_queues_source_free_relayout() -> None:
     request = control._controls.get_nowait()
     assert request.layout is not None
     assert request.layout.by_slot()[7].z_index == 2
-    assert _geometry_without_z(request.layout) == _geometry_without_z(
-        control._active_layout
-    )
+    assert _geometry_without_z(request.layout) == _geometry_without_z(control._active_layout)
 
 
 def test_selected_stack_noop_does_not_queue_or_count() -> None:
-    control = BoundedSelectableWindowsOperatorControl()
-    control._state = WindowsOperatorSessionState.RUNNING
-    control._application = object()
-    control._active_layout = _layout()
+    control = _running_control()
     control._set_selection(4095)
 
     snapshot = control.request_stack(ViewportStackAction.BRING_TO_FRONT)
@@ -181,10 +201,7 @@ def test_selected_stack_noop_does_not_queue_or_count() -> None:
 
 
 def test_stack_requires_selection() -> None:
-    control = BoundedSelectableWindowsOperatorControl()
-    control._state = WindowsOperatorSessionState.RUNNING
-    control._application = object()
-    control._active_layout = _layout()
+    control = _running_control()
 
     with pytest.raises(WindowsOperatorControlError) as exc_info:
         control.request_stack(ViewportStackAction.BRING_TO_FRONT)
@@ -194,10 +211,7 @@ def test_stack_requires_selection() -> None:
 
 
 def test_stack_snapshot_is_source_and_native_identity_free() -> None:
-    control = BoundedSelectableWindowsOperatorControl()
-    control._state = WindowsOperatorSessionState.RUNNING
-    control._application = object()
-    control._active_layout = _layout()
+    control = _running_control()
     control._set_selection(7)
     control.request_stack(ViewportStackAction.BRING_TO_FRONT)
 
