@@ -44,7 +44,22 @@ function Assert-ExpectedRuntime {
     return $true
 }
 
-if (-not (Assert-ExpectedRuntime)) {
+function Get-RecordedInstallerHash {
+    if (-not (Test-Path -LiteralPath $hashRecord)) {
+        return $null
+    }
+
+    $recordedHash = (Get-Content -LiteralPath $hashRecord -Raw).Trim().ToLowerInvariant()
+    if ($recordedHash -notmatch '^[0-9a-f]{64}$') {
+        return $null
+    }
+    return $recordedHash
+}
+
+$recordedInstallerSha256 = Get-RecordedInstallerHash
+$runtimeReady = Assert-ExpectedRuntime
+
+if (-not $runtimeReady -or [string]::IsNullOrWhiteSpace([string]$recordedInstallerSha256)) {
     New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
     $downloadRoot = Join-Path $env:RUNNER_TEMP "k5-stage03-gstreamer-$Version"
     if (Test-Path -LiteralPath $downloadRoot) {
@@ -95,11 +110,8 @@ if (-not (Assert-ExpectedRuntime)) {
     }
 
     Set-Content -LiteralPath $hashRecord -Value $installerSha256 -Encoding Ascii -NoNewline
-} elseif (Test-Path -LiteralPath $hashRecord) {
-    $recordedHash = (Get-Content -LiteralPath $hashRecord -Raw).Trim().ToLowerInvariant()
-    if ($recordedHash -match '^[0-9a-f]{64}$') {
-        $installerSha256 = $recordedHash
-    }
+} else {
+    $installerSha256 = $recordedInstallerSha256
 }
 
 $registryPath = Join-Path $env:RUNNER_TEMP "k5-stage03-gstreamer-registry-$Version.bin"
