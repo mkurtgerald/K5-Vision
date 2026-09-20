@@ -191,44 +191,55 @@ def test_control_preserves_all_live_sparse_plan_across_same_shell_replacement() 
             poll_interval_seconds=0.001,
             max_cycles=500,
         )
+        initial_layout = _layout(7, 4095)
+        replacement_layout = _layout(23, 4000, offset=37)
         task = asyncio.create_task(
             control.run(
                 width=1280,
                 height=900,
-                layout=_layout(7, 4095),
+                layout=initial_layout,
                 streams=_streams(7, 4095),
             )
         )
 
         while app.pumps == 0:
             await asyncio.sleep(0)
-        control.request_replace(
-            _layout(23, 4000, offset=37),
+        assert control.control_snapshot.active_layout == initial_layout
+
+        queued = control.request_replace(
+            replacement_layout,
             _streams(23, 4000),
         )
+        assert queued.active_layout == initial_layout
         while control.control_snapshot.replacements == 0:
             await asyncio.sleep(0)
 
+        assert control.control_snapshot.active_layout == replacement_layout
         control.request_stop()
         finished = await task
         assert finished.session.state == WindowsOperatorSessionState.COMPLETE
         assert finished.session.shell_open is False
         assert finished.replacements == 1
         assert finished.stop_requests == 1
+        assert finished.active_layout == replacement_layout
         assert app.plans == [
             ((7, 4095), (7, 4095)),
             ((23, 4000), (23, 4000)),
         ]
 
         retained = finished.model_dump_json().casefold()
+        assert '"logical_slot":23' in retained
+        assert '"logical_slot":4000' in retained
+        assert '"x":54' in retained
+        assert '"y":78' in retained
         for forbidden in (
             "rtsp://",
             "synthetic.invalid",
-            "4095",
-            "4000",
-            "logical_slot",
+            "credential",
+            "password",
             "source_id",
             "recording_id",
+            "path",
             "payload",
             "handle",
             "pointer",
