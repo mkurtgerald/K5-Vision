@@ -9,8 +9,12 @@ on:
       - src/k5vision/media/mixed_presentation.py
       - src/k5vision/media/presentation_runtime.py
       - src/k5vision/media/windows_operator_runtime.py
+      - src/k5vision/media/windows_operator_application.py
+      - src/k5vision/media/windows_operator_control.py
       - tests/unit/test_current_gate_live_plan.py
+      - tests/unit/test_current_gate_all_live_control.py
       - tests/integration/test_current_gate_windows.py
+      - tests/integration/test_current_gate_all_live_application_windows.py
       - docs/current-gate-dependency-review.md
   push:
     branches: [main]
@@ -19,8 +23,12 @@ on:
       - src/k5vision/media/mixed_presentation.py
       - src/k5vision/media/presentation_runtime.py
       - src/k5vision/media/windows_operator_runtime.py
+      - src/k5vision/media/windows_operator_application.py
+      - src/k5vision/media/windows_operator_control.py
       - tests/unit/test_current_gate_live_plan.py
+      - tests/unit/test_current_gate_all_live_control.py
       - tests/integration/test_current_gate_windows.py
+      - tests/integration/test_current_gate_all_live_application_windows.py
       - docs/current-gate-dependency-review.md
 
 permissions:
@@ -52,4 +60,4 @@ jobs:
       - name: Run exact gate regression
         shell: powershell
         run: |
-          pytest tests/unit/test_current_gate_live_plan.py tests/integration/test_current_gate_windows.py -q --no-cov
+          pytest tests/unit/test_current_gate_live_plan.py tests/unit/test_current_gate_all_live_control.py tests/integration/test_current_gate_windows.py tests/integration/test_current_gate_all_live_application_windows.py -q --no-cov
