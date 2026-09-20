@@ -10,7 +10,10 @@ import pytest
 
 from k5vision.media.mixed_presentation import MixedPresentationStream
 from k5vision.media.presentation_frame import PixelFormat, PresentationVideoFrame
-from k5vision.media.presentation_runtime import PresentationRuntimeSnapshot, PresentationRuntimeState
+from k5vision.media.presentation_runtime import (
+    PresentationRuntimeSnapshot,
+    PresentationRuntimeState,
+)
 from k5vision.media.viewport_dispatch import ViewportBinding
 from k5vision.media.viewport_geometry import ViewportGeometry, ViewportLayout, ViewportPlacement
 from k5vision.media.windows_operator_runtime import (
@@ -21,7 +24,9 @@ from k5vision.media.windows_operator_runtime import (
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only qualification")
 
 
-def _snapshot(state: PresentationRuntimeState, delivered_frames: int = 0) -> PresentationRuntimeSnapshot:
+def _snapshot(
+    state: PresentationRuntimeState, delivered_frames: int = 0
+) -> PresentationRuntimeSnapshot:
     return PresentationRuntimeSnapshot(
         state=state,
         stream_count=2,
