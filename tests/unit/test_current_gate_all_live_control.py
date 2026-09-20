@@ -5,7 +5,6 @@ from collections.abc import Sequence
 
 from k5vision.media.live_presentation import LivePresentationSnapshot, LivePresentationState
 from k5vision.media.mixed_presentation import MixedLiveStream, MixedPresentationStream
-from k5vision.media.presentation_frame import PresentationVideoFrame
 from k5vision.media.viewport_geometry import ViewportGeometry, ViewportLayout, ViewportPlacement
 from k5vision.media.windows_operator_application import (
     WindowsOperatorApplicationSnapshot,
