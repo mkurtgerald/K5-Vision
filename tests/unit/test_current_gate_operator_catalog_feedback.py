@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ctypes
+import typing
 
 import pytest
 
 from k5vision.media.windows_operator_application import (
     WindowsOperatorApplicationError,
     WindowsOperatorApplicationErrorCode,
+    WindowsOperatorApplicationState,
     _NativeShellError,
     _NativeShellFailure,
 )
@@ -19,8 +21,8 @@ from k5vision.media.windows_operator_catalog_feedback import (
     BoundedFeedbackCatalogUiWindowsOperatorControl,
     BoundedFeedbackCatalogWindowsOperatorApplication,
     WindowsOperatorCatalogFeedback,
-    _FeedbackOverlayCatalogWin32OperatorShellApi,
     _feedback_for_command,
+    _FeedbackOverlayCatalogWin32OperatorShellApi,
 )
 from k5vision.media.windows_operator_catalog_overlay import (
     _OverlayCatalogWin32OperatorShellApi,
@@ -98,6 +100,31 @@ def test_feedback_mapping_is_deterministic(
     assert _feedback_for_command(kind) == feedback
 
 
+def test_feedback_mapping_rejects_unknown_kind() -> None:
+    with pytest.raises(WindowsOperatorControlError) as failed:
+        _feedback_for_command(typing.cast(WindowsOperatorCatalogCommandKind, "unknown"))
+    assert failed.value.code == WindowsOperatorControlErrorCode.INVALID_CONFIGURATION
+
+
+def test_native_feedback_initialization_binds_only_fixed_text_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_window_text = lambda *_args: 1
+    user32 = type("_User32", (), {})()
+    user32.SetWindowTextW = set_window_text
+
+    def _base_init(self: object) -> None:
+        self._user32 = user32
+        self._catalog_z_order_handles = []
+
+    monkeypatch.setattr(_OverlayCatalogWin32OperatorShellApi, "__init__", _base_init)
+    api = _FeedbackOverlayCatalogWin32OperatorShellApi()
+
+    assert api._feedback_handle == 0
+    assert api._set_window_text is set_window_text
+    assert api._set_window_text.restype is ctypes.c_int
+
+
 def test_native_feedback_writes_only_fixed_text() -> None:
     api = object.__new__(_FeedbackOverlayCatalogWin32OperatorShellApi)
     api._feedback_handle = 707
@@ -111,6 +138,21 @@ def test_native_feedback_writes_only_fixed_text() -> None:
     api.set_catalog_feedback(WindowsOperatorCatalogFeedback.SAVED)
 
     assert calls == [(707, "Saved")]
+
+
+def test_native_feedback_rejects_invalid_or_missing_target() -> None:
+    api = object.__new__(_FeedbackOverlayCatalogWin32OperatorShellApi)
+    api._feedback_handle = 0
+    api._set_window_text = lambda *_args: 1
+
+    with pytest.raises(_NativeShellError) as missing:
+        api.set_catalog_feedback(WindowsOperatorCatalogFeedback.READY)
+    assert missing.value.failure == _NativeShellFailure.PUMP
+
+    api._feedback_handle = 707
+    with pytest.raises(_NativeShellError) as invalid:
+        api.set_catalog_feedback(typing.cast(WindowsOperatorCatalogFeedback, "saved"))
+    assert invalid.value.failure == _NativeShellFailure.PUMP
 
 
 def test_native_feedback_failure_is_sanitized() -> None:
@@ -145,7 +187,7 @@ def test_feedback_child_joins_overlap_safe_z_order(
         "create_shell",
         lambda _self, _width, _height: 101,
     )
-    api._create_child = lambda **kwargs: (created.append(kwargs) or 808)
+    api._create_child = lambda **kwargs: created.append(kwargs) or 808
     api._raise_catalog_controls = lambda: raised.append(True)
 
     assert api.create_shell(1280, 720) == 101
@@ -162,6 +204,127 @@ def test_feedback_child_joins_overlap_safe_z_order(
         }
     ]
     assert raised == [True]
+
+
+def test_feedback_child_creation_failure_cleans_ephemeral_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = object.__new__(_FeedbackOverlayCatalogWin32OperatorShellApi)
+    api._feedback_handle = 0
+    destroyed: list[int] = []
+
+    monkeypatch.setattr(
+        _OverlayCatalogWin32OperatorShellApi,
+        "create_shell",
+        lambda _self, _width, _height: 101,
+    )
+    monkeypatch.setattr(
+        _OverlayCatalogWin32OperatorShellApi,
+        "destroy_shell",
+        lambda _self, shell: destroyed.append(shell),
+    )
+
+    def _fail_child(**_kwargs: object) -> int:
+        raise _NativeShellError(_NativeShellFailure.CREATE)
+
+    api._create_child = _fail_child
+
+    with pytest.raises(_NativeShellError) as failed:
+        api.create_shell(1280, 720)
+    assert failed.value.failure == _NativeShellFailure.CREATE
+    assert api._feedback_handle == 0
+    assert destroyed == [101]
+
+
+def test_feedback_destroy_clears_ephemeral_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = object.__new__(_FeedbackOverlayCatalogWin32OperatorShellApi)
+    api._feedback_handle = 707
+    destroyed: list[int] = []
+    monkeypatch.setattr(
+        _OverlayCatalogWin32OperatorShellApi,
+        "destroy_shell",
+        lambda _self, shell: destroyed.append(shell),
+    )
+
+    api.destroy_shell(101)
+
+    assert api._feedback_handle == 0
+    assert destroyed == [101]
+
+
+def test_feedback_application_native_api_success_and_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native = object()
+    monkeypatch.setattr(
+        "k5vision.media.windows_operator_catalog_feedback."
+        "_FeedbackOverlayCatalogWin32OperatorShellApi",
+        lambda: native,
+    )
+    application = BoundedFeedbackCatalogWindowsOperatorApplication()
+
+    assert application._ensure_native_api() is native
+    assert application._ensure_native_api() is native
+
+
+@pytest.mark.parametrize(
+    ("failure", "code"),
+    (
+        (
+            _NativeShellFailure.UNSUPPORTED_PLATFORM,
+            WindowsOperatorApplicationErrorCode.UNSUPPORTED_PLATFORM,
+        ),
+        (_NativeShellFailure.LOAD, WindowsOperatorApplicationErrorCode.NATIVE_LOAD_FAILURE),
+    ),
+)
+def test_feedback_application_native_api_failure_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: _NativeShellFailure,
+    code: WindowsOperatorApplicationErrorCode,
+) -> None:
+    def _fail() -> object:
+        raise _NativeShellError(failure)
+
+    monkeypatch.setattr(
+        "k5vision.media.windows_operator_catalog_feedback."
+        "_FeedbackOverlayCatalogWin32OperatorShellApi",
+        _fail,
+    )
+    application = BoundedFeedbackCatalogWindowsOperatorApplication()
+
+    with pytest.raises(WindowsOperatorApplicationError) as failed:
+        application._ensure_native_api()
+    assert failed.value.code == code
+    assert application._state == WindowsOperatorApplicationState.FAILED
+
+
+def test_application_feedback_validates_native_boundary() -> None:
+    application = BoundedFeedbackCatalogWindowsOperatorApplication()
+
+    with pytest.raises(WindowsOperatorApplicationError) as invalid:
+        application.set_catalog_feedback(typing.cast(WindowsOperatorCatalogFeedback, "saved"))
+    assert invalid.value.code == WindowsOperatorApplicationErrorCode.INVALID_CONFIGURATION
+
+    application._native_api = object()
+    with pytest.raises(WindowsOperatorApplicationError) as unavailable:
+        application.set_catalog_feedback(WindowsOperatorCatalogFeedback.SAVED)
+    assert unavailable.value.code == WindowsOperatorApplicationErrorCode.PUMP_FAILURE
+
+
+def test_application_feedback_delegates_fixed_enum() -> None:
+    application = BoundedFeedbackCatalogWindowsOperatorApplication()
+    received: list[WindowsOperatorCatalogFeedback] = []
+
+    class _Native:
+        def set_catalog_feedback(self, feedback: WindowsOperatorCatalogFeedback) -> None:
+            received.append(feedback)
+
+    application._native_api = _Native()
+    application.set_catalog_feedback(WindowsOperatorCatalogFeedback.DELETED)
+
+    assert received == [WindowsOperatorCatalogFeedback.DELETED]
 
 
 def test_successful_commands_show_fixed_outcomes(
@@ -224,6 +387,30 @@ def test_rejections_show_rejected_without_retaining_arguments(
     assert '"view_id":63' not in payload
     assert "applied" not in payload
     assert "rejected" not in payload
+
+
+def test_feedback_control_rejects_missing_feedback_boundary() -> None:
+    control = BoundedFeedbackCatalogUiWindowsOperatorControl()
+
+    with pytest.raises(WindowsOperatorControlError) as failed:
+        control._drain_native_catalog_commands(object())
+    assert failed.value.code == WindowsOperatorControlErrorCode.APPLICATION_FAILURE
+
+
+def test_feedback_control_rejects_unbounded_native_command_batch() -> None:
+    commands = tuple(
+        WindowsOperatorCatalogCommand(
+            kind=WindowsOperatorCatalogCommandKind.SAVE,
+            view_id=index % 64,
+        )
+        for index in range(65)
+    )
+    control = BoundedFeedbackCatalogUiWindowsOperatorControl()
+    application = _FakeFeedbackApplication(commands=commands)
+
+    with pytest.raises(WindowsOperatorControlError) as failed:
+        control._drain_native_catalog_commands(application)
+    assert failed.value.code == WindowsOperatorControlErrorCode.APPLICATION_FAILURE
 
 
 def test_application_feedback_maps_native_failure_without_details() -> None:
