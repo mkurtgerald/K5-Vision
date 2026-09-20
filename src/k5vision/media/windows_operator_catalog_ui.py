@@ -33,9 +33,6 @@ from k5vision.media.windows_operator_control import (
     WindowsOperatorControlSnapshot,
 )
 from k5vision.media.windows_operator_interaction import (
-    BoundedInteractiveWindowsOperatorApplication,
-    WindowsPointerEventKind,
-    _InteractiveWin32OperatorShellApi,
     _PM_REMOVE,
     _WM_CANCELMODE,
     _WM_CAPTURECHANGED,
@@ -44,6 +41,9 @@ from k5vision.media.windows_operator_interaction import (
     _WM_LBUTTONUP,
     _WM_MOUSEMOVE,
     _WM_QUIT,
+    BoundedInteractiveWindowsOperatorApplication,
+    WindowsPointerEventKind,
+    _InteractiveWin32OperatorShellApi,
 )
 
 _MAX_NATIVE_CATALOG_COMMANDS = 64
@@ -444,7 +444,9 @@ class BoundedCatalogUiWindowsOperatorControl(BoundedCommandWindowsOperatorContro
             native_rejections=self._native_rejections,
         )
 
-    def _drain_native_catalog_commands(self, application: _CatalogCommandApplicationBoundary) -> None:
+    def _drain_native_catalog_commands(
+        self, application: _CatalogCommandApplicationBoundary
+    ) -> None:
         self._native_rejections += application.drain_catalog_rejections()
         for command in application.drain_catalog_commands(max_commands=16):
             try:
@@ -476,7 +478,9 @@ class BoundedCatalogUiWindowsOperatorControl(BoundedCommandWindowsOperatorContro
                 application = self._application
                 if isinstance(application, _CatalogCommandApplicationBoundary):
                     self._drain_native_catalog_commands(application)
-                await asyncio.sleep(self._poll_interval_seconds if self._poll_interval_seconds else 0)
+                await asyncio.sleep(
+                    self._poll_interval_seconds if self._poll_interval_seconds else 0
+                )
             return await control_task
         finally:
             if not control_task.done():
