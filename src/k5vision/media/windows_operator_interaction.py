@@ -90,9 +90,7 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
                 )
             except Exception:
                 raise _NativeShellError(_NativeShellFailure.PUMP) from None
-        self._pointer_events.append(
-            WindowsPointerEvent(kind=kind, x=int(point.x), y=int(point.y))
-        )
+        self._pointer_events.append(WindowsPointerEvent(kind=kind, x=int(point.x), y=int(point.y)))
 
     def pump_messages(self, shell: int, max_messages: int) -> tuple[int, bool]:
         count = 0
@@ -108,9 +106,7 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
             ):
                 count += 1
                 hwnd = int(message.hwnd or 0)
-                if message.message == _WM_QUIT or (
-                    message.message == _WM_CLOSE and hwnd == shell
-                ):
+                if message.message == _WM_QUIT or (message.message == _WM_CLOSE and hwnd == shell):
                     close_requested = True
                     continue
                 if message.message == _WM_LBUTTONDOWN:
