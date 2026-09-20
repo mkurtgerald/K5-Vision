@@ -17,7 +17,11 @@ from k5vision.media.windows_operator_application import (
     WindowsOperatorApplicationSnapshot,
     WindowsOperatorApplicationState,
 )
-from k5vision.media.windows_operator_control import BoundedWindowsOperatorControl
+from k5vision.media.windows_operator_control import (
+    BoundedWindowsOperatorControl,
+    WindowsOperatorControlError,
+    WindowsOperatorControlErrorCode,
+)
 
 
 def _layout() -> ViewportLayout:
@@ -206,6 +210,7 @@ def test_editor_layout_flows_through_existing_control_relayout_without_restart()
         assert app.generation == 1
         assert control.control_snapshot.active_layout == candidate
         assert control.control_snapshot.relayouts == 1
+        assert control.control_snapshot.viewport_edits == 0
         assert control.control_snapshot.replacements == 0
         control.request_stop()
         return await task
@@ -213,6 +218,88 @@ def test_editor_layout_flows_through_existing_control_relayout_without_restart()
     result = asyncio.run(scenario())
     assert result.active_layout == candidate
     assert result.relayouts == 1
+    assert result.viewport_edits == 0
     serialized = result.model_dump_json().casefold()
     assert "execution-a" not in serialized
     assert "execution-b" not in serialized
+
+
+def test_live_edit_control_serializes_against_latest_accepted_layout() -> None:
+    app = _FakeApplication()
+    control = BoundedWindowsOperatorControl(
+        application_factory=lambda: app,
+        poll_interval_seconds=0,
+        max_cycles=1000,
+    )
+
+    async def scenario() -> object:
+        task = asyncio.create_task(
+            control.run(width=1280, height=720, layout=_layout(), streams=_streams())
+        )
+        await app.wait_entered.wait()
+        control.request_edit(ViewportMove(logical_slot=7, dx=100, dy=50))
+        control.request_edit(ViewportResize(logical_slot=7, dwidth=50, dheight=25))
+        for _ in range(40):
+            await asyncio.sleep(0)
+            if len(app.relayouts) == 2:
+                break
+
+        assert len(app.relayouts) == 2
+        first = app.relayouts[0].by_slot()[7]
+        second = app.relayouts[1].by_slot()[7]
+        untouched = app.relayouts[1].by_slot()[4095]
+        assert (first.x, first.y, first.width, first.height, first.z_index) == (
+            117,
+            79,
+            613,
+            347,
+            2,
+        )
+        assert (second.x, second.y, second.width, second.height, second.z_index) == (
+            117,
+            79,
+            663,
+            372,
+            2,
+        )
+        assert untouched == _layout().by_slot()[4095]
+        assert app.generation == 1
+        assert control.control_snapshot.viewport_edits == 2
+        assert control.control_snapshot.relayouts == 2
+        assert control.control_snapshot.replacements == 0
+        control.request_stop()
+        return await task
+
+    result = asyncio.run(scenario())
+    assert result.viewport_edits == 2
+    assert result.relayouts == 2
+    assert result.active_layout == app.relayouts[-1]
+    serialized = result.model_dump_json().casefold()
+    assert "execution-a" not in serialized
+    assert "execution-b" not in serialized
+
+
+def test_invalid_live_edit_fails_closed_without_publishing_geometry() -> None:
+    app = _FakeApplication()
+    control = BoundedWindowsOperatorControl(
+        application_factory=lambda: app,
+        poll_interval_seconds=0,
+        max_cycles=1000,
+    )
+    original = _layout()
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            control.run(width=1280, height=720, layout=original, streams=_streams())
+        )
+        await app.wait_entered.wait()
+        control.request_edit(ViewportResize(logical_slot=7, dwidth=-613, dheight=0))
+        with pytest.raises(WindowsOperatorControlError) as exc_info:
+            await task
+        assert exc_info.value.code == WindowsOperatorControlErrorCode.INVALID_EDIT
+
+    asyncio.run(scenario())
+    assert app.relayouts == []
+    assert control.control_snapshot.active_layout == original
+    assert control.control_snapshot.viewport_edits == 0
+    assert control.control_snapshot.relayouts == 0
