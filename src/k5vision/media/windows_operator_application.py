@@ -249,9 +249,7 @@ class _Win32OperatorShellApi:
             ):
                 count += 1
                 hwnd = int(message.hwnd or 0)
-                if message.message == _WM_QUIT or (
-                    message.message == _WM_CLOSE and hwnd == shell
-                ):
+                if message.message == _WM_QUIT or (message.message == _WM_CLOSE and hwnd == shell):
                     close_requested = True
                     continue
                 self._translate_message(ctypes.byref(message))
@@ -485,11 +483,15 @@ class BoundedWindowsOperatorApplication:
     ) -> WindowsOperatorApplicationSnapshot:
         """Replace the current arbitrary layout without replacing the top-level shell."""
         async with self._lock:
-            if self._state not in {
-                WindowsOperatorApplicationState.RUNNING,
-                WindowsOperatorApplicationState.COMPLETE,
-                WindowsOperatorApplicationState.STOPPED,
-            } or self._host is None:
+            if (
+                self._state
+                not in {
+                    WindowsOperatorApplicationState.RUNNING,
+                    WindowsOperatorApplicationState.COMPLETE,
+                    WindowsOperatorApplicationState.STOPPED,
+                }
+                or self._host is None
+            ):
                 raise WindowsOperatorApplicationError(
                     WindowsOperatorApplicationErrorCode.INVALID_STATE,
                     "operator application cannot replace from current state",
@@ -511,10 +513,7 @@ class BoundedWindowsOperatorApplication:
     async def wait(self) -> WindowsOperatorApplicationSnapshot:
         """Wait for the active host generation while retaining the shell."""
         async with self._lock:
-            if (
-                self._state != WindowsOperatorApplicationState.RUNNING
-                or self._host is None
-            ):
+            if self._state != WindowsOperatorApplicationState.RUNNING or self._host is None:
                 raise WindowsOperatorApplicationError(
                     WindowsOperatorApplicationErrorCode.INVALID_STATE,
                     "operator application has no running generation",
@@ -555,10 +554,7 @@ class BoundedWindowsOperatorApplication:
         async with self._lock:
             if self._state == WindowsOperatorApplicationState.CLOSED:
                 return self.snapshot
-            if (
-                self._state != WindowsOperatorApplicationState.RUNNING
-                or self._host is None
-            ):
+            if self._state != WindowsOperatorApplicationState.RUNNING or self._host is None:
                 raise WindowsOperatorApplicationError(
                     WindowsOperatorApplicationErrorCode.INVALID_STATE,
                     "operator application has no running generation",
@@ -594,12 +590,16 @@ class BoundedWindowsOperatorApplication:
     ) -> WindowsOperatorApplicationSnapshot:
         """Process a bounded message batch and honor close requests fail-closed."""
         async with self._lock:
-            if self._state not in {
-                WindowsOperatorApplicationState.OPEN,
-                WindowsOperatorApplicationState.RUNNING,
-                WindowsOperatorApplicationState.COMPLETE,
-                WindowsOperatorApplicationState.STOPPED,
-            } or self._shell is None:
+            if (
+                self._state
+                not in {
+                    WindowsOperatorApplicationState.OPEN,
+                    WindowsOperatorApplicationState.RUNNING,
+                    WindowsOperatorApplicationState.COMPLETE,
+                    WindowsOperatorApplicationState.STOPPED,
+                }
+                or self._shell is None
+            ):
                 raise WindowsOperatorApplicationError(
                     WindowsOperatorApplicationErrorCode.INVALID_STATE,
                     "operator application shell cannot pump from current state",
