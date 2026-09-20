@@ -55,11 +55,13 @@ class WindowsOperatorControlSnapshot(BaseModel):
     queued_controls: int = Field(ge=0, le=_MAX_PENDING_CONTROLS)
     processed_controls: int = Field(ge=0)
     replacements: int = Field(ge=0)
+    relayouts: int = Field(default=0, ge=0)
     stop_requests: int = Field(ge=0)
 
 
 class _ControlKind(enum.StrEnum):
     REPLACE = "replace"
+    RELAYOUT = "relayout"
     STOP = "stop"
 
 
@@ -102,8 +104,13 @@ class _ControllableApplicationBoundary(typing.Protocol):
     async def close(self) -> WindowsOperatorApplicationSnapshot: ...
 
 
+@typing.runtime_checkable
+class _RelayoutApplicationBoundary(typing.Protocol):
+    async def relayout(self, layout: ViewportLayout) -> WindowsOperatorApplicationSnapshot: ...
+
+
 class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
-    """Run one visible session while accepting bounded replace/stop requests."""
+    """Run one visible session while accepting bounded replace/relayout/stop requests."""
 
     def __init__(
         self,
@@ -138,6 +145,7 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
         self._controls: asyncio.Queue[_ControlRequest] = asyncio.Queue(maxsize=max_pending_controls)
         self._processed_controls = 0
         self._replacements = 0
+        self._relayouts = 0
         self._stop_requests = 0
         self._active_layout: ViewportLayout | None = None
 
@@ -149,6 +157,7 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
             queued_controls=self._controls.qsize(),
             processed_controls=self._processed_controls,
             replacements=self._replacements,
+            relayouts=self._relayouts,
             stop_requests=self._stop_requests,
         )
 
@@ -180,6 +189,10 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
                 streams=tuple(streams),
             )
         )
+
+    def request_relayout(self, layout: ViewportLayout) -> WindowsOperatorControlSnapshot:
+        """Queue one source-free same-slot arbitrary-geometry change."""
+        return self._enqueue(_ControlRequest(kind=_ControlKind.RELAYOUT, layout=layout))
 
     def request_stop(self) -> WindowsOperatorControlSnapshot:
         """Queue one explicit session stop request."""
@@ -216,8 +229,21 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
             if request.layout is None:
                 raise WindowsOperatorControlError(
                     WindowsOperatorControlErrorCode.APPLICATION_FAILURE,
-                    "operator replacement request is invalid",
+                    "operator layout request is invalid",
                 )
+
+            if request.kind == _ControlKind.RELAYOUT:
+                if not isinstance(application, _RelayoutApplicationBoundary):
+                    raise WindowsOperatorControlError(
+                        WindowsOperatorControlErrorCode.APPLICATION_FAILURE,
+                        "operator application does not support source-free relayout",
+                    )
+                self._application_snapshot = await application.relayout(request.layout)
+                self._active_layout = request.layout
+                self._processed_controls += 1
+                self._relayouts += 1
+                continue
+
             await self._cancel_wait_task(wait_task)
             self._application_snapshot = await application.replace(
                 request.layout,
