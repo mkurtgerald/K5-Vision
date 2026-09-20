@@ -142,6 +142,11 @@ class _OperatorHostBoundary(typing.Protocol):
 
 
 @typing.runtime_checkable
+class _RelayoutOperatorHostBoundary(typing.Protocol):
+    async def relayout(self, layout: ViewportLayout) -> WindowsOperatorHostSnapshot: ...
+
+
+@typing.runtime_checkable
 class _NativeShellBoundary(typing.Protocol):
     def create_shell(self, width: int, height: int) -> int: ...
 
@@ -508,6 +513,41 @@ class BoundedWindowsOperatorApplication:
                     "operator application replacement failed",
                 ) from None
             self._state = WindowsOperatorApplicationState.RUNNING
+            return self.snapshot
+
+    async def relayout(self, layout: ViewportLayout) -> WindowsOperatorApplicationSnapshot:
+        """Apply source-free geometry while preserving shell, generation, and media plan."""
+        async with self._lock:
+            if self._state != WindowsOperatorApplicationState.RUNNING or self._host is None:
+                raise WindowsOperatorApplicationError(
+                    WindowsOperatorApplicationErrorCode.INVALID_STATE,
+                    "operator application cannot relayout from current state",
+                )
+            host = self._host
+            if not isinstance(host, _RelayoutOperatorHostBoundary):
+                await self._fail_closed()
+                raise WindowsOperatorApplicationError(
+                    WindowsOperatorApplicationErrorCode.CONTROL_FAILURE,
+                    "operator application relayout boundary is unavailable",
+                )
+            try:
+                child = await host.relayout(layout)
+            except asyncio.CancelledError:
+                await self._fail_closed()
+                raise
+            except Exception:
+                await self._fail_closed()
+                raise WindowsOperatorApplicationError(
+                    WindowsOperatorApplicationErrorCode.CONTROL_FAILURE,
+                    "operator application relayout failed",
+                ) from None
+            self._host_snapshot = child
+            if child.state != WindowsOperatorHostState.RUNNING:
+                await self._fail_closed()
+                raise WindowsOperatorApplicationError(
+                    WindowsOperatorApplicationErrorCode.CONTROL_FAILURE,
+                    "operator application relayout did not preserve running state",
+                )
             return self.snapshot
 
     async def wait(self) -> WindowsOperatorApplicationSnapshot:
