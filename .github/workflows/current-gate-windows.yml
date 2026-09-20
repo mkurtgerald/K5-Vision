@@ -12,9 +12,11 @@ on:
       - src/k5vision/media/windows_operator_host.py
       - src/k5vision/media/windows_operator_application.py
       - src/k5vision/media/windows_operator_control.py
+      - src/k5vision/media/windows_operator_catalog_ui.py
       - tests/unit/test_current_gate_live_plan.py
       - tests/unit/test_current_gate_all_live_control.py
       - tests/unit/test_current_gate_operator_relayout_control.py
+      - tests/unit/test_current_gate_operator_catalog_ui.py
       - tests/integration/test_current_gate_windows.py
       - tests/integration/test_current_gate_all_live_application_windows.py
       - docs/current-gate-dependency-review.md
@@ -28,9 +30,11 @@ on:
       - src/k5vision/media/windows_operator_host.py
       - src/k5vision/media/windows_operator_application.py
       - src/k5vision/media/windows_operator_control.py
+      - src/k5vision/media/windows_operator_catalog_ui.py
       - tests/unit/test_current_gate_live_plan.py
       - tests/unit/test_current_gate_all_live_control.py
       - tests/unit/test_current_gate_operator_relayout_control.py
+      - tests/unit/test_current_gate_operator_catalog_ui.py
       - tests/integration/test_current_gate_windows.py
       - tests/integration/test_current_gate_all_live_application_windows.py
       - docs/current-gate-dependency-review.md
@@ -64,4 +68,4 @@ jobs:
       - name: Run exact gate regression
         shell: powershell
         run: |
-          pytest tests/unit/test_current_gate_live_plan.py tests/unit/test_current_gate_all_live_control.py tests/unit/test_current_gate_operator_relayout_control.py tests/integration/test_current_gate_windows.py tests/integration/test_current_gate_all_live_application_windows.py -q --no-cov
+          pytest tests/unit/test_current_gate_live_plan.py tests/unit/test_current_gate_all_live_control.py tests/unit/test_current_gate_operator_relayout_control.py tests/unit/test_current_gate_operator_catalog_ui.py tests/integration/test_current_gate_windows.py tests/integration/test_current_gate_all_live_application_windows.py -q --no-cov
