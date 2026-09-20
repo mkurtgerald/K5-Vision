@@ -109,7 +109,9 @@ def test_feedback_mapping_rejects_unknown_kind() -> None:
 def test_native_feedback_initialization_binds_only_fixed_text_api(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    set_window_text = lambda *_args: 1
+    def set_window_text(*_args: object) -> int:
+        return 1
+
     user32 = type("_User32", (), {})()
     user32.SetWindowTextW = set_window_text
 
