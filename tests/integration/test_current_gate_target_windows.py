@@ -53,17 +53,23 @@ def test_real_win32_target_accepts_the_accepted_surface() -> None:
 
         await surface.open()
         await surface.present(frame)
-        opened = await target.open(2, 2)
+        opened = await target.open(2, 2, x=17, y=29)
         assert opened.state == WindowsPresentationTargetState.OPEN
         assert opened.target_open
+        assert opened.x == 17
+        assert opened.y == 29
 
         presented = await target.present(surface)
         assert presented.presentations == 1
+        assert presented.x == 17
+        assert presented.y == 29
         assert surface.snapshot.blits == 1
 
         closed = await target.close()
         assert closed.state == WindowsPresentationTargetState.CLOSED
         assert not closed.target_open
+        assert closed.x == 0
+        assert closed.y == 0
         await surface.close()
 
     asyncio.run(scenario())
