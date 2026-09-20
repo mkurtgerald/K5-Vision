@@ -44,6 +44,7 @@ class WindowsOperatorRuntimeErrorCode(enum.StrEnum):
     ASSEMBLY_FAILURE = "assembly_failure"
     START_FAILURE = "start_failure"
     EXECUTION_FAILURE = "execution_failure"
+    RELAYOUT_FAILURE = "relayout_failure"
     STOP_FAILURE = "stop_failure"
     CLEANUP_FAILURE = "cleanup_failure"
 
@@ -81,6 +82,11 @@ class _WindowsRuntimeBoundary(typing.Protocol):
     async def open(self) -> WindowsViewportRuntimeSnapshot: ...
 
     async def close(self) -> WindowsViewportRuntimeSnapshot: ...
+
+
+@typing.runtime_checkable
+class _RelayoutWindowsRuntimeBoundary(typing.Protocol):
+    async def relayout(self, layout: ViewportLayout) -> WindowsViewportRuntimeSnapshot: ...
 
 
 @typing.runtime_checkable
@@ -247,7 +253,7 @@ class BoundedWindowsOperatorRuntime:
             return self.snapshot
 
     async def wait(self) -> WindowsOperatorRuntimeSnapshot:
-        """Wait for the media runtime and preserve Windows resources until close."""
+        """Wait without owning the runtime lock so source-free relayout can proceed."""
         async with self._lock:
             if self._state != WindowsOperatorRuntimeState.RUNNING:
                 raise WindowsOperatorRuntimeError(
@@ -261,28 +267,81 @@ class BoundedWindowsOperatorRuntime:
                     WindowsOperatorRuntimeErrorCode.EXECUTION_FAILURE,
                     "operator runtime media boundary is unavailable",
                 )
+
+        try:
+            child = await presentation.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            async with self._lock:
+                if presentation is self._presentation_runtime:
+                    await self._fail_closed()
+            raise WindowsOperatorRuntimeError(
+                WindowsOperatorRuntimeErrorCode.EXECUTION_FAILURE,
+                "operator runtime execution failed",
+            ) from None
+
+        async with self._lock:
+            if presentation is not self._presentation_runtime:
+                raise WindowsOperatorRuntimeError(
+                    WindowsOperatorRuntimeErrorCode.INVALID_STATE,
+                    "operator runtime media boundary changed during wait",
+                )
+            self._presentation_snapshot = child
+            if child.state == PresentationRuntimeState.COMPLETE:
+                self._state = WindowsOperatorRuntimeState.COMPLETE
+            elif child.state == PresentationRuntimeState.STOPPED:
+                self._state = WindowsOperatorRuntimeState.STOPPED
+            elif child.state == PresentationRuntimeState.FAILED:
+                await self._fail_closed()
+                raise WindowsOperatorRuntimeError(
+                    WindowsOperatorRuntimeErrorCode.EXECUTION_FAILURE,
+                    "operator runtime child failed",
+                )
+            return self.snapshot
+
+    async def relayout(self, layout: ViewportLayout) -> WindowsOperatorRuntimeSnapshot:
+        """Relayout active Windows targets without changing the media presentation runtime."""
+        async with self._lock:
+            if self._state != WindowsOperatorRuntimeState.RUNNING:
+                raise WindowsOperatorRuntimeError(
+                    WindowsOperatorRuntimeErrorCode.INVALID_STATE,
+                    "operator runtime cannot relayout from current state",
+                )
+            if (
+                not isinstance(layout, ViewportLayout)
+                or not 2 <= len(layout.placements) <= _MAX_VIEWPORTS
+            ):
+                raise WindowsOperatorRuntimeError(
+                    WindowsOperatorRuntimeErrorCode.INVALID_CONFIGURATION,
+                    "operator runtime replacement layout is invalid",
+                )
+            current_slots = {item.logical_slot for item in self._layout.placements}
+            candidate_slots = {item.logical_slot for item in layout.placements}
+            if candidate_slots != current_slots:
+                raise WindowsOperatorRuntimeError(
+                    WindowsOperatorRuntimeErrorCode.INVALID_CONFIGURATION,
+                    "operator runtime replacement slot set does not match active layout",
+                )
+            windows = self._windows_runtime
+            if windows is None or not isinstance(windows, _RelayoutWindowsRuntimeBoundary):
+                await self._fail_closed()
+                raise WindowsOperatorRuntimeError(
+                    WindowsOperatorRuntimeErrorCode.RELAYOUT_FAILURE,
+                    "operator runtime Windows relayout boundary is unavailable",
+                )
             try:
-                self._presentation_snapshot = await presentation.wait()
+                self._windows_snapshot = await windows.relayout(layout)
             except asyncio.CancelledError:
                 await self._fail_closed()
                 raise
             except Exception:
                 await self._fail_closed()
                 raise WindowsOperatorRuntimeError(
-                    WindowsOperatorRuntimeErrorCode.EXECUTION_FAILURE,
-                    "operator runtime execution failed",
+                    WindowsOperatorRuntimeErrorCode.RELAYOUT_FAILURE,
+                    "operator runtime relayout failed",
                 ) from None
-
-            if self._presentation_snapshot.state == PresentationRuntimeState.COMPLETE:
-                self._state = WindowsOperatorRuntimeState.COMPLETE
-            elif self._presentation_snapshot.state == PresentationRuntimeState.STOPPED:
-                self._state = WindowsOperatorRuntimeState.STOPPED
-            elif self._presentation_snapshot.state == PresentationRuntimeState.FAILED:
-                await self._fail_closed()
-                raise WindowsOperatorRuntimeError(
-                    WindowsOperatorRuntimeErrorCode.EXECUTION_FAILURE,
-                    "operator runtime child failed",
-                )
+            self._layout = layout
             return self.snapshot
 
     async def stop(self) -> WindowsOperatorRuntimeSnapshot:

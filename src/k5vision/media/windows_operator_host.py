@@ -88,6 +88,11 @@ class _OperatorRuntimeBoundary(typing.Protocol):
     async def close(self) -> WindowsOperatorRuntimeSnapshot: ...
 
 
+@typing.runtime_checkable
+class _RelayoutRuntimeBoundary(typing.Protocol):
+    async def relayout(self, layout: ViewportLayout) -> WindowsOperatorRuntimeSnapshot: ...
+
+
 OperatorRuntimeFactory = Callable[[ViewportLayout], _OperatorRuntimeBoundary]
 
 
@@ -340,6 +345,48 @@ class BoundedWindowsOperatorHost:
                 )
             await self._release_current()
             return await self._start_generation(layout, streams)
+
+    async def relayout(self, layout: ViewportLayout) -> WindowsOperatorHostSnapshot:
+        """Apply source-free geometry to the active generation without replacing it."""
+        self._validate_layout(layout)
+        async with self._lock:
+            if self._state != WindowsOperatorHostState.RUNNING or self._runtime is None:
+                raise WindowsOperatorHostError(
+                    WindowsOperatorHostErrorCode.INVALID_STATE,
+                    "operator host has no running generation to relayout",
+                )
+            runtime = self._runtime
+            if not isinstance(runtime, _RelayoutRuntimeBoundary):
+                await self._close_runtime_after_failure(runtime)
+                self._fail()
+                raise WindowsOperatorHostError(
+                    WindowsOperatorHostErrorCode.CONTROL_FAILURE,
+                    "operator host relayout boundary is unavailable",
+                )
+            try:
+                child = await asyncio.wait_for(
+                    runtime.relayout(layout),
+                    timeout=self._transition_timeout_seconds,
+                )
+            except asyncio.CancelledError:
+                await self._close_runtime_after_failure(runtime)
+                self._fail()
+                raise
+            except Exception:
+                await self._close_runtime_after_failure(runtime)
+                self._fail()
+                raise WindowsOperatorHostError(
+                    WindowsOperatorHostErrorCode.CONTROL_FAILURE,
+                    "operator host relayout failed",
+                ) from None
+            if child.state != WindowsOperatorRuntimeState.RUNNING:
+                await self._close_runtime_after_failure(runtime)
+                self._fail()
+                raise WindowsOperatorHostError(
+                    WindowsOperatorHostErrorCode.CONTROL_FAILURE,
+                    "operator host relayout did not preserve running state",
+                )
+            return self.snapshot
 
     async def wait(self) -> WindowsOperatorHostSnapshot:
         """Wait for the active operator generation to terminate."""
