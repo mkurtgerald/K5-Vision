@@ -187,8 +187,7 @@ def _select_pointer_drag(
     kind = (
         _PointerDragKind.RESIZE
         if (
-            x >= geometry.x + geometry.width - handle
-            and y >= geometry.y + geometry.height - handle
+            x >= geometry.x + geometry.width - handle and y >= geometry.y + geometry.height - handle
         )
         else _PointerDragKind.MOVE
     )
