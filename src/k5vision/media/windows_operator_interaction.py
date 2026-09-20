@@ -26,15 +26,18 @@ _MAX_POINTER_EVENTS = 256
 _PM_REMOVE = 0x0001
 _WM_CLOSE = 0x0010
 _WM_QUIT = 0x0012
+_WM_CANCELMODE = 0x001F
 _WM_MOUSEMOVE = 0x0200
 _WM_LBUTTONDOWN = 0x0201
 _WM_LBUTTONUP = 0x0202
+_WM_CAPTURECHANGED = 0x0215
 
 
 class WindowsPointerEventKind(enum.StrEnum):
     DOWN = "down"
     MOVE = "move"
     UP = "up"
+    CANCEL = "cancel"
 
 
 class WindowsPointerEvent(BaseModel):
@@ -57,6 +60,7 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
     def __init__(self) -> None:
         super().__init__()
         self._pointer_events: deque[WindowsPointerEvent] = deque()
+        self._capture_active = False
         try:
             self._map_window_points = self._user32.MapWindowPoints
             self._map_window_points.argtypes = [
@@ -66,6 +70,18 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
                 ctypes.c_uint32,
             ]
             self._map_window_points.restype = ctypes.c_int
+
+            self._set_capture = self._user32.SetCapture
+            self._set_capture.argtypes = [ctypes.c_void_p]
+            self._set_capture.restype = ctypes.c_void_p
+
+            self._get_capture = self._user32.GetCapture
+            self._get_capture.argtypes = []
+            self._get_capture.restype = ctypes.c_void_p
+
+            self._release_capture = self._user32.ReleaseCapture
+            self._release_capture.argtypes = []
+            self._release_capture.restype = ctypes.c_int
         except Exception:
             raise _NativeShellError(_NativeShellFailure.LOAD) from None
 
@@ -92,6 +108,49 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
                 raise _NativeShellError(_NativeShellFailure.PUMP) from None
         self._pointer_events.append(WindowsPointerEvent(kind=kind, x=int(point.x), y=int(point.y)))
 
+    def _acquire_pointer_capture(self, shell: int) -> None:
+        try:
+            self._set_capture(ctypes.c_void_p(shell))
+            captured = int(self._get_capture() or 0)
+        except Exception:
+            raise _NativeShellError(_NativeShellFailure.PUMP) from None
+        if captured != shell:
+            raise _NativeShellError(_NativeShellFailure.PUMP)
+        self._capture_active = True
+
+    def _release_pointer_capture(self) -> None:
+        if not self._capture_active:
+            return
+        self._capture_active = False
+        try:
+            released = bool(self._release_capture())
+        except Exception:
+            raise _NativeShellError(_NativeShellFailure.PUMP) from None
+        if not released:
+            raise _NativeShellError(_NativeShellFailure.PUMP)
+
+    def _cancel_pointer_capture(self, shell: int) -> None:
+        if not self._capture_active:
+            return
+        self._release_pointer_capture()
+        self._append_pointer_event(
+            kind=WindowsPointerEventKind.CANCEL,
+            shell=shell,
+            hwnd=0,
+            lparam=0,
+        )
+
+    def _capture_was_lost(self, shell: int) -> None:
+        if not self._capture_active:
+            return
+        self._capture_active = False
+        self._append_pointer_event(
+            kind=WindowsPointerEventKind.CANCEL,
+            shell=shell,
+            hwnd=0,
+            lparam=0,
+        )
+
     def pump_messages(self, shell: int, max_messages: int) -> tuple[int, bool]:
         count = 0
         close_requested = False
@@ -107,15 +166,24 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
                 count += 1
                 hwnd = int(message.hwnd or 0)
                 if message.message == _WM_QUIT or (message.message == _WM_CLOSE and hwnd == shell):
+                    self._cancel_pointer_capture(shell)
                     close_requested = True
                     continue
+                if message.message == _WM_CANCELMODE:
+                    self._cancel_pointer_capture(shell)
+                    continue
+                if message.message == _WM_CAPTURECHANGED:
+                    self._capture_was_lost(shell)
+                    continue
                 if message.message == _WM_LBUTTONDOWN:
+                    self._cancel_pointer_capture(shell)
                     self._append_pointer_event(
                         kind=WindowsPointerEventKind.DOWN,
                         shell=shell,
                         hwnd=hwnd,
                         lparam=int(message.lParam),
                     )
+                    self._acquire_pointer_capture(shell)
                 elif message.message == _WM_MOUSEMOVE:
                     self._append_pointer_event(
                         kind=WindowsPointerEventKind.MOVE,
@@ -130,6 +198,7 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
                         hwnd=hwnd,
                         lparam=int(message.lParam),
                     )
+                    self._release_pointer_capture()
                 self._translate_message(ctypes.byref(message))
                 self._dispatch_message(ctypes.byref(message))
         except _NativeShellError:

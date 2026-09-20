@@ -72,6 +72,7 @@ class WindowsOperatorControlSnapshot(BaseModel):
     relayouts: int = Field(default=0, ge=0)
     viewport_edits: int = Field(default=0, ge=0)
     interaction_edits: int = Field(default=0, ge=0)
+    cancelled_interactions: int = Field(default=0, ge=0)
     stop_requests: int = Field(ge=0)
 
 
@@ -239,6 +240,7 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
         self._relayouts = 0
         self._viewport_edits = 0
         self._interaction_edits = 0
+        self._cancelled_interactions = 0
         self._stop_requests = 0
         self._active_layout: ViewportLayout | None = None
         self._pointer_drag: _PointerDrag | None = None
@@ -254,6 +256,7 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
             relayouts=self._relayouts,
             viewport_edits=self._viewport_edits,
             interaction_edits=self._interaction_edits,
+            cancelled_interactions=self._cancelled_interactions,
             stop_requests=self._stop_requests,
         )
 
@@ -321,7 +324,15 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
                     "operator pointer input is invalid",
                 )
 
+            if event.kind == WindowsPointerEventKind.CANCEL:
+                if self._pointer_drag is not None:
+                    self._cancelled_interactions += 1
+                self._pointer_drag = None
+                continue
+
             if event.kind == WindowsPointerEventKind.DOWN:
+                if self._pointer_drag is not None:
+                    self._cancelled_interactions += 1
                 self._pointer_drag = (
                     None
                     if self._active_layout is None
@@ -572,6 +583,8 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
             )
             raise WindowsOperatorSessionError(code, message) from None
         finally:
+            if self._pointer_drag is not None:
+                self._cancelled_interactions += 1
             self._pointer_drag = None
             self._drain_controls()
 
