@@ -17,8 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from k5vision.media.presentation_frame import PresentationVideoFrame
 
-_MAX_VIEWPORTS = 16
-_MAX_SLOT = 63
+_MAX_VIEWPORTS = 64
+_MAX_SLOT = 4095
 _MAX_TOTAL_FRAMES = 1_000_000
 _MAX_FRAME_BYTES = 256 * 1024 * 1024
 _MAX_TOTAL_FRAME_BYTES = 16 * 1024 * 1024 * 1024
@@ -36,7 +36,7 @@ class ViewportBinding:
 
     def __post_init__(self) -> None:
         if not 0 <= self.slot <= _MAX_SLOT:
-            raise ValueError("slot must be between 0 and 63")
+            raise ValueError("slot must be between 0 and 4095")
         if not callable(self.consumer):
             raise TypeError("consumer must be callable")
 
@@ -87,14 +87,14 @@ class BoundedViewportDispatcher:
         self,
         bindings: Sequence[ViewportBinding],
         *,
-        max_viewports: int = 16,
+        max_viewports: int = 64,
         max_total_frames: int = 100_000,
         max_frame_bytes: int = 64 * 1024 * 1024,
         max_total_frame_bytes: int = 4 * 1024 * 1024 * 1024,
         consumer_timeout_seconds: float = 0.5,
     ) -> None:
         if not 1 <= max_viewports <= _MAX_VIEWPORTS:
-            raise ValueError("max_viewports must be between 1 and 16")
+            raise ValueError("max_viewports must be between 1 and 64")
         if not 1 <= max_total_frames <= _MAX_TOTAL_FRAMES:
             raise ValueError("max_total_frames must be between 1 and 1000000")
         if not 1 <= max_frame_bytes <= _MAX_FRAME_BYTES:
