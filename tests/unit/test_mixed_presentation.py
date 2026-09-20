@@ -157,6 +157,26 @@ def test_mixed_presentation_serializes_consumer_and_retains_aggregate_state() ->
     assert "abcd" not in payload
 
 
+def test_mixed_streams_accept_full_arbitrary_viewport_slot_ceiling() -> None:
+    coordinator = BoundedMixedPresentation()
+    observed: list[int] = []
+
+    async def consume(slot: int, _frame: PresentationVideoFrame) -> None:
+        observed.append(slot)
+
+    streams = [
+        MixedLiveStream(4095, "rtsp://execution-only", FakeLiveDelivery([_frame(0)])),
+        MixedPlaybackStream(7, FakePlaybackDelivery([_frame(0)])),
+    ]
+    snapshot = asyncio.run(coordinator.run(streams, consume))
+
+    assert sorted(observed) == [7, 4095]
+    assert snapshot.state == MixedPresentationState.COMPLETE
+    assert snapshot.stream_count == 2
+    assert "4095" not in snapshot.model_dump_json()
+    assert "rtsp://" not in snapshot.model_dump_json()
+
+
 def test_mixed_set_requires_both_kinds_and_unique_slots() -> None:
     async def consume(_slot: int, _frame: PresentationVideoFrame) -> None:
         return None
@@ -253,8 +273,8 @@ def test_single_use_and_constructor_bounds_fail_closed() -> None:
     with pytest.raises(ValueError):
         BoundedMixedPresentation(max_total_frame_bytes=0)
     with pytest.raises(ValueError):
-        MixedLiveStream(64, "rtsp://source", FakeLiveDelivery([]))
+        MixedLiveStream(4096, "rtsp://source", FakeLiveDelivery([]))
     with pytest.raises(ValueError):
         MixedLiveStream(0, "", FakeLiveDelivery([]))
     with pytest.raises(ValueError):
-        MixedPlaybackStream(64, FakePlaybackDelivery([]))
+        MixedPlaybackStream(4096, FakePlaybackDelivery([]))

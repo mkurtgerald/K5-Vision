@@ -24,7 +24,7 @@ from k5vision.media.presentation_playback import (
 )
 
 _MAX_STREAMS = 16
-_MAX_SLOT = 63
+_MAX_SLOT = 4095
 _MAX_TOTAL_FRAMES = 1_000_000
 _MAX_TOTAL_FRAME_BYTES = 16 * 1024 * 1024 * 1024
 _MAX_SOURCE_SPAN_MS = 2_147_483_647
@@ -55,7 +55,7 @@ class MixedLiveStream:
 
     def __post_init__(self) -> None:
         if not 0 <= self.slot <= _MAX_SLOT:
-            raise ValueError("slot must be between 0 and 63")
+            raise ValueError("slot must be between 0 and 4095")
         if not isinstance(self.source_uri, str) or not self.source_uri.strip():
             raise ValueError("source_uri must be a non-empty string")
         if not callable(getattr(self.delivery, "run", None)):
@@ -71,7 +71,7 @@ class MixedPlaybackStream:
 
     def __post_init__(self) -> None:
         if not 0 <= self.slot <= _MAX_SLOT:
-            raise ValueError("slot must be between 0 and 63")
+            raise ValueError("slot must be between 0 and 4095")
         if not callable(getattr(self.delivery, "run", None)):
             raise TypeError("delivery must implement the playback presentation boundary")
 
