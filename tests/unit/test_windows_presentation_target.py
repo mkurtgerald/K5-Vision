@@ -15,7 +15,7 @@ from k5vision.media.windows_presentation_target import (
 
 class FakeNativeApi:
     def __init__(self) -> None:
-        self.created: list[tuple[int, int]] = []
+        self.created: list[tuple[int, int, int, int]] = []
         self.acquired: list[int] = []
         self.released: list[tuple[int, int]] = []
         self.destroyed: list[int] = []
@@ -24,10 +24,10 @@ class FakeNativeApi:
         self.fail_release = False
         self.fail_destroy = False
 
-    def create_target(self, width: int, height: int) -> int:
+    def create_target(self, x: int, y: int, width: int, height: int) -> int:
         if self.fail_create:
             raise target_module._NativeTargetError(target_module._NativeTargetFailure.CREATE)
-        self.created.append((width, height))
+        self.created.append((x, y, width, height))
         return 101
 
     def acquire_dc(self, target: int) -> int:
@@ -58,17 +58,20 @@ class FakeSurface:
             raise RuntimeError("C:\\private\\target-secret")
 
 
-def test_open_present_close_is_bounded_and_handle_free() -> None:
+def test_open_present_close_is_bounded_positioned_and_handle_free() -> None:
     async def scenario() -> None:
         native = FakeNativeApi()
         surface = FakeSurface()
         target = BoundedWindowsPresentationTarget(native_api=native)
 
-        opened = await target.open(640, 480)
+        opened = await target.open(640, 480, x=17, y=29)
         assert opened.state == WindowsPresentationTargetState.OPEN
         assert opened.target_open
+        assert opened.x == 17
+        assert opened.y == 29
         assert opened.width == 640
         assert opened.height == 480
+        assert native.created == [(17, 29, 640, 480)]
 
         current = await target.present(surface)
         assert current.presentations == 1
@@ -82,6 +85,8 @@ def test_open_present_close_is_bounded_and_handle_free() -> None:
         closed = await target.close()
         assert closed.state == WindowsPresentationTargetState.CLOSED
         assert not closed.target_open
+        assert closed.x == 0
+        assert closed.y == 0
         assert native.destroyed == [101]
         assert (await target.close()).state == WindowsPresentationTargetState.CLOSED
 
@@ -92,13 +97,13 @@ def test_matching_open_is_idempotent_but_geometry_change_is_rejected() -> None:
     async def scenario() -> None:
         native = FakeNativeApi()
         target = BoundedWindowsPresentationTarget(native_api=native)
-        await target.open(320, 240)
-        again = await target.open(320, 240)
+        await target.open(320, 240, x=5, y=7)
+        again = await target.open(320, 240, x=5, y=7)
         assert again.state == WindowsPresentationTargetState.OPEN
-        assert native.created == [(320, 240)]
+        assert native.created == [(5, 7, 320, 240)]
 
         with pytest.raises(WindowsPresentationTargetError) as exc_info:
-            await target.open(321, 240)
+            await target.open(320, 240, x=6, y=7)
         assert exc_info.value.code == WindowsPresentationTargetErrorCode.INVALID_STATE
         await target.close()
 
@@ -106,14 +111,33 @@ def test_matching_open_is_idempotent_but_geometry_change_is_rejected() -> None:
 
 
 @pytest.mark.parametrize(
-    ("width", "height"),
-    [(0, 1), (1, 0), (-1, 1), (1, -1), (16_385, 1), (1, 16_385), (True, 1)],
+    ("x", "y", "width", "height"),
+    [
+        (0, 0, 0, 1),
+        (0, 0, 1, 0),
+        (0, 0, -1, 1),
+        (0, 0, 1, -1),
+        (0, 0, 16_385, 1),
+        (0, 0, 1, 16_385),
+        (-1, 0, 1, 1),
+        (0, -1, 1, 1),
+        (1_000_001, 0, 1, 1),
+        (0, 1_000_001, 1, 1),
+        (True, 0, 1, 1),
+        (0, True, 1, 1),
+        (0, 0, True, 1),
+    ],
 )
-def test_geometry_validation_is_explicit(width: object, height: object) -> None:
+def test_geometry_validation_is_explicit(
+    x: object,
+    y: object,
+    width: object,
+    height: object,
+) -> None:
     async def scenario() -> None:
         target = BoundedWindowsPresentationTarget(native_api=FakeNativeApi())
         with pytest.raises(WindowsPresentationTargetError) as exc_info:
-            await target.open(width, height)  # type: ignore[arg-type]
+            await target.open(width, height, x=x, y=y)  # type: ignore[arg-type]
         assert exc_info.value.code == WindowsPresentationTargetErrorCode.INVALID_CONFIGURATION
         assert target.snapshot.state == WindowsPresentationTargetState.READY
 
