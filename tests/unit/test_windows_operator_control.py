@@ -93,7 +93,9 @@ class ControllableFakeApplication:
         )
         return self._snapshot
 
-    async def start(self, layout: ViewportLayout, streams: object) -> WindowsOperatorApplicationSnapshot:
+    async def start(
+        self, layout: ViewportLayout, streams: object
+    ) -> WindowsOperatorApplicationSnapshot:
         del streams
         assert {item.logical_slot for item in layout.placements} == {7, 4095}
         self.generation = 1
@@ -226,9 +228,7 @@ def test_control_queue_is_bounded_while_pump_is_blocked() -> None:
             poll_interval_seconds=0,
             max_cycles=50,
         )
-        task = asyncio.create_task(
-            control.run(width=900, height=700, layout=_layout(), streams=())
-        )
+        task = asyncio.create_task(control.run(width=900, height=700, layout=_layout(), streams=()))
         while "pump-blocked" not in events:
             await asyncio.sleep(0)
 
