@@ -1,0 +1,52 @@
+name: Current Gate Viewport Editor Qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/current-gate-viewport-editor.yml
+      - src/k5vision/media/viewport_editor.py
+      - src/k5vision/media/viewport_geometry.py
+      - src/k5vision/media/windows_operator_control.py
+      - tests/unit/test_current_gate_viewport_editor.py
+      - docs/current-gate-dependency-review.md
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/current-gate-viewport-editor.yml
+      - src/k5vision/media/viewport_editor.py
+      - src/k5vision/media/viewport_geometry.py
+      - src/k5vision/media/windows_operator_control.py
+      - tests/unit/test_current_gate_viewport_editor.py
+      - docs/current-gate-dependency-review.md
+
+permissions:
+  contents: read
+
+jobs:
+  viewport-editor:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout exact current-gate revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run exact viewport editor regression
+        shell: powershell
+        run: pytest tests/unit/test_current_gate_viewport_editor.py tests/unit/test_viewport_geometry.py tests/unit/test_current_gate_operator_relayout_control.py -q --no-cov
