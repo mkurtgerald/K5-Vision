@@ -163,9 +163,7 @@ class BoundedWindowsOperatorSession:
             shell_open=False if application is None else application.shell_open,
             generation=0 if application is None else application.generation,
             viewport_count=0 if application is None else application.viewport_count,
-            open_surface_count=(
-                0 if application is None else application.open_surface_count
-            ),
+            open_surface_count=(0 if application is None else application.open_surface_count),
             delivered_frames=0 if application is None else application.delivered_frames,
             presentations=0 if application is None else application.presentations,
             pumped_messages=0 if application is None else application.pumped_messages,
