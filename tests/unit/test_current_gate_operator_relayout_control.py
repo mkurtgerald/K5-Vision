@@ -361,9 +361,7 @@ class FakeApplicationHost:
             presentations=0,
         )
 
-    async def start(
-        self, _layout: ViewportLayout, _streams: object
-    ) -> WindowsOperatorHostSnapshot:
+    async def start(self, _layout: ViewportLayout, _streams: object) -> WindowsOperatorHostSnapshot:
         self.start_calls += 1
         self.generation = 1
         self.state = WindowsOperatorHostState.RUNNING
