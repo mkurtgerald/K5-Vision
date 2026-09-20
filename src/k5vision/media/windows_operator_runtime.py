@@ -117,7 +117,10 @@ class BoundedWindowsOperatorRuntime:
         windows_runtime_factory: WindowsRuntimeFactory | None = None,
         presentation_runtime_factory: PresentationRuntimeFactory | None = None,
     ) -> None:
-        if not isinstance(layout, ViewportLayout) or not 2 <= len(layout.placements) <= _MAX_VIEWPORTS:
+        if (
+            not isinstance(layout, ViewportLayout)
+            or not 2 <= len(layout.placements) <= _MAX_VIEWPORTS
+        ):
             raise WindowsOperatorRuntimeError(
                 WindowsOperatorRuntimeErrorCode.INVALID_CONFIGURATION,
                 "operator runtime viewport layout is invalid",
@@ -324,6 +327,6 @@ class BoundedWindowsOperatorRuntime:
                 raise WindowsOperatorRuntimeError(
                     WindowsOperatorRuntimeErrorCode.CLEANUP_FAILURE,
                     "operator runtime cleanup failed",
-                )
+                ) from None
             self._state = WindowsOperatorRuntimeState.CLOSED
             return self.snapshot
