@@ -119,7 +119,7 @@ def test_message_pump_refreshes_z_order_before_processing(
     monkeypatch.setattr(
         _CatalogWin32OperatorShellApi,
         "pump_messages",
-        lambda _self, _shell, _max_messages: (order.append("pump") or (0, False)),
+        lambda _self, _shell, _max_messages: order.append("pump") or (0, False),
     )
 
     assert api.pump_messages(1, 16) == (0, False)
