@@ -119,9 +119,7 @@ def test_catalog_capacity_is_bounded() -> None:
 
 
 def test_restored_view_requires_same_active_logical_slot_set() -> None:
-    catalog = build_viewport_catalog(
-        (ViewportCatalogEntry(view_id=4, layout=_layout()),)
-    )
+    catalog = build_viewport_catalog((ViewportCatalogEntry(view_id=4, layout=_layout()),))
     incompatible = _layout(2, second_slot=2)
 
     with pytest.raises(ViewportCatalogError) as exc_info:
@@ -132,9 +130,7 @@ def test_restored_view_requires_same_active_logical_slot_set() -> None:
 
 def test_restored_view_returns_exact_non_grid_layout_for_sparse_slot() -> None:
     expected = _layout(11)
-    catalog = build_viewport_catalog(
-        (ViewportCatalogEntry(view_id=6, layout=expected),)
-    )
+    catalog = build_viewport_catalog((ViewportCatalogEntry(view_id=6, layout=expected),))
 
     restored = catalog_view_for_active_layout(catalog, 6, _layout())
 
@@ -144,9 +140,7 @@ def test_restored_view_returns_exact_non_grid_layout_for_sparse_slot() -> None:
 
 
 def test_missing_view_and_invalid_identifier_fail_without_fallback() -> None:
-    catalog = build_viewport_catalog(
-        (ViewportCatalogEntry(view_id=1, layout=_layout()),)
-    )
+    catalog = build_viewport_catalog((ViewportCatalogEntry(view_id=1, layout=_layout()),))
 
     with pytest.raises(ViewportCatalogError) as missing_error:
         catalog_view_for_active_layout(catalog, 2, _layout())
@@ -158,9 +152,7 @@ def test_missing_view_and_invalid_identifier_fail_without_fallback() -> None:
 
 
 def test_serialized_catalog_is_source_and_native_identity_free() -> None:
-    catalog = build_viewport_catalog(
-        (ViewportCatalogEntry(view_id=5, layout=_layout()),)
-    )
+    catalog = build_viewport_catalog((ViewportCatalogEntry(view_id=5, layout=_layout()),))
     payload = serialize_viewport_catalog(catalog).decode("utf-8").casefold()
 
     for forbidden in (
