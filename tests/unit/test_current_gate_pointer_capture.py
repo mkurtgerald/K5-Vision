@@ -80,16 +80,12 @@ def test_cancel_and_capture_loss_emit_ephemeral_cancel_events() -> None:
     native._capture_active = True
     native._cancel_pointer_capture(71)
     assert native._capture_active is False
-    assert native.drain_pointer_events(1) == (
-        _event(WindowsPointerEventKind.CANCEL),
-    )
+    assert native.drain_pointer_events(1) == (_event(WindowsPointerEventKind.CANCEL),)
 
     native._capture_active = True
     native._capture_was_lost(71)
     assert native._capture_active is False
-    assert native.drain_pointer_events(1) == (
-        _event(WindowsPointerEventKind.CANCEL),
-    )
+    assert native.drain_pointer_events(1) == (_event(WindowsPointerEventKind.CANCEL),)
 
 
 class _CaptureFakeApplication:
@@ -120,12 +116,16 @@ class _CaptureFakeApplication:
         self.state = WindowsOperatorApplicationState.OPEN
         return self.snapshot
 
-    async def start(self, _layout: ViewportLayout, _streams: object) -> WindowsOperatorApplicationSnapshot:
+    async def start(
+        self, _layout: ViewportLayout, _streams: object
+    ) -> WindowsOperatorApplicationSnapshot:
         self.generation = 1
         self.state = WindowsOperatorApplicationState.RUNNING
         return self.snapshot
 
-    async def replace(self, _layout: ViewportLayout, _streams: object) -> WindowsOperatorApplicationSnapshot:
+    async def replace(
+        self, _layout: ViewportLayout, _streams: object
+    ) -> WindowsOperatorApplicationSnapshot:
         self.generation += 1
         return self.snapshot
 
