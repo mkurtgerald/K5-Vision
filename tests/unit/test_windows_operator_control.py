@@ -173,29 +173,35 @@ def test_live_control_replaces_arbitrary_layout_and_stops_same_session() -> None
             max_cycles=500,
         )
 
+        initial_layout = _layout()
+        replacement_layout = _layout(offset=37)
         task = asyncio.create_task(
             control.run(
                 width=1280,
                 height=900,
-                layout=_layout(),
+                layout=initial_layout,
                 streams=(),
             )
         )
         while "pump" not in events:
             await asyncio.sleep(0)
 
-        queued = control.request_replace(_layout(offset=37), ())
+        assert control.control_snapshot.active_layout == initial_layout
+        queued = control.request_replace(replacement_layout, ())
         assert queued.queued_controls == 1
+        assert queued.active_layout == initial_layout
         while "replace" not in events:
             await asyncio.sleep(0)
 
         assert control.control_snapshot.replacements == 1
         assert control.control_snapshot.session.generation == 2
+        assert control.control_snapshot.active_layout == replacement_layout
         control.request_stop()
         finished = await task
 
         assert finished.session.state == WindowsOperatorSessionState.COMPLETE
         assert finished.session.shell_open is False
+        assert finished.active_layout == replacement_layout
         assert finished.replacements == 1
         assert finished.stop_requests == 1
         assert finished.processed_controls == 2
@@ -203,6 +209,24 @@ def test_live_control_replaces_arbitrary_layout_and_stops_same_session() -> None
         assert events.count("open:1280x900") == 1
         assert events.count("replace") == 1
         assert events[-2:] == ["stop", "close"]
+
+        retained = finished.model_dump_json().casefold()
+        assert '"logical_slot":7' in retained
+        assert '"logical_slot":4095' in retained
+        assert '"x":54' in retained
+        assert '"y":78' in retained
+        for forbidden in (
+            "rtsp://",
+            "credential",
+            "password",
+            "source_id",
+            "recording_id",
+            "path",
+            "payload",
+            "handle",
+            "pointer",
+        ):
+            assert forbidden not in retained
 
     asyncio.run(scenario())
 
