@@ -266,9 +266,7 @@ def test_native_button_message_queues_only_exact_button_handle_and_valid_view() 
     assert api._consume_catalog_command_message(_SAVE_BUTTON_ID, 999) is False
     assert api._consume_catalog_command_message(_SAVE_BUTTON_ID, 101) is True
 
-    assert tuple(api._catalog_commands) == (
-        _command(WindowsOperatorCatalogCommandKind.SAVE, 63),
-    )
+    assert tuple(api._catalog_commands) == (_command(WindowsOperatorCatalogCommandKind.SAVE, 63),)
     assert api._catalog_rejections == 0
 
 
@@ -303,8 +301,7 @@ def test_native_command_queue_is_bounded_and_fails_closed() -> None:
 def test_native_drain_is_bounded_and_rejection_counter_resets() -> None:
     api = object.__new__(_CatalogWin32OperatorShellApi)
     commands = tuple(
-        _command(WindowsOperatorCatalogCommandKind.SAVE, view_id)
-        for view_id in (1, 2, 3)
+        _command(WindowsOperatorCatalogCommandKind.SAVE, view_id) for view_id in (1, 2, 3)
     )
     api._catalog_commands = deque(commands)
     api._catalog_rejections = 4
@@ -362,9 +359,7 @@ def test_application_rejects_invalid_batches_and_native_failures() -> None:
         )
     assert configuration.value.code == WindowsOperatorApplicationErrorCode.INVALID_CONFIGURATION
 
-    bad_commands = BoundedCatalogWindowsOperatorApplication(
-        native_api=_BadNative([], rejected=0)
-    )
+    bad_commands = BoundedCatalogWindowsOperatorApplication(native_api=_BadNative([], rejected=0))
     with pytest.raises(WindowsOperatorApplicationError) as invalid_batch:
         bad_commands.drain_catalog_commands()
     assert invalid_batch.value.code == WindowsOperatorApplicationErrorCode.PUMP_FAILURE
