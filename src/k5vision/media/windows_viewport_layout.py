@@ -72,7 +72,7 @@ TargetFactory = Callable[[], _TargetBoundary]
 
 
 class BoundedWindowsViewportLayout:
-    """Open, route and close positioned targets for one immutable viewport layout."""
+    """Open, route, relayout and close positioned targets for one viewport set."""
 
     def __init__(
         self,
@@ -110,11 +110,10 @@ class BoundedWindowsViewportLayout:
             presentations=self._presentations,
         )
 
-    async def _close_targets(self) -> bool:
+    @staticmethod
+    async def _close_target_map(targets: dict[int, _TargetBoundary]) -> bool:
         failed = False
-        targets = tuple(self._targets.values())
-        self._targets.clear()
-        for target in reversed(targets):
+        for target in reversed(tuple(targets.values())):
             try:
                 await target.close()
             except asyncio.CancelledError:
@@ -122,6 +121,34 @@ class BoundedWindowsViewportLayout:
             except Exception:
                 failed = True
         return failed
+
+    async def _close_targets(self) -> bool:
+        targets = self._targets
+        self._targets = {}
+        return await self._close_target_map(targets)
+
+    async def _open_target_map(
+        self,
+        layout: ViewportLayout,
+    ) -> dict[int, _TargetBoundary]:
+        targets: dict[int, _TargetBoundary] = {}
+        try:
+            for placement in layout.placements:
+                target = self._target_factory()
+                if not isinstance(target, _TargetBoundary):
+                    raise TypeError("invalid target boundary")
+                targets[placement.logical_slot] = target
+                geometry = placement.geometry
+                await target.open(
+                    geometry.width,
+                    geometry.height,
+                    x=geometry.x,
+                    y=geometry.y,
+                )
+        except BaseException:
+            await self._close_target_map(targets)
+            raise
+        return targets
 
     async def open(self) -> WindowsViewportLayoutSnapshot:
         """Open one positioned target per logical placement, failing closed on partial open."""
@@ -134,32 +161,68 @@ class BoundedWindowsViewportLayout:
                     "viewport target layout cannot open from current state",
                 )
 
-            for placement in self._layout.placements:
-                try:
-                    target = self._target_factory()
-                    if not isinstance(target, _TargetBoundary):
-                        raise TypeError("invalid target boundary")
-                    self._targets[placement.logical_slot] = target
-                    geometry = placement.geometry
-                    await target.open(
-                        geometry.width,
-                        geometry.height,
-                        x=geometry.x,
-                        y=geometry.y,
-                    )
-                except asyncio.CancelledError:
-                    await self._close_targets()
-                    self._state = WindowsViewportLayoutState.FAILED
-                    raise
-                except Exception:
-                    await self._close_targets()
-                    self._state = WindowsViewportLayoutState.FAILED
-                    raise WindowsViewportLayoutError(
-                        WindowsViewportLayoutErrorCode.TARGET_OPEN_FAILURE,
-                        "viewport target layout open failed",
-                    ) from None
+            try:
+                self._targets = await self._open_target_map(self._layout)
+            except asyncio.CancelledError:
+                self._targets = {}
+                self._state = WindowsViewportLayoutState.FAILED
+                raise
+            except Exception:
+                self._targets = {}
+                self._state = WindowsViewportLayoutState.FAILED
+                raise WindowsViewportLayoutError(
+                    WindowsViewportLayoutErrorCode.TARGET_OPEN_FAILURE,
+                    "viewport target layout open failed",
+                ) from None
 
             self._state = WindowsViewportLayoutState.OPEN
+            return self.snapshot
+
+    async def relayout(self, layout: ViewportLayout) -> WindowsViewportLayoutSnapshot:
+        """Atomically replace target geometry while preserving the active logical-slot set."""
+        async with self._lock:
+            if self._state != WindowsViewportLayoutState.OPEN:
+                raise WindowsViewportLayoutError(
+                    WindowsViewportLayoutErrorCode.INVALID_STATE,
+                    "viewport target layout is not open",
+                )
+            if not isinstance(layout, ViewportLayout):
+                raise WindowsViewportLayoutError(
+                    WindowsViewportLayoutErrorCode.INVALID_CONFIGURATION,
+                    "replacement viewport layout is invalid",
+                )
+            active_slots = set(self._targets)
+            candidate_slots = {placement.logical_slot for placement in layout.placements}
+            if candidate_slots != active_slots:
+                raise WindowsViewportLayoutError(
+                    WindowsViewportLayoutErrorCode.INVALID_CONFIGURATION,
+                    "replacement viewport slot set does not match active layout",
+                )
+
+            try:
+                replacement_targets = await self._open_target_map(layout)
+            except asyncio.CancelledError:
+                await self._close_targets()
+                self._state = WindowsViewportLayoutState.FAILED
+                raise
+            except Exception:
+                await self._close_targets()
+                self._state = WindowsViewportLayoutState.FAILED
+                raise WindowsViewportLayoutError(
+                    WindowsViewportLayoutErrorCode.TARGET_OPEN_FAILURE,
+                    "replacement viewport target layout open failed",
+                ) from None
+
+            prior_targets = self._targets
+            self._targets = replacement_targets
+            self._layout = layout
+            if await self._close_target_map(prior_targets):
+                await self._close_targets()
+                self._state = WindowsViewportLayoutState.FAILED
+                raise WindowsViewportLayoutError(
+                    WindowsViewportLayoutErrorCode.CLEANUP_FAILURE,
+                    "prior viewport target layout cleanup failed",
+                )
             return self.snapshot
 
     async def present(self, logical_slot: int, surface: object) -> WindowsViewportLayoutSnapshot:

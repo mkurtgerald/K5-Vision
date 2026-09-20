@@ -31,6 +31,7 @@ class WindowsViewportRuntimeErrorCode(enum.StrEnum):
     INVALID_STATE = "invalid_state"
     SURFACE_OPEN_FAILURE = "surface_open_failure"
     LAYOUT_OPEN_FAILURE = "layout_open_failure"
+    RELAYOUT_FAILURE = "relayout_failure"
     UNKNOWN_SLOT = "unknown_slot"
     PRESENTATION_LIMIT = "presentation_limit"
     PRESENTATION_FAILURE = "presentation_failure"
@@ -73,6 +74,11 @@ class _LayoutBoundary(typing.Protocol):
     async def present(self, logical_slot: int, surface: object) -> object: ...
 
     async def close(self) -> object: ...
+
+
+@typing.runtime_checkable
+class _RelayoutBoundary(typing.Protocol):
+    async def relayout(self, layout: ViewportLayout) -> object: ...
 
 
 SurfaceFactory = Callable[[], _SurfaceBoundary]
@@ -219,6 +225,49 @@ class BoundedWindowsViewportRuntime:
                 ) from None
 
             self._state = WindowsViewportRuntimeState.OPEN
+            return self.snapshot
+
+    async def relayout(self, layout: ViewportLayout) -> WindowsViewportRuntimeSnapshot:
+        """Apply source-free geometry changes while preserving active surfaces and bindings."""
+        async with self._lock:
+            if self._state != WindowsViewportRuntimeState.OPEN:
+                raise WindowsViewportRuntimeError(
+                    WindowsViewportRuntimeErrorCode.INVALID_STATE,
+                    "viewport runtime is not open",
+                )
+            if not isinstance(layout, ViewportLayout):
+                raise WindowsViewportRuntimeError(
+                    WindowsViewportRuntimeErrorCode.INVALID_CONFIGURATION,
+                    "replacement viewport runtime layout is invalid",
+                )
+            active_slots = set(self._surfaces)
+            candidate_slots = {placement.logical_slot for placement in layout.placements}
+            if candidate_slots != active_slots:
+                raise WindowsViewportRuntimeError(
+                    WindowsViewportRuntimeErrorCode.INVALID_CONFIGURATION,
+                    "replacement viewport runtime slot set does not match active layout",
+                )
+            target_layout = self._target_layout
+            if target_layout is None or not isinstance(target_layout, _RelayoutBoundary):
+                await self._fail_closed()
+                raise WindowsViewportRuntimeError(
+                    WindowsViewportRuntimeErrorCode.RELAYOUT_FAILURE,
+                    "viewport runtime target layout cannot be replaced",
+                )
+
+            try:
+                await target_layout.relayout(layout)
+            except asyncio.CancelledError:
+                await self._fail_closed()
+                raise
+            except Exception:
+                await self._fail_closed()
+                raise WindowsViewportRuntimeError(
+                    WindowsViewportRuntimeErrorCode.RELAYOUT_FAILURE,
+                    "viewport runtime relayout failed",
+                ) from None
+
+            self._layout = layout
             return self.snapshot
 
     async def present(
