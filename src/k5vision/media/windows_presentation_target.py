@@ -10,6 +10,7 @@ import typing
 
 from pydantic import BaseModel, ConfigDict, Field
 
+_MAX_COORDINATE = 1_000_000
 _MAX_DIMENSION = 16_384
 _MAX_PRESENTATIONS = 1_000_000
 _WS_POPUP = 0x80000000
@@ -50,6 +51,8 @@ class WindowsPresentationTargetSnapshot(BaseModel):
     schema_version: typing.Literal["1"] = "1"
     state: WindowsPresentationTargetState
     target_open: bool
+    x: int = Field(ge=0, le=_MAX_COORDINATE)
+    y: int = Field(ge=0, le=_MAX_COORDINATE)
     width: int = Field(ge=0, le=_MAX_DIMENSION)
     height: int = Field(ge=0, le=_MAX_DIMENSION)
     presentations: int = Field(ge=0, le=_MAX_PRESENTATIONS)
@@ -77,7 +80,7 @@ class _SurfaceBoundary(typing.Protocol):
 
 @typing.runtime_checkable
 class _NativeTargetBoundary(typing.Protocol):
-    def create_target(self, width: int, height: int) -> int: ...
+    def create_target(self, x: int, y: int, width: int, height: int) -> int: ...
 
     def acquire_dc(self, target: int) -> int: ...
 
@@ -132,7 +135,7 @@ class _Win32WindowTargetApi:
         except Exception:
             raise _NativeTargetError(_NativeTargetFailure.LOAD) from None
 
-    def create_target(self, width: int, height: int) -> int:
+    def create_target(self, x: int, y: int, width: int, height: int) -> int:
         try:
             instance = int(self._get_module_handle(None) or 0)
             target = int(
@@ -141,8 +144,8 @@ class _Win32WindowTargetApi:
                     "STATIC",
                     "",
                     _WS_POPUP,
-                    0,
-                    0,
+                    x,
+                    y,
                     width,
                     height,
                     None,
@@ -204,6 +207,8 @@ class BoundedWindowsPresentationTarget:
         self._native_api = native_api
         self._state = WindowsPresentationTargetState.READY
         self._target: int | None = None
+        self._x = 0
+        self._y = 0
         self._width = 0
         self._height = 0
         self._presentations = 0
@@ -214,6 +219,8 @@ class BoundedWindowsPresentationTarget:
         return WindowsPresentationTargetSnapshot(
             state=self._state,
             target_open=self._target is not None,
+            x=self._x,
+            y=self._y,
             width=self._width,
             height=self._height,
             presentations=self._presentations,
@@ -222,6 +229,8 @@ class BoundedWindowsPresentationTarget:
     def _destroy_target(self) -> None:
         target = self._target
         self._target = None
+        self._x = 0
+        self._y = 0
         self._width = 0
         self._height = 0
         if target is None:
@@ -236,14 +245,23 @@ class BoundedWindowsPresentationTarget:
             self._destroy_target()
         except _NativeTargetError:
             self._target = None
+            self._x = 0
+            self._y = 0
             self._width = 0
             self._height = 0
 
-    async def open(self, width: int, height: int) -> WindowsPresentationTargetSnapshot:
-        """Create one bounded native target without exposing its handle."""
+    async def open(
+        self,
+        width: int,
+        height: int,
+        *,
+        x: int = 0,
+        y: int = 0,
+    ) -> WindowsPresentationTargetSnapshot:
+        """Create one bounded positioned native target without exposing its handle."""
         async with self._lock:
             if self._state == WindowsPresentationTargetState.OPEN:
-                if (width, height) == (self._width, self._height):
+                if (x, y, width, height) == (self._x, self._y, self._width, self._height):
                     return self.snapshot
                 raise WindowsPresentationTargetError(
                     WindowsPresentationTargetErrorCode.INVALID_STATE,
@@ -255,10 +273,16 @@ class BoundedWindowsPresentationTarget:
                     "presentation target cannot open from current state",
                 )
             if (
-                isinstance(width, bool)
+                isinstance(x, bool)
+                or isinstance(y, bool)
+                or isinstance(width, bool)
                 or isinstance(height, bool)
+                or not isinstance(x, int)
+                or not isinstance(y, int)
                 or not isinstance(width, int)
                 or not isinstance(height, int)
+                or not 0 <= x <= _MAX_COORDINATE
+                or not 0 <= y <= _MAX_COORDINATE
                 or not 1 <= width <= _MAX_DIMENSION
                 or not 1 <= height <= _MAX_DIMENSION
             ):
@@ -281,7 +305,7 @@ class BoundedWindowsPresentationTarget:
                     raise WindowsPresentationTargetError(code, message) from None
 
             try:
-                target = self._native_api.create_target(width, height)
+                target = self._native_api.create_target(x, y, width, height)
             except _NativeTargetError:
                 self._state = WindowsPresentationTargetState.FAILED
                 raise WindowsPresentationTargetError(
@@ -290,6 +314,8 @@ class BoundedWindowsPresentationTarget:
                 ) from None
 
             self._target = target
+            self._x = x
+            self._y = y
             self._width = width
             self._height = height
             self._state = WindowsPresentationTargetState.OPEN
