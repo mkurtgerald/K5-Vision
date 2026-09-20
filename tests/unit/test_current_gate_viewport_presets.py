@@ -65,9 +65,7 @@ class _FakeApplication:
 
 
 def _control(*, max_pending_controls: int = 16) -> BoundedSelectableWindowsOperatorControl:
-    control = BoundedSelectableWindowsOperatorControl(
-        max_pending_controls=max_pending_controls
-    )
+    control = BoundedSelectableWindowsOperatorControl(max_pending_controls=max_pending_controls)
     control._state = WindowsOperatorSessionState.RUNNING
     control._application = _FakeApplication()
     control._active_layout = _layout()
