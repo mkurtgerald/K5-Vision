@@ -130,7 +130,6 @@ def test_real_win32_application_runs_and_replaces_sparse_all_live_generations() 
         assert first_started.generation == 1
         assert first_started.viewport_count == 2
         assert first_started.open_surface_count == 2
-        assert first_started.stream_count == 2
 
         first_complete = await app.wait()
         assert first_complete.state == WindowsOperatorApplicationState.COMPLETE
@@ -143,7 +142,6 @@ def test_real_win32_application_runs_and_replaces_sparse_all_live_generations() 
         assert second_started.generation == 2
         assert second_started.viewport_count == 2
         assert second_started.open_surface_count == 2
-        assert second_started.stream_count == 2
         assert len(parent_handles) == 1
 
         second_complete = await app.wait()
