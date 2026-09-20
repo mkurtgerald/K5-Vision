@@ -2,11 +2,11 @@
 
 Status: **APPROVED FOR EXACT-REVISION QUALIFICATION.**
 
-This successor introduces no new third-party package, donor code, model, binary, external service, persisted format, network surface, or platform API. It hardens the accepted project-owned source-free Win32 pointer interaction boundary with the operating system's existing mouse-capture lifecycle and reuses the accepted serialized viewport-edit control.
+This successor introduces no new third-party package, donor code, model, binary, external service, persisted format, network surface, or platform API. It layers project-owned source-free viewport selection on the accepted capture-aware Win32 pointer interaction and existing arbitrary-layout operator control.
 
-A left-button drag is captured to the already-owned visible operator shell only after the initial bounded client-relative input is accepted. Capture ownership is verified through the existing Win32 user32 surface; release, capture-loss, cancel-mode, repeated-down, and close paths deterministically terminate ephemeral drag state. A completed release continues through the accepted move/resize edit queue against the latest accepted arbitrary `ViewportLayout`; cancellation publishes no candidate geometry. Sparse slots through 4095, overlap/non-grid geometry, z-order, source/media bindings, and presentation generation remain unchanged. Existing message, input, control-queue, controls-per-cycle, geometry, and session limits remain governing resource bounds.
+Selection is derived only from the already-accepted `ViewportLayout` logical slot and z-ordered geometry. A zero-delta click/release selects the topmost logical viewport; an empty-shell click clears selection. Drag movement, capture loss, cancellation, move/resize edits, and presentation generation remain governed by the accepted capture/edit lifecycle. Sparse logical slots through 4095, overlap/non-grid geometry, media bindings, and source identity remain unchanged.
 
-Retained control state contains only accepted viewport geometry/logical slots and aggregate replacement/relayout/edit/completed-interaction/cancelled-interaction/stop counters. Native capture state and pointer coordinates/traces are ephemeral and are not retained. No camera source, credential, private path, payload, recording identity, native handle/pointer value, or runner identity is added to retained observability.
+Retained selection observability is limited to the currently selected logical slot (or none) and an aggregate selection-change count wrapped around the accepted privacy-safe control snapshot. Pointer coordinates/traces and native capture state remain ephemeral. No camera source, credential, private path, payload, recording identity, native handle/pointer value, or runner identity is added to retained state.
 
 No new third-party license or distribution obligation is introduced. Existing dependency and provenance controls remain governing.
 
