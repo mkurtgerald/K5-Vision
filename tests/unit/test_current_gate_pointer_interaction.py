@@ -7,8 +7,12 @@ import pytest
 
 from k5vision.media.viewport_geometry import ViewportGeometry, ViewportLayout, ViewportPlacement
 from k5vision.media.windows_operator_application import (
+    WindowsOperatorApplicationError,
+    WindowsOperatorApplicationErrorCode,
     WindowsOperatorApplicationSnapshot,
     WindowsOperatorApplicationState,
+    _NativeShellError,
+    _NativeShellFailure,
 )
 from k5vision.media.windows_operator_control import (
     BoundedWindowsOperatorControl,
@@ -16,8 +20,11 @@ from k5vision.media.windows_operator_control import (
     WindowsOperatorControlErrorCode,
 )
 from k5vision.media.windows_operator_interaction import (
+    BoundedInteractiveWindowsOperatorApplication,
     WindowsPointerEvent,
     WindowsPointerEventKind,
+    _InteractiveWin32OperatorShellApi,
+    _signed_word,
 )
 
 
@@ -71,9 +78,7 @@ class _InteractiveFakeApplication:
             pumped_messages=self.pumps,
             generation=self.generation,
             viewport_count=2 if self.generation else 0,
-            open_surface_count=(
-                2 if self.state == WindowsOperatorApplicationState.RUNNING else 0
-            ),
+            open_surface_count=(2 if self.state == WindowsOperatorApplicationState.RUNNING else 0),
             delivered_frames=0,
             presentations=0,
         )
@@ -115,9 +120,7 @@ class _InteractiveFakeApplication:
         await asyncio.sleep(0)
         return self.snapshot
 
-    def drain_pointer_events(
-        self, *, max_events: int = 64
-    ) -> tuple[WindowsPointerEvent, ...]:
+    def drain_pointer_events(self, *, max_events: int = 64) -> tuple[WindowsPointerEvent, ...]:
         if not self.batches:
             return ()
         batch = self.batches.popleft()
@@ -147,9 +150,7 @@ def test_drag_hit_tests_topmost_overlap_and_moves_without_generation_change() ->
     )
 
     async def scenario() -> object:
-        task = asyncio.create_task(
-            control.run(width=900, height=700, layout=_layout(), streams=())
-        )
+        task = asyncio.create_task(control.run(width=900, height=700, layout=_layout(), streams=()))
         await app.wait_entered.wait()
         for _ in range(40):
             await asyncio.sleep(0)
@@ -194,9 +195,7 @@ def test_bottom_right_drag_resizes_without_changing_position_or_z_order() -> Non
     )
 
     async def scenario() -> object:
-        task = asyncio.create_task(
-            control.run(width=900, height=700, layout=_layout(), streams=())
-        )
+        task = asyncio.create_task(control.run(width=900, height=700, layout=_layout(), streams=()))
         await app.wait_entered.wait()
         for _ in range(40):
             await asyncio.sleep(0)
@@ -239,9 +238,7 @@ def test_pointer_batch_cannot_overrun_control_queue() -> None:
     original = _layout()
 
     async def scenario() -> None:
-        task = asyncio.create_task(
-            control.run(width=900, height=700, layout=original, streams=())
-        )
+        task = asyncio.create_task(control.run(width=900, height=700, layout=original, streams=()))
         with pytest.raises(WindowsOperatorControlError) as exc_info:
             await task
         assert exc_info.value.code == WindowsOperatorControlErrorCode.CONTROL_LIMIT
@@ -269,3 +266,90 @@ def test_pointer_events_are_ephemeral_not_retained_in_control_snapshot() -> None
         "handle",
     ):
         assert forbidden not in serialized
+
+
+def test_signed_pointer_words_preserve_win32_coordinates() -> None:
+    assert _signed_word(0x0001) == 1
+    assert _signed_word(0xFFFF) == -1
+    assert _signed_word(0x8000) == -32_768
+
+
+def test_native_pointer_buffer_decodes_and_bounds_ephemeral_events() -> None:
+    native = object.__new__(_InteractiveWin32OperatorShellApi)
+    native._pointer_events = deque()
+
+    native._append_pointer_event(
+        kind=WindowsPointerEventKind.DOWN,
+        shell=71,
+        hwnd=0,
+        lparam=(0xFFFE << 16) | 0x0003,
+    )
+    assert native.drain_pointer_events(1) == (
+        WindowsPointerEvent(kind=WindowsPointerEventKind.DOWN, x=3, y=-2),
+    )
+
+    with pytest.raises(_NativeShellError) as invalid_batch:
+        native.drain_pointer_events(0)
+    assert invalid_batch.value.failure == _NativeShellFailure.PUMP
+
+    event = WindowsPointerEvent(kind=WindowsPointerEventKind.MOVE, x=1, y=1)
+    native._pointer_events = deque([event] * 256)
+    with pytest.raises(_NativeShellError) as overflow:
+        native._append_pointer_event(
+            kind=WindowsPointerEventKind.UP,
+            shell=71,
+            hwnd=0,
+            lparam=0,
+        )
+    assert overflow.value.failure == _NativeShellFailure.PUMP
+
+
+class _DrainNative:
+    def __init__(self, result: object) -> None:
+        self.result = result
+        self.max_events = 0
+
+    def drain_pointer_events(self, max_events: int) -> object:
+        self.max_events = max_events
+        return self.result
+
+
+class _FailingDrainNative:
+    def drain_pointer_events(self, _max_events: int) -> object:
+        raise _NativeShellError(_NativeShellFailure.PUMP)
+
+
+def _interactive_app(native: object) -> BoundedInteractiveWindowsOperatorApplication:
+    return BoundedInteractiveWindowsOperatorApplication(
+        native_api=native,
+        host_factory=lambda _parent: object(),
+    )
+
+
+def test_interactive_application_drains_valid_events_and_missing_boundary() -> None:
+    event = WindowsPointerEvent(kind=WindowsPointerEventKind.UP, x=17, y=29)
+    native = _DrainNative((event,))
+    app = _interactive_app(native)
+
+    assert app.drain_pointer_events(max_events=3) == (event,)
+    assert native.max_events == 3
+    assert _interactive_app(object()).drain_pointer_events() == ()
+
+
+def test_interactive_application_rejects_invalid_pointer_batches() -> None:
+    app = _interactive_app(_DrainNative(()))
+    with pytest.raises(WindowsOperatorApplicationError) as invalid_bound:
+        app.drain_pointer_events(max_events=0)
+    assert invalid_bound.value.code == WindowsOperatorApplicationErrorCode.INVALID_CONFIGURATION
+
+    with pytest.raises(WindowsOperatorApplicationError) as native_failure:
+        _interactive_app(_FailingDrainNative()).drain_pointer_events()
+    assert native_failure.value.code == WindowsOperatorApplicationErrorCode.PUMP_FAILURE
+
+    with pytest.raises(WindowsOperatorApplicationError) as invalid_result:
+        _interactive_app(_DrainNative([object()])).drain_pointer_events()
+    assert invalid_result.value.code == WindowsOperatorApplicationErrorCode.PUMP_FAILURE
+
+    with pytest.raises(WindowsOperatorApplicationError) as invalid_item:
+        _interactive_app(_DrainNative((object(),))).drain_pointer_events()
+    assert invalid_item.value.code == WindowsOperatorApplicationErrorCode.PUMP_FAILURE
