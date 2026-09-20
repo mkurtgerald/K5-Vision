@@ -93,7 +93,7 @@ _CONTROLLER_STATE_MAP: dict[PresentationControllerState, PresentationRuntimeStat
 
 
 class BoundedPresentationRuntime:
-    """Assemble and operate one accepted mixed live/playback presentation runtime."""
+    """Assemble and operate one accepted bounded presentation runtime."""
 
     def __init__(
         self,
@@ -106,6 +106,7 @@ class BoundedPresentationRuntime:
         max_total_frame_bytes: int = 4 * 1024 * 1024 * 1024,
         consumer_timeout_seconds: float = 0.5,
         stop_timeout_seconds: float = 5.0,
+        allow_all_live: bool = False,
     ) -> None:
         if not 2 <= max_streams <= _MAX_STREAMS:
             raise PresentationRuntimeError(
@@ -147,6 +148,11 @@ class BoundedPresentationRuntime:
                 PresentationRuntimeErrorCode.INVALID_CONFIGURATION,
                 "presentation runtime stop timeout is invalid",
             )
+        if not isinstance(allow_all_live, bool):
+            raise PresentationRuntimeError(
+                PresentationRuntimeErrorCode.INVALID_CONFIGURATION,
+                "presentation runtime live-only capability is invalid",
+            )
 
         selected_bindings = tuple(bindings)
         if not 2 <= len(selected_bindings) <= max_viewports:
@@ -180,6 +186,7 @@ class BoundedPresentationRuntime:
                 max_total_frames=max_total_frames,
                 max_total_frame_bytes=max_total_frame_bytes,
                 consumer_timeout_seconds=consumer_timeout_seconds,
+                allow_all_live=allow_all_live,
             )
             session = BoundedPresentationSession(coordinator, dispatcher)
             controller = BoundedPresentationController(
@@ -195,6 +202,7 @@ class BoundedPresentationRuntime:
         self._controller = controller
         self._viewport_slots = frozenset(slots)
         self._max_streams = max_streams
+        self._allow_all_live = allow_all_live
 
     @property
     def snapshot(self) -> PresentationRuntimeSnapshot:
@@ -236,7 +244,7 @@ class BoundedPresentationRuntime:
             )
         live_count = sum(isinstance(stream, MixedLiveStream) for stream in selected)
         playback_count = len(selected) - live_count
-        if live_count == 0 or playback_count == 0:
+        if live_count == 0 or (playback_count == 0 and not self._allow_all_live):
             raise PresentationRuntimeError(
                 PresentationRuntimeErrorCode.INVALID_PLAN,
                 "presentation runtime requires live and playback streams",

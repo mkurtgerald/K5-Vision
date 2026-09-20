@@ -107,8 +107,14 @@ PresentationRuntimeFactory = Callable[
 ]
 
 
+def _default_presentation_runtime_factory(
+    bindings: Sequence[ViewportBinding],
+) -> BoundedPresentationRuntime:
+    return BoundedPresentationRuntime(bindings, allow_all_live=True)
+
+
 class BoundedWindowsOperatorRuntime:
-    """Run one exact mixed stream plan through one arbitrary Windows viewport layout."""
+    """Run one exact stream plan through one arbitrary Windows viewport layout."""
 
     def __init__(
         self,
@@ -128,7 +134,7 @@ class BoundedWindowsOperatorRuntime:
         self._layout = layout
         self._windows_runtime_factory = windows_runtime_factory or BoundedWindowsViewportRuntime
         self._presentation_runtime_factory = (
-            presentation_runtime_factory or BoundedPresentationRuntime
+            presentation_runtime_factory or _default_presentation_runtime_factory
         )
         self._state = WindowsOperatorRuntimeState.READY
         self._windows_runtime: _WindowsRuntimeBoundary | None = None

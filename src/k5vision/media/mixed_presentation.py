@@ -123,7 +123,7 @@ class MixedPresentationSnapshot(BaseModel):
 
 
 class BoundedMixedPresentation:
-    """Coordinate a bounded mixed set of live and playback presentation streams."""
+    """Coordinate a bounded set of live/playback presentation streams."""
 
     def __init__(
         self,
@@ -132,6 +132,7 @@ class BoundedMixedPresentation:
         max_total_frames: int = 100_000,
         max_total_frame_bytes: int = 4 * 1024 * 1024 * 1024,
         consumer_timeout_seconds: float = 0.5,
+        allow_all_live: bool = False,
     ) -> None:
         if not 2 <= max_streams <= _MAX_STREAMS:
             raise ValueError("max_streams must be between 2 and 16")
@@ -141,11 +142,14 @@ class BoundedMixedPresentation:
             raise ValueError("max_total_frame_bytes must be between 1 and 17179869184")
         if not 0 < consumer_timeout_seconds <= 10:
             raise ValueError("consumer_timeout_seconds must be between zero and 10")
+        if not isinstance(allow_all_live, bool):
+            raise ValueError("allow_all_live must be boolean")
 
         self._max_streams = max_streams
         self._max_total_frames = max_total_frames
         self._max_total_frame_bytes = max_total_frame_bytes
         self._consumer_timeout_seconds = consumer_timeout_seconds
+        self._allow_all_live = allow_all_live
         self._state = MixedPresentationState.CREATED
         self._stream_count = 0
         self._live_streams = 0
@@ -194,7 +198,7 @@ class BoundedMixedPresentation:
             )
         live_count = sum(isinstance(stream, MixedLiveStream) for stream in selected)
         playback_count = len(selected) - live_count
-        if live_count == 0 or playback_count == 0:
+        if live_count == 0 or (playback_count == 0 and not self._allow_all_live):
             raise MixedPresentationError(
                 MixedPresentationErrorCode.INVALID_STREAM_SET,
                 "mixed presentation requires live and playback streams",
