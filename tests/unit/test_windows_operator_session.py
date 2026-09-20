@@ -85,7 +85,9 @@ class FakeApplication:
         )
         return self._snapshot
 
-    async def start(self, layout: ViewportLayout, streams: object) -> WindowsOperatorApplicationSnapshot:
+    async def start(
+        self, layout: ViewportLayout, streams: object
+    ) -> WindowsOperatorApplicationSnapshot:
         assert len(layout.placements) == 2
         del streams
         self.events.append("start")
