@@ -5,7 +5,10 @@ import asyncio
 import pytest
 
 from k5vision.media.mixed_presentation import MixedLiveStream
-from k5vision.media.presentation_runtime import PresentationRuntimeSnapshot, PresentationRuntimeState
+from k5vision.media.presentation_runtime import (
+    PresentationRuntimeSnapshot,
+    PresentationRuntimeState,
+)
 from k5vision.media.viewport_dispatch import ViewportBinding
 from k5vision.media.viewport_geometry import ViewportGeometry, ViewportLayout, ViewportPlacement
 from k5vision.media.windows_operator_application import (
@@ -59,10 +62,23 @@ def _layout(offset: int = 0, *, second_slot: int = 4095) -> ViewportLayout:
     )
 
 
+class FakeLiveDelivery:
+    async def run(self, _source_uri: str, _consumer: object) -> object:
+        return object()
+
+
 def _streams() -> tuple[MixedLiveStream, MixedLiveStream]:
     return (
-        MixedLiveStream(slot=7, source_uri="execution-only-a", frame_limit=3),
-        MixedLiveStream(slot=4095, source_uri="execution-only-b", frame_limit=3),
+        MixedLiveStream(
+            slot=7,
+            source_uri="execution-only-a",
+            delivery=FakeLiveDelivery(),
+        ),
+        MixedLiveStream(
+            slot=4095,
+            source_uri="execution-only-b",
+            delivery=FakeLiveDelivery(),
+        ),
     )
 
 
@@ -79,7 +95,11 @@ class FakeWindowsRuntime:
 
     @property
     def snapshot(self) -> WindowsViewportRuntimeSnapshot:
-        state = WindowsViewportRuntimeState.OPEN if self.opened and not self.closed else WindowsViewportRuntimeState.READY
+        state = (
+            WindowsViewportRuntimeState.OPEN
+            if self.opened and not self.closed
+            else WindowsViewportRuntimeState.READY
+        )
         if self.closed:
             state = WindowsViewportRuntimeState.CLOSED
         return WindowsViewportRuntimeSnapshot(
@@ -341,13 +361,17 @@ class FakeApplicationHost:
             presentations=0,
         )
 
-    async def start(self, _layout: ViewportLayout, _streams: object) -> WindowsOperatorHostSnapshot:
+    async def start(
+        self, _layout: ViewportLayout, _streams: object
+    ) -> WindowsOperatorHostSnapshot:
         self.start_calls += 1
         self.generation = 1
         self.state = WindowsOperatorHostState.RUNNING
         return self.snapshot
 
-    async def replace(self, _layout: ViewportLayout, _streams: object) -> WindowsOperatorHostSnapshot:
+    async def replace(
+        self, _layout: ViewportLayout, _streams: object
+    ) -> WindowsOperatorHostSnapshot:
         self.generation += 1
         return self.snapshot
 
@@ -421,12 +445,16 @@ class FakeControlApplication:
         self.state = WindowsOperatorApplicationState.OPEN
         return self.snapshot
 
-    async def start(self, _layout: ViewportLayout, _streams: object) -> WindowsOperatorApplicationSnapshot:
+    async def start(
+        self, _layout: ViewportLayout, _streams: object
+    ) -> WindowsOperatorApplicationSnapshot:
         self.generation = 1
         self.state = WindowsOperatorApplicationState.RUNNING
         return self.snapshot
 
-    async def replace(self, _layout: ViewportLayout, _streams: object) -> WindowsOperatorApplicationSnapshot:
+    async def replace(
+        self, _layout: ViewportLayout, _streams: object
+    ) -> WindowsOperatorApplicationSnapshot:
         self.replace_calls += 1
         self.generation += 1
         self.state = WindowsOperatorApplicationState.RUNNING
@@ -458,7 +486,7 @@ class FakeControlApplication:
         return self.snapshot
 
 
-def test_control_relayout_keeps_existing_wait_generation_and_updates_geometry_after_acceptance() -> None:
+def test_control_relayout_preserves_wait_generation_and_updates_after_acceptance() -> None:
     app = FakeControlApplication()
     control = BoundedWindowsOperatorControl(
         application_factory=lambda: app,
