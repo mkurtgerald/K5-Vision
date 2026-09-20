@@ -6,17 +6,27 @@ on:
     branches: [main]
     paths:
       - .github/workflows/current-gate-target-windows.yml
+      - src/k5vision/media/viewport_geometry.py
       - src/k5vision/media/windows_presentation_target.py
+      - src/k5vision/media/windows_viewport_layout.py
+      - tests/unit/test_viewport_geometry.py
       - tests/unit/test_windows_presentation_target.py
+      - tests/unit/test_windows_viewport_layout.py
       - tests/integration/test_current_gate_target_windows.py
+      - tests/integration/test_current_gate_layout_windows.py
       - docs/current-gate-target-dependency-review.md
   push:
     branches: [main]
     paths:
       - .github/workflows/current-gate-target-windows.yml
+      - src/k5vision/media/viewport_geometry.py
       - src/k5vision/media/windows_presentation_target.py
+      - src/k5vision/media/windows_viewport_layout.py
+      - tests/unit/test_viewport_geometry.py
       - tests/unit/test_windows_presentation_target.py
+      - tests/unit/test_windows_viewport_layout.py
       - tests/integration/test_current_gate_target_windows.py
+      - tests/integration/test_current_gate_layout_windows.py
       - docs/current-gate-target-dependency-review.md
 
 permissions:
@@ -48,4 +58,4 @@ jobs:
       - name: Run exact gate regression
         shell: powershell
         run: |
-          pytest tests/unit/test_windows_presentation_target.py tests/integration/test_current_gate_target_windows.py -q --no-cov
+          pytest tests/unit/test_viewport_geometry.py tests/unit/test_windows_presentation_target.py tests/unit/test_windows_viewport_layout.py tests/integration/test_current_gate_target_windows.py tests/integration/test_current_gate_layout_windows.py -q --no-cov
