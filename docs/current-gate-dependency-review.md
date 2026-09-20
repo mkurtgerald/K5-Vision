@@ -2,11 +2,11 @@
 
 Status: **APPROVED FOR EXACT-REVISION QUALIFICATION.**
 
-This successor introduces no new third-party package, donor code, model, binary, external service, persisted format, network surface, or platform API. It advances the already-accepted source-free same-slot viewport relayout through project-owned Windows operator runtime, host, application, and bounded control orchestration only.
+This successor introduces no new third-party package, donor code, model, binary, external service, persisted format, network surface, or platform API. It adds one project-owned source-free viewport edit boundary above the accepted arbitrary `ViewportLayout` contract and reuses the already-accepted operator-control relayout path.
 
-The request surface contains `ViewportLayout` geometry/logical slots only. Existing media/source bindings and the presentation generation remain unchanged during relayout; the control layer updates retained active geometry only after downstream acceptance. Same-slot validation remains enforced, failures are sanitized and fail closed, and no camera source, credential, private path, payload, native handle/pointer, or runner identity is added to retained observability.
+Move and resize edits contain only a logical slot and bounded numeric deltas. They do not carry camera/media identity. Each accepted edit produces a newly validated arbitrary layout, preserves every untouched placement exactly, preserves z-order unless a later explicit contract changes it, allows overlap/non-grid composition, and updates editor state only after validation succeeds. The editor enforces a bounded operation count, and the existing bounded operator-control queue remains the serialization/resource boundary when an edited layout is applied live.
 
-The runtime wait boundary was narrowed so a cancellable waiter no longer owns the operator-runtime lock while the underlying shielded presentation continues. This enables serialized geometry control without restarting media execution and does not add a new concurrency primitive or dependency.
+Retained editor state contains only viewport geometry/logical slots and an aggregate operation count. No camera source, credential, private path, payload, native handle/pointer, recording identity, or runner identity is added to retained observability. Existing media/source bindings and presentation generation remain unchanged when the resulting layout is sent through source-free relayout.
 
 No new third-party license or distribution obligation is introduced. Existing dependency and provenance controls remain governing.
 
