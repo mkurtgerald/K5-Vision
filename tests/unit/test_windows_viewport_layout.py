@@ -94,7 +94,15 @@ def test_open_route_close_preserves_sparse_arbitrary_geometry_without_identity_s
     assert closed.presentations == 1
 
     serialized = closed.model_dump_json().casefold()
-    for forbidden in ("4095", "logical_slot", "rtsp://", "source_id", "recording_id", "handle", "pointer"):
+    for forbidden in (
+        "4095",
+        "logical_slot",
+        "rtsp://",
+        "source_id",
+        "recording_id",
+        "handle",
+        "pointer",
+    ):
         assert forbidden not in serialized
 
 
