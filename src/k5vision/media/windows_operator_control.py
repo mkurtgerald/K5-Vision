@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import typing
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -134,9 +134,7 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
         )
         self._max_pending_controls = max_pending_controls
         self._max_controls_per_cycle = max_controls_per_cycle
-        self._controls: asyncio.Queue[_ControlRequest] = asyncio.Queue(
-            maxsize=max_pending_controls
-        )
+        self._controls: asyncio.Queue[_ControlRequest] = asyncio.Queue(maxsize=max_pending_controls)
         self._processed_controls = 0
         self._replacements = 0
         self._stop_requests = 0
