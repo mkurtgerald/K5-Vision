@@ -2,12 +2,10 @@
 
 Status: **APPROVED FOR EXACT-REVISION QUALIFICATION.**
 
-This successor introduces no new third-party package, donor code, model, binary, external service, persisted format, network surface, or platform API. It adds a project-owned bounded in-session source-free layout preset bank above the accepted selected arbitrary-layout operator control.
+This successor introduces no new third-party package, donor code, model, binary, external service, network surface, platform API, or customer filesystem decision. It adds a project-owned bounded source-free reusable view catalog over the accepted arbitrary-layout contract.
 
-Preset save captures only the already-accepted immutable `ViewportLayout` geometry/logical-slot contract in one of 16 logical in-memory slots. Preset restore requires the same active logical-slot set and routes through the accepted bounded relayout lifecycle, so arbitrary x/y/width/height/z geometry, sparse logical slots through 4095, media/source bindings, selection semantics, and deterministic stack ordering remain governed by existing boundaries. No file/network persistence, user-supplied preset name, or source reassignment is introduced.
+The catalog serializes only logical view identifiers plus already-accepted `ViewportLayout` geometry and sparse logical slots. Canonical ordering, a fixed 64-view capacity, a 262144-byte payload ceiling, strict schema/version validation, duplicate-identifier rejection, exact arbitrary/non-grid geometry preservation, and same-slot-set compatibility checks are enforced before a restored layout is returned. The gate remains storage-transport-neutral: it exposes canonical bytes/text serialization but does not select a private path or perform automatic disk/network persistence.
 
-Retained observability adds only preset occupancy plus aggregate save/restore counts around the accepted privacy-safe selection/control snapshot. Camera/source identity, credentials, private paths, payloads, recording identity, pointer traces, native handles/pointer values, and runner identity remain excluded from retained state.
-
-No new third-party license or distribution obligation is introduced. Existing dependency and provenance controls remain governing.
+Retained catalog data excludes camera/source identity, credentials, RTSP/network data, payload/media data, recording identity, private paths, native handles/pointer values, runner identity, analytics, and source assignment. No new third-party license or distribution obligation is introduced. Existing dependency and provenance controls remain governing.
 
 This is an engineering dependency review, not legal advice.
