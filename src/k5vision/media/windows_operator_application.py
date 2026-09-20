@@ -101,6 +101,22 @@ class _NativeShellError(RuntimeError):
         self.failure = failure
 
 
+class _Win32Point(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _Win32Message(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p),
+        ("message", ctypes.c_uint32),
+        ("wParam", ctypes.c_size_t),
+        ("lParam", ctypes.c_ssize_t),
+        ("time", ctypes.c_uint32),
+        ("pt", _Win32Point),
+        ("lPrivate", ctypes.c_uint32),
+    ]
+
+
 @typing.runtime_checkable
 class _OperatorHostBoundary(typing.Protocol):
     @property
@@ -140,20 +156,6 @@ OperatorHostFactory = Callable[[int], _OperatorHostBoundary]
 class _Win32OperatorShellApi:
     """Small ctypes boundary for one visible top-level Win32 shell."""
 
-    class _Point(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-    class _Message(ctypes.Structure):
-        _fields_ = [
-            ("hwnd", ctypes.c_void_p),
-            ("message", ctypes.c_uint32),
-            ("wParam", ctypes.c_size_t),
-            ("lParam", ctypes.c_ssize_t),
-            ("time", ctypes.c_uint32),
-            ("pt", _Point),
-            ("lPrivate", ctypes.c_uint32),
-        ]
-
     def __init__(self) -> None:
         if sys.platform != "win32":
             raise _NativeShellError(_NativeShellFailure.UNSUPPORTED_PLATFORM)
@@ -185,7 +187,7 @@ class _Win32OperatorShellApi:
 
             self._peek_message = self._user32.PeekMessageW
             self._peek_message.argtypes = [
-                ctypes.POINTER(self._Message),
+                ctypes.POINTER(_Win32Message),
                 ctypes.c_void_p,
                 ctypes.c_uint32,
                 ctypes.c_uint32,
@@ -194,11 +196,11 @@ class _Win32OperatorShellApi:
             self._peek_message.restype = ctypes.c_int
 
             self._translate_message = self._user32.TranslateMessage
-            self._translate_message.argtypes = [ctypes.POINTER(self._Message)]
+            self._translate_message.argtypes = [ctypes.POINTER(_Win32Message)]
             self._translate_message.restype = ctypes.c_int
 
             self._dispatch_message = self._user32.DispatchMessageW
-            self._dispatch_message.argtypes = [ctypes.POINTER(self._Message)]
+            self._dispatch_message.argtypes = [ctypes.POINTER(_Win32Message)]
             self._dispatch_message.restype = ctypes.c_ssize_t
 
             self._destroy_window = self._user32.DestroyWindow
@@ -236,7 +238,7 @@ class _Win32OperatorShellApi:
     def pump_messages(self, shell: int, max_messages: int) -> tuple[int, bool]:
         count = 0
         close_requested = False
-        message = self._Message()
+        message = _Win32Message()
         try:
             while count < max_messages and self._peek_message(
                 ctypes.byref(message),
@@ -509,7 +511,10 @@ class BoundedWindowsOperatorApplication:
     async def wait(self) -> WindowsOperatorApplicationSnapshot:
         """Wait for the active host generation while retaining the shell."""
         async with self._lock:
-            if self._state != WindowsOperatorApplicationState.RUNNING or self._host is None:
+            if (
+                self._state != WindowsOperatorApplicationState.RUNNING
+                or self._host is None
+            ):
                 raise WindowsOperatorApplicationError(
                     WindowsOperatorApplicationErrorCode.INVALID_STATE,
                     "operator application has no running generation",
@@ -550,7 +555,10 @@ class BoundedWindowsOperatorApplication:
         async with self._lock:
             if self._state == WindowsOperatorApplicationState.CLOSED:
                 return self.snapshot
-            if self._state != WindowsOperatorApplicationState.RUNNING or self._host is None:
+            if (
+                self._state != WindowsOperatorApplicationState.RUNNING
+                or self._host is None
+            ):
                 raise WindowsOperatorApplicationError(
                     WindowsOperatorApplicationErrorCode.INVALID_STATE,
                     "operator application has no running generation",
@@ -579,7 +587,11 @@ class BoundedWindowsOperatorApplication:
                 )
             return self.snapshot
 
-    async def pump(self, *, max_messages: int = 64) -> WindowsOperatorApplicationSnapshot:
+    async def pump(
+        self,
+        *,
+        max_messages: int = 64,
+    ) -> WindowsOperatorApplicationSnapshot:
         """Process a bounded message batch and honor close requests fail-closed."""
         async with self._lock:
             if self._state not in {
