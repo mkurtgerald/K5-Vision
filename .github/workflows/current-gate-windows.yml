@@ -6,16 +6,20 @@ on:
     branches: [main]
     paths:
       - .github/workflows/current-gate-windows.yml
-      - src/k5vision/media/windows_presentation_surface.py
-      - tests/unit/test_current_gate_surface.py
+      - src/k5vision/media/mixed_presentation.py
+      - src/k5vision/media/presentation_runtime.py
+      - src/k5vision/media/windows_operator_runtime.py
+      - tests/unit/test_current_gate_live_plan.py
       - tests/integration/test_current_gate_windows.py
       - docs/current-gate-dependency-review.md
   push:
     branches: [main]
     paths:
       - .github/workflows/current-gate-windows.yml
-      - src/k5vision/media/windows_presentation_surface.py
-      - tests/unit/test_current_gate_surface.py
+      - src/k5vision/media/mixed_presentation.py
+      - src/k5vision/media/presentation_runtime.py
+      - src/k5vision/media/windows_operator_runtime.py
+      - tests/unit/test_current_gate_live_plan.py
       - tests/integration/test_current_gate_windows.py
       - docs/current-gate-dependency-review.md
 
@@ -48,4 +52,4 @@ jobs:
       - name: Run exact gate regression
         shell: powershell
         run: |
-          pytest tests/unit/test_current_gate_surface.py tests/integration/test_current_gate_windows.py -q --no-cov
+          pytest tests/unit/test_current_gate_live_plan.py tests/integration/test_current_gate_windows.py -q --no-cov
