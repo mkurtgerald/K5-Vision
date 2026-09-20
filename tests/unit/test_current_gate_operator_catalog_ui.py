@@ -15,6 +15,7 @@ from k5vision.media.windows_operator_application import (
     WindowsOperatorApplicationSnapshot,
     WindowsOperatorApplicationState,
     _NativeShellError,
+    _NativeShellFailure,
 )
 from k5vision.media.windows_operator_catalog_commands import (
     WindowsOperatorCatalogCommand,
@@ -198,7 +199,10 @@ def test_native_child_creation_fails_closed_on_zero_or_exception() -> None:
             control_id=_APPLY_BUTTON_ID,
         )
 
-    api._get_module_handle = lambda _name: (_ for _ in ()).throw(RuntimeError("native"))
+    def _fail_module(_name: object) -> int:
+        raise RuntimeError("native")
+
+    api._get_module_handle = _fail_module
     with pytest.raises(_NativeShellError):
         api._create_child(
             shell=101,
@@ -238,7 +242,11 @@ def test_native_view_editor_failures_are_sanitized() -> None:
         api._read_view_id()
 
     api._view_editor = 404
-    api._get_window_text_length = lambda _handle: (_ for _ in ()).throw(RuntimeError("native"))
+
+    def _fail_length(_handle: object) -> int:
+        raise RuntimeError("native")
+
+    api._get_window_text_length = _fail_length
     with pytest.raises(_NativeShellError):
         api._read_view_id()
 
@@ -258,7 +266,9 @@ def test_native_button_message_queues_only_exact_button_handle_and_valid_view() 
     assert api._consume_catalog_command_message(_SAVE_BUTTON_ID, 999) is False
     assert api._consume_catalog_command_message(_SAVE_BUTTON_ID, 101) is True
 
-    assert tuple(api._catalog_commands) == (_command(WindowsOperatorCatalogCommandKind.SAVE, 63),)
+    assert tuple(api._catalog_commands) == (
+        _command(WindowsOperatorCatalogCommandKind.SAVE, 63),
+    )
     assert api._catalog_rejections == 0
 
 
@@ -338,12 +348,12 @@ def test_application_rejects_invalid_batches_and_native_failures() -> None:
 
         def drain_catalog_commands(self, _max_commands: int) -> object:
             if isinstance(self.commands, Exception):
-                raise _NativeShellError()
+                raise self.commands
             return self.commands
 
         def drain_catalog_rejections(self) -> object:
             if isinstance(self.rejected, Exception):
-                raise _NativeShellError()
+                raise self.rejected
             return self.rejected
 
     with pytest.raises(WindowsOperatorApplicationError) as configuration:
@@ -360,7 +370,7 @@ def test_application_rejects_invalid_batches_and_native_failures() -> None:
     assert invalid_batch.value.code == WindowsOperatorApplicationErrorCode.PUMP_FAILURE
 
     native_command_failure = BoundedCatalogWindowsOperatorApplication(
-        native_api=_BadNative(RuntimeError("native"), rejected=0)
+        native_api=_BadNative(_NativeShellError(_NativeShellFailure.PUMP), rejected=0)
     )
     with pytest.raises(WindowsOperatorApplicationError) as command_failure:
         native_command_failure.drain_catalog_commands()
