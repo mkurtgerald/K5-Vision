@@ -73,12 +73,8 @@ def apply_viewport_stack(
     order = _stack_order(layout)
     target_position = order.index(target_index)
     if (
-        edit.action == ViewportStackAction.BRING_TO_FRONT
-        and target_position == len(order) - 1
-    ) or (
-        edit.action == ViewportStackAction.SEND_TO_BACK
-        and target_position == 0
-    ):
+        edit.action == ViewportStackAction.BRING_TO_FRONT and target_position == len(order) - 1
+    ) or (edit.action == ViewportStackAction.SEND_TO_BACK and target_position == 0):
         return layout
 
     order.remove(target_index)
