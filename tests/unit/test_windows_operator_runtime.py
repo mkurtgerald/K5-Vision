@@ -79,10 +79,18 @@ class FakeWindowsRuntime:
         self.closed = 0
         self.fail_open = False
         self.fail_close = False
+        self._snapshot = _windows_snapshot(
+            WindowsViewportRuntimeState.READY,
+            open_surfaces=0,
+        )
         self._bindings = (
             ViewportBinding(slot=7, consumer=_consumer),
             ViewportBinding(slot=4095, consumer=_consumer),
         )
+
+    @property
+    def snapshot(self) -> WindowsViewportRuntimeSnapshot:
+        return self._snapshot
 
     @property
     def bindings(self) -> tuple[ViewportBinding, ...]:
@@ -92,13 +100,21 @@ class FakeWindowsRuntime:
         self.opened += 1
         if self.fail_open:
             raise RuntimeError("SECRET Windows open detail")
-        return _windows_snapshot(WindowsViewportRuntimeState.OPEN, open_surfaces=2)
+        self._snapshot = _windows_snapshot(
+            WindowsViewportRuntimeState.OPEN,
+            open_surfaces=2,
+        )
+        return self._snapshot
 
     async def close(self) -> WindowsViewportRuntimeSnapshot:
         self.closed += 1
         if self.fail_close:
             raise RuntimeError("SECRET Windows cleanup detail")
-        return _windows_snapshot(WindowsViewportRuntimeState.CLOSED, open_surfaces=0)
+        self._snapshot = _windows_snapshot(
+            WindowsViewportRuntimeState.CLOSED,
+            open_surfaces=0,
+        )
+        return self._snapshot
 
 
 class FakePresentationRuntime:
@@ -112,6 +128,11 @@ class FakePresentationRuntime:
         self.fail_wait = False
         self.fail_stop = False
         self.fail_close = False
+        self._snapshot = _presentation_snapshot(PresentationRuntimeState.CREATED)
+
+    @property
+    def snapshot(self) -> PresentationRuntimeSnapshot:
+        return self._snapshot
 
     async def start(
         self,
@@ -120,25 +141,35 @@ class FakePresentationRuntime:
         self.started.append(streams)
         if self.fail_start:
             raise RuntimeError("SECRET start detail")
-        return _presentation_snapshot(PresentationRuntimeState.RUNNING)
+        self._snapshot = _presentation_snapshot(PresentationRuntimeState.RUNNING)
+        return self._snapshot
 
     async def wait(self) -> PresentationRuntimeSnapshot:
         self.waited += 1
         if self.fail_wait:
             raise RuntimeError("SECRET wait detail")
-        return _presentation_snapshot(PresentationRuntimeState.COMPLETE, delivered_frames=2)
+        self._snapshot = _presentation_snapshot(
+            PresentationRuntimeState.COMPLETE,
+            delivered_frames=2,
+        )
+        return self._snapshot
 
     async def stop(self) -> PresentationRuntimeSnapshot:
         self.stopped += 1
         if self.fail_stop:
             raise RuntimeError("SECRET stop detail")
-        return _presentation_snapshot(PresentationRuntimeState.STOPPED, delivered_frames=1)
+        self._snapshot = _presentation_snapshot(
+            PresentationRuntimeState.STOPPED,
+            delivered_frames=1,
+        )
+        return self._snapshot
 
     async def close(self) -> PresentationRuntimeSnapshot:
         self.closed += 1
         if self.fail_close:
             raise RuntimeError("SECRET media cleanup detail")
-        return _presentation_snapshot(PresentationRuntimeState.CLOSED)
+        self._snapshot = _presentation_snapshot(PresentationRuntimeState.CLOSED)
+        return self._snapshot
 
 
 def test_start_wait_close_preserves_sparse_bindings_and_safe_snapshot() -> None:
@@ -197,33 +228,27 @@ def test_start_wait_close_preserves_sparse_bindings_and_safe_snapshot() -> None:
         assert forbidden not in serialized
 
 
-def test_windows_open_failure_is_sanitized_and_fails_closed() -> None:
+def test_windows_and_start_failures_are_sanitized_and_fail_closed() -> None:
     windows: list[FakeWindowsRuntime] = []
 
-    def windows_factory(layout: ViewportLayout) -> FakeWindowsRuntime:
+    def bad_windows(layout: ViewportLayout) -> FakeWindowsRuntime:
         runtime = FakeWindowsRuntime(layout)
         runtime.fail_open = True
         windows.append(runtime)
         return runtime
 
-    runtime = BoundedWindowsOperatorRuntime(_layout(), windows_runtime_factory=windows_factory)
-    with pytest.raises(WindowsOperatorRuntimeError) as exc_info:
-        asyncio.run(runtime.start(()))
-
-    assert exc_info.value.code == WindowsOperatorRuntimeErrorCode.WINDOWS_OPEN_FAILURE
-    assert "secret" not in str(exc_info.value).casefold()
-    assert runtime.snapshot.state == WindowsOperatorRuntimeState.FAILED
+    failed_windows = BoundedWindowsOperatorRuntime(
+        _layout(),
+        windows_runtime_factory=bad_windows,
+    )
+    with pytest.raises(WindowsOperatorRuntimeError) as windows_exc:
+        asyncio.run(failed_windows.start(()))
+    assert windows_exc.value.code == WindowsOperatorRuntimeErrorCode.WINDOWS_OPEN_FAILURE
+    assert "secret" not in str(windows_exc.value).casefold()
+    assert failed_windows.snapshot.state == WindowsOperatorRuntimeState.FAILED
     assert windows[0].closed == 1
 
-
-def test_start_failure_closes_both_children() -> None:
-    windows: list[FakeWindowsRuntime] = []
     presentations: list[FakePresentationRuntime] = []
-
-    def windows_factory(layout: ViewportLayout) -> FakeWindowsRuntime:
-        runtime = FakeWindowsRuntime(layout)
-        windows.append(runtime)
-        return runtime
 
     def presentation_factory(
         bindings: Sequence[ViewportBinding],
@@ -233,22 +258,20 @@ def test_start_failure_closes_both_children() -> None:
         presentations.append(runtime)
         return runtime
 
-    runtime = BoundedWindowsOperatorRuntime(
+    failed_start = BoundedWindowsOperatorRuntime(
         _layout(),
-        windows_runtime_factory=windows_factory,
+        windows_runtime_factory=FakeWindowsRuntime,
         presentation_runtime_factory=presentation_factory,
     )
-    with pytest.raises(WindowsOperatorRuntimeError) as exc_info:
-        asyncio.run(runtime.start(()))
-
-    assert exc_info.value.code == WindowsOperatorRuntimeErrorCode.START_FAILURE
-    assert "secret" not in str(exc_info.value).casefold()
-    assert runtime.snapshot.state == WindowsOperatorRuntimeState.FAILED
+    with pytest.raises(WindowsOperatorRuntimeError) as start_exc:
+        asyncio.run(failed_start.start(()))
+    assert start_exc.value.code == WindowsOperatorRuntimeErrorCode.START_FAILURE
+    assert "secret" not in str(start_exc.value).casefold()
+    assert failed_start.snapshot.state == WindowsOperatorRuntimeState.FAILED
     assert presentations[0].closed == 1
-    assert windows[0].closed == 1
 
 
-def test_wait_failure_fails_closed() -> None:
+def test_wait_failure_and_stop_release_both_children() -> None:
     windows: list[FakeWindowsRuntime] = []
     presentations: list[FakePresentationRuntime] = []
 
@@ -257,7 +280,7 @@ def test_wait_failure_fails_closed() -> None:
         windows.append(runtime)
         return runtime
 
-    def presentation_factory(
+    def bad_wait_factory(
         bindings: Sequence[ViewportBinding],
     ) -> FakePresentationRuntime:
         runtime = FakePresentationRuntime(bindings)
@@ -265,52 +288,43 @@ def test_wait_failure_fails_closed() -> None:
         presentations.append(runtime)
         return runtime
 
-    runtime = BoundedWindowsOperatorRuntime(
+    failed_wait = BoundedWindowsOperatorRuntime(
         _layout(),
         windows_runtime_factory=windows_factory,
-        presentation_runtime_factory=presentation_factory,
+        presentation_runtime_factory=bad_wait_factory,
     )
 
-    async def scenario() -> None:
-        await runtime.start(())
+    async def fail_wait() -> None:
+        await failed_wait.start(())
         with pytest.raises(WindowsOperatorRuntimeError) as exc_info:
-            await runtime.wait()
+            await failed_wait.wait()
         assert exc_info.value.code == WindowsOperatorRuntimeErrorCode.EXECUTION_FAILURE
         assert "secret" not in str(exc_info.value).casefold()
 
-    asyncio.run(scenario())
-    assert runtime.snapshot.state == WindowsOperatorRuntimeState.FAILED
+    asyncio.run(fail_wait())
+    assert failed_wait.snapshot.state == WindowsOperatorRuntimeState.FAILED
     assert presentations[0].closed == 1
     assert windows[0].closed == 1
 
+    windows.clear()
+    presentations.clear()
 
-def test_stop_releases_both_children() -> None:
-    windows: list[FakeWindowsRuntime] = []
-    presentations: list[FakePresentationRuntime] = []
-
-    def windows_factory(layout: ViewportLayout) -> FakeWindowsRuntime:
-        runtime = FakeWindowsRuntime(layout)
-        windows.append(runtime)
-        return runtime
-
-    def presentation_factory(
-        bindings: Sequence[ViewportBinding],
-    ) -> FakePresentationRuntime:
+    def good_factory(bindings: Sequence[ViewportBinding]) -> FakePresentationRuntime:
         runtime = FakePresentationRuntime(bindings)
         presentations.append(runtime)
         return runtime
 
-    runtime = BoundedWindowsOperatorRuntime(
+    stopped_runtime = BoundedWindowsOperatorRuntime(
         _layout(),
         windows_runtime_factory=windows_factory,
-        presentation_runtime_factory=presentation_factory,
+        presentation_runtime_factory=good_factory,
     )
 
-    async def scenario() -> object:
-        await runtime.start(())
-        return await runtime.stop()
+    async def stop() -> object:
+        await stopped_runtime.start(())
+        return await stopped_runtime.stop()
 
-    stopped = asyncio.run(scenario())
+    stopped = asyncio.run(stop())
     assert stopped.state == WindowsOperatorRuntimeState.STOPPED
     assert stopped.open_surface_count == 0
     assert presentations[0].stopped == 1
