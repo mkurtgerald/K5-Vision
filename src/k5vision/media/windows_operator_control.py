@@ -11,6 +11,13 @@ from dataclasses import dataclass
 from pydantic import BaseModel, ConfigDict, Field
 
 from k5vision.media.mixed_presentation import MixedPresentationStream
+from k5vision.media.viewport_editor import (
+    ViewportEdit,
+    ViewportEditorError,
+    ViewportMove,
+    ViewportResize,
+    apply_viewport_edit,
+)
 from k5vision.media.viewport_geometry import ViewportLayout
 from k5vision.media.windows_operator_application import (
     WindowsOperatorApplicationSnapshot,
@@ -32,6 +39,7 @@ _MAX_CONTROLS_PER_CYCLE = 16
 class WindowsOperatorControlErrorCode(enum.StrEnum):
     INVALID_CONFIGURATION = "invalid_configuration"
     INVALID_STATE = "invalid_state"
+    INVALID_EDIT = "invalid_edit"
     CONTROL_LIMIT = "control_limit"
     APPLICATION_FAILURE = "application_failure"
 
@@ -56,12 +64,14 @@ class WindowsOperatorControlSnapshot(BaseModel):
     processed_controls: int = Field(ge=0)
     replacements: int = Field(ge=0)
     relayouts: int = Field(default=0, ge=0)
+    viewport_edits: int = Field(default=0, ge=0)
     stop_requests: int = Field(ge=0)
 
 
 class _ControlKind(enum.StrEnum):
     REPLACE = "replace"
     RELAYOUT = "relayout"
+    EDIT = "edit"
     STOP = "stop"
 
 
@@ -70,6 +80,7 @@ class _ControlRequest:
     kind: _ControlKind
     layout: ViewportLayout | None = None
     streams: tuple[MixedPresentationStream, ...] = ()
+    edit: ViewportEdit | None = None
 
 
 @typing.runtime_checkable
@@ -110,7 +121,7 @@ class _RelayoutApplicationBoundary(typing.Protocol):
 
 
 class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
-    """Run one visible session while accepting bounded replace/relayout/stop requests."""
+    """Run one visible session while accepting bounded live operator requests."""
 
     def __init__(
         self,
@@ -146,6 +157,7 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
         self._processed_controls = 0
         self._replacements = 0
         self._relayouts = 0
+        self._viewport_edits = 0
         self._stop_requests = 0
         self._active_layout: ViewportLayout | None = None
 
@@ -158,6 +170,7 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
             processed_controls=self._processed_controls,
             replacements=self._replacements,
             relayouts=self._relayouts,
+            viewport_edits=self._viewport_edits,
             stop_requests=self._stop_requests,
         )
 
@@ -194,6 +207,15 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
         """Queue one source-free same-slot arbitrary-geometry change."""
         return self._enqueue(_ControlRequest(kind=_ControlKind.RELAYOUT, layout=layout))
 
+    def request_edit(self, edit: ViewportEdit) -> WindowsOperatorControlSnapshot:
+        """Queue one source-free incremental viewport edit."""
+        if not isinstance(edit, (ViewportMove, ViewportResize)):
+            raise WindowsOperatorControlError(
+                WindowsOperatorControlErrorCode.INVALID_CONFIGURATION,
+                "operator viewport edit request is invalid",
+            )
+        return self._enqueue(_ControlRequest(kind=_ControlKind.EDIT, edit=edit))
+
     def request_stop(self) -> WindowsOperatorControlSnapshot:
         """Queue one explicit session stop request."""
         return self._enqueue(_ControlRequest(kind=_ControlKind.STOP))
@@ -225,6 +247,31 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
                 self._processed_controls += 1
                 self._stop_requests += 1
                 return None, WindowsOperatorSessionState.COMPLETE
+
+            if request.kind == _ControlKind.EDIT:
+                if request.edit is None or self._active_layout is None:
+                    raise WindowsOperatorControlError(
+                        WindowsOperatorControlErrorCode.INVALID_EDIT,
+                        "operator viewport edit cannot be applied",
+                    )
+                if not isinstance(application, _RelayoutApplicationBoundary):
+                    raise WindowsOperatorControlError(
+                        WindowsOperatorControlErrorCode.APPLICATION_FAILURE,
+                        "operator application does not support source-free relayout",
+                    )
+                try:
+                    candidate = apply_viewport_edit(self._active_layout, request.edit)
+                except ViewportEditorError:
+                    raise WindowsOperatorControlError(
+                        WindowsOperatorControlErrorCode.INVALID_EDIT,
+                        "operator viewport edit is invalid",
+                    ) from None
+                self._application_snapshot = await application.relayout(candidate)
+                self._active_layout = candidate
+                self._processed_controls += 1
+                self._relayouts += 1
+                self._viewport_edits += 1
+                continue
 
             if request.layout is None:
                 raise WindowsOperatorControlError(
