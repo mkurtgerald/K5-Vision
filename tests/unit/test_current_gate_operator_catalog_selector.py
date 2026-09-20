@@ -22,15 +22,17 @@ from k5vision.media.windows_operator_catalog_feedback import (
     _FeedbackOverlayCatalogWin32OperatorShellApi,
 )
 from k5vision.media.windows_operator_catalog_selector import (
-    BoundedSelectorCatalogUiWindowsOperatorControl,
-    BoundedSelectorCatalogWindowsOperatorApplication,
     _NEXT_BUTTON_ID,
     _PREVIOUS_BUTTON_ID,
+    BoundedSelectorCatalogUiWindowsOperatorControl,
+    BoundedSelectorCatalogWindowsOperatorApplication,
     _SelectorFeedbackCatalogWin32OperatorShellApi,
     _validated_catalog_view_ids,
 )
-from k5vision.media.windows_operator_control import WindowsOperatorControlError
-from k5vision.media.windows_operator_session import WindowsOperatorSessionState
+from k5vision.media.windows_operator_control import (
+    WindowsOperatorControlError,
+    WindowsOperatorControlErrorCode,
+)
 
 
 def _layout(x: int = 11) -> ViewportLayout:
@@ -112,6 +114,45 @@ def test_selector_children_join_existing_overlap_safe_surface(
     assert raised == [True]
 
 
+def test_selector_child_failure_cleans_ephemeral_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = object.__new__(_SelectorFeedbackCatalogWin32OperatorShellApi)
+    api._selector_view_ids = (2,)
+    api._selector_button_handles = {}
+    destroyed: list[int] = []
+    monkeypatch.setattr(
+        _FeedbackOverlayCatalogWin32OperatorShellApi,
+        "create_shell",
+        lambda _self, _width, _height: 101,
+    )
+    monkeypatch.setattr(
+        _FeedbackOverlayCatalogWin32OperatorShellApi,
+        "destroy_shell",
+        lambda _self, shell: destroyed.append(shell),
+    )
+
+    def _fail_child(**_kwargs: object) -> int:
+        raise _NativeShellError(_NativeShellFailure.CREATE)
+
+    api._create_child = _fail_child
+    api._raise_catalog_controls = lambda: None
+
+    with pytest.raises(_NativeShellError) as failed:
+        api.create_shell(1280, 720)
+    assert failed.value.failure == _NativeShellFailure.CREATE
+    assert api._selector_view_ids == ()
+    assert api._selector_button_handles == {}
+    assert destroyed == [101]
+
+
+def test_native_selector_rejects_noncanonical_occupancy() -> None:
+    api = object.__new__(_SelectorFeedbackCatalogWin32OperatorShellApi)
+    with pytest.raises(_NativeShellError) as failed:
+        api.set_catalog_view_ids((7, 2))
+    assert failed.value.failure == _NativeShellFailure.PUMP
+
+
 def test_selector_cycles_only_published_view_ids() -> None:
     api = object.__new__(_SelectorFeedbackCatalogWin32OperatorShellApi)
     api._selector_view_ids = (2, 7, 63)
@@ -135,6 +176,24 @@ def test_selector_cycles_only_published_view_ids() -> None:
     assert api._consume_catalog_command_message(_PREVIOUS_BUTTON_ID, 801)
     assert writes == ["63", "7"]
     assert api._catalog_rejections == 0
+
+
+def test_selector_chooses_boundary_when_editor_is_not_saved() -> None:
+    api = object.__new__(_SelectorFeedbackCatalogWin32OperatorShellApi)
+    api._selector_view_ids = (2, 7, 63)
+    api._selector_button_handles = {
+        _PREVIOUS_BUTTON_ID: 801,
+        _NEXT_BUTTON_ID: 802,
+    }
+    api._catalog_rejections = 0
+    api._view_editor = 707
+    api._read_view_id = lambda: 41
+    writes: list[str] = []
+    api._set_window_text = lambda _handle, text: writes.append(text) or 1
+
+    assert api._consume_catalog_command_message(_NEXT_BUTTON_ID, 802)
+    assert api._consume_catalog_command_message(_PREVIOUS_BUTTON_ID, 801)
+    assert writes == ["2", "63"]
 
 
 def test_selector_wraps_and_rejects_empty_occupancy() -> None:
@@ -179,6 +238,15 @@ def test_selector_native_update_failure_is_sanitized() -> None:
         api._consume_catalog_command_message(_NEXT_BUTTON_ID, 802)
     assert failed.value.failure == _NativeShellFailure.PUMP
 
+    def _explode(*_args: object) -> int:
+        raise RuntimeError("private selector detail")
+
+    api._set_window_text = _explode
+    with pytest.raises(_NativeShellError) as exploded:
+        api._consume_catalog_command_message(_NEXT_BUTTON_ID, 802)
+    assert exploded.value.failure == _NativeShellFailure.PUMP
+    assert "private selector detail" not in str(exploded.value)
+
 
 def test_selector_destroy_clears_ephemeral_occupancy(
     monkeypatch: pytest.MonkeyPatch,
@@ -199,6 +267,39 @@ def test_selector_destroy_clears_ephemeral_occupancy(
     assert destroyed == [101]
 
 
+def test_selector_application_native_api_success_and_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native = object()
+    monkeypatch.setattr(
+        "k5vision.media.windows_operator_catalog_selector."
+        "_SelectorFeedbackCatalogWin32OperatorShellApi",
+        lambda: native,
+    )
+    application = BoundedSelectorCatalogWindowsOperatorApplication()
+
+    assert application._ensure_native_api() is native
+    assert application._ensure_native_api() is native
+
+
+def test_selector_application_native_api_failure_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fail() -> object:
+        raise _NativeShellError(_NativeShellFailure.UNSUPPORTED_PLATFORM)
+
+    monkeypatch.setattr(
+        "k5vision.media.windows_operator_catalog_selector."
+        "_SelectorFeedbackCatalogWin32OperatorShellApi",
+        _fail,
+    )
+    application = BoundedSelectorCatalogWindowsOperatorApplication()
+
+    with pytest.raises(WindowsOperatorApplicationError) as failed:
+        application._ensure_native_api()
+    assert failed.value.code == WindowsOperatorApplicationErrorCode.UNSUPPORTED_PLATFORM
+
+
 def test_selector_application_validates_and_delegates_occupancy() -> None:
     application = BoundedSelectorCatalogWindowsOperatorApplication()
     received: list[tuple[int, ...]] = []
@@ -214,6 +315,14 @@ def test_selector_application_validates_and_delegates_occupancy() -> None:
     with pytest.raises(WindowsOperatorApplicationError) as invalid:
         application.set_catalog_view_ids((8, 0))
     assert invalid.value.code == WindowsOperatorApplicationErrorCode.INVALID_CONFIGURATION
+
+
+def test_selector_application_rejects_missing_native_boundary() -> None:
+    application = BoundedSelectorCatalogWindowsOperatorApplication()
+    application._native_api = object()
+    with pytest.raises(WindowsOperatorApplicationError) as failed:
+        application.set_catalog_view_ids((3,))
+    assert failed.value.code == WindowsOperatorApplicationErrorCode.PUMP_FAILURE
 
 
 def test_selector_application_maps_native_failure_without_details() -> None:
@@ -245,11 +354,13 @@ def test_control_publishes_canonical_occupancy_without_retaining_ids() -> None:
 
     assert application.published == [(2, 63)]
     payload = control.catalog_ui_snapshot.model_dump_json().casefold()
-    for forbidden in ("view_id", "rtsp://", "credential", "password", "native", "pointer"):
+    for forbidden in ("view_id", "selector_view_ids", "rtsp://", "credential", "password", "63"):
         assert forbidden not in payload
 
 
-def test_save_and_delete_refresh_selector_after_accepted_command() -> None:
+def test_save_and_delete_refresh_selector_after_accepted_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     control = BoundedSelectorCatalogUiWindowsOperatorControl()
     application = _FakeSelectorApplication(
         commands=(
@@ -259,10 +370,16 @@ def test_save_and_delete_refresh_selector_after_accepted_command() -> None:
             ),
         )
     )
-    control._state = WindowsOperatorSessionState.RUNNING
-    control._application = application
-    control._active_layout = _layout()
 
+    def _dispatch(command: WindowsOperatorCatalogCommand) -> None:
+        if command.kind == WindowsOperatorCatalogCommandKind.SAVE:
+            control._catalog = build_viewport_catalog(
+                (ViewportCatalogEntry(view_id=command.view_id, layout=_layout()),)
+            )
+        elif command.kind == WindowsOperatorCatalogCommandKind.DELETE:
+            control._catalog = build_viewport_catalog(())
+
+    monkeypatch.setattr(control, "dispatch_catalog_command", _dispatch)
     control._drain_native_catalog_commands(application)
     assert application.published == [(), (5,)]
     assert application.feedback == [WindowsOperatorCatalogFeedback.SAVED]
@@ -279,7 +396,23 @@ def test_save_and_delete_refresh_selector_after_accepted_command() -> None:
     assert control.catalog_ui_snapshot.native_commands == 2
 
 
+def test_selector_control_maps_application_failure_without_details() -> None:
+    class _FailingSelectorApplication(_FakeSelectorApplication):
+        def set_catalog_view_ids(self, _view_ids: tuple[int, ...]) -> None:
+            raise WindowsOperatorApplicationError(
+                WindowsOperatorApplicationErrorCode.PUMP_FAILURE,
+                "private selector detail",
+            )
+
+    control = BoundedSelectorCatalogUiWindowsOperatorControl()
+    with pytest.raises(WindowsOperatorControlError) as failed:
+        control._sync_catalog_selector(_FailingSelectorApplication())
+    assert failed.value.code == WindowsOperatorControlErrorCode.APPLICATION_FAILURE
+    assert "private selector detail" not in str(failed.value)
+
+
 def test_selector_control_fails_closed_without_selector_boundary() -> None:
     control = BoundedSelectorCatalogUiWindowsOperatorControl()
-    with pytest.raises(WindowsOperatorControlError):
+    with pytest.raises(WindowsOperatorControlError) as failed:
         control._sync_catalog_selector(object())
+    assert failed.value.code == WindowsOperatorControlErrorCode.APPLICATION_FAILURE
