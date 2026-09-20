@@ -65,7 +65,9 @@ class ViewportEditorSnapshot(BaseModel):
 
 def apply_viewport_edit(layout: ViewportLayout, edit: ViewportEdit) -> ViewportLayout:
     """Apply one validated relative edit while preserving every untouched placement."""
-    if not isinstance(layout, ViewportLayout) or not isinstance(edit, (ViewportMove, ViewportResize)):
+    if not isinstance(layout, ViewportLayout) or not isinstance(
+        edit, (ViewportMove, ViewportResize)
+    ):
         raise ViewportEditorError(
             ViewportEditorErrorCode.INVALID_CONFIGURATION,
             "viewport edit input is invalid",
