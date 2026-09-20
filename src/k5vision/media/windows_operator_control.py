@@ -18,10 +18,15 @@ from k5vision.media.viewport_editor import (
     ViewportResize,
     apply_viewport_edit,
 )
-from k5vision.media.viewport_geometry import ViewportLayout
+from k5vision.media.viewport_geometry import ViewportGeometry, ViewportLayout
 from k5vision.media.windows_operator_application import (
     WindowsOperatorApplicationSnapshot,
     WindowsOperatorApplicationState,
+)
+from k5vision.media.windows_operator_interaction import (
+    BoundedInteractiveWindowsOperatorApplication,
+    WindowsPointerEvent,
+    WindowsPointerEventKind,
 )
 from k5vision.media.windows_operator_session import (
     ApplicationFactory,
@@ -34,6 +39,7 @@ from k5vision.media.windows_operator_session import (
 
 _MAX_PENDING_CONTROLS = 64
 _MAX_CONTROLS_PER_CYCLE = 16
+_RESIZE_HANDLE_PIXELS = 16
 
 
 class WindowsOperatorControlErrorCode(enum.StrEnum):
@@ -65,6 +71,7 @@ class WindowsOperatorControlSnapshot(BaseModel):
     replacements: int = Field(ge=0)
     relayouts: int = Field(default=0, ge=0)
     viewport_edits: int = Field(default=0, ge=0)
+    interaction_edits: int = Field(default=0, ge=0)
     stop_requests: int = Field(ge=0)
 
 
@@ -75,12 +82,26 @@ class _ControlKind(enum.StrEnum):
     STOP = "stop"
 
 
+class _PointerDragKind(enum.StrEnum):
+    MOVE = "move"
+    RESIZE = "resize"
+
+
 @dataclass(frozen=True, slots=True)
 class _ControlRequest:
     kind: _ControlKind
     layout: ViewportLayout | None = None
     streams: tuple[MixedPresentationStream, ...] = ()
     edit: ViewportEdit | None = None
+    pointer_origin: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _PointerDrag:
+    logical_slot: int
+    kind: _PointerDragKind
+    start_x: int
+    start_y: int
 
 
 @typing.runtime_checkable
@@ -120,6 +141,65 @@ class _RelayoutApplicationBoundary(typing.Protocol):
     async def relayout(self, layout: ViewportLayout) -> WindowsOperatorApplicationSnapshot: ...
 
 
+@typing.runtime_checkable
+class _PointerApplicationBoundary(typing.Protocol):
+    def drain_pointer_events(
+        self,
+        *,
+        max_events: int = 64,
+    ) -> tuple[WindowsPointerEvent, ...]: ...
+
+
+def _geometry_contains(geometry: ViewportGeometry, x: int, y: int) -> bool:
+    return (
+        geometry.x <= x < geometry.x + geometry.width
+        and geometry.y <= y < geometry.y + geometry.height
+    )
+
+
+def _select_pointer_drag(
+    layout: ViewportLayout,
+    x: int,
+    y: int,
+) -> _PointerDrag | None:
+    selected: tuple[int, int, int, ViewportGeometry] | None = None
+    for index, placement in enumerate(layout.placements):
+        geometry = placement.geometry
+        if not _geometry_contains(geometry, x, y):
+            continue
+        candidate = (
+            geometry.z_index,
+            index,
+            placement.logical_slot,
+            geometry,
+        )
+        if selected is None or candidate[:2] > selected[:2]:
+            selected = candidate
+
+    if selected is None:
+        return None
+
+    _, _, logical_slot, geometry = selected
+    handle = min(
+        _RESIZE_HANDLE_PIXELS,
+        max(1, min(geometry.width, geometry.height) // 4),
+    )
+    kind = (
+        _PointerDragKind.RESIZE
+        if (
+            x >= geometry.x + geometry.width - handle
+            and y >= geometry.y + geometry.height - handle
+        )
+        else _PointerDragKind.MOVE
+    )
+    return _PointerDrag(
+        logical_slot=logical_slot,
+        kind=kind,
+        start_x=x,
+        start_y=y,
+    )
+
+
 class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
     """Run one visible session while accepting bounded live operator requests."""
 
@@ -144,8 +224,9 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
                 WindowsOperatorControlErrorCode.INVALID_CONFIGURATION,
                 "operator controls-per-cycle bound is invalid",
             )
+        selected_factory = application_factory or BoundedInteractiveWindowsOperatorApplication
         super().__init__(
-            application_factory=application_factory,
+            application_factory=selected_factory,
             max_cycles=max_cycles,
             max_messages_per_cycle=max_messages_per_cycle,
             poll_interval_seconds=poll_interval_seconds,
@@ -158,8 +239,10 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
         self._replacements = 0
         self._relayouts = 0
         self._viewport_edits = 0
+        self._interaction_edits = 0
         self._stop_requests = 0
         self._active_layout: ViewportLayout | None = None
+        self._pointer_drag: _PointerDrag | None = None
 
     @property
     def control_snapshot(self) -> WindowsOperatorControlSnapshot:
@@ -171,6 +254,7 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
             replacements=self._replacements,
             relayouts=self._relayouts,
             viewport_edits=self._viewport_edits,
+            interaction_edits=self._interaction_edits,
             stop_requests=self._stop_requests,
         )
 
@@ -227,6 +311,63 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
             except asyncio.QueueEmpty:
                 return
 
+    def _consume_pointer_events(
+        self,
+        events: tuple[WindowsPointerEvent, ...],
+    ) -> None:
+        for event in events:
+            if not isinstance(event, WindowsPointerEvent):
+                raise WindowsOperatorControlError(
+                    WindowsOperatorControlErrorCode.APPLICATION_FAILURE,
+                    "operator pointer input is invalid",
+                )
+
+            if event.kind == WindowsPointerEventKind.DOWN:
+                self._pointer_drag = (
+                    None
+                    if self._active_layout is None
+                    else _select_pointer_drag(
+                        self._active_layout,
+                        event.x,
+                        event.y,
+                    )
+                )
+                continue
+
+            if event.kind == WindowsPointerEventKind.MOVE:
+                continue
+
+            drag = self._pointer_drag
+            self._pointer_drag = None
+            if event.kind != WindowsPointerEventKind.UP or drag is None:
+                continue
+
+            dx = event.x - drag.start_x
+            dy = event.y - drag.start_y
+            if dx == 0 and dy == 0:
+                continue
+
+            edit: ViewportEdit
+            if drag.kind == _PointerDragKind.MOVE:
+                edit = ViewportMove(
+                    logical_slot=drag.logical_slot,
+                    dx=dx,
+                    dy=dy,
+                )
+            else:
+                edit = ViewportResize(
+                    logical_slot=drag.logical_slot,
+                    dwidth=dx,
+                    dheight=dy,
+                )
+            self._enqueue(
+                _ControlRequest(
+                    kind=_ControlKind.EDIT,
+                    edit=edit,
+                    pointer_origin=True,
+                )
+            )
+
     async def _process_controls(
         self,
         application: _ControllableApplicationBoundary,
@@ -271,6 +412,8 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
                 self._processed_controls += 1
                 self._relayouts += 1
                 self._viewport_edits += 1
+                if request.pointer_origin:
+                    self._interaction_edits += 1
                 continue
 
             if request.layout is None:
@@ -359,6 +502,13 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
                     await self._cancel_wait_task(wait_task)
                     break
 
+                if isinstance(application, _PointerApplicationBoundary):
+                    self._consume_pointer_events(
+                        application.drain_pointer_events(
+                            max_events=self._max_messages_per_cycle,
+                        )
+                    )
+
                 if wait_task is not None and wait_task.done():
                     self._application_snapshot = await wait_task
                     if self._application_snapshot.state in {
@@ -423,6 +573,7 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
             )
             raise WindowsOperatorSessionError(code, message) from None
         finally:
+            self._pointer_drag = None
             self._drain_controls()
 
         cleanup_failed = await self._close_application()
