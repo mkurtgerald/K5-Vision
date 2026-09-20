@@ -56,6 +56,26 @@ def test_dispatch_routes_frames_and_retains_only_aggregate_state() -> None:
     assert "abcd" not in payload
 
 
+def test_dispatch_accepts_full_layout_capacity_and_sparse_high_slot() -> None:
+    observed: list[int] = []
+
+    async def consume(frame: PresentationVideoFrame) -> None:
+        observed.append(frame.source_elapsed_ms)
+
+    bindings = [ViewportBinding(slot, consume) for slot in range(63)]
+    bindings.append(ViewportBinding(4095, consume))
+    dispatcher = BoundedViewportDispatcher(bindings)
+
+    async def exercise() -> object:
+        await dispatcher.dispatch(4095, _frame(37))
+        return await dispatcher.close()
+
+    snapshot = asyncio.run(exercise())
+    assert observed == [37]
+    assert snapshot.viewport_count == 64
+    assert snapshot.delivered_frames == 1
+
+
 def test_unknown_duplicate_and_out_of_range_slots_fail_closed_or_validate() -> None:
     async def consume(_frame: PresentationVideoFrame) -> None:
         return None
@@ -71,7 +91,7 @@ def test_unknown_duplicate_and_out_of_range_slots_fail_closed_or_validate() -> N
     assert duplicate_exc.value.code == ViewportDispatchErrorCode.INVALID_BINDINGS
 
     with pytest.raises(ValueError):
-        ViewportBinding(64, consume)
+        ViewportBinding(4096, consume)
 
 
 def test_consumer_failure_and_timeout_are_sanitized_and_release_bindings() -> None:
@@ -155,6 +175,8 @@ def test_close_and_constructor_bounds() -> None:
 
     with pytest.raises(ValueError):
         BoundedViewportDispatcher([ViewportBinding(0, consume)], max_viewports=0)
+    with pytest.raises(ValueError):
+        BoundedViewportDispatcher([ViewportBinding(0, consume)], max_viewports=65)
     with pytest.raises(ValueError):
         BoundedViewportDispatcher([ViewportBinding(0, consume)], max_total_frames=0)
     with pytest.raises(ValueError):
