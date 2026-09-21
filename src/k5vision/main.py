@@ -1,11 +1,13 @@
 """K5 Vision control-plane API."""
 
+from contextlib import asynccontextmanager
 from hmac import compare_digest
 from os import environ
+from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from k5vision import __version__
@@ -16,9 +18,13 @@ from k5vision.services.device_registry import (
     MAX_DEVICE_PAGE_SIZE,
     DeviceRegistry,
     DeviceRegistryCapacityError,
+    DeviceRegistryConflictError,
+    DeviceRegistryStorageError,
 )
 
 CONTROL_PLANE_TOKEN_ENV = "K5_CONTROL_PLANE_TOKEN"
+CONTROL_PLANE_SITE_ENV = "K5_CONTROL_PLANE_SITE_ID"
+DEVICE_DB_PATH_ENV = "K5_DEVICE_DB_PATH"
 MAX_DEVICE_REQUEST_BYTES = 16_384
 
 
@@ -114,32 +120,70 @@ def _resolve_control_plane_token(explicit_token: str | None) -> str | None:
     return token if token and token.isascii() else None
 
 
+def _resolve_control_plane_site(explicit_site: str | None) -> str | None:
+    site = explicit_site if explicit_site is not None else environ.get(CONTROL_PLANE_SITE_ENV)
+    if site is None:
+        return None
+    site = site.strip()
+    allowed = all(character.isalnum() or character in "._-" for character in site)
+    return site if site and len(site) <= 128 and site.isascii() and allowed else None
+
+
+def _resolve_device_db_path(explicit_path: str | Path | None) -> str | None:
+    raw_path = explicit_path if explicit_path is not None else environ.get(DEVICE_DB_PATH_ENV)
+    if raw_path is None:
+        return None
+    path = str(raw_path).strip()
+    return path if path and path != ":memory:" else None
+
+
 def create_app(
     *,
     control_plane_token: str | None = None,
+    control_plane_site_id: str | None = None,
+    device_db_path: str | Path | None = None,
     device_capacity: int = DEFAULT_DEVICE_CAPACITY,
     max_device_request_bytes: int = MAX_DEVICE_REQUEST_BYTES,
 ) -> FastAPI:
-    """Build an isolated API requiring one ASCII bearer credential for device operations.
-
-    Missing or non-ASCII token configuration leaves device operations unavailable.
-    """
+    """Build the control plane with fail-closed authenticated durable device state."""
     if not 1 <= device_capacity <= MAX_DEVICE_CAPACITY:
         raise ValueError(f"device_capacity must be between 1 and {MAX_DEVICE_CAPACITY}")
     if not 1024 <= max_device_request_bytes <= 1_048_576:
         raise ValueError("max_device_request_bytes must be between 1024 and 1048576")
 
+    expected_token = _resolve_control_plane_token(control_plane_token)
+    site_id = _resolve_control_plane_site(control_plane_site_id)
+    database_path = _resolve_device_db_path(device_db_path)
+    registry: DeviceRegistry | None = None
+    if site_id is not None and database_path is not None:
+        try:
+            registry = DeviceRegistry(
+                capacity=device_capacity,
+                database_path=database_path,
+                site_id=site_id,
+            )
+        except DeviceRegistryStorageError:
+            registry = None
+
+    @asynccontextmanager
+    async def lifespan(_application: FastAPI):
+        try:
+            yield
+        finally:
+            if registry is not None:
+                registry.close()
+
     application = FastAPI(
         title="K5 Vision Control Plane",
         version=__version__,
         description="Vendor-neutral security sensor management control plane.",
+        lifespan=lifespan,
     )
     application.add_middleware(
         _BoundedDeviceRequestBody,
         max_bytes=max_device_request_bytes,
     )
-    application.state.device_registry = DeviceRegistry(capacity=device_capacity)
-    expected_token = _resolve_control_plane_token(control_plane_token)
+    application.state.device_registry = registry
 
     async def require_control_plane_auth(
         authorization: Annotated[list[str] | None, Header()] = None,
@@ -164,6 +208,19 @@ def create_app(
                 detail="Unauthorized",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        if registry is None or site_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Control-plane device state is not configured",
+            )
+
+    def require_registry() -> DeviceRegistry:
+        if registry is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Device registry unavailable",
+            )
+        return registry
 
     device_auth = [Depends(require_control_plane_auth)]
 
@@ -178,27 +235,46 @@ def create_app(
         dependencies=device_auth,
     )
     async def list_devices(
-        request: Request,
         offset: Annotated[int, Query(ge=0)] = 0,
         limit: Annotated[int, Query(ge=1, le=MAX_DEVICE_PAGE_SIZE)] = MAX_DEVICE_PAGE_SIZE,
     ) -> list[Device]:
-        return request.app.state.device_registry.list(offset=offset, limit=limit)
+        try:
+            return require_registry().list(offset=offset, limit=limit)
+        except DeviceRegistryStorageError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Device registry unavailable",
+            ) from None
 
     @application.post(
         "/api/v1/devices",
         response_model=Device,
         status_code=status.HTTP_201_CREATED,
+        responses={status.HTTP_200_OK: {"description": "Existing identical enrollment"}},
         tags=["devices"],
         dependencies=device_auth,
     )
-    async def register_device(payload: DeviceCreate, request: Request) -> Device:
+    async def register_device(payload: DeviceCreate, response: Response) -> Device:
         try:
-            return request.app.state.device_registry.register(payload)
+            enrollment = require_registry().enroll(payload)
         except DeviceRegistryCapacityError:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Device registry capacity reached",
             ) from None
+        except DeviceRegistryConflictError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Device endpoint already enrolled with different metadata",
+            ) from None
+        except DeviceRegistryStorageError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Device registry unavailable",
+            ) from None
+        if not enrollment.created:
+            response.status_code = status.HTTP_200_OK
+        return enrollment.device
 
     @application.get(
         "/api/v1/devices/{device_id}",
@@ -206,8 +282,14 @@ def create_app(
         tags=["devices"],
         dependencies=device_auth,
     )
-    async def get_device(device_id: UUID, request: Request) -> Device:
-        device = request.app.state.device_registry.get(device_id)
+    async def get_device(device_id: UUID) -> Device:
+        try:
+            device = require_registry().get(device_id)
+        except DeviceRegistryStorageError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Device registry unavailable",
+            ) from None
         if device is None:
             raise HTTPException(status_code=404, detail="Device not found")
         return device

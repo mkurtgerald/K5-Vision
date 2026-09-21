@@ -3,9 +3,22 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from k5vision.main import CONTROL_PLANE_TOKEN_ENV, MAX_DEVICE_REQUEST_BYTES, create_app
+from k5vision.main import (
+    CONTROL_PLANE_SITE_ENV,
+    CONTROL_PLANE_TOKEN_ENV,
+    DEVICE_DB_PATH_ENV,
+    MAX_DEVICE_REQUEST_BYTES,
+    create_app,
+)
 
 CONTROL_PLANE_TOKEN = "test-control-plane-token"
+CONTROL_PLANE_SITE = "test-site"
+
+
+@pytest.fixture(autouse=True)
+def configure_device_state(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv(CONTROL_PLANE_SITE_ENV, CONTROL_PLANE_SITE)
+    monkeypatch.setenv(DEVICE_DB_PATH_ENV, str(tmp_path / "devices.sqlite3"))
 
 
 def _auth_headers(token: str = CONTROL_PLANE_TOKEN) -> dict[str, str]:
@@ -40,6 +53,20 @@ def test_device_api_fails_closed_without_auth_configuration(monkeypatch) -> None
 
     assert listed.status_code == 503
     assert created.status_code == 503
+
+
+@pytest.mark.parametrize("missing_env", [CONTROL_PLANE_SITE_ENV, DEVICE_DB_PATH_ENV])
+def test_device_api_fails_closed_without_durable_scope_configuration(
+    monkeypatch: pytest.MonkeyPatch, missing_env: str
+) -> None:
+    monkeypatch.delenv(missing_env, raising=False)
+    with TestClient(create_app(control_plane_token=CONTROL_PLANE_TOKEN)) as client:
+        response = client.get("/api/v1/devices", headers=_auth_headers())
+        health = client.get("/api/v1/health")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Control-plane device state is not configured"}
+    assert health.status_code == 200
 
 
 def test_device_api_rejects_missing_or_invalid_bearer_token() -> None:
@@ -79,6 +106,89 @@ def test_device_registration_round_trip() -> None:
     assert len(listed.json()) == 1
     assert fetched.status_code == 200
     assert fetched.json()["id"] == created.json()["id"]
+
+
+def test_device_enrollment_is_idempotent_across_application_restart() -> None:
+    payload = _device_payload()
+    headers = _auth_headers()
+
+    with TestClient(create_app(control_plane_token=CONTROL_PLANE_TOKEN)) as client:
+        created = client.post("/api/v1/devices", json=payload, headers=headers)
+    with TestClient(create_app(control_plane_token=CONTROL_PLANE_TOKEN)) as client:
+        repeated = client.post("/api/v1/devices", json=payload, headers=headers)
+        listed = client.get("/api/v1/devices", headers=headers)
+
+    assert created.status_code == 201
+    assert repeated.status_code == 200
+    assert repeated.json()["id"] == created.json()["id"]
+    assert [device["id"] for device in listed.json()] == [created.json()["id"]]
+
+
+def test_conflicting_reenrollment_does_not_mutate_existing_device() -> None:
+    payload = _device_payload()
+    headers = _auth_headers()
+
+    with TestClient(create_app(control_plane_token=CONTROL_PLANE_TOKEN)) as client:
+        created = client.post("/api/v1/devices", json=payload, headers=headers)
+        conflict_payload = {**payload, "name": "Different Camera"}
+        conflict = client.post("/api/v1/devices", json=conflict_payload, headers=headers)
+        listed = client.get("/api/v1/devices", headers=headers)
+
+    assert created.status_code == 201
+    assert conflict.status_code == 409
+    assert conflict.json() == {"detail": "Device endpoint already enrolled with different metadata"}
+    assert listed.json() == [created.json()]
+
+
+def test_device_state_is_isolated_by_authenticated_site(tmp_path) -> None:
+    database = tmp_path / "shared-devices.sqlite3"
+    payload = _device_payload()
+
+    with TestClient(
+        create_app(
+            control_plane_token="site-a-token",
+            control_plane_site_id="site-a",
+            device_db_path=database,
+        )
+    ) as client:
+        site_a = client.post(
+            "/api/v1/devices",
+            json=payload,
+            headers=_auth_headers("site-a-token"),
+        )
+    with TestClient(
+        create_app(
+            control_plane_token="site-b-token",
+            control_plane_site_id="site-b",
+            device_db_path=database,
+        )
+    ) as client:
+        site_b_list = client.get("/api/v1/devices", headers=_auth_headers("site-b-token"))
+        site_b_get = client.get(
+            f"/api/v1/devices/{site_a.json()['id']}",
+            headers=_auth_headers("site-b-token"),
+        )
+        site_b = client.post(
+            "/api/v1/devices",
+            json=payload,
+            headers=_auth_headers("site-b-token"),
+        )
+    with TestClient(
+        create_app(
+            control_plane_token="site-a-token",
+            control_plane_site_id="site-a",
+            device_db_path=database,
+        )
+    ) as client:
+        site_a_list = client.get("/api/v1/devices", headers=_auth_headers("site-a-token"))
+
+    assert site_a.status_code == 201
+    assert site_b_list.status_code == 200
+    assert site_b_list.json() == []
+    assert site_b_get.status_code == 404
+    assert site_b.status_code == 201
+    assert site_b.json()["id"] != site_a.json()["id"]
+    assert [device["id"] for device in site_a_list.json()] == [site_a.json()["id"]]
 
 
 def test_unknown_device_returns_404() -> None:
