@@ -19,11 +19,14 @@ def _resolve_control_plane_token(explicit_token: str | None) -> str | None:
     if token is None:
         return None
     token = token.strip()
-    return token or None
+    return token if token and token.isascii() else None
 
 
 def create_app(*, control_plane_token: str | None = None) -> FastAPI:
-    """Build an isolated K5 Vision API application instance."""
+    """Build an isolated API requiring one ASCII bearer credential for device operations.
+
+    Missing or non-ASCII token configuration leaves device operations unavailable.
+    """
     application = FastAPI(
         title="K5 Vision Control Plane",
         version=__version__,
@@ -33,7 +36,7 @@ def create_app(*, control_plane_token: str | None = None) -> FastAPI:
     expected_token = _resolve_control_plane_token(control_plane_token)
 
     async def require_control_plane_auth(
-        authorization: Annotated[str | None, Header()] = None,
+        authorization: Annotated[list[str] | None, Header()] = None,
     ) -> None:
         if expected_token is None:
             raise HTTPException(
@@ -41,11 +44,13 @@ def create_app(*, control_plane_token: str | None = None) -> FastAPI:
                 detail="Control-plane authentication is not configured",
             )
 
-        scheme, separator, credential = (authorization or "").partition(" ")
+        header = authorization[0] if authorization and len(authorization) == 1 else ""
+        scheme, separator, credential = header.partition(" ")
         if (
             scheme.lower() != "bearer"
             or not separator
             or not credential
+            or not credential.isascii()
             or not compare_digest(credential, expected_token)
         ):
             raise HTTPException(
