@@ -128,7 +128,7 @@ class Stage02Adapter:
         *,
         timeout_seconds: float = 8.0,
         interface: str | None = None,
-        verify_ssl: bool = False,
+        verify_ssl: bool = True,
         client_factory: ClientFactory | None = None,
         discovery_factory: DiscoveryFactory | None = None,
     ) -> None:
