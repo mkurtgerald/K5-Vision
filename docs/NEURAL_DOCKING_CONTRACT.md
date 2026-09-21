@@ -75,3 +75,55 @@ user, role, action class, device, site, and current system state.
 Feature work on either side of this seam must not bypass these contracts.
 If a new capability cannot fit this boundary, update the boundary deliberately
 before coupling production code to a one-off interface.
+
+
+## Autonomous operation
+
+K5 Vision supports autonomous security operation as a normal deployment mode.
+Human confirmation is not required for every action.
+
+Autonomy modes are:
+
+- **manual** -- operator drives execution;
+- **assisted** -- the system recommends and prepares actions;
+- **auto** -- pre-authorized policies may execute without per-action operator approval;
+- **emergency** -- narrowly defined emergency policies may execute immediately.
+
+Autonomous behavior is governed by policy, not by unrestricted model privilege.
+A reasoning subsystem may propose an action; K5 policy may approve it
+automatically when the current autonomy mode, action class, target, confidence,
+site policy, user/site configuration, and current system state satisfy the
+configured rule set.
+
+An approved autonomous action receives a short-lived, single-use
+`ExecutionGrant` bound to the exact proposal, action type, target, and policy
+version. The execution layer consumes that grant and emits an
+`ActionReceipt`.
+
+This permits K5 Neural / Virtual Guard to function as an autonomous security
+guard while keeping device authority explicit, auditable, revocable, and
+bounded.
+
+### Example
+
+```text
+Observation
+   ↓
+Neural / Virtual Guard
+   ↓
+ActionProposal
+   ↓
+K5 policy evaluates current mode
+   ├─ manual  → request operator
+   ├─ assisted → recommend
+   └─ auto/emergency + policy match
+               ↓
+         ExecutionGrant
+               ↓
+          Device action
+               ↓
+         ActionReceipt
+```
+
+Switching to Auto mode does not bypass policy. It changes which policy-approved
+actions may proceed without a human confirmation step.
