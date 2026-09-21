@@ -92,7 +92,7 @@ class _BoundedDeviceRequestBody:
 
     @staticmethod
     async def _reject(send: Send, response_status: int, detail: str) -> None:
-        body = (f'{{"detail":"{detail}"}}').encode("utf-8")
+        body = (f'{{"detail":"{detail}"}}').encode()
         await send(
             {
                 "type": "http.response.start",
