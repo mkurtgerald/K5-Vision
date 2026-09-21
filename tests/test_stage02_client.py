@@ -126,7 +126,7 @@ def test_probe_returns_canonical_capabilities_and_strips_uri_credentials() -> No
         captured.update(kwargs)
         return FakeClient()
 
-    adapter = Stage02Adapter(timeout_seconds=3, verify_ssl=True, client_factory=client_factory)
+    adapter = Stage02Adapter(timeout_seconds=3, client_factory=client_factory)
     device = Device(
         name="endpoint",
         host="10.0.0.9",
