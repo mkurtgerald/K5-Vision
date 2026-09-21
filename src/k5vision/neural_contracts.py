@@ -9,7 +9,13 @@ K5 policy/authority layer.
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_validator,
+)
 
 
 ContractVersion = Literal["1.0"]
