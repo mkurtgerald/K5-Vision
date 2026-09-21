@@ -1,13 +1,25 @@
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
-from k5vision.main import CONTROL_PLANE_TOKEN_ENV, create_app
+from k5vision.main import CONTROL_PLANE_TOKEN_ENV, MAX_DEVICE_REQUEST_BYTES, create_app
 
 CONTROL_PLANE_TOKEN = "test-control-plane-token"
 
 
 def _auth_headers(token: str = CONTROL_PLANE_TOKEN) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def _device_payload(index: int = 1) -> dict[str, object]:
+    return {
+        "name": f"Synthetic Camera {index}",
+        "host": f"192.0.2.{index}",
+        "kind": "camera",
+        "protocols": ["rtsp"],
+        "tags": ["synthetic"],
+    }
 
 
 def test_health_reports_version() -> None:
@@ -24,16 +36,7 @@ def test_device_api_fails_closed_without_auth_configuration(monkeypatch) -> None
 
     with TestClient(create_app()) as client:
         listed = client.get("/api/v1/devices")
-        created = client.post(
-            "/api/v1/devices",
-            json={
-                "name": "Synthetic Camera",
-                "host": "192.0.2.10",
-                "kind": "camera",
-                "protocols": ["rtsp"],
-                "tags": [],
-            },
-        )
+        created = client.post("/api/v1/devices", json=_device_payload())
 
     assert listed.status_code == 503
     assert created.status_code == 503
@@ -124,13 +127,7 @@ def test_device_api_rejects_ambiguous_credentials(
             method,
             path,
             headers=headers,
-            json={
-                "name": "Synthetic Camera",
-                "host": "192.0.2.10",
-                "kind": "camera",
-                "protocols": ["rtsp"],
-                "tags": [],
-            },
+            json=_device_payload(),
         )
         remaining = client.get("/api/v1/devices", headers=_auth_headers())
         health = client.get("/api/v1/health")
@@ -179,3 +176,97 @@ def test_device_api_explicit_blank_token_does_not_fall_back_to_environment(monke
         response = client.get("/api/v1/devices", headers=_auth_headers())
 
     assert response.status_code == 503
+
+
+def test_device_registration_rejects_unexpected_and_oversized_fields_without_mutation() -> None:
+    headers = _auth_headers()
+    unexpected = _device_payload()
+    unexpected["unexpected"] = "ignored-before-hardening"
+    overlong_tag = _device_payload()
+    overlong_tag["tags"] = ["x" * 65]
+    too_many_tags = _device_payload()
+    too_many_tags["tags"] = [f"tag-{index}" for index in range(33)]
+
+    with TestClient(create_app(control_plane_token=CONTROL_PLANE_TOKEN)) as client:
+        unexpected_response = client.post("/api/v1/devices", json=unexpected, headers=headers)
+        overlong_response = client.post("/api/v1/devices", json=overlong_tag, headers=headers)
+        too_many_response = client.post("/api/v1/devices", json=too_many_tags, headers=headers)
+        remaining = client.get("/api/v1/devices", headers=headers)
+
+    assert unexpected_response.status_code == 422
+    assert overlong_response.status_code == 422
+    assert too_many_response.status_code == 422
+    assert remaining.status_code == 200
+    assert remaining.json() == []
+
+
+def test_device_registration_accepts_maximum_bounded_tags() -> None:
+    payload = _device_payload()
+    payload["tags"] = [f"tag-{index:02d}-" + "x" * 57 for index in range(32)]
+
+    with TestClient(create_app(control_plane_token=CONTROL_PLANE_TOKEN)) as client:
+        response = client.post("/api/v1/devices", json=payload, headers=_auth_headers())
+
+    assert response.status_code == 201
+    assert len(response.json()["tags"]) == 32
+    assert max(len(tag) for tag in response.json()["tags"]) == 64
+
+
+def test_device_registration_body_is_bounded_before_model_parsing() -> None:
+    payload = _device_payload()
+    payload["tags"] = ["x" * (MAX_DEVICE_REQUEST_BYTES + 1)]
+    encoded = json.dumps(payload).encode("utf-8")
+    assert len(encoded) > MAX_DEVICE_REQUEST_BYTES
+
+    with TestClient(create_app(control_plane_token=CONTROL_PLANE_TOKEN)) as client:
+        response = client.post(
+            "/api/v1/devices",
+            content=encoded,
+            headers={**_auth_headers(), "Content-Type": "application/json"},
+        )
+        remaining = client.get("/api/v1/devices", headers=_auth_headers())
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "Request body too large"}
+    assert remaining.status_code == 200
+    assert remaining.json() == []
+
+
+def test_device_registry_capacity_rejects_extra_write_without_mutation() -> None:
+    headers = _auth_headers()
+    with TestClient(
+        create_app(control_plane_token=CONTROL_PLANE_TOKEN, device_capacity=2)
+    ) as client:
+        first = client.post("/api/v1/devices", json=_device_payload(1), headers=headers)
+        second = client.post("/api/v1/devices", json=_device_payload(2), headers=headers)
+        rejected = client.post("/api/v1/devices", json=_device_payload(3), headers=headers)
+        remaining = client.get("/api/v1/devices", headers=headers)
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert rejected.status_code == 409
+    assert rejected.json() == {"detail": "Device registry capacity reached"}
+    assert [device["name"] for device in remaining.json()] == [
+        "Synthetic Camera 1",
+        "Synthetic Camera 2",
+    ]
+
+
+def test_device_list_paginates_and_rejects_unbounded_queries() -> None:
+    headers = _auth_headers()
+    with TestClient(create_app(control_plane_token=CONTROL_PLANE_TOKEN)) as client:
+        for index in range(1, 4):
+            response = client.post("/api/v1/devices", json=_device_payload(index), headers=headers)
+            assert response.status_code == 201
+
+        page = client.get("/api/v1/devices?offset=1&limit=2", headers=headers)
+        over_limit = client.get("/api/v1/devices?limit=101", headers=headers)
+        negative_offset = client.get("/api/v1/devices?offset=-1", headers=headers)
+
+    assert page.status_code == 200
+    assert [device["name"] for device in page.json()] == [
+        "Synthetic Camera 2",
+        "Synthetic Camera 3",
+    ]
+    assert over_limit.status_code == 422
+    assert negative_offset.status_code == 422
