@@ -104,16 +104,22 @@ def test_execution_grant_is_single_use() -> None:
     item = proposal()
     grant = grant_for(item)
     ledger = GrantLedger()
-    assert ledger.consume(
-        grant,
-        proposal=item,
-        now=item.created_at + timedelta(seconds=1),
-    ) is True
-    assert ledger.consume(
-        grant,
-        proposal=item,
-        now=item.created_at + timedelta(seconds=2),
-    ) is False
+    assert (
+        ledger.consume(
+            grant,
+            proposal=item,
+            now=item.created_at + timedelta(seconds=1),
+        )
+        is True
+    )
+    assert (
+        ledger.consume(
+            grant,
+            proposal=item,
+            now=item.created_at + timedelta(seconds=2),
+        )
+        is False
+    )
 
 
 def test_execution_grant_rejects_mismatched_proposal() -> None:
@@ -121,11 +127,14 @@ def test_execution_grant_rejects_mismatched_proposal() -> None:
     grant = grant_for(item)
     item.constraints["tampered"] = True
     ledger = GrantLedger()
-    assert ledger.consume(
-        grant,
-        proposal=item,
-        now=item.created_at + timedelta(seconds=1),
-    ) is False
+    assert (
+        ledger.consume(
+            grant,
+            proposal=item,
+            now=item.created_at + timedelta(seconds=1),
+        )
+        is False
+    )
 
 
 def test_expired_execution_grant_is_rejected() -> None:
@@ -144,8 +153,11 @@ def test_expired_execution_grant_is_rejected() -> None:
         issued_by="k5-policy-engine",
     )
     ledger = GrantLedger()
-    assert ledger.consume(
-        grant,
-        proposal=item,
-        now=issued + timedelta(seconds=2),
-    ) is False
+    assert (
+        ledger.consume(
+            grant,
+            proposal=item,
+            now=issued + timedelta(seconds=2),
+        )
+        is False
+    )
