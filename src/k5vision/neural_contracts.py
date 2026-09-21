@@ -6,14 +6,15 @@ They do not themselves grant device authority; execution remains owned by the
 K5 policy/authority layer.
 """
 
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import (
-    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
+    field_validator,
     model_validator,
 )
 
@@ -48,11 +49,18 @@ class ContractModel(BaseModel):
 
     schema_version: ContractVersion = "1.0"
 
+    @field_validator("*", mode="after")
+    @classmethod
+    def reject_naive_datetimes(cls, value: Any) -> Any:
+        if isinstance(value, datetime) and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("timezone-aware timestamp required")
+        return value
+
 
 class ObservationEnvelope(ContractModel):
     observation_id: str = Field(min_length=1, max_length=128)
     source_id: str = Field(min_length=1, max_length=128)
-    observed_at: AwareDatetime
+    observed_at: datetime
     kind: str = Field(min_length=1, max_length=128)
     attributes: dict[str, Any] = Field(default_factory=dict)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -62,8 +70,8 @@ class ObservationEnvelope(ContractModel):
 
 class ActionProposal(ContractModel):
     proposal_id: str = Field(min_length=1, max_length=128)
-    created_at: AwareDatetime
-    expires_at: AwareDatetime
+    created_at: datetime
+    expires_at: datetime
     action_type: str = Field(min_length=1, max_length=128)
     target_ref: str = Field(min_length=1, max_length=256)
     rationale: str = Field(min_length=1, max_length=4096)
@@ -83,7 +91,7 @@ class ActionProposal(ContractModel):
 
 class AuthorityDecision(ContractModel):
     proposal_id: str = Field(min_length=1, max_length=128)
-    decided_at: AwareDatetime
+    decided_at: datetime
     decision: Literal["allow", "deny", "modify"]
     policy_version: str = Field(min_length=1, max_length=128)
     decided_by: str = Field(min_length=1, max_length=256)
@@ -94,8 +102,8 @@ class AuthorityDecision(ContractModel):
 class ExecutionGrant(ContractModel):
     grant_id: str = Field(min_length=1, max_length=128)
     proposal_id: str = Field(min_length=1, max_length=128)
-    issued_at: AwareDatetime
-    expires_at: AwareDatetime
+    issued_at: datetime
+    expires_at: datetime
     action_type: str = Field(min_length=1, max_length=128)
     target_ref: str = Field(min_length=1, max_length=256)
     policy_version: str = Field(min_length=1, max_length=128)
@@ -113,7 +121,7 @@ class ExecutionGrant(ContractModel):
 class ActionReceipt(ContractModel):
     receipt_id: str = Field(min_length=1, max_length=128)
     proposal_id: str = Field(min_length=1, max_length=128)
-    completed_at: AwareDatetime
+    completed_at: datetime
     decision: Literal["allow", "deny", "modify"]
     executed: bool
     result: str = Field(min_length=1, max_length=4096)
@@ -123,7 +131,7 @@ class ActionReceipt(ContractModel):
 
 
 class CapabilityHandshake(ContractModel):
-    generated_at: AwareDatetime
+    generated_at: datetime
     producer_version: str = Field(min_length=1, max_length=128)
     contract_versions: tuple[str, ...] = ("1.0",)
     capabilities: frozenset[str] = frozenset()
