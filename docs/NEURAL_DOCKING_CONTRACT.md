@@ -40,6 +40,8 @@ The Python reference models live in
 - Every authorized execution produces a receipt.
 - Messages carry explicit schema versions and timezone-aware timestamps.
 - Unknown schema versions fail closed until an adapter is deliberately added.
+- Extensible object payloads are bounded JSON-safe data, not arbitrary Python
+  objects. Validation copies that data away from caller-owned mutable inputs.
 - Proprietary ontology extensions, response policies, tuning, learned weights,
   customer data, and protected adapters remain outside public generic contracts.
 
@@ -97,8 +99,16 @@ configured rule set.
 
 An approved autonomous action receives a short-lived, single-use
 `ExecutionGrant` bound to the exact proposal, action type, target, and policy
-version. The execution layer consumes that grant and emits an
-`ActionReceipt`.
+version. Contract v1 binds the exact proposal using a lowercase SHA-256 digest
+of K5's canonical UTF-8 JSON representation: JSON-mode field values, explicit
+nulls, sorted object keys, compact separators, finite JSON numbers, and the
+bounded extension rules defined by the reference contract. The grant consumer
+must reject a proposal whose ID, action, target, expiry, or canonical digest no
+longer matches the grant. This binding detects post-review mutation; it does not
+replace authenticated policy, durable grant storage, revocation, executor
+isolation, or trusted reconciliation.
+
+The execution layer consumes that grant and emits an `ActionReceipt`.
 
 This permits K5 Neural / Virtual Guard to function as an autonomous security
 guard while keeping device authority explicit, auditable, revocable, and
