@@ -1,9 +1,9 @@
 """Deterministic policy primitives for K5 autonomous execution."""
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from collections.abc import Iterable
 
 from .neural_contracts import ActionProposal, AutonomyMode, ExecutionGrant
 
