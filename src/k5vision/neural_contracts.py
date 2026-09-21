@@ -7,7 +7,7 @@ K5 policy/authority layer.
 """
 
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
@@ -48,7 +48,7 @@ class ObservationEnvelope(ContractModel):
     source_id: str = Field(min_length=1, max_length=128)
     observed_at: AwareDatetime
     kind: str = Field(min_length=1, max_length=128)
-    attributes: dict[str, object] = Field(default_factory=dict)
+    attributes: dict[str, Any] = Field(default_factory=dict)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     provenance: tuple[str, ...] = ()
     evidence_ref: str | None = None
@@ -66,7 +66,7 @@ class ActionProposal(ContractModel):
     correlation_id: str | None = None
     producer_version: str = Field(min_length=1, max_length=128)
     evidence_refs: tuple[str, ...] = ()
-    constraints: dict[str, object] = Field(default_factory=dict)
+    constraints: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_window(self) -> "ActionProposal":
@@ -82,7 +82,7 @@ class AuthorityDecision(ContractModel):
     policy_version: str = Field(min_length=1, max_length=128)
     decided_by: str = Field(min_length=1, max_length=256)
     autonomy_mode: AutonomyMode = AutonomyMode.MANUAL
-    modifications: dict[str, object] = Field(default_factory=dict)
+    modifications: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExecutionGrant(ContractModel):
