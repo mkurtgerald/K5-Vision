@@ -6,6 +6,9 @@ They do not themselves grant device authority; execution remains owned by the
 K5 policy/authority layer.
 """
 
+import hashlib
+import json
+import math
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -13,6 +16,71 @@ from typing import Any, Literal
 import pydantic
 
 ContractVersion = Literal["1.0"]
+
+MAX_EXTENSION_DEPTH = 6
+MAX_EXTENSION_ITEMS = 256
+MAX_EXTENSION_BYTES = 16_384
+MAX_EXTENSION_STRING_BYTES = 4_096
+MAX_EXTENSION_KEY_BYTES = 128
+
+
+def _bounded_json_object(value: Any) -> dict[str, Any]:
+    item_count = 0
+
+    def copy_value(item: Any, *, depth: int) -> Any:
+        nonlocal item_count
+        item_count += 1
+        if item_count > MAX_EXTENSION_ITEMS:
+            raise ValueError("extension payload item limit exceeded")
+        if depth > MAX_EXTENSION_DEPTH:
+            raise ValueError("extension payload depth limit exceeded")
+
+        if item is None or isinstance(item, (bool, int)):
+            return item
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError("extension payload numbers must be finite")
+            return item
+        if isinstance(item, str):
+            if len(item.encode("utf-8")) > MAX_EXTENSION_STRING_BYTES:
+                raise ValueError("extension payload string limit exceeded")
+            return item
+        if isinstance(item, list):
+            return [copy_value(member, depth=depth + 1) for member in item]
+        if isinstance(item, dict):
+            copied: dict[str, Any] = {}
+            for key, member in item.items():
+                if not isinstance(key, str):
+                    raise ValueError("extension payload keys must be strings")
+                if not key or len(key.encode("utf-8")) > MAX_EXTENSION_KEY_BYTES:
+                    raise ValueError("extension payload key limit exceeded")
+                copied[key] = copy_value(member, depth=depth + 1)
+            return copied
+        raise ValueError("extension payload must contain only JSON-safe values")
+
+    copied = copy_value(value, depth=0)
+    if not isinstance(copied, dict):
+        raise ValueError("extension payload must be a JSON object")
+    encoded = json.dumps(
+        copied,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(encoded) > MAX_EXTENSION_BYTES:
+        raise ValueError("extension payload byte limit exceeded")
+    return copied
+
+
+def _canonical_model_bytes(model: pydantic.BaseModel) -> bytes:
+    return json.dumps(
+        model.model_dump(mode="json", exclude_none=False),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 class AuthorityLevel(StrEnum):
@@ -60,6 +128,11 @@ class ObservationEnvelope(ContractModel):
     provenance: tuple[str, ...] = ()
     evidence_ref: str | None = None
 
+    @pydantic.field_validator("attributes", mode="before")
+    @classmethod
+    def bound_attributes(cls, value: Any) -> dict[str, Any]:
+        return _bounded_json_object(value)
+
 
 class ActionProposal(ContractModel):
     proposal_id: str = pydantic.Field(min_length=1, max_length=128)
@@ -75,11 +148,21 @@ class ActionProposal(ContractModel):
     evidence_refs: tuple[str, ...] = ()
     constraints: dict[str, Any] = pydantic.Field(default_factory=dict)
 
+    @pydantic.field_validator("constraints", mode="before")
+    @classmethod
+    def bound_constraints(cls, value: Any) -> dict[str, Any]:
+        return _bounded_json_object(value)
+
     @pydantic.model_validator(mode="after")
     def validate_window(self) -> "ActionProposal":
         if self.expires_at <= self.created_at:
             raise ValueError("proposal expiration must be after creation")
         return self
+
+    def canonical_digest(self) -> str:
+        """Return the v1 canonical SHA-256 binding for this exact proposal."""
+
+        return hashlib.sha256(_canonical_model_bytes(self)).hexdigest()
 
 
 class AuthorityDecision(ContractModel):
@@ -91,10 +174,16 @@ class AuthorityDecision(ContractModel):
     autonomy_mode: AutonomyMode = AutonomyMode.MANUAL
     modifications: dict[str, Any] = pydantic.Field(default_factory=dict)
 
+    @pydantic.field_validator("modifications", mode="before")
+    @classmethod
+    def bound_modifications(cls, value: Any) -> dict[str, Any]:
+        return _bounded_json_object(value)
+
 
 class ExecutionGrant(ContractModel):
     grant_id: str = pydantic.Field(min_length=1, max_length=128)
     proposal_id: str = pydantic.Field(min_length=1, max_length=128)
+    proposal_digest: str = pydantic.Field(pattern=r"^[0-9a-f]{64}$")
     issued_at: datetime
     expires_at: datetime
     action_type: str = pydantic.Field(min_length=1, max_length=128)
@@ -109,6 +198,14 @@ class ExecutionGrant(ContractModel):
         if self.expires_at <= self.issued_at:
             raise ValueError("execution grant expiration must be after issuance")
         return self
+
+    def binds_proposal(self, proposal: ActionProposal) -> bool:
+        return (
+            self.proposal_id == proposal.proposal_id
+            and self.action_type == proposal.action_type
+            and self.target_ref == proposal.target_ref
+            and self.proposal_digest == proposal.canonical_digest()
+        )
 
 
 class ActionReceipt(ContractModel):
