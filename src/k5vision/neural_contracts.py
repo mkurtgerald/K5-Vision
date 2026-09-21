@@ -238,11 +238,15 @@ class ActionReceipt(ContractModel):
         elif self.outcome is ExecutionOutcome.DENIED_BUT_OBSERVED:
             raise ValueError("denied-but-observed outcome requires a denied decision")
 
-        if self.outcome in {
-            ExecutionOutcome.VERIFIED_FAILURE,
-            ExecutionOutcome.UNKNOWN,
-            ExecutionOutcome.DENIED_BUT_OBSERVED,
-        } and not self.failure_reason:
+        if (
+            self.outcome
+            in {
+                ExecutionOutcome.VERIFIED_FAILURE,
+                ExecutionOutcome.UNKNOWN,
+                ExecutionOutcome.DENIED_BUT_OBSERVED,
+            }
+            and not self.failure_reason
+        ):
             raise ValueError("non-success execution outcome requires failure_reason")
 
         if (
@@ -252,10 +256,7 @@ class ActionReceipt(ContractModel):
         ):
             raise ValueError("authorized action not attempted requires failure_reason")
 
-        if (
-            self.outcome is ExecutionOutcome.VERIFIED_SUCCESS
-            and self.failure_reason is not None
-        ):
+        if self.outcome is ExecutionOutcome.VERIFIED_SUCCESS and self.failure_reason is not None:
             raise ValueError("verified success cannot include failure_reason")
 
         return self
