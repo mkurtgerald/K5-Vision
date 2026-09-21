@@ -34,6 +34,39 @@ def test_observation_contract_accepts_transport_neutral_payload() -> None:
     assert item.attributes["count"] == 2
 
 
+def test_extension_payload_is_detached_from_original_input() -> None:
+    source = {"nested": {"items": [1, 2]}}
+    item = ObservationEnvelope(
+        observation_id="obs-copy",
+        source_id="source-7",
+        observed_at=now(),
+        kind="generic-event",
+        attributes=source,
+    )
+    source["nested"]["items"].append(3)
+    assert item.attributes == {"nested": {"items": [1, 2]}}
+
+
+def test_extension_payload_fails_closed_when_not_bounded_json() -> None:
+    with pytest.raises(ValidationError):
+        ObservationEnvelope(
+            observation_id="obs-object",
+            source_id="source-7",
+            observed_at=now(),
+            kind="generic-event",
+            attributes={"bad": object()},
+        )
+
+    with pytest.raises(ValidationError):
+        ObservationEnvelope(
+            observation_id="obs-large",
+            source_id="source-7",
+            observed_at=now(),
+            kind="generic-event",
+            attributes={"large": "x" * 20_000},
+        )
+
+
 def test_proposal_has_no_execution_authority() -> None:
     created = now()
     proposal = ActionProposal(
@@ -117,15 +150,79 @@ def test_mixed_awareness_window_fails_with_validation_error() -> None:
         )
 
 
-def test_autonomous_execution_uses_scoped_single_use_grant() -> None:
-    issued = now()
-    grant = ExecutionGrant(
-        grant_id="grant-1",
-        proposal_id="proposal-1",
-        issued_at=issued,
-        expires_at=issued + timedelta(seconds=10),
+def test_equivalent_proposals_have_same_canonical_digest() -> None:
+    created = now()
+    common = {
+        "proposal_id": "proposal-digest",
+        "created_at": created,
+        "expires_at": created + timedelta(seconds=30),
+        "action_type": "generic-action",
+        "target_ref": "target-1",
+        "rationale": "canonical binding",
+        "confidence": 0.8,
+        "producer_version": "0.1.0",
+    }
+    first = ActionProposal(**common, constraints={"b": 2, "a": {"x": 1}})
+    second = ActionProposal(**common, constraints={"a": {"x": 1}, "b": 2})
+    assert first.canonical_digest() == second.canonical_digest()
+
+
+def test_execution_grant_detects_post_binding_proposal_mutation() -> None:
+    created = now()
+    source_constraints = {"zone": {"ids": ["north"]}}
+    proposal = ActionProposal(
+        proposal_id="proposal-bound",
+        created_at=created,
+        expires_at=created + timedelta(seconds=30),
         action_type="generic-action",
         target_ref="target-1",
+        rationale="canonical binding",
+        confidence=0.8,
+        producer_version="0.1.0",
+        constraints=source_constraints,
+    )
+    bound_digest = proposal.canonical_digest()
+    source_constraints["zone"]["ids"].append("south")
+    assert proposal.canonical_digest() == bound_digest
+
+    grant = ExecutionGrant(
+        grant_id="grant-bound",
+        proposal_id=proposal.proposal_id,
+        proposal_digest=bound_digest,
+        issued_at=created,
+        expires_at=created + timedelta(seconds=10),
+        action_type=proposal.action_type,
+        target_ref=proposal.target_ref,
+        policy_version="policy-7",
+        autonomy_mode=AutonomyMode.AUTO,
+        issued_by="k5-policy-engine",
+    )
+    assert grant.binds_proposal(proposal) is True
+
+    proposal.constraints["zone"]["ids"].append("tampered")
+    assert grant.binds_proposal(proposal) is False
+
+
+def test_autonomous_execution_uses_scoped_single_use_grant() -> None:
+    issued = now()
+    proposal = ActionProposal(
+        proposal_id="proposal-1",
+        created_at=issued,
+        expires_at=issued + timedelta(seconds=30),
+        action_type="generic-action",
+        target_ref="target-1",
+        rationale="grant binding",
+        confidence=0.8,
+        producer_version="0.1.0",
+    )
+    grant = ExecutionGrant(
+        grant_id="grant-1",
+        proposal_id=proposal.proposal_id,
+        proposal_digest=proposal.canonical_digest(),
+        issued_at=issued,
+        expires_at=issued + timedelta(seconds=10),
+        action_type=proposal.action_type,
+        target_ref=proposal.target_ref,
         policy_version="policy-7",
         autonomy_mode=AutonomyMode.AUTO,
         issued_by="k5-policy-engine",
@@ -133,18 +230,30 @@ def test_autonomous_execution_uses_scoped_single_use_grant() -> None:
     assert grant.single_use is True
     assert grant.autonomy_mode is AutonomyMode.AUTO
     assert grant.target_ref == "target-1"
+    assert grant.binds_proposal(proposal) is True
 
 
 def test_execution_grant_fails_closed_on_invalid_expiry() -> None:
     issued = now()
+    proposal = ActionProposal(
+        proposal_id="proposal-1",
+        created_at=issued,
+        expires_at=issued + timedelta(seconds=30),
+        action_type="generic-action",
+        target_ref="target-1",
+        rationale="grant binding",
+        confidence=0.8,
+        producer_version="0.1.0",
+    )
     with pytest.raises(ValidationError):
         ExecutionGrant(
             grant_id="grant-1",
-            proposal_id="proposal-1",
+            proposal_id=proposal.proposal_id,
+            proposal_digest=proposal.canonical_digest(),
             issued_at=issued,
             expires_at=issued,
-            action_type="generic-action",
-            target_ref="target-1",
+            action_type=proposal.action_type,
+            target_ref=proposal.target_ref,
             policy_version="policy-7",
             autonomy_mode=AutonomyMode.EMERGENCY,
             issued_by="k5-policy-engine",
