@@ -5,8 +5,12 @@ from pydantic import ValidationError
 
 from k5vision.neural_contracts import (
     ActionProposal,
+    ActionReceipt,
+    AuthorityDecision,
     AuthorityLevel,
+    AutonomyMode,
     CapabilityHandshake,
+    ExecutionGrant,
     ObservationEnvelope,
     RuntimeMode,
 )
@@ -106,8 +110,6 @@ def test_execution_grant_fails_closed_on_invalid_expiry() -> None:
 
 
 def test_authority_decision_records_auto_mode_without_grant_token() -> None:
-    from k5vision.neural_contracts import AuthorityDecision
-
     decision = AuthorityDecision(
         proposal_id="proposal-2",
         decided_at=now(),
@@ -122,8 +124,6 @@ def test_authority_decision_records_auto_mode_without_grant_token() -> None:
 
 
 def test_action_receipt_closes_execution_loop() -> None:
-    from k5vision.neural_contracts import ActionReceipt
-
     receipt = ActionReceipt(
         receipt_id="receipt-1",
         proposal_id="proposal-2",
