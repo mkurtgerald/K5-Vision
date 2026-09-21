@@ -77,10 +77,18 @@ class GrantLedger:
     def __init__(self) -> None:
         self._consumed: set[str] = set()
 
-    def consume(self, grant: ExecutionGrant, *, now: datetime) -> bool:
+    def consume(
+        self,
+        grant: ExecutionGrant,
+        *,
+        proposal: ActionProposal,
+        now: datetime,
+    ) -> bool:
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("timezone-aware timestamp required")
-        if grant.expires_at <= now:
+        if proposal.expires_at <= now or grant.expires_at <= now:
+            return False
+        if not grant.binds_proposal(proposal):
             return False
         if grant.grant_id in self._consumed:
             return False
