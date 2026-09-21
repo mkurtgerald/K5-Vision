@@ -75,6 +75,48 @@ def test_naive_timestamps_fail_closed() -> None:
         )
 
 
+def test_naive_wire_timestamp_fails_closed() -> None:
+    with pytest.raises(ValidationError):
+        ObservationEnvelope.model_validate(
+            {
+                "observation_id": "obs-wire-naive",
+                "source_id": "source-1",
+                "observed_at": "2026-09-21T12:00:00",
+                "kind": "generic-event",
+            }
+        )
+
+
+def test_offset_wire_timestamp_round_trips_as_aware() -> None:
+    item = ObservationEnvelope.model_validate(
+        {
+            "observation_id": "obs-wire-aware",
+            "source_id": "source-1",
+            "observed_at": "2026-09-21T08:00:00-04:00",
+            "kind": "generic-event",
+        }
+    )
+    restored = ObservationEnvelope.model_validate_json(item.model_dump_json())
+    assert restored.observed_at.utcoffset() is not None
+    assert restored.observed_at == item.observed_at
+
+
+def test_mixed_awareness_window_fails_with_validation_error() -> None:
+    with pytest.raises(ValidationError):
+        ActionProposal.model_validate(
+            {
+                "proposal_id": "proposal-wire-naive",
+                "created_at": "2026-09-21T12:00:00Z",
+                "expires_at": "2026-09-21T12:00:30",
+                "action_type": "generic-action",
+                "target_ref": "target-1",
+                "rationale": "invalid mixed-awareness wire window",
+                "confidence": 0.8,
+                "producer_version": "0.1.0",
+            }
+        )
+
+
 def test_autonomous_execution_uses_scoped_single_use_grant() -> None:
     issued = now()
     grant = ExecutionGrant(
