@@ -6,17 +6,10 @@ They do not themselves grant device authority; execution remains owned by the
 K5 policy/authority layer.
 """
 
-from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    field_validator,
-    model_validator,
-)
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 
 ContractVersion = Literal["1.0"]
@@ -49,20 +42,13 @@ class ContractModel(BaseModel):
 
     schema_version: ContractVersion = "1.0"
 
-    @field_validator("*", mode="before")
-    @classmethod
-    def reject_naive_datetimes(cls, value: Any) -> Any:
-        if isinstance(value, datetime) and (value.tzinfo is None or value.utcoffset() is None):
-            raise ValueError("timezone-aware timestamp required")
-        return value
-
 
 class ObservationEnvelope(ContractModel):
     observation_id: str = Field(min_length=1, max_length=128)
     source_id: str = Field(min_length=1, max_length=128)
-    observed_at: datetime
+    observed_at: AwareDatetime
     kind: str = Field(min_length=1, max_length=128)
-    attributes: dict[str, Any] = Field(default_factory=dict)
+    attributes: dict[str, object] = Field(default_factory=dict)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     provenance: tuple[str, ...] = ()
     evidence_ref: str | None = None
@@ -70,8 +56,8 @@ class ObservationEnvelope(ContractModel):
 
 class ActionProposal(ContractModel):
     proposal_id: str = Field(min_length=1, max_length=128)
-    created_at: datetime
-    expires_at: datetime
+    created_at: AwareDatetime
+    expires_at: AwareDatetime
     action_type: str = Field(min_length=1, max_length=128)
     target_ref: str = Field(min_length=1, max_length=256)
     rationale: str = Field(min_length=1, max_length=4096)
@@ -80,7 +66,7 @@ class ActionProposal(ContractModel):
     correlation_id: str | None = None
     producer_version: str = Field(min_length=1, max_length=128)
     evidence_refs: tuple[str, ...] = ()
-    constraints: dict[str, Any] = Field(default_factory=dict)
+    constraints: dict[str, object] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_window(self) -> "ActionProposal":
@@ -91,19 +77,19 @@ class ActionProposal(ContractModel):
 
 class AuthorityDecision(ContractModel):
     proposal_id: str = Field(min_length=1, max_length=128)
-    decided_at: datetime
+    decided_at: AwareDatetime
     decision: Literal["allow", "deny", "modify"]
     policy_version: str = Field(min_length=1, max_length=128)
     decided_by: str = Field(min_length=1, max_length=256)
     autonomy_mode: AutonomyMode = AutonomyMode.MANUAL
-    modifications: dict[str, Any] = Field(default_factory=dict)
+    modifications: dict[str, object] = Field(default_factory=dict)
 
 
 class ExecutionGrant(ContractModel):
     grant_id: str = Field(min_length=1, max_length=128)
     proposal_id: str = Field(min_length=1, max_length=128)
-    issued_at: datetime
-    expires_at: datetime
+    issued_at: AwareDatetime
+    expires_at: AwareDatetime
     action_type: str = Field(min_length=1, max_length=128)
     target_ref: str = Field(min_length=1, max_length=256)
     policy_version: str = Field(min_length=1, max_length=128)
@@ -121,7 +107,7 @@ class ExecutionGrant(ContractModel):
 class ActionReceipt(ContractModel):
     receipt_id: str = Field(min_length=1, max_length=128)
     proposal_id: str = Field(min_length=1, max_length=128)
-    completed_at: datetime
+    completed_at: AwareDatetime
     decision: Literal["allow", "deny", "modify"]
     executed: bool
     result: str = Field(min_length=1, max_length=4096)
@@ -131,7 +117,7 @@ class ActionReceipt(ContractModel):
 
 
 class CapabilityHandshake(ContractModel):
-    generated_at: datetime
+    generated_at: AwareDatetime
     producer_version: str = Field(min_length=1, max_length=128)
     contract_versions: tuple[str, ...] = ("1.0",)
     capabilities: frozenset[str] = frozenset()
