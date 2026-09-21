@@ -103,3 +103,98 @@ def test_execution_grant_fails_closed_on_invalid_expiry() -> None:
             autonomy_mode=AutonomyMode.EMERGENCY,
             issued_by="k5-policy-engine",
         )
+
+
+def test_authority_decision_records_auto_mode_without_grant_token() -> None:
+    from k5vision.neural_contracts import AuthorityDecision
+
+    decision = AuthorityDecision(
+        proposal_id="proposal-2",
+        decided_at=now(),
+        decision="allow",
+        policy_version="policy-8",
+        decided_by="k5-policy-engine",
+        autonomy_mode=AutonomyMode.AUTO,
+    )
+    assert decision.decision == "allow"
+    assert decision.autonomy_mode is AutonomyMode.AUTO
+    assert not hasattr(decision, "execution_token")
+
+
+def test_action_receipt_closes_execution_loop() -> None:
+    from k5vision.neural_contracts import ActionReceipt
+
+    receipt = ActionReceipt(
+        receipt_id="receipt-1",
+        proposal_id="proposal-2",
+        completed_at=now(),
+        decision="allow",
+        executed=True,
+        result="completed",
+        policy_version="policy-8",
+        authority_ref="grant-2",
+    )
+    assert receipt.executed is True
+    assert receipt.failure_reason is None
+
+
+def test_capability_handshake_supports_runtime_and_capabilities() -> None:
+    item = CapabilityHandshake(
+        generated_at=now(),
+        producer_version="0.2.0",
+        contract_versions=("1.0",),
+        capabilities=frozenset({"correlation", "offline-llm"}),
+        runtime_mode=RuntimeMode.EMBEDDED,
+    )
+    assert "offline-llm" in item.capabilities
+    assert item.runtime_mode is RuntimeMode.EMBEDDED
+
+
+def test_contract_models_reject_unknown_fields() -> None:
+    with pytest.raises(ValidationError):
+        ObservationEnvelope(
+            observation_id="obs-2",
+            source_id="source-1",
+            observed_at=now(),
+            kind="generic-event",
+            unexpected="nope",
+        )
+
+
+def test_confidence_bounds_fail_closed() -> None:
+    with pytest.raises(ValidationError):
+        ObservationEnvelope(
+            observation_id="obs-3",
+            source_id="source-1",
+            observed_at=now(),
+            kind="generic-event",
+            confidence=1.01,
+        )
+
+
+def test_authority_modes_are_explicit() -> None:
+    assert [mode.value for mode in AutonomyMode] == [
+        "manual",
+        "assisted",
+        "auto",
+        "emergency",
+    ]
+
+
+def test_runtime_modes_are_explicit() -> None:
+    assert {mode.value for mode in RuntimeMode} == {
+        "embedded",
+        "local-service",
+        "remote-service",
+    }
+
+
+def test_authority_levels_are_explicit() -> None:
+    assert {level.value for level in AuthorityLevel} == {
+        "observe",
+        "recommend",
+        "confirm",
+        "bounded",
+        "high",
+        "emergency",
+    }
