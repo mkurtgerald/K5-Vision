@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from k5vision.main import CONTROL_PLANE_TOKEN_ENV, create_app
@@ -85,3 +86,96 @@ def test_unknown_device_returns_404() -> None:
         )
 
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/v1/devices"),
+        ("POST", "/api/v1/devices"),
+        ("GET", "/api/v1/devices/00000000-0000-0000-0000-000000000000"),
+    ],
+)
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [(b"authorization", b"Bearer invalid-\xff")],
+        [
+            (b"authorization", b"Bearer test-control-plane-token"),
+            (b"authorization", b"Bearer wrong-token"),
+        ],
+        [
+            (b"authorization", b"Bearer wrong-token"),
+            (b"authorization", b"Bearer test-control-plane-token"),
+        ],
+        [
+            (b"authorization", b"Bearer test-control-plane-token"),
+            (b"authorization", b"Bearer test-control-plane-token"),
+        ],
+    ],
+    ids=["non-ascii", "multiple-first-valid", "multiple-last-valid", "multiple-identical"],
+)
+def test_device_api_rejects_ambiguous_credentials(
+    method: str, path: str, headers: list[tuple[bytes, bytes]]
+) -> None:
+    application = create_app(control_plane_token=CONTROL_PLANE_TOKEN)
+    with TestClient(application, raise_server_exceptions=False) as client:
+        response = client.request(
+            method,
+            path,
+            headers=headers,
+            json={
+                "name": "Synthetic Camera",
+                "host": "192.0.2.10",
+                "kind": "camera",
+                "protocols": ["rtsp"],
+                "tags": [],
+            },
+        )
+        remaining = client.get("/api/v1/devices", headers=_auth_headers())
+        health = client.get("/api/v1/health")
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json() == {"detail": "Unauthorized"}
+    assert remaining.status_code == 200
+    assert remaining.json() == []
+    assert health.status_code == 200
+
+
+@pytest.mark.parametrize("from_environment", [False, True])
+def test_device_api_rejects_unusable_token_configuration(
+    monkeypatch: pytest.MonkeyPatch, from_environment: bool
+) -> None:
+    if from_environment:
+        monkeypatch.setenv(CONTROL_PLANE_TOKEN_ENV, "invalid-\u00e9")
+        application = create_app()
+    else:
+        application = create_app(control_plane_token="invalid-\u00e9")
+
+    with TestClient(application, raise_server_exceptions=False) as client:
+        response = client.get("/api/v1/devices", headers=_auth_headers())
+        health = client.get("/api/v1/health")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Control-plane authentication is not configured"}
+    assert health.status_code == 200
+
+
+def test_device_api_accepts_configured_environment_token(monkeypatch) -> None:
+    monkeypatch.setenv(CONTROL_PLANE_TOKEN_ENV, CONTROL_PLANE_TOKEN)
+    with TestClient(create_app()) as client:
+        response = client.get(
+            "/api/v1/devices", headers={"Authorization": f"bEaReR {CONTROL_PLANE_TOKEN}"}
+        )
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_device_api_explicit_blank_token_does_not_fall_back_to_environment(monkeypatch) -> None:
+    monkeypatch.setenv(CONTROL_PLANE_TOKEN_ENV, CONTROL_PLANE_TOKEN)
+    with TestClient(create_app(control_plane_token=" ")) as client:
+        response = client.get("/api/v1/devices", headers=_auth_headers())
+
+    assert response.status_code == 503
