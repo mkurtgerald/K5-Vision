@@ -105,6 +105,14 @@ class RuntimeMode(StrEnum):
     REMOTE_SERVICE = "remote-service"
 
 
+class ExecutionOutcome(StrEnum):
+    NOT_ATTEMPTED = "not-attempted"
+    VERIFIED_SUCCESS = "verified-success"
+    VERIFIED_FAILURE = "verified-failure"
+    UNKNOWN = "unknown"
+    DENIED_BUT_OBSERVED = "denied-but-observed"
+
+
 class ContractModel(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid", frozen=True)
 
@@ -213,11 +221,44 @@ class ActionReceipt(ContractModel):
     proposal_id: str = pydantic.Field(min_length=1, max_length=128)
     completed_at: datetime
     decision: Literal["allow", "deny", "modify"]
-    executed: bool
+    outcome: ExecutionOutcome
     result: str = pydantic.Field(min_length=1, max_length=4096)
     policy_version: str = pydantic.Field(min_length=1, max_length=128)
     authority_ref: str = pydantic.Field(min_length=1, max_length=256)
-    failure_reason: str | None = None
+    failure_reason: str | None = pydantic.Field(default=None, max_length=4096)
+
+    @pydantic.model_validator(mode="after")
+    def validate_outcome(self) -> "ActionReceipt":
+        if self.decision == "deny":
+            if self.outcome not in {
+                ExecutionOutcome.NOT_ATTEMPTED,
+                ExecutionOutcome.DENIED_BUT_OBSERVED,
+            }:
+                raise ValueError("denied decision cannot report authorized execution outcome")
+        elif self.outcome is ExecutionOutcome.DENIED_BUT_OBSERVED:
+            raise ValueError("denied-but-observed outcome requires a denied decision")
+
+        if self.outcome in {
+            ExecutionOutcome.VERIFIED_FAILURE,
+            ExecutionOutcome.UNKNOWN,
+            ExecutionOutcome.DENIED_BUT_OBSERVED,
+        } and not self.failure_reason:
+            raise ValueError("non-success execution outcome requires failure_reason")
+
+        if (
+            self.outcome is ExecutionOutcome.NOT_ATTEMPTED
+            and self.decision != "deny"
+            and not self.failure_reason
+        ):
+            raise ValueError("authorized action not attempted requires failure_reason")
+
+        if (
+            self.outcome is ExecutionOutcome.VERIFIED_SUCCESS
+            and self.failure_reason is not None
+        ):
+            raise ValueError("verified success cannot include failure_reason")
+
+        return self
 
 
 class CapabilityHandshake(ContractModel):

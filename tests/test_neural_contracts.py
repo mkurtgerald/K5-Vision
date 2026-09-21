@@ -11,6 +11,7 @@ from k5vision.neural_contracts import (
     AutonomyMode,
     CapabilityHandshake,
     ExecutionGrant,
+    ExecutionOutcome,
     ObservationEnvelope,
     RuntimeMode,
 )
@@ -280,13 +281,71 @@ def test_action_receipt_closes_execution_loop() -> None:
         proposal_id="proposal-2",
         completed_at=now(),
         decision="allow",
-        executed=True,
+        outcome=ExecutionOutcome.VERIFIED_SUCCESS,
         result="completed",
         policy_version="policy-8",
         authority_ref="grant-2",
     )
-    assert receipt.executed is True
+    assert receipt.outcome is ExecutionOutcome.VERIFIED_SUCCESS
     assert receipt.failure_reason is None
+
+
+def test_action_receipt_represents_unknown_outcome_explicitly() -> None:
+    receipt = ActionReceipt(
+        receipt_id="receipt-unknown",
+        proposal_id="proposal-3",
+        completed_at=now(),
+        decision="allow",
+        outcome=ExecutionOutcome.UNKNOWN,
+        result="executor acknowledgement timed out",
+        policy_version="policy-8",
+        authority_ref="grant-3",
+        failure_reason="execution result could not be verified",
+    )
+    assert receipt.outcome is ExecutionOutcome.UNKNOWN
+
+
+def test_action_receipt_represents_denied_but_observed_anomaly() -> None:
+    receipt = ActionReceipt(
+        receipt_id="receipt-anomaly",
+        proposal_id="proposal-4",
+        completed_at=now(),
+        decision="deny",
+        outcome=ExecutionOutcome.DENIED_BUT_OBSERVED,
+        result="device state changed despite denied policy decision",
+        policy_version="policy-9",
+        authority_ref="decision-4",
+        failure_reason="unauthorized execution observed",
+    )
+    assert receipt.outcome is ExecutionOutcome.DENIED_BUT_OBSERVED
+
+
+def test_action_receipt_rejects_denied_verified_success() -> None:
+    with pytest.raises(ValidationError):
+        ActionReceipt(
+            receipt_id="receipt-invalid",
+            proposal_id="proposal-5",
+            completed_at=now(),
+            decision="deny",
+            outcome=ExecutionOutcome.VERIFIED_SUCCESS,
+            result="invalid success",
+            policy_version="policy-9",
+            authority_ref="decision-5",
+        )
+
+
+def test_action_receipt_requires_reason_for_unknown_outcome() -> None:
+    with pytest.raises(ValidationError):
+        ActionReceipt(
+            receipt_id="receipt-unknown-no-reason",
+            proposal_id="proposal-6",
+            completed_at=now(),
+            decision="allow",
+            outcome=ExecutionOutcome.UNKNOWN,
+            result="result unavailable",
+            policy_version="policy-9",
+            authority_ref="grant-6",
+        )
 
 
 def test_capability_handshake_supports_runtime_and_capabilities() -> None:
