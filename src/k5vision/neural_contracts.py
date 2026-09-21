@@ -12,7 +12,6 @@ from typing import Any, Literal
 
 import pydantic
 
-
 ContractVersion = Literal["1.0"]
 
 
