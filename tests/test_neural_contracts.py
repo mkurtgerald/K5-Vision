@@ -69,3 +69,37 @@ def test_naive_timestamps_fail_closed() -> None:
             producer_version="0.1.0",
             runtime_mode=RuntimeMode.LOCAL_SERVICE,
         )
+
+
+def test_autonomous_execution_uses_scoped_single_use_grant() -> None:
+    issued = now()
+    grant = ExecutionGrant(
+        grant_id="grant-1",
+        proposal_id="proposal-1",
+        issued_at=issued,
+        expires_at=issued + timedelta(seconds=10),
+        action_type="generic-action",
+        target_ref="target-1",
+        policy_version="policy-7",
+        autonomy_mode=AutonomyMode.AUTO,
+        issued_by="k5-policy-engine",
+    )
+    assert grant.single_use is True
+    assert grant.autonomy_mode is AutonomyMode.AUTO
+    assert grant.target_ref == "target-1"
+
+
+def test_execution_grant_fails_closed_on_invalid_expiry() -> None:
+    issued = now()
+    with pytest.raises(ValidationError):
+        ExecutionGrant(
+            grant_id="grant-1",
+            proposal_id="proposal-1",
+            issued_at=issued,
+            expires_at=issued,
+            action_type="generic-action",
+            target_ref="target-1",
+            policy_version="policy-7",
+            autonomy_mode=AutonomyMode.EMERGENCY,
+            issued_by="k5-policy-engine",
+        )
