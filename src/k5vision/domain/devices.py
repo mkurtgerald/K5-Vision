@@ -1,9 +1,15 @@
 """Canonical device models used across vendor adapters."""
 
 from enum import StrEnum
+from typing import Annotated
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, IPvAnyAddress
+from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress, StringConstraints
+
+DeviceTag = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=64),
+]
 
 
 class DeviceProtocol(StrEnum):
@@ -29,12 +35,18 @@ class DeviceKind(StrEnum):
 class DeviceCreate(BaseModel):
     """Data accepted when registering a device with the control plane."""
 
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     name: str = Field(min_length=1, max_length=128)
     host: IPvAnyAddress
     management_port: int = Field(default=80, ge=1, le=65535)
     kind: DeviceKind = DeviceKind.CAMERA
-    protocols: set[DeviceProtocol] = Field(default_factory=lambda: {DeviceProtocol.ONVIF})
-    tags: set[str] = Field(default_factory=set)
+    protocols: set[DeviceProtocol] = Field(
+        default_factory=lambda: {DeviceProtocol.ONVIF},
+        min_length=1,
+        max_length=len(DeviceProtocol),
+    )
+    tags: set[DeviceTag] = Field(default_factory=set, max_length=32)
 
 
 class Device(DeviceCreate):
