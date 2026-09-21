@@ -68,7 +68,12 @@ class FakeMedia:
         if self.stream_error is not None:
             raise self.stream_error
         token = kwargs["ProfileToken"]
-        return {"Uri": f"rtsp://user:secret@10.0.0.9:8554/{token}?transport=tcp"}
+        return {
+            "Uri": (
+                f"rtsp://user:secret@10.0.0.9:8554/{token}"
+                "?transport=tcp&token=AUDIT_QUERY_TOKEN#AUDIT_FRAGMENT_TOKEN"
+            )
+        }
 
 
 class FakeClient:
@@ -119,7 +124,7 @@ def test_discovery_normalizes_results_and_skips_empty_hosts() -> None:
     assert results[0].secure is True
 
 
-def test_probe_returns_canonical_capabilities_and_strips_uri_credentials() -> None:
+def test_probe_returns_canonical_capabilities_and_strips_sensitive_uri_parts() -> None:
     captured = {}
 
     def client_factory(**kwargs):
@@ -149,7 +154,9 @@ def test_probe_returns_canonical_capabilities_and_strips_uri_credentials() -> No
     assert result.supports_digital_io is True
     assert result.stream_profiles[0].role is StreamRole.MAIN
     assert result.stream_profiles[0].connection_uri == ("rtsp://10.0.0.9:8554/main?transport=tcp")
-    assert "secret" not in result.model_dump_json()
+    serialized = result.model_dump_json()
+    for forbidden in ("secret", "AUDIT_QUERY_TOKEN", "AUDIT_FRAGMENT_TOKEN"):
+        assert forbidden not in serialized
 
 
 def test_optional_capability_failure_does_not_hide_core_probe_success() -> None:
@@ -214,7 +221,17 @@ def test_exception_mapping_is_stable(error: Exception, expected: ProbeErrorCode)
     assert _map_exception(error).code is expected
 
 
-def test_stream_profile_rejects_embedded_credentials() -> None:
+@pytest.mark.parametrize(
+    "connection_uri",
+    [
+        "rtsp://admin:secret@10.0.0.9/live",
+        "rtsp://admin%3Asecret@10.0.0.9/live",
+        "rtsp://10.0.0.9/live?token=AUDIT_QUERY_TOKEN",
+        "rtsp://10.0.0.9/live?transport=tcp&access_token=AUDIT_QUERY_TOKEN",
+        "rtsp://10.0.0.9/live#AUDIT_FRAGMENT_TOKEN",
+    ],
+)
+def test_stream_profile_rejects_sensitive_connection_metadata(connection_uri: str) -> None:
     with pytest.raises(ValidationError):
         StreamProfile(
             token="main",
@@ -222,8 +239,21 @@ def test_stream_profile_rejects_embedded_credentials() -> None:
             role=StreamRole.MAIN,
             width=1920,
             height=1080,
-            connection_uri="rtsp://admin:secret@10.0.0.9/live",
+            connection_uri=connection_uri,
         )
+
+
+def test_stream_profile_accepts_allowlisted_transport_hint() -> None:
+    profile = StreamProfile(
+        token="main",
+        name="Main",
+        role=StreamRole.MAIN,
+        width=1920,
+        height=1080,
+        connection_uri="rtsp://10.0.0.9/live?transport=tcp",
+    )
+
+    assert profile.connection_uri == "rtsp://10.0.0.9/live?transport=tcp"
 
 
 def test_notauthorized_fault_maps_to_authentication_failure() -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, Field
 
@@ -24,6 +24,8 @@ from k5vision.domain.devices import Device, DeviceProtocol
 
 ClientFactory = Callable[..., Any]
 DiscoveryFactory = Callable[..., Any]
+
+_SAFE_DISPLAY_QUERY_VALUES = {"transport": frozenset({"tcp", "udp"})}
 
 
 class DiscoveredEndpoint(BaseModel):
@@ -68,6 +70,18 @@ def _positive_number(value: Any, cast: Callable[[Any], Any]) -> Any:
     return converted if converted > 0 else None
 
 
+def _safe_display_query(query: str) -> str:
+    """Retain only non-secret transport hints in credential-free metadata."""
+    safe_items: list[tuple[str, str]] = []
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        normalized_key = key.casefold()
+        normalized_value = value.casefold()
+        allowed_values = _SAFE_DISPLAY_QUERY_VALUES.get(normalized_key)
+        if allowed_values is not None and normalized_value in allowed_values:
+            safe_items.append((normalized_key, normalized_value))
+    return urlencode(safe_items)
+
+
 def _sanitize_uri(value: Any) -> str | None:
     if not value:
         return None
@@ -80,7 +94,13 @@ def _sanitize_uri(value: Any) -> str | None:
             host = f"[{host}]"
         port = f":{parsed.port}" if parsed.port is not None else ""
         return urlunsplit(
-            (parsed.scheme, f"{host}{port}", parsed.path, parsed.query, parsed.fragment)
+            (
+                parsed.scheme,
+                f"{host}{port}",
+                parsed.path,
+                _safe_display_query(parsed.query),
+                "",
+            )
         )
     except ValueError:
         return None
