@@ -1,8 +1,9 @@
 """Versioned, transport-neutral contracts for the K5 Vision neural boundary.
 
-These models define the seam between production K5 Vision and any reasoning,
-learning, or inference subsystem. They intentionally do not grant execution
-authority. Device actions remain owned by the K5 authority/policy layer.
+These models define the seam between production K5 Vision and reasoning,
+learning, inference, correlation, simulation, LLM, and Virtual Guard subsystems.
+They do not themselves grant device authority; execution remains owned by the
+K5 policy/authority layer.
 """
 
 from datetime import datetime
@@ -21,6 +22,13 @@ class AuthorityLevel(StrEnum):
     CONFIRM = "confirm"
     BOUNDED = "bounded"
     HIGH = "high"
+    EMERGENCY = "emergency"
+
+
+class AutonomyMode(StrEnum):
+    MANUAL = "manual"
+    ASSISTED = "assisted"
+    AUTO = "auto"
     EMERGENCY = "emergency"
 
 
@@ -81,8 +89,27 @@ class AuthorityDecision(ContractModel):
     decision: Literal["allow", "deny", "modify"]
     policy_version: str = Field(min_length=1, max_length=128)
     decided_by: str = Field(min_length=1, max_length=256)
-    execution_token: str | None = None
+    autonomy_mode: AutonomyMode = AutonomyMode.MANUAL
     modifications: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExecutionGrant(ContractModel):
+    grant_id: str = Field(min_length=1, max_length=128)
+    proposal_id: str = Field(min_length=1, max_length=128)
+    issued_at: datetime
+    expires_at: datetime
+    action_type: str = Field(min_length=1, max_length=128)
+    target_ref: str = Field(min_length=1, max_length=256)
+    policy_version: str = Field(min_length=1, max_length=128)
+    autonomy_mode: AutonomyMode
+    issued_by: str = Field(min_length=1, max_length=256)
+    single_use: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "ExecutionGrant":
+        if self.expires_at <= self.issued_at:
+            raise ValueError("execution grant expiration must be after issuance")
+        return self
 
 
 class ActionReceipt(ContractModel):
