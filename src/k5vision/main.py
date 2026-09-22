@@ -175,7 +175,11 @@ def create_app(
     auth_configuration_valid = write_token_configured and write_token is not None
     if read_token_configured:
         auth_configuration_valid = auth_configuration_valid and read_token is not None
-    if write_token is not None and read_token is not None and compare_digest(write_token, read_token):
+    if (
+        write_token is not None
+        and read_token is not None
+        and compare_digest(write_token, read_token)
+    ):
         auth_configuration_valid = False
 
     site_id = _resolve_control_plane_site(control_plane_site_id)
@@ -227,9 +231,7 @@ def create_app(
         )
         write_match = credential_valid and compare_digest(credential, write_token)
         read_match = bool(
-            credential_valid
-            and read_token is not None
-            and compare_digest(credential, read_token)
+            credential_valid and read_token is not None and compare_digest(credential, read_token)
         )
         if not write_match and not read_match:
             raise HTTPException(
