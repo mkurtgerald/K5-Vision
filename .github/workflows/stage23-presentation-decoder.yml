@@ -2,51 +2,36 @@ name: Stage 23 Presentation Decoder Qualification
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches: [main]
-    paths:
-      - .github/workflows/stage23-presentation-decoder.yml
-      - scripts/provision-stage03-gstreamer.ps1
-      - src/k5vision/media/gstreamer_native_abi.py
-      - src/k5vision/media/gstreamer_playback_decoder.py
-      - src/k5vision/media/presentation_decoder.py
-      - src/k5vision/media/presentation_decoder_evidence.py
-      - src/k5vision/media/presentation_frame.py
-      - tests/unit/test_presentation_decoder.py
-      - tests/integration/test_stage23_physical.py
-      - docs/stage23-dependency-review.md
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/stage23-presentation-decoder.yml
-      - scripts/provision-stage03-gstreamer.ps1
-      - src/k5vision/media/gstreamer_native_abi.py
-      - src/k5vision/media/gstreamer_playback_decoder.py
-      - src/k5vision/media/presentation_decoder.py
-      - src/k5vision/media/presentation_decoder_evidence.py
-      - src/k5vision/media/presentation_frame.py
-      - tests/unit/test_presentation_decoder.py
-      - tests/integration/test_stage23_physical.py
-      - docs/stage23-dependency-review.md
+    inputs:
+      reviewed_sha:
+        description: Exact reviewed commit selected for this qualification
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   stage23-presentation-decoder:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner &&
+      inputs.reviewed_sha == github.sha
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 25
     env:
       K5_STAGE23_PHYSICAL: "1"
       K5_STAGE23_OUTPUT: ${{ github.workspace }}\artifacts\stage23-presentation-decoder.json
       K5_STAGE23_ABI_OUTPUT: ${{ github.workspace }}\artifacts\stage23-native-abi.json
-      K5_STAGE23_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_STAGE23_REVISION: ${{ github.sha }}
 
     steps:
       - name: Checkout exact Stage 23 revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Provision isolated reviewed GStreamer runtime
         shell: powershell
@@ -113,6 +98,7 @@ jobs:
         run: pytest tests/integration/test_stage23_physical.py -q --no-cov
 
       - name: Assert retained evidence is source-free
+        id: safe_evidence
         if: always()
         shell: powershell
         run: |
@@ -139,7 +125,7 @@ jobs:
           }
 
       - name: Upload source-free Stage 23 evidence
-        if: always()
+        if: always() && steps.safe_evidence.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: stage23-presentation-decoder-evidence

@@ -2,44 +2,35 @@ name: Stage 04 Physical Qualification
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches: [main]
-    paths:
-      - .github/workflows/stage04-physical.yml
-      - scripts/provision-stage03-gstreamer.ps1
-      - src/k5vision/media/**
-      - src/k5vision/stage03_credentials.py
-      - src/k5vision/stage03_credential_probe.py
-      - src/k5vision/stage03_gst_candidate.py
-      - tests/integration/test_stage04_physical.py
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/stage04-physical.yml
-      - scripts/provision-stage03-gstreamer.ps1
-      - src/k5vision/media/**
-      - src/k5vision/stage03_credentials.py
-      - src/k5vision/stage03_credential_probe.py
-      - src/k5vision/stage03_gst_candidate.py
-      - tests/integration/test_stage04_physical.py
+    inputs:
+      reviewed_sha:
+        description: Exact reviewed commit selected for this qualification
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   stage04-physical:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner &&
+      inputs.reviewed_sha == github.sha
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 15
     env:
       K5_STAGE04_PHYSICAL: "1"
       K5_STAGE04_OUTPUT: ${{ github.workspace }}\artifacts\stage04-physical.json
-      K5_STAGE04_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_STAGE04_REVISION: ${{ github.sha }}
 
     steps:
       - name: Checkout exact Stage 04 revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Provision isolated reviewed GStreamer runtime
         shell: powershell
@@ -114,7 +105,7 @@ jobs:
         run: pytest tests/integration/test_stage04_physical.py -q --no-cov
 
       - name: Upload source-free Stage 04 evidence
-        if: always()
+        if: success()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: stage04-physical-evidence
