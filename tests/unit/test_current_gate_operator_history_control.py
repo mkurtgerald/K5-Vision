@@ -62,7 +62,9 @@ class _Application:
         self.state = WindowsOperatorApplicationState.OPEN
         return self.snapshot
 
-    async def start(self, _layout: ViewportLayout, _streams: object) -> WindowsOperatorApplicationSnapshot:
+    async def start(
+        self, _layout: ViewportLayout, _streams: object
+    ) -> WindowsOperatorApplicationSnapshot:
         self.generation = 1
         self.state = WindowsOperatorApplicationState.RUNNING
         return self.snapshot
@@ -119,9 +121,7 @@ def test_live_operator_edit_undo_redo_and_explicit_relayout_rebase() -> None:
             max_cycles=1000,
         )
         original = _layout()
-        task = asyncio.create_task(
-            control.run(width=1280, height=720, layout=original, streams=())
-        )
+        task = asyncio.create_task(control.run(width=1280, height=720, layout=original, streams=()))
         await app.wait_entered.wait()
 
         control.request_edit(ViewportMove(logical_slot=7, dx=23, dy=0))
