@@ -402,25 +402,26 @@ class UserRegistry:
                     try:
                         salt = bytes(row["salt"])
                         expected = bytes(row["verifier"])
-                        expires_at = datetime.fromisoformat(row["expires_at"])
                     except (TypeError, ValueError) as exc:
                         raise UserRegistryStorageError(
                             "user credential registry contains invalid state"
                         ) from exc
-                    if (
-                        len(salt) != _SALT_BYTES
-                        or len(expected) != _SCRYPT_DKLEN
-                        or expires_at.tzinfo is None
-                        or expires_at.utcoffset() is None
-                    ):
+                    if len(salt) != _SALT_BYTES or len(expected) != _SCRYPT_DKLEN:
                         raise UserRegistryStorageError(
                             "user credential registry contains invalid state"
                         )
-                    eligible = bool(
-                        row["credential_kind"] == "bootstrap"
-                        and bool(row["enabled"])
-                        and expires_at > now
-                    )
+                    if row["credential_kind"] == "bootstrap":
+                        try:
+                            expires_at = datetime.fromisoformat(row["expires_at"])
+                        except (TypeError, ValueError) as exc:
+                            raise UserRegistryStorageError(
+                                "user credential registry contains invalid state"
+                            ) from exc
+                        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+                            raise UserRegistryStorageError(
+                                "user credential registry contains invalid state"
+                            )
+                        eligible = bool(bool(row["enabled"]) and expires_at > now)
 
                 candidate = _derive_credential(temporary_credential, salt)
                 if not eligible or not compare_digest(candidate, expected):
