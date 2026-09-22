@@ -1,11 +1,9 @@
-from pathlib import Path
-
-
-_WORKFLOW = Path(".github/workflows/physical-validation.yml")
+_WORKFLOW = ".github/workflows/physical-validation.yml"
 
 
 def _workflow_text() -> str:
-    return _WORKFLOW.read_text(encoding="utf-8")
+    with open(_WORKFLOW, encoding="utf-8") as workflow:
+        return workflow.read()
 
 
 def test_stage03_physical_workflow_is_manual_only() -> None:
