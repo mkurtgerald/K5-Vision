@@ -40,7 +40,10 @@ from k5vision.operator_launch import (
     ResolvedLiveSource,
     StreamToken,
 )
-from k5vision.operator_runtime import _default_delivery_factory, _stage_one_presentation_runtime_factory
+from k5vision.operator_runtime import (
+    _default_delivery_factory,
+    _stage_one_presentation_runtime_factory,
+)
 from k5vision.services.device_registry import DeviceRegistry, DeviceRegistryStorageError
 
 _MAX_ACTIVE_PLAYBACKS = 8
@@ -85,7 +88,7 @@ class OperatorPlaybackRequest(BaseModel):
     height: int = Field(default=720, ge=240, le=_MAX_DIMENSION)
 
     @model_validator(mode="after")
-    def validate_requested_window(self) -> "OperatorPlaybackRequest":
+    def validate_requested_window(self) -> OperatorPlaybackRequest:
         if self.end_ms is not None and self.end_ms < self.start_ms:
             raise ValueError("playback end must not precede start")
         return self
