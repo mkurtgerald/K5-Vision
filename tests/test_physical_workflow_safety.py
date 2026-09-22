@@ -47,6 +47,20 @@ def test_stage03_retained_evidence_requires_success() -> None:
     assert "if: always()" not in guard_block
 
 
+def test_stage03_private_source_never_enters_probe_process_argv() -> None:
+    physical = _workflow_text()
+    remaining = (_WORKFLOWS / "stage-one-remaining-physical-suite.yml").read_text(
+        encoding="utf-8"
+    )
+    unsafe = "stage03_credential_probe $env:K5_STAGE03_SOURCE"
+    safe = 'stage03_credential_probe "env:K5_STAGE03_SOURCE"'
+
+    assert unsafe not in physical
+    assert unsafe not in remaining
+    assert safe in physical
+    assert safe in remaining
+
+
 def test_qualification_inventory_remains_present() -> None:
     assert len(_PHYSICAL) == 26
     names = {path.name for path in _PHYSICAL}
