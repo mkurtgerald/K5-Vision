@@ -56,6 +56,8 @@ jobs:
           wheel="$(find dist -maxdepth 1 -type f -name 'k5_vision-*.whl' -print -quit)"
           python -m venv .package-smoke
           .package-smoke/bin/python -m pip install --no-deps "$wheel"
+          .package-smoke/bin/k5-vision --version
+          .package-smoke/bin/k5-vision --help >/dev/null
           .package-smoke/bin/python - <<'PY'
           import importlib.util
           import k5vision
