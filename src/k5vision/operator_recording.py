@@ -111,7 +111,9 @@ def _rtp_timestamp(packet: memoryview) -> int:
     return int.from_bytes(packet[4:8], "big")
 
 
-def _write_descriptor_sync(root: Path, recording_id: UUID, descriptor: RecordingStreamDescriptor) -> None:
+def _write_descriptor_sync(
+    root: Path, recording_id: UUID, descriptor: RecordingStreamDescriptor
+) -> None:
     root.mkdir(parents=True, exist_ok=True)
     final_path = root / f"{recording_id}.k5d"
     stage_path = root / f"{recording_id}.k5d.stage"
@@ -166,9 +168,7 @@ class BoundedOperatorRecordingCoordinator:
         if not 1 <= packet_goal <= _MAX_PACKET_GOAL:
             raise ValueError(f"packet_goal must be between 1 and {_MAX_PACKET_GOAL}")
         if not 1 <= max_recording_bytes <= _MAX_RECORDING_BYTES:
-            raise ValueError(
-                f"max_recording_bytes must be between 1 and {_MAX_RECORDING_BYTES}"
-            )
+            raise ValueError(f"max_recording_bytes must be between 1 and {_MAX_RECORDING_BYTES}")
         if not 1 <= max_active_recordings <= _MAX_ACTIVE_RECORDINGS:
             raise ValueError(
                 f"max_active_recordings must be between 1 and {_MAX_ACTIVE_RECORDINGS}"
