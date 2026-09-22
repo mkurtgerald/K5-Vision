@@ -1,10 +1,10 @@
-"""Bounded administrator API over the durable K5 user registry.
+"""Bounded human and service administration over the durable K5 user registry.
 
-This is an interim control-plane containment boundary, not a full human session
-implementation. A dedicated administrator bearer credential may perform only the
-bounded user-administration operations exposed here. New accounts receive a
-short-lived one-time bootstrap credential and must replace it before password
-verification can succeed.
+A dedicated service administrator credential remains available for controlled
+bootstrap/automation. Initialized user accounts may also authenticate with their
+own password and receive a short-lived opaque in-process session. Administrator
+sessions use the same bounded user-management routes and audit path as the
+service administrator; lower roles are denied.
 """
 
 from __future__ import annotations
@@ -22,6 +22,14 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from k5vision.auth_sessions import (
+    DEFAULT_SESSION_TTL_SECONDS,
+    MAX_SESSION_TTL_SECONDS,
+    MIN_SESSION_TTL_SECONDS,
+    UserLogin,
+    UserSessionIssue,
+    UserSessionManager,
+)
 from k5vision.domain.users import (
     UserAccount,
     UserAuditEvent,
@@ -29,6 +37,7 @@ from k5vision.domain.users import (
     UserBootstrapPasswordChange,
     UserCreate,
     UserPatch,
+    UserRole,
 )
 from k5vision.services.user_registry import (
     DEFAULT_BOOTSTRAP_TTL_SECONDS,
@@ -49,6 +58,7 @@ USER_DB_PATH_ENV = "K5_USER_DB_PATH"
 MAX_USER_REQUEST_BYTES = 16_384
 DEFAULT_USER_ADMIN_RATE_LIMIT = 120
 DEFAULT_BOOTSTRAP_RATE_LIMIT = 30
+DEFAULT_LOGIN_RATE_LIMIT = 30
 DEFAULT_USER_ADMIN_RATE_WINDOW_SECONDS = 60.0
 MAX_USER_ADMIN_RATE_LIMIT = 10_000
 MAX_USER_ADMIN_RATE_WINDOW_SECONDS = 3_600.0
@@ -76,6 +86,7 @@ class _BoundedUserRequestBody:
         return (
             (method == "POST" and path == "/api/v1/users")
             or (method == "POST" and path == "/api/v1/auth/bootstrap-password")
+            or (method == "POST" and path == "/api/v1/auth/login")
             or (method == "PATCH" and path.startswith("/api/v1/users/"))
         )
 
@@ -148,8 +159,8 @@ class _BoundedUserRequestBody:
         await send({"type": "http.response.body", "body": body})
 
 
-class _UserAdminRateLimiter:
-    """Bound user-administration requests without retaining credentials or client identity."""
+class _UserRateLimiter:
+    """Bound sensitive user requests without retaining credentials or client identity."""
 
     def __init__(self, *, limit: int, window_seconds: float) -> None:
         self._limit = limit
@@ -174,7 +185,7 @@ def _resolve_token(explicit_token: str | None) -> tuple[str | None, bool]:
     if raw_token is None:
         return None, False
     token = raw_token.strip()
-    valid = bool(token and token.isascii())
+    valid = bool(token and token.isascii() and len(token) <= 512)
     return (token if valid else None), True
 
 
@@ -184,6 +195,20 @@ def _resolve_database_path(explicit_path: str | Path | None) -> str | None:
         return None
     path = str(raw_path).strip()
     return path if path and path != ":memory:" else None
+
+
+def _extract_bearer(authorization: list[str] | None) -> str | None:
+    header = authorization[0] if authorization and len(authorization) == 1 else ""
+    scheme, separator, credential = header.partition(" ")
+    if not (
+        scheme.lower() == "bearer"
+        and separator
+        and credential
+        and credential.isascii()
+        and len(credential) <= 512
+    ):
+        return None
+    return credential
 
 
 def install_user_admin_api(
@@ -197,10 +222,12 @@ def install_user_admin_api(
     max_request_bytes: int = MAX_USER_REQUEST_BYTES,
     rate_limit: int = DEFAULT_USER_ADMIN_RATE_LIMIT,
     bootstrap_rate_limit: int = DEFAULT_BOOTSTRAP_RATE_LIMIT,
+    login_rate_limit: int = DEFAULT_LOGIN_RATE_LIMIT,
     bootstrap_ttl_seconds: int = DEFAULT_BOOTSTRAP_TTL_SECONDS,
+    session_ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS,
     rate_window_seconds: float = DEFAULT_USER_ADMIN_RATE_WINDOW_SECONDS,
 ) -> UserRegistry | None:
-    """Install a fail-closed, site-scoped user administration surface."""
+    """Install a fail-closed, site-scoped human/service administration surface."""
     if not 1 <= user_capacity <= MAX_USER_CAPACITY:
         raise ValueError(f"user_capacity must be between 1 and {MAX_USER_CAPACITY}")
     if not 1024 <= max_request_bytes <= 1_048_576:
@@ -209,10 +236,17 @@ def install_user_admin_api(
         raise ValueError(f"rate_limit must be between 1 and {MAX_USER_ADMIN_RATE_LIMIT}")
     if not 1 <= bootstrap_rate_limit <= MAX_USER_ADMIN_RATE_LIMIT:
         raise ValueError(f"bootstrap_rate_limit must be between 1 and {MAX_USER_ADMIN_RATE_LIMIT}")
+    if not 1 <= login_rate_limit <= MAX_USER_ADMIN_RATE_LIMIT:
+        raise ValueError(f"login_rate_limit must be between 1 and {MAX_USER_ADMIN_RATE_LIMIT}")
     if not MIN_BOOTSTRAP_TTL_SECONDS <= bootstrap_ttl_seconds <= MAX_BOOTSTRAP_TTL_SECONDS:
         raise ValueError(
             f"bootstrap_ttl_seconds must be between {MIN_BOOTSTRAP_TTL_SECONDS} "
             f"and {MAX_BOOTSTRAP_TTL_SECONDS}"
+        )
+    if not MIN_SESSION_TTL_SECONDS <= session_ttl_seconds <= MAX_SESSION_TTL_SECONDS:
+        raise ValueError(
+            f"session_ttl_seconds must be between {MIN_SESSION_TTL_SECONDS} "
+            f"and {MAX_SESSION_TTL_SECONDS}"
         )
     if not 1.0 <= rate_window_seconds <= MAX_USER_ADMIN_RATE_WINDOW_SECONDS:
         raise ValueError(
@@ -224,7 +258,7 @@ def install_user_admin_api(
         resolved_token is not None
         and all(not compare_digest(resolved_token, reserved) for reserved in reserved_tokens)
     )
-    auth_configuration_valid = token_configured and token_is_distinct
+    service_auth_configuration_valid = token_configured and token_is_distinct
 
     database_path = _resolve_database_path(user_db_path)
     registry: UserRegistry | None = None
@@ -238,39 +272,69 @@ def install_user_admin_api(
         except UserRegistryStorageError:
             registry = None
 
-    limiter = _UserAdminRateLimiter(limit=rate_limit, window_seconds=rate_window_seconds)
-    bootstrap_limiter = _UserAdminRateLimiter(
+    session_manager = UserSessionManager(ttl_seconds=session_ttl_seconds)
+    limiter = _UserRateLimiter(limit=rate_limit, window_seconds=rate_window_seconds)
+    bootstrap_limiter = _UserRateLimiter(
         limit=bootstrap_rate_limit,
+        window_seconds=rate_window_seconds,
+    )
+    login_limiter = _UserRateLimiter(
+        limit=login_rate_limit,
         window_seconds=rate_window_seconds,
     )
     application.add_middleware(_BoundedUserRequestBody, max_bytes=max_request_bytes)
     application.state.user_registry = registry
+    application.state.user_session_manager = session_manager
 
-    async def require_user_admin(
-        authorization: Annotated[list[str] | None, Header()] = None,
-    ) -> None:
-        if not auth_configuration_valid or resolved_token is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="User administration authentication is not configured",
-            )
-
-        header = authorization[0] if authorization and len(authorization) == 1 else ""
-        scheme, separator, credential = header.partition(" ")
-        credential_valid = bool(
-            scheme.lower() == "bearer" and separator and credential and credential.isascii()
-        )
-        if not credential_valid or not compare_digest(credential, resolved_token):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    def require_registry() -> UserRegistry:
         if registry is None or site_id is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="User administration state is not configured",
             )
+        return registry
+
+    async def require_user_admin(
+        authorization: Annotated[list[str] | None, Header()] = None,
+    ) -> str:
+        require_registry()
+        credential = _extract_bearer(authorization)
+        if credential is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        actor: str | None = None
+        if (
+            service_auth_configuration_valid
+            and resolved_token is not None
+            and compare_digest(credential, resolved_token)
+        ):
+            actor = _USER_AUDIT_ACTOR
+        else:
+            principal = await session_manager.resolve(credential)
+            if principal is not None:
+                if principal.role is not UserRole.ADMINISTRATOR:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Insufficient user administration permission",
+                    )
+                actor = principal.username
+
+        if actor is None:
+            if not service_auth_configuration_valid:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="User administration authentication is not configured",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
         retry_after = await limiter.consume()
         if retry_after is not None:
             raise HTTPException(
@@ -278,13 +342,24 @@ def install_user_admin_api(
                 detail="User administration rate limit exceeded",
                 headers={"Retry-After": str(retry_after)},
             )
+        return actor
+
+    async def require_user_session(
+        authorization: Annotated[list[str] | None, Header()] = None,
+    ) -> tuple[UserAccount, str]:
+        require_registry()
+        credential = _extract_bearer(authorization)
+        principal = await session_manager.resolve(credential or "")
+        if principal is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return principal, credential or ""
 
     async def require_bootstrap_budget() -> None:
-        if registry is None or site_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="User administration state is not configured",
-            )
+        require_registry()
         retry_after = await bootstrap_limiter.consume()
         if retry_after is not None:
             raise HTTPException(
@@ -293,26 +368,28 @@ def install_user_admin_api(
                 headers={"Retry-After": str(retry_after)},
             )
 
-    def require_registry() -> UserRegistry:
-        if registry is None:
+    async def require_login_budget() -> None:
+        require_registry()
+        retry_after = await login_limiter.consume()
+        if retry_after is not None:
             raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="User registry unavailable",
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Login request rate limit exceeded",
+                headers={"Retry-After": str(retry_after)},
             )
-        return registry
 
-    admin_auth = [Depends(require_user_admin)]
     bootstrap_budget = [Depends(require_bootstrap_budget)]
+    login_budget = [Depends(require_login_budget)]
 
     @application.get(
         "/api/v1/users",
         response_model=list[UserAccount],
         tags=["users"],
-        dependencies=admin_auth,
     )
     async def list_users(
         offset: Annotated[int, Query(ge=0)] = 0,
         limit: Annotated[int, Query(ge=1, le=MAX_USER_PAGE_SIZE)] = MAX_USER_PAGE_SIZE,
+        _actor: str = Depends(require_user_admin),
     ) -> list[UserAccount]:
         try:
             return require_registry().list(offset=offset, limit=limit)
@@ -326,11 +403,11 @@ def install_user_admin_api(
         "/api/v1/users/audit",
         response_model=list[UserAuditEvent],
         tags=["users"],
-        dependencies=admin_auth,
     )
     async def list_user_audit(
         offset: Annotated[int, Query(ge=0)] = 0,
         limit: Annotated[int, Query(ge=1, le=MAX_USER_AUDIT_PAGE_SIZE)] = MAX_USER_AUDIT_PAGE_SIZE,
+        _actor: str = Depends(require_user_admin),
     ) -> list[UserAuditEvent]:
         try:
             return require_registry().audit_events(offset=offset, limit=limit)
@@ -345,13 +422,15 @@ def install_user_admin_api(
         response_model=UserBootstrapIssue,
         status_code=status.HTTP_201_CREATED,
         tags=["users"],
-        dependencies=admin_auth,
     )
-    async def create_user(payload: UserCreate) -> UserBootstrapIssue:
+    async def create_user(
+        payload: UserCreate,
+        actor: str = Depends(require_user_admin),
+    ) -> UserBootstrapIssue:
         try:
             account, temporary_credential, expires_at = require_registry().create_with_bootstrap(
                 payload,
-                actor=_USER_AUDIT_ACTOR,
+                actor=actor,
                 ttl_seconds=bootstrap_ttl_seconds,
             )
         except UserRegistryCapacityError:
@@ -401,15 +480,68 @@ def install_user_admin_api(
             )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    @application.post(
+        "/api/v1/auth/login",
+        response_model=UserSessionIssue,
+        tags=["authentication"],
+        dependencies=login_budget,
+    )
+    async def login(payload: UserLogin) -> UserSessionIssue:
+        try:
+            account = require_registry().verify_password(
+                username=payload.username,
+                password=payload.password,
+            )
+        except UserRegistryStorageError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="User registry unavailable",
+            ) from None
+        if account is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid username or password",
+            )
+        session_token, expires_at = await session_manager.issue(account)
+        return UserSessionIssue(
+            account=account,
+            session_token=session_token,
+            expires_at=expires_at,
+        )
+
+    @application.get(
+        "/api/v1/auth/me",
+        response_model=UserAccount,
+        tags=["authentication"],
+    )
+    async def current_user(
+        session: tuple[UserAccount, str] = Depends(require_user_session),
+    ) -> UserAccount:
+        return session[0]
+
+    @application.post(
+        "/api/v1/auth/logout",
+        status_code=status.HTTP_204_NO_CONTENT,
+        tags=["authentication"],
+    )
+    async def logout(
+        session: tuple[UserAccount, str] = Depends(require_user_session),
+    ) -> Response:
+        await session_manager.revoke(session[1])
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     @application.patch(
         "/api/v1/users/{user_id}",
         response_model=UserAccount,
         tags=["users"],
-        dependencies=admin_auth,
     )
-    async def update_user(user_id: UUID, payload: UserPatch) -> UserAccount:
+    async def update_user(
+        user_id: UUID,
+        payload: UserPatch,
+        actor: str = Depends(require_user_admin),
+    ) -> UserAccount:
         try:
-            user = require_registry().update(user_id, payload, actor=_USER_AUDIT_ACTOR)
+            user = require_registry().update(user_id, payload, actor=actor)
         except UserRegistryStorageError:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -417,6 +549,8 @@ def install_user_admin_api(
             ) from None
         if user is None:
             raise HTTPException(status_code=404, detail="User not found")
+        if payload.role is not None or payload.enabled is not None:
+            await session_manager.revoke_user(user_id)
         return user
 
     return registry
