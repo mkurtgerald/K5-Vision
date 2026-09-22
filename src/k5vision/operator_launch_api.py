@@ -9,9 +9,9 @@ from fastapi import FastAPI, Header, HTTPException, status
 from k5vision.auth_sessions import UserSessionManager
 from k5vision.operator_launch import (
     BoundedOperatorLaunchCoordinator,
+    OperatorLauncher,
     OperatorLaunchError,
     OperatorLaunchErrorCode,
-    OperatorLauncher,
     OperatorLaunchReceipt,
     OperatorLaunchRequest,
     OperatorSourceResolver,
