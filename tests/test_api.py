@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from k5vision.main import (
+    CONTROL_PLANE_READ_TOKEN_ENV,
     CONTROL_PLANE_SITE_ENV,
     CONTROL_PLANE_TOKEN_ENV,
     DEVICE_DB_PATH_ENV,
@@ -12,6 +13,7 @@ from k5vision.main import (
 )
 
 CONTROL_PLANE_TOKEN = "test-control-plane-token"
+CONTROL_PLANE_READ_TOKEN = "test-control-plane-read-token"
 CONTROL_PLANE_SITE = "test-site"
 
 
@@ -19,6 +21,7 @@ CONTROL_PLANE_SITE = "test-site"
 def configure_device_state(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.setenv(CONTROL_PLANE_SITE_ENV, CONTROL_PLANE_SITE)
     monkeypatch.setenv(DEVICE_DB_PATH_ENV, str(tmp_path / "devices.sqlite3"))
+    monkeypatch.delenv(CONTROL_PLANE_READ_TOKEN_ENV, raising=False)
 
 
 def _auth_headers(token: str = CONTROL_PLANE_TOKEN) -> dict[str, str]:
@@ -80,6 +83,62 @@ def test_device_api_rejects_missing_or_invalid_bearer_token() -> None:
     assert missing.status_code == 401
     assert missing.headers["www-authenticate"] == "Bearer"
     assert invalid.status_code == 401
+
+
+def test_read_only_device_credential_can_read_but_cannot_enroll() -> None:
+    payload = _device_payload()
+    write_headers = _auth_headers()
+    read_headers = _auth_headers(CONTROL_PLANE_READ_TOKEN)
+
+    with TestClient(
+        create_app(
+            control_plane_token=CONTROL_PLANE_TOKEN,
+            control_plane_read_token=CONTROL_PLANE_READ_TOKEN,
+        )
+    ) as client:
+        created = client.post("/api/v1/devices", json=payload, headers=write_headers)
+        listed = client.get("/api/v1/devices", headers=read_headers)
+        fetched = client.get(f"/api/v1/devices/{created.json()['id']}", headers=read_headers)
+        rejected = client.post("/api/v1/devices", json=_device_payload(2), headers=read_headers)
+        remaining = client.get("/api/v1/devices", headers=write_headers)
+
+    assert created.status_code == 201
+    assert listed.status_code == 200
+    assert listed.json() == [created.json()]
+    assert fetched.status_code == 200
+    assert fetched.json() == created.json()
+    assert rejected.status_code == 403
+    assert rejected.json() == {"detail": "Insufficient device permission"}
+    assert remaining.json() == [created.json()]
+
+
+def test_device_api_fails_closed_for_ambiguous_permission_tokens() -> None:
+    with TestClient(
+        create_app(
+            control_plane_token=CONTROL_PLANE_TOKEN,
+            control_plane_read_token=CONTROL_PLANE_TOKEN,
+        )
+    ) as client:
+        read = client.get("/api/v1/devices", headers=_auth_headers())
+        write = client.post("/api/v1/devices", json=_device_payload(), headers=_auth_headers())
+
+    assert read.status_code == 503
+    assert write.status_code == 503
+    assert read.json() == {"detail": "Control-plane authentication is not configured"}
+    assert write.json() == {"detail": "Control-plane authentication is not configured"}
+
+
+def test_device_api_fails_closed_for_invalid_read_token_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(CONTROL_PLANE_TOKEN_ENV, CONTROL_PLANE_TOKEN)
+    monkeypatch.setenv(CONTROL_PLANE_READ_TOKEN_ENV, "invalid-\u00e9")
+
+    with TestClient(create_app()) as client:
+        response = client.get("/api/v1/devices", headers=_auth_headers())
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Control-plane authentication is not configured"}
 
 
 def test_device_registration_round_trip() -> None:
