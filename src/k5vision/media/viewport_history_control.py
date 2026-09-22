@@ -78,6 +78,15 @@ class TransactionalViewportHistoryControl:
             operations=state.operations,
         )
 
+    def _ensure_operation_available(self) -> None:
+        try:
+            self._history.ensure_operation_available()
+        except ViewportEditorHistoryError:
+            raise ViewportHistoryControlError(
+                ViewportHistoryControlErrorCode.HISTORY_FAILURE,
+                "viewport history operation limit reached",
+            ) from None
+
     async def _relayout(
         self,
         application: ViewportRelayoutBoundary,
@@ -96,6 +105,17 @@ class TransactionalViewportHistoryControl:
                 "viewport relayout was rejected",
             ) from None
 
+    def rebase(self, layout: ViewportLayout) -> ViewportHistoryControlSnapshot:
+        """Accept an explicit replace/relayout as a new history baseline."""
+        try:
+            self._history.rebase(layout)
+        except ViewportEditorHistoryError:
+            raise ViewportHistoryControlError(
+                ViewportHistoryControlErrorCode.HISTORY_FAILURE,
+                "viewport history could not rebase",
+            ) from None
+        return self.snapshot
+
     async def apply(
         self,
         application: ViewportRelayoutBoundary,
@@ -108,6 +128,7 @@ class TransactionalViewportHistoryControl:
                 ViewportHistoryControlErrorCode.HISTORY_FAILURE,
                 "viewport edit is invalid",
             ) from None
+        self._ensure_operation_available()
         await self._relayout(application, candidate)
         try:
             accepted = self._history.apply(edit)
@@ -134,6 +155,7 @@ class TransactionalViewportHistoryControl:
                 ViewportHistoryControlErrorCode.HISTORY_FAILURE,
                 "no viewport edit is available to undo",
             ) from None
+        self._ensure_operation_available()
         await self._relayout(application, candidate)
         try:
             accepted = self._history.undo()
@@ -160,6 +182,7 @@ class TransactionalViewportHistoryControl:
                 ViewportHistoryControlErrorCode.HISTORY_FAILURE,
                 "no viewport edit is available to redo",
             ) from None
+        self._ensure_operation_available()
         await self._relayout(application, candidate)
         try:
             accepted = self._history.redo()

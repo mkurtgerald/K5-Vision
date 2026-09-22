@@ -94,13 +94,29 @@ class BoundedViewportEditorHistory:
             )
         return self._redo[-1]
 
-    def _consume(self) -> None:
+    def ensure_operation_available(self) -> None:
+        """Fail before any visible side effect when the lifetime budget is exhausted."""
         if self._operations >= self._max_operations:
             raise ViewportEditorHistoryError(
                 ViewportEditorHistoryErrorCode.OPERATION_LIMIT,
                 "viewport history operation limit reached",
             )
+
+    def _consume(self) -> None:
+        self.ensure_operation_available()
         self._operations += 1
+
+    def rebase(self, layout: ViewportLayout) -> ViewportEditorHistorySnapshot:
+        """Make an explicitly accepted layout the new baseline and drop stale branches."""
+        if not isinstance(layout, ViewportLayout):
+            raise ViewportEditorHistoryError(
+                ViewportEditorHistoryErrorCode.INVALID_CONFIGURATION,
+                "viewport history layout is invalid",
+            )
+        self._layout = layout
+        self._undo.clear()
+        self._redo.clear()
+        return self.snapshot
 
     def apply(self, edit: ViewportEdit) -> ViewportEditorHistorySnapshot:
         candidate = apply_viewport_edit(self._layout, edit)

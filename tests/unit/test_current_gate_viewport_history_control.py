@@ -13,12 +13,12 @@ from k5vision.media.viewport_history_control import (
 )
 
 
-def _layout() -> ViewportLayout:
+def _layout(*, x: int = 17) -> ViewportLayout:
     return ViewportLayout(
         placements=(
             ViewportPlacement(
                 logical_slot=7,
-                geometry=ViewportGeometry(x=17, y=29, width=613, height=347, z_index=2),
+                geometry=ViewportGeometry(x=x, y=29, width=613, height=347, z_index=2),
             ),
         )
     )
@@ -79,6 +79,41 @@ def test_failed_undo_keeps_accepted_history_intact() -> None:
             await control.undo(application)
         assert caught.value.code == ViewportHistoryControlErrorCode.RELAYOUT_FAILURE
         assert control.snapshot == before
+
+    asyncio.run(scenario())
+
+
+def test_operation_limit_is_rejected_before_visible_relayout() -> None:
+    async def scenario() -> None:
+        application = _Relayout()
+        control = TransactionalViewportHistoryControl(_layout(), max_operations=1)
+        edited = await control.apply(application, ViewportMove(logical_slot=7, dx=8, dy=9))
+        assert application.layouts == [edited.layout]
+        before = control.snapshot
+        with pytest.raises(ViewportHistoryControlError) as caught:
+            await control.undo(application)
+        assert caught.value.code == ViewportHistoryControlErrorCode.HISTORY_FAILURE
+        assert str(caught.value) == "viewport history operation limit reached"
+        assert control.snapshot == before
+        assert application.layouts == [edited.layout]
+
+    asyncio.run(scenario())
+
+
+def test_explicit_rebase_clears_stale_history_and_preserves_operation_count() -> None:
+    async def scenario() -> None:
+        application = _Relayout()
+        control = TransactionalViewportHistoryControl(_layout())
+        edited = await control.apply(application, ViewportMove(logical_slot=7, dx=8, dy=9))
+        rebased = control.rebase(_layout(x=101))
+        assert rebased.layout == _layout(x=101)
+        assert rebased.undo_depth == 0
+        assert rebased.redo_depth == 0
+        assert rebased.operations == 1
+        with pytest.raises(ViewportHistoryControlError) as caught:
+            await control.undo(application)
+        assert caught.value.code == ViewportHistoryControlErrorCode.HISTORY_FAILURE
+        assert application.layouts == [edited.layout]
 
     asyncio.run(scenario())
 
