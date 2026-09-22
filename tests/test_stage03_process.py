@@ -44,6 +44,43 @@ def test_process_spec_requires_exactly_one_source_token() -> None:
         )
 
 
+def test_process_spec_builds_nonsensitive_source_handle_and_private_environment() -> None:
+    private_source = "rtsp://user:secret@192.0.2.50/live?token=query-secret#fragment-secret"
+    spec = _spec("candidate-a")
+
+    argv = spec.build_argv(private_source)
+    environment = spec.build_environment(private_source)
+
+    joined = " ".join(argv)
+    assert private_source not in joined
+    assert "secret" not in joined
+    assert "token=" not in joined
+    assert "fragment-secret" not in joined
+    assert argv[-1] == "env:K5_STAGE03_SOURCE"
+    assert environment["K5_STAGE03_SOURCE"] == private_source
+
+
+def test_process_candidate_receives_private_source_only_through_environment() -> None:
+    source = "rtsp://example.invalid/live?token=synthetic#synthetic-fragment"
+    code = (
+        "import os,sys; "
+        f"assert os.environ.get('K5_STAGE03_SOURCE') == {source!r}; "
+        "assert all('rtsp://' not in arg for arg in sys.argv); "
+        "assert all('token=' not in arg for arg in sys.argv); "
+        "assert sys.argv[-1] == 'env:K5_STAGE03_SOURCE'"
+    )
+    spec = ProcessCandidateSpec(
+        candidate="candidate-a",
+        argv=[sys.executable, "-c", code, "{source}"],
+        interruption_seconds=0.02,
+        poll_interval_seconds=0.01,
+    )
+
+    sample = asyncio.run(ProcessRuntimeCandidate(spec).measure(source, timeout_seconds=1))
+
+    assert sample.completed is True
+
+
 def test_process_candidate_measurement_is_bounded_and_project_owned() -> None:
     candidate = ProcessRuntimeCandidate(_spec("candidate-a"))
 
