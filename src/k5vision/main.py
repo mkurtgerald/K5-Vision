@@ -26,6 +26,7 @@ from k5vision.services.device_registry import (
     DeviceRegistryConflictError,
     DeviceRegistryStorageError,
 )
+from k5vision.user_admin_api import install_user_admin_api
 
 CONTROL_PLANE_TOKEN_ENV = "K5_CONTROL_PLANE_TOKEN"
 CONTROL_PLANE_READ_TOKEN_ENV = "K5_CONTROL_PLANE_READ_TOKEN"
@@ -263,12 +264,15 @@ def create_app(
         write_limit=device_write_rate_limit,
         window_seconds=device_rate_window_seconds,
     )
+    user_registry = None
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
         try:
             yield
         finally:
+            if user_registry is not None:
+                user_registry.close()
             if registry is not None:
                 registry.close()
 
@@ -283,6 +287,11 @@ def create_app(
         max_bytes=max_device_request_bytes,
     )
     application.state.device_registry = registry
+    user_registry = install_user_admin_api(
+        application,
+        site_id=site_id,
+        reserved_tokens=tuple(token for token in (write_token, read_token) if token is not None),
+    )
 
     async def authenticate_control_plane(
         authorization: Annotated[list[str] | None, Header()] = None,
