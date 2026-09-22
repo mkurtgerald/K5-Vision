@@ -45,7 +45,28 @@ def test_extension_payload_is_detached_from_original_input() -> None:
         attributes=source,
     )
     source["nested"]["items"].append(3)
-    assert item.attributes == {"nested": {"items": [1, 2]}}
+    assert item.model_dump(mode="json")["attributes"] == {"nested": {"items": [1, 2]}}
+
+
+def test_extension_payload_is_deeply_immutable_after_validation() -> None:
+    item = ObservationEnvelope(
+        observation_id="obs-immutable",
+        source_id="source-7",
+        observed_at=now(),
+        kind="generic-event",
+        attributes={"nested": {"items": [1, 2]}},
+    )
+
+    with pytest.raises(TypeError):
+        item.attributes["new"] = "blocked"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        item.attributes["nested"]["new"] = "blocked"
+    with pytest.raises(AttributeError):
+        item.attributes["nested"]["items"].append(3)
+
+    assert item.model_dump(mode="json")["attributes"] == {"nested": {"items": [1, 2]}}
+    restored = ObservationEnvelope.model_validate_json(item.model_dump_json())
+    assert restored.model_dump(mode="json") == item.model_dump(mode="json")
 
 
 def test_extension_payload_fails_closed_when_not_bounded_json() -> None:
@@ -168,7 +189,7 @@ def test_equivalent_proposals_have_same_canonical_digest() -> None:
     assert first.canonical_digest() == second.canonical_digest()
 
 
-def test_execution_grant_detects_post_binding_proposal_mutation() -> None:
+def test_execution_grant_binding_uses_immutable_proposal_payload() -> None:
     created = now()
     source_constraints = {"zone": {"ids": ["north"]}}
     proposal = ActionProposal(
@@ -200,8 +221,35 @@ def test_execution_grant_detects_post_binding_proposal_mutation() -> None:
     )
     assert grant.binds_proposal(proposal) is True
 
-    proposal.constraints["zone"]["ids"].append("tampered")
-    assert grant.binds_proposal(proposal) is False
+    with pytest.raises(TypeError):
+        proposal.constraints["zone"] = {"ids": ["tampered"]}  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        proposal.constraints["zone"]["ids"].append("tampered")
+
+    assert proposal.canonical_digest() == bound_digest
+    assert grant.binds_proposal(proposal) is True
+    assert proposal.model_dump(mode="json")["constraints"] == {"zone": {"ids": ["north"]}}
+
+
+def test_authority_decision_modifications_are_immutable_and_serializable() -> None:
+    decision = AuthorityDecision(
+        proposal_id="proposal-modify",
+        decided_at=now(),
+        decision="modify",
+        policy_version="policy-8",
+        decided_by="k5-policy-engine",
+        modifications={"limits": {"zones": ["north"]}},
+    )
+
+    with pytest.raises(TypeError):
+        decision.modifications["limits"]["mode"] = "blocked"
+    with pytest.raises(AttributeError):
+        decision.modifications["limits"]["zones"].append("south")
+
+    wire = decision.model_dump(mode="json")
+    assert wire["modifications"] == {"limits": {"zones": ["north"]}}
+    restored = AuthorityDecision.model_validate_json(decision.model_dump_json())
+    assert restored.model_dump(mode="json") == wire
 
 
 def test_autonomous_execution_uses_scoped_single_use_grant() -> None:
