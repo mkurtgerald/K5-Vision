@@ -230,3 +230,30 @@ def test_environment_builder_accepts_complete_private_configuration() -> None:
     )
     assert isinstance(resolver, PrivateStageOneSourceResolver)
     assert isinstance(launcher, WindowsSingleLiveOperatorLauncher)
+
+
+def test_environment_builder_discovers_payload_type_when_not_pinned() -> None:
+    payload_sources: list[str] = []
+
+    async def payload_probe(source_uri: str) -> int:
+        payload_sources.append(source_uri)
+        return 97
+
+    resolver, launcher = build_environment_operator_runtime(
+        {
+            "K5_STAGE03_SOURCE": "rtsp://192.0.2.10/live",
+            "K5_STAGE03_CAM_CRED": "operator\nfirst-secret\nsecond-secret\n",
+        },
+        credential_probe=lambda _source, _credentials: 1,
+        payload_probe=payload_probe,
+    )
+    assert isinstance(resolver, PrivateStageOneSourceResolver)
+    assert isinstance(launcher, WindowsSingleLiveOperatorLauncher)
+
+    async def scenario() -> None:
+        resolved = await resolver.resolve(_device(), "main")
+        assert resolved.payload_type == 97
+        assert len(payload_sources) == 1
+        assert payload_sources[0] == resolved.source_uri
+
+    asyncio.run(scenario())
