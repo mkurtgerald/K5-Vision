@@ -9,8 +9,10 @@ K5 policy/authority layer.
 import hashlib
 import json
 import math
+from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, Literal
 
 import pydantic
@@ -73,6 +75,34 @@ def _bounded_json_object(value: Any) -> dict[str, Any]:
     return copied
 
 
+def _freeze_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json_value(member) for key, member in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json_value(member) for member in value)
+    return value
+
+
+def _freeze_json_object(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    return MappingProxyType({key: _freeze_json_value(member) for key, member in value.items()})
+
+
+def _empty_frozen_json_object() -> Mapping[str, Any]:
+    return MappingProxyType({})
+
+
+def _json_wire_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _json_wire_value(member) for key, member in value.items()}
+    if isinstance(value, tuple):
+        return [_json_wire_value(member) for member in value]
+    return value
+
+
+def _json_wire_object(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: _json_wire_value(member) for key, member in value.items()}
+
+
 def _canonical_model_bytes(model: pydantic.BaseModel) -> bytes:
     return json.dumps(
         model.model_dump(mode="json", exclude_none=False),
@@ -131,7 +161,7 @@ class ObservationEnvelope(ContractModel):
     source_id: str = pydantic.Field(min_length=1, max_length=128)
     observed_at: datetime
     kind: str = pydantic.Field(min_length=1, max_length=128)
-    attributes: dict[str, Any] = pydantic.Field(default_factory=dict)
+    attributes: Mapping[str, Any] = pydantic.Field(default_factory=_empty_frozen_json_object)
     confidence: float | None = pydantic.Field(default=None, ge=0.0, le=1.0)
     provenance: tuple[str, ...] = ()
     evidence_ref: str | None = None
@@ -140,6 +170,15 @@ class ObservationEnvelope(ContractModel):
     @classmethod
     def bound_attributes(cls, value: Any) -> dict[str, Any]:
         return _bounded_json_object(value)
+
+    @pydantic.field_validator("attributes", mode="after")
+    @classmethod
+    def freeze_attributes(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        return _freeze_json_object(value)
+
+    @pydantic.field_serializer("attributes")
+    def serialize_attributes(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        return _json_wire_object(value)
 
 
 class ActionProposal(ContractModel):
@@ -154,12 +193,21 @@ class ActionProposal(ContractModel):
     correlation_id: str | None = None
     producer_version: str = pydantic.Field(min_length=1, max_length=128)
     evidence_refs: tuple[str, ...] = ()
-    constraints: dict[str, Any] = pydantic.Field(default_factory=dict)
+    constraints: Mapping[str, Any] = pydantic.Field(default_factory=_empty_frozen_json_object)
 
     @pydantic.field_validator("constraints", mode="before")
     @classmethod
     def bound_constraints(cls, value: Any) -> dict[str, Any]:
         return _bounded_json_object(value)
+
+    @pydantic.field_validator("constraints", mode="after")
+    @classmethod
+    def freeze_constraints(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        return _freeze_json_object(value)
+
+    @pydantic.field_serializer("constraints")
+    def serialize_constraints(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        return _json_wire_object(value)
 
     @pydantic.model_validator(mode="after")
     def validate_window(self) -> "ActionProposal":
@@ -180,12 +228,21 @@ class AuthorityDecision(ContractModel):
     policy_version: str = pydantic.Field(min_length=1, max_length=128)
     decided_by: str = pydantic.Field(min_length=1, max_length=256)
     autonomy_mode: AutonomyMode = AutonomyMode.MANUAL
-    modifications: dict[str, Any] = pydantic.Field(default_factory=dict)
+    modifications: Mapping[str, Any] = pydantic.Field(default_factory=_empty_frozen_json_object)
 
     @pydantic.field_validator("modifications", mode="before")
     @classmethod
     def bound_modifications(cls, value: Any) -> dict[str, Any]:
         return _bounded_json_object(value)
+
+    @pydantic.field_validator("modifications", mode="after")
+    @classmethod
+    def freeze_modifications(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        return _freeze_json_object(value)
+
+    @pydantic.field_serializer("modifications")
+    def serialize_modifications(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        return _json_wire_object(value)
 
 
 class ExecutionGrant(ContractModel):
