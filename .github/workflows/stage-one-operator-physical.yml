@@ -2,58 +2,28 @@ name: Stage One Authenticated Operator Physical Witness
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches: [main]
-    paths:
-      - .github/workflows/stage-one-operator-physical.yml
-      - scripts/provision-stage03-gstreamer.ps1
-      - src/k5vision/auth_sessions.py
-      - src/k5vision/domain/devices.py
-      - src/k5vision/domain/users.py
-      - src/k5vision/main.py
-      - src/k5vision/operator_launch.py
-      - src/k5vision/operator_launch_api.py
-      - src/k5vision/operator_runtime.py
-      - src/k5vision/stage_one_app.py
-      - src/k5vision/stage03_credentials.py
-      - src/k5vision/stage03_credential_probe.py
-      - src/k5vision/services/device_registry.py
-      - src/k5vision/services/user_registry.py
-      - src/k5vision/user_admin_api.py
-      - src/k5vision/media/**
-      - tests/integration/test_stage_one_operator_physical.py
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/stage-one-operator-physical.yml
-      - scripts/provision-stage03-gstreamer.ps1
-      - src/k5vision/auth_sessions.py
-      - src/k5vision/domain/devices.py
-      - src/k5vision/domain/users.py
-      - src/k5vision/main.py
-      - src/k5vision/operator_launch.py
-      - src/k5vision/operator_launch_api.py
-      - src/k5vision/operator_runtime.py
-      - src/k5vision/stage_one_app.py
-      - src/k5vision/stage03_credentials.py
-      - src/k5vision/stage03_credential_probe.py
-      - src/k5vision/services/device_registry.py
-      - src/k5vision/services/user_registry.py
-      - src/k5vision/user_admin_api.py
-      - src/k5vision/media/**
-      - tests/integration/test_stage_one_operator_physical.py
+    inputs:
+      reviewed_sha:
+        description: Exact reviewed commit selected for this qualification
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   stage-one-operator-physical:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner &&
+      inputs.reviewed_sha == github.sha
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 25
     env:
       K5_STAGE_ONE_OPERATOR_PHYSICAL: "1"
       K5_STAGE_ONE_OUTPUT: ${{ github.workspace }}\artifacts\stage-one-operator-physical.json
-      K5_STAGE_ONE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_STAGE_ONE_REVISION: ${{ github.sha }}
       K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
       K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
 
@@ -61,7 +31,8 @@ jobs:
       - name: Checkout exact Stage One revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Provision isolated reviewed GStreamer runtime
         shell: powershell
@@ -95,6 +66,8 @@ jobs:
         run: pytest tests/integration/test_stage_one_operator_physical.py -q --no-cov
 
       - name: Assert retained witness is source-free
+        id: safe_evidence
+        if: always()
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -122,6 +95,7 @@ jobs:
           }
 
       - name: Upload source-free Stage One witness
+        if: always() && steps.safe_evidence.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: stage-one-operator-physical-witness
