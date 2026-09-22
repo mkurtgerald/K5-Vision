@@ -32,6 +32,12 @@ def _assert_attempt_clean(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+def _arm_short_operation_timeout(recorder: BoundedRtpRecorder) -> None:
+    # Keep setup outside the deliberately tiny timeout. These tests exercise a
+    # specific late worker, not scheduler latency in the preceding open/write.
+    recorder._timeout = 0.01
+
+
 def test_duplicate_raw_attempt_cannot_remove_active_recording(tmp_path: Path) -> None:
     async def exercise() -> None:
         packet = _rtp(b"raw-owner")
@@ -149,9 +155,9 @@ def test_write_timeout_settles_before_failure_is_reported(
             sink,
             max_packets=2,
             max_bytes=4096,
-            operation_timeout_seconds=0.01,
         )
         await recorder.start()
+        _arm_short_operation_timeout(recorder)
 
         attribute = "_write_sync" if kind == "raw" else "_write_record_sync"
         real_write = getattr(sink, attribute)
@@ -182,10 +188,10 @@ def test_flush_timeout_rolls_back_late_publication(
             sink,
             max_packets=2,
             max_bytes=4096,
-            operation_timeout_seconds=0.01,
         )
         await recorder.start()
         await recorder.consume(memoryview(_rtp(b"late-flush")))
+        _arm_short_operation_timeout(recorder)
 
         real_fsync = os.fsync
 
@@ -215,10 +221,10 @@ def test_publish_timeout_rolls_back_late_publication(
             sink,
             max_packets=2,
             max_bytes=4096,
-            operation_timeout_seconds=0.01,
         )
         await recorder.start()
         await recorder.consume(memoryview(_rtp(b"late-publish")))
+        _arm_short_operation_timeout(recorder)
 
         real_publish = sink._attempt.publish
 
@@ -248,10 +254,10 @@ def test_cleanup_timeout_settles_before_aborted_state_is_reported(
             sink,
             max_packets=2,
             max_bytes=4096,
-            operation_timeout_seconds=0.01,
         )
         await recorder.start()
         await recorder.consume(memoryview(_rtp(b"late-cleanup")))
+        _arm_short_operation_timeout(recorder)
 
         real_abort = sink._abort_sync
 
