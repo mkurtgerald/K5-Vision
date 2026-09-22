@@ -20,6 +20,7 @@ from k5vision.domain.devices import Device, DeviceCreate
 from k5vision.domain.users import UserRole
 from k5vision.operator_launch import OperatorLauncher, OperatorSourceResolver
 from k5vision.operator_launch_api import install_operator_launch_api
+from k5vision.operator_recording_api import install_operator_recording_api
 from k5vision.services.device_registry import (
     DEFAULT_DEVICE_CAPACITY,
     MAX_DEVICE_CAPACITY,
@@ -69,7 +70,8 @@ class _BoundedDeviceRequestBody:
         if (
             scope["type"] != "http"
             or scope.get("method") != "POST"
-            or scope.get("path") not in {"/api/v1/devices", "/api/v1/operator/live"}
+            or scope.get("path")
+            not in {"/api/v1/devices", "/api/v1/operator/live", "/api/v1/operator/recordings"}
         ):
             await self.app(scope, receive, send)
             return
@@ -219,6 +221,7 @@ def create_app(
     device_rate_window_seconds: float = DEFAULT_DEVICE_RATE_WINDOW_SECONDS,
     operator_source_resolver: OperatorSourceResolver | None = None,
     operator_launcher: OperatorLauncher | None = None,
+    operator_recording_root: str | Path | None = None,
 ) -> FastAPI:
     """Build the control plane with fail-closed authenticated durable device state."""
     if not 1 <= device_capacity <= MAX_DEVICE_CAPACITY:
@@ -305,6 +308,13 @@ def create_app(
         session_manager=session_manager,
         source_resolver=operator_source_resolver,
         launcher=operator_launcher,
+    )
+    install_operator_recording_api(
+        application,
+        registry=registry,
+        session_manager=session_manager,
+        source_resolver=operator_source_resolver,
+        recording_root=operator_recording_root,
     )
 
     async def authenticate_control_plane(
