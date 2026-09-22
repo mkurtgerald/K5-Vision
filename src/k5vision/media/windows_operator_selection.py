@@ -26,13 +26,13 @@ from k5vision.media.viewport_stack import (
 )
 from k5vision.media.windows_operator_application import WindowsOperatorApplicationSnapshot
 from k5vision.media.windows_operator_control import (
-    BoundedWindowsOperatorControl,
     WindowsOperatorControlError,
     WindowsOperatorControlErrorCode,
     WindowsOperatorControlSnapshot,
     _ControllableApplicationBoundary,
     _select_pointer_drag,
 )
+from k5vision.media.windows_operator_history_control import BoundedHistoryWindowsOperatorControl
 from k5vision.media.windows_operator_interaction import WindowsPointerEvent, WindowsPointerEventKind
 from k5vision.media.windows_operator_session import WindowsOperatorSessionState
 
@@ -66,7 +66,7 @@ class _SelectionCandidate:
     moved: bool = False
 
 
-class BoundedSelectableWindowsOperatorControl(BoundedWindowsOperatorControl):
+class BoundedSelectableWindowsOperatorControl(BoundedHistoryWindowsOperatorControl):
     """Add deterministic viewport selection without introducing source identity."""
 
     def __init__(self, **kwargs: typing.Any) -> None:
