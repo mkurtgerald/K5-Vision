@@ -7,18 +7,32 @@ on:
     paths:
       - .github/workflows/current-gate-viewport-editor.yml
       - src/k5vision/media/viewport_editor.py
+      - src/k5vision/media/viewport_editor_history.py
+      - src/k5vision/media/viewport_history_control.py
       - src/k5vision/media/viewport_geometry.py
       - src/k5vision/media/windows_operator_control.py
+      - src/k5vision/media/windows_operator_history_control.py
+      - src/k5vision/media/windows_operator_selection.py
       - tests/unit/test_current_gate_viewport_editor.py
+      - tests/unit/test_current_gate_viewport_history.py
+      - tests/unit/test_current_gate_viewport_history_control.py
+      - tests/unit/test_current_gate_operator_history_control.py
       - docs/current-gate-dependency-review.md
   push:
     branches: [main]
     paths:
       - .github/workflows/current-gate-viewport-editor.yml
       - src/k5vision/media/viewport_editor.py
+      - src/k5vision/media/viewport_editor_history.py
+      - src/k5vision/media/viewport_history_control.py
       - src/k5vision/media/viewport_geometry.py
       - src/k5vision/media/windows_operator_control.py
+      - src/k5vision/media/windows_operator_history_control.py
+      - src/k5vision/media/windows_operator_selection.py
       - tests/unit/test_current_gate_viewport_editor.py
+      - tests/unit/test_current_gate_viewport_history.py
+      - tests/unit/test_current_gate_viewport_history_control.py
+      - tests/unit/test_current_gate_operator_history_control.py
       - docs/current-gate-dependency-review.md
 
 permissions:
@@ -49,4 +63,4 @@ jobs:
 
       - name: Run exact viewport editor regression
         shell: powershell
-        run: pytest tests/unit/test_current_gate_viewport_editor.py tests/unit/test_viewport_geometry.py tests/unit/test_current_gate_operator_relayout_control.py -q --no-cov
+        run: pytest tests/unit/test_current_gate_viewport_editor.py tests/unit/test_viewport_geometry.py tests/unit/test_current_gate_operator_relayout_control.py tests/unit/test_current_gate_viewport_history.py tests/unit/test_current_gate_viewport_history_control.py tests/unit/test_current_gate_operator_history_control.py -q --no-cov
