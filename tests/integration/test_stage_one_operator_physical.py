@@ -58,6 +58,8 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
     monkeypatch.setenv("K5_DEVICE_DB_PATH", str(device_db))
     monkeypatch.setenv("K5_USER_DB_PATH", str(user_db))
     monkeypatch.setenv("K5_CONTROL_PLANE_ADMIN_TOKEN", _ADMIN_TOKEN)
+    monkeypatch.setenv("K5_OPERATOR_STREAM_TOKEN", "main")
+    monkeypatch.delenv("K5_OPERATOR_RTP_PAYLOAD_TYPE", raising=False)
 
     username = f"physical-{secrets.token_hex(6)}"
     permanent_password = secrets.token_urlsafe(32)
@@ -122,13 +124,15 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
                 "/api/v1/operator/live",
                 json={
                     "device_id": device_id,
-                    "stream_token": os.getenv("K5_OPERATOR_STREAM_TOKEN", "main"),
+                    "stream_token": "main",
                     "width": 1280,
                     "height": 720,
                 },
                 headers=_headers(session_token),
             )
-            assert launched.status_code == 200
+            assert launched.status_code == 200, launched.json().get(
+                "detail", "operator launch failed"
+            )
             receipt = launched.json()
             assert receipt["completed"] is True
             assert receipt["delivered_frames"] >= 1
