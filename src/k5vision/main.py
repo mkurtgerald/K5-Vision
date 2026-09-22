@@ -153,18 +153,18 @@ class _DeviceRequestRateLimiter:
             _DeviceRequestClass.WRITE: write_limit,
         }
         self._window_seconds = window_seconds
-        self._events: dict[tuple[_DeviceRequestClass, _DeviceAccess], deque[float]] = {}
+        self._events: dict[tuple[_DeviceRequestClass, str], deque[float]] = {}
         self._lock = asyncio.Lock()
 
     async def consume(
         self,
         request_class: _DeviceRequestClass,
-        access: _DeviceAccess,
+        principal_key: str,
     ) -> int | None:
-        """Return Retry-After seconds when the bounded in-process budget is exhausted."""
+        """Return Retry-After seconds when one principal's bounded budget is exhausted."""
         now = monotonic()
         cutoff = now - self._window_seconds
-        key = (request_class, access)
+        key = (request_class, principal_key)
         async with self._lock:
             events = self._events.setdefault(key, deque())
             while events and events[0] <= cutoff:
@@ -309,7 +309,7 @@ def create_app(
 
     async def authenticate_control_plane(
         authorization: Annotated[list[str] | None, Header()] = None,
-    ) -> _DeviceAccess:
+    ) -> tuple[_DeviceAccess, str]:
         human_auth_available = user_registry is not None
         if not auth_configuration_valid and not human_auth_available:
             raise HTTPException(
@@ -334,13 +334,16 @@ def create_app(
             )
 
         access: _DeviceAccess | None = None
+        principal_key: str | None = None
         if auth_configuration_valid and write_token is not None:
             write_match = compare_digest(credential, write_token)
             read_match = bool(read_token is not None and compare_digest(credential, read_token))
             if write_match:
                 access = _DeviceAccess.WRITE
+                principal_key = "service:write"
             elif read_match:
                 access = _DeviceAccess.READ
+                principal_key = "service:read"
 
         if access is None and human_auth_available:
             principal = await session_manager.resolve(credential)
@@ -348,8 +351,9 @@ def create_app(
                 access = (
                     _DeviceAccess.READ if principal.role is UserRole.VIEWER else _DeviceAccess.WRITE
                 )
+                principal_key = f"user:{principal.id}"
 
-        if access is None:
+        if access is None or principal_key is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unauthorized",
@@ -360,13 +364,13 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Control-plane device state is not configured",
             )
-        return access
+        return access, principal_key
 
     async def enforce_device_rate_limit(
         request_class: _DeviceRequestClass,
-        access: _DeviceAccess,
+        principal_key: str,
     ) -> None:
-        retry_after = await request_limiter.consume(request_class, access)
+        retry_after = await request_limiter.consume(request_class, principal_key)
         if retry_after is not None:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -375,19 +379,21 @@ def create_app(
             )
 
     async def require_device_read(
-        access: Annotated[_DeviceAccess, Depends(authenticate_control_plane)],
+        principal: Annotated[tuple[_DeviceAccess, str], Depends(authenticate_control_plane)],
     ) -> None:
-        await enforce_device_rate_limit(_DeviceRequestClass.READ, access)
+        _, principal_key = principal
+        await enforce_device_rate_limit(_DeviceRequestClass.READ, principal_key)
 
     async def require_device_write(
-        access: Annotated[_DeviceAccess, Depends(authenticate_control_plane)],
+        principal: Annotated[tuple[_DeviceAccess, str], Depends(authenticate_control_plane)],
     ) -> None:
+        access, principal_key = principal
         if access is not _DeviceAccess.WRITE:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Insufficient device permission",
             )
-        await enforce_device_rate_limit(_DeviceRequestClass.WRITE, access)
+        await enforce_device_rate_limit(_DeviceRequestClass.WRITE, principal_key)
 
     def require_registry() -> DeviceRegistry:
         if registry is None:
