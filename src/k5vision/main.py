@@ -320,9 +320,7 @@ def create_app(
         access: _DeviceAccess | None = None
         if auth_configuration_valid and write_token is not None:
             write_match = compare_digest(credential, write_token)
-            read_match = bool(
-                read_token is not None and compare_digest(credential, read_token)
-            )
+            read_match = bool(read_token is not None and compare_digest(credential, read_token))
             if write_match:
                 access = _DeviceAccess.WRITE
             elif read_match:
@@ -332,9 +330,7 @@ def create_app(
             principal = await session_manager.resolve(credential)
             if principal is not None:
                 access = (
-                    _DeviceAccess.READ
-                    if principal.role is UserRole.VIEWER
-                    else _DeviceAccess.WRITE
+                    _DeviceAccess.READ if principal.role is UserRole.VIEWER else _DeviceAccess.WRITE
                 )
 
         if access is None:
