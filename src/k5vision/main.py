@@ -1,10 +1,14 @@
 """K5 Vision control-plane API."""
 
+import asyncio
+from collections import deque
 from contextlib import asynccontextmanager
 from enum import StrEnum
 from hmac import compare_digest
+from math import ceil
 from os import environ
 from pathlib import Path
+from time import monotonic
 from typing import Annotated
 from uuid import UUID
 
@@ -28,9 +32,19 @@ CONTROL_PLANE_READ_TOKEN_ENV = "K5_CONTROL_PLANE_READ_TOKEN"
 CONTROL_PLANE_SITE_ENV = "K5_CONTROL_PLANE_SITE_ID"
 DEVICE_DB_PATH_ENV = "K5_DEVICE_DB_PATH"
 MAX_DEVICE_REQUEST_BYTES = 16_384
+DEFAULT_DEVICE_READ_RATE_LIMIT = 240
+DEFAULT_DEVICE_WRITE_RATE_LIMIT = 60
+DEFAULT_DEVICE_RATE_WINDOW_SECONDS = 60.0
+MAX_DEVICE_RATE_LIMIT = 10_000
+MAX_DEVICE_RATE_WINDOW_SECONDS = 3_600.0
 
 
 class _DeviceAccess(StrEnum):
+    READ = "read"
+    WRITE = "write"
+
+
+class _DeviceRequestClass(StrEnum):
     READ = "read"
     WRITE = "write"
 
@@ -119,6 +133,44 @@ class _BoundedDeviceRequestBody:
         await send({"type": "http.response.body", "body": body})
 
 
+class _DeviceRequestRateLimiter:
+    """Bound authenticated device requests without retaining credentials or client addresses."""
+
+    def __init__(
+        self,
+        *,
+        read_limit: int,
+        write_limit: int,
+        window_seconds: float,
+    ) -> None:
+        self._limits = {
+            _DeviceRequestClass.READ: read_limit,
+            _DeviceRequestClass.WRITE: write_limit,
+        }
+        self._window_seconds = window_seconds
+        self._events: dict[tuple[_DeviceRequestClass, _DeviceAccess], deque[float]] = {}
+        self._lock = asyncio.Lock()
+
+    async def consume(
+        self,
+        request_class: _DeviceRequestClass,
+        access: _DeviceAccess,
+    ) -> int | None:
+        """Return Retry-After seconds when the bounded in-process budget is exhausted."""
+        now = monotonic()
+        cutoff = now - self._window_seconds
+        key = (request_class, access)
+        async with self._lock:
+            events = self._events.setdefault(key, deque())
+            while events and events[0] <= cutoff:
+                events.popleft()
+            limit = self._limits[request_class]
+            if len(events) >= limit:
+                return max(1, ceil(self._window_seconds - (now - events[0])))
+            events.append(now)
+        return None
+
+
 def _resolve_bearer_token(
     explicit_token: str | None,
     *,
@@ -157,12 +209,24 @@ def create_app(
     device_db_path: str | Path | None = None,
     device_capacity: int = DEFAULT_DEVICE_CAPACITY,
     max_device_request_bytes: int = MAX_DEVICE_REQUEST_BYTES,
+    device_read_rate_limit: int = DEFAULT_DEVICE_READ_RATE_LIMIT,
+    device_write_rate_limit: int = DEFAULT_DEVICE_WRITE_RATE_LIMIT,
+    device_rate_window_seconds: float = DEFAULT_DEVICE_RATE_WINDOW_SECONDS,
 ) -> FastAPI:
     """Build the control plane with fail-closed authenticated durable device state."""
     if not 1 <= device_capacity <= MAX_DEVICE_CAPACITY:
         raise ValueError(f"device_capacity must be between 1 and {MAX_DEVICE_CAPACITY}")
     if not 1024 <= max_device_request_bytes <= 1_048_576:
         raise ValueError("max_device_request_bytes must be between 1024 and 1048576")
+    if not 1 <= device_read_rate_limit <= MAX_DEVICE_RATE_LIMIT:
+        raise ValueError(f"device_read_rate_limit must be between 1 and {MAX_DEVICE_RATE_LIMIT}")
+    if not 1 <= device_write_rate_limit <= MAX_DEVICE_RATE_LIMIT:
+        raise ValueError(f"device_write_rate_limit must be between 1 and {MAX_DEVICE_RATE_LIMIT}")
+    if not 1.0 <= device_rate_window_seconds <= MAX_DEVICE_RATE_WINDOW_SECONDS:
+        raise ValueError(
+            "device_rate_window_seconds must be between 1.0 and "
+            f"{MAX_DEVICE_RATE_WINDOW_SECONDS}"
+        )
 
     write_token, write_token_configured = _resolve_bearer_token(
         control_plane_token,
@@ -194,6 +258,12 @@ def create_app(
             )
         except DeviceRegistryStorageError:
             registry = None
+
+    request_limiter = _DeviceRequestRateLimiter(
+        read_limit=device_read_rate_limit,
+        write_limit=device_write_rate_limit,
+        window_seconds=device_rate_window_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
@@ -246,6 +316,23 @@ def create_app(
             )
         return _DeviceAccess.WRITE if write_match else _DeviceAccess.READ
 
+    async def enforce_device_rate_limit(
+        request_class: _DeviceRequestClass,
+        access: _DeviceAccess,
+    ) -> None:
+        retry_after = await request_limiter.consume(request_class, access)
+        if retry_after is not None:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Device request rate limit exceeded",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    async def require_device_read(
+        access: Annotated[_DeviceAccess, Depends(authenticate_control_plane)],
+    ) -> None:
+        await enforce_device_rate_limit(_DeviceRequestClass.READ, access)
+
     async def require_device_write(
         access: Annotated[_DeviceAccess, Depends(authenticate_control_plane)],
     ) -> None:
@@ -254,6 +341,7 @@ def create_app(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Insufficient device permission",
             )
+        await enforce_device_rate_limit(_DeviceRequestClass.WRITE, access)
 
     def require_registry() -> DeviceRegistry:
         if registry is None:
@@ -263,7 +351,7 @@ def create_app(
             )
         return registry
 
-    device_read_auth = [Depends(authenticate_control_plane)]
+    device_read_auth = [Depends(require_device_read)]
     device_write_auth = [Depends(require_device_write)]
 
     @application.get("/api/v1/health", tags=["system"])
