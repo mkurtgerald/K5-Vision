@@ -139,10 +139,10 @@ def test_windows_operator_runtime_requires_explicit_single_live_capability() -> 
         assert started.state == WindowsOperatorRuntimeState.RUNNING
         assert started.viewport_count == 1
         assert started.open_surface_count == 1
-        assert started.stream_count == 1
 
         final = await runtime.wait()
         assert final.state == WindowsOperatorRuntimeState.COMPLETE
+        assert final.stream_count == 1
         assert final.delivered_frames == 1
         serialized = final.model_dump_json().casefold()
         assert "rtsp://" not in serialized
