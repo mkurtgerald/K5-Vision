@@ -11,12 +11,12 @@ from k5vision.media.viewport_editor_history import (
 from k5vision.media.viewport_geometry import ViewportGeometry, ViewportLayout, ViewportPlacement
 
 
-def _layout() -> ViewportLayout:
+def _layout(*, x: int = 17) -> ViewportLayout:
     return ViewportLayout(
         placements=(
             ViewportPlacement(
                 logical_slot=7,
-                geometry=ViewportGeometry(x=17, y=29, width=613, height=347, z_index=2),
+                geometry=ViewportGeometry(x=x, y=29, width=613, height=347, z_index=2),
             ),
         )
     )
@@ -51,6 +51,29 @@ def test_history_is_bounded() -> None:
     with pytest.raises(ViewportEditorHistoryError) as caught:
         history.undo()
     assert caught.value.code == ViewportEditorHistoryErrorCode.NOTHING_TO_UNDO
+
+
+def test_rebase_clears_stale_branches_without_resetting_lifetime_budget() -> None:
+    history = BoundedViewportEditorHistory(_layout(), max_operations=4)
+    history.apply(ViewportMove(logical_slot=7, dx=10, dy=0))
+    history.undo()
+    assert history.snapshot.redo_depth == 1
+    rebased = history.rebase(_layout(x=101))
+    assert rebased.layout == _layout(x=101)
+    assert rebased.undo_depth == 0
+    assert rebased.redo_depth == 0
+    assert rebased.operations == 2
+    history.ensure_operation_available()
+
+
+def test_operation_preflight_fails_without_mutating_state() -> None:
+    history = BoundedViewportEditorHistory(_layout(), max_operations=1)
+    history.apply(ViewportMove(logical_slot=7, dx=1, dy=0))
+    before = history.snapshot
+    with pytest.raises(ViewportEditorHistoryError) as caught:
+        history.ensure_operation_available()
+    assert caught.value.code == ViewportEditorHistoryErrorCode.OPERATION_LIMIT
+    assert history.snapshot == before
 
 
 def test_history_observability_is_source_free() -> None:
