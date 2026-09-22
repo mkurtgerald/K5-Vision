@@ -18,6 +18,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from k5vision import __version__
 from k5vision.domain.devices import Device, DeviceCreate
 from k5vision.domain.users import UserRole
+from k5vision.operator_launch import OperatorLauncher, OperatorSourceResolver
+from k5vision.operator_launch_api import install_operator_launch_api
 from k5vision.services.device_registry import (
     DEFAULT_DEVICE_CAPACITY,
     MAX_DEVICE_CAPACITY,
@@ -57,7 +59,7 @@ class _RequestBodyTooLarge(Exception):
 
 
 class _BoundedDeviceRequestBody:
-    """Reject oversized device-registration bodies before application parsing."""
+    """Reject oversized device/operator mutation bodies before application parsing."""
 
     def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
         self.app = app
@@ -67,7 +69,7 @@ class _BoundedDeviceRequestBody:
         if (
             scope["type"] != "http"
             or scope.get("method") != "POST"
-            or scope.get("path") != "/api/v1/devices"
+            or scope.get("path") not in {"/api/v1/devices", "/api/v1/operator/live"}
         ):
             await self.app(scope, receive, send)
             return
@@ -215,6 +217,8 @@ def create_app(
     device_read_rate_limit: int = DEFAULT_DEVICE_READ_RATE_LIMIT,
     device_write_rate_limit: int = DEFAULT_DEVICE_WRITE_RATE_LIMIT,
     device_rate_window_seconds: float = DEFAULT_DEVICE_RATE_WINDOW_SECONDS,
+    operator_source_resolver: OperatorSourceResolver | None = None,
+    operator_launcher: OperatorLauncher | None = None,
 ) -> FastAPI:
     """Build the control plane with fail-closed authenticated durable device state."""
     if not 1 <= device_capacity <= MAX_DEVICE_CAPACITY:
@@ -295,6 +299,13 @@ def create_app(
         reserved_tokens=tuple(token for token in (write_token, read_token) if token is not None),
     )
     session_manager = application.state.user_session_manager
+    install_operator_launch_api(
+        application,
+        registry=registry,
+        session_manager=session_manager,
+        source_resolver=operator_source_resolver,
+        launcher=operator_launcher,
+    )
 
     async def authenticate_control_plane(
         authorization: Annotated[list[str] | None, Header()] = None,
