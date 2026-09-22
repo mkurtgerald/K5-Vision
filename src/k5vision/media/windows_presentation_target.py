@@ -142,7 +142,10 @@ class _Win32WindowTargetApi:
         try:
             instance = int(self._get_module_handle(None) or 0)
             if self._parent_handle is None:
-                style = _WS_POPUP
+                # Stage-One human acceptance needs a real operator-visible top-level
+                # surface. A bare WS_POPUP creates a valid but hidden window, which is
+                # not an acceptable live-view target even when GDI calls succeed.
+                style = _WS_POPUP | _WS_VISIBLE
                 parent = None
             else:
                 style = _WS_CHILD | _WS_VISIBLE
