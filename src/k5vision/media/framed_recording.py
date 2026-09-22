@@ -18,6 +18,7 @@ import zlib
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from k5vision.media.recording_attempt import FileIdentity, RecordingAttempt
 from k5vision.media.rtp_delivery import is_rtp_v2
 
 _MAGIC = b"K5RTPF\x00\x01"
@@ -97,8 +98,13 @@ class FramedAtomicRecordingSink:
         self._max_packets = max_packets
         self._max_payload_bytes = max_payload_bytes
         self._max_packet_bytes = max_packet_bytes
-        self._part_path = self._root / f".{recording_id}.k5r.part"
         self._final_path = self._root / f"{recording_id}.k5r"
+        self._attempt = RecordingAttempt(
+            self._root,
+            recording_id,
+            lock_suffix=".k5r.part",
+            staging_suffix=".k5r.stage",
+        )
         self._file: typing.BinaryIO | None = None
         self._state = FramedRecordingState.CREATED
         self._packets = 0
@@ -114,48 +120,45 @@ class FramedAtomicRecordingSink:
             file_bytes=self._file_bytes,
         )
 
-    def _write_all_sync(self, data: bytes | memoryview) -> None:
-        if self._file is None:
-            raise OSError
+    @staticmethod
+    def _write_to_file_sync(file: typing.BinaryIO, data: bytes | memoryview) -> None:
         view = memoryview(data)
         while view:
-            written = self._file.write(view)
+            written = file.write(view)
             if written is None or written <= 0:
                 raise OSError
             view = view[written:]
 
+    def _write_all_sync(self, data: bytes | memoryview) -> None:
+        if self._file is None:
+            raise OSError
+        self._write_to_file_sync(self._file, data)
+
     def _open_sync(self) -> typing.BinaryIO:
-        self._root.mkdir(parents=True, exist_ok=True)
         if self._final_path.exists():
             raise FileExistsError
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_BINARY"):
-            flags |= os.O_BINARY
-        fd = os.open(self._part_path, flags, 0o600)
-        file: typing.BinaryIO | None = None
+        file = self._attempt.acquire_staging()
         try:
-            file = os.fdopen(fd, "wb", buffering=0)
-            self._file = file
-            self._write_all_sync(_MAGIC)
-            self._file_bytes = len(_MAGIC)
-            return file
+            self._write_to_file_sync(file, _MAGIC)
         except BaseException:
-            if file is not None:
-                try:
-                    file.close()
-                except OSError:
-                    pass
-            else:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            self._file = None
             try:
-                self._part_path.unlink()
-            except OSError:
-                pass
+                file.close()
+            finally:
+                try:
+                    self._attempt.cleanup()
+                except OSError:
+                    pass
             raise
+        return file
+
+    def _cleanup_open_result_sync(self, file: typing.BinaryIO | None) -> None:
+        if file is not None:
+            try:
+                file.close()
+            finally:
+                if self._file is file:
+                    self._file = None
+        self._attempt.cleanup()
 
     async def open(self) -> None:
         if self._state == FramedRecordingState.OPEN:
@@ -165,8 +168,25 @@ class FramedAtomicRecordingSink:
                 FramedRecordingErrorCode.INVALID_STATE,
                 "framed recording cannot open from current state",
             )
+        worker = asyncio.create_task(asyncio.to_thread(self._open_sync))
         try:
-            self._file = await asyncio.to_thread(self._open_sync)
+            self._file = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            opened: typing.BinaryIO | None = None
+            try:
+                opened = await asyncio.shield(worker)
+            except Exception:
+                pass
+            try:
+                self._cleanup_open_result_sync(opened)
+            except OSError:
+                self._state = FramedRecordingState.FAILED
+                raise FramedRecordingError(
+                    FramedRecordingErrorCode.IO_FAILURE,
+                    "framed recording cleanup failed",
+                ) from None
+            self._state = FramedRecordingState.ABORTED
+            raise
         except FileExistsError:
             self._state = FramedRecordingState.FAILED
             raise FramedRecordingError(
@@ -179,6 +199,7 @@ class FramedAtomicRecordingSink:
                 FramedRecordingErrorCode.IO_FAILURE,
                 "framed recording failed to open",
             ) from None
+        self._file_bytes = len(_MAGIC)
         self._state = FramedRecordingState.OPEN
 
     def _write_record_sync(self, packet: memoryview) -> None:
@@ -186,6 +207,18 @@ class FramedAtomicRecordingSink:
         header = _RECORD_HEADER.pack(len(packet), checksum)
         self._write_all_sync(header)
         self._write_all_sync(packet)
+
+    def _abort_sync(self) -> None:
+        if self._file is not None:
+            try:
+                self._file.close()
+            finally:
+                self._file = None
+        self._attempt.cleanup()
+
+    def _reconcile_cancelled_active_operation(self) -> None:
+        self._abort_sync()
+        self._state = FramedRecordingState.ABORTED
 
     async def write(self, packet: memoryview) -> None:
         if self._state != FramedRecordingState.OPEN:
@@ -209,8 +242,23 @@ class FramedAtomicRecordingSink:
                 FramedRecordingErrorCode.LIMIT_EXCEEDED,
                 "framed recording limit exceeded",
             )
+        worker = asyncio.create_task(asyncio.to_thread(self._write_record_sync, packet))
         try:
-            await asyncio.to_thread(self._write_record_sync, packet)
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(worker)
+            except Exception:
+                pass
+            try:
+                self._reconcile_cancelled_active_operation()
+            except OSError:
+                self._state = FramedRecordingState.FAILED
+                raise FramedRecordingError(
+                    FramedRecordingErrorCode.IO_FAILURE,
+                    "framed recording cleanup failed",
+                ) from None
+            raise
         except OSError:
             self._state = FramedRecordingState.FAILED
             raise FramedRecordingError(
@@ -221,25 +269,14 @@ class FramedAtomicRecordingSink:
         self._payload_bytes += packet_bytes
         self._file_bytes += _RECORD_HEADER.size + packet_bytes
 
-    def _finalize_sync(self) -> None:
+    def _finalize_sync(self) -> FileIdentity:
         if self._file is None:
             raise OSError
         self._file.flush()
         os.fsync(self._file.fileno())
         self._file.close()
         self._file = None
-
-        os.link(self._part_path, self._final_path)
-        try:
-            self._part_path.unlink()
-        except FileNotFoundError:
-            return
-        except OSError:
-            try:
-                self._final_path.unlink()
-            except OSError:
-                pass
-            raise
+        return self._attempt.publish(self._final_path)
 
     async def finalize(self) -> None:
         if self._state == FramedRecordingState.FINALIZED:
@@ -249,8 +286,27 @@ class FramedAtomicRecordingSink:
                 FramedRecordingErrorCode.INVALID_STATE,
                 "framed recording cannot finalize from current state",
             )
+        worker = asyncio.create_task(asyncio.to_thread(self._finalize_sync))
         try:
-            await asyncio.to_thread(self._finalize_sync)
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            identity: FileIdentity | None = None
+            try:
+                identity = await asyncio.shield(worker)
+            except Exception:
+                pass
+            try:
+                if identity is not None:
+                    RecordingAttempt.rollback_published(self._final_path, identity)
+                self._abort_sync()
+            except OSError:
+                self._state = FramedRecordingState.FAILED
+                raise FramedRecordingError(
+                    FramedRecordingErrorCode.IO_FAILURE,
+                    "framed recording cleanup failed",
+                ) from None
+            self._state = FramedRecordingState.ABORTED
+            raise
         except FileExistsError:
             self._state = FramedRecordingState.FAILED
             await self._delete_part_best_effort()
@@ -267,17 +323,6 @@ class FramedAtomicRecordingSink:
             ) from None
         self._state = FramedRecordingState.FINALIZED
 
-    def _abort_sync(self) -> None:
-        if self._file is not None:
-            try:
-                self._file.close()
-            finally:
-                self._file = None
-        try:
-            self._part_path.unlink()
-        except FileNotFoundError:
-            pass
-
     async def _delete_part_best_effort(self) -> None:
         try:
             await asyncio.to_thread(self._abort_sync)
@@ -292,8 +337,20 @@ class FramedAtomicRecordingSink:
                 FramedRecordingErrorCode.INVALID_STATE,
                 "finalized framed recording cannot be aborted",
             )
+        worker = asyncio.create_task(asyncio.to_thread(self._abort_sync))
         try:
-            await asyncio.to_thread(self._abort_sync)
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(worker)
+            except OSError:
+                self._state = FramedRecordingState.FAILED
+                raise FramedRecordingError(
+                    FramedRecordingErrorCode.IO_FAILURE,
+                    "framed recording cleanup failed",
+                ) from None
+            self._state = FramedRecordingState.ABORTED
+            raise
         except OSError:
             self._state = FramedRecordingState.FAILED
             raise FramedRecordingError(
