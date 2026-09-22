@@ -6,6 +6,9 @@ on:
     branches: [main]
     paths:
       - .github/workflows/current-gate-target-windows.yml
+      - src/k5vision/operator_playback.py
+      - src/k5vision/operator_recording_api.py
+      - tests/test_operator_playback.py
       - src/k5vision/media/mixed_presentation.py
       - src/k5vision/media/presentation_runtime.py
       - src/k5vision/media/viewport_dispatch.py
@@ -58,6 +61,9 @@ on:
     branches: [main]
     paths:
       - .github/workflows/current-gate-target-windows.yml
+      - src/k5vision/operator_playback.py
+      - src/k5vision/operator_recording_api.py
+      - tests/test_operator_playback.py
       - src/k5vision/media/mixed_presentation.py
       - src/k5vision/media/presentation_runtime.py
       - src/k5vision/media/viewport_dispatch.py
