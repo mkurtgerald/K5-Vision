@@ -65,9 +65,18 @@ def test_user_admin_api_fails_closed_without_durable_user_state(
 
     with TestClient(create_app()) as client:
         response = client.get("/api/v1/users", headers=_headers())
+        bootstrap = client.post(
+            "/api/v1/auth/bootstrap-password",
+            json={
+                "username": "operator.one",
+                "temporary_credential": "x" * 43,
+                "new_password": "correct horse battery staple",
+            },
+        )
 
     assert response.status_code == 503
     assert response.json() == {"detail": "User administration state is not configured"}
+    assert bootstrap.status_code == 503
 
 
 def test_admin_token_must_be_distinct_from_device_authority(
@@ -104,8 +113,10 @@ def test_device_credential_cannot_administer_users_and_rejection_does_not_mutate
 def test_user_admin_surface_persists_create_update_and_audit_across_restart() -> None:
     with TestClient(create_app()) as client:
         created = client.post("/api/v1/users", json=_user_payload(), headers=_headers())
+        created_body = created.json()
+        account = created_body["account"]
         updated = client.patch(
-            f"/api/v1/users/{created.json()['id']}",
+            f"/api/v1/users/{account['id']}",
             json={"display_name": "Shift Supervisor", "role": "administrator", "enabled": False},
             headers=_headers(),
         )
@@ -113,15 +124,23 @@ def test_user_admin_surface_persists_create_update_and_audit_across_restart() ->
         audit = client.get("/api/v1/users/audit", headers=_headers())
 
     assert created.status_code == 201
+    assert len(created_body["temporary_credential"]) >= 32
+    assert created_body["expires_at"]
     assert updated.status_code == 200
     assert updated.json()["username"] == "operator.one"
     assert updated.json()["display_name"] == "Shift Supervisor"
     assert updated.json()["role"] == "administrator"
     assert updated.json()["enabled"] is False
     assert listed.json() == [updated.json()]
-    assert [event["action"] for event in audit.json()] == ["created", "updated"]
+    assert [event["action"] for event in audit.json()] == [
+        "created",
+        "bootstrap-issued",
+        "updated",
+    ]
     assert all(event["actor"] == "control-plane-admin" for event in audit.json())
-    assert audit.json()[1]["changed_fields"] == ["display_name", "role", "enabled"]
+    assert audit.json()[2]["changed_fields"] == ["display_name", "role", "enabled"]
+    assert created_body["temporary_credential"] not in audit.text
+    assert created_body["temporary_credential"] not in listed.text
 
     with TestClient(create_app()) as client:
         after_restart = client.get("/api/v1/users", headers=_headers())
@@ -130,6 +149,69 @@ def test_user_admin_surface_persists_create_update_and_audit_across_restart() ->
     assert after_restart.status_code == 200
     assert after_restart.json() == [updated.json()]
     assert audit_after_restart.json() == audit.json()
+
+
+def test_bootstrap_password_is_one_time_and_not_returned_after_creation() -> None:
+    with TestClient(create_app()) as client:
+        created = client.post("/api/v1/users", json=_user_payload(), headers=_headers())
+        body = created.json()
+        temporary_credential = body["temporary_credential"]
+        activate = client.post(
+            "/api/v1/auth/bootstrap-password",
+            json={
+                "username": body["account"]["username"],
+                "temporary_credential": temporary_credential,
+                "new_password": "correct horse battery staple",
+            },
+        )
+        replay = client.post(
+            "/api/v1/auth/bootstrap-password",
+            json={
+                "username": body["account"]["username"],
+                "temporary_credential": temporary_credential,
+                "new_password": "another strong password",
+            },
+        )
+        listed = client.get("/api/v1/users", headers=_headers())
+        audit = client.get("/api/v1/users/audit", headers=_headers())
+
+    assert activate.status_code == 204
+    assert activate.content == b""
+    assert replay.status_code == 401
+    assert replay.json() == {"detail": "Invalid or expired bootstrap credential"}
+    assert temporary_credential not in listed.text
+    assert temporary_credential not in audit.text
+    assert [event["action"] for event in audit.json()] == [
+        "created",
+        "bootstrap-issued",
+        "bootstrap-consumed",
+    ]
+    assert audit.json()[-1]["actor"] == "bootstrap-user"
+
+
+def test_wrong_bootstrap_credential_is_rejected_without_consuming_valid_one() -> None:
+    with TestClient(create_app()) as client:
+        created = client.post("/api/v1/users", json=_user_payload(), headers=_headers()).json()
+        temporary_credential = created["temporary_credential"]
+        wrong = client.post(
+            "/api/v1/auth/bootstrap-password",
+            json={
+                "username": created["account"]["username"],
+                "temporary_credential": "x" * len(temporary_credential),
+                "new_password": "correct horse battery staple",
+            },
+        )
+        valid = client.post(
+            "/api/v1/auth/bootstrap-password",
+            json={
+                "username": created["account"]["username"],
+                "temporary_credential": temporary_credential,
+                "new_password": "correct horse battery staple",
+            },
+        )
+
+    assert wrong.status_code == 401
+    assert valid.status_code == 204
 
 
 def test_duplicate_user_is_rejected_without_replacing_existing_account() -> None:
@@ -147,7 +229,7 @@ def test_duplicate_user_is_rejected_without_replacing_existing_account() -> None
     assert created.status_code == 201
     assert duplicate.status_code == 409
     assert duplicate.json() == {"detail": "Username already exists"}
-    assert remaining.json() == [created.json()]
+    assert remaining.json() == [created.json()["account"]]
 
 
 def test_user_mutation_body_is_bounded_before_model_parsing() -> None:
@@ -167,6 +249,27 @@ def test_user_mutation_body_is_bounded_before_model_parsing() -> None:
     assert response.status_code == 413
     assert response.json() == {"detail": "Request body too large"}
     assert remaining.json() == []
+
+
+def test_bootstrap_mutation_body_is_bounded_before_model_parsing() -> None:
+    encoded = json.dumps(
+        {
+            "username": "operator.one",
+            "temporary_credential": "x" * 43,
+            "new_password": "x" * (MAX_USER_REQUEST_BYTES + 1),
+        }
+    ).encode("utf-8")
+    assert len(encoded) > MAX_USER_REQUEST_BYTES
+
+    with TestClient(create_app()) as client:
+        response = client.post(
+            "/api/v1/auth/bootstrap-password",
+            content=encoded,
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "Request body too large"}
 
 
 def test_user_admin_api_rejects_ambiguous_authorization_headers_without_mutation() -> None:
