@@ -56,12 +56,8 @@ def test_qualification_inventory_remains_present() -> None:
 @pytest.mark.parametrize("path", _PHYSICAL, ids=lambda path: path.stem)
 def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
-    triggers = text.split("\non:\n", maxsplit=1)[1].split(
-        "\npermissions:", maxsplit=1
-    )[0]
-    admission = text.split("\njobs:\n", maxsplit=1)[1].split(
-        "    runs-on:", maxsplit=1
-    )[0]
+    triggers = text.split("\non:\n", maxsplit=1)[1].split("\npermissions:", maxsplit=1)[0]
+    admission = text.split("\njobs:\n", maxsplit=1)[1].split("    runs-on:", maxsplit=1)[0]
 
     assert "    if: >-\n" in admission
     assert "github.event_name == 'workflow_dispatch' &&" in admission
@@ -69,10 +65,7 @@ def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
     assert "github.triggering_actor == github.repository_owner &&" in admission
     assert "github.event.pull_request.head.sha" not in text
 
-    checkouts = [
-        part for part in text.split("      - name: ")
-        if "uses: actions/checkout@" in part
-    ]
+    checkouts = [part for part in text.split("      - name: ") if "uses: actions/checkout@" in part]
     assert checkouts
 
     if path.name in _TARGETED_DISPATCH:
@@ -127,10 +120,7 @@ def test_qualification_upload_requires_its_validation_outcome(path: Path) -> Non
         for upload in uploads:
             assert steps.index(validation) < steps.index(upload)
             header = upload.split("        uses:", maxsplit=1)[0]
-            assert (
-                "        if: always() && steps.safe_evidence.outcome == 'success'\n"
-                in header
-            )
+            assert "        if: always() && steps.safe_evidence.outcome == 'success'\n" in header
     else:
         for upload in uploads:
             header = upload.split("        uses:", maxsplit=1)[0]
