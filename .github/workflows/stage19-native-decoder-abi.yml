@@ -2,41 +2,34 @@ name: Stage 19 Native Decoder ABI Qualification
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches: [main]
-    paths:
-      - .github/workflows/stage19-native-decoder-abi.yml
-      - scripts/provision-stage03-gstreamer.ps1
-      - src/k5vision/media/decoder_runtime.py
-      - src/k5vision/media/gstreamer_native_abi.py
-      - tests/unit/test_gstreamer_native_abi.py
-      - docs/stage19-dependency-review.md
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/stage19-native-decoder-abi.yml
-      - scripts/provision-stage03-gstreamer.ps1
-      - src/k5vision/media/decoder_runtime.py
-      - src/k5vision/media/gstreamer_native_abi.py
-      - tests/unit/test_gstreamer_native_abi.py
-      - docs/stage19-dependency-review.md
+    inputs:
+      reviewed_sha:
+        description: Exact reviewed commit selected for this qualification
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   stage19-native-decoder-abi:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner &&
+      inputs.reviewed_sha == github.sha
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 15
     env:
       K5_STAGE19_OUTPUT: ${{ github.workspace }}\artifacts\stage19-native-decoder-abi.json
-      K5_STAGE19_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_STAGE19_REVISION: ${{ github.sha }}
 
     steps:
       - name: Checkout exact Stage 19 revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Provision isolated reviewed GStreamer runtime
         shell: powershell
@@ -86,6 +79,8 @@ jobs:
           }
 
       - name: Assert retained ABI evidence is source-free
+        id: safe_evidence
+        if: always()
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -109,7 +104,7 @@ jobs:
           }
 
       - name: Upload source-free Stage 19 evidence
-        if: always()
+        if: always() && steps.safe_evidence.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: stage19-native-decoder-abi-evidence
