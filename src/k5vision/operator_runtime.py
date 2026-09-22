@@ -24,10 +24,10 @@ from k5vision.media.windows_operator_runtime import (
     WindowsOperatorRuntimeState,
 )
 from k5vision.operator_launch import (
+    OperatorLauncher,
     OperatorLaunchError,
     OperatorLaunchErrorCode,
     OperatorLaunchMetrics,
-    OperatorLauncher,
     OperatorSourceResolver,
     ResolvedLiveSource,
 )
@@ -71,7 +71,10 @@ def _sanitize_stream_token(value: str) -> str:
         not token
         or len(token) > _MAX_STREAM_TOKEN_LENGTH
         or not token.isascii()
-        or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-" for character in token)
+        or any(
+            character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+            for character in token
+        )
     ):
         raise ValueError("operator stream token is invalid")
     return token
