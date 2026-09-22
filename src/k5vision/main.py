@@ -224,8 +224,7 @@ def create_app(
         raise ValueError(f"device_write_rate_limit must be between 1 and {MAX_DEVICE_RATE_LIMIT}")
     if not 1.0 <= device_rate_window_seconds <= MAX_DEVICE_RATE_WINDOW_SECONDS:
         raise ValueError(
-            "device_rate_window_seconds must be between 1.0 and "
-            f"{MAX_DEVICE_RATE_WINDOW_SECONDS}"
+            f"device_rate_window_seconds must be between 1.0 and {MAX_DEVICE_RATE_WINDOW_SECONDS}"
         )
 
     write_token, write_token_configured = _resolve_bearer_token(
