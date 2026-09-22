@@ -127,3 +127,23 @@ def test_qualification_upload_requires_its_validation_outcome(path: Path) -> Non
             header = upload.split("        uses:", maxsplit=1)[0]
             assert "        if: success()\n" in header
             assert "if: always()" not in header
+
+
+def test_remaining_stage_one_suite_covers_every_required_gate() -> None:
+    text = (_WORKFLOWS / "stage-one-remaining-physical-suite.yml").read_text(
+        encoding="utf-8"
+    )
+    required_tests = {
+        "tests/integration/test_stage05_physical.py",
+        "tests/integration/test_stage06_physical.py",
+        "tests/integration/test_stage31_physical.py",
+        "tests/integration/test_stage32_physical.py",
+        "tests/integration/test_stage33_physical.py",
+        "tests/integration/test_stage34_physical.py",
+        "tests/integration/test_stage35_physical.py",
+        "tests/integration/test_stage_one_operator_physical.py",
+    }
+    assert required_tests.issubset(set(text.split()))
+    assert text.count("stage03_credential_probe") == 1
+    assert "if-no-files-found: error" in text
+    assert "stage-one-remaining-physical-suite-evidence" in text
