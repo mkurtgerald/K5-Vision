@@ -2,12 +2,22 @@ name: Physical Qualification
 
 on:
   workflow_dispatch:
+    inputs:
+      reviewed_sha:
+        description: Exact reviewed commit selected for this qualification
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   stage03-physical:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner &&
+      inputs.reviewed_sha == github.sha
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 30
     env:
@@ -19,6 +29,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Load versioned runtime candidate configuration
         shell: powershell
