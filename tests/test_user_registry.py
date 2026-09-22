@@ -127,7 +127,9 @@ def test_bootstrap_credential_is_one_time_persisted_only_as_verifier(tmp_path) -
     assert all(temporary_credential not in event.model_dump_json() for event in audit)
 
     reopened = UserRegistry(database_path=database, site_id="site-a")
-    assert reopened.verify_password(username=account.username, password=temporary_credential) is None
+    assert (
+        reopened.verify_password(username=account.username, password=temporary_credential) is None
+    )
     activated = reopened.activate_bootstrap_password(
         username=account.username,
         temporary_credential=temporary_credential,
