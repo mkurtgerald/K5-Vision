@@ -208,9 +208,7 @@ def install_user_admin_api(
     if not 1 <= rate_limit <= MAX_USER_ADMIN_RATE_LIMIT:
         raise ValueError(f"rate_limit must be between 1 and {MAX_USER_ADMIN_RATE_LIMIT}")
     if not 1 <= bootstrap_rate_limit <= MAX_USER_ADMIN_RATE_LIMIT:
-        raise ValueError(
-            f"bootstrap_rate_limit must be between 1 and {MAX_USER_ADMIN_RATE_LIMIT}"
-        )
+        raise ValueError(f"bootstrap_rate_limit must be between 1 and {MAX_USER_ADMIN_RATE_LIMIT}")
     if not MIN_BOOTSTRAP_TTL_SECONDS <= bootstrap_ttl_seconds <= MAX_BOOTSTRAP_TTL_SECONDS:
         raise ValueError(
             f"bootstrap_ttl_seconds must be between {MIN_BOOTSTRAP_TTL_SECONDS} "
