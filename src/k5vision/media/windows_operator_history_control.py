@@ -21,8 +21,8 @@ from k5vision.media.windows_operator_control import (
     WindowsOperatorControlError,
     WindowsOperatorControlErrorCode,
     WindowsOperatorControlSnapshot,
-    _ControllableApplicationBoundary,
     _ControlKind,
+    _ControllableApplicationBoundary,
     _ControlRequest,
     _RelayoutApplicationBoundary,
 )
@@ -64,9 +64,7 @@ class BoundedHistoryWindowsOperatorControl(BoundedWindowsOperatorControl):
     ) -> None:
         if (
             not 1 <= max_viewport_history <= _MAX_VIEWPORT_HISTORY
-            or not 1
-            <= max_viewport_history_operations
-            <= _MAX_VIEWPORT_HISTORY_OPERATIONS
+            or not 1 <= max_viewport_history_operations <= _MAX_VIEWPORT_HISTORY_OPERATIONS
         ):
             raise WindowsOperatorControlError(
                 WindowsOperatorControlErrorCode.INVALID_CONFIGURATION,
