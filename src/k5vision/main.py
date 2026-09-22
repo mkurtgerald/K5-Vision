@@ -17,6 +17,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from k5vision import __version__
 from k5vision.domain.devices import Device, DeviceCreate
+from k5vision.domain.users import UserRole
 from k5vision.services.device_registry import (
     DEFAULT_DEVICE_CAPACITY,
     MAX_DEVICE_CAPACITY,
@@ -292,11 +293,13 @@ def create_app(
         site_id=site_id,
         reserved_tokens=tuple(token for token in (write_token, read_token) if token is not None),
     )
+    session_manager = application.state.user_session_manager
 
     async def authenticate_control_plane(
         authorization: Annotated[list[str] | None, Header()] = None,
     ) -> _DeviceAccess:
-        if not auth_configuration_valid or write_token is None:
+        human_auth_available = user_registry is not None
+        if not auth_configuration_valid and not human_auth_available:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Control-plane authentication is not configured",
@@ -307,11 +310,30 @@ def create_app(
         credential_valid = bool(
             scheme.lower() == "bearer" and separator and credential and credential.isascii()
         )
-        write_match = credential_valid and compare_digest(credential, write_token)
-        read_match = bool(
-            credential_valid and read_token is not None and compare_digest(credential, read_token)
-        )
-        if not write_match and not read_match:
+        if not credential_valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        access: _DeviceAccess | None = None
+        if auth_configuration_valid and write_token is not None:
+            write_match = compare_digest(credential, write_token)
+            read_match = bool(read_token is not None and compare_digest(credential, read_token))
+            if write_match:
+                access = _DeviceAccess.WRITE
+            elif read_match:
+                access = _DeviceAccess.READ
+
+        if access is None and human_auth_available:
+            principal = await session_manager.resolve(credential)
+            if principal is not None:
+                access = (
+                    _DeviceAccess.READ if principal.role is UserRole.VIEWER else _DeviceAccess.WRITE
+                )
+
+        if access is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unauthorized",
@@ -322,7 +344,7 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Control-plane device state is not configured",
             )
-        return _DeviceAccess.WRITE if write_match else _DeviceAccess.READ
+        return access
 
     async def enforce_device_rate_limit(
         request_class: _DeviceRequestClass,
