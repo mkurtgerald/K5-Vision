@@ -138,9 +138,7 @@ class BoundedMixedPresentation:
             raise ValueError("allow_all_live must be boolean")
         minimum_streams = 1 if allow_all_live else 2
         if not minimum_streams <= max_streams <= _MAX_STREAMS:
-            raise ValueError(
-                f"max_streams must be between {minimum_streams} and {_MAX_STREAMS}"
-            )
+            raise ValueError(f"max_streams must be between {minimum_streams} and {_MAX_STREAMS}")
         if not 1 <= max_total_frames <= _MAX_TOTAL_FRAMES:
             raise ValueError("max_total_frames must be between 1 and 1000000")
         if not 1 <= max_total_frame_bytes <= _MAX_TOTAL_FRAME_BYTES:
