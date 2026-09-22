@@ -10,13 +10,16 @@ media payloads, and native window identities never cross this boundary.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Protocol
 from urllib.parse import urlsplit
 
 from k5vision.domain.devices import Device
 from k5vision.media.live_presentation import BoundedLivePresentationDelivery
 from k5vision.media.mixed_presentation import MixedLiveStream
+from k5vision.media.presentation_runtime import BoundedPresentationRuntime
+from k5vision.media.rtp_delivery import EphemeralRtpDelivery
+from k5vision.media.viewport_dispatch import ViewportBinding
 from k5vision.media.viewport_geometry import ViewportGeometry, ViewportLayout, ViewportPlacement
 from k5vision.media.windows_operator_runtime import (
     BoundedWindowsOperatorRuntime,
@@ -44,6 +47,7 @@ _MAX_STREAM_TOKEN_LENGTH = 256
 
 
 CredentialProbe = Callable[[str, str], int | None]
+PayloadTypeProbe = Callable[[str], Awaitable[int]]
 
 
 class _LiveDeliveryBoundary(Protocol):
@@ -80,6 +84,29 @@ def _sanitize_stream_token(value: str) -> str:
     return token
 
 
+async def _probe_dynamic_payload_type(source_uri: str) -> int:
+    """Read one transient RTP header and return only its dynamic payload type."""
+    payload_type: int | None = None
+
+    async def capture(packet: memoryview) -> None:
+        nonlocal payload_type
+        candidate = int(packet[1] & 0x7F)
+        if not 96 <= candidate <= 127:
+            raise ValueError("operator RTP payload type is outside the supported range")
+        payload_type = candidate
+
+    delivery = EphemeralRtpDelivery(
+        packet_goal=1,
+        delivery_timeout_seconds=15.0,
+        consumer_timeout_seconds=2.0,
+        relay_startup_probe_seconds=0.5,
+    )
+    await delivery.deliver(source_uri, capture)
+    if payload_type is None:
+        raise RuntimeError("operator RTP payload type could not be established")
+    return payload_type
+
+
 class PrivateStageOneSourceResolver(OperatorSourceResolver):
     """Resolve one configured physical source without exposing private material."""
 
@@ -89,6 +116,7 @@ class PrivateStageOneSourceResolver(OperatorSourceResolver):
         "_stream_token",
         "_payload_type",
         "_credential_probe",
+        "_payload_probe",
     )
 
     def __init__(
@@ -97,23 +125,29 @@ class PrivateStageOneSourceResolver(OperatorSourceResolver):
         credential_bundle: str,
         *,
         stream_token: str = _DEFAULT_STREAM_TOKEN,
-        payload_type: int = _DEFAULT_PAYLOAD_TYPE,
+        payload_type: int | None = _DEFAULT_PAYLOAD_TYPE,
         credential_probe: CredentialProbe = resolve_credential_index,
+        payload_probe: PayloadTypeProbe = _probe_dynamic_payload_type,
     ) -> None:
         if not isinstance(source_uri, str) or not source_uri.strip():
             raise ValueError("private operator source is unavailable")
         if not isinstance(credential_bundle, str) or not credential_bundle.strip():
             raise ValueError("private operator credential bundle is unavailable")
-        if isinstance(payload_type, bool) or not 96 <= payload_type <= 127:
+        if payload_type is not None and (
+            isinstance(payload_type, bool) or not 96 <= payload_type <= 127
+        ):
             raise ValueError("operator RTP payload type must be between 96 and 127")
         if not callable(credential_probe):
             raise TypeError("credential_probe must be callable")
+        if not callable(payload_probe):
+            raise TypeError("payload_probe must be callable")
 
         self._source_uri = source_uri.strip()
         self._credential_bundle = credential_bundle
         self._stream_token = _sanitize_stream_token(stream_token)
         self._payload_type = payload_type
         self._credential_probe = credential_probe
+        self._payload_probe = payload_probe
 
     async def resolve(self, device: Device, stream_token: str) -> ResolvedLiveSource:
         """Resolve the configured source only for the selected enrolled device."""
@@ -152,6 +186,11 @@ class PrivateStageOneSourceResolver(OperatorSourceResolver):
                 self._credential_bundle,
                 credential_index,
             )
+            payload_type = self._payload_type
+            if payload_type is None:
+                payload_type = await self._payload_probe(authenticated_source)
+            if isinstance(payload_type, bool) or not 96 <= payload_type <= 127:
+                raise ValueError("operator RTP payload type is invalid")
         except OperatorLaunchError:
             raise
         except Exception:
@@ -160,15 +199,45 @@ class PrivateStageOneSourceResolver(OperatorSourceResolver):
                 "selected live source could not be resolved",
             ) from None
 
-        return ResolvedLiveSource(authenticated_source, self._payload_type)
+        return ResolvedLiveSource(authenticated_source, payload_type)
 
 
 def _default_delivery_factory(payload_type: int) -> _LiveDeliveryBoundary:
-    return BoundedLivePresentationDelivery(payload_type)
+    """Reuse the physically qualified Stage-32/35 live delivery envelope."""
+    return BoundedLivePresentationDelivery(
+        payload_type,
+        packet_goal=2048,
+        delivery_timeout_seconds=30.0,
+        packet_consumer_timeout_seconds=4.0,
+        decoder_timeout_seconds=2.0,
+        frame_consumer_timeout_seconds=2.0,
+        cleanup_timeout_seconds=2.0,
+        relay_startup_probe_seconds=0.5,
+    )
+
+
+def _stage_one_presentation_runtime_factory(
+    bindings: Sequence[ViewportBinding],
+) -> BoundedPresentationRuntime:
+    """Reuse the physically qualified Stage-32 presentation timing/bounds."""
+    return BoundedPresentationRuntime(
+        bindings,
+        max_streams=16,
+        max_viewports=16,
+        max_total_frames=100_000,
+        max_total_frame_bytes=16 * 1024 * 1024 * 1024,
+        consumer_timeout_seconds=2.0,
+        stop_timeout_seconds=5.0,
+        allow_all_live=True,
+    )
 
 
 def _default_windows_operator_factory(layout: ViewportLayout) -> _WindowsOperatorBoundary:
-    return BoundedWindowsOperatorRuntime(layout, allow_single_live=True)
+    return BoundedWindowsOperatorRuntime(
+        layout,
+        allow_single_live=True,
+        presentation_runtime_factory=_stage_one_presentation_runtime_factory,
+    )
 
 
 class WindowsSingleLiveOperatorLauncher(OperatorLauncher):
@@ -261,6 +330,7 @@ def build_environment_operator_runtime(
     environment: Mapping[str, str],
     *,
     credential_probe: CredentialProbe = resolve_credential_index,
+    payload_probe: PayloadTypeProbe = _probe_dynamic_payload_type,
 ) -> tuple[OperatorSourceResolver | None, OperatorLauncher | None]:
     """Build the physical Stage-One bridge only when private configuration is complete."""
     source_uri = environment.get(STAGE_ONE_SOURCE_ENV, "").strip()
@@ -269,15 +339,16 @@ def build_environment_operator_runtime(
         return None, None
 
     stream_token = environment.get(STAGE_ONE_STREAM_TOKEN_ENV, _DEFAULT_STREAM_TOKEN)
-    payload_raw = environment.get(STAGE_ONE_PAYLOAD_TYPE_ENV, str(_DEFAULT_PAYLOAD_TYPE)).strip()
+    payload_raw = environment.get(STAGE_ONE_PAYLOAD_TYPE_ENV)
     try:
-        payload_type = int(payload_raw)
+        payload_type = None if payload_raw is None or not payload_raw.strip() else int(payload_raw)
         resolver = PrivateStageOneSourceResolver(
             source_uri,
             credential_bundle,
             stream_token=stream_token,
             payload_type=payload_type,
             credential_probe=credential_probe,
+            payload_probe=payload_probe,
         )
     except (TypeError, ValueError):
         return None, None
