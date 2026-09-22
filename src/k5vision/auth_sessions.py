@@ -73,8 +73,10 @@ class UserSessionManager:
 
     @staticmethod
     def _token_is_valid(token: str) -> bool:
-        return 32 <= len(token) <= 128 and token.isascii() and all(
-            character.isalnum() or character in "_-" for character in token
+        return (
+            32 <= len(token) <= 128
+            and token.isascii()
+            and all(character.isalnum() or character in "_-" for character in token)
         )
 
     async def issue(self, account: UserAccount) -> tuple[str, datetime]:

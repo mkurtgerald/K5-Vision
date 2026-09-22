@@ -387,9 +387,9 @@ def install_user_admin_api(
         tags=["users"],
     )
     async def list_users(
-        _actor: Annotated[str, Depends(require_user_admin)],
         offset: Annotated[int, Query(ge=0)] = 0,
         limit: Annotated[int, Query(ge=1, le=MAX_USER_PAGE_SIZE)] = MAX_USER_PAGE_SIZE,
+        _actor: str = Depends(require_user_admin),
     ) -> list[UserAccount]:
         try:
             return require_registry().list(offset=offset, limit=limit)
@@ -405,9 +405,9 @@ def install_user_admin_api(
         tags=["users"],
     )
     async def list_user_audit(
-        _actor: Annotated[str, Depends(require_user_admin)],
         offset: Annotated[int, Query(ge=0)] = 0,
         limit: Annotated[int, Query(ge=1, le=MAX_USER_AUDIT_PAGE_SIZE)] = MAX_USER_AUDIT_PAGE_SIZE,
+        _actor: str = Depends(require_user_admin),
     ) -> list[UserAuditEvent]:
         try:
             return require_registry().audit_events(offset=offset, limit=limit)
@@ -425,7 +425,7 @@ def install_user_admin_api(
     )
     async def create_user(
         payload: UserCreate,
-        actor: Annotated[str, Depends(require_user_admin)],
+        actor: str = Depends(require_user_admin),
     ) -> UserBootstrapIssue:
         try:
             account, temporary_credential, expires_at = require_registry().create_with_bootstrap(
@@ -515,7 +515,7 @@ def install_user_admin_api(
         tags=["authentication"],
     )
     async def current_user(
-        session: Annotated[tuple[UserAccount, str], Depends(require_user_session)],
+        session: tuple[UserAccount, str] = Depends(require_user_session),
     ) -> UserAccount:
         return session[0]
 
@@ -525,7 +525,7 @@ def install_user_admin_api(
         tags=["authentication"],
     )
     async def logout(
-        session: Annotated[tuple[UserAccount, str], Depends(require_user_session)],
+        session: tuple[UserAccount, str] = Depends(require_user_session),
     ) -> Response:
         await session_manager.revoke(session[1])
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -538,7 +538,7 @@ def install_user_admin_api(
     async def update_user(
         user_id: UUID,
         payload: UserPatch,
-        actor: Annotated[str, Depends(require_user_admin)],
+        actor: str = Depends(require_user_admin),
     ) -> UserAccount:
         try:
             user = require_registry().update(user_id, payload, actor=actor)
