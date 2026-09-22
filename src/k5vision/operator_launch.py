@@ -1,6 +1,6 @@
 """Authenticated source-safe handoff into the accepted live operator runtime.
 
-This boundary deliberately keeps camera connection material execution-only.  Callers
+This boundary deliberately keeps camera connection material execution-only. Callers
 select an already-enrolled device and a credential-free stream token; a private
 resolver may turn that selection into a transient authenticated RTSP URI, but that
 URI never appears in the request, receipt, retained coordinator state, or errors.
@@ -11,12 +11,11 @@ from __future__ import annotations
 import asyncio
 import enum
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Annotated, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
-from typing_extensions import Annotated
 
 from k5vision.domain.devices import Device, DeviceKind, DeviceProtocol
 from k5vision.domain.users import UserAccount
