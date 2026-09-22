@@ -104,7 +104,7 @@ def test_explicit_rebase_clears_stale_history_and_preserves_operation_count() ->
     async def scenario() -> None:
         application = _Relayout()
         control = TransactionalViewportHistoryControl(_layout())
-        await control.apply(application, ViewportMove(logical_slot=7, dx=8, dy=9))
+        edited = await control.apply(application, ViewportMove(logical_slot=7, dx=8, dy=9))
         rebased = control.rebase(_layout(x=101))
         assert rebased.layout == _layout(x=101)
         assert rebased.undo_depth == 0
@@ -113,7 +113,7 @@ def test_explicit_rebase_clears_stale_history_and_preserves_operation_count() ->
         with pytest.raises(ViewportHistoryControlError) as caught:
             await control.undo(application)
         assert caught.value.code == ViewportHistoryControlErrorCode.HISTORY_FAILURE
-        assert application.layouts == [control.snapshot.layout.model_copy(update={"placements": control.snapshot.layout.placements})] or application.layouts
+        assert application.layouts == [edited.layout]
 
     asyncio.run(scenario())
 
