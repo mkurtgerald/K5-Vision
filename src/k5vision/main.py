@@ -20,6 +20,8 @@ from k5vision.domain.devices import Device, DeviceCreate
 from k5vision.domain.users import UserRole
 from k5vision.operator_launch import OperatorLauncher, OperatorSourceResolver
 from k5vision.operator_launch_api import install_operator_launch_api
+from k5vision.operator_playback import OperatorPlaybackLauncher
+from k5vision.operator_playback_api import install_operator_playback_api
 from k5vision.operator_recording_api import install_operator_recording_api
 from k5vision.services.device_registry import (
     DEFAULT_DEVICE_CAPACITY,
@@ -71,7 +73,12 @@ class _BoundedDeviceRequestBody:
             scope["type"] != "http"
             or scope.get("method") != "POST"
             or scope.get("path")
-            not in {"/api/v1/devices", "/api/v1/operator/live", "/api/v1/operator/recordings"}
+            not in {
+                "/api/v1/devices",
+                "/api/v1/operator/live",
+                "/api/v1/operator/recordings",
+                "/api/v1/operator/playback",
+            }
         ):
             await self.app(scope, receive, send)
             return
@@ -222,6 +229,7 @@ def create_app(
     operator_source_resolver: OperatorSourceResolver | None = None,
     operator_launcher: OperatorLauncher | None = None,
     operator_recording_root: str | Path | None = None,
+    operator_playback_launcher: OperatorPlaybackLauncher | None = None,
 ) -> FastAPI:
     """Build the control plane with fail-closed authenticated durable device state."""
     if not 1 <= device_capacity <= MAX_DEVICE_CAPACITY:
@@ -315,6 +323,14 @@ def create_app(
         session_manager=session_manager,
         source_resolver=operator_source_resolver,
         recording_root=operator_recording_root,
+    )
+    install_operator_playback_api(
+        application,
+        registry=registry,
+        session_manager=session_manager,
+        source_resolver=operator_source_resolver,
+        recording_root=operator_recording_root,
+        launcher=operator_playback_launcher,
     )
 
     async def authenticate_control_plane(
