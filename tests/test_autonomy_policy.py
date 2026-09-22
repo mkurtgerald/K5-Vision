@@ -125,12 +125,14 @@ def test_execution_grant_is_single_use() -> None:
 def test_execution_grant_rejects_mismatched_proposal() -> None:
     item = proposal()
     grant = grant_for(item)
-    item.constraints["tampered"] = True
+    payload = item.model_dump(mode="json")
+    payload["constraints"] = {"tampered": True}
+    mismatched = ActionProposal.model_validate(payload)
     ledger = GrantLedger()
     assert (
         ledger.consume(
             grant,
-            proposal=item,
+            proposal=mismatched,
             now=item.created_at + timedelta(seconds=1),
         )
         is False
