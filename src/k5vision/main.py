@@ -34,6 +34,7 @@ CONTROL_PLANE_READ_TOKEN_ENV = "K5_CONTROL_PLANE_READ_TOKEN"
 CONTROL_PLANE_SITE_ENV = "K5_CONTROL_PLANE_SITE_ID"
 DEVICE_DB_PATH_ENV = "K5_DEVICE_DB_PATH"
 MAX_DEVICE_REQUEST_BYTES = 16_384
+MAX_CONTROL_PLANE_BEARER_LENGTH = 512
 DEFAULT_DEVICE_READ_RATE_LIMIT = 240
 DEFAULT_DEVICE_WRITE_RATE_LIMIT = 60
 DEFAULT_DEVICE_RATE_WINDOW_SECONDS = 60.0
@@ -182,7 +183,7 @@ def _resolve_bearer_token(
     if raw_token is None:
         return None, False
     token = raw_token.strip()
-    valid = bool(token and token.isascii())
+    valid = bool(token and token.isascii() and len(token) <= MAX_CONTROL_PLANE_BEARER_LENGTH)
     return (token if valid else None), True
 
 
@@ -308,7 +309,11 @@ def create_app(
         header = authorization[0] if authorization and len(authorization) == 1 else ""
         scheme, separator, credential = header.partition(" ")
         credential_valid = bool(
-            scheme.lower() == "bearer" and separator and credential and credential.isascii()
+            scheme.lower() == "bearer"
+            and separator
+            and credential
+            and credential.isascii()
+            and len(credential) <= MAX_CONTROL_PLANE_BEARER_LENGTH
         )
         if not credential_valid:
             raise HTTPException(
