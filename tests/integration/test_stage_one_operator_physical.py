@@ -277,8 +277,7 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
                     _diagnose_private_windows_live(source, private_credentials)
                 )
                 pytest.fail(
-                    "Stage One live operator runtime failed; "
-                    f"source-free diagnostic={diagnostic}"
+                    f"Stage One live operator runtime failed; source-free diagnostic={diagnostic}"
                 )
 
             receipt = launched.json()
