@@ -128,16 +128,24 @@ class BoundedWindowsOperatorRuntime:
         *,
         windows_runtime_factory: WindowsRuntimeFactory | None = None,
         presentation_runtime_factory: PresentationRuntimeFactory | None = None,
+        allow_single_live: bool = False,
     ) -> None:
+        if not isinstance(allow_single_live, bool):
+            raise WindowsOperatorRuntimeError(
+                WindowsOperatorRuntimeErrorCode.INVALID_CONFIGURATION,
+                "operator runtime single-live capability is invalid",
+            )
+        minimum_viewports = 1 if allow_single_live else 2
         if (
             not isinstance(layout, ViewportLayout)
-            or not 2 <= len(layout.placements) <= _MAX_VIEWPORTS
+            or not minimum_viewports <= len(layout.placements) <= _MAX_VIEWPORTS
         ):
             raise WindowsOperatorRuntimeError(
                 WindowsOperatorRuntimeErrorCode.INVALID_CONFIGURATION,
                 "operator runtime viewport layout is invalid",
             )
         self._layout = layout
+        self._minimum_viewports = minimum_viewports
         self._windows_runtime_factory = windows_runtime_factory or BoundedWindowsViewportRuntime
         self._presentation_runtime_factory = (
             presentation_runtime_factory or _default_presentation_runtime_factory
@@ -310,7 +318,7 @@ class BoundedWindowsOperatorRuntime:
                 )
             if (
                 not isinstance(layout, ViewportLayout)
-                or not 2 <= len(layout.placements) <= _MAX_VIEWPORTS
+                or not self._minimum_viewports <= len(layout.placements) <= _MAX_VIEWPORTS
             ):
                 raise WindowsOperatorRuntimeError(
                     WindowsOperatorRuntimeErrorCode.INVALID_CONFIGURATION,

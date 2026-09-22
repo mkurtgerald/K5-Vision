@@ -134,16 +134,17 @@ class BoundedMixedPresentation:
         consumer_timeout_seconds: float = 0.5,
         allow_all_live: bool = False,
     ) -> None:
-        if not 2 <= max_streams <= _MAX_STREAMS:
-            raise ValueError("max_streams must be between 2 and 16")
+        if not isinstance(allow_all_live, bool):
+            raise ValueError("allow_all_live must be boolean")
+        minimum_streams = 1 if allow_all_live else 2
+        if not minimum_streams <= max_streams <= _MAX_STREAMS:
+            raise ValueError(f"max_streams must be between {minimum_streams} and {_MAX_STREAMS}")
         if not 1 <= max_total_frames <= _MAX_TOTAL_FRAMES:
             raise ValueError("max_total_frames must be between 1 and 1000000")
         if not 1 <= max_total_frame_bytes <= _MAX_TOTAL_FRAME_BYTES:
             raise ValueError("max_total_frame_bytes must be between 1 and 17179869184")
         if not 0 < consumer_timeout_seconds <= 10:
             raise ValueError("consumer_timeout_seconds must be between zero and 10")
-        if not isinstance(allow_all_live, bool):
-            raise ValueError("allow_all_live must be boolean")
 
         self._max_streams = max_streams
         self._max_total_frames = max_total_frames
@@ -178,7 +179,8 @@ class BoundedMixedPresentation:
         streams: Sequence[MixedPresentationStream],
     ) -> tuple[MixedPresentationStream, ...]:
         selected = tuple(streams)
-        if not 2 <= len(selected) <= self._max_streams:
+        minimum_streams = 1 if self._allow_all_live else 2
+        if not minimum_streams <= len(selected) <= self._max_streams:
             raise MixedPresentationError(
                 MixedPresentationErrorCode.INVALID_STREAM_SET,
                 "mixed presentation stream count is outside the configured bound",

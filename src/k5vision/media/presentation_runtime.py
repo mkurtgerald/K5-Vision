@@ -108,15 +108,21 @@ class BoundedPresentationRuntime:
         stop_timeout_seconds: float = 5.0,
         allow_all_live: bool = False,
     ) -> None:
-        if not 2 <= max_streams <= _MAX_STREAMS:
+        if not isinstance(allow_all_live, bool):
             raise PresentationRuntimeError(
                 PresentationRuntimeErrorCode.INVALID_CONFIGURATION,
-                "presentation runtime max_streams must be between 2 and 16",
+                "presentation runtime live-only capability is invalid",
             )
-        if not 2 <= max_viewports <= _MAX_VIEWPORTS:
+        minimum_streams = 1 if allow_all_live else 2
+        if not minimum_streams <= max_streams <= _MAX_STREAMS:
             raise PresentationRuntimeError(
                 PresentationRuntimeErrorCode.INVALID_CONFIGURATION,
-                "presentation runtime max_viewports must be between 2 and 16",
+                f"presentation runtime max_streams must be between {minimum_streams} and 16",
+            )
+        if not minimum_streams <= max_viewports <= _MAX_VIEWPORTS:
+            raise PresentationRuntimeError(
+                PresentationRuntimeErrorCode.INVALID_CONFIGURATION,
+                f"presentation runtime max_viewports must be between {minimum_streams} and 16",
             )
         if max_viewports > max_streams:
             raise PresentationRuntimeError(
@@ -148,14 +154,9 @@ class BoundedPresentationRuntime:
                 PresentationRuntimeErrorCode.INVALID_CONFIGURATION,
                 "presentation runtime stop timeout is invalid",
             )
-        if not isinstance(allow_all_live, bool):
-            raise PresentationRuntimeError(
-                PresentationRuntimeErrorCode.INVALID_CONFIGURATION,
-                "presentation runtime live-only capability is invalid",
-            )
 
         selected_bindings = tuple(bindings)
-        if not 2 <= len(selected_bindings) <= max_viewports:
+        if not minimum_streams <= len(selected_bindings) <= max_viewports:
             raise PresentationRuntimeError(
                 PresentationRuntimeErrorCode.INVALID_CONFIGURATION,
                 "presentation runtime viewport binding count is outside the configured bound",
@@ -224,7 +225,8 @@ class BoundedPresentationRuntime:
         streams: Sequence[MixedPresentationStream],
     ) -> tuple[MixedPresentationStream, ...]:
         selected = tuple(streams)
-        if not 2 <= len(selected) <= self._max_streams:
+        minimum_streams = 1 if self._allow_all_live else 2
+        if not minimum_streams <= len(selected) <= self._max_streams:
             raise PresentationRuntimeError(
                 PresentationRuntimeErrorCode.INVALID_PLAN,
                 "presentation runtime stream count is outside the configured bound",
