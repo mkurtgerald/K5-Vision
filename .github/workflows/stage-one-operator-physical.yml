@@ -95,7 +95,6 @@ jobs:
         run: pytest tests/integration/test_stage_one_operator_physical.py -q --no-cov
 
       - name: Assert retained witness is source-free
-        if: always()
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -123,10 +122,9 @@ jobs:
           }
 
       - name: Upload source-free Stage One witness
-        if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: stage-one-operator-physical-witness
           path: artifacts/stage-one-operator-physical.json
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
