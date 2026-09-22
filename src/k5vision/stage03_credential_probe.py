@@ -8,6 +8,9 @@ import sys
 from k5vision.stage03_credentials import credentialized_uri, parse_cam_cred
 from k5vision.stage03_gst_candidate import run_gst_uri
 
+_SOURCE_ARG_HANDLE = "env:K5_STAGE03_SOURCE"
+_SOURCE_ENV = "K5_STAGE03_SOURCE"
+
 # A completed RTSP/RTP run proves authentication. A downstream caps/negotiation
 # failure also proves that RTSP authentication and session setup got far enough
 # to reach the media boundary; that failure belongs to runtime qualification,
@@ -37,13 +40,14 @@ def resolve_credential_index(source_uri: str, cam_cred: str) -> int | None:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
+    if len(sys.argv) != 2 or sys.argv[1] != _SOURCE_ARG_HANDLE:
         return 2
+    source_uri = os.getenv(_SOURCE_ENV)
     cam_cred = os.getenv("K5_STAGE03_CAM_CRED")
-    if not cam_cred:
+    if not source_uri or not source_uri.strip() or not cam_cred:
         return 2
     try:
-        index, statuses = probe_credential_candidates(sys.argv[1], cam_cred)
+        index, statuses = probe_credential_candidates(source_uri, cam_cred)
     except (TypeError, ValueError):
         return 2
     if index is None:

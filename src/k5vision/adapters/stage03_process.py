@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import time
 from collections.abc import Iterable, Sequence
@@ -23,11 +24,13 @@ from k5vision.adapters.runtime import (
 from k5vision.adapters.stage03_evidence import ResourceMeasurement, ResourceProfile
 
 _SOURCE_TOKEN = "{source}"
+_SOURCE_ARG_HANDLE = "env:K5_STAGE03_SOURCE"
+_SOURCE_ENV = "K5_STAGE03_SOURCE"
 _MAX_CAPTURE_LOAD = 32
 
 
 class ProcessCandidateSpec(BaseModel):
-    """Safe argv-only process specification used for local qualification capture."""
+    """Fixed process specification with a non-sensitive private-source handle."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -48,10 +51,18 @@ class ProcessCandidateSpec(BaseModel):
         return self
 
     def build_argv(self, source_uri: str) -> list[str]:
-        """Return argv with the source inserted as one argument, never through a shell."""
-        if not source_uri.strip():
+        """Return argv containing only a fixed handle, never the private source value."""
+        if not source_uri.strip() or "\x00" in source_uri:
             raise ValueError("source_uri must not be empty")
-        return [source_uri if arg == _SOURCE_TOKEN else arg for arg in self.argv]
+        return [_SOURCE_ARG_HANDLE if arg == _SOURCE_TOKEN else arg for arg in self.argv]
+
+    def build_environment(self, source_uri: str) -> dict[str, str]:
+        """Bind the private source to the child environment instead of process argv."""
+        if not source_uri.strip() or "\x00" in source_uri:
+            raise ValueError("source_uri must not be empty")
+        environment = os.environ.copy()
+        environment[_SOURCE_ENV] = source_uri
+        return environment
 
 
 class Stage03Capture(BaseModel):
@@ -83,7 +94,7 @@ class Stage03Capture(BaseModel):
 
 
 class ProcessRuntimeCandidate(RuntimeCandidate):
-    """Measure one external candidate through a bounded argv-only subprocess."""
+    """Measure one external candidate through a bounded fixed-argv subprocess."""
 
     def __init__(self, spec: ProcessCandidateSpec) -> None:
         self.spec = spec
@@ -194,6 +205,7 @@ class ProcessRuntimeCandidate(RuntimeCandidate):
         interrupt_after: float | None = None,
     ) -> RuntimeSample:
         argv = self.spec.build_argv(source_uri)
+        environment = self.spec.build_environment(source_uri)
         started = time.perf_counter()
         process = subprocess.Popen(
             argv,
@@ -201,6 +213,7 @@ class ProcessRuntimeCandidate(RuntimeCandidate):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             shell=False,
+            env=environment,
         )
         monitored = psutil.Process(process.pid)
         known_processes = {monitored.pid: monitored}

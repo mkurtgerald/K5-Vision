@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import argparse
 import os
+import sys
 
 from k5vision.media.native_rtsp_pipeline import (
     NativeRtspPipeline,
@@ -14,6 +14,8 @@ from k5vision.media.native_rtsp_pipeline import (
 from k5vision.stage03_credentials import selected_source_uri
 
 _ALLOWED_TRANSPORTS = ("tcp", "udp")
+_SOURCE_ARG_HANDLE = "env:K5_STAGE03_SOURCE"
+_SOURCE_ENV = "K5_STAGE03_SOURCE"
 _GST_AUTH_FAILURE = 41
 _GST_CONNECT_FAILURE = 42
 _GST_NEGOTIATION_FAILURE = 43
@@ -144,11 +146,16 @@ def run_candidate(transport: str, source_uri: str) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--transport", choices=_ALLOWED_TRANSPORTS, required=True)
-    parser.add_argument("source")
-    args = parser.parse_args()
-    return run_candidate(args.transport, args.source)
+    args = sys.argv[1:]
+    if len(args) != 3 or args[0] != "--transport":
+        return 2
+    transport, source_handle = args[1], args[2]
+    if transport not in _ALLOWED_TRANSPORTS or source_handle != _SOURCE_ARG_HANDLE:
+        return 2
+    source_uri = os.getenv(_SOURCE_ENV)
+    if not source_uri or not source_uri.strip():
+        return 2
+    return run_candidate(transport, source_uri)
 
 
 if __name__ == "__main__":

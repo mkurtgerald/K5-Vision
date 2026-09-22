@@ -88,8 +88,13 @@ def test_probe_failure_emits_only_deduplicated_sanitized_statuses(
     capsys,
 ) -> None:
     statuses = iter((42, 41, 42))
+    monkeypatch.setenv("K5_STAGE03_SOURCE", "rtsp://example/stream1?token=private#fragment")
     monkeypatch.setenv("K5_STAGE03_CAM_CRED", "viewer\n\nfirst\n\nsecond!\n\nthird")
-    monkeypatch.setattr(sys, "argv", ["stage03_credential_probe", "rtsp://example/stream1"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["stage03_credential_probe", "env:K5_STAGE03_SOURCE"],
+    )
     monkeypatch.setattr(
         stage03_credential_probe,
         "run_gst_uri",
@@ -104,6 +109,64 @@ def test_probe_failure_emits_only_deduplicated_sanitized_statuses(
     assert "first" not in captured.err
     assert "second" not in captured.err
     assert "rtsp://" not in captured.err
+    assert "token=" not in captured.err
+    assert "fragment" not in captured.err
+
+
+def test_probe_main_rejects_private_source_as_positional_argument_without_output(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv("K5_STAGE03_SOURCE", "rtsp://example/stream1")
+    monkeypatch.setenv("K5_STAGE03_CAM_CRED", "viewer\n\nfirst")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["stage03_credential_probe", "rtsp://user:secret@example/stream1?token=x#y"],
+    )
+
+    assert stage03_credential_probe.main() == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_candidate_main_resolves_source_from_environment_handle(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+    source = "rtsp://example/stream1?token=private#fragment"
+    monkeypatch.setenv("K5_STAGE03_SOURCE", source)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["stage03_gst_candidate", "--transport", "tcp", "env:K5_STAGE03_SOURCE"],
+    )
+
+    def fake_run(transport: str, uri: str) -> int:
+        captured["transport"] = transport
+        captured["uri"] = uri
+        return 0
+
+    monkeypatch.setattr(stage03_gst_candidate, "run_candidate", fake_run)
+
+    assert stage03_gst_candidate.main() == 0
+    assert captured == {"transport": "tcp", "uri": source}
+    assert source not in " ".join(sys.argv)
+
+
+def test_candidate_main_rejects_private_source_as_positional_argument(monkeypatch) -> None:
+    monkeypatch.setenv("K5_STAGE03_SOURCE", "rtsp://example/stream1")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["stage03_gst_candidate", "--transport", "tcp", "rtsp://example/stream1"],
+    )
+    monkeypatch.setattr(
+        stage03_gst_candidate,
+        "run_candidate",
+        lambda *_args, **_kwargs: pytest.fail("unsafe positional source must not run"),
+    )
+
+    assert stage03_gst_candidate.main() == 2
 
 
 def test_wrapper_applies_selected_credential_without_logging(monkeypatch) -> None:
