@@ -74,6 +74,26 @@ class BoundedViewportEditorHistory:
             operations=self._operations,
         )
 
+    @property
+    def undo_candidate(self) -> ViewportLayout:
+        """Return the next undo layout without mutating accepted history state."""
+        if not self._undo:
+            raise ViewportEditorHistoryError(
+                ViewportEditorHistoryErrorCode.NOTHING_TO_UNDO,
+                "no viewport edit is available to undo",
+            )
+        return self._undo[-1]
+
+    @property
+    def redo_candidate(self) -> ViewportLayout:
+        """Return the next redo layout without mutating accepted history state."""
+        if not self._redo:
+            raise ViewportEditorHistoryError(
+                ViewportEditorHistoryErrorCode.NOTHING_TO_REDO,
+                "no viewport edit is available to redo",
+            )
+        return self._redo[-1]
+
     def _consume(self) -> None:
         if self._operations >= self._max_operations:
             raise ViewportEditorHistoryError(
@@ -93,25 +113,17 @@ class BoundedViewportEditorHistory:
         return self.snapshot
 
     def undo(self) -> ViewportEditorHistorySnapshot:
-        if not self._undo:
-            raise ViewportEditorHistoryError(
-                ViewportEditorHistoryErrorCode.NOTHING_TO_UNDO,
-                "no viewport edit is available to undo",
-            )
+        previous = self.undo_candidate
         self._consume()
-        previous = self._undo.pop()
+        self._undo.pop()
         self._redo.append(self._layout)
         self._layout = previous
         return self.snapshot
 
     def redo(self) -> ViewportEditorHistorySnapshot:
-        if not self._redo:
-            raise ViewportEditorHistoryError(
-                ViewportEditorHistoryErrorCode.NOTHING_TO_REDO,
-                "no viewport edit is available to redo",
-            )
+        following = self.redo_candidate
         self._consume()
-        following = self._redo.pop()
+        self._redo.pop()
         self._undo.append(self._layout)
         self._layout = following
         return self.snapshot
