@@ -21,6 +21,7 @@ _TARGETED_DISPATCH = {
     "stage34-presentation-replacement.yml",
     "stage35-windows-presentation-surface.yml",
     "stage-one-operator-physical.yml",
+    "stage-one-remaining-physical-suite.yml",
 }
 
 
@@ -47,7 +48,7 @@ def test_stage03_retained_evidence_requires_success() -> None:
 
 
 def test_qualification_inventory_remains_present() -> None:
-    assert len(_PHYSICAL) == 25
+    assert len(_PHYSICAL) == 26
     names = {path.name for path in _PHYSICAL}
     assert _TARGETED_DISPATCH.issubset(names)
     assert all(path.is_file() for path in _PHYSICAL)
