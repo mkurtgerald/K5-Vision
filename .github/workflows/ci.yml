@@ -40,14 +40,39 @@ jobs:
         continue-on-error: true
         run: pytest
 
+      - name: Build and smoke-test installable wheel
+        id: package
+        continue-on-error: true
+        shell: bash
+        run: |
+          python -m pip check
+          rm -rf dist .package-smoke
+          python -m pip wheel . --no-deps --wheel-dir dist
+          wheel_count="$(find dist -maxdepth 1 -type f -name 'k5_vision-*.whl' | wc -l)"
+          if [ "$wheel_count" -ne 1 ]; then
+            echo "expected exactly one k5-vision wheel, found $wheel_count"
+            exit 1
+          fi
+          wheel="$(find dist -maxdepth 1 -type f -name 'k5_vision-*.whl' -print -quit)"
+          python -m venv .package-smoke
+          .package-smoke/bin/python -m pip install --no-deps "$wheel"
+          .package-smoke/bin/python - <<'PY'
+          import importlib.util
+          import k5vision
+
+          assert k5vision.__version__ == "0.1.0"
+          assert importlib.util.find_spec("k5vision.main") is not None
+          PY
+
       - name: Enforce quality gate
         if: always()
         env:
           LINT: ${{ steps.lint.outcome }}
           FORMAT: ${{ steps.format.outcome }}
           TESTS: ${{ steps.tests.outcome }}
+          PACKAGE: ${{ steps.package.outcome }}
         run: |
-          echo "lint=$LINT format=$FORMAT tests=$TESTS"
-          if [ "$LINT" != "success" ] || [ "$FORMAT" != "success" ] || [ "$TESTS" != "success" ]; then
+          echo "lint=$LINT format=$FORMAT tests=$TESTS package=$PACKAGE"
+          if [ "$LINT" != "success" ] || [ "$FORMAT" != "success" ] || [ "$TESTS" != "success" ] || [ "$PACKAGE" != "success" ]; then
             exit 1
           fi
