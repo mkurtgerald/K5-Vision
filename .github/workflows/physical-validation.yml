@@ -2,17 +2,6 @@ name: Physical Qualification
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/physical-validation.yml
-      - config/stage03-gstreamer-candidates.json
-      - config/stage03-gstreamer-reviews.json
-      - scripts/provision-stage03-gstreamer.ps1
-      - src/k5vision/stage03_finalize.py
-      - src/k5vision/stage03_gst_candidate.py
-      - src/k5vision/stage03_credentials.py
-      - src/k5vision/stage03_credential_probe.py
 
 permissions:
   contents: read
@@ -211,7 +200,7 @@ jobs:
             --selection-output artifacts/stage03-selection.json
 
       - name: Upload retained qualification evidence
-        if: always()
+        if: success()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: stage03-physical-evidence
