@@ -11,7 +11,11 @@ from k5vision.media.windows_operator_runtime import (
     WindowsOperatorRuntimeSnapshot,
     WindowsOperatorRuntimeState,
 )
-from k5vision.operator_launch import OperatorLaunchError, OperatorLaunchErrorCode, ResolvedLiveSource
+from k5vision.operator_launch import (
+    OperatorLaunchError,
+    OperatorLaunchErrorCode,
+    ResolvedLiveSource,
+)
 from k5vision.operator_runtime import (
     PrivateStageOneSourceResolver,
     WindowsSingleLiveOperatorLauncher,
