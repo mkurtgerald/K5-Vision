@@ -1,6 +1,7 @@
 """K5 Vision control-plane API."""
 
 from contextlib import asynccontextmanager
+from enum import StrEnum
 from hmac import compare_digest
 from os import environ
 from pathlib import Path
@@ -23,9 +24,15 @@ from k5vision.services.device_registry import (
 )
 
 CONTROL_PLANE_TOKEN_ENV = "K5_CONTROL_PLANE_TOKEN"
+CONTROL_PLANE_READ_TOKEN_ENV = "K5_CONTROL_PLANE_READ_TOKEN"
 CONTROL_PLANE_SITE_ENV = "K5_CONTROL_PLANE_SITE_ID"
 DEVICE_DB_PATH_ENV = "K5_DEVICE_DB_PATH"
 MAX_DEVICE_REQUEST_BYTES = 16_384
+
+
+class _DeviceAccess(StrEnum):
+    READ = "read"
+    WRITE = "write"
 
 
 class _RequestBodyTooLarge(Exception):
@@ -112,12 +119,17 @@ class _BoundedDeviceRequestBody:
         await send({"type": "http.response.body", "body": body})
 
 
-def _resolve_control_plane_token(explicit_token: str | None) -> str | None:
-    token = explicit_token if explicit_token is not None else environ.get(CONTROL_PLANE_TOKEN_ENV)
-    if token is None:
-        return None
-    token = token.strip()
-    return token if token and token.isascii() else None
+def _resolve_bearer_token(
+    explicit_token: str | None,
+    *,
+    environment_name: str,
+) -> tuple[str | None, bool]:
+    raw_token = explicit_token if explicit_token is not None else environ.get(environment_name)
+    if raw_token is None:
+        return None, False
+    token = raw_token.strip()
+    valid = bool(token and token.isascii())
+    return (token if valid else None), True
 
 
 def _resolve_control_plane_site(explicit_site: str | None) -> str | None:
@@ -140,6 +152,7 @@ def _resolve_device_db_path(explicit_path: str | Path | None) -> str | None:
 def create_app(
     *,
     control_plane_token: str | None = None,
+    control_plane_read_token: str | None = None,
     control_plane_site_id: str | None = None,
     device_db_path: str | Path | None = None,
     device_capacity: int = DEFAULT_DEVICE_CAPACITY,
@@ -151,7 +164,20 @@ def create_app(
     if not 1024 <= max_device_request_bytes <= 1_048_576:
         raise ValueError("max_device_request_bytes must be between 1024 and 1048576")
 
-    expected_token = _resolve_control_plane_token(control_plane_token)
+    write_token, write_token_configured = _resolve_bearer_token(
+        control_plane_token,
+        environment_name=CONTROL_PLANE_TOKEN_ENV,
+    )
+    read_token, read_token_configured = _resolve_bearer_token(
+        control_plane_read_token,
+        environment_name=CONTROL_PLANE_READ_TOKEN_ENV,
+    )
+    auth_configuration_valid = write_token_configured and write_token is not None
+    if read_token_configured:
+        auth_configuration_valid = auth_configuration_valid and read_token is not None
+    if write_token is not None and read_token is not None and compare_digest(write_token, read_token):
+        auth_configuration_valid = False
+
     site_id = _resolve_control_plane_site(control_plane_site_id)
     database_path = _resolve_device_db_path(device_db_path)
     registry: DeviceRegistry | None = None
@@ -185,10 +211,10 @@ def create_app(
     )
     application.state.device_registry = registry
 
-    async def require_control_plane_auth(
+    async def authenticate_control_plane(
         authorization: Annotated[list[str] | None, Header()] = None,
-    ) -> None:
-        if expected_token is None:
+    ) -> _DeviceAccess:
+        if not auth_configuration_valid or write_token is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Control-plane authentication is not configured",
@@ -196,13 +222,16 @@ def create_app(
 
         header = authorization[0] if authorization and len(authorization) == 1 else ""
         scheme, separator, credential = header.partition(" ")
-        if (
-            scheme.lower() != "bearer"
-            or not separator
-            or not credential
-            or not credential.isascii()
-            or not compare_digest(credential, expected_token)
-        ):
+        credential_valid = bool(
+            scheme.lower() == "bearer" and separator and credential and credential.isascii()
+        )
+        write_match = credential_valid and compare_digest(credential, write_token)
+        read_match = bool(
+            credential_valid
+            and read_token is not None
+            and compare_digest(credential, read_token)
+        )
+        if not write_match and not read_match:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unauthorized",
@@ -213,6 +242,16 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Control-plane device state is not configured",
             )
+        return _DeviceAccess.WRITE if write_match else _DeviceAccess.READ
+
+    async def require_device_write(
+        access: Annotated[_DeviceAccess, Depends(authenticate_control_plane)],
+    ) -> None:
+        if access is not _DeviceAccess.WRITE:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient device permission",
+            )
 
     def require_registry() -> DeviceRegistry:
         if registry is None:
@@ -222,7 +261,8 @@ def create_app(
             )
         return registry
 
-    device_auth = [Depends(require_control_plane_auth)]
+    device_read_auth = [Depends(authenticate_control_plane)]
+    device_write_auth = [Depends(require_device_write)]
 
     @application.get("/api/v1/health", tags=["system"])
     async def health() -> dict[str, str]:
@@ -232,7 +272,7 @@ def create_app(
         "/api/v1/devices",
         response_model=list[Device],
         tags=["devices"],
-        dependencies=device_auth,
+        dependencies=device_read_auth,
     )
     async def list_devices(
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -252,7 +292,7 @@ def create_app(
         status_code=status.HTTP_201_CREATED,
         responses={status.HTTP_200_OK: {"description": "Existing identical enrollment"}},
         tags=["devices"],
-        dependencies=device_auth,
+        dependencies=device_write_auth,
     )
     async def register_device(payload: DeviceCreate, response: Response) -> Device:
         try:
@@ -280,7 +320,7 @@ def create_app(
         "/api/v1/devices/{device_id}",
         response_model=Device,
         tags=["devices"],
-        dependencies=device_auth,
+        dependencies=device_read_auth,
     )
     async def get_device(device_id: UUID) -> Device:
         try:
