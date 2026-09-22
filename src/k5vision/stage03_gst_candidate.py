@@ -4,17 +4,16 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
-import subprocess
 
+from k5vision.media.native_rtsp_pipeline import (
+    NativeRtspPipeline,
+    NativeRtspPipelineError,
+    NativeRtspPipelineUnavailable,
+    quote_pipeline_value,
+)
 from k5vision.stage03_credentials import selected_source_uri
 
-_GST_LAUNCH = "gst-launch-1.0"
 _ALLOWED_TRANSPORTS = ("tcp", "udp")
-
-# Exit statuses intentionally expose only a coarse failure class to the outer
-# qualification harness. Raw GStreamer stderr may contain a sensitive RTSP URI
-# and is therefore never emitted or retained.
 _GST_AUTH_FAILURE = 41
 _GST_CONNECT_FAILURE = 42
 _GST_NEGOTIATION_FAILURE = 43
@@ -25,43 +24,21 @@ _GST_WRAPPER_OS_FAILURE = 47
 _GST_WRAPPER_INTERNAL_FAILURE = 48
 
 
-def build_gst_argv(transport: str, source_uri: str) -> list[str]:
-    """Build one bounded raw-RTP receive path without invoking a command shell."""
+def build_gst_pipeline(transport: str, source_uri: str) -> str:
+    """Build one finite raw-RTP receive path for in-process GStreamer parsing."""
     if transport not in _ALLOWED_TRANSPORTS:
         raise ValueError("unsupported transport candidate")
-    if not source_uri.strip():
-        raise ValueError("source_uri must not be empty")
-
-    # Stage 03 qualifies the RTSP/RTP transport/runtime boundary, not decode.
-    # Avoid media-specific dynamic-pad selection here: cameras may advertise
-    # video, audio, and metadata RTP streams, and unselected pads can otherwise
-    # masquerade as transport failures. The identity element produces EOS after
-    # a finite number of received RTP buffers so every successful measurement
-    # terminates deterministically without retaining media.
-    return [
-        _GST_LAUNCH,
-        "-q",
-        "rtspsrc",
-        f"location={source_uri}",
-        f"protocols={transport}",
-        "latency=100",
-        "tcp-timeout=5000000",
-        "teardown-timeout=0",
-        "!",
-        "queue",
-        "!",
-        "identity",
-        "eos-after=60",
-        "!",
-        "fakesink",
-        "sync=false",
-    ]
+    location = quote_pipeline_value(source_uri)
+    return (
+        f"rtspsrc location={location} protocols={transport} latency=100 "
+        "tcp-timeout=5000000 teardown-timeout=0 "
+        "! queue ! identity eos-after=60 ! fakesink sync=false"
+    )
 
 
 def classify_gst_failure(stderr: str) -> int:
-    """Map raw GStreamer diagnostics to a bounded secret-safe exit status."""
+    """Map legacy raw diagnostics to a bounded secret-safe status."""
     normalized = stderr.casefold()
-
     if any(
         marker in normalized
         for marker in (
@@ -108,55 +85,50 @@ def classify_gst_failure(stderr: str) -> int:
         return _GST_NEGOTIATION_FAILURE
     if any(
         marker in normalized
-        for marker in (
-            "404",
-            "not found",
-            "resource not found",
-            "no such resource",
-        )
+        for marker in ("404", "not found", "resource not found", "no such resource")
     ):
         return _GST_SOURCE_FAILURE
     if any(
         marker in normalized
-        for marker in (
-            "erroneous pipeline",
-            "no property",
-            "syntax error",
-            "no element",
-        )
+        for marker in ("erroneous pipeline", "no property", "syntax error", "no element")
     ):
         return _GST_PIPELINE_FAILURE
     return _GST_OTHER_FAILURE
 
 
-def run_gst_uri(transport: str, source_uri: str) -> int:
-    """Run GStreamer against one already-resolved URI and return only a safe status."""
-    executable = shutil.which(_GST_LAUNCH)
-    if executable is None:
-        return 127
-
-    argv = build_gst_argv(transport, source_uri)
-    argv[0] = executable
-
+def _qualification_timeout_seconds() -> float:
+    raw = os.getenv("K5_STAGE03_TIMEOUT", "10").strip()
     try:
-        completed = subprocess.run(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            shell=False,
-            check=False,
-        )
-    except OSError:
-        return _GST_WRAPPER_OS_FAILURE
-    except Exception:
-        # Do not propagate exception text because it may embed argv/source data.
-        return _GST_WRAPPER_INTERNAL_FAILURE
+        timeout = float(raw)
+    except ValueError:
+        return 10.0
+    return min(max(timeout, 0.1), 120.0)
 
-    if completed.returncode == 0:
+
+def run_gst_uri(transport: str, source_uri: str) -> int:
+    """Run one finite native GStreamer proof and return only a sanitized status."""
+    pipeline: NativeRtspPipeline | None = None
+    try:
+        pipeline = NativeRtspPipeline(
+            build_gst_pipeline(transport, source_uri),
+            startup_probe_seconds=min(_qualification_timeout_seconds(), 0.5),
+        )
+        terminal = pipeline.wait_for_terminal(timeout_seconds=_qualification_timeout_seconds())
+    except NativeRtspPipelineUnavailable:
+        return 127
+    except (NativeRtspPipelineError, OSError):
+        return _GST_OTHER_FAILURE
+    except Exception:
+        return _GST_WRAPPER_INTERNAL_FAILURE
+    finally:
+        if pipeline is not None:
+            pipeline.close(timeout_seconds=1.0)
+
+    if terminal == "eos":
         return 0
-    stderr = (completed.stderr or b"").decode("utf-8", errors="replace")
-    return classify_gst_failure(stderr)
+    if terminal == "timeout":
+        return _GST_CONNECT_FAILURE
+    return _GST_OTHER_FAILURE
 
 
 def run_candidate(transport: str, source_uri: str) -> int:
