@@ -6,6 +6,9 @@ on:
     branches: [main]
     paths:
       - .github/workflows/current-gate-viewport-editor.yml
+      - src/k5vision/operator_runtime.py
+      - src/k5vision/stage_one_app.py
+      - tests/test_operator_runtime.py
       - src/k5vision/media/viewport_editor.py
       - src/k5vision/media/viewport_editor_history.py
       - src/k5vision/media/viewport_history_control.py
@@ -22,6 +25,9 @@ on:
     branches: [main]
     paths:
       - .github/workflows/current-gate-viewport-editor.yml
+      - src/k5vision/operator_runtime.py
+      - src/k5vision/stage_one_app.py
+      - tests/test_operator_runtime.py
       - src/k5vision/media/viewport_editor.py
       - src/k5vision/media/viewport_editor_history.py
       - src/k5vision/media/viewport_history_control.py
