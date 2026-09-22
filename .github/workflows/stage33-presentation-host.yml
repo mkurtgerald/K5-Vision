@@ -3,6 +3,10 @@ name: Stage 33 Re-entrant Presentation Host Qualification
 on:
   workflow_dispatch:
     inputs:
+      reviewed_branch:
+        description: Exact branch whose current head is being qualified
+        required: true
+        type: string
       reviewed_sha:
         description: Exact reviewed commit selected for this qualification
         required: true
@@ -17,20 +21,46 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       github.actor == github.repository_owner &&
       github.triggering_actor == github.repository_owner &&
-      inputs.reviewed_sha == github.sha
+      github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 50
     env:
       K5_STAGE33_PHYSICAL: "1"
       K5_STAGE33_OUTPUT: ${{ github.workspace }}\artifacts\stage33-presentation-host.json
       K5_STAGE33_ABI_OUTPUT: ${{ github.workspace }}\artifacts\stage33-native-abi.json
-      K5_STAGE33_REVISION: ${{ github.sha }}
+      K5_STAGE33_REVISION: ${{ inputs.reviewed_sha }}
 
     steps:
+      - name: Verify exact reviewed branch head
+        shell: powershell
+        env:
+          K5_REVIEWED_BRANCH: ${{ inputs.reviewed_branch }}
+          K5_REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+          K5_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:K5_REVIEWED_BRANCH)) {
+            throw "Reviewed branch is required."
+          }
+          if ($env:K5_REVIEWED_SHA -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "Reviewed SHA must be an exact 40-character commit SHA."
+          }
+          $encodedBranch = [uri]::EscapeDataString($env:K5_REVIEWED_BRANCH)
+          $headers = @{
+            Authorization = "Bearer $env:K5_GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/branches/$encodedBranch"
+          $branch = Invoke-RestMethod -Method Get -Headers $headers -Uri $uri
+          if ($branch.commit.sha -ne $env:K5_REVIEWED_SHA) {
+            throw "Reviewed SHA is not the current head of the reviewed branch."
+          }
+
       - name: Checkout exact Stage 33 revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.reviewed_sha }}
           persist-credentials: false
 
       - name: Provision isolated reviewed GStreamer runtime
