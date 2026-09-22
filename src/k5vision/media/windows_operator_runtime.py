@@ -120,7 +120,12 @@ def _default_presentation_runtime_factory(
 
 
 class BoundedWindowsOperatorRuntime:
-    """Run one exact stream plan through one arbitrary Windows viewport layout."""
+    """Run one exact stream plan through one arbitrary Windows viewport layout.
+
+    Single-live operation is deliberately opt-in for the Stage-One physical launch
+    bridge. The default keeps the previously accepted multi-viewport contract so a
+    caller cannot silently broaden the runtime's accepted operating envelope.
+    """
 
     def __init__(
         self,
