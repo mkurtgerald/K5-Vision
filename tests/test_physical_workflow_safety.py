@@ -130,9 +130,9 @@ def test_qualification_upload_requires_its_validation_outcome(path: Path) -> Non
 
 
 def test_remaining_stage_one_suite_covers_every_required_gate() -> None:
-    text = (_WORKFLOWS / "stage-one-remaining-physical-suite.yml").read_text(
-        encoding="utf-8"
-    )
+    text = (
+        _WORKFLOWS / "stage-one-remaining-physical-suite.yml"
+    ).read_text(encoding="utf-8")
     required_tests = {
         "tests/integration/test_stage05_physical.py",
         "tests/integration/test_stage06_physical.py",
