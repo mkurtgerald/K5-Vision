@@ -11,6 +11,17 @@ _PHYSICAL = tuple(
     for path in sorted(_WORKFLOWS.glob("*.yml"))
     if "runs-on: [self-hosted," in path.read_text(encoding="utf-8")
 )
+_TARGETED_DISPATCH = {
+    "stage04-physical.yml",
+    "stage05-physical.yml",
+    "stage06-physical.yml",
+    "stage31-presentation-controller.yml",
+    "stage32-presentation-runtime.yml",
+    "stage33-presentation-host.yml",
+    "stage34-presentation-replacement.yml",
+    "stage35-windows-presentation-surface.yml",
+    "stage-one-operator-physical.yml",
+}
 
 
 def _workflow_text() -> str:
@@ -36,39 +47,69 @@ def test_stage03_retained_evidence_requires_success() -> None:
 
 
 def test_qualification_inventory_remains_present() -> None:
-    assert len(_PHYSICAL) == 24
-    assert {
-        "stage04-physical.yml",
-        "stage05-physical.yml",
-        "stage35-windows-presentation-surface.yml",
-    }.issubset({path.name for path in _PHYSICAL})
+    assert len(_PHYSICAL) == 25
+    names = {path.name for path in _PHYSICAL}
+    assert _TARGETED_DISPATCH.issubset(names)
     assert all(path.is_file() for path in _PHYSICAL)
 
 
 @pytest.mark.parametrize("path", _PHYSICAL, ids=lambda path: path.stem)
 def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
-    triggers = text.split("\non:\n", maxsplit=1)[1].split("\npermissions:", maxsplit=1)[0]
-    assert triggers == (
-        "  workflow_dispatch:\n"
-        "    inputs:\n"
-        "      reviewed_sha:\n"
-        "        description: Exact reviewed commit selected for this qualification\n"
-        "        required: true\n"
-        "        type: string\n"
-    )
-    admission = text.split("\njobs:\n", maxsplit=1)[1].split("    runs-on:", maxsplit=1)[0]
+    triggers = text.split("\non:\n", maxsplit=1)[1].split(
+        "\npermissions:", maxsplit=1
+    )[0]
+    admission = text.split("\njobs:\n", maxsplit=1)[1].split(
+        "    runs-on:", maxsplit=1
+    )[0]
+
     assert "    if: >-\n" in admission
     assert "github.event_name == 'workflow_dispatch' &&" in admission
     assert "github.actor == github.repository_owner &&" in admission
     assert "github.triggering_actor == github.repository_owner &&" in admission
-    assert "inputs.reviewed_sha == github.sha\n" in admission
     assert "github.event.pull_request.head.sha" not in text
-    checkouts = [part for part in text.split("      - name: ") if "uses: actions/checkout@" in part]
+
+    checkouts = [
+        part for part in text.split("      - name: ")
+        if "uses: actions/checkout@" in part
+    ]
     assert checkouts
-    for checkout in checkouts:
-        assert "          ref: ${{ github.sha }}\n" in checkout
-        assert "          persist-credentials: false\n" in checkout
+
+    if path.name in _TARGETED_DISPATCH:
+        assert triggers == (
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      reviewed_branch:\n"
+            "        description: Exact branch whose current head is being qualified\n"
+            "        required: true\n"
+            "        type: string\n"
+            "      reviewed_sha:\n"
+            "        description: Exact reviewed commit selected for this qualification\n"
+            "        required: true\n"
+            "        type: string\n"
+        )
+        assert "github.ref == 'refs/heads/main'\n" in admission
+        assert "inputs.reviewed_sha == github.sha" not in admission
+        assert "K5_REVIEWED_BRANCH: ${{ inputs.reviewed_branch }}" in text
+        assert "K5_REVIEWED_SHA: ${{ inputs.reviewed_sha }}" in text
+        assert "https://api.github.com/repos/$env:GITHUB_REPOSITORY/branches/" in text
+        assert "$branch.commit.sha -ne $env:K5_REVIEWED_SHA" in text
+        for checkout in checkouts:
+            assert "          ref: ${{ inputs.reviewed_sha }}\n" in checkout
+            assert "          persist-credentials: false\n" in checkout
+    else:
+        assert triggers == (
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      reviewed_sha:\n"
+            "        description: Exact reviewed commit selected for this qualification\n"
+            "        required: true\n"
+            "        type: string\n"
+        )
+        assert "inputs.reviewed_sha == github.sha\n" in admission
+        for checkout in checkouts:
+            assert "          ref: ${{ github.sha }}\n" in checkout
+            assert "          persist-credentials: false\n" in checkout
 
 
 @pytest.mark.parametrize("path", _PHYSICAL, ids=lambda path: path.stem)
@@ -86,7 +127,10 @@ def test_qualification_upload_requires_its_validation_outcome(path: Path) -> Non
         for upload in uploads:
             assert steps.index(validation) < steps.index(upload)
             header = upload.split("        uses:", maxsplit=1)[0]
-            assert "        if: always() && steps.safe_evidence.outcome == 'success'\n" in header
+            assert (
+                "        if: always() && steps.safe_evidence.outcome == 'success'\n"
+                in header
+            )
     else:
         for upload in uploads:
             header = upload.split("        uses:", maxsplit=1)[0]
