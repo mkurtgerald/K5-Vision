@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import os
 import pathlib
 import re
 import typing
@@ -206,9 +207,6 @@ class AtomicLocalRecordingSink:
         if self._file is None:
             raise OSError
         self._file.flush()
-        self._file.flush()
-        import os
-
         os.fsync(self._file.fileno())
         self._file.close()
         self._file = None
