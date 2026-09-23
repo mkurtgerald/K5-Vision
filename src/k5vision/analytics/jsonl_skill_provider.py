@@ -127,7 +127,9 @@ class JsonlSkillProvider:
             except TimeoutError as exc:
                 raise SkillProviderError("analytics skill response timed out") from exc
             except (ValueError, asyncio.LimitOverrunError) as exc:
-                raise SkillProviderError(\n                    "analytics skill response exceeded configured bound"\n                ) from exc
+                raise SkillProviderError(
+                    "analytics skill response exceeded configured bound"
+                ) from exc
 
             if not line:
                 raise SkillProviderError("analytics skill process exited unexpectedly")
