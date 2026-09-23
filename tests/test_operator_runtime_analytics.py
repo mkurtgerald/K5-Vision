@@ -126,6 +126,9 @@ def test_launcher_returns_source_free_analytics_outcome(
                 rendered_boxes=11,
             )
 
+        async def run(self, _source_uri: str, _consumer: object) -> object:
+            raise AssertionError("fake Windows runtime owns execution")
+
     monkeypatch.setattr(
         operator_runtime_module,
         "BoundedAnalyticsOverlayDelivery",
