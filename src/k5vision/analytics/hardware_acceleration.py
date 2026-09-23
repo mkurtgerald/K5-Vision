@@ -62,11 +62,11 @@ def _nvidia_smi_path() -> str | None:
         return None
 
     candidates = (
-        Path(platform.os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
         / "NVIDIA Corporation"
         / "NVSMI"
         / "nvidia-smi.exe",
-        Path(platform.os.environ.get("WINDIR", r"C:\Windows"))
+        Path(os.environ.get("WINDIR", r"C:\Windows"))
         / "System32"
         / "nvidia-smi.exe",
     )
