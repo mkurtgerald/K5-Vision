@@ -113,9 +113,9 @@ class BoundedAnalyticsOverlayDelivery:
         self._capacity_bypasses = 0
         self._stale_bypasses = 0
         self._rendered_boxes = 0
-        self._provider_task: asyncio.Task[
-            tuple[tuple[DetectionOverlayObservation, ...], int]
-        ] | None = None
+        self._provider_task: (
+            asyncio.Task[tuple[tuple[DetectionOverlayObservation, ...], int]] | None
+        ) = None
         self._latest_observations: tuple[DetectionOverlayObservation, ...] | None = None
         self._latest_source_elapsed_ms: int | None = None
 
