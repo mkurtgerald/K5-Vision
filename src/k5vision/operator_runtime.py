@@ -15,6 +15,10 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 from k5vision.domain.devices import Device
+from k5vision.media.analytics_overlay_delivery import (
+    AnalyticsObservationProvider,
+    BoundedAnalyticsOverlayDelivery,
+)
 from k5vision.media.live_presentation import BoundedLivePresentationDelivery
 from k5vision.media.mixed_presentation import MixedLiveStream
 from k5vision.media.presentation_runtime import BoundedPresentationRuntime
@@ -248,13 +252,17 @@ class WindowsSingleLiveOperatorLauncher(OperatorLauncher):
         *,
         delivery_factory: LiveDeliveryFactory = _default_delivery_factory,
         runtime_factory: WindowsOperatorFactory = _default_windows_operator_factory,
+        detection_provider: AnalyticsObservationProvider | None = None,
     ) -> None:
         if not callable(delivery_factory):
             raise TypeError("delivery_factory must be callable")
         if not callable(runtime_factory):
             raise TypeError("runtime_factory must be callable")
+        if detection_provider is not None and not callable(detection_provider):
+            raise TypeError("detection_provider must be callable")
         self._delivery_factory = delivery_factory
         self._runtime_factory = runtime_factory
+        self._detection_provider = detection_provider
 
     async def run(
         self,
@@ -278,6 +286,11 @@ class WindowsSingleLiveOperatorLauncher(OperatorLauncher):
                 )
             )
             delivery = self._delivery_factory(source.payload_type)
+            if self._detection_provider is not None:
+                delivery = BoundedAnalyticsOverlayDelivery(
+                    delivery,
+                    self._detection_provider,
+                )
             runtime = self._runtime_factory(layout)
             stream = MixedLiveStream(slot=0, source_uri=source.source_uri, delivery=delivery)
         except Exception:
@@ -331,6 +344,7 @@ def build_environment_operator_runtime(
     *,
     credential_probe: CredentialProbe = resolve_credential_index,
     payload_probe: PayloadTypeProbe = _probe_dynamic_payload_type,
+    detection_provider: AnalyticsObservationProvider | None = None,
 ) -> tuple[OperatorSourceResolver | None, OperatorLauncher | None]:
     """Build the physical Stage-One bridge only when private configuration is complete."""
     source_uri = environment.get(STAGE_ONE_SOURCE_ENV, "").strip()
@@ -350,7 +364,8 @@ def build_environment_operator_runtime(
             credential_probe=credential_probe,
             payload_probe=payload_probe,
         )
+        launcher = WindowsSingleLiveOperatorLauncher(detection_provider=detection_provider)
     except (TypeError, ValueError):
         return None, None
 
-    return resolver, WindowsSingleLiveOperatorLauncher()
+    return resolver, launcher
