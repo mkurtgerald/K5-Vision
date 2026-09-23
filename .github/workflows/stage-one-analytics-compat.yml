@@ -1,0 +1,59 @@
+name: Stage One Analytics Compatibility
+
+on:
+  pull_request:
+    paths:
+      - "src/k5vision/media/analytics_detection_adapter.py"
+      - "src/k5vision/media/detection_overlay.py"
+      - "tests/test_analytics_detection_adapter.py"
+      - "tests/integration/test_analytics_lab_overlay_compat.py"
+      - ".github/workflows/stage-one-analytics-compat.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/k5vision/media/analytics_detection_adapter.py"
+      - "src/k5vision/media/detection_overlay.py"
+      - "tests/test_analytics_detection_adapter.py"
+      - "tests/integration/test_analytics_lab_overlay_compat.py"
+      - ".github/workflows/stage-one-analytics-compat.yml"
+
+permissions:
+  contents: read
+
+env:
+  ANALYTICS_LAB_SHA: 1f0c308a2f6b8c46064dc9c97ad08dff8f415361
+
+jobs:
+  exact-producer-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout K5 exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Fetch pinned public Analytics-lab revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init analytics-lab
+          git -C analytics-lab remote add origin https://github.com/mkurtgerald/Analytics-lab.git
+          git -C analytics-lab fetch --depth=1 origin "$ANALYTICS_LAB_SHA"
+          git -C analytics-lab checkout --detach FETCH_HEAD
+          test "$(git -C analytics-lab rev-parse HEAD)" = "$ANALYTICS_LAB_SHA"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install K5 test dependencies
+        run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+
+      - name: Run exact Analytics-lab compatibility witness
+        env:
+          K5_ANALYTICS_COMPAT: "1"
+          PYTHONPATH: ${{ github.workspace }}/analytics-lab
+        run: pytest tests/integration/test_analytics_lab_overlay_compat.py -q --no-cov
