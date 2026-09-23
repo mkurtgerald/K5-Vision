@@ -28,8 +28,6 @@ jobs:
     timeout-minutes: 240
     env:
       ANALYTICS_LAB_SHA: c8b347ae538991a0c0ce38eabc2dc17b566531d3
-      K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
-      K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
 
       K5_STAGE05_PHYSICAL: "1"
       K5_STAGE05_OUTPUT: ${{ github.workspace }}\artifacts\stage05-readiness.json
@@ -157,6 +155,9 @@ jobs:
 
       - name: Verify private physical configuration
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: |
           $ErrorActionPreference = "Stop"
           if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_SOURCE)) {
@@ -190,6 +191,9 @@ jobs:
 
       - name: Resolve private camera credential candidate once
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: |
           $ErrorActionPreference = "Stop"
           $index = & python -m k5vision.stage03_credential_probe "env:K5_STAGE03_SOURCE"
@@ -200,14 +204,23 @@ jobs:
 
       - name: Run Stage 05 physical readiness
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: pytest tests/integration/test_stage05_physical.py -q --no-cov
 
       - name: Run Stage 06 physical live view
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: pytest tests/integration/test_stage06_physical.py -q --no-cov
 
       - name: Run Stage 31 controller qualification
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: |
           python -m k5vision.media.gstreamer_native_abi --revision $env:K5_STAGE31_REVISION --output $env:K5_STAGE31_ABI_OUTPUT
           if ($LASTEXITCODE -ne 0) { throw "Stage 31 native ABI qualification failed." }
@@ -218,6 +231,9 @@ jobs:
 
       - name: Run Stage 32 runtime qualification
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: |
           python -m k5vision.media.gstreamer_native_abi --revision $env:K5_STAGE32_REVISION --output $env:K5_STAGE32_ABI_OUTPUT
           if ($LASTEXITCODE -ne 0) { throw "Stage 32 native ABI qualification failed." }
@@ -228,6 +244,9 @@ jobs:
 
       - name: Run Stage 33 host qualification
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: |
           python -m k5vision.media.gstreamer_native_abi --revision $env:K5_STAGE33_REVISION --output $env:K5_STAGE33_ABI_OUTPUT
           if ($LASTEXITCODE -ne 0) { throw "Stage 33 native ABI qualification failed." }
@@ -238,6 +257,9 @@ jobs:
 
       - name: Run Stage 34 replacement qualification
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: |
           python -m k5vision.media.gstreamer_native_abi --revision $env:K5_STAGE34_REVISION --output $env:K5_STAGE34_ABI_OUTPUT
           if ($LASTEXITCODE -ne 0) { throw "Stage 34 native ABI qualification failed." }
@@ -248,6 +270,9 @@ jobs:
 
       - name: Run Stage 35 Windows surface qualification
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: |
           python -m k5vision.media.gstreamer_native_abi --revision $env:K5_STAGE35_REVISION --output $env:K5_STAGE35_ABI_OUTPUT
           if ($LASTEXITCODE -ne 0) { throw "Stage 35 native ABI qualification failed." }
@@ -258,6 +283,9 @@ jobs:
 
       - name: Run authenticated Stage One operator witness
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: pytest tests/integration/test_stage_one_operator_physical.py -q --no-cov
 
       - name: Assert no qualification payload remains

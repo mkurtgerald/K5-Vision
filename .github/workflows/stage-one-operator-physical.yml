@@ -31,8 +31,6 @@ jobs:
       K5_STAGE_ONE_OPERATOR_PHYSICAL: "1"
       K5_STAGE_ONE_OUTPUT: ${{ github.workspace }}\artifacts\stage-one-operator-physical.json
       K5_STAGE_ONE_REVISION: ${{ inputs.reviewed_sha }}
-      K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
-      K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
 
     steps:
       - name: Verify exact reviewed branch head
@@ -103,6 +101,9 @@ jobs:
 
       - name: Verify private physical configuration
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: |
           $ErrorActionPreference = "Stop"
           if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_SOURCE)) {
@@ -133,6 +134,9 @@ jobs:
 
       - name: Run authenticated physical operator witness
         shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: pytest tests/integration/test_stage_one_operator_physical.py -q --no-cov
 
       - name: Assert retained witness is source-free

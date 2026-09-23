@@ -28,6 +28,28 @@ _ANALYTICS_PHYSICAL = {
     "stage-one-remaining-physical-suite.yml",
 }
 _CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+_PRIVATE_CAMERA_BINDINGS = (
+    "K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}",
+    "K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}",
+)
+_STAGE_ONE_CAMERA_STEPS = {
+    "stage-one-operator-physical.yml": {
+        "Verify private physical configuration",
+        "Run authenticated physical operator witness",
+    },
+    "stage-one-remaining-physical-suite.yml": {
+        "Verify private physical configuration",
+        "Resolve private camera credential candidate once",
+        "Run Stage 05 physical readiness",
+        "Run Stage 06 physical live view",
+        "Run Stage 31 controller qualification",
+        "Run Stage 32 runtime qualification",
+        "Run Stage 33 host qualification",
+        "Run Stage 34 replacement qualification",
+        "Run Stage 35 Windows surface qualification",
+        "Run authenticated Stage One operator witness",
+    },
+}
 
 
 def _workflow_text() -> str:
@@ -38,6 +60,12 @@ def _analytics_sha(text: str) -> str:
     marker = "ANALYTICS_LAB_SHA: "
     assert marker in text
     return text.split(marker, maxsplit=1)[1].splitlines()[0].strip()
+
+
+def _named_step(text: str, name: str) -> str:
+    marker = f"      - name: {name}\n"
+    assert marker in text
+    return text.split(marker, maxsplit=1)[1].split("      - name: ", maxsplit=1)[0]
 
 
 def test_stage03_physical_workflow_is_manual_only() -> None:
@@ -176,6 +204,27 @@ def test_stage_one_physical_paths_bind_same_reviewed_analytics_revision() -> Non
         assert '"openvino==2026.3.1"' in text
         assert '"opencv-python-headless==4.12.0.88"' in text
         assert "git -C $analytics fetch" not in text
+
+
+def test_stage_one_private_camera_configuration_is_step_scoped() -> None:
+    for name, consumers in _STAGE_ONE_CAMERA_STEPS.items():
+        text = (_WORKFLOWS / name).read_text(encoding="utf-8")
+        job_scope = text.split("    steps:\n", maxsplit=1)[0]
+        for binding in _PRIVATE_CAMERA_BINDINGS:
+            assert binding not in job_scope
+
+        for step_name in consumers:
+            step = _named_step(text, step_name)
+            for binding in _PRIVATE_CAMERA_BINDINGS:
+                assert f"          {binding}\n" in step
+
+        action_steps = [
+            part for part in text.split("      - name: ")[1:] if "        uses: actions/" in part
+        ]
+        assert action_steps
+        for step in action_steps:
+            for binding in _PRIVATE_CAMERA_BINDINGS:
+                assert binding not in step
 
 
 def test_remaining_stage_one_suite_covers_every_required_gate() -> None:
