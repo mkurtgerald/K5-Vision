@@ -166,11 +166,7 @@ def parse_detection_event(
         track_id = item.get("track_id")
         if track_id is None:
             track_id = f"{expected_frame_id}:{index}"
-        if (
-            not isinstance(track_id, str)
-            or not track_id
-            or len(track_id) > _MAX_TRACK_ID_LENGTH
-        ):
+        if not isinstance(track_id, str) or not track_id or len(track_id) > _MAX_TRACK_ID_LENGTH:
             raise SkillProtocolError("analytics detection track id is invalid")
 
         detections.append(
