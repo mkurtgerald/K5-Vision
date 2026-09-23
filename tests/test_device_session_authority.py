@@ -78,6 +78,7 @@ def test_human_sessions_enforce_device_role_permissions_without_service_device_t
         )
 
         viewer_list = client.get("/api/v1/devices", headers=_headers(viewer))
+        operator_list = client.get("/api/v1/devices", headers=_headers(operator))
         viewer_write = client.post(
             "/api/v1/devices",
             json=_device(1),
@@ -94,17 +95,20 @@ def test_human_sessions_enforce_device_role_permissions_without_service_device_t
             headers=_headers(administrator),
         )
         viewer_after = client.get("/api/v1/devices", headers=_headers(viewer))
+        operator_after = client.get("/api/v1/devices", headers=_headers(operator))
 
     assert viewer_list.status_code == 200
     assert viewer_list.json() == []
+    assert operator_list.status_code == 200
+    assert operator_list.json() == []
     assert viewer_write.status_code == 403
     assert viewer_write.json() == {"detail": "Insufficient device permission"}
-    assert operator_write.status_code == 201
+    assert operator_write.status_code == 403
+    assert operator_write.json() == {"detail": "Insufficient device permission"}
     assert administrator_write.status_code == 201
-    assert [item["name"] for item in viewer_after.json()] == [
-        "Synthetic Camera 2",
-        "Synthetic Camera 3",
-    ]
+    assert [item["name"] for item in viewer_after.json()] == ["Synthetic Camera 3"]
+    assert operator_after.status_code == 200
+    assert operator_after.json() == viewer_after.json()
 
 
 def test_invalid_human_session_cannot_use_device_api(monkeypatch, tmp_path) -> None:
