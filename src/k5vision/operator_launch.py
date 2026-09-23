@@ -25,6 +25,7 @@ _MAX_ACTIVE_LAUNCHES = 16
 _MAX_STREAM_TOKEN_LENGTH = 256
 _MAX_DIMENSION = 16_384
 _MAX_COUNT = 1_000_000
+_MAX_RENDERED_BOXES = _MAX_COUNT * 512
 
 StreamToken = Annotated[
     str,
@@ -77,6 +78,11 @@ class OperatorLaunchMetrics(BaseModel):
     delivered_frames: int = Field(default=0, ge=0, le=_MAX_COUNT)
     presentations: int = Field(default=0, ge=0, le=_MAX_COUNT)
     processed_controls: int = Field(default=0, ge=0, le=_MAX_COUNT)
+    analytics_enabled: bool = False
+    analytics_provider_submissions: int = Field(default=0, ge=0, le=_MAX_COUNT)
+    analytics_provider_completions: int = Field(default=0, ge=0, le=_MAX_COUNT)
+    analytics_failures: int = Field(default=0, ge=0, le=_MAX_COUNT)
+    analytics_rendered_boxes: int = Field(default=0, ge=0, le=_MAX_RENDERED_BOXES)
 
 
 class OperatorLaunchReceipt(BaseModel):
@@ -84,11 +90,16 @@ class OperatorLaunchReceipt(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: str = "1"
+    schema_version: str = "2"
     completed: bool = True
     delivered_frames: int = Field(ge=0, le=_MAX_COUNT)
     presentations: int = Field(ge=0, le=_MAX_COUNT)
     processed_controls: int = Field(ge=0, le=_MAX_COUNT)
+    analytics_enabled: bool = False
+    analytics_provider_submissions: int = Field(default=0, ge=0, le=_MAX_COUNT)
+    analytics_provider_completions: int = Field(default=0, ge=0, le=_MAX_COUNT)
+    analytics_failures: int = Field(default=0, ge=0, le=_MAX_COUNT)
+    analytics_rendered_boxes: int = Field(default=0, ge=0, le=_MAX_RENDERED_BOXES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +282,11 @@ class BoundedOperatorLaunchCoordinator:
                 delivered_frames=metrics.delivered_frames,
                 presentations=metrics.presentations,
                 processed_controls=metrics.processed_controls,
+                analytics_enabled=metrics.analytics_enabled,
+                analytics_provider_submissions=metrics.analytics_provider_submissions,
+                analytics_provider_completions=metrics.analytics_provider_completions,
+                analytics_failures=metrics.analytics_failures,
+                analytics_rendered_boxes=metrics.analytics_rendered_boxes,
             )
         finally:
             await self._release()
