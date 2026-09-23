@@ -149,10 +149,7 @@ def _probe_intel() -> HardwareProfile | None:
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    (
-                        "Get-CimInstance Win32_VideoController | "
-                        "Select-Object -ExpandProperty Name"
-                    ),
+                    ("Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"),
                 ]
             )
             if output:
