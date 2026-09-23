@@ -67,9 +67,9 @@ class _PhysicalAnalyticsProvider:
         manifest_path = (evidence_root / "validation-manifest.json").resolve(strict=True)
         manifest_path.relative_to(evidence_root)
         document = json.loads(manifest_path.read_text(encoding="utf-8"))
-        artifact_root = (
-            evidence_root / str(document.get("artifact_root", "artifacts"))
-        ).resolve(strict=True)
+        artifact_root = (evidence_root / str(document.get("artifact_root", "artifacts"))).resolve(
+            strict=True
+        )
         artifact_root.relative_to(evidence_root)
 
         self._detector = OpenVINOOMZPoseBackend(
