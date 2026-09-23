@@ -199,3 +199,96 @@ def test_catalog_rejects_incomplete_or_mismatched_pairs_after_restart(tmp_path: 
     assert page.entries == ()
     assert "orphan" not in page.model_dump_json()
     assert "stale" not in page.model_dump_json()
+
+
+def test_continuous_recording_rejects_invalid_segment_configuration(tmp_path: Path) -> None:
+    registry, _ = _registry(tmp_path)
+    source_uri = "rtsp://192.0.2.10/private-live"
+    resolver = _StaticResolver(ResolvedLiveSource(source_uri, 96))
+    root = tmp_path / "recordings"
+
+    try:
+        with pytest.raises(ValueError, match="max_segments"):
+            BoundedOperatorRecordingCoordinator(
+                registry,
+                resolver,
+                root,
+                packet_goal=2,
+                max_segments=0,
+            )
+        with pytest.raises(ValueError, match="segment_packet_goal"):
+            BoundedOperatorRecordingCoordinator(
+                registry,
+                resolver,
+                root,
+                packet_goal=2,
+                segment_packet_goal=3,
+            )
+    finally:
+        registry.close()
+
+
+def test_continuous_recording_payload_mismatch_cleans_active_segment(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        registry, device = _registry(tmp_path)
+        source_uri = "rtsp://192.0.2.10/private-live"
+        packets = (_packet(1, 0, payload_type=97),)
+        root = tmp_path / "recordings"
+        coordinator = BoundedOperatorRecordingCoordinator(
+            registry,
+            _StaticResolver(ResolvedLiveSource(source_uri, 96)),
+            root,
+            delivery_factory=lambda: _FakeDelivery(packets, source_uri),
+            packet_goal=1,
+            segment_packet_goal=1,
+            max_segments=1,
+        )
+
+        try:
+            with pytest.raises(OperatorRecordingError) as raised:
+                await coordinator.record_continuous(
+                    _principal(),
+                    OperatorRecordingRequest(device_id=device.id, stream_token="main"),
+                )
+            assert raised.value.code is OperatorRecordingErrorCode.RECORDING_FAILURE
+            assert coordinator.active_recordings == 0
+            assert not list(root.glob("*.k5r"))
+            assert not list(root.glob("*.k5d"))
+            assert not list(root.glob("*.stage"))
+        finally:
+            registry.close()
+
+    asyncio.run(exercise())
+
+
+def test_continuous_recording_rejects_empty_delivery_without_publishing_media(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        registry, device = _registry(tmp_path)
+        source_uri = "rtsp://192.0.2.10/private-live"
+        root = tmp_path / "recordings"
+        coordinator = BoundedOperatorRecordingCoordinator(
+            registry,
+            _StaticResolver(ResolvedLiveSource(source_uri, 96)),
+            root,
+            delivery_factory=lambda: _FakeDelivery((), source_uri),
+            packet_goal=1,
+            segment_packet_goal=1,
+            max_segments=1,
+        )
+
+        try:
+            with pytest.raises(OperatorRecordingError) as raised:
+                await coordinator.record_continuous(
+                    _principal(),
+                    OperatorRecordingRequest(device_id=device.id, stream_token="main"),
+                )
+            assert raised.value.code is OperatorRecordingErrorCode.RECORDING_FAILURE
+            assert coordinator.active_recordings == 0
+            assert not list(root.glob("*.k5r"))
+            assert not list(root.glob("*.k5d"))
+        finally:
+            registry.close()
+
+    asyncio.run(exercise())
