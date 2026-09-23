@@ -166,9 +166,7 @@ def test_pause_resume_routes_require_session_and_fail_closed_when_inactive(
     recording_id = UUID("56565656-5656-4656-8656-565656565656")
 
     with TestClient(application) as client:
-        unauthorized = client.post(
-            f"/api/v1/operator/recordings/{recording_id}/playback/pause"
-        )
+        unauthorized = client.post(f"/api/v1/operator/recordings/{recording_id}/playback/pause")
         token = _issue_session(client, "control-viewer")
         inactive_pause = client.post(
             f"/api/v1/operator/recordings/{recording_id}/playback/pause",
