@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -23,6 +24,11 @@ from k5vision.user_admin_api import USER_ADMIN_TOKEN_ENV, USER_DB_PATH_ENV
 _ADMIN_TOKEN = "synthetic-control-admin-token"
 _PASSWORD = "synthetic-control-password-12345"
 _SITE_ID = "synthetic-playback-control-site"
+
+
+class _Resolver:
+    async def resolve(self, *_args):
+        raise AssertionError("resolver should not run in inactive-control tests")
 
 
 class _FakePump:
@@ -64,10 +70,7 @@ class _ControlledDeliveryHarness:
 
     @property
     def snapshot(self):
-        class _Snapshot:
-            state = self._state
-
-        return _Snapshot()
+        return SimpleNamespace(state=self._state)
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -157,7 +160,7 @@ def test_pause_resume_routes_require_session_and_fail_closed_when_inactive(
     application = create_app(
         control_plane_site_id=_SITE_ID,
         device_db_path=tmp_path / "devices.sqlite3",
-        operator_source_resolver=lambda *_args: None,
+        operator_source_resolver=_Resolver(),
         operator_recording_root=tmp_path / "recordings",
     )
     recording_id = UUID("56565656-5656-4656-8656-565656565656")
