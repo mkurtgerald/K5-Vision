@@ -229,6 +229,7 @@ class BoundedPlaybackPump:
                 if sleep_task in done:
                     await sleep_task
                     return False
+                await control_task
                 sleep_task.cancel()
                 await asyncio.gather(sleep_task, return_exceptions=True)
             except asyncio.CancelledError:
@@ -269,7 +270,11 @@ class BoundedPlaybackPump:
         self._state = PlaybackPumpState.RUNNING
         completed = False
         try:
-            started = self._read_clock()
+            try:
+                started = self._read_clock()
+            except PlaybackPumpError:
+                self._state = PlaybackPumpState.FAILED
+                raise
 
             for item in iterator:
                 try:
