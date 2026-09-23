@@ -9,8 +9,8 @@ and private topology remain transient execution data.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 from pydantic import BaseModel, ConfigDict, Field
 
