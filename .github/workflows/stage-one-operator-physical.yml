@@ -23,8 +23,9 @@ jobs:
       github.triggering_actor == github.repository_owner &&
       github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
-    timeout-minutes: 25
+    timeout-minutes: 35
     env:
+      ANALYTICS_LAB_SHA: c8b347ae538991a0c0ce38eabc2dc17b566531d3
       K5_STAGE_ONE_OPERATOR_PHYSICAL: "1"
       K5_STAGE_ONE_OUTPUT: ${{ github.workspace }}\artifacts\stage-one-operator-physical.json
       K5_STAGE_ONE_REVISION: ${{ inputs.reviewed_sha }}
@@ -64,6 +65,26 @@ jobs:
           ref: ${{ inputs.reviewed_sha }}
           persist-credentials: false
 
+      - name: Fetch exact reviewed Analytics-lab revision
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $analytics = Join-Path $env:RUNNER_TEMP "analytics-lab"
+          if (Test-Path -LiteralPath $analytics) {
+            Remove-Item -LiteralPath $analytics -Recurse -Force
+          }
+          git init $analytics
+          git -C $analytics remote add origin https://github.com/mkurtgerald/Analytics-lab.git
+          git -C $analytics fetch --depth=1 origin $env:ANALYTICS_LAB_SHA
+          git -C $analytics checkout --detach FETCH_HEAD
+          $actual = (git -C $analytics rev-parse HEAD).Trim()
+          if ($actual -ne $env:ANALYTICS_LAB_SHA) {
+            throw "Analytics-lab exact revision verification failed."
+          }
+          $evidenceRoot = Join-Path $env:RUNNER_TEMP "analytics-validation"
+          "PYTHONPATH=$analytics" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "K5_ANALYTICS_EVIDENCE_ROOT=$evidenceRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Provision isolated reviewed GStreamer runtime
         shell: powershell
         run: .\scripts\provision-stage03-gstreamer.ps1
@@ -85,11 +106,18 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install
+      - name: Install K5 and pinned detector evidence runtimes
         shell: powershell
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+          python -m pip install --no-cache-dir "openvino==2026.3.1" "opencv-python-headless==4.12.0.88"
+
+      - name: Prepare bounded rights-reviewed detector evidence
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m analytics_lab.validation_seed --output-dir "$env:K5_ANALYTICS_EVIDENCE_ROOT"
 
       - name: Run authenticated physical operator witness
         shell: powershell

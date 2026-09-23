@@ -14,13 +14,20 @@ from os import environ
 from fastapi import FastAPI
 
 from k5vision.main import create_app
+from k5vision.media.analytics_overlay_delivery import AnalyticsObservationProvider
 from k5vision.operator_recording import STAGE_ONE_RECORDING_ROOT_ENV
 from k5vision.operator_runtime import build_environment_operator_runtime
 
 
-def create_stage_one_app() -> FastAPI:
-    """Build the standard K5 app with the bounded physical live runtime enabled."""
-    source_resolver, launcher = build_environment_operator_runtime(environ)
+def create_stage_one_app(
+    *,
+    detection_provider: AnalyticsObservationProvider | None = None,
+) -> FastAPI:
+    """Build the standard K5 app with bounded physical live operation enabled."""
+    source_resolver, launcher = build_environment_operator_runtime(
+        environ,
+        detection_provider=detection_provider,
+    )
     recording_root = environ.get(STAGE_ONE_RECORDING_ROOT_ENV, "").strip() or None
     return create_app(
         operator_source_resolver=source_resolver,
