@@ -297,7 +297,9 @@ class BoundedOperatorRecordingCoordinator:
         self._validate_device(device)
         return device
 
-    async def _resolve_source(self, device: Device, stream_token: StreamToken) -> ResolvedLiveSource:
+    async def _resolve_source(
+        self, device: Device, stream_token: StreamToken
+    ) -> ResolvedLiveSource:
         try:
             source = await self._source_resolver.resolve(device, stream_token)
         except OperatorLaunchError:
