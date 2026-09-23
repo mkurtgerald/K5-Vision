@@ -30,7 +30,6 @@ def _normalized(value: float, extent: int) -> float:
 
 def test_pinned_real_detector_tracking_output_renders_visible_box() -> None:
     import cv2
-
     from analytics_lab.iou_tracker import SimpleIoUAssociationBackend
     from analytics_lab.openvino_omz import OpenVINOOMZPoseBackend
     from analytics_lab.tracking import (
