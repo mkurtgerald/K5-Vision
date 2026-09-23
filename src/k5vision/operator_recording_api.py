@@ -19,6 +19,10 @@ from k5vision.operator_playback import (
     OperatorPlaybackRequest,
     WindowsMixedOperatorPlaybackLauncher,
 )
+from k5vision.operator_playback_timeline import (
+    BoundedOperatorPlaybackTimeline,
+    OperatorPlaybackTimelineReceipt,
+)
 from k5vision.operator_recording import (
     BoundedOperatorRecordingCoordinator,
     OperatorRecordingError,
@@ -82,6 +86,12 @@ def install_operator_recording_api(
     """Install recording/playback only when private source and storage are configured."""
     recording_coordinator: BoundedOperatorRecordingCoordinator | None = None
     playback_coordinator: BoundedOperatorPlaybackCoordinator | None = None
+    timeline_coordinator: BoundedOperatorPlaybackTimeline | None = None
+    if registry is not None and recording_root is not None:
+        try:
+            timeline_coordinator = BoundedOperatorPlaybackTimeline(registry, recording_root)
+        except (TypeError, ValueError):
+            timeline_coordinator = None
     if registry is not None and source_resolver is not None and recording_root is not None:
         try:
             recording_coordinator = BoundedOperatorRecordingCoordinator(
@@ -101,6 +111,7 @@ def install_operator_recording_api(
 
     application.state.operator_recording_coordinator = recording_coordinator
     application.state.operator_playback_coordinator = playback_coordinator
+    application.state.operator_playback_timeline = timeline_coordinator
 
     @application.post(
         "/api/v1/operator/recordings",
@@ -130,6 +141,40 @@ def install_operator_recording_api(
             return await recording_coordinator.record(principal, payload)
         except OperatorRecordingError as exc:
             response_status = _RECORDING_ERROR_STATUS[exc.code]
+            headers = {"WWW-Authenticate": "Bearer"} if response_status == 401 else None
+            raise HTTPException(
+                status_code=response_status,
+                detail=str(exc),
+                headers=headers,
+            ) from None
+
+    @application.get(
+        "/api/v1/operator/recordings/{recording_id}/timeline",
+        response_model=OperatorPlaybackTimelineReceipt,
+        tags=["operator"],
+    )
+    async def get_operator_recording_timeline(
+        recording_id: UUID,
+        authorization: Annotated[list[str] | None, Header()] = None,
+    ) -> OperatorPlaybackTimelineReceipt:
+        credential = _extract_bearer(authorization)
+        principal = await session_manager.resolve(credential or "")
+        if principal is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if timeline_coordinator is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Operator playback timeline is not configured",
+            )
+
+        try:
+            return await timeline_coordinator.inspect(principal, recording_id)
+        except OperatorPlaybackError as exc:
+            response_status = _PLAYBACK_ERROR_STATUS[exc.code]
             headers = {"WWW-Authenticate": "Bearer"} if response_status == 401 else None
             raise HTTPException(
                 status_code=response_status,
