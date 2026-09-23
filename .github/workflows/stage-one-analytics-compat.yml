@@ -4,29 +4,39 @@ on:
   pull_request:
     paths:
       - "src/k5vision/media/analytics_detection_adapter.py"
+      - "src/k5vision/media/analytics_overlay_delivery.py"
       - "src/k5vision/media/detection_overlay.py"
+      - "src/k5vision/operator_runtime.py"
       - "tests/test_analytics_detection_adapter.py"
+      - "tests/test_analytics_overlay_delivery.py"
+      - "tests/test_operator_runtime_analytics.py"
       - "tests/integration/test_analytics_lab_overlay_compat.py"
+      - "tests/integration/test_analytics_lab_real_detector_overlay.py"
       - ".github/workflows/stage-one-analytics-compat.yml"
   push:
     branches: [main]
     paths:
       - "src/k5vision/media/analytics_detection_adapter.py"
+      - "src/k5vision/media/analytics_overlay_delivery.py"
       - "src/k5vision/media/detection_overlay.py"
+      - "src/k5vision/operator_runtime.py"
       - "tests/test_analytics_detection_adapter.py"
+      - "tests/test_analytics_overlay_delivery.py"
+      - "tests/test_operator_runtime_analytics.py"
       - "tests/integration/test_analytics_lab_overlay_compat.py"
+      - "tests/integration/test_analytics_lab_real_detector_overlay.py"
       - ".github/workflows/stage-one-analytics-compat.yml"
 
 permissions:
   contents: read
 
 env:
-  ANALYTICS_LAB_SHA: 1f0c308a2f6b8c46064dc9c97ad08dff8f415361
+  ANALYTICS_LAB_SHA: c8b347ae538991a0c0ce38eabc2dc17b566531d3
 
 jobs:
   exact-producer-compatibility:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout K5 exact revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -52,8 +62,27 @@ jobs:
       - name: Install K5 test dependencies
         run: python -m pip install --upgrade pip && pip install -e ".[dev]"
 
-      - name: Run exact Analytics-lab compatibility witness
+      - name: Run exact Analytics-lab contract compatibility witness
         env:
           K5_ANALYTICS_COMPAT: "1"
           PYTHONPATH: ${{ github.workspace }}/analytics-lab
         run: pytest tests/integration/test_analytics_lab_overlay_compat.py -q --no-cov
+
+      - name: Install pinned detector evidence runtimes
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install --no-cache-dir 'openvino==2026.3.1' 'opencv-python-headless==4.12.0.88'
+
+      - name: Prepare bounded rights-reviewed detector evidence
+        env:
+          PYTHONPATH: ${{ github.workspace }}/analytics-lab
+        run: |
+          set -euo pipefail
+          python -m analytics_lab.validation_seed --output-dir "$RUNNER_TEMP/analytics-validation"
+
+      - name: Run exact real-detector tracking-to-overlay witness
+        env:
+          K5_ANALYTICS_REAL_DETECTOR: "1"
+          K5_ANALYTICS_EVIDENCE_ROOT: ${{ runner.temp }}/analytics-validation
+          PYTHONPATH: ${{ github.workspace }}/analytics-lab
+        run: pytest tests/integration/test_analytics_lab_real_detector_overlay.py -q --no-cov
