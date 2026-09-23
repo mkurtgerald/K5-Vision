@@ -355,7 +355,7 @@ jobs:
           }
 
       - name: Upload source-free remaining physical-suite evidence
-        if: always() && steps.safe_evidence.outcome == 'success'
+        if: success() && steps.safe_evidence.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: stage-one-remaining-physical-suite-evidence
