@@ -21,6 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from k5vision.media.live_presentation import BoundedLivePresentationDelivery, LivePresentationError
+from k5vision.media.presentation_frame import PresentationVideoFrame
 from k5vision.media.rtp_delivery import EphemeralRtpDelivery, RtpDeliveryError
 from k5vision.media.windows_presentation_surface import (
     BoundedWindowsPresentationSurface,
@@ -53,6 +54,78 @@ def _remove_temporary_state(root: Path) -> None:
             path.unlink()
         except FileNotFoundError:
             pass
+
+
+class _PhysicalAnalyticsProvider:
+    """Exact reviewed Analytics-lab detector/tracker adapter for this witness only."""
+
+    def __init__(self, evidence_root: Path) -> None:
+        from analytics_lab.iou_tracker import SimpleIoUAssociationBackend
+        from analytics_lab.openvino_omz import OpenVINOOMZConfig, OpenVINOOMZPoseBackend
+        from analytics_lab.tracking import TrackingSession
+
+        manifest_path = (evidence_root / "validation-manifest.json").resolve(strict=True)
+        manifest_path.relative_to(evidence_root)
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        artifact_root = (
+            evidence_root / str(document.get("artifact_root", "artifacts"))
+        ).resolve(strict=True)
+        artifact_root.relative_to(evidence_root)
+
+        self._detector = OpenVINOOMZPoseBackend(
+            artifact_root,
+            config=OpenVINOOMZConfig(max_people=4),
+        )
+        self._tracker = TrackingSession(SimpleIoUAssociationBackend())
+        self._frame_index = 0
+        self.provider_calls = 0
+        self.tracked_detections = 0
+
+    async def __call__(self, frame: PresentationVideoFrame) -> tuple[object, ...]:
+        import numpy as np
+        from analytics_lab.tracking import DetectionCandidate, NormalizedBox
+
+        self.provider_calls += 1
+        frame_index = self._frame_index
+        self._frame_index += 1
+        timestamp_ms = frame_index * 40 + 1
+
+        raw = np.frombuffer(
+            frame.payload,
+            dtype=np.uint8,
+            count=frame.height * frame.stride_bytes,
+        )
+        rows = raw.reshape(frame.height, frame.stride_bytes)
+        bgrx = rows[:, : frame.width * 4].reshape(frame.height, frame.width, 4)
+        bgr = np.ascontiguousarray(bgrx[:, :, :3])
+
+        poses = await asyncio.to_thread(
+            self._detector,
+            bgr,
+            frame_index,
+            timestamp_ms,
+        )
+        candidates = []
+        for pose in poses:
+            box = pose.bbox
+            x_min = min(1.0, max(0.0, float(box.x1) / frame.width))
+            y_min = min(1.0, max(0.0, float(box.y1) / frame.height))
+            x_max = min(1.0, max(0.0, float(box.x2) / frame.width))
+            y_max = min(1.0, max(0.0, float(box.y2) / frame.height))
+            if x_max <= x_min or y_max <= y_min:
+                continue
+            candidates.append(
+                DetectionCandidate(
+                    category="person",
+                    confidence=pose.confidence,
+                    box=NormalizedBox(x_min, y_min, x_max, y_max),
+                    model_class_id=1,
+                )
+            )
+
+        tracks = self._tracker.update(frame_index, timestamp_ms, tuple(candidates))
+        self.tracked_detections += len(tracks)
+        return tracks
 
 
 async def _diagnose_private_windows_live(source: str, private_credentials: str) -> str:
@@ -189,6 +262,7 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
     private_credentials = os.environ["K5_STAGE03_CAM_CRED"]
     output = Path(os.environ["K5_STAGE_ONE_OUTPUT"])
     revision = os.environ["K5_STAGE_ONE_REVISION"].casefold()
+    analytics_root = Path(os.environ["K5_ANALYTICS_EVIDENCE_ROOT"]).resolve(strict=True)
 
     parsed = urlsplit(source)
     host = parsed.hostname
@@ -207,9 +281,10 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
     permanent_password = secrets.token_urlsafe(32)
     temporary_credential = ""
     session_token = ""
+    analytics_provider = _PhysicalAnalyticsProvider(analytics_root)
 
     try:
-        application = create_stage_one_app()
+        application = create_stage_one_app(detection_provider=analytics_provider)
         with TestClient(application) as client:
             created = client.post(
                 "/api/v1/users",
@@ -284,9 +359,11 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
             assert receipt["completed"] is True
             assert receipt["delivered_frames"] >= 1
             assert receipt["presentations"] >= 1
+            assert analytics_provider.provider_calls >= 1
+            assert analytics_provider.tracked_detections >= 1
 
         evidence = {
-            "schema_version": "1",
+            "schema_version": "2",
             "revision": revision,
             "execution_context": "camera-lab-windows-x64",
             "human_session_authenticated": True,
@@ -296,6 +373,8 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
             "delivered_frames": receipt["delivered_frames"],
             "presentations": receipt["presentations"],
             "processed_controls": receipt["processed_controls"],
+            "analytics_provider_calls": analytics_provider.provider_calls,
+            "analytics_tracked_detections": analytics_provider.tracked_detections,
         }
         payload = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
         lowered = payload.casefold()
@@ -307,6 +386,7 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
             permanent_password,
             session_token,
             _ADMIN_TOKEN,
+            str(analytics_root),
         ):
             assert forbidden and forbidden not in payload
         for forbidden_marker in (
