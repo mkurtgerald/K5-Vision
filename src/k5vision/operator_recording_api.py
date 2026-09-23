@@ -19,6 +19,8 @@ from k5vision.operator_export import (
 from k5vision.operator_launch import OperatorSourceResolver
 from k5vision.operator_playback import (
     BoundedOperatorPlaybackCoordinator,
+    OperatorPlaybackControlAction,
+    OperatorPlaybackControlReceipt,
     OperatorPlaybackError,
     OperatorPlaybackErrorCode,
     OperatorPlaybackReceipt,
@@ -62,6 +64,9 @@ _PLAYBACK_ERROR_STATUS = {
     OperatorPlaybackErrorCode.SOURCE_SCOPE_MISMATCH: status.HTTP_422_UNPROCESSABLE_CONTENT,
     OperatorPlaybackErrorCode.WINDOW_INVALID: status.HTTP_422_UNPROCESSABLE_CONTENT,
     OperatorPlaybackErrorCode.PLAYBACK_BUSY: status.HTTP_429_TOO_MANY_REQUESTS,
+    OperatorPlaybackErrorCode.CONTROL_CONFLICT: status.HTTP_409_CONFLICT,
+    OperatorPlaybackErrorCode.CONTROL_NOT_FOUND: status.HTTP_404_NOT_FOUND,
+    OperatorPlaybackErrorCode.CONTROL_FORBIDDEN: status.HTTP_403_FORBIDDEN,
     OperatorPlaybackErrorCode.PLAYBACK_FAILURE: status.HTTP_503_SERVICE_UNAVAILABLE,
     OperatorPlaybackErrorCode.REGISTRY_UNAVAILABLE: status.HTTP_503_SERVICE_UNAVAILABLE,
 }
@@ -269,6 +274,7 @@ def install_operator_recording_api(
         rate: PlaybackRate = PlaybackRate.NORMAL,
         width: Annotated[int, Query(ge=640, le=16_384)] = 1280,
         height: Annotated[int, Query(ge=240, le=16_384)] = 720,
+        control_id: UUID | None = None,
     ) -> OperatorPlaybackReceipt:
         credential = _extract_bearer(authorization)
         principal = await session_manager.resolve(credential or "")
@@ -286,6 +292,7 @@ def install_operator_recording_api(
 
         request = OperatorPlaybackRequest(
             recording_id=recording_id,
+            control_id=control_id,
             stream_token=stream_token,
             start_ms=start_ms,
             end_ms=end_ms,
@@ -303,5 +310,64 @@ def install_operator_recording_api(
                 detail=str(exc),
                 headers=headers,
             ) from None
+
+    async def _apply_playback_control(
+        control_id: UUID,
+        action: OperatorPlaybackControlAction,
+        authorization: list[str] | None,
+    ) -> OperatorPlaybackControlReceipt:
+        credential = _extract_bearer(authorization)
+        principal = await session_manager.resolve(credential or "")
+        if principal is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if playback_coordinator is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Operator playback is not configured",
+            )
+        try:
+            return await playback_coordinator.control(principal, control_id, action)
+        except OperatorPlaybackError as exc:
+            response_status = _PLAYBACK_ERROR_STATUS[exc.code]
+            headers = {"WWW-Authenticate": "Bearer"} if response_status == 401 else None
+            raise HTTPException(
+                status_code=response_status,
+                detail=str(exc),
+                headers=headers,
+            ) from None
+
+    @application.post(
+        "/api/v1/operator/playback-controls/{control_id}/pause",
+        response_model=OperatorPlaybackControlReceipt,
+        tags=["operator"],
+    )
+    async def pause_operator_playback(
+        control_id: UUID,
+        authorization: Annotated[list[str] | None, Header()] = None,
+    ) -> OperatorPlaybackControlReceipt:
+        return await _apply_playback_control(
+            control_id,
+            OperatorPlaybackControlAction.PAUSE,
+            authorization,
+        )
+
+    @application.post(
+        "/api/v1/operator/playback-controls/{control_id}/resume",
+        response_model=OperatorPlaybackControlReceipt,
+        tags=["operator"],
+    )
+    async def resume_operator_playback(
+        control_id: UUID,
+        authorization: Annotated[list[str] | None, Header()] = None,
+    ) -> OperatorPlaybackControlReceipt:
+        return await _apply_playback_control(
+            control_id,
+            OperatorPlaybackControlAction.RESUME,
+            authorization,
+        )
 
     return recording_coordinator

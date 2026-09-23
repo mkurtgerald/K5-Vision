@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from k5vision.media.playback_control import PlaybackPauseControl
 from k5vision.media.playback_schedule import (
     BoundedPlaybackSchedule,
     PlaybackRate,
@@ -114,6 +115,7 @@ class BoundedPlaybackPump:
         self._consumer_timeout_seconds = consumer_timeout_seconds
         self._clock = clock
         self._sleep = sleep
+        self._pause_control: PlaybackPauseControl | None = None
         self._state = PlaybackPumpState.CREATED
         self._delivered_packets = 0
         self._delivered_bytes = 0
@@ -121,6 +123,19 @@ class BoundedPlaybackPump:
         self._source_span_ms = 0
         self._scheduled_span_ms = 0
         self._descriptor_verified = False
+
+    def bind_pause_control(self, pause_control: PlaybackPauseControl) -> None:
+        """Bind one pause control before the pump starts."""
+        if self._state != PlaybackPumpState.CREATED:
+            raise PlaybackPumpError(
+                PlaybackPumpErrorCode.INVALID_STATE,
+                "playback pause control cannot be rebound after start",
+            )
+        if not isinstance(pause_control, PlaybackPauseControl):
+            raise TypeError("pause_control must be a PlaybackPauseControl")
+        self._pause_control = pause_control
+        self._clock = pause_control.monotonic
+        self._sleep = pause_control.sleep
 
     @property
     def snapshot(self) -> PlaybackPumpSnapshot:
@@ -160,6 +175,8 @@ class BoundedPlaybackPump:
 
             for item in iterator:
                 try:
+                    if self._pause_control is not None:
+                        await self._pause_control.wait_until_running()
                     now = self._clock()
                     remaining = started + (item.due_ms / 1000.0) - now
                     if remaining > 0:
@@ -177,6 +194,8 @@ class BoundedPlaybackPump:
                     ) from None
 
                 try:
+                    if self._pause_control is not None:
+                        await self._pause_control.wait_until_running()
                     await asyncio.wait_for(
                         consumer(memoryview(item.packet), item.source_elapsed_ms),
                         timeout=self._consumer_timeout_seconds,
