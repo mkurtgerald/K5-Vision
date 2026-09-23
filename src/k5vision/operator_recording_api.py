@@ -37,7 +37,9 @@ from k5vision.operator_recording import (
     OperatorRecordingErrorCode,
     OperatorRecordingReceipt,
     OperatorRecordingRequest,
+    OperatorRecordingSessionReceipt,
 )
+from k5vision.operator_recording_catalog import BoundedRecordingCatalog, RecordingCatalogPage
 from k5vision.services.device_registry import DeviceRegistry
 
 MAX_OPERATOR_RECORDING_BEARER_LENGTH = 512
@@ -105,13 +107,17 @@ def install_operator_recording_api(
     playback_coordinator: BoundedOperatorPlaybackCoordinator | None = None
     timeline_coordinator: BoundedOperatorPlaybackTimeline | None = None
     export_coordinator: BoundedOperatorExportCoordinator | None = None
+    recording_catalog: BoundedRecordingCatalog | None = None
     if registry is not None and recording_root is not None:
         try:
             timeline_coordinator = BoundedOperatorPlaybackTimeline(registry, recording_root)
             export_coordinator = BoundedOperatorExportCoordinator(registry, recording_root)
+            recording_catalog = BoundedRecordingCatalog(recording_root)
+            recording_catalog.recover()
         except (TypeError, ValueError):
             timeline_coordinator = None
             export_coordinator = None
+            recording_catalog = None
     if registry is not None and source_resolver is not None and recording_root is not None:
         try:
             recording_coordinator = BoundedOperatorRecordingCoordinator(
@@ -133,6 +139,18 @@ def install_operator_recording_api(
     application.state.operator_playback_coordinator = playback_coordinator
     application.state.operator_playback_timeline = timeline_coordinator
     application.state.operator_export_coordinator = export_coordinator
+    application.state.operator_recording_catalog = recording_catalog
+
+    async def resolve_principal(authorization: list[str] | None):
+        credential = _extract_bearer(authorization)
+        principal = await session_manager.resolve(credential or "")
+        if principal is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return principal
 
     @application.post(
         "/api/v1/operator/recordings",
@@ -144,14 +162,7 @@ def install_operator_recording_api(
         payload: OperatorRecordingRequest,
         authorization: Annotated[list[str] | None, Header()] = None,
     ) -> OperatorRecordingReceipt:
-        credential = _extract_bearer(authorization)
-        principal = await session_manager.resolve(credential or "")
-        if principal is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        principal = await resolve_principal(authorization)
         if recording_coordinator is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -169,6 +180,51 @@ def install_operator_recording_api(
                 headers=headers,
             ) from None
 
+    @application.post(
+        "/api/v1/operator/recording-sessions",
+        response_model=OperatorRecordingSessionReceipt,
+        status_code=status.HTTP_201_CREATED,
+        tags=["operator"],
+    )
+    async def create_operator_recording_session(
+        payload: OperatorRecordingRequest,
+        authorization: Annotated[list[str] | None, Header()] = None,
+    ) -> OperatorRecordingSessionReceipt:
+        principal = await resolve_principal(authorization)
+        if recording_coordinator is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Operator recording is not configured",
+            )
+        try:
+            return await recording_coordinator.record_continuous(principal, payload)
+        except OperatorRecordingError as exc:
+            response_status = _RECORDING_ERROR_STATUS[exc.code]
+            headers = {"WWW-Authenticate": "Bearer"} if response_status == 401 else None
+            raise HTTPException(
+                status_code=response_status,
+                detail=str(exc),
+                headers=headers,
+            ) from None
+
+    @application.get(
+        "/api/v1/operator/recordings",
+        response_model=RecordingCatalogPage,
+        tags=["operator"],
+    )
+    async def list_operator_recordings(
+        authorization: Annotated[list[str] | None, Header()] = None,
+        source_id: UUID | None = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    ) -> RecordingCatalogPage:
+        await resolve_principal(authorization)
+        if recording_catalog is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Operator recording catalog is not configured",
+            )
+        return recording_catalog.page(source_id=source_id, limit=limit)
+
     @application.get(
         "/api/v1/operator/recordings/{recording_id}/timeline",
         response_model=OperatorPlaybackTimelineReceipt,
@@ -178,14 +234,7 @@ def install_operator_recording_api(
         recording_id: UUID,
         authorization: Annotated[list[str] | None, Header()] = None,
     ) -> OperatorPlaybackTimelineReceipt:
-        credential = _extract_bearer(authorization)
-        principal = await session_manager.resolve(credential or "")
-        if principal is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        principal = await resolve_principal(authorization)
         if timeline_coordinator is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -211,14 +260,7 @@ def install_operator_recording_api(
         recording_id: UUID,
         authorization: Annotated[list[str] | None, Header()] = None,
     ) -> StreamingResponse:
-        credential = _extract_bearer(authorization)
-        principal = await session_manager.resolve(credential or "")
-        if principal is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        principal = await resolve_principal(authorization)
         if export_coordinator is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -276,14 +318,7 @@ def install_operator_recording_api(
         height: Annotated[int, Query(ge=240, le=16_384)] = 720,
         control_id: UUID | None = None,
     ) -> OperatorPlaybackReceipt:
-        credential = _extract_bearer(authorization)
-        principal = await session_manager.resolve(credential or "")
-        if principal is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        principal = await resolve_principal(authorization)
         if playback_coordinator is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -316,14 +351,7 @@ def install_operator_recording_api(
         action: OperatorPlaybackControlAction,
         authorization: list[str] | None,
     ) -> OperatorPlaybackControlReceipt:
-        credential = _extract_bearer(authorization)
-        principal = await session_manager.resolve(credential or "")
-        if principal is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        principal = await resolve_principal(authorization)
         if playback_coordinator is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
