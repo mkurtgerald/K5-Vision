@@ -11,6 +11,7 @@ packages, model weights, or arbitrary skill dependencies.
 from __future__ import annotations
 
 import enum
+import os
 import platform
 import shutil
 import subprocess
