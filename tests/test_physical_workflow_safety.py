@@ -219,9 +219,7 @@ def test_stage_one_private_camera_configuration_is_step_scoped() -> None:
                 assert f"          {binding}\n" in step
 
         action_steps = [
-            part
-            for part in text.split("      - name: ")[1:]
-            if "        uses: actions/" in part
+            part for part in text.split("      - name: ")[1:] if "        uses: actions/" in part
         ]
         assert action_steps
         for step in action_steps:
