@@ -114,10 +114,10 @@ def test_viewer_session_selects_enrolled_device_and_invokes_private_launcher(
 
     with TestClient(application) as client:
         viewer, _viewer_id = _issue_session(client, username="viewer-user", role="viewer")
-        operator, _operator_id = _issue_session(
+        administrator, _administrator_id = _issue_session(
             client,
-            username="operator-user",
-            role="operator",
+            username="administrator-user",
+            role="administrator",
         )
         enrolled = client.post(
             "/api/v1/devices",
@@ -128,7 +128,7 @@ def test_viewer_session_selects_enrolled_device_and_invokes_private_launcher(
                 "protocols": ["rtsp"],
                 "tags": ["synthetic"],
             },
-            headers=_headers(operator),
+            headers=_headers(administrator),
         )
         assert enrolled.status_code == 201
 

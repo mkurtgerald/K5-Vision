@@ -121,7 +121,7 @@ def test_export_streams_validated_pair_without_live_runtime(monkeypatch, tmp_pat
 
     with TestClient(application) as client:
         viewer = _issue_session(client, "viewer-user", "viewer")
-        operator = _issue_session(client, "operator-user", "operator")
+        administrator = _issue_session(client, "administrator-user", "administrator")
         enrolled = client.post(
             "/api/v1/devices",
             json={
@@ -130,7 +130,7 @@ def test_export_streams_validated_pair_without_live_runtime(monkeypatch, tmp_pat
                 "kind": "camera",
                 "protocols": ["rtsp"],
             },
-            headers=_headers(operator),
+            headers=_headers(administrator),
         )
         assert enrolled.status_code == 201
         recording_id = uuid4()
@@ -170,7 +170,7 @@ def test_export_rejects_corrupted_recording_before_media_response(
 
     with TestClient(application) as client:
         viewer = _issue_session(client, "corrupt-viewer", "viewer")
-        operator = _issue_session(client, "corrupt-operator", "operator")
+        administrator = _issue_session(client, "corrupt-administrator", "administrator")
         enrolled = client.post(
             "/api/v1/devices",
             json={
@@ -179,8 +179,9 @@ def test_export_rejects_corrupted_recording_before_media_response(
                 "kind": "camera",
                 "protocols": ["rtsp"],
             },
-            headers=_headers(operator),
+            headers=_headers(administrator),
         )
+        assert enrolled.status_code == 201
         recording_id = uuid4()
         asyncio.run(_write_recording_pair(root, recording_id, UUID(enrolled.json()["id"])))
         recording_path = root / f"{recording_id}.k5r"

@@ -359,7 +359,9 @@ def create_app(
             principal = await session_manager.resolve(credential)
             if principal is not None:
                 access = (
-                    _DeviceAccess.READ if principal.role is UserRole.VIEWER else _DeviceAccess.WRITE
+                    _DeviceAccess.WRITE
+                    if principal.role is UserRole.ADMINISTRATOR
+                    else _DeviceAccess.READ
                 )
                 principal_key = f"user:{principal.id}"
 
