@@ -94,8 +94,9 @@ def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
             "        required: true\n"
             "        type: string\n"
         )
-        assert "github.ref == 'refs/heads/main'\n" in admission
-        assert "inputs.reviewed_sha == github.sha" not in admission
+        assert "github.ref == 'refs/heads/main' &&\n" in admission
+        assert "inputs.reviewed_branch == 'main' &&\n" in admission
+        assert "inputs.reviewed_sha == github.sha\n" in admission
         assert "K5_REVIEWED_BRANCH: ${{ inputs.reviewed_branch }}" in text
         assert "K5_REVIEWED_SHA: ${{ inputs.reviewed_sha }}" in text
         assert "https://api.github.com/repos/$env:GITHUB_REPOSITORY/branches/" in text
