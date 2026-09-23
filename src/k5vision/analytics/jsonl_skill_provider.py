@@ -124,10 +124,10 @@ class JsonlSkillProvider:
                     process.stdout.readline(),
                     timeout=self._response_timeout_seconds,
                 )
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 raise SkillProviderError("analytics skill response timed out") from exc
             except (ValueError, asyncio.LimitOverrunError) as exc:
-                raise SkillProviderError("analytics skill response exceeded configured bound") from exc
+                raise SkillProviderError(\n                    "analytics skill response exceeded configured bound"\n                ) from exc
 
             if not line:
                 raise SkillProviderError("analytics skill process exited unexpectedly")
@@ -224,11 +224,11 @@ class JsonlSkillProvider:
 
             try:
                 await asyncio.wait_for(process.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 process.kill()
                 await process.wait()
 
-    async def __aenter__(self) -> "JsonlSkillProvider":
+    async def __aenter__(self) -> JsonlSkillProvider:
         if self._closed:
             raise SkillProviderError("analytics skill provider is closed")
         return self
