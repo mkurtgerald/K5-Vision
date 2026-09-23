@@ -349,9 +349,7 @@ def test_playback_control_route_requires_human_session_and_rejects_unknown_contr
     control_id = uuid4()
 
     with TestClient(application) as client:
-        unauthorized = client.post(
-            f"/api/v1/operator/playback-controls/{control_id}/pause"
-        )
+        unauthorized = client.post(f"/api/v1/operator/playback-controls/{control_id}/pause")
         viewer = _issue_session(client, "control-viewer")
         missing = client.post(
             f"/api/v1/operator/playback-controls/{control_id}/pause",

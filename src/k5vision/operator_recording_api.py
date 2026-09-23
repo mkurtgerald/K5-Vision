@@ -19,9 +19,9 @@ from k5vision.operator_export import (
 from k5vision.operator_launch import OperatorSourceResolver
 from k5vision.operator_playback import (
     BoundedOperatorPlaybackCoordinator,
-    OperatorPlaybackError,
     OperatorPlaybackControlAction,
     OperatorPlaybackControlReceipt,
+    OperatorPlaybackError,
     OperatorPlaybackErrorCode,
     OperatorPlaybackReceipt,
     OperatorPlaybackRequest,
