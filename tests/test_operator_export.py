@@ -152,12 +152,14 @@ def test_export_streams_validated_pair_without_live_runtime(monkeypatch, tmp_pat
     assert b"K5RTPF\x00\x01" in response.content
     assert str(recording_id).encode("ascii") in response.content
     assert b"192.0.2.30" not in response.content
-    assert b"rtsp://" not in response.content.casefold()
-    assert str(tmp_path).encode().casefold() not in response.content.casefold()
+    assert b"rtsp://" not in response.content.lower()
+    assert str(tmp_path).encode().lower() not in response.content.lower()
     assert application.state.operator_export_coordinator.active_exports == 0
 
 
-def test_export_rejects_corrupted_recording_before_media_response(monkeypatch, tmp_path: Path) -> None:
+def test_export_rejects_corrupted_recording_before_media_response(
+    monkeypatch, tmp_path: Path
+) -> None:
     _configure_user_state(monkeypatch, tmp_path)
     root = tmp_path / "recordings"
     application = create_app(
