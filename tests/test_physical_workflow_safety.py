@@ -23,10 +23,21 @@ _TARGETED_DISPATCH = {
     "stage-one-operator-physical.yml",
     "stage-one-remaining-physical-suite.yml",
 }
+_ANALYTICS_PHYSICAL = {
+    "stage-one-operator-physical.yml",
+    "stage-one-remaining-physical-suite.yml",
+}
+_CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 
 
 def _workflow_text() -> str:
     return Path(_WORKFLOW).read_text(encoding="utf-8")
+
+
+def _analytics_sha(text: str) -> str:
+    marker = "ANALYTICS_LAB_SHA: "
+    assert marker in text
+    return text.split(marker, maxsplit=1)[1].splitlines()[0].strip()
 
 
 def test_stage03_physical_workflow_is_manual_only() -> None:
@@ -79,7 +90,9 @@ def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
     assert "github.event.pull_request.head.sha" not in text
 
     checkouts = [part for part in text.split("      - name: ") if "uses: actions/checkout@" in part]
-    assert checkouts
+    primary_checkouts = [part for part in checkouts if "          repository:" not in part]
+    assert primary_checkouts
+    assert all("          persist-credentials: false\n" in checkout for checkout in checkouts)
 
     if path.name in _TARGETED_DISPATCH:
         assert triggers == (
@@ -101,9 +114,8 @@ def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
         assert "K5_REVIEWED_SHA: ${{ inputs.reviewed_sha }}" in text
         assert "https://api.github.com/repos/$env:GITHUB_REPOSITORY/branches/" in text
         assert "$branch.commit.sha -ne $env:K5_REVIEWED_SHA" in text
-        for checkout in checkouts:
+        for checkout in primary_checkouts:
             assert "          ref: ${{ inputs.reviewed_sha }}\n" in checkout
-            assert "          persist-credentials: false\n" in checkout
     else:
         assert triggers == (
             "  workflow_dispatch:\n"
@@ -114,9 +126,8 @@ def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
             "        type: string\n"
         )
         assert "inputs.reviewed_sha == github.sha\n" in admission
-        for checkout in checkouts:
+        for checkout in primary_checkouts:
             assert "          ref: ${{ github.sha }}\n" in checkout
-            assert "          persist-credentials: false\n" in checkout
 
 
 @pytest.mark.parametrize("path", _PHYSICAL, ids=lambda path: path.stem)
@@ -140,6 +151,31 @@ def test_qualification_upload_requires_its_validation_outcome(path: Path) -> Non
             header = upload.split("        uses:", maxsplit=1)[0]
             assert "        if: success()\n" in header
             assert "if: always()" not in header
+
+
+def test_stage_one_physical_paths_bind_same_reviewed_analytics_revision() -> None:
+    compatibility = (_WORKFLOWS / "stage-one-analytics-compat.yml").read_text(encoding="utf-8")
+    expected_sha = _analytics_sha(compatibility)
+
+    for name in sorted(_ANALYTICS_PHYSICAL):
+        text = (_WORKFLOWS / name).read_text(encoding="utf-8")
+        assert _analytics_sha(text) == expected_sha
+        checkout = next(
+            part
+            for part in text.split("      - name: ")
+            if "          repository: mkurtgerald/Analytics-lab\n" in part
+        )
+        assert f"        uses: {_CHECKOUT_ACTION} # v7\n" in checkout
+        assert "        id: analytics_checkout\n" in checkout
+        assert "          ref: ${{ env.ANALYTICS_LAB_SHA }}\n" in checkout
+        assert "          path: analytics-lab\n" in checkout
+        assert "          persist-credentials: false\n" in checkout
+        assert "steps.analytics_checkout.outputs.commit" in text
+        assert "K5_ANALYTICS_EVIDENCE_ROOT" in text
+        assert "analytics_lab.validation_seed" in text
+        assert '"openvino==2026.3.1"' in text
+        assert '"opencv-python-headless==4.12.0.88"' in text
+        assert "git -C $analytics fetch" not in text
 
 
 def test_remaining_stage_one_suite_covers_every_required_gate() -> None:
