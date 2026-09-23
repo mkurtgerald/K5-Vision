@@ -359,11 +359,13 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
             assert receipt["completed"] is True
             assert receipt["delivered_frames"] >= 1
             assert receipt["presentations"] >= 1
-            assert analytics_provider.provider_calls >= 1
-            assert analytics_provider.tracked_detections >= 1
+            assert receipt["analytics_enabled"] is True
+            assert receipt["analytics_provider_submissions"] >= 1
+            assert receipt["analytics_provider_completions"] >= 1
+            assert receipt["analytics_rendered_boxes"] >= 1
 
         evidence = {
-            "schema_version": "2",
+            "schema_version": "3",
             "revision": revision,
             "execution_context": "camera-lab-windows-x64",
             "human_session_authenticated": True,
@@ -375,6 +377,10 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
             "processed_controls": receipt["processed_controls"],
             "analytics_provider_calls": analytics_provider.provider_calls,
             "analytics_tracked_detections": analytics_provider.tracked_detections,
+            "analytics_provider_submissions": receipt["analytics_provider_submissions"],
+            "analytics_provider_completions": receipt["analytics_provider_completions"],
+            "analytics_failures": receipt["analytics_failures"],
+            "analytics_rendered_boxes": receipt["analytics_rendered_boxes"],
         }
         payload = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
         lowered = payload.casefold()
