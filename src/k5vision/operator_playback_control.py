@@ -16,7 +16,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from k5vision.media.playback_pump import PlaybackPumpError, PlaybackPumpErrorCode, PlaybackPumpState
+from k5vision.media.playback_pump import (
+    PlaybackPumpError,
+    PlaybackPumpErrorCode,
+    PlaybackPumpState,
+)
 from k5vision.media.playback_schedule import PlaybackRate
 from k5vision.media.presentation_playback import (
     BoundedPresentationPlaybackDelivery,
@@ -25,10 +29,17 @@ from k5vision.media.presentation_playback import (
     PresentationPlaybackState,
 )
 from k5vision.media.recording_descriptor import RecordingStreamDescriptor
-from k5vision.operator_playback import WindowsMixedOperatorPlaybackLauncher
+from k5vision.operator_playback import (
+    OperatorPlaybackError,
+    OperatorPlaybackErrorCode,
+    WindowsMixedOperatorPlaybackLauncher,
+)
 
 _ControlKey = tuple[UUID, UUID]
-_CONTROL_KEY: ContextVar[_ControlKey | None] = ContextVar("k5_operator_playback_control", default=None)
+_CONTROL_KEY: ContextVar[_ControlKey | None] = ContextVar(
+    "k5_operator_playback_control",
+    default=None,
+)
 
 
 class OperatorPlaybackControlState(StrEnum):
@@ -158,6 +169,11 @@ class ControlledWindowsMixedOperatorPlaybackLauncher(WindowsMixedOperatorPlaybac
 
     async def run(self, *args, **kwargs):
         key = _CONTROL_KEY.get()
+        if key is not None and key in self._active_controls:
+            raise OperatorPlaybackError(
+                OperatorPlaybackErrorCode.PLAYBACK_BUSY,
+                "operator playback is already active for this recording",
+            )
         try:
             return await super().run(*args, **kwargs)
         finally:
