@@ -157,8 +157,7 @@ class BoundedPlaybackPump:
                     PlaybackPumpErrorCode.INVALID_STATE,
                     "playback pump is not running",
                 )
-            paused_at = self._read_clock()
-            self._pause_started = paused_at
+            self._pause_started = self._read_clock()
             self._state = PlaybackPumpState.PAUSED
             self._control_changed.set()
             return self.snapshot
@@ -196,18 +195,19 @@ class BoundedPlaybackPump:
         finally:
             self._control_changed.clear()
 
+    async def _wait_while_paused(self) -> None:
+        while self._state is PlaybackPumpState.PAUSED:
+            await self._wait_for_control_change()
+        if self._state is not PlaybackPumpState.RUNNING:
+            raise PlaybackPumpError(
+                PlaybackPumpErrorCode.INVALID_STATE,
+                "playback pump left its active state",
+            )
+
     async def _wait_until_due(self, started: float, due_seconds: float) -> bool:
         """Wait until one packet deadline. Return whether the packet is late."""
         while True:
-            if self._state is PlaybackPumpState.PAUSED:
-                await self._wait_for_control_change()
-                continue
-            if self._state is not PlaybackPumpState.RUNNING:
-                raise PlaybackPumpError(
-                    PlaybackPumpErrorCode.INVALID_STATE,
-                    "playback pump left its active state",
-                )
-
+            await self._wait_while_paused()
             now = self._read_clock()
             remaining = started + self._paused_seconds + due_seconds - now
             if remaining <= 0:
@@ -215,6 +215,7 @@ class BoundedPlaybackPump:
 
             sleep_task = asyncio.create_task(self._sleep(remaining))
             control_task = asyncio.create_task(self._control_changed.wait())
+            pending: set[asyncio.Task[object]] = set()
             try:
                 done, pending = await asyncio.wait(
                     {sleep_task, control_task},
@@ -232,11 +233,6 @@ class BoundedPlaybackPump:
                 control_task.cancel()
                 await asyncio.gather(sleep_task, control_task, return_exceptions=True)
                 raise
-            except PlaybackPumpError:
-                sleep_task.cancel()
-                control_task.cancel()
-                await asyncio.gather(sleep_task, control_task, return_exceptions=True)
-                raise
             except Exception:
                 sleep_task.cancel()
                 control_task.cancel()
@@ -246,9 +242,9 @@ class BoundedPlaybackPump:
                     "playback pacing failed",
                 ) from None
             finally:
-                for task in pending if "pending" in locals() else ():
+                for task in pending:
                     task.cancel()
-                if "pending" in locals():
+                if pending:
                     await asyncio.gather(*pending, return_exceptions=True)
 
     async def run(self, consumer: PlaybackConsumer) -> PlaybackPumpSnapshot:
@@ -272,6 +268,7 @@ class BoundedPlaybackPump:
                     late = await self._wait_until_due(started, item.due_ms / 1000.0)
                     if late:
                         self._late_packets += 1
+                    await self._wait_while_paused()
                 except asyncio.CancelledError:
                     self._state = PlaybackPumpState.CANCELLED
                     raise
@@ -280,8 +277,6 @@ class BoundedPlaybackPump:
                     raise
 
                 try:
-                    if self._state is PlaybackPumpState.PAUSED:
-                        await self._wait_for_control_change()
                     await asyncio.wait_for(
                         consumer(memoryview(item.packet), item.source_elapsed_ms),
                         timeout=self._consumer_timeout_seconds,
