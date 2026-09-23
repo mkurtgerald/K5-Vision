@@ -8,6 +8,7 @@ URIs, credentials, filesystem paths, and media payloads never enter catalog stat
 
 from __future__ import annotations
 
+import itertools
 import stat
 from datetime import datetime
 from pathlib import Path
@@ -116,23 +117,26 @@ class BoundedRecordingCatalog:
 
         recovered: list[RecordingCatalogEntry] = []
         rejected = 0
-        scanned = 0
         truncated = False
         try:
-            candidates = sorted(self._root.glob("*.k5d"), key=lambda path: path.name)
+            limited = list(
+                itertools.islice(
+                    self._root.glob("*.k5d"),
+                    self._max_scan_files + 1,
+                )
+            )
+            if len(limited) > self._max_scan_files:
+                truncated = True
+                limited = limited[: self._max_scan_files]
+            candidates = sorted(limited, key=lambda path: path.name)
         except OSError:
             candidates = []
             rejected = 1
 
         for descriptor_path in candidates:
-            if scanned >= self._max_scan_files:
-                truncated = True
-                break
-            scanned += 1
             if len(recovered) >= self._max_entries:
                 truncated = True
                 break
-
             try:
                 recording_id = UUID(descriptor_path.stem)
                 descriptor_stat = descriptor_path.lstat()
