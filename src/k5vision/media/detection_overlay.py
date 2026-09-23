@@ -18,7 +18,7 @@ from k5vision.media.presentation_frame import PixelFormat, PresentationVideoFram
 
 _MAX_BOXES = 512
 _MAX_BORDER_WIDTH = 8
-_MAX_PIXELS_TOUCHED = 16_384 * 16_384
+_MAX_PIXEL_WRITES = 16_384 * 16_384
 
 
 class DetectionOverlayError(ValueError):
@@ -66,7 +66,7 @@ class DetectionOverlaySnapshot(BaseModel):
     input_observations: int = Field(ge=0, le=_MAX_BOXES)
     rendered_boxes: int = Field(ge=0, le=_MAX_BOXES)
     confidence_filtered: int = Field(ge=0, le=_MAX_BOXES)
-    touched_pixels: int = Field(ge=0, le=_MAX_PIXELS_TOUCHED)
+    pixel_writes: int = Field(ge=0, le=_MAX_PIXEL_WRITES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,12 +144,12 @@ class BoundedDetectionOverlayRenderer:
                     input_observations=len(selected),
                     rendered_boxes=0,
                     confidence_filtered=len(selected),
-                    touched_pixels=0,
+                    pixel_writes=0,
                 ),
             )
 
         rendered = bytearray(frame.payload)
-        touched: set[int] = set()
+        pixel_writes = 0
         for observation in active:
             left, top, right, bottom = self._pixel_bounds(
                 observation,
@@ -165,16 +165,16 @@ class BoundedDetectionOverlayRenderer:
                     break
                 for x in range(x0, x1 + 1):
                     self._write_pixel(rendered, frame.stride_bytes, x, y0)
-                    touched.add(y0 * frame.width + x)
+                    pixel_writes += 1
                     if y1 != y0:
                         self._write_pixel(rendered, frame.stride_bytes, x, y1)
-                        touched.add(y1 * frame.width + x)
+                        pixel_writes += 1
                 for y in range(y0 + 1, y1):
                     self._write_pixel(rendered, frame.stride_bytes, x0, y)
-                    touched.add(y * frame.width + x0)
+                    pixel_writes += 1
                     if x1 != x0:
                         self._write_pixel(rendered, frame.stride_bytes, x1, y)
-                        touched.add(y * frame.width + x1)
+                        pixel_writes += 1
 
         output = PresentationVideoFrame(
             payload=memoryview(rendered),
@@ -190,6 +190,6 @@ class BoundedDetectionOverlayRenderer:
                 input_observations=len(selected),
                 rendered_boxes=len(active),
                 confidence_filtered=len(selected) - len(active),
-                touched_pixels=len(touched),
+                pixel_writes=pixel_writes,
             ),
         )
