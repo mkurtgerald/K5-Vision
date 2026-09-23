@@ -66,9 +66,7 @@ def _nvidia_smi_path() -> str | None:
         / "NVIDIA Corporation"
         / "NVSMI"
         / "nvidia-smi.exe",
-        Path(os.environ.get("WINDIR", r"C:\Windows"))
-        / "System32"
-        / "nvidia-smi.exe",
+        Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "nvidia-smi.exe",
     )
     for candidate in candidates:
         if candidate.is_file():
