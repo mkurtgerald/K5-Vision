@@ -7,9 +7,15 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import FastAPI, Header, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 
 from k5vision.auth_sessions import UserSessionManager
 from k5vision.media.playback_schedule import PlaybackRate
+from k5vision.operator_export import (
+    BoundedOperatorExportCoordinator,
+    OperatorExportError,
+    OperatorExportErrorCode,
+)
 from k5vision.operator_launch import OperatorSourceResolver
 from k5vision.operator_playback import (
     BoundedOperatorPlaybackCoordinator,
@@ -60,6 +66,12 @@ _PLAYBACK_ERROR_STATUS = {
     OperatorPlaybackErrorCode.REGISTRY_UNAVAILABLE: status.HTTP_503_SERVICE_UNAVAILABLE,
 }
 
+_EXPORT_ERROR_STATUS = {
+    OperatorExportErrorCode.EXPORT_TOO_LARGE: status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+    OperatorExportErrorCode.EXPORT_BUSY: status.HTTP_429_TOO_MANY_REQUESTS,
+    OperatorExportErrorCode.EXPORT_INVALID: status.HTTP_503_SERVICE_UNAVAILABLE,
+}
+
 
 def _extract_bearer(authorization: list[str] | None) -> str | None:
     header = authorization[0] if authorization and len(authorization) == 1 else ""
@@ -87,11 +99,14 @@ def install_operator_recording_api(
     recording_coordinator: BoundedOperatorRecordingCoordinator | None = None
     playback_coordinator: BoundedOperatorPlaybackCoordinator | None = None
     timeline_coordinator: BoundedOperatorPlaybackTimeline | None = None
+    export_coordinator: BoundedOperatorExportCoordinator | None = None
     if registry is not None and recording_root is not None:
         try:
             timeline_coordinator = BoundedOperatorPlaybackTimeline(registry, recording_root)
+            export_coordinator = BoundedOperatorExportCoordinator(registry, recording_root)
         except (TypeError, ValueError):
             timeline_coordinator = None
+            export_coordinator = None
     if registry is not None and source_resolver is not None and recording_root is not None:
         try:
             recording_coordinator = BoundedOperatorRecordingCoordinator(
@@ -112,6 +127,7 @@ def install_operator_recording_api(
     application.state.operator_recording_coordinator = recording_coordinator
     application.state.operator_playback_coordinator = playback_coordinator
     application.state.operator_playback_timeline = timeline_coordinator
+    application.state.operator_export_coordinator = export_coordinator
 
     @application.post(
         "/api/v1/operator/recordings",
@@ -181,6 +197,56 @@ def install_operator_recording_api(
                 detail=str(exc),
                 headers=headers,
             ) from None
+
+    @application.get(
+        "/api/v1/operator/recordings/{recording_id}/export",
+        tags=["operator"],
+    )
+    async def export_operator_recording(
+        recording_id: UUID,
+        authorization: Annotated[list[str] | None, Header()] = None,
+    ) -> StreamingResponse:
+        credential = _extract_bearer(authorization)
+        principal = await session_manager.resolve(credential or "")
+        if principal is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if export_coordinator is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Operator export is not configured",
+            )
+
+        try:
+            handle = await export_coordinator.begin_export(principal, recording_id)
+        except OperatorPlaybackError as exc:
+            response_status = _PLAYBACK_ERROR_STATUS[exc.code]
+            headers = {"WWW-Authenticate": "Bearer"} if response_status == 401 else None
+            raise HTTPException(
+                status_code=response_status,
+                detail=str(exc),
+                headers=headers,
+            ) from None
+        except OperatorExportError as exc:
+            raise HTTPException(
+                status_code=_EXPORT_ERROR_STATUS[exc.code],
+                detail=str(exc),
+            ) from None
+
+        return StreamingResponse(
+            export_coordinator.stream(handle),
+            media_type=f"multipart/mixed; boundary={handle.boundary}",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Length": str(handle.response_bytes),
+                "X-Content-Type-Options": "nosniff",
+                "X-K5-Recording-Id": str(recording_id),
+                "X-K5-Descriptor-Validated": "true",
+            },
+        )
 
     @application.post(
         "/api/v1/operator/recordings/{recording_id}/playback",
