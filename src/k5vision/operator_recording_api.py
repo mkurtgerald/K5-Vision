@@ -23,7 +23,13 @@ from k5vision.operator_playback import (
     OperatorPlaybackErrorCode,
     OperatorPlaybackReceipt,
     OperatorPlaybackRequest,
-    WindowsMixedOperatorPlaybackLauncher,
+)
+from k5vision.operator_playback_control import (
+    ControlledWindowsMixedOperatorPlaybackLauncher,
+    OperatorPlaybackControlError,
+    OperatorPlaybackControlErrorCode,
+    OperatorPlaybackControlReceipt,
+    playback_control_scope,
 )
 from k5vision.operator_playback_timeline import (
     BoundedOperatorPlaybackTimeline,
@@ -72,6 +78,12 @@ _EXPORT_ERROR_STATUS = {
     OperatorExportErrorCode.EXPORT_INVALID: status.HTTP_503_SERVICE_UNAVAILABLE,
 }
 
+_CONTROL_ERROR_STATUS = {
+    OperatorPlaybackControlErrorCode.NOT_ACTIVE: status.HTTP_409_CONFLICT,
+    OperatorPlaybackControlErrorCode.INVALID_STATE: status.HTTP_409_CONFLICT,
+    OperatorPlaybackControlErrorCode.CONTROL_FAILURE: status.HTTP_503_SERVICE_UNAVAILABLE,
+}
+
 
 def _extract_bearer(authorization: list[str] | None) -> str | None:
     header = authorization[0] if authorization and len(authorization) == 1 else ""
@@ -100,6 +112,7 @@ def install_operator_recording_api(
     playback_coordinator: BoundedOperatorPlaybackCoordinator | None = None
     timeline_coordinator: BoundedOperatorPlaybackTimeline | None = None
     export_coordinator: BoundedOperatorExportCoordinator | None = None
+    control_launcher: ControlledWindowsMixedOperatorPlaybackLauncher | None = None
     if registry is not None and recording_root is not None:
         try:
             timeline_coordinator = BoundedOperatorPlaybackTimeline(registry, recording_root)
@@ -114,20 +127,34 @@ def install_operator_recording_api(
                 source_resolver,
                 recording_root,
             )
+            control_launcher = ControlledWindowsMixedOperatorPlaybackLauncher()
             playback_coordinator = BoundedOperatorPlaybackCoordinator(
                 registry,
                 source_resolver,
                 recording_root,
-                WindowsMixedOperatorPlaybackLauncher(),
+                control_launcher,
             )
         except (TypeError, ValueError):
             recording_coordinator = None
             playback_coordinator = None
+            control_launcher = None
 
     application.state.operator_recording_coordinator = recording_coordinator
     application.state.operator_playback_coordinator = playback_coordinator
     application.state.operator_playback_timeline = timeline_coordinator
     application.state.operator_export_coordinator = export_coordinator
+    application.state.operator_playback_control_launcher = control_launcher
+
+    async def resolve_human_principal(authorization: list[str] | None):
+        credential = _extract_bearer(authorization)
+        principal = await session_manager.resolve(credential or "")
+        if principal is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return principal
 
     @application.post(
         "/api/v1/operator/recordings",
@@ -139,14 +166,7 @@ def install_operator_recording_api(
         payload: OperatorRecordingRequest,
         authorization: Annotated[list[str] | None, Header()] = None,
     ) -> OperatorRecordingReceipt:
-        credential = _extract_bearer(authorization)
-        principal = await session_manager.resolve(credential or "")
-        if principal is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        principal = await resolve_human_principal(authorization)
         if recording_coordinator is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -173,14 +193,7 @@ def install_operator_recording_api(
         recording_id: UUID,
         authorization: Annotated[list[str] | None, Header()] = None,
     ) -> OperatorPlaybackTimelineReceipt:
-        credential = _extract_bearer(authorization)
-        principal = await session_manager.resolve(credential or "")
-        if principal is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        principal = await resolve_human_principal(authorization)
         if timeline_coordinator is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -206,14 +219,7 @@ def install_operator_recording_api(
         recording_id: UUID,
         authorization: Annotated[list[str] | None, Header()] = None,
     ) -> StreamingResponse:
-        credential = _extract_bearer(authorization)
-        principal = await session_manager.resolve(credential or "")
-        if principal is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        principal = await resolve_human_principal(authorization)
         if export_coordinator is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -270,14 +276,7 @@ def install_operator_recording_api(
         width: Annotated[int, Query(ge=640, le=16_384)] = 1280,
         height: Annotated[int, Query(ge=240, le=16_384)] = 720,
     ) -> OperatorPlaybackReceipt:
-        credential = _extract_bearer(authorization)
-        principal = await session_manager.resolve(credential or "")
-        if principal is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        principal = await resolve_human_principal(authorization)
         if playback_coordinator is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -294,7 +293,8 @@ def install_operator_recording_api(
             height=height,
         )
         try:
-            return await playback_coordinator.play(principal, request)
+            with playback_control_scope(principal.id, recording_id):
+                return await playback_coordinator.play(principal, request)
         except OperatorPlaybackError as exc:
             response_status = _PLAYBACK_ERROR_STATUS[exc.code]
             headers = {"WWW-Authenticate": "Bearer"} if response_status == 401 else None
@@ -303,5 +303,49 @@ def install_operator_recording_api(
                 detail=str(exc),
                 headers=headers,
             ) from None
+
+    async def control_operator_playback(
+        recording_id: UUID,
+        authorization: list[str] | None,
+        *,
+        pause: bool,
+    ) -> OperatorPlaybackControlReceipt:
+        principal = await resolve_human_principal(authorization)
+        if control_launcher is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Operator playback control is not configured",
+            )
+        try:
+            if pause:
+                return await control_launcher.pause(principal.id, recording_id)
+            return await control_launcher.resume(principal.id, recording_id)
+        except OperatorPlaybackControlError as exc:
+            raise HTTPException(
+                status_code=_CONTROL_ERROR_STATUS[exc.code],
+                detail=str(exc),
+            ) from None
+
+    @application.post(
+        "/api/v1/operator/recordings/{recording_id}/playback/pause",
+        response_model=OperatorPlaybackControlReceipt,
+        tags=["operator"],
+    )
+    async def pause_operator_playback(
+        recording_id: UUID,
+        authorization: Annotated[list[str] | None, Header()] = None,
+    ) -> OperatorPlaybackControlReceipt:
+        return await control_operator_playback(recording_id, authorization, pause=True)
+
+    @application.post(
+        "/api/v1/operator/recordings/{recording_id}/playback/resume",
+        response_model=OperatorPlaybackControlReceipt,
+        tags=["operator"],
+    )
+    async def resume_operator_playback(
+        recording_id: UUID,
+        authorization: Annotated[list[str] | None, Header()] = None,
+    ) -> OperatorPlaybackControlReceipt:
+        return await control_operator_playback(recording_id, authorization, pause=False)
 
     return recording_coordinator
