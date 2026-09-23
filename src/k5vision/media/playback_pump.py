@@ -122,8 +122,8 @@ class BoundedPlaybackPump:
         self._source_span_ms = 0
         self._scheduled_span_ms = 0
         self._descriptor_verified = False
-        self._control_lock = asyncio.Lock()
-        self._control_changed = asyncio.Event()
+        self._control_condition = asyncio.Condition()
+        self._control_generation = 0
         self._pause_started: float | None = None
         self._paused_seconds = 0.0
 
@@ -151,7 +151,7 @@ class BoundedPlaybackPump:
 
     async def pause(self) -> PlaybackPumpSnapshot:
         """Pause an active pump without advancing the deterministic media clock."""
-        async with self._control_lock:
+        async with self._control_condition:
             if self._state is not PlaybackPumpState.RUNNING:
                 raise PlaybackPumpError(
                     PlaybackPumpErrorCode.INVALID_STATE,
@@ -159,12 +159,13 @@ class BoundedPlaybackPump:
                 )
             self._pause_started = self._read_clock()
             self._state = PlaybackPumpState.PAUSED
-            self._control_changed.set()
+            self._control_generation += 1
+            self._control_condition.notify_all()
             return self.snapshot
 
     async def resume(self) -> PlaybackPumpSnapshot:
         """Resume a paused pump and shift future deadlines by the paused duration."""
-        async with self._control_lock:
+        async with self._control_condition:
             if self._state is not PlaybackPumpState.PAUSED or self._pause_started is None:
                 raise PlaybackPumpError(
                     PlaybackPumpErrorCode.INVALID_STATE,
@@ -179,12 +180,16 @@ class BoundedPlaybackPump:
             self._paused_seconds += resumed_at - self._pause_started
             self._pause_started = None
             self._state = PlaybackPumpState.RUNNING
-            self._control_changed.set()
+            self._control_generation += 1
+            self._control_condition.notify_all()
             return self.snapshot
 
-    async def _wait_for_control_change(self) -> None:
+    async def _wait_for_control_change(self, generation: int) -> None:
         try:
-            await self._control_changed.wait()
+            async with self._control_condition:
+                await self._control_condition.wait_for(
+                    lambda: self._control_generation != generation
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -192,12 +197,11 @@ class BoundedPlaybackPump:
                 PlaybackPumpErrorCode.PACING_FAILURE,
                 "playback pacing control failed",
             ) from None
-        finally:
-            self._control_changed.clear()
 
     async def _wait_while_paused(self) -> None:
         while self._state is PlaybackPumpState.PAUSED:
-            await self._wait_for_control_change()
+            generation = self._control_generation
+            await self._wait_for_control_change(generation)
         if self._state is not PlaybackPumpState.RUNNING:
             raise PlaybackPumpError(
                 PlaybackPumpErrorCode.INVALID_STATE,
@@ -213,9 +217,10 @@ class BoundedPlaybackPump:
             if remaining <= 0:
                 return remaining < 0
 
+            generation = self._control_generation
             sleep_task = asyncio.create_task(self._sleep(remaining))
-            control_task = asyncio.create_task(self._control_changed.wait())
-            pending: set[asyncio.Task[object]] = set()
+            control_task = asyncio.create_task(self._wait_for_control_change(generation))
+            pending: set[asyncio.Task[None]] = set()
             try:
                 done, pending = await asyncio.wait(
                     {sleep_task, control_task},
@@ -224,11 +229,14 @@ class BoundedPlaybackPump:
                 if sleep_task in done:
                     await sleep_task
                     return False
-
-                self._control_changed.clear()
                 sleep_task.cancel()
                 await asyncio.gather(sleep_task, return_exceptions=True)
             except asyncio.CancelledError:
+                sleep_task.cancel()
+                control_task.cancel()
+                await asyncio.gather(sleep_task, control_task, return_exceptions=True)
+                raise
+            except PlaybackPumpError:
                 sleep_task.cancel()
                 control_task.cancel()
                 await asyncio.gather(sleep_task, control_task, return_exceptions=True)
