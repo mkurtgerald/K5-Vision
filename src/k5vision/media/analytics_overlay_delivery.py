@@ -73,8 +73,8 @@ class BoundedAnalyticsOverlayDelivery:
         *,
         max_observations: int = 128,
         max_frames: int = 100_000,
-        provider_timeout_seconds: float = 0.25,
-        max_stale_ms: int = 750,
+        provider_timeout_seconds: float = 2.0,
+        max_stale_ms: int = 2_500,
         minimum_confidence: float = 0.5,
         border_width: int = 2,
     ) -> None:
