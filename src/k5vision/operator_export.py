@@ -6,9 +6,9 @@ import asyncio
 import enum
 import os
 import stat
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator
 from uuid import UUID
 
 from k5vision.domain.users import UserAccount
