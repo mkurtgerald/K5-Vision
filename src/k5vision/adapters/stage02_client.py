@@ -180,7 +180,11 @@ class Stage02Adapter:
             if not host:
                 continue
             port = _positive_number(_get(item, "port"), int) or 80
-            xaddrs = [str(value) for value in (_get(item, "xaddrs") or [])]
+            xaddrs = [
+                sanitized
+                for value in (_get(item, "xaddrs") or [])
+                if (sanitized := _sanitize_uri(value)) is not None
+            ]
             secure = any(address.lower().startswith("https://") for address in xaddrs)
             results.append(
                 DiscoveredEndpoint(
