@@ -276,6 +276,7 @@ class WindowsSingleLiveOperatorLauncher(OperatorLauncher):
                 OperatorLaunchErrorCode.LAUNCH_FAILURE,
                 "live operator runtime failed",
             )
+        analytics_delivery: BoundedAnalyticsOverlayDelivery | None = None
         try:
             layout = ViewportLayout(
                 placements=(
@@ -287,10 +288,11 @@ class WindowsSingleLiveOperatorLauncher(OperatorLauncher):
             )
             delivery = self._delivery_factory(source.payload_type)
             if self._detection_provider is not None:
-                delivery = BoundedAnalyticsOverlayDelivery(
+                analytics_delivery = BoundedAnalyticsOverlayDelivery(
                     delivery,
                     self._detection_provider,
                 )
+                delivery = analytics_delivery
             runtime = self._runtime_factory(layout)
             stream = MixedLiveStream(slot=0, source_uri=source.source_uri, delivery=delivery)
         except Exception:
@@ -308,10 +310,24 @@ class WindowsSingleLiveOperatorLauncher(OperatorLauncher):
                     OperatorLaunchErrorCode.LAUNCH_FAILURE,
                     "live operator runtime failed",
                 )
+            analytics_snapshot = None if analytics_delivery is None else analytics_delivery.snapshot
             return OperatorLaunchMetrics(
                 delivered_frames=final.delivered_frames,
                 presentations=final.presentations,
                 processed_controls=0,
+                analytics_enabled=analytics_delivery is not None,
+                analytics_provider_submissions=(
+                    0 if analytics_snapshot is None else analytics_snapshot.provider_submissions
+                ),
+                analytics_provider_completions=(
+                    0 if analytics_snapshot is None else analytics_snapshot.provider_completions
+                ),
+                analytics_failures=(
+                    0 if analytics_snapshot is None else analytics_snapshot.analytics_failures
+                ),
+                analytics_rendered_boxes=(
+                    0 if analytics_snapshot is None else analytics_snapshot.rendered_boxes
+                ),
             )
         except asyncio.CancelledError as exc:
             primary_error = exc
