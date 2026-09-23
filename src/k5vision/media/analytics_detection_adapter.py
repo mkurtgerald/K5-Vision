@@ -36,20 +36,14 @@ def adapt_analytics_tracked_detections(
     trusted here; site/source/session authority remains product-owned upstream.
     """
     if type(max_observations) is not int or not 1 <= max_observations <= _MAX_TRACKED_OBSERVATIONS:
-        raise ValueError(
-            f"max_observations must be between 1 and {_MAX_TRACKED_OBSERVATIONS}"
-        )
+        raise ValueError(f"max_observations must be between 1 and {_MAX_TRACKED_OBSERVATIONS}")
 
     try:
         selected = tuple(values)
     except TypeError as exc:
-        raise AnalyticsDetectionAdapterError(
-            "analytics detections must be iterable"
-        ) from exc
+        raise AnalyticsDetectionAdapterError("analytics detections must be iterable") from exc
     if len(selected) > max_observations:
-        raise AnalyticsDetectionAdapterError(
-            "analytics detection count exceeds configured bound"
-        )
+        raise AnalyticsDetectionAdapterError("analytics detection count exceeds configured bound")
 
     observations: list[DetectionOverlayObservation] = []
     for value in selected:
@@ -60,14 +54,10 @@ def adapt_analytics_tracked_detections(
             box = value.box
             coordinates = (box.x_min, box.y_min, box.x_max, box.y_max)
         except Exception as exc:
-            raise AnalyticsDetectionAdapterError(
-                "analytics detection value is invalid"
-            ) from exc
+            raise AnalyticsDetectionAdapterError("analytics detection value is invalid") from exc
 
         if not isinstance(track_id, str) or not track_id or len(track_id) > 128:
-            raise AnalyticsDetectionAdapterError(
-                "analytics detection value is invalid"
-            )
+            raise AnalyticsDetectionAdapterError("analytics detection value is invalid")
 
         try:
             observation = DetectionOverlayObservation(
@@ -79,9 +69,7 @@ def adapt_analytics_tracked_detections(
                 y_max=coordinates[3],
             )
         except (DetectionOverlayError, TypeError, ValueError) as exc:
-            raise AnalyticsDetectionAdapterError(
-                "analytics detection value is invalid"
-            ) from exc
+            raise AnalyticsDetectionAdapterError("analytics detection value is invalid") from exc
         observations.append(observation)
 
     return tuple(observations)
