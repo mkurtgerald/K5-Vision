@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Mapping, Sequence
 from multiprocessing import shared_memory
 
@@ -70,7 +71,10 @@ class JsonlSkillProvider:
                     raise ValueError("analytics skill environment is invalid")
 
         self._command = selected
-        self._environment = None if environment is None else dict(environment)
+        self._environment = None
+        if environment is not None:
+            self._environment = dict(os.environ)
+            self._environment.update(environment)
         self._response_timeout_seconds = response_timeout_seconds
         self._max_detections = max_detections
         self._max_response_bytes = max_response_bytes
