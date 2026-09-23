@@ -21,8 +21,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from k5vision.domain.devices import Device, DeviceKind, DeviceProtocol
 from k5vision.domain.users import UserAccount, UserRole
 from k5vision.media.mixed_presentation import MixedLiveStream, MixedPlaybackStream
+from k5vision.media.pausable_presentation_playback import PausablePresentationPlaybackDelivery
+from k5vision.media.playback_control import (
+    PlaybackControlSnapshot,
+    PlaybackControlState,
+    PlaybackPauseControl,
+)
 from k5vision.media.playback_schedule import PlaybackRate
-from k5vision.media.presentation_playback import BoundedPresentationPlaybackDelivery
 from k5vision.media.recording_descriptor import (
     RecordingDescriptorError,
     RecordingStreamDescriptor,
@@ -62,6 +67,9 @@ class OperatorPlaybackErrorCode(StrEnum):
     SOURCE_SCOPE_MISMATCH = "source_scope_mismatch"
     WINDOW_INVALID = "window_invalid"
     PLAYBACK_BUSY = "playback_busy"
+    CONTROL_CONFLICT = "control_conflict"
+    CONTROL_NOT_FOUND = "control_not_found"
+    CONTROL_FORBIDDEN = "control_forbidden"
     PLAYBACK_FAILURE = "playback_failure"
     REGISTRY_UNAVAILABLE = "registry_unavailable"
 
@@ -80,6 +88,7 @@ class OperatorPlaybackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     recording_id: UUID
+    control_id: UUID | None = None
     stream_token: StreamToken = "main"
     start_ms: int = Field(default=0, ge=0, le=7 * 24 * 60 * 60 * 1000)
     end_ms: int | None = Field(default=None, ge=0, le=7 * 24 * 60 * 60 * 1000)
@@ -119,6 +128,24 @@ class OperatorPlaybackReceipt(BaseModel):
     descriptor_verified: bool
 
 
+class OperatorPlaybackControlAction(StrEnum):
+    PAUSE = "pause"
+    RESUME = "resume"
+
+
+class OperatorPlaybackControlReceipt(BaseModel):
+    """Source-free status for one authorized active playback control."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: str = "1"
+    control_id: UUID
+    state: PlaybackControlState
+    pause_count: int = Field(ge=0, le=_MAX_COUNT)
+    resume_count: int = Field(ge=0, le=_MAX_COUNT)
+    paused_total_ms: int = Field(ge=0, le=2_147_483_647)
+
+
 class OperatorPlaybackLauncher(Protocol):
     async def run(
         self,
@@ -131,6 +158,7 @@ class OperatorPlaybackLauncher(Protocol):
         rate: PlaybackRate,
         width: int,
         height: int,
+        pause_control: PlaybackPauseControl | None = None,
     ) -> OperatorPlaybackMetrics: ...
 
 
@@ -148,7 +176,7 @@ class WindowsMixedOperatorPlaybackLauncher:
     def __init__(self, *, runtime_factory=None, live_delivery_factory=None, playback_factory=None):
         self._runtime_factory = runtime_factory or self._default_runtime_factory
         self._live_delivery_factory = live_delivery_factory or _default_delivery_factory
-        self._playback_factory = playback_factory or BoundedPresentationPlaybackDelivery
+        self._playback_factory = playback_factory or PausablePresentationPlaybackDelivery
         if not callable(self._runtime_factory):
             raise TypeError("runtime_factory must be callable")
         if not callable(self._live_delivery_factory):
@@ -174,6 +202,7 @@ class WindowsMixedOperatorPlaybackLauncher:
         rate: PlaybackRate,
         width: int,
         height: int,
+        pause_control: PlaybackPauseControl | None = None,
     ) -> OperatorPlaybackMetrics:
         if not isinstance(source, ResolvedLiveSource):
             raise OperatorPlaybackError(
@@ -207,13 +236,23 @@ class WindowsMixedOperatorPlaybackLauncher:
                 )
             )
             live_delivery = self._live_delivery_factory(source.payload_type)
-            playback_delivery = self._playback_factory(
-                recording_path,
-                descriptor,
-                start_ms,
-                end_ms,
-                rate,
-            )
+            if pause_control is None:
+                playback_delivery = self._playback_factory(
+                    recording_path,
+                    descriptor,
+                    start_ms,
+                    end_ms,
+                    rate,
+                )
+            else:
+                playback_delivery = self._playback_factory(
+                    recording_path,
+                    descriptor,
+                    start_ms,
+                    end_ms,
+                    rate,
+                    pause_control=pause_control,
+                )
             streams = (
                 MixedLiveStream(slot=0, source_uri=source.source_uri, delivery=live_delivery),
                 MixedPlaybackStream(slot=1, delivery=playback_delivery),
@@ -340,24 +379,90 @@ class BoundedOperatorPlaybackCoordinator:
         self._playback_launcher = playback_launcher
         self._max_active_playbacks = max_active_playbacks
         self._active_playbacks = 0
+        self._controls: dict[UUID, tuple[UUID, UUID, PlaybackPauseControl]] = {}
         self._state_lock = asyncio.Lock()
 
     @property
     def active_playbacks(self) -> int:
         return self._active_playbacks
 
-    async def _reserve(self) -> None:
+    async def _reserve(
+        self,
+        principal: UserAccount,
+        request: OperatorPlaybackRequest,
+    ) -> PlaybackPauseControl | None:
         async with self._state_lock:
             if self._active_playbacks >= self._max_active_playbacks:
                 raise OperatorPlaybackError(
                     OperatorPlaybackErrorCode.PLAYBACK_BUSY,
                     "operator playback capacity is currently exhausted",
                 )
+            pause_control: PlaybackPauseControl | None = None
+            if request.control_id is not None:
+                if request.control_id in self._controls:
+                    raise OperatorPlaybackError(
+                        OperatorPlaybackErrorCode.CONTROL_CONFLICT,
+                        "playback control identifier is already active",
+                    )
+                pause_control = PlaybackPauseControl()
+                self._controls[request.control_id] = (
+                    principal.id,
+                    request.recording_id,
+                    pause_control,
+                )
             self._active_playbacks += 1
+            return pause_control
 
-    async def _release(self) -> None:
+    async def _release(self, control_id: UUID | None) -> None:
         async with self._state_lock:
+            if control_id is not None:
+                self._controls.pop(control_id, None)
             self._active_playbacks = max(0, self._active_playbacks - 1)
+
+    @staticmethod
+    def _control_receipt(
+        control_id: UUID,
+        snapshot: PlaybackControlSnapshot,
+    ) -> OperatorPlaybackControlReceipt:
+        return OperatorPlaybackControlReceipt(
+            control_id=control_id,
+            state=snapshot.state,
+            pause_count=snapshot.pause_count,
+            resume_count=snapshot.resume_count,
+            paused_total_ms=snapshot.paused_total_ms,
+        )
+
+    async def control(
+        self,
+        principal: UserAccount,
+        control_id: UUID,
+        action: OperatorPlaybackControlAction,
+    ) -> OperatorPlaybackControlReceipt:
+        """Apply one bounded control to an active playback owned by the same principal."""
+        self._validate_principal(principal)
+        if not isinstance(control_id, UUID):
+            raise TypeError("control_id must be a UUID")
+        if not isinstance(action, OperatorPlaybackControlAction):
+            raise TypeError("action must be an OperatorPlaybackControlAction")
+
+        async with self._state_lock:
+            active = self._controls.get(control_id)
+            if active is None:
+                raise OperatorPlaybackError(
+                    OperatorPlaybackErrorCode.CONTROL_NOT_FOUND,
+                    "active playback control was not found",
+                )
+            owner_id, _recording_id, pause_control = active
+            if owner_id != principal.id:
+                raise OperatorPlaybackError(
+                    OperatorPlaybackErrorCode.CONTROL_FORBIDDEN,
+                    "active playback control belongs to another principal",
+                )
+            if action is OperatorPlaybackControlAction.PAUSE:
+                snapshot = await pause_control.pause()
+            else:
+                snapshot = await pause_control.resume()
+            return self._control_receipt(control_id, snapshot)
 
     @staticmethod
     def _validate_principal(principal: UserAccount) -> None:
@@ -435,7 +540,7 @@ class BoundedOperatorPlaybackCoordinator:
                 "playback window is outside the recording duration",
             )
 
-        await self._reserve()
+        pause_control = await self._reserve(principal, request)
         try:
             try:
                 source = await self._source_resolver.resolve(device, request.stream_token)
@@ -457,16 +562,29 @@ class BoundedOperatorPlaybackCoordinator:
             self._validate_source(device, source)
 
             try:
-                metrics = await self._playback_launcher.run(
-                    source,
-                    recording_path,
-                    descriptor,
-                    start_ms=request.start_ms,
-                    end_ms=end_ms,
-                    rate=request.rate,
-                    width=request.width,
-                    height=request.height,
-                )
+                if pause_control is None:
+                    metrics = await self._playback_launcher.run(
+                        source,
+                        recording_path,
+                        descriptor,
+                        start_ms=request.start_ms,
+                        end_ms=end_ms,
+                        rate=request.rate,
+                        width=request.width,
+                        height=request.height,
+                    )
+                else:
+                    metrics = await self._playback_launcher.run(
+                        source,
+                        recording_path,
+                        descriptor,
+                        start_ms=request.start_ms,
+                        end_ms=end_ms,
+                        rate=request.rate,
+                        width=request.width,
+                        height=request.height,
+                        pause_control=pause_control,
+                    )
             except OperatorPlaybackError:
                 raise
             except Exception:
@@ -487,4 +605,4 @@ class BoundedOperatorPlaybackCoordinator:
                 descriptor_verified=True,
             )
         finally:
-            await self._release()
+            await self._release(request.control_id)
