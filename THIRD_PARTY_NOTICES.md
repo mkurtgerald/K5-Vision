@@ -6,7 +6,17 @@ This file is the distribution-facing notice registry. Detailed source provenance
 
 ## Incorporated donor source
 
-No incorporated donor source is currently recorded.
+### SharpAI/DeepCamera
+
+K5 Vision adapts a limited accelerator-discovery strategy and process-boundary design
+from SharpAI/DeepCamera commit
+`933dcc7c90226cd1f92dc6ea7cee3b3c94790ad0`, licensed under the MIT License,
+Copyright (c) 2019 SharpAI Dev Team. The complete upstream MIT notice is preserved in
+`third_party/licenses/DeepCamera-MIT.txt`.
+
+This notice covers only the incorporated/adapted MIT-licensed material. It does not
+grant or imply commercial clearance for separately licensed model weights, artifacts,
+applications, or runtime dependencies referenced by DeepCamera.
 
 ## Runtime and development dependencies
 

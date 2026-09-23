@@ -21,7 +21,20 @@ For each donor component or copied source block, record:
 
 ## Current donor imports
 
-No donor source has been recorded in this ledger yet.
+### SharpAI/DeepCamera accelerator discovery
+
+- **Source:** https://github.com/SharpAI/DeepCamera
+- **Version/commit:** 933dcc7c90226cd1f92dc6ea7cee3b3c94790ad0
+- **License:** MIT
+- **Copyright:** Copyright (c) 2019 SharpAI Dev Team
+- **K5 files affected:** `src/k5vision/analytics/hardware_acceleration.py`; protocol/process architecture documented in `docs/DEEP_CAMERA_ACCELERATION.md`
+- **Integration method:** accelerator-probing strategy adapted; JSONL skill architecture used as a design reference; K5 process and shared-memory transport implementation is product-owned
+- **Modifications:** reduced to dependency-free hardware discovery; removed package/model installation and model loading; replaced frame-path transport with transient OS shared memory; retained K5 authority over media, source scope, credentials, auth, audit, evidence, and presentation
+- **Required notices:** preserve upstream MIT copyright/license text in `third_party/licenses/DeepCamera-MIT.txt` and distribution notice
+- **Commercial use:** approved for the adapted MIT-licensed source strategy only; no approval is granted here to Ultralytics/YOLO, InsightFace model weights, Depth Anything model weights, Aegis, or any separately licensed dependency/artifact
+- **Reviewed by:** K5 engineering review
+- **Reviewed on:** 2026-09-23
+- **Integrity reference:** upstream commit `933dcc7c90226cd1f92dc6ea7cee3b3c94790ad0`; upstream `skills/lib/env_config.py` blob `8c9b2e13a7776afc08700987b83f588d96e6ea31`
 
 Package dependencies declared in `pyproject.toml` are dependencies, not automatically donor-source imports. If source from one of those projects is copied or substantially adapted into this repository, add a ledger entry before merge.
 
