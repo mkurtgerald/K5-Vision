@@ -84,7 +84,7 @@ jobs:
           K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: |
           $ErrorActionPreference = "Stop"
-          $index = & python -m k5vision.stage03_credential_probe $env:K5_STAGE03_SOURCE
+          $index = & python -m k5vision.stage03_credential_probe "env:K5_STAGE03_SOURCE"
           if ($LASTEXITCODE -ne 0 -or $index -notmatch '^\d+$') {
             throw "No supplied camera credential candidate authenticated the Stage 28 source."
           }
