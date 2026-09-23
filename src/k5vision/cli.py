@@ -29,6 +29,11 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default=DEFAULT_HOST)
     serve.add_argument("--port", type=int, default=DEFAULT_PORT)
     serve.add_argument("--log-level", choices=_LOG_LEVELS, default="info")
+    serve.add_argument(
+        "--operator",
+        action="store_true",
+        help="start the configured Stage-One operator application",
+    )
     return parser
 
 
@@ -41,8 +46,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
+
+    application = "k5vision.main:app"
+    factory = False
+    if args.operator:
+        application = "k5vision.stage_one_app:create_stage_one_app"
+        factory = True
+
     uvicorn.run(
-        "k5vision.main:app",
+        application,
+        factory=factory,
         host=args.host,
         port=args.port,
         log_level=args.log_level,

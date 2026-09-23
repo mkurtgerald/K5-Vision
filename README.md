@@ -16,6 +16,14 @@ ruff format --check src tests
 pytest
 ```
 
+## Installed startup
+
+`k5-vision serve` starts the local control plane on loopback by default.
+`k5-vision serve --operator` selects the existing Stage-One operator application
+factory. It uses the same authenticated application composition and private runtime
+configuration; selecting it does not enroll a source, start a media session, or bypass
+authorization. Missing private runtime configuration remains fail closed.
+
 ## Contributions
 
 See `CONTRIBUTING.md` before opening a pull request.
