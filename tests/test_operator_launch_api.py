@@ -143,11 +143,16 @@ def test_viewer_session_selects_enrolled_device_and_invokes_private_launcher(
 
     assert response.status_code == 200
     assert response.json() == {
-        "schema_version": "1",
+        "schema_version": "2",
         "completed": True,
         "delivered_frames": 12,
         "presentations": 12,
         "processed_controls": 1,
+        "analytics_enabled": False,
+        "analytics_provider_submissions": 0,
+        "analytics_provider_completions": 0,
+        "analytics_failures": 0,
+        "analytics_rendered_boxes": 0,
     }
     assert resolver.calls == 1
     assert resolver.tokens == ["main-profile"]
