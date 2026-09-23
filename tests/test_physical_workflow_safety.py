@@ -173,7 +173,8 @@ def test_qualification_upload_requires_its_validation_outcome(path: Path) -> Non
         for upload in uploads:
             assert steps.index(validation) < steps.index(upload)
             header = upload.split("        uses:", maxsplit=1)[0]
-            assert "        if: always() && steps.safe_evidence.outcome == 'success'\n" in header
+            assert "        if: success() && steps.safe_evidence.outcome == 'success'\n" in header
+            assert "if: always()" not in header
     else:
         for upload in uploads:
             header = upload.split("        uses:", maxsplit=1)[0]
