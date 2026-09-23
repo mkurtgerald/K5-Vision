@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
+import pytest
+
+import k5vision.operator_runtime as operator_runtime_module
 from k5vision.media.analytics_overlay_delivery import BoundedAnalyticsOverlayDelivery
 from k5vision.media.presentation_frame import PresentationVideoFrame
 from k5vision.media.windows_operator_runtime import (
@@ -96,8 +100,56 @@ def test_launcher_wraps_live_delivery_only_when_detection_provider_is_present() 
     )
 
     assert metrics.delivered_frames == 3
+    assert metrics.analytics_enabled is True
+    assert metrics.analytics_provider_submissions == 0
+    assert metrics.analytics_provider_completions == 0
+    assert metrics.analytics_failures == 0
+    assert metrics.analytics_rendered_boxes == 0
     assert isinstance(runtime.delivery, BoundedAnalyticsOverlayDelivery)
     assert runtime.closed is True
+
+
+def test_launcher_returns_source_free_analytics_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _CapturingRuntime()
+
+    async def provider(_frame: PresentationVideoFrame) -> tuple[object, ...]:
+        return ()
+
+    class AggregateAnalyticsDelivery:
+        def __init__(self, _runner: object, _provider: object) -> None:
+            self.snapshot = SimpleNamespace(
+                provider_submissions=9,
+                provider_completions=7,
+                analytics_failures=2,
+                rendered_boxes=11,
+            )
+
+    monkeypatch.setattr(
+        operator_runtime_module,
+        "BoundedAnalyticsOverlayDelivery",
+        AggregateAnalyticsDelivery,
+    )
+    launcher = WindowsSingleLiveOperatorLauncher(
+        delivery_factory=lambda _payload_type: _BaseDelivery(),
+        runtime_factory=lambda _layout: runtime,
+        detection_provider=provider,
+    )
+
+    metrics = asyncio.run(
+        launcher.run(
+            ResolvedLiveSource("rtsp://private-source/live", 96),
+            width=1280,
+            height=720,
+        )
+    )
+
+    assert metrics.analytics_enabled is True
+    assert metrics.analytics_provider_submissions == 9
+    assert metrics.analytics_provider_completions == 7
+    assert metrics.analytics_failures == 2
+    assert metrics.analytics_rendered_boxes == 11
 
 
 def test_environment_builder_accepts_bounded_detection_provider() -> None:
