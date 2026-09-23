@@ -67,21 +67,31 @@ jobs:
           ref: ${{ inputs.reviewed_sha }}
           persist-credentials: false
 
-      - name: Fetch exact reviewed Analytics-lab revision
+      - name: Checkout exact reviewed Analytics-lab revision
+        id: analytics_checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: mkurtgerald/Analytics-lab
+          ref: ${{ env.ANALYTICS_LAB_SHA }}
+          path: analytics-lab
+          persist-credentials: false
+
+      - name: Bind reviewed Analytics-lab revision
         shell: powershell
+        env:
+          K5_ANALYTICS_CHECKED_OUT_SHA: ${{ steps.analytics_checkout.outputs.commit }}
         run: |
           $ErrorActionPreference = "Stop"
-          $analytics = Join-Path $env:RUNNER_TEMP "analytics-lab"
-          if (Test-Path -LiteralPath $analytics) {
-            Remove-Item -LiteralPath $analytics -Recurse -Force
+          $checkedOut = $env:K5_ANALYTICS_CHECKED_OUT_SHA
+          if ([string]::IsNullOrWhiteSpace($checkedOut)) {
+            throw "Analytics-lab checkout did not report an exact revision."
           }
-          git init $analytics
-          git -C $analytics remote add origin https://github.com/mkurtgerald/Analytics-lab.git
-          git -C $analytics fetch --depth=1 origin $env:ANALYTICS_LAB_SHA
-          git -C $analytics checkout --detach FETCH_HEAD
-          $actual = (git -C $analytics rev-parse HEAD).Trim()
-          if ($actual -ne $env:ANALYTICS_LAB_SHA) {
+          if ($checkedOut.ToLowerInvariant() -ne $env:ANALYTICS_LAB_SHA.ToLowerInvariant()) {
             throw "Analytics-lab exact revision verification failed."
+          }
+          $analytics = Join-Path $env:GITHUB_WORKSPACE "analytics-lab"
+          if (-not (Test-Path -LiteralPath $analytics)) {
+            throw "Analytics-lab checkout path is unavailable."
           }
           $evidenceRoot = Join-Path $env:RUNNER_TEMP "analytics-validation"
           "PYTHONPATH=$analytics" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
