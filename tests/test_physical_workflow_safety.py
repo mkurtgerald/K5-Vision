@@ -200,12 +200,10 @@ def test_stage_one_physical_paths_bind_same_reviewed_analytics_revision() -> Non
         assert "          persist-credentials: false\n" in checkout
         assert "steps.analytics_checkout.outputs.commit" not in text
         assert (
-            "https://api.github.com/repos/mkurtgerald/Analytics-lab/commits/"
-            "$env:ANALYTICS_LAB_SHA"
+            "https://api.github.com/repos/mkurtgerald/Analytics-lab/commits/$env:ANALYTICS_LAB_SHA"
         ) in text
         assert (
-            "$commit.sha.ToLowerInvariant() -ne "
-            "$env:ANALYTICS_LAB_SHA.ToLowerInvariant()"
+            "$commit.sha.ToLowerInvariant() -ne $env:ANALYTICS_LAB_SHA.ToLowerInvariant()"
         ) in text
         assert "K5_ANALYTICS_EVIDENCE_ROOT" in text
         assert "analytics_lab.validation_seed" in text
