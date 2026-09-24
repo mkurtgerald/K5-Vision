@@ -401,6 +401,7 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
             assert receipt["analytics_enabled"] is True
             assert receipt["analytics_provider_submissions"] >= 1
             assert receipt["analytics_provider_completions"] >= 1
+            assert receipt["analytics_failures"] == 0
             assert receipt["analytics_rendered_boxes"] >= 1
 
         evidence = {
