@@ -47,7 +47,15 @@ jobs:
           if ($env:K5_REVIEWED_SHA -notmatch '^[0-9a-fA-F]{40}$') {
             throw "Reviewed SHA must be an exact 40-character commit SHA."
           }
-          $encodedBranch = [uri]::EscapeDataString($env:K5_REVIEWED_BRANCH)
+          # GitHub expression string comparisons are case-insensitive, while the
+          # branches REST route is case-sensitive. Canonicalize the already-gated
+          # main input before the API lookup so an accepted case variant cannot
+          # fail before exact-head verification.
+          $reviewedBranch = $env:K5_REVIEWED_BRANCH.ToLowerInvariant()
+          if ($reviewedBranch -ne "main") {
+            throw "Reviewed branch must be main."
+          }
+          $encodedBranch = [uri]::EscapeDataString($reviewedBranch)
           $headers = @{
             Authorization = "Bearer $env:K5_GITHUB_TOKEN"
             Accept = "application/vnd.github+json"
