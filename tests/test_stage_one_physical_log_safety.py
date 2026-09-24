@@ -2,15 +2,14 @@
 
 from pathlib import Path
 
-
 _WORKFLOW = Path(".github/workflows/stage-one-operator-physical.yml")
 
 
 def test_stage_one_physical_witness_suppresses_unbounded_pytest_failure_output() -> None:
     text = _WORKFLOW.read_text(encoding="utf-8")
-    step = text.split(
-        "      - name: Run authenticated physical operator witness\n", maxsplit=1
-    )[1].split("      - name: ", maxsplit=1)[0]
+    step = text.split("      - name: Run authenticated physical operator witness\n", maxsplit=1)[
+        1
+    ].split("      - name: ", maxsplit=1)[0]
 
     assert "--tb=no" in step
     assert "--show-capture=no" in step
