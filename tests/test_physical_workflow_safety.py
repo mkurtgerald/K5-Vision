@@ -195,16 +195,33 @@ def test_stage_one_physical_paths_bind_same_reviewed_analytics_revision() -> Non
             if "          repository: mkurtgerald/Analytics-lab\n" in part
         )
         assert f"        uses: {_CHECKOUT_ACTION} # v7\n" in checkout
-        assert "        id: analytics_checkout\n" in checkout
         assert "          ref: ${{ env.ANALYTICS_LAB_SHA }}\n" in checkout
         assert "          path: analytics-lab\n" in checkout
         assert "          persist-credentials: false\n" in checkout
-        assert "steps.analytics_checkout.outputs.commit" in text
+        assert "steps.analytics_checkout.outputs.commit" not in text
+        assert (
+            "https://api.github.com/repos/mkurtgerald/Analytics-lab/commits/"
+            "$env:ANALYTICS_LAB_SHA"
+        ) in text
+        assert (
+            "$commit.sha.ToLowerInvariant() -ne "
+            "$env:ANALYTICS_LAB_SHA.ToLowerInvariant()"
+        ) in text
         assert "K5_ANALYTICS_EVIDENCE_ROOT" in text
         assert "analytics_lab.validation_seed" in text
         assert '"openvino==2026.3.1"' in text
         assert '"opencv-python-headless==4.12.0.88"' in text
         assert "git -C $analytics fetch" not in text
+
+
+def test_stage_one_reviewed_main_lookup_is_canonicalized() -> None:
+    for name in sorted(_ANALYTICS_PHYSICAL):
+        text = (_WORKFLOWS / name).read_text(encoding="utf-8")
+        verify = _named_step(text, "Verify exact reviewed branch head")
+        assert "$reviewedBranch = $env:K5_REVIEWED_BRANCH.ToLowerInvariant()" in verify
+        assert '$reviewedBranch -ne "main"' in verify
+        assert "[uri]::EscapeDataString($reviewedBranch)" in verify
+        assert "[uri]::EscapeDataString($env:K5_REVIEWED_BRANCH)" not in verify
 
 
 def test_stage_one_private_camera_configuration_is_step_scoped() -> None:
