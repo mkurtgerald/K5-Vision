@@ -19,7 +19,13 @@ def _headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _issue_session(client: TestClient, *, username: str, role: str) -> str:
+def _issue_session(
+    client: TestClient,
+    *,
+    username: str,
+    role: str,
+    creator_token: str,
+) -> str:
     created = client.post(
         "/api/v1/users",
         json={
@@ -28,7 +34,7 @@ def _issue_session(client: TestClient, *, username: str, role: str) -> str:
             "role": role,
             "enabled": True,
         },
-        headers=_headers(_USER_ADMIN_TOKEN),
+        headers=_headers(creator_token),
     )
     assert created.status_code == 201
 
@@ -113,12 +119,26 @@ def test_stage_one_hosted_contract_preserves_split_authority_and_rendered_box_ac
             client,
             username="stage-one-administrator",
             role="administrator",
+            creator_token=_USER_ADMIN_TOKEN,
         )
         operator = _issue_session(
             client,
             username="stage-one-operator",
             role="operator",
+            creator_token=administrator,
         )
+
+        rejected_user = client.post(
+            "/api/v1/users",
+            json={
+                "username": "operator-cannot-administer",
+                "display_name": "Rejected Operator Admin",
+                "role": "viewer",
+                "enabled": True,
+            },
+            headers=_headers(operator),
+        )
+        assert rejected_user.status_code == 403
 
         operator_enrollment = client.post(
             "/api/v1/devices",
