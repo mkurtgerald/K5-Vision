@@ -449,10 +449,7 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
                     provider_calls=analytics_provider.provider_calls,
                     tracked_detections=analytics_provider.tracked_detections,
                 )
-                pytest.fail(
-                    "Stage One analytics acceptance failed; "
-                    f"source-free diagnostic={diagnostic}"
-                )
+                pytest.fail(f"Stage One analytics acceptance failed; source-free diagnostic={diagnostic}")
             assert receipt["analytics_enabled"] is True
             assert receipt["analytics_provider_submissions"] >= 1
             assert receipt["analytics_provider_completions"] >= 1
