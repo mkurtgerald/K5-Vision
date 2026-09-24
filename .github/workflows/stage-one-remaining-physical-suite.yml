@@ -81,7 +81,11 @@ jobs:
           if ($env:K5_REVIEWED_SHA -notmatch '^[0-9a-fA-F]{40}$') {
             throw "Reviewed SHA must be an exact 40-character commit SHA."
           }
-          $encodedBranch = [uri]::EscapeDataString($env:K5_REVIEWED_BRANCH)
+          $reviewedBranch = $env:K5_REVIEWED_BRANCH.ToLowerInvariant()
+          if ($reviewedBranch -ne "main") {
+            throw "Reviewed branch must be main."
+          }
+          $encodedBranch = [uri]::EscapeDataString($reviewedBranch)
           $headers = @{
             Authorization = "Bearer $env:K5_GITHUB_TOKEN"
             Accept = "application/vnd.github+json"
@@ -100,7 +104,6 @@ jobs:
           persist-credentials: false
 
       - name: Checkout exact reviewed Analytics-lab revision
-        id: analytics_checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: mkurtgerald/Analytics-lab
@@ -111,14 +114,268 @@ jobs:
       - name: Bind reviewed Analytics-lab revision
         shell: powershell
         env:
-          K5_ANALYTICS_CHECKED_OUT_SHA: ${{ steps.analytics_checkout.outputs.commit }}
+          K5_GITHUB_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
-          $checkedOut = $env:K5_ANALYTICS_CHECKED_OUT_SHA
-          if ([string]::IsNullOrWhiteSpace($checkedOut)) {
-            throw "Analytics-lab checkout did not report an exact revision."
+          if ($env:ANALYTICS_LAB_SHA -notmatch '^[0-9a-fA-F]{40}
+      - name: Provision isolated reviewed GStreamer runtime
+        shell: powershell
+        run: .\scripts\provision-stage03-gstreamer.ps1
+
+      - name: Verify reviewed runtime surface
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($name in @("gst-launch-1.0", "gst-inspect-1.0")) {
+            if ($null -eq (Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+              throw "Required GStreamer executable is unavailable."
+            }
           }
-          if ($checkedOut.ToLowerInvariant() -ne $env:ANALYTICS_LAB_SHA.ToLowerInvariant()) {
+          $versionOutput = @(& gst-launch-1.0 --version 2>$null)
+          if ($LASTEXITCODE -ne 0 -or -not ($versionOutput -join "`n").Contains("GStreamer 1.28.7")) {
+            throw "Physical suite did not resolve the reviewed GStreamer 1.28.7 runtime."
+          }
+          foreach ($plugin in @("rtspsrc", "queue", "fakesink", "capsfilter", "udpsink")) {
+            & gst-inspect-1.0 $plugin *> $null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Required physical-suite GStreamer plugin is unavailable."
+            }
+          }
+
+      - name: Verify private physical configuration
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_SOURCE)) {
+            throw "Required physical source configuration is missing."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:K5_STAGE03_CAM_CRED)) {
+            throw "Required physical credential configuration is missing."
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Install pinned detector evidence runtimes
+        shell: powershell
+        run: python -m pip install --no-cache-dir "openvino==2026.3.1" "opencv-python-headless==4.12.0.88"
+
+      - name: Prepare bounded rights-reviewed detector evidence
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m analytics_lab.validation_seed --output-dir "$env:K5_ANALYTICS_EVIDENCE_ROOT"
+
+      - name: Resolve private camera credential candidate once
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $index = & python -m k5vision.stage03_credential_probe "env:K5_STAGE03_SOURCE"
+          if ($LASTEXITCODE -ne 0 -or $index -notmatch '^\d+$') {
+            throw "No supplied camera credential candidate authenticated the reviewed source."
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "K5_STAGE03_CREDENTIAL_INDEX=$index"
+
+      - name: Run Stage 05 physical readiness
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: pytest tests/integration/test_stage05_physical.py -q --no-cov
+
+      - name: Run Stage 06 physical live view
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: pytest tests/integration/test_stage06_physical.py -q --no-cov
+
+      - name: Run Stage 31 controller qualification
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          python -m k5vision.media.gstreamer_native_abi --revision $env:K5_STAGE31_REVISION --output $env:K5_STAGE31_ABI_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw "Stage 31 native ABI qualification failed." }
+          pytest tests/unit/test_presentation_controller.py -q --no-cov
+          if ($LASTEXITCODE -ne 0) { throw "Stage 31 unit regression failed." }
+          pytest tests/integration/test_stage31_physical.py -q --no-cov
+          if ($LASTEXITCODE -ne 0) { throw "Stage 31 physical qualification failed." }
+
+      - name: Run Stage 32 runtime qualification
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          python -m k5vision.media.gstreamer_native_abi --revision $env:K5_STAGE32_REVISION --output $env:K5_STAGE32_ABI_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw "Stage 32 native ABI qualification failed." }
+          pytest tests/unit/test_presentation_runtime.py -q --no-cov
+          if ($LASTEXITCODE -ne 0) { throw "Stage 32 unit regression failed." }
+          pytest tests/integration/test_stage32_physical.py -q --no-cov
+          if ($LASTEXITCODE -ne 0) { throw "Stage 32 physical qualification failed." }
+
+      - name: Run Stage 33 host qualification
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          python -m k5vision.media.gstreamer_native_abi --revision $env:K5_STAGE33_REVISION --output $env:K5_STAGE33_ABI_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw "Stage 33 native ABI qualification failed." }
+          pytest tests/unit/test_presentation_host.py -q --no-cov
+          if ($LASTEXITCODE -ne 0) { throw "Stage 33 unit regression failed." }
+          pytest tests/integration/test_stage33_physical.py -q --no-cov
+          if ($LASTEXITCODE -ne 0) { throw "Stage 33 physical qualification failed." }
+
+      - name: Run Stage 34 replacement qualification
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          python -m k5vision.media.gstreamer_native_abi --revision $env:K5_STAGE34_REVISION --output $env:K5_STAGE34_ABI_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw "Stage 34 native ABI qualification failed." }
+          pytest tests/unit/test_presentation_supervisor.py -q --no-cov
+          if ($LASTEXITCODE -ne 0) { throw "Stage 34 unit regression failed." }
+          pytest tests/integration/test_stage34_physical.py -q --no-cov
+          if ($LASTEXITCODE -ne 0) { throw "Stage 34 physical qualification failed." }
+
+      - name: Run Stage 35 Windows surface qualification
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: |
+          python -m k5vision.media.gstreamer_native_abi --revision $env:K5_STAGE35_REVISION --output $env:K5_STAGE35_ABI_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw "Stage 35 native ABI qualification failed." }
+          pytest tests/unit/test_windows_presentation_surface.py -q --no-cov
+          if ($LASTEXITCODE -ne 0) { throw "Stage 35 unit regression failed." }
+          pytest tests/integration/test_stage35_physical.py -q --no-cov
+          if ($LASTEXITCODE -ne 0) { throw "Stage 35 physical qualification failed." }
+
+      - name: Run authenticated Stage One operator witness
+        shell: powershell
+        env:
+          K5_STAGE03_SOURCE: ${{ secrets.K5_STAGE03_SOURCE }}
+          K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
+        run: pytest tests/integration/test_stage_one_operator_physical.py -q --no-cov
+
+      - name: Assert no qualification payload remains
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $leaks = @()
+          foreach ($pattern in @("k5-stage31-*", "k5-stage32-*", "k5-stage33-*", "k5-stage34-*")) {
+            $leaks += Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Filter $pattern -Force -ErrorAction SilentlyContinue
+          }
+          if ($leaks) {
+            $leaks | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            throw "Stage One physical-suite temporary payload cleanup was incomplete."
+          }
+
+      - name: Assert retained suite evidence is source-free
+        id: safe_evidence
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $required = @(
+            $env:K5_STAGE05_OUTPUT,
+            $env:K5_STAGE06_OUTPUT,
+            "$env:GITHUB_WORKSPACE\artifacts\stage06-rtp-delivery.json",
+            $env:K5_STAGE31_OUTPUT,
+            $env:K5_STAGE31_ABI_OUTPUT,
+            $env:K5_STAGE32_OUTPUT,
+            $env:K5_STAGE32_ABI_OUTPUT,
+            $env:K5_STAGE33_OUTPUT,
+            $env:K5_STAGE33_ABI_OUTPUT,
+            $env:K5_STAGE34_OUTPUT,
+            $env:K5_STAGE34_ABI_OUTPUT,
+            $env:K5_STAGE35_OUTPUT,
+            $env:K5_STAGE35_ABI_OUTPUT,
+            $env:K5_STAGE_ONE_OUTPUT
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Required Stage One physical-suite evidence was not produced."
+            }
+            $text = Get-Content -LiteralPath $path -Raw
+            foreach ($pattern in @(
+              'rtsp://',
+              'rtsps://',
+              '(?i)username',
+              '(?i)password',
+              '(?i)credential',
+              '(?i)session_token',
+              '(?i)device_id',
+              '(?i)source_uri',
+              '(?i)runner[_ -]?name',
+              '(?i)recording_id',
+              '(?i)source_id',
+              '(?i)payload',
+              '(?i)handle',
+              '(?i)pointer',
+              '[A-Za-z]:\\',
+              '\\Users\\',
+              '(?<![0-9])(?:10\.|127\.|169\.254\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|192\.168\.)'
+            )) {
+              if ($text -match $pattern) {
+                throw "Retained Stage One physical-suite evidence violated the source-free contract."
+              }
+            }
+          }
+
+      - name: Upload source-free remaining physical-suite evidence
+        if: success() && steps.safe_evidence.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: stage-one-remaining-physical-suite-evidence
+          path: |
+            artifacts/stage05-readiness.json
+            artifacts/stage06-live-view.json
+            artifacts/stage06-rtp-delivery.json
+            artifacts/stage31-presentation-controller.json
+            artifacts/stage31-native-abi.json
+            artifacts/stage32-presentation-runtime.json
+            artifacts/stage32-native-abi.json
+            artifacts/stage33-presentation-host.json
+            artifacts/stage33-native-abi.json
+            artifacts/stage34-presentation-replacement.json
+            artifacts/stage34-native-abi.json
+            artifacts/stage35-windows-presentation-surface.json
+            artifacts/stage35-native-abi.json
+            artifacts/stage-one-operator-physical.json
+          if-no-files-found: error
+          retention-days: 14
+) {
+            throw "Analytics-lab revision must be an exact 40-character commit SHA."
+          }
+          $headers = @{
+            Authorization = "Bearer $env:K5_GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $uri = "https://api.github.com/repos/mkurtgerald/Analytics-lab/commits/$env:ANALYTICS_LAB_SHA"
+          $commit = Invoke-RestMethod -Method Get -Headers $headers -Uri $uri
+          if ($commit.sha.ToLowerInvariant() -ne $env:ANALYTICS_LAB_SHA.ToLowerInvariant()) {
             throw "Analytics-lab exact revision verification failed."
           }
           $analytics = Join-Path $env:GITHUB_WORKSPACE "analytics-lab"
