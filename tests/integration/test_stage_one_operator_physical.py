@@ -277,44 +277,83 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
     monkeypatch.setenv("K5_OPERATOR_STREAM_TOKEN", "main")
     monkeypatch.delenv("K5_OPERATOR_RTP_PAYLOAD_TYPE", raising=False)
 
-    username = f"physical-{secrets.token_hex(6)}"
-    permanent_password = secrets.token_urlsafe(32)
-    temporary_credential = ""
-    session_token = ""
+    administrator_username = f"physical-administrator-{secrets.token_hex(6)}"
+    administrator_password = secrets.token_urlsafe(32)
+    administrator_temporary_credential = ""
+    administrator_session_token = ""
+    operator_username = f"physical-operator-{secrets.token_hex(6)}"
+    operator_password = secrets.token_urlsafe(32)
+    operator_temporary_credential = ""
+    operator_session_token = ""
     analytics_provider = _PhysicalAnalyticsProvider(analytics_root)
 
     try:
         application = create_stage_one_app(detection_provider=analytics_provider)
         with TestClient(application) as client:
-            created = client.post(
+            administrator_created = client.post(
                 "/api/v1/users",
                 json={
-                    "username": username,
+                    "username": administrator_username,
+                    "display_name": "Stage One Physical Administrator",
+                    "role": "administrator",
+                    "enabled": True,
+                },
+                headers=_headers(_ADMIN_TOKEN),
+            )
+            assert administrator_created.status_code == 201
+            administrator_temporary_credential = administrator_created.json()[
+                "temporary_credential"
+            ]
+
+            administrator_initialized = client.post(
+                "/api/v1/auth/bootstrap-password",
+                json={
+                    "username": administrator_username,
+                    "temporary_credential": administrator_temporary_credential,
+                    "new_password": administrator_password,
+                },
+            )
+            assert administrator_initialized.status_code == 204
+
+            administrator_logged_in = client.post(
+                "/api/v1/auth/login",
+                json={
+                    "username": administrator_username,
+                    "password": administrator_password,
+                },
+            )
+            assert administrator_logged_in.status_code == 200
+            administrator_session_token = administrator_logged_in.json()["session_token"]
+
+            operator_created = client.post(
+                "/api/v1/users",
+                json={
+                    "username": operator_username,
                     "display_name": "Stage One Physical Operator",
                     "role": "operator",
                     "enabled": True,
                 },
                 headers=_headers(_ADMIN_TOKEN),
             )
-            assert created.status_code == 201
-            temporary_credential = created.json()["temporary_credential"]
+            assert operator_created.status_code == 201
+            operator_temporary_credential = operator_created.json()["temporary_credential"]
 
-            initialized = client.post(
+            operator_initialized = client.post(
                 "/api/v1/auth/bootstrap-password",
                 json={
-                    "username": username,
-                    "temporary_credential": temporary_credential,
-                    "new_password": permanent_password,
+                    "username": operator_username,
+                    "temporary_credential": operator_temporary_credential,
+                    "new_password": operator_password,
                 },
             )
-            assert initialized.status_code == 204
+            assert operator_initialized.status_code == 204
 
-            logged_in = client.post(
+            operator_logged_in = client.post(
                 "/api/v1/auth/login",
-                json={"username": username, "password": permanent_password},
+                json={"username": operator_username, "password": operator_password},
             )
-            assert logged_in.status_code == 200
-            session_token = logged_in.json()["session_token"]
+            assert operator_logged_in.status_code == 200
+            operator_session_token = operator_logged_in.json()["session_token"]
 
             enrolled = client.post(
                 "/api/v1/devices",
@@ -325,7 +364,7 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
                     "protocols": ["rtsp"],
                     "tags": ["stage-one-physical-witness"],
                 },
-                headers=_headers(session_token),
+                headers=_headers(administrator_session_token),
             )
             assert enrolled.status_code in {200, 201}
             device_id = enrolled.json()["id"]
@@ -345,7 +384,7 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
                     "width": 1280,
                     "height": 720,
                 },
-                headers=_headers(session_token),
+                headers=_headers(operator_session_token),
             )
             if launched.status_code != 200:
                 diagnostic = asyncio.run(
@@ -388,9 +427,14 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
             source,
             host,
             private_credentials,
-            temporary_credential,
-            permanent_password,
-            session_token,
+            administrator_username,
+            administrator_temporary_credential,
+            administrator_password,
+            administrator_session_token,
+            operator_username,
+            operator_temporary_credential,
+            operator_password,
+            operator_session_token,
             _ADMIN_TOKEN,
             str(analytics_root),
         ):
