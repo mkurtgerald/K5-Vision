@@ -15,6 +15,11 @@ def test_all_self_hosted_physical_qualifications_are_main_bound() -> None:
     for path in physical:
         text = path.read_text(encoding="utf-8")
         admission = text.split("\njobs:\n", maxsplit=1)[1].split("    runs-on:", maxsplit=1)[0]
+        if path == _STAGE_ONE:
+            assert "github.ref == 'refs/heads/main'" in admission, path.name
+            assert "github.actor == github.repository_owner" not in admission, path.name
+            assert "github.triggering_actor == github.repository_owner" not in admission, path.name
+            continue
         assert "github.event_name == 'workflow_dispatch' &&\n" in admission, path.name
         assert "github.actor == github.repository_owner &&\n" in admission, path.name
         assert "github.triggering_actor == github.repository_owner &&\n" in admission, path.name
