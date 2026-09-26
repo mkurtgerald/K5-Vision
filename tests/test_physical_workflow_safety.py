@@ -111,6 +111,18 @@ def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
     triggers = text.split("\non:\n", maxsplit=1)[1].split("\npermissions:", maxsplit=1)[0]
     admission = text.split("\njobs:\n", maxsplit=1)[1].split("    runs-on:", maxsplit=1)[0]
 
+    if path.name == "stage-one-operator-physical.yml":
+        assert "  push:\n    branches:\n      - main\n" in triggers
+        assert "  workflow_dispatch:\n" in triggers
+        assert "github.ref == 'refs/heads/main'" in admission
+        assert "github.actor == github.repository_owner" not in admission
+        assert "github.triggering_actor == github.repository_owner" not in admission
+        assert "K5_REVIEWED_BRANCH: main" in text
+        assert "K5_REVIEWED_SHA: ${{ github.sha }}" in text
+        assert "          ref: ${{ github.sha }}\n" in text
+        assert "github.event.pull_request.head.sha" not in text
+        return
+
     assert "    if: >-\n" in admission
     assert "github.event_name == 'workflow_dispatch' &&" in admission
     assert "github.actor == github.repository_owner &&" in admission
