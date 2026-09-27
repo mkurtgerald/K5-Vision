@@ -1,43 +1,35 @@
 name: Stage One Authenticated Operator Physical Witness
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
-    inputs:
-      reviewed_branch:
-        description: Exact branch whose current head is being qualified
-        required: true
-        type: string
-      reviewed_sha:
-        description: Exact reviewed commit selected for this qualification
-        required: true
-        type: string
+
+concurrency:
+  group: stage-one-operator-physical
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   stage-one-operator-physical:
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      github.actor == github.repository_owner &&
-      github.triggering_actor == github.repository_owner &&
-      github.ref == 'refs/heads/main' &&
-      inputs.reviewed_branch == 'main' &&
-      inputs.reviewed_sha == github.sha
+    if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 35
     env:
       ANALYTICS_LAB_SHA: c8b347ae538991a0c0ce38eabc2dc17b566531d3
       K5_STAGE_ONE_OPERATOR_PHYSICAL: "1"
       K5_STAGE_ONE_OUTPUT: artifacts\stage-one-operator-physical.json
-      K5_STAGE_ONE_REVISION: ${{ inputs.reviewed_sha }}
+      K5_STAGE_ONE_REVISION: ${{ github.sha }}
 
     steps:
       - name: Verify exact reviewed branch head
         shell: powershell
         env:
-          K5_REVIEWED_BRANCH: ${{ inputs.reviewed_branch }}
-          K5_REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+          K5_REVIEWED_BRANCH: main
+          K5_REVIEWED_SHA: ${{ github.sha }}
           K5_GITHUB_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -70,7 +62,7 @@ jobs:
       - name: Checkout exact Stage One revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.reviewed_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Checkout exact reviewed Analytics-lab revision
