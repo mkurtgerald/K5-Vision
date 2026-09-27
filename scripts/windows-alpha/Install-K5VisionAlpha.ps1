@@ -2,7 +2,7 @@
 param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "K5VisionAlpha"),
     [string]$GStreamerVersion = "1.28.7",
-    [string]$K5Revision = "2b2ef1a6d64bbc9df14271c95d2d0d14a19b7077"
+    [string]$K5Revision = "917ca0f94516775cbcc86097eea16a88d8c6e795"
 )
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
