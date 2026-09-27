@@ -8,7 +8,9 @@ if ($env:OS -ne "Windows_NT") { throw "Windows is required." }
 $python = Join-Path $InstallRoot ".venv\Scripts\python.exe"
 $revisionRecord = Join-Path $InstallRoot "k5-revision.txt"
 $versionRecord = Join-Path $InstallRoot "gstreamer-version.txt"
-foreach ($path in @($python, $revisionRecord, $versionRecord)) {
+$launcher = Join-Path $InstallRoot "Start-K5VisionAlpha.ps1"
+$runtime = Join-Path $InstallRoot "Run-K5VisionAlpha.ps1"
+foreach ($path in @($python, $revisionRecord, $versionRecord, $launcher, $runtime)) {
     if (-not (Test-Path -LiteralPath $path)) { throw "K5 Alpha preflight is missing a required installed file." }
 }
 
@@ -19,12 +21,14 @@ if ($gstreamerVersion -notmatch '^1\.28\.\d+$') { throw "Installed GStreamer ver
 
 $gstreamerRoot = Join-Path $env:LOCALAPPDATA "K5RunnerTools\k5-gstreamer\$gstreamerVersion\msvc_x86_64"
 $gstLaunch = Join-Path $gstreamerRoot "bin\gst-launch-1.0.exe"
-if (-not (Test-Path -LiteralPath $gstLaunch)) { throw "Reviewed GStreamer runtime is missing." }
+$gstCoreReady = (Test-Path -LiteralPath (Join-Path $gstreamerRoot "bin\gstreamer-1.0-0.dll")) -or
+    (Test-Path -LiteralPath (Join-Path $gstreamerRoot "bin\libgstreamer-1.0-0.dll"))
+if (-not $gstCoreReady -or -not (Test-Path -LiteralPath $gstLaunch)) { throw "Reviewed GStreamer runtime is incomplete." }
+
 $output = @(& $gstLaunch --version 2>$null)
 if ($LASTEXITCODE -ne 0 -or -not (($output -join "`n").Contains("GStreamer $gstreamerVersion"))) {
     throw "Reviewed GStreamer runtime version verification failed."
 }
-
 & $python -m k5vision.cli --version
 if ($LASTEXITCODE -ne 0) { throw "Installed K5 CLI verification failed." }
 & $python -m k5vision.cli --help *> $null
