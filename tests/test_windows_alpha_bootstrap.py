@@ -4,6 +4,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ALPHA = ROOT / "scripts" / "windows-alpha"
 INSTALL = ALPHA / "Install-K5VisionAlpha.ps1"
 PREFLIGHT = ALPHA / "Test-K5VisionAlpha.ps1"
+RUN = ALPHA / "Run-K5VisionAlpha.ps1"
 PROVISION = ROOT / "scripts" / "provision-stage03-gstreamer.ps1"
 PIN = "0fc10949a105357ff607a21866c5333f4d4be0c7"
 
@@ -11,6 +12,7 @@ PIN = "0fc10949a105357ff607a21866c5333f4d4be0c7"
 def test_windows_alpha_bootstrap_files_exist() -> None:
     assert INSTALL.is_file()
     assert PREFLIGHT.is_file()
+    assert RUN.is_file()
     assert PROVISION.is_file()
 
 
@@ -48,3 +50,11 @@ def test_windows_alpha_bootstrap_does_not_enable_recording() -> None:
     combined = INSTALL.read_text(encoding="utf-8") + PREFLIGHT.read_text(encoding="utf-8")
     assert "K5_STAGE_ONE_RECORDING_ROOT" not in combined
     assert "recording_root" not in combined
+
+
+def test_windows_alpha_runtime_launcher_is_loopback_and_non_recording() -> None:
+    text = RUN.read_text(encoding="utf-8")
+    assert "--host 127.0.0.1" in text
+    assert "K5_STAGE_ONE_RECORDING_ROOT" in text
+    assert "does not enroll a camera" in text
+    assert "K5_STAGE03_SOURCE" not in text
