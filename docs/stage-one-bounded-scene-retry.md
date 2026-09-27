@@ -5,3 +5,5 @@ The current Stage One physical witness reached authenticated live presentation a
 The repair must preserve the existing acceptance bar: at least one real K5-rendered box, zero analytics failures, unchanged detector and renderer confidence, source-free retained evidence, and no private media retention.
 
 Implement a bounded retry only when a live attempt is otherwise healthy and yields zero boxes. Fail immediately for live-path errors, analytics failures, malformed receipts, or any weakened security/privacy condition. Cap retries so the self-hosted runner remains bounded.
+
+Implementation note: keep private-camera qualification transient and use deterministic rights-reviewed media only for the detector/tracker/overlay acceptance seam.
