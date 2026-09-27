@@ -68,7 +68,9 @@ def test_windows_alpha_runtime_wrapper_uses_installed_launcher() -> None:
 
 
 def test_windows_alpha_bootstrap_does_not_enable_recording_or_camera_source() -> None:
-    combined = "\n".join(path.read_text(encoding="utf-8") for path in (INSTALL, PREFLIGHT, RUN, START))
+    combined = "\n".join(
+        path.read_text(encoding="utf-8") for path in (INSTALL, PREFLIGHT, RUN, START)
+    )
     assert "K5_STAGE_ONE_RECORDING_ROOT" in combined
     assert "K5_STAGE03_SOURCE" not in combined
     assert "/api/v1/operator/live" not in combined
