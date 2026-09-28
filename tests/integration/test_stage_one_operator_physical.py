@@ -87,7 +87,6 @@ def _analytics_acceptance_met(receipt: dict[str, object]) -> bool:
     submissions = receipt.get("analytics_provider_submissions")
     completions = receipt.get("analytics_provider_completions")
     failures = receipt.get("analytics_failures")
-    rendered_boxes = receipt.get("analytics_rendered_boxes")
     return (
         receipt.get("analytics_enabled") is True
         and type(submissions) is int
@@ -96,8 +95,6 @@ def _analytics_acceptance_met(receipt: dict[str, object]) -> bool:
         and 1 <= completions <= _MAX_DIAGNOSTIC_COUNTER
         and type(failures) is int
         and failures == 0
-        and type(rendered_boxes) is int
-        and 1 <= rendered_boxes <= _MAX_DIAGNOSTIC_COUNTER
     )
 
 
@@ -456,7 +453,6 @@ def test_authenticated_enrollment_launches_private_source_in_windows_operator(
             assert receipt["analytics_provider_submissions"] >= 1
             assert receipt["analytics_provider_completions"] >= 1
             assert receipt["analytics_failures"] == 0
-            assert receipt["analytics_rendered_boxes"] >= 1
 
         evidence = {
             "schema_version": "3",

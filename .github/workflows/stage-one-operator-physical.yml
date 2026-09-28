@@ -144,6 +144,13 @@ jobs:
           K5_STAGE03_CAM_CRED: ${{ secrets.CAM_CRED }}
         run: pytest tests/integration/test_stage_one_operator_physical.py -q --no-cov --tb=no --show-capture=no
 
+      - name: Prove deterministic detector tracking overlay rendering
+        shell: powershell
+        env:
+          K5_ANALYTICS_REAL_DETECTOR: "1"
+          PYTHONPATH: ${{ github.workspace }}\analytics-lab
+        run: pytest tests/integration/test_analytics_lab_real_detector_overlay.py -q --no-cov --tb=no --show-capture=no
+
       - name: Assert retained witness is source-free
         id: safe_evidence
         if: always()
