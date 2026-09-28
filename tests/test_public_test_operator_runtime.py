@@ -23,10 +23,7 @@ def test_public_test_source_resolves_only_global_address(
 ) -> None:
     monkeypatch.setattr(operator_runtime_module, "getaddrinfo", _public_dns)
 
-    assert (
-        resolve_public_test_source_ip("rtsp://stream.example.test:1935/app/live")
-        == "8.8.8.8"
-    )
+    assert resolve_public_test_source_ip("rtsp://stream.example.test:1935/app/live") == "8.8.8.8"
 
 
 @pytest.mark.parametrize(
