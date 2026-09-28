@@ -78,3 +78,15 @@ def test_physical_analytics_acceptance_requires_clean_completed_rendering() -> N
     }
 
     assert module._analytics_acceptance_met(receipt) is True
+
+
+def test_physical_analytics_acceptance_allows_clean_empty_scene() -> None:
+    module = _physical_witness_module()
+    receipt = {
+        "analytics_enabled": True,
+        "analytics_provider_submissions": 2,
+        "analytics_provider_completions": 2,
+        "analytics_failures": 0,
+        "analytics_rendered_boxes": 0,
+    }
+    assert module._analytics_acceptance_met(receipt) is True
