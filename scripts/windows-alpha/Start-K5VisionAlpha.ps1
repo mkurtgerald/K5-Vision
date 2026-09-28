@@ -142,7 +142,13 @@ try {
     }
 
     Write-Host ("K5 public RTSP operator PASS: frames={0}, presentations={1}" -f $receipt.delivered_frames, $receipt.presentations)
-    Write-Host "No public-stream recording or retained media was created."\n    if ($ExitAfterPublicTest) {\n        Write-Host "Exiting after one bounded public RTSP acceptance run."\n        return\n    }\n    Start-Process "$baseUri/docs"\n    Write-Host "K5 control plane remains available locally. Close this console to end the alpha session."
+    Write-Host "No public-stream recording or retained media was created."
+    if ($ExitAfterPublicTest) {
+        Write-Host "Exiting after one bounded public RTSP acceptance run."
+        return
+    }
+    Start-Process "$baseUri/docs"
+    Write-Host "K5 control plane remains available locally. Close this console to end the alpha session."
     Wait-Process -Id $process.Id
 }
 finally {
