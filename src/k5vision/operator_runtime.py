@@ -157,7 +157,7 @@ class PublicTestSourceResolver(OperatorSourceResolver):
         *,
         stream_token: str = _PUBLIC_TEST_STREAM_TOKEN,
         payload_type: int | None = None,
-        payload_probe: PayloadTypeProbe = _probe_dynamic_payload_type,
+        payload_probe: PayloadTypeProbe | None = None,
     ) -> None:
         parsed, addresses = _public_test_source_addresses(source_uri)
         try:
@@ -170,14 +170,15 @@ class PublicTestSourceResolver(OperatorSourceResolver):
             isinstance(payload_type, bool) or not 96 <= payload_type <= 127
         ):
             raise ValueError("operator RTP payload type must be between 96 and 127")
-        if not callable(payload_probe):
+        resolved_payload_probe = _probe_dynamic_payload_type if payload_probe is None else payload_probe
+        if not callable(resolved_payload_probe):
             raise TypeError("payload_probe must be callable")
 
         self._source_uri = _rewrite_public_test_source(parsed, normalized_ip)
         self._source_ip = normalized_ip
         self._stream_token = _sanitize_stream_token(stream_token)
         self._payload_type = payload_type
-        self._payload_probe = payload_probe
+        self._payload_probe = resolved_payload_probe
 
     async def resolve(self, device: Device, stream_token: str) -> ResolvedLiveSource:
         """Return the pinned public stream only for its enrolled ephemeral device."""
