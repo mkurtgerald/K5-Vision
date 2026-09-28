@@ -2,7 +2,8 @@
 param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "K5VisionAlpha"),
     [string]$GStreamerVersion = "1.28.7",
-    [string]$K5Revision = "d3eedafbc4328eb673afb7c1706796f5d1ba18c3"
+    [string]$K5Revision = "d3eedafbc4328eb673afb7c1706796f5d1ba18c3",
+    [switch]$SkipDesktopShortcut
 )
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -59,22 +60,26 @@ Set-Content -LiteralPath (Join-Path $InstallRoot "k5-revision.txt") -Value $K5Re
 & $preflightTarget -InstallRoot $InstallRoot
 if ($LASTEXITCODE -ne 0) { throw "K5 Alpha camera-free preflight failed." }
 
-$desktop = [Environment]::GetFolderPath("Desktop")
-if ([string]::IsNullOrWhiteSpace($desktop)) { throw "Desktop path is unavailable." }
-$shortcutPath = Join-Path $desktop "K5 Vision Alpha.lnk"
-$hostCommand = Get-Command powershell.exe -ErrorAction SilentlyContinue
-if ($null -eq $hostCommand) { $hostCommand = Get-Command pwsh.exe -ErrorAction SilentlyContinue }
-if ($null -eq $hostCommand) { throw "A PowerShell host is required to create the K5 launcher." }
+if (-not $SkipDesktopShortcut) {
+    $desktop = [Environment]::GetFolderPath("Desktop")
+    if ([string]::IsNullOrWhiteSpace($desktop)) { throw "Desktop path is unavailable." }
+    $shortcutPath = Join-Path $desktop "K5 Vision Alpha.lnk"
+    $hostCommand = Get-Command powershell.exe -ErrorAction SilentlyContinue
+    if ($null -eq $hostCommand) { $hostCommand = Get-Command pwsh.exe -ErrorAction SilentlyContinue }
+    if ($null -eq $hostCommand) { throw "A PowerShell host is required to create the K5 launcher." }
 
-$wsh = New-Object -ComObject WScript.Shell
-$shortcut = $wsh.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = $hostCommand.Source
-$shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $launcherTarget + '"'
-$shortcut.WorkingDirectory = $InstallRoot
-$shortcut.Description = "K5 Vision Windows Alpha"
-$shortcut.Save()
-if (-not (Test-Path -LiteralPath $shortcutPath)) { throw "K5 Vision Alpha desktop shortcut creation failed." }
+    $wsh = New-Object -ComObject WScript.Shell
+    $shortcut = $wsh.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $hostCommand.Source
+    $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $launcherTarget + '"'
+    $shortcut.WorkingDirectory = $InstallRoot
+    $shortcut.Description = "K5 Vision Windows Alpha"
+    $shortcut.Save()
+    if (-not (Test-Path -LiteralPath $shortcutPath)) {
+        throw "K5 Vision Alpha desktop shortcut creation failed."
+    }
+    Write-Host "Desktop shortcut created: $shortcutPath"
+}
 
 Write-Host "K5 Vision Alpha runtime installed from reviewed commit $K5Revision."
 Write-Host "Camera-free preflight passed; no camera media was contacted or stored."
-Write-Host "Desktop shortcut created: $shortcutPath"

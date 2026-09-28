@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from ipaddress import ip_address
+from socket import SOCK_STREAM, getaddrinfo
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from k5vision.domain.devices import Device
 from k5vision.media.analytics_overlay_delivery import (
@@ -45,7 +47,10 @@ STAGE_ONE_SOURCE_ENV = "K5_STAGE03_SOURCE"
 STAGE_ONE_CREDENTIAL_ENV = "K5_STAGE03_CAM_CRED"
 STAGE_ONE_STREAM_TOKEN_ENV = "K5_OPERATOR_STREAM_TOKEN"
 STAGE_ONE_PAYLOAD_TYPE_ENV = "K5_OPERATOR_RTP_PAYLOAD_TYPE"
+PUBLIC_TEST_SOURCE_ENV = "K5_PUBLIC_TEST_RTSP_SOURCE"
+PUBLIC_TEST_SOURCE_IP_ENV = "K5_PUBLIC_TEST_SOURCE_IP"
 _DEFAULT_STREAM_TOKEN = "main"
+_PUBLIC_TEST_STREAM_TOKEN = "public-test"
 _DEFAULT_PAYLOAD_TYPE = 96
 _MAX_STREAM_TOKEN_LENGTH = 256
 
@@ -86,6 +91,121 @@ def _sanitize_stream_token(value: str) -> str:
     ):
         raise ValueError("operator stream token is invalid")
     return token
+
+
+def _public_test_source_addresses(source_uri: str) -> tuple[SplitResult, tuple[str, ...]]:
+    """Validate a credential-free public RTSP URI and return only global endpoints."""
+    if not isinstance(source_uri, str) or not source_uri.strip():
+        raise ValueError("public RTSP test source is unavailable")
+    try:
+        parsed = urlsplit(source_uri.strip())
+        port = parsed.port or 554
+    except ValueError as exc:
+        raise ValueError("public RTSP test source is invalid") from exc
+    if (
+        parsed.scheme.casefold() != "rtsp"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or not 1 <= port <= 65535
+    ):
+        raise ValueError("public RTSP test source is invalid")
+
+    addresses = []
+    try:
+        addresses = [ip_address(parsed.hostname)]
+    except ValueError:
+        try:
+            answers = getaddrinfo(parsed.hostname, port, type=SOCK_STREAM)
+        except OSError as exc:
+            raise ValueError("public RTSP test source could not be resolved") from exc
+        for answer in answers:
+            try:
+                addresses.append(ip_address(answer[4][0]))
+            except (ValueError, IndexError):
+                continue
+
+    unique = sorted(set(addresses), key=lambda address: (address.version != 4, int(address)))
+    if not unique or any(not address.is_global for address in unique):
+        raise ValueError("public RTSP test source must resolve only to public addresses")
+    return parsed, tuple(str(address) for address in unique)
+
+
+def resolve_public_test_source_ip(source_uri: str) -> str:
+    """Resolve a public alpha-test RTSP source to one deterministic global address."""
+    _, addresses = _public_test_source_addresses(source_uri)
+    return addresses[0]
+
+
+def _rewrite_public_test_source(parsed: SplitResult, source_ip: str) -> str:
+    address = ip_address(source_ip)
+    host = f"[{address}]" if address.version == 6 else str(address)
+    port = parsed.port or 554
+    return urlunsplit(("rtsp", f"{host}:{port}", parsed.path, parsed.query, ""))
+
+
+class PublicTestSourceResolver(OperatorSourceResolver):
+    """Resolve one credential-free public test stream to a pinned public address."""
+
+    __slots__ = ("_source_uri", "_source_ip", "_stream_token", "_payload_type", "_payload_probe")
+
+    def __init__(
+        self,
+        source_uri: str,
+        source_ip: str,
+        *,
+        stream_token: str = _PUBLIC_TEST_STREAM_TOKEN,
+        payload_type: int | None = None,
+        payload_probe: PayloadTypeProbe | None = None,
+    ) -> None:
+        parsed, addresses = _public_test_source_addresses(source_uri)
+        try:
+            normalized_ip = str(ip_address(source_ip.strip()))
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("public RTSP test source address is invalid") from exc
+        if normalized_ip not in addresses:
+            raise ValueError("public RTSP test source address does not match current DNS")
+        if payload_type is not None and (
+            isinstance(payload_type, bool) or not 96 <= payload_type <= 127
+        ):
+            raise ValueError("operator RTP payload type must be between 96 and 127")
+        resolved_payload_probe = (
+            _probe_dynamic_payload_type if payload_probe is None else payload_probe
+        )
+        if not callable(resolved_payload_probe):
+            raise TypeError("payload_probe must be callable")
+
+        self._source_uri = _rewrite_public_test_source(parsed, normalized_ip)
+        self._source_ip = normalized_ip
+        self._stream_token = _sanitize_stream_token(stream_token)
+        self._payload_type = payload_type
+        self._payload_probe = resolved_payload_probe
+
+    async def resolve(self, device: Device, stream_token: str) -> ResolvedLiveSource:
+        """Return the pinned public stream only for its enrolled ephemeral device."""
+        if not isinstance(device, Device) or stream_token != self._stream_token:
+            raise OperatorLaunchError(
+                OperatorLaunchErrorCode.SOURCE_UNAVAILABLE,
+                "selected live source could not be resolved",
+            )
+        if str(device.host) != self._source_ip:
+            raise OperatorLaunchError(
+                OperatorLaunchErrorCode.SOURCE_SCOPE_MISMATCH,
+                "resolved live source is outside the selected device scope",
+            )
+        try:
+            payload_type = self._payload_type
+            if payload_type is None:
+                payload_type = await self._payload_probe(self._source_uri)
+            if isinstance(payload_type, bool) or not 96 <= payload_type <= 127:
+                raise ValueError("operator RTP payload type is invalid")
+        except Exception:
+            raise OperatorLaunchError(
+                OperatorLaunchErrorCode.SOURCE_UNAVAILABLE,
+                "selected live source could not be resolved",
+            ) from None
+        return ResolvedLiveSource(self._source_uri, payload_type)
 
 
 async def _probe_dynamic_payload_type(source_uri: str) -> int:
@@ -365,11 +485,34 @@ def build_environment_operator_runtime(
     """Build the physical Stage-One bridge only when private configuration is complete."""
     source_uri = environment.get(STAGE_ONE_SOURCE_ENV, "").strip()
     credential_bundle = environment.get(STAGE_ONE_CREDENTIAL_ENV, "")
+    public_source_uri = environment.get(PUBLIC_TEST_SOURCE_ENV, "").strip()
+    public_source_ip = environment.get(PUBLIC_TEST_SOURCE_IP_ENV, "").strip()
+    payload_raw = environment.get(STAGE_ONE_PAYLOAD_TYPE_ENV)
+
+    if public_source_uri or public_source_ip:
+        if source_uri or credential_bundle.strip() or not public_source_uri or not public_source_ip:
+            return None, None
+        stream_token = environment.get(STAGE_ONE_STREAM_TOKEN_ENV, _PUBLIC_TEST_STREAM_TOKEN)
+        try:
+            payload_type = (
+                None if payload_raw is None or not payload_raw.strip() else int(payload_raw)
+            )
+            resolver = PublicTestSourceResolver(
+                public_source_uri,
+                public_source_ip,
+                stream_token=stream_token,
+                payload_type=payload_type,
+                payload_probe=payload_probe,
+            )
+            launcher = WindowsSingleLiveOperatorLauncher(detection_provider=detection_provider)
+        except (TypeError, ValueError):
+            return None, None
+        return resolver, launcher
+
     if not source_uri or not credential_bundle.strip():
         return None, None
 
     stream_token = environment.get(STAGE_ONE_STREAM_TOKEN_ENV, _DEFAULT_STREAM_TOKEN)
-    payload_raw = environment.get(STAGE_ONE_PAYLOAD_TYPE_ENV)
     try:
         payload_type = None if payload_raw is None or not payload_raw.strip() else int(payload_raw)
         resolver = PrivateStageOneSourceResolver(
