@@ -170,7 +170,9 @@ class PublicTestSourceResolver(OperatorSourceResolver):
             isinstance(payload_type, bool) or not 96 <= payload_type <= 127
         ):
             raise ValueError("operator RTP payload type must be between 96 and 127")
-        resolved_payload_probe = _probe_dynamic_payload_type if payload_probe is None else payload_probe
+        resolved_payload_probe = (
+            _probe_dynamic_payload_type if payload_probe is None else payload_probe
+        )
         if not callable(resolved_payload_probe):
             raise TypeError("payload_probe must be callable")
 
