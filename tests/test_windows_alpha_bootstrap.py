@@ -65,12 +65,30 @@ def test_windows_alpha_runtime_wrapper_uses_installed_launcher() -> None:
     text = RUN.read_text(encoding="utf-8")
     assert 'Join-Path $InstallRoot "Start-K5VisionAlpha.ps1"' in text
     assert "& $launcher -Port $Port" in text
+    assert "-PublicRtspSource $PublicRtspSource" in text
 
 
-def test_windows_alpha_bootstrap_does_not_enable_recording_or_camera_source() -> None:
-    combined = "\n".join(
-        path.read_text(encoding="utf-8") for path in (INSTALL, PREFLIGHT, RUN, START)
-    )
-    assert "K5_STAGE_ONE_RECORDING_ROOT" in combined
-    assert "K5_STAGE03_SOURCE" not in combined
-    assert "/api/v1/operator/live" not in combined
+def test_windows_alpha_launches_authenticated_public_operator_without_recording() -> None:
+    text = START.read_text(encoding="utf-8")
+    assert '"--operator"' in text
+    assert "resolve_public_test_source_ip" in text
+    assert "K5_PUBLIC_TEST_RTSP_SOURCE" in text
+    assert "K5_PUBLIC_TEST_SOURCE_IP" in text
+    assert '$env:K5_OPERATOR_STREAM_TOKEN = "public-test"' in text
+    assert "Remove-Item Env:K5_STAGE_ONE_RECORDING_ROOT" in text
+    assert "/api/v1/users" in text
+    assert "/api/v1/auth/bootstrap-password" in text
+    assert "/api/v1/auth/login" in text
+    assert "/api/v1/devices" in text
+    assert "/api/v1/operator/live" in text
+    assert 'tags = @("alpha-public-test","ephemeral","non-recording")' in text
+
+
+def test_windows_alpha_public_test_does_not_retain_media_or_private_camera_config() -> None:
+    text = START.read_text(encoding="utf-8")
+    assert "No public-stream recording or retained media was created." in text
+    assert "Set-Content" not in text
+    assert "Remove-Item Env:K5_STAGE03_SOURCE" in text
+    assert "Remove-Item Env:K5_STAGE03_CAM_CRED" in text
+    assert "$env:K5_STAGE03_SOURCE =" not in text
+    assert "$env:K5_STAGE03_CAM_CRED =" not in text
