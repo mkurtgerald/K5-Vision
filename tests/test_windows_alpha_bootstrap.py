@@ -35,6 +35,8 @@ def test_windows_alpha_installer_materializes_launcher_and_shortcut() -> None:
     assert "Run-K5VisionAlpha.ps1" in text
     assert "K5 Vision Alpha.lnk" in text
     assert "-ExecutionPolicy Bypass -File" in text
+    assert "[switch]$SkipDesktopShortcut" in text
+    assert "if (-not $SkipDesktopShortcut)" in text
 
 
 def test_windows_alpha_preflight_verifies_installed_runtime_without_camera_contact() -> None:
@@ -66,11 +68,15 @@ def test_windows_alpha_runtime_wrapper_uses_installed_launcher() -> None:
     assert 'Join-Path $InstallRoot "Start-K5VisionAlpha.ps1"' in text
     assert "& $launcher -Port $Port" in text
     assert "-PublicRtspSource $PublicRtspSource" in text
+    assert "[switch]$ExitAfterPublicTest" in text
+    assert "-ExitAfterPublicTest:$ExitAfterPublicTest" in text
 
 
 def test_windows_alpha_launches_authenticated_public_operator_without_recording() -> None:
     text = START.read_text(encoding="utf-8")
     assert '"--operator"' in text
+    assert "[switch]$ExitAfterPublicTest" in text
+    assert "Exiting after one bounded public RTSP acceptance run." in text
     assert "resolve_public_test_source_ip" in text
     assert "K5_PUBLIC_TEST_RTSP_SOURCE" in text
     assert "K5_PUBLIC_TEST_SOURCE_IP" in text
