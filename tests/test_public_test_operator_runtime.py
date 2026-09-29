@@ -125,3 +125,26 @@ def test_public_test_environment_builder_keeps_private_mode_separate(
     )
     assert resolver is None
     assert launcher is None
+
+
+def test_public_test_environment_builder_forwards_analytics_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(operator_runtime_module, "getaddrinfo", _public_dns)
+
+    async def provider(_frame: object) -> tuple[object, ...]:
+        return ()
+
+    resolver, launcher = build_environment_operator_runtime(
+        {
+            "K5_PUBLIC_TEST_RTSP_SOURCE": "rtsp://stream.example.test:1935/app/live",
+            "K5_PUBLIC_TEST_SOURCE_IP": "8.8.8.8",
+            "K5_OPERATOR_STREAM_TOKEN": "public-test",
+            "K5_OPERATOR_RTP_PAYLOAD_TYPE": "96",
+        },
+        detection_provider=provider,
+    )
+
+    assert isinstance(resolver, PublicTestSourceResolver)
+    assert isinstance(launcher, WindowsSingleLiveOperatorLauncher)
+    assert launcher._detection_provider is provider
