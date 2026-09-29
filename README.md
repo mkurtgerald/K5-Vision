@@ -2,6 +2,22 @@
 
 Early-stage systems project.
 
+## Windows Alpha — Start Here
+
+For the current Windows alpha test path, download and run `Install-K5VisionAlpha.ps1` from the repository root.
+
+The bootstrap:
+- downloads the exact reviewed K5 alpha revision;
+- installs K5 into a user-local isolated environment;
+- provisions the reviewed GStreamer runtime;
+- creates the **K5 Vision Alpha** desktop shortcut;
+- verifies the installed revision;
+- removes its temporary bootstrap files.
+
+Launching the desktop shortcut runs the current **non-recording public RTSP operator test** through the normal K5 authentication, device-enrollment, and live-operator APIs. Public test media is not retained.
+
+This is still an alpha bootstrap, not the final signed MSI/EXE installer.
+
 ## Development
 
 Requirements: Python 3.12+
