@@ -3,6 +3,7 @@ name: Windows Alpha Script Smoke
 on:
   pull_request:
     paths:
+      - "Install-K5VisionAlpha.ps1"
       - "scripts/windows-alpha/**"
       - "src/k5vision/operator_runtime.py"
       - "tests/test_windows_alpha_bootstrap.py"
@@ -63,4 +64,4 @@ jobs:
       - name: Run Windows alpha boundary regressions
         shell: powershell
         run: |
-          pytest tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py -q --no-cov
+          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py -q --no-cov
