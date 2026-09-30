@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 import k5vision.operator_runtime as operator_runtime_module
+from k5vision.media.gstreamer_rtp_pull import GStreamerDirectRtpDelivery
 from k5vision.domain.devices import Device, DeviceProtocol
 from k5vision.operator_runtime import (
     LocalTestSourceResolver,
@@ -149,10 +150,7 @@ def test_local_test_environment_builder_is_mutually_exclusive() -> None:
     assert isinstance(resolver, LocalTestSourceResolver)
     assert isinstance(launcher, WindowsSingleLiveOperatorLauncher)
     delivery = launcher._delivery_factory(96)
-    relay_factory = delivery._rtp_delivery._relay_factory
-    assert relay_factory is not None
-    relay = relay_factory(50000)
-    assert relay._rtsp_transport == "tcp"
+    assert isinstance(delivery._rtp_delivery, GStreamerDirectRtpDelivery)
 
     resolver, launcher = build_environment_operator_runtime(
         {
