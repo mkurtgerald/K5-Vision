@@ -23,6 +23,11 @@ def test_windows_alpha_installer_is_revision_pinned_and_checkout_free() -> None:
     assert "pip install $repoRoot" not in text
 
 
+def test_windows_alpha_gstreamer_download_suppresses_slow_progress_renderer() -> None:
+    text = PROVISION.read_text(encoding="utf-8")
+    assert '$ProgressPreference = "SilentlyContinue"' in text
+
+
 def test_windows_alpha_installer_uses_reviewed_media_provisioner() -> None:
     text = INSTALL.read_text(encoding="utf-8")
     assert "provision-stage03-gstreamer.ps1" in text
