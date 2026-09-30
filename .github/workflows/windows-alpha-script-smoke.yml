@@ -61,6 +61,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Verify clean Windows alpha runtime dependency install
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $probe = Join-Path $env:RUNNER_TEMP "k5-alpha-runtime-probe"
+          python -m venv $probe
+          $probePython = Join-Path $probe "Scripts\python.exe"
+          & $probePython -m pip install --upgrade pip
+          & $probePython -m pip install --requirement scripts\windows-alpha\runtime-requirements.txt
+          & $probePython -m pip install --no-deps .
+          & $probePython -m pip check
+          & $probePython -m k5vision.cli --version
+
       - name: Run Windows alpha boundary regressions
         shell: powershell
         run: |
