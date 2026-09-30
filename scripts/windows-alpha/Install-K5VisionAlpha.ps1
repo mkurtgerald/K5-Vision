@@ -59,6 +59,44 @@ finally {
 
 New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
 $venv = Join-Path $InstallRoot ".venv"
+$venvPython = Join-Path $venv "Scripts\python.exe"
+
+if (Test-Path -LiteralPath $venv) {
+    $normalizedVenvPython = [IO.Path]::GetFullPath($venvPython)
+    $staleK5Processes = @(
+        Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and
+                [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$_.ExecutablePath),
+                    $normalizedVenvPython,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            }
+    )
+    foreach ($staleProcess in $staleK5Processes) {
+        Write-Host ("Stopping stale K5 Vision Alpha runtime process {0}..." -f $staleProcess.ProcessId)
+        Stop-Process -Id ([int]$staleProcess.ProcessId) -Force -ErrorAction Stop
+        Wait-Process -Id ([int]$staleProcess.ProcessId) -Timeout 10 -ErrorAction SilentlyContinue
+    }
+
+    $venvRemoved = $false
+    foreach ($attempt in 1..12) {
+        try {
+            Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction Stop
+            $venvRemoved = -not (Test-Path -LiteralPath $venv)
+        } catch {
+            $venvRemoved = $false
+        }
+        if ($venvRemoved) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    if (-not $venvRemoved) {
+        throw "Existing K5 Vision Alpha runtime is still locked. Close any K5 Vision Alpha window and retry."
+    }
+    Write-Host "Removed previous K5 Vision Alpha runtime cleanly."
+}
+
 & $pythonCommand @pythonPrefixArgs -m venv $venv
 if ($LASTEXITCODE -ne 0) { throw "Virtual environment creation failed." }
 $python = Join-Path $venv "Scripts\python.exe"
