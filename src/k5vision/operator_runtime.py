@@ -49,8 +49,10 @@ STAGE_ONE_STREAM_TOKEN_ENV = "K5_OPERATOR_STREAM_TOKEN"
 STAGE_ONE_PAYLOAD_TYPE_ENV = "K5_OPERATOR_RTP_PAYLOAD_TYPE"
 PUBLIC_TEST_SOURCE_ENV = "K5_PUBLIC_TEST_RTSP_SOURCE"
 PUBLIC_TEST_SOURCE_IP_ENV = "K5_PUBLIC_TEST_SOURCE_IP"
+LOCAL_TEST_SOURCE_ENV = "K5_LOCAL_TEST_RTSP_SOURCE"
 _DEFAULT_STREAM_TOKEN = "main"
 _PUBLIC_TEST_STREAM_TOKEN = "public-test"
+_LOCAL_TEST_STREAM_TOKEN = "local-test"
 _DEFAULT_PAYLOAD_TYPE = 96
 _MAX_STREAM_TOKEN_LENGTH = 256
 
@@ -143,6 +145,92 @@ def _rewrite_public_test_source(parsed: SplitResult, source_ip: str) -> str:
     host = f"[{address}]" if address.version == 6 else str(address)
     port = parsed.port or 554
     return urlunsplit(("rtsp", f"{host}:{port}", parsed.path, parsed.query, ""))
+
+
+def _local_test_source(source_uri: str) -> tuple[str, str]:
+    """Validate one credential-free loopback-only RTSP alpha source."""
+    if not isinstance(source_uri, str) or not source_uri.strip():
+        raise ValueError("local RTSP test source is unavailable")
+    try:
+        parsed = urlsplit(source_uri.strip())
+        port = parsed.port or 554
+        host = ip_address(parsed.hostname or "")
+    except ValueError as exc:
+        raise ValueError("local RTSP test source is invalid") from exc
+    if (
+        parsed.scheme.casefold() != "rtsp"
+        or not host.is_loopback
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or not 1 <= port <= 65535
+    ):
+        raise ValueError("local RTSP test source must be credential-free loopback RTSP")
+    normalized = urlunsplit(
+        (
+            "rtsp",
+            f"[{host}]:{port}" if host.version == 6 else f"{host}:{port}",
+            parsed.path,
+            parsed.query,
+            "",
+        )
+    )
+    return normalized, str(host)
+
+
+class LocalTestSourceResolver(OperatorSourceResolver):
+    """Resolve one explicit loopback-only synthetic alpha stream."""
+
+    __slots__ = ("_source_uri", "_source_ip", "_stream_token", "_payload_type", "_payload_probe")
+
+    def __init__(
+        self,
+        source_uri: str,
+        *,
+        stream_token: str = _LOCAL_TEST_STREAM_TOKEN,
+        payload_type: int | None = None,
+        payload_probe: PayloadTypeProbe | None = None,
+    ) -> None:
+        normalized_uri, source_ip = _local_test_source(source_uri)
+        if payload_type is not None and (
+            isinstance(payload_type, bool) or not 96 <= payload_type <= 127
+        ):
+            raise ValueError("operator RTP payload type must be between 96 and 127")
+        resolved_payload_probe = (
+            _probe_dynamic_payload_type if payload_probe is None else payload_probe
+        )
+        if not callable(resolved_payload_probe):
+            raise TypeError("payload_probe must be callable")
+        self._source_uri = normalized_uri
+        self._source_ip = source_ip
+        self._stream_token = _sanitize_stream_token(stream_token)
+        self._payload_type = payload_type
+        self._payload_probe = resolved_payload_probe
+
+    async def resolve(self, device: Device, stream_token: str) -> ResolvedLiveSource:
+        """Return the synthetic stream only for the enrolled loopback test device."""
+        if not isinstance(device, Device) or stream_token != self._stream_token:
+            raise OperatorLaunchError(
+                OperatorLaunchErrorCode.SOURCE_UNAVAILABLE,
+                "selected live source could not be resolved",
+            )
+        if str(device.host) != self._source_ip:
+            raise OperatorLaunchError(
+                OperatorLaunchErrorCode.SOURCE_SCOPE_MISMATCH,
+                "resolved live source is outside the selected device scope",
+            )
+        try:
+            payload_type = self._payload_type
+            if payload_type is None:
+                payload_type = await self._payload_probe(self._source_uri)
+            if isinstance(payload_type, bool) or not 96 <= payload_type <= 127:
+                raise ValueError("operator RTP payload type is invalid")
+        except Exception:
+            raise OperatorLaunchError(
+                OperatorLaunchErrorCode.SOURCE_UNAVAILABLE,
+                "selected live source could not be resolved",
+            ) from None
+        return ResolvedLiveSource(self._source_uri, payload_type)
 
 
 class PublicTestSourceResolver(OperatorSourceResolver):
@@ -487,7 +575,27 @@ def build_environment_operator_runtime(
     credential_bundle = environment.get(STAGE_ONE_CREDENTIAL_ENV, "")
     public_source_uri = environment.get(PUBLIC_TEST_SOURCE_ENV, "").strip()
     public_source_ip = environment.get(PUBLIC_TEST_SOURCE_IP_ENV, "").strip()
+    local_source_uri = environment.get(LOCAL_TEST_SOURCE_ENV, "").strip()
     payload_raw = environment.get(STAGE_ONE_PAYLOAD_TYPE_ENV)
+
+    if local_source_uri:
+        if source_uri or credential_bundle.strip() or public_source_uri or public_source_ip:
+            return None, None
+        stream_token = environment.get(STAGE_ONE_STREAM_TOKEN_ENV, _LOCAL_TEST_STREAM_TOKEN)
+        try:
+            payload_type = (
+                None if payload_raw is None or not payload_raw.strip() else int(payload_raw)
+            )
+            resolver = LocalTestSourceResolver(
+                local_source_uri,
+                stream_token=stream_token,
+                payload_type=payload_type,
+                payload_probe=payload_probe,
+            )
+            launcher = WindowsSingleLiveOperatorLauncher(detection_provider=detection_provider)
+        except (TypeError, ValueError):
+            return None, None
+        return resolver, launcher
 
     if public_source_uri or public_source_ip:
         if source_uri or credential_bundle.strip() or not public_source_uri or not public_source_ip:

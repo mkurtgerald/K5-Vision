@@ -7,6 +7,7 @@ import pytest
 import k5vision.operator_runtime as operator_runtime_module
 from k5vision.domain.devices import Device, DeviceProtocol
 from k5vision.operator_runtime import (
+    LocalTestSourceResolver,
     PublicTestSourceResolver,
     WindowsSingleLiveOperatorLauncher,
     build_environment_operator_runtime,
@@ -97,6 +98,66 @@ def test_public_test_resolver_pins_runtime_uri_to_enrolled_public_ip(
     assert resolved.source_uri == "rtsp://8.8.8.8:1935/app/live?profile=main"
     assert resolved.payload_type == 97
     assert probed == [resolved.source_uri]
+
+
+def test_local_test_source_is_loopback_only() -> None:
+    async def payload_probe(source_uri: str) -> int:
+        assert source_uri == "rtsp://127.0.0.1:8554/k5synthetic"
+        return 96
+
+    resolver = LocalTestSourceResolver(
+        "rtsp://127.0.0.1:8554/k5synthetic",
+        payload_probe=payload_probe,
+    )
+    device = Device(
+        name="Synthetic test",
+        host="127.0.0.1",
+        management_port=8554,
+        protocols={DeviceProtocol.RTSP},
+        tags={"alpha-local-synthetic"},
+    )
+
+    resolved = asyncio.run(resolver.resolve(device, "local-test"))
+
+    assert resolved.source_uri == "rtsp://127.0.0.1:8554/k5synthetic"
+    assert resolved.payload_type == 96
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "rtsp://192.168.1.10:8554/k5synthetic",
+        "rtsp://8.8.8.8:8554/k5synthetic",
+        "rtsp://user:secret@127.0.0.1:8554/k5synthetic",
+        "http://127.0.0.1:8554/k5synthetic",
+    ],
+)
+def test_local_test_source_rejects_non_loopback_or_credentials(source: str) -> None:
+    with pytest.raises(ValueError):
+        LocalTestSourceResolver(source, payload_type=96)
+
+
+def test_local_test_environment_builder_is_mutually_exclusive() -> None:
+    resolver, launcher = build_environment_operator_runtime(
+        {
+            "K5_LOCAL_TEST_RTSP_SOURCE": "rtsp://127.0.0.1:8554/k5synthetic",
+            "K5_OPERATOR_STREAM_TOKEN": "local-test",
+            "K5_OPERATOR_RTP_PAYLOAD_TYPE": "96",
+        }
+    )
+
+    assert isinstance(resolver, LocalTestSourceResolver)
+    assert isinstance(launcher, WindowsSingleLiveOperatorLauncher)
+
+    resolver, launcher = build_environment_operator_runtime(
+        {
+            "K5_LOCAL_TEST_RTSP_SOURCE": "rtsp://127.0.0.1:8554/k5synthetic",
+            "K5_PUBLIC_TEST_RTSP_SOURCE": "rtsp://stream.example.test/live",
+            "K5_PUBLIC_TEST_SOURCE_IP": "8.8.8.8",
+        }
+    )
+    assert resolver is None
+    assert launcher is None
 
 
 def test_public_test_environment_builder_keeps_private_mode_separate(

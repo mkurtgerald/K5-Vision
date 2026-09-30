@@ -89,27 +89,43 @@ def test_windows_alpha_runtime_wrapper_uses_installed_launcher() -> None:
     assert "-ExitAfterPublicTest:$ExitAfterPublicTest" in text
 
 
-def test_windows_alpha_launches_authenticated_public_operator_without_recording() -> None:
+def test_windows_alpha_defaults_to_verified_local_synthetic_rtsp() -> None:
+    text = START.read_text(encoding="utf-8")
+    assert '[string]$PublicRtspSource = ""' in text
+    assert '$MediaMtxVersion = "1.21.1"' in text
+    assert "faa97974861eb75a68b5aa326c78e7e7a6f670b5ef191bace78e715130381f23" in text
+    assert "mediamtx_v$MediaMtxVersion" in text
+    assert "Get-FileHash" in text
+    assert "rtspAddress: 127.0.0.1:8554" in text
+    assert "rtspTransports: [tcp]" in text
+    assert "videotestsrc" in text
+    assert "rtspclientsink" in text
+    assert "rtsp://127.0.0.1:8554/k5synthetic" in text
+    assert "K5_LOCAL_TEST_RTSP_SOURCE" in text
+    assert '"alpha-local-synthetic","ephemeral","non-recording"' in text
+    assert "Local synthetic RTSP source PASS." in text
+
+
+def test_windows_alpha_launches_authenticated_operator_without_recording() -> None:
     text = START.read_text(encoding="utf-8")
     assert '"--operator"' in text
     assert "[switch]$ExitAfterPublicTest" in text
-    assert "Exiting after one bounded public RTSP acceptance run." in text
+    assert "Exiting after one bounded alpha acceptance run." in text
     assert "resolve_public_test_source_ip" in text
     assert "K5_PUBLIC_TEST_RTSP_SOURCE" in text
     assert "K5_PUBLIC_TEST_SOURCE_IP" in text
-    assert '$env:K5_OPERATOR_STREAM_TOKEN = "public-test"' in text
+    assert "$env:K5_OPERATOR_STREAM_TOKEN = $streamToken" in text
     assert "Remove-Item Env:K5_STAGE_ONE_RECORDING_ROOT" in text
     assert "/api/v1/users" in text
     assert "/api/v1/auth/bootstrap-password" in text
     assert "/api/v1/auth/login" in text
     assert "/api/v1/devices" in text
     assert "/api/v1/operator/live" in text
-    assert 'tags = @("alpha-public-test","ephemeral","non-recording")' in text
 
 
-def test_windows_alpha_public_test_does_not_retain_media_or_private_camera_config() -> None:
+def test_windows_alpha_test_does_not_retain_media_or_private_camera_config() -> None:
     text = START.read_text(encoding="utf-8")
-    assert "No public-stream recording or retained media was created." in text
+    assert "No test-stream recording or retained media was created." in text
     assert "Set-Content" not in text
     assert "Remove-Item Env:K5_STAGE03_SOURCE" in text
     assert "Remove-Item Env:K5_STAGE03_CAM_CRED" in text

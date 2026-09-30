@@ -47,7 +47,7 @@ try {
 
     Write-Host ""
     Write-Host "K5 Vision Alpha installation PASS."
-    Write-Host "Launch the 'K5 Vision Alpha' desktop shortcut to run the non-recording public RTSP operator test."
+    Write-Host "Launch the 'K5 Vision Alpha' desktop shortcut to run the non-recording local synthetic RTSP operator test."
 }
 finally {
     if (Test-Path -LiteralPath $bootstrapRoot) {

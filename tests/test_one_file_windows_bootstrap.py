@@ -24,4 +24,4 @@ def test_one_file_windows_bootstrap_verifies_installed_revision_and_cleans_up() 
     assert "if ($actualRevision -ne $K5Revision)" in text
     assert "Remove-Item -LiteralPath $bootstrapRoot -Recurse -Force" in text
     assert "K5 Vision Alpha installation PASS." in text
-    assert "non-recording public RTSP operator test" in text
+    assert "non-recording local synthetic RTSP operator test" in text
