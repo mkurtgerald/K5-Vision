@@ -2,7 +2,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP = ROOT / "Install-K5VisionAlpha.ps1"
-PIN = "6efb8f9deb845395a95fa8a2feaf2cc06f8c31fb"
+PIN = "8e52789f96e42f262795fad1833da934577f5fd3"
 
 
 def test_one_file_windows_bootstrap_exists() -> None:
