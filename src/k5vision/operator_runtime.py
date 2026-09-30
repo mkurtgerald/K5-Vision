@@ -548,7 +548,7 @@ class WindowsSingleLiveOperatorLauncher(OperatorLauncher):
             primary_error = exc
             raise OperatorLaunchError(
                 OperatorLaunchErrorCode.LAUNCH_FAILURE,
-                f"live operator runtime failed at {exc.code.value}",
+                f"live operator runtime failed at {exc.code.value}: {exc}",
             ) from None
         except Exception as exc:
             primary_error = exc
