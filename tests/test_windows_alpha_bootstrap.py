@@ -96,11 +96,11 @@ def test_windows_alpha_defaults_to_verified_local_synthetic_rtsp() -> None:
     assert "faa97974861eb75a68b5aa326c78e7e7a6f670b5ef191bace78e715130381f23" in text
     assert "mediamtx_v$MediaMtxVersion" in text
     assert "Get-FileHash" in text
-    assert 'rtspAddress: 127.0.0.1:8554' in text
-    assert 'rtspTransports: [tcp]' in text
+    assert "rtspAddress: 127.0.0.1:8554" in text
+    assert "rtspTransports: [tcp]" in text
     assert "videotestsrc" in text
     assert "rtspclientsink" in text
-    assert 'rtsp://127.0.0.1:8554/k5synthetic' in text
+    assert "rtsp://127.0.0.1:8554/k5synthetic" in text
     assert "K5_LOCAL_TEST_RTSP_SOURCE" in text
     assert '"alpha-local-synthetic","ephemeral","non-recording"' in text
     assert "Local synthetic RTSP source PASS." in text
