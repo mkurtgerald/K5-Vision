@@ -8,6 +8,8 @@ import pytest
 
 from k5vision.domain.devices import Device, DeviceCreate, DeviceKind, DeviceProtocol
 from k5vision.media.windows_operator_runtime import (
+    WindowsOperatorRuntimeError,
+    WindowsOperatorRuntimeErrorCode,
     WindowsOperatorRuntimeSnapshot,
     WindowsOperatorRuntimeState,
 )
@@ -202,6 +204,38 @@ def test_windows_launcher_drives_exactly_one_private_live_stream_and_closes() ->
         assert "rtsp://" not in retained
         assert "super-secret" not in retained
         assert "192.0.2.10" not in retained
+
+    asyncio.run(scenario())
+
+
+class _FailingRuntime(_Runtime):
+    async def wait(self) -> WindowsOperatorRuntimeSnapshot:
+        raise WindowsOperatorRuntimeError(
+            WindowsOperatorRuntimeErrorCode.EXECUTION_FAILURE,
+            "operator runtime execution failed at control_failure: synthetic-safe-stage",
+        )
+
+
+def test_windows_launcher_surfaces_only_source_free_failure_stage() -> None:
+    launcher = WindowsSingleLiveOperatorLauncher(
+        delivery_factory=lambda _payload_type: _UnusedDelivery(),
+        runtime_factory=lambda _layout: _FailingRuntime(),  # type: ignore[arg-type]
+    )
+    private_source = ResolvedLiveSource(
+        "rtsp://operator:super-secret@192.0.2.10/live",
+        96,
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(OperatorLaunchError) as caught:
+            await launcher.run(private_source, width=1280, height=720)
+        assert caught.value.code == OperatorLaunchErrorCode.LAUNCH_FAILURE
+        detail = str(caught.value)
+        assert "execution_failure" in detail
+        assert "control_failure" in detail
+        assert "rtsp://" not in detail
+        assert "super-secret" not in detail
+        assert "192.0.2.10" not in detail
 
     asyncio.run(scenario())
 
