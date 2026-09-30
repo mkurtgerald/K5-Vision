@@ -7,7 +7,7 @@ PREFLIGHT = ALPHA / "Test-K5VisionAlpha.ps1"
 RUN = ALPHA / "Run-K5VisionAlpha.ps1"
 START = ALPHA / "Start-K5VisionAlpha.ps1"
 PROVISION = ROOT / "scripts" / "provision-stage03-gstreamer.ps1"
-PIN = "3cec169c2b298f5b7650b05a9c2665cd98f66d39"
+PIN = "682c17bba1a1e2f42a3522448ce0b4a947e272de"
 
 
 def test_windows_alpha_bootstrap_files_exist() -> None:

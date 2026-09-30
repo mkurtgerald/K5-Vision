@@ -180,6 +180,10 @@ def test_public_test_environment_builder_keeps_private_mode_separate(
 
     assert isinstance(resolver, PublicTestSourceResolver)
     assert isinstance(launcher, WindowsSingleLiveOperatorLauncher)
+    delivery = launcher._delivery_factory(96)
+    assert isinstance(delivery, GStreamerDirectFrameDelivery)
+    assert delivery._frame_goal == 225
+    assert delivery._delivery_timeout_seconds == 25.0
 
     resolver, launcher = build_environment_operator_runtime(
         {
@@ -191,3 +195,40 @@ def test_public_test_environment_builder_keeps_private_mode_separate(
     )
     assert resolver is None
     assert launcher is None
+
+
+def test_public_test_environment_builder_skips_udp_payload_probe_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(operator_runtime_module, "getaddrinfo", _public_dns)
+    probed: list[str] = []
+
+    async def payload_probe(source_uri: str) -> int:
+        probed.append(source_uri)
+        raise AssertionError("public direct RTSP/TCP acceptance should not probe RTP over UDP")
+
+    resolver, launcher = build_environment_operator_runtime(
+        {
+            "K5_PUBLIC_TEST_RTSP_SOURCE": "rtsp://stream.example.test:1935/app/live",
+            "K5_PUBLIC_TEST_SOURCE_IP": "8.8.8.8",
+            "K5_OPERATOR_STREAM_TOKEN": "public-test",
+        },
+        payload_probe=payload_probe,
+    )
+
+    assert isinstance(resolver, PublicTestSourceResolver)
+    assert isinstance(launcher, WindowsSingleLiveOperatorLauncher)
+
+    device = Device(
+        name="Public test",
+        host="8.8.8.8",
+        management_port=1935,
+        protocols={DeviceProtocol.RTSP},
+        tags={"alpha-public-test"},
+    )
+    resolved = asyncio.run(resolver.resolve(device, "public-test"))
+
+    assert resolved.payload_type == 96
+    assert probed == []
+    delivery = launcher._delivery_factory(resolved.payload_type)
+    assert isinstance(delivery, GStreamerDirectFrameDelivery)
