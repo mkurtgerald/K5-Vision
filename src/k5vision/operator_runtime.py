@@ -21,7 +21,7 @@ from k5vision.media.analytics_overlay_delivery import (
     AnalyticsObservationProvider,
     BoundedAnalyticsOverlayDelivery,
 )
-from k5vision.media.gstreamer_rtp_relay import GStreamerRtpRelayRuntime
+from k5vision.media.gstreamer_rtp_pull import GStreamerDirectRtpDelivery
 from k5vision.media.live_presentation import BoundedLivePresentationDelivery
 from k5vision.media.mixed_presentation import MixedLiveStream
 from k5vision.media.presentation_runtime import BoundedPresentationRuntime
@@ -431,17 +431,12 @@ def _default_delivery_factory(payload_type: int) -> _LiveDeliveryBoundary:
 
 
 def _local_test_delivery_factory(payload_type: int) -> _LiveDeliveryBoundary:
-    """Reuse the accepted envelope with RTSP/TCP for loopback synthetic delivery."""
-    rtp_delivery = EphemeralRtpDelivery(
+    """Reuse the accepted envelope with direct RTSP/TCP RTP pull for local synthetic."""
+    rtp_delivery = GStreamerDirectRtpDelivery(
         packet_goal=2048,
         delivery_timeout_seconds=30.0,
         consumer_timeout_seconds=4.0,
-        relay_startup_probe_seconds=0.5,
-        relay_factory=lambda port: GStreamerRtpRelayRuntime(
-            port,
-            startup_probe_seconds=0.5,
-            rtsp_transport="tcp",
-        ),
+        startup_probe_ms=500,
     )
     return BoundedLivePresentationDelivery(
         payload_type,
