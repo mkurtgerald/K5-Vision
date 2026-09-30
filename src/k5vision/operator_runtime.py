@@ -266,7 +266,7 @@ class PublicTestSourceResolver(OperatorSourceResolver):
         if not callable(resolved_payload_probe):
             raise TypeError("payload_probe must be callable")
 
-        self._source_uri = _rewrite_public_test_source(parsed, normalized_ip)
+        self._source_uri = urlunsplit(("rtsp", parsed.netloc, parsed.path, parsed.query, ""))
         self._source_ip = normalized_ip
         self._stream_token = _sanitize_stream_token(stream_token)
         self._payload_type = payload_type
@@ -285,6 +285,9 @@ class PublicTestSourceResolver(OperatorSourceResolver):
                 "resolved live source is outside the selected device scope",
             )
         try:
+            _, current_addresses = _public_test_source_addresses(self._source_uri)
+            if self._source_ip not in current_addresses:
+                raise ValueError("public RTSP test source address changed")
             payload_type = self._payload_type
             if payload_type is None:
                 payload_type = await self._payload_probe(self._source_uri)
@@ -295,7 +298,11 @@ class PublicTestSourceResolver(OperatorSourceResolver):
                 OperatorLaunchErrorCode.SOURCE_UNAVAILABLE,
                 "selected live source could not be resolved",
             ) from None
-        return ResolvedLiveSource(self._source_uri, payload_type)
+        return ResolvedLiveSource(
+            self._source_uri,
+            payload_type,
+            endpoint_ip=self._source_ip,
+        )
 
 
 async def _probe_dynamic_payload_type(source_uri: str) -> int:

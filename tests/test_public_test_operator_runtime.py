@@ -7,6 +7,7 @@ import pytest
 import k5vision.operator_runtime as operator_runtime_module
 from k5vision.domain.devices import Device, DeviceProtocol
 from k5vision.media.gstreamer_direct_frame_delivery import GStreamerDirectFrameDelivery
+from k5vision.operator_launch import OperatorLaunchError, OperatorLaunchErrorCode
 from k5vision.operator_runtime import (
     LocalTestSourceResolver,
     PublicTestSourceResolver,
@@ -71,7 +72,7 @@ def test_public_test_source_rejects_credentials_or_unsafe_scheme(
         resolve_public_test_source_ip(source)
 
 
-def test_public_test_resolver_pins_runtime_uri_to_enrolled_public_ip(
+def test_public_test_resolver_preserves_hostname_and_binds_enrolled_public_ip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(operator_runtime_module, "getaddrinfo", _public_dns)
@@ -96,8 +97,9 @@ def test_public_test_resolver_pins_runtime_uri_to_enrolled_public_ip(
 
     resolved = asyncio.run(resolver.resolve(device, "public-test"))
 
-    assert resolved.source_uri == "rtsp://8.8.8.8:1935/app/live?profile=main"
+    assert resolved.source_uri == "rtsp://stream.example.test:1935/app/live?profile=main"
     assert resolved.payload_type == 97
+    assert resolved.endpoint_ip == "8.8.8.8"
     assert probed == [resolved.source_uri]
 
 
@@ -232,3 +234,32 @@ def test_public_test_environment_builder_skips_udp_payload_probe_by_default(
     assert probed == []
     delivery = launcher._delivery_factory(resolved.payload_type)
     assert isinstance(delivery, GStreamerDirectFrameDelivery)
+
+
+def test_public_test_resolver_revalidates_pinned_ip_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    answers = [("8.8.8.8", 1935)]
+
+    def dns(*_args: object, **_kwargs: object) -> list[tuple[object, ...]]:
+        return [(2, 1, 6, "", answer) for answer in answers]
+
+    monkeypatch.setattr(operator_runtime_module, "getaddrinfo", dns)
+    resolver = PublicTestSourceResolver(
+        "rtsp://stream.example.test:1935/app/live",
+        "8.8.8.8",
+        payload_type=96,
+    )
+    device = Device(
+        name="Public test",
+        host="8.8.8.8",
+        management_port=1935,
+        protocols={DeviceProtocol.RTSP},
+        tags={"alpha-public-test"},
+    )
+
+    answers[:] = [("1.1.1.1", 1935)]
+    with pytest.raises(OperatorLaunchError) as caught:
+        asyncio.run(resolver.resolve(device, "public-test"))
+
+    assert caught.value.code == OperatorLaunchErrorCode.SOURCE_UNAVAILABLE
