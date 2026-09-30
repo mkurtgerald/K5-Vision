@@ -156,9 +156,8 @@ paths:
         throw "Local synthetic RTSP port 8554 is already in use."
     }
 
-    $serverOut = Join-Path $sessionRoot "mediamtx.stdout.log"
-    $serverErr = Join-Path $sessionRoot "mediamtx.stderr.log"
-    $server = Start-Process -FilePath $mediaMtx -ArgumentList @($configPath) -PassThru -WindowStyle Hidden -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr
+    Write-Host "Starting local MediaMTX RTSP server..."
+    $server = Start-Process -FilePath $mediaMtx -ArgumentList @($configPath) -PassThru -NoNewWindow
     $serverReady = $false
     foreach ($attempt in 1..40) {
         if ($server.HasExited) { break }
@@ -171,14 +170,6 @@ paths:
     if (-not $serverReady) {
         $serverState = if ($server.HasExited) { "exited:$($server.ExitCode)" } else { "running" }
         Write-Host ("Synthetic RTSP server diagnostics: state={0}" -f $serverState)
-        if (Test-Path -LiteralPath $serverOut) {
-            $serverOutTail = @(Get-Content -LiteralPath $serverOut -Tail 12 -ErrorAction SilentlyContinue)
-            foreach ($line in $serverOutTail) { Write-Host ("mediamtx: " + $line) }
-        }
-        if (Test-Path -LiteralPath $serverErr) {
-            $serverErrTail = @(Get-Content -LiteralPath $serverErr -Tail 12 -ErrorAction SilentlyContinue)
-            foreach ($line in $serverErrTail) { Write-Host ("mediamtx: " + $line) }
-        }
         if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue }
         throw "Local synthetic RTSP server failed to start."
     }
@@ -231,14 +222,6 @@ paths:
         if (Test-Path -LiteralPath $publisherErr) {
             $publisherTail = @(Get-Content -LiteralPath $publisherErr -Tail 8 -ErrorAction SilentlyContinue)
             foreach ($line in $publisherTail) { Write-Host ("publisher: " + $line) }
-        }
-        if (Test-Path -LiteralPath $serverOut) {
-            $serverOutTail = @(Get-Content -LiteralPath $serverOut -Tail 12 -ErrorAction SilentlyContinue)
-            foreach ($line in $serverOutTail) { Write-Host ("mediamtx: " + $line) }
-        }
-        if (Test-Path -LiteralPath $serverErr) {
-            $serverErrTail = @(Get-Content -LiteralPath $serverErr -Tail 12 -ErrorAction SilentlyContinue)
-            foreach ($line in $serverErrTail) { Write-Host ("mediamtx: " + $line) }
         }
         Stop-Process -Id $publisher.Id -Force -ErrorAction SilentlyContinue
         Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
