@@ -42,7 +42,7 @@ def test_windows_alpha_installer_materializes_launcher_and_shortcut() -> None:
     assert "Start-K5VisionAlpha.ps1" in text
     assert "Run-K5VisionAlpha.ps1" in text
     assert "K5 Vision Alpha.lnk" in text
-    assert "-ExecutionPolicy Bypass -File" in text
+    assert "-ExecutionPolicy Bypass -NoExit -File" in text
     assert "[switch]$SkipDesktopShortcut" in text
     assert "if (-not $SkipDesktopShortcut)" in text
 
