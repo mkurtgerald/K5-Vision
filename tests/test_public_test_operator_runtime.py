@@ -5,8 +5,8 @@ import asyncio
 import pytest
 
 import k5vision.operator_runtime as operator_runtime_module
-from k5vision.media.gstreamer_rtp_pull import GStreamerDirectRtpDelivery
 from k5vision.domain.devices import Device, DeviceProtocol
+from k5vision.media.gstreamer_rtp_pull import GStreamerDirectRtpDelivery
 from k5vision.operator_runtime import (
     LocalTestSourceResolver,
     PublicTestSourceResolver,
