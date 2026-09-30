@@ -66,6 +66,9 @@ def test_windows_alpha_launcher_is_loopback_ephemeral_and_non_recording() -> Non
     assert "K5_STAGE_ONE_RECORDING_ROOT" in text
     assert "K5_GSTREAMER_ROOT" in text
     assert "GST_REGISTRY_1_0" in text
+    assert 'Join-Path $gstreamerRoot "bin"' in text
+    assert '$env:PATH = if ([string]::IsNullOrWhiteSpace($priorPath))' in text
+    assert '$env:PATH = $priorPath' in text
     assert "K5_DEVICE_DB_PATH" in text and "$sessionRoot" in text
     assert "K5_USER_DB_PATH" in text and "$sessionRoot" in text
     assert "Remove-Item -LiteralPath $sessionRoot -Recurse -Force" in text
