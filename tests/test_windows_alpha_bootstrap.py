@@ -193,3 +193,24 @@ def test_windows_alpha_launcher_rejects_occupied_control_plane_port() -> None:
     assert "K5 Vision Alpha control-plane port $Port is already in use." in text
     assert text.index(guard) < text.index('$arguments = @("-m","k5vision.cli","serve"')
     assert '$health.status -eq "ok" -and -not $process.HasExited' in text
+
+
+
+def test_windows_alpha_installer_installs_reviewed_runtime_dependencies() -> None:
+    text = INSTALL.read_text(encoding="utf-8")
+    requirements = ALPHA / "runtime-requirements.txt"
+    assert requirements.is_file()
+    dependency_text = requirements.read_text(encoding="utf-8")
+    for requirement in (
+        "fastapi==0.142.2",
+        "onvif-python==0.3.1",
+        "psutil==7.2.2",
+        "pydantic==2.13.5",
+        "uvicorn==0.54.0",
+    ):
+        assert requirement in dependency_text
+    assert '$runtimeRequirements = Join-Path $PSScriptRoot "runtime-requirements.txt"' in text
+    assert "-m pip install --requirement $runtimeRequirements" in text
+    assert "-m pip install --force-reinstall --no-deps $packageUri" in text
+    assert "-m pip check" in text
+    assert "K5 Vision Alpha runtime dependency verification PASS." in text
