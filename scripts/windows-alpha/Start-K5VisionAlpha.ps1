@@ -54,6 +54,7 @@ $sessionToken = $null
 $bootstrap = $null
 $process = $null
 $priorPath = $null
+$priorGioProxyResolver = $null
 
 try {
     $env:K5_CONTROL_PLANE_SITE_ID = "alpha-" + [Guid]::NewGuid().ToString("N")
@@ -62,6 +63,8 @@ try {
     $env:K5_CONTROL_PLANE_TOKEN = $writeToken
     $env:K5_CONTROL_PLANE_ADMIN_TOKEN = $adminToken
     $env:K5_GSTREAMER_ROOT = $gstreamerRoot
+    $priorGioProxyResolver = [Environment]::GetEnvironmentVariable("GIO_USE_PROXY_RESOLVER", "Process")
+    $env:GIO_USE_PROXY_RESOLVER = "dummy"
     $gstreamerBin = Join-Path $gstreamerRoot "bin"
     $priorPath = [string]$env:PATH
     $env:PATH = if ([string]::IsNullOrWhiteSpace($priorPath)) { $gstreamerBin } else { $gstreamerBin + [IO.Path]::PathSeparator + $priorPath }
@@ -179,5 +182,7 @@ finally {
     $writeToken = $null
     $adminToken = $null
     if ($null -ne $priorPath) { $env:PATH = $priorPath }
+    if ($null -eq $priorGioProxyResolver) { Remove-Item Env:GIO_USE_PROXY_RESOLVER -ErrorAction SilentlyContinue }
+    else { $env:GIO_USE_PROXY_RESOLVER = $priorGioProxyResolver }
     $publicSourceIp = $null
 }
