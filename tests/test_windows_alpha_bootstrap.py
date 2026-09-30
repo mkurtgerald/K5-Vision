@@ -115,6 +115,10 @@ def test_windows_alpha_defaults_to_verified_local_synthetic_rtsp() -> None:
     assert 'Test-K5TcpListener "127.0.0.1" 8554' in text
     assert "Local synthetic RTSP port 8554 is already in use." in text
     assert "source: publisher" not in text
+    assert "--version" in text
+    assert "--validate-conf" in text
+    assert "Pinned MediaMTX executable failed its version probe." in text
+    assert "Local synthetic RTSP MediaMTX configuration is invalid." in text
 
 
 def test_windows_alpha_launches_authenticated_operator_without_recording() -> None:
