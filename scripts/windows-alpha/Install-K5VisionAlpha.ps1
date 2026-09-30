@@ -14,8 +14,9 @@ if ($K5Revision -notmatch '^[0-9a-fA-F]{40}$') { throw "K5Revision must be an ex
 $preflightSource = Join-Path $PSScriptRoot "Test-K5VisionAlpha.ps1"
 $launcherSource = Join-Path $PSScriptRoot "Start-K5VisionAlpha.ps1"
 $runtimeSource = Join-Path $PSScriptRoot "Run-K5VisionAlpha.ps1"
+$runtimeRequirements = Join-Path $PSScriptRoot "runtime-requirements.txt"
 $provisioner = Join-Path (Split-Path $PSScriptRoot -Parent) "provision-stage03-gstreamer.ps1"
-foreach ($path in @($preflightSource, $launcherSource, $runtimeSource, $provisioner)) {
+foreach ($path in @($preflightSource, $launcherSource, $runtimeSource, $runtimeRequirements, $provisioner)) {
     if (-not (Test-Path -LiteralPath $path)) { throw "Required alpha bootstrap file is missing: $path" }
 }
 
@@ -102,9 +103,15 @@ if ($LASTEXITCODE -ne 0) { throw "Virtual environment creation failed." }
 $python = Join-Path $venv "Scripts\python.exe"
 & $python -m pip install --upgrade pip
 if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed." }
+Write-Host "Installing reviewed K5 Vision Alpha runtime dependencies..."
+& $python -m pip install --requirement $runtimeRequirements
+if ($LASTEXITCODE -ne 0) { throw "K5 Vision Alpha runtime dependency installation failed." }
 $packageUri = "https://github.com/mkurtgerald/K5-Vision/archive/$K5Revision.zip"
 & $python -m pip install --force-reinstall --no-deps $packageUri
 if ($LASTEXITCODE -ne 0) { throw "K5 Vision Alpha installation failed." }
+& $python -m pip check
+if ($LASTEXITCODE -ne 0) { throw "K5 Vision Alpha runtime dependency verification failed." }
+Write-Host "K5 Vision Alpha runtime dependency verification PASS."
 & $python -m k5vision.cli --version
 if ($LASTEXITCODE -ne 0) { throw "Installed K5 CLI verification failed." }
 $runtimeProbe = "from k5vision.operator_runtime import LOCAL_TEST_SOURCE_ENV; raise SystemExit(0 if LOCAL_TEST_SOURCE_ENV == 'K5_LOCAL_TEST_RTSP_SOURCE' else 1)"
