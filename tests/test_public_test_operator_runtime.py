@@ -151,6 +151,8 @@ def test_local_test_environment_builder_is_mutually_exclusive() -> None:
     assert isinstance(launcher, WindowsSingleLiveOperatorLauncher)
     delivery = launcher._delivery_factory(96)
     assert isinstance(delivery, GStreamerDirectFrameDelivery)
+    assert delivery._frame_goal == 225
+    assert delivery._delivery_timeout_seconds == 25.0
 
     resolver, launcher = build_environment_operator_runtime(
         {
