@@ -55,9 +55,7 @@ def test_direct_frame_delivery_presents_bounded_decoded_frames() -> None:
         backend_factory=lambda _uri, _max, _probe: backend,
     )
 
-    snapshot = asyncio.run(
-        delivery.run("rtsp://127.0.0.1:8554/k5synthetic", consume)
-    )
+    snapshot = asyncio.run(delivery.run("rtsp://127.0.0.1:8554/k5synthetic", consume))
 
     assert snapshot.state.value == "complete"
     assert snapshot.decoder_initialized is True
