@@ -21,7 +21,7 @@ def test_one_file_windows_bootstrap_is_exact_revision_pinned() -> None:
 def test_one_file_windows_bootstrap_verifies_installed_revision_and_cleans_up() -> None:
     text = BOOTSTRAP.read_text(encoding="utf-8")
     assert 'Join-Path $InstallRoot "k5-revision.txt"' in text
-    assert 'if ($actualRevision -ne $K5Revision)' in text
-    assert 'Remove-Item -LiteralPath $bootstrapRoot -Recurse -Force' in text
+    assert "if ($actualRevision -ne $K5Revision)" in text
+    assert "Remove-Item -LiteralPath $bootstrapRoot -Recurse -Force" in text
     assert "K5 Vision Alpha installation PASS." in text
     assert "non-recording public RTSP operator test" in text
