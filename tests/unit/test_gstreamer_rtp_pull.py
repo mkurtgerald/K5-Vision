@@ -9,7 +9,7 @@ from k5vision.media.rtp_delivery import RtpDeliveryError, RtpDeliveryErrorCode
 
 
 def _rtp_packet(payload_type: int = 96, sequence: int = 1) -> bytes:
-    return bytes(
+    header = bytes(
         [
             0x80,
             payload_type & 0x7F,
@@ -24,7 +24,8 @@ def _rtp_packet(payload_type: int = 96, sequence: int = 1) -> bytes:
             0,
             1,
         ]
-    ) + b"payload"
+    )
+    return header + b"payload"
 
 
 class _Backend:
