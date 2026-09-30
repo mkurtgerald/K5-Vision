@@ -222,9 +222,6 @@ class LocalTestSourceResolver(OperatorSourceResolver):
                 "resolved live source is outside the selected device scope",
             )
         try:
-            _, current_addresses = _public_test_source_addresses(self._source_uri)
-            if self._source_ip not in current_addresses:
-                raise ValueError("public RTSP test source address changed")
             payload_type = self._payload_type
             if payload_type is None:
                 payload_type = await self._payload_probe(self._source_uri)
@@ -235,11 +232,7 @@ class LocalTestSourceResolver(OperatorSourceResolver):
                 OperatorLaunchErrorCode.SOURCE_UNAVAILABLE,
                 "selected live source could not be resolved",
             ) from None
-        return ResolvedLiveSource(
-            self._source_uri,
-            payload_type,
-            endpoint_ip=self._source_ip,
-        )
+        return ResolvedLiveSource(self._source_uri, payload_type)
 
 
 class PublicTestSourceResolver(OperatorSourceResolver):
@@ -292,6 +285,9 @@ class PublicTestSourceResolver(OperatorSourceResolver):
                 "resolved live source is outside the selected device scope",
             )
         try:
+            _, current_addresses = _public_test_source_addresses(self._source_uri)
+            if self._source_ip not in current_addresses:
+                raise ValueError("public RTSP test source address changed")
             payload_type = self._payload_type
             if payload_type is None:
                 payload_type = await self._payload_probe(self._source_uri)
@@ -302,7 +298,11 @@ class PublicTestSourceResolver(OperatorSourceResolver):
                 OperatorLaunchErrorCode.SOURCE_UNAVAILABLE,
                 "selected live source could not be resolved",
             ) from None
-        return ResolvedLiveSource(self._source_uri, payload_type)
+        return ResolvedLiveSource(
+            self._source_uri,
+            payload_type,
+            endpoint_ip=self._source_ip,
+        )
 
 
 async def _probe_dynamic_payload_type(source_uri: str) -> int:
