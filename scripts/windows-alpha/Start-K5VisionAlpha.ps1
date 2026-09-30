@@ -53,6 +53,11 @@ $operatorPassword = New-K5Token
 $sessionToken = $null
 $bootstrap = $null
 $process = $null
+$priorPath = $null
+$priorGioProxyResolver = $null
+$priorGioModuleDir = $null
+$priorNoProxy = $null
+$priorNoProxyUpper = $null
 
 try {
     $env:K5_CONTROL_PLANE_SITE_ID = "alpha-" + [Guid]::NewGuid().ToString("N")
@@ -61,6 +66,19 @@ try {
     $env:K5_CONTROL_PLANE_TOKEN = $writeToken
     $env:K5_CONTROL_PLANE_ADMIN_TOKEN = $adminToken
     $env:K5_GSTREAMER_ROOT = $gstreamerRoot
+    $priorGioProxyResolver = [Environment]::GetEnvironmentVariable("GIO_USE_PROXY_RESOLVER", "Process")
+    $priorGioModuleDir = [Environment]::GetEnvironmentVariable("GIO_MODULE_DIR", "Process")
+    $priorNoProxy = [Environment]::GetEnvironmentVariable("no_proxy", "Process")
+    $priorNoProxyUpper = [Environment]::GetEnvironmentVariable("NO_PROXY", "Process")
+    $gioModuleDir = Join-Path $sessionRoot "gio-modules"
+    New-Item -ItemType Directory -Force -Path $gioModuleDir | Out-Null
+    $env:GIO_MODULE_DIR = $gioModuleDir
+    $env:GIO_USE_PROXY_RESOLVER = "dummy"
+    $env:no_proxy = "*"
+    $env:NO_PROXY = "*"
+    $gstreamerBin = Join-Path $gstreamerRoot "bin"
+    $priorPath = [string]$env:PATH
+    $env:PATH = if ([string]::IsNullOrWhiteSpace($priorPath)) { $gstreamerBin } else { $gstreamerBin + [IO.Path]::PathSeparator + $priorPath }
     $env:GST_REGISTRY_1_0 = Join-Path $sessionRoot "gstreamer-registry.bin"
     $env:K5_PUBLIC_TEST_RTSP_SOURCE = $PublicRtspSource
     $env:K5_PUBLIC_TEST_SOURCE_IP = $publicSourceIp
@@ -174,5 +192,14 @@ finally {
     $bootstrap = $null
     $writeToken = $null
     $adminToken = $null
+    if ($null -ne $priorPath) { $env:PATH = $priorPath }
+    if ($null -eq $priorGioProxyResolver) { Remove-Item Env:GIO_USE_PROXY_RESOLVER -ErrorAction SilentlyContinue }
+    else { $env:GIO_USE_PROXY_RESOLVER = $priorGioProxyResolver }
+    if ($null -eq $priorGioModuleDir) { Remove-Item Env:GIO_MODULE_DIR -ErrorAction SilentlyContinue }
+    else { $env:GIO_MODULE_DIR = $priorGioModuleDir }
+    if ($null -eq $priorNoProxy) { Remove-Item Env:no_proxy -ErrorAction SilentlyContinue }
+    else { $env:no_proxy = $priorNoProxy }
+    if ($null -eq $priorNoProxyUpper) { Remove-Item Env:NO_PROXY -ErrorAction SilentlyContinue }
+    else { $env:NO_PROXY = $priorNoProxyUpper }
     $publicSourceIp = $null
 }

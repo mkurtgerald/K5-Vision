@@ -93,7 +93,7 @@ if (-not $SkipDesktopShortcut) {
     $wsh = New-Object -ComObject WScript.Shell
     $shortcut = $wsh.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = $hostCommand.Source
-    $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $launcherTarget + '"'
+    $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -NoExit -File "' + $launcherTarget + '"'
     $shortcut.WorkingDirectory = $InstallRoot
     $shortcut.Description = "K5 Vision Windows Alpha"
     $shortcut.Save()

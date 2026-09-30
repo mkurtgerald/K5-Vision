@@ -42,7 +42,7 @@ def test_windows_alpha_installer_materializes_launcher_and_shortcut() -> None:
     assert "Start-K5VisionAlpha.ps1" in text
     assert "Run-K5VisionAlpha.ps1" in text
     assert "K5 Vision Alpha.lnk" in text
-    assert "-ExecutionPolicy Bypass -File" in text
+    assert "-ExecutionPolicy Bypass -NoExit -File" in text
     assert "[switch]$SkipDesktopShortcut" in text
     assert "if (-not $SkipDesktopShortcut)" in text
 
@@ -66,6 +66,15 @@ def test_windows_alpha_launcher_is_loopback_ephemeral_and_non_recording() -> Non
     assert "K5_STAGE_ONE_RECORDING_ROOT" in text
     assert "K5_GSTREAMER_ROOT" in text
     assert "GST_REGISTRY_1_0" in text
+    assert 'Join-Path $gstreamerRoot "bin"' in text
+    assert "$env:PATH = if ([string]::IsNullOrWhiteSpace($priorPath))" in text
+    assert "$env:PATH = $priorPath" in text
+    assert '$env:GIO_USE_PROXY_RESOLVER = "dummy"' in text
+    assert "$env:GIO_MODULE_DIR = $gioModuleDir" in text
+    assert '$env:no_proxy = "*"' in text
+    assert '$env:NO_PROXY = "*"' in text
+    assert "Remove-Item Env:GIO_USE_PROXY_RESOLVER" in text
+    assert "Remove-Item Env:GIO_MODULE_DIR" in text
     assert "K5_DEVICE_DB_PATH" in text and "$sessionRoot" in text
     assert "K5_USER_DB_PATH" in text and "$sessionRoot" in text
     assert "Remove-Item -LiteralPath $sessionRoot -Recurse -Force" in text
