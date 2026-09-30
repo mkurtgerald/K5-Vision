@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import Protocol
+from typing import Literal, Protocol
 
 from k5vision.media.native_rtsp_pipeline import NativeRtspPipeline, quote_pipeline_value
 
@@ -23,13 +23,23 @@ class _Pipeline(Protocol):
 _PipelineFactory = Callable[[str, float], _Pipeline]
 
 
-def build_rtp_relay_pipeline(source_uri: str, port: int) -> str:
+RtspTransport = Literal["udp", "tcp"]
+
+
+def build_rtp_relay_pipeline(
+    source_uri: str,
+    port: int,
+    *,
+    rtsp_transport: RtspTransport = "udp",
+) -> str:
     """Build a bounded video-RTP relay to K5-owned loopback UDP."""
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
+    if rtsp_transport not in {"udp", "tcp"}:
+        raise ValueError("rtsp_transport must be udp or tcp")
     location = quote_pipeline_value(source_uri)
     return (
-        f"rtspsrc location={location} protocols=udp latency=100 "
+        f"rtspsrc location={location} protocols={rtsp_transport} latency=100 "
         "tcp-timeout=5000000 teardown-timeout=0 "
         "! application/x-rtp,media=video "
         "! queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 leaky=downstream "
@@ -54,6 +64,7 @@ class GStreamerRtpRelayRuntime:
         executable_name: str = "gst-launch-1.0",
         startup_probe_seconds: float = 0.15,
         stop_timeout_seconds: float = 1.0,
+        rtsp_transport: RtspTransport = "udp",
         pipeline_factory: _PipelineFactory | None = None,
     ) -> None:
         if not 1 <= port <= 65535:
@@ -64,7 +75,10 @@ class GStreamerRtpRelayRuntime:
             raise ValueError("startup_probe_seconds must be positive")
         if stop_timeout_seconds <= 0:
             raise ValueError("stop_timeout_seconds must be positive")
+        if rtsp_transport not in {"udp", "tcp"}:
+            raise ValueError("rtsp_transport must be udp or tcp")
         self._port = port
+        self._rtsp_transport = rtsp_transport
         self._startup_probe_seconds = startup_probe_seconds
         self._stop_timeout_seconds = stop_timeout_seconds
         self._pipeline_factory = pipeline_factory or _default_pipeline_factory
@@ -75,7 +89,11 @@ class GStreamerRtpRelayRuntime:
             return
         try:
             self._pipeline = self._pipeline_factory(
-                build_rtp_relay_pipeline(source_uri, self._port),
+                build_rtp_relay_pipeline(
+                    source_uri,
+                    self._port,
+                    rtsp_transport=self._rtsp_transport,
+                ),
                 self._startup_probe_seconds,
             )
         except (RuntimeError, ValueError):

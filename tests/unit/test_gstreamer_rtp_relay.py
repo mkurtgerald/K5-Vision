@@ -28,6 +28,9 @@ def test_relay_pipeline_is_video_rtp_loopback_only() -> None:
 
     assert source in description
     assert "protocols=udp" in description
+    tcp_description = build_rtp_relay_pipeline(source, 50001, rtsp_transport="tcp")
+    assert "protocols=tcp" in tcp_description
+    assert "port=50001" in tcp_description
     assert "application/x-rtp,media=video" in description
     assert "queue" in description
     assert "max-size-buffers=8" in description
@@ -45,6 +48,12 @@ def test_relay_pipeline_rejects_invalid_inputs() -> None:
         build_rtp_relay_pipeline("rtsp://example.invalid/live", 0)
     with pytest.raises(ValueError):
         build_rtp_relay_pipeline("rtsp://example.invalid/live", 65536)
+    with pytest.raises(ValueError):
+        build_rtp_relay_pipeline(
+            "rtsp://example.invalid/live",
+            50000,
+            rtsp_transport="invalid",  # type: ignore[arg-type]
+        )
 
 
 def test_relay_runtime_uses_in_process_pipeline_and_sanitizes_failure() -> None:
@@ -69,6 +78,22 @@ def test_relay_runtime_uses_in_process_pipeline_and_sanitizes_failure() -> None:
 
     run(scenario())
 
+    async def tcp_scenario() -> None:
+        runtime = GStreamerRtpRelayRuntime(
+            50001,
+            rtsp_transport="tcp",
+            pipeline_factory=factory,
+        )
+        await runtime.start(source)
+        await runtime.close()
+
+    run(tcp_scenario())
+
+    assert len(pipelines) == 2
+    tcp_description, _, _ = pipelines[1]
+    assert "protocols=tcp" in tcp_description
+
+    pipelines[:] = pipelines[:1]
     assert len(pipelines) == 1
     description, probe_seconds, pipeline = pipelines[0]
     assert source in description

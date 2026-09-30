@@ -21,6 +21,7 @@ from k5vision.media.analytics_overlay_delivery import (
     AnalyticsObservationProvider,
     BoundedAnalyticsOverlayDelivery,
 )
+from k5vision.media.gstreamer_rtp_relay import GStreamerRtpRelayRuntime
 from k5vision.media.live_presentation import BoundedLivePresentationDelivery
 from k5vision.media.mixed_presentation import MixedLiveStream
 from k5vision.media.presentation_runtime import BoundedPresentationRuntime
@@ -429,6 +430,32 @@ def _default_delivery_factory(payload_type: int) -> _LiveDeliveryBoundary:
     )
 
 
+def _local_test_delivery_factory(payload_type: int) -> _LiveDeliveryBoundary:
+    """Reuse the accepted envelope with RTSP/TCP for loopback synthetic delivery."""
+    rtp_delivery = EphemeralRtpDelivery(
+        packet_goal=2048,
+        delivery_timeout_seconds=30.0,
+        consumer_timeout_seconds=4.0,
+        relay_startup_probe_seconds=0.5,
+        relay_factory=lambda port: GStreamerRtpRelayRuntime(
+            port,
+            startup_probe_seconds=0.5,
+            rtsp_transport="tcp",
+        ),
+    )
+    return BoundedLivePresentationDelivery(
+        payload_type,
+        rtp_delivery=rtp_delivery,
+        packet_goal=2048,
+        delivery_timeout_seconds=30.0,
+        packet_consumer_timeout_seconds=4.0,
+        decoder_timeout_seconds=2.0,
+        frame_consumer_timeout_seconds=2.0,
+        cleanup_timeout_seconds=2.0,
+        relay_startup_probe_seconds=0.5,
+    )
+
+
 def _stage_one_presentation_runtime_factory(
     bindings: Sequence[ViewportBinding],
 ) -> BoundedPresentationRuntime:
@@ -599,7 +626,10 @@ def build_environment_operator_runtime(
                 payload_type=payload_type,
                 payload_probe=payload_probe,
             )
-            launcher = WindowsSingleLiveOperatorLauncher(detection_provider=detection_provider)
+            launcher = WindowsSingleLiveOperatorLauncher(
+                delivery_factory=_local_test_delivery_factory,
+                detection_provider=detection_provider,
+            )
         except (TypeError, ValueError):
             return None, None
         return resolver, launcher
