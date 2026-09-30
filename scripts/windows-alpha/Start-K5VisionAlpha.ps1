@@ -123,8 +123,10 @@ metrics: false
 pprof: false
 playback: false
 rtsp: true
-rtspTransports: [tcp]
+rtspTransports: [tcp, udp]
 rtspAddress: 127.0.0.1:8554
+rtpAddress: 127.0.0.1:18000
+rtcpAddress: 127.0.0.1:18001
 rtmp: false
 hls: false
 webrtc: false
@@ -189,44 +191,19 @@ paths:
     $publisherErr = Join-Path $sessionRoot "publisher.stderr.log"
     $publisher = Start-Process -FilePath $gstLaunch -ArgumentList $publisherArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $publisherOut -RedirectStandardError $publisherErr
 
-    $probeArgs = @(
-        "-q",
-        "rtspsrc","location=$source","protocols=tcp","latency=50","tcp-timeout=2000000","teardown-timeout=0",
-        "!","queue",
-        "!","fakesink","num-buffers=1","sync=false","async=false"
-    )
-    $sourceReady = $false
-    $probeExitCode = "not-run"
-    foreach ($attempt in 1..20) {
-        if ($publisher.HasExited -or $server.HasExited) { break }
-        $probeOut = Join-Path $sessionRoot ("probe-{0}.stdout.log" -f $attempt)
-        $probeErr = Join-Path $sessionRoot ("probe-{0}.stderr.log" -f $attempt)
-        $probe = Start-Process -FilePath $gstLaunch -ArgumentList $probeArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $probeOut -RedirectStandardError $probeErr
-        if (-not $probe.WaitForExit(3000)) {
-            Stop-Process -Id $probe.Id -Force -ErrorAction SilentlyContinue
-            Wait-Process -Id $probe.Id -ErrorAction SilentlyContinue
-            $probeExitCode = -1
-        } else {
-            $probeExitCode = $probe.ExitCode
-            if ($probeExitCode -eq 0) {
-                $sourceReady = $true
-                break
-            }
-        }
-        Start-Sleep -Milliseconds 500
-    }
-
-    if (-not $sourceReady) {
+    Write-Host "Synthetic RTSP publisher started; deferring media readback to the K5 native live-source probe."
+    Start-Sleep -Milliseconds 750
+    if ($publisher.HasExited -or $server.HasExited) {
         $publisherState = if ($publisher.HasExited) { "exited:$($publisher.ExitCode)" } else { "running" }
         $serverState = if ($server.HasExited) { "exited:$($server.ExitCode)" } else { "running" }
-        Write-Host ("Synthetic RTSP diagnostics: server={0}, publisher={1}, lastProbe={2}" -f $serverState, $publisherState, $probeExitCode)
+        Write-Host ("Synthetic RTSP diagnostics: server={0}, publisher={1}" -f $serverState, $publisherState)
         if (Test-Path -LiteralPath $publisherErr) {
             $publisherTail = @(Get-Content -LiteralPath $publisherErr -Tail 8 -ErrorAction SilentlyContinue)
             foreach ($line in $publisherTail) { Write-Host ("publisher: " + $line) }
         }
         Stop-Process -Id $publisher.Id -Force -ErrorAction SilentlyContinue
         Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
-        throw "Local synthetic RTSP source failed its bounded readiness probe."
+        throw "Local synthetic RTSP source failed to remain available for K5 probing."
     }
 
     Write-Host "Local synthetic RTSP source PASS."
