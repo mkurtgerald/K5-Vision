@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from k5vision.media.mixed_presentation import MixedPresentationStream
 from k5vision.media.presentation_runtime import (
     BoundedPresentationRuntime,
+    PresentationRuntimeError,
     PresentationRuntimeSnapshot,
     PresentationRuntimeState,
 )
@@ -255,6 +256,12 @@ class BoundedWindowsOperatorRuntime:
             except asyncio.CancelledError:
                 await self._fail_closed()
                 raise
+            except PresentationRuntimeError as exc:
+                await self._fail_closed()
+                raise WindowsOperatorRuntimeError(
+                    WindowsOperatorRuntimeErrorCode.START_FAILURE,
+                    f"operator runtime start failed at {exc.code.value}: {exc}",
+                ) from None
             except Exception:
                 await self._fail_closed()
                 raise WindowsOperatorRuntimeError(
@@ -285,6 +292,14 @@ class BoundedWindowsOperatorRuntime:
             child = await presentation.wait()
         except asyncio.CancelledError:
             raise
+        except PresentationRuntimeError as exc:
+            async with self._lock:
+                if presentation is self._presentation_runtime:
+                    await self._fail_closed()
+            raise WindowsOperatorRuntimeError(
+                WindowsOperatorRuntimeErrorCode.EXECUTION_FAILURE,
+                f"operator runtime execution failed at {exc.code.value}: {exc}",
+            ) from None
         except Exception:
             async with self._lock:
                 if presentation is self._presentation_runtime:
