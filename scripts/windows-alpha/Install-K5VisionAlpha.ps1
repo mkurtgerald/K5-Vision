@@ -65,10 +65,14 @@ $python = Join-Path $venv "Scripts\python.exe"
 & $python -m pip install --upgrade pip
 if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed." }
 $packageUri = "https://github.com/mkurtgerald/K5-Vision/archive/$K5Revision.zip"
-& $python -m pip install $packageUri
+& $python -m pip install --force-reinstall --no-deps $packageUri
 if ($LASTEXITCODE -ne 0) { throw "K5 Vision Alpha installation failed." }
 & $python -m k5vision.cli --version
 if ($LASTEXITCODE -ne 0) { throw "Installed K5 CLI verification failed." }
+$runtimeProbe = "from k5vision.operator_runtime import LOCAL_TEST_SOURCE_ENV; raise SystemExit(0 if LOCAL_TEST_SOURCE_ENV == 'K5_LOCAL_TEST_RTSP_SOURCE' else 1)"
+& $python -c $runtimeProbe
+if ($LASTEXITCODE -ne 0) { throw "Installed K5 runtime does not match the reviewed alpha capabilities." }
+Write-Host "Installed K5 Python runtime capability verification PASS."
 
 $preflightTarget = Join-Path $InstallRoot "Test-K5VisionAlpha.ps1"
 $launcherTarget = Join-Path $InstallRoot "Start-K5VisionAlpha.ps1"
