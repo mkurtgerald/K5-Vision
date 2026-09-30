@@ -430,8 +430,8 @@ def _default_delivery_factory(payload_type: int) -> _LiveDeliveryBoundary:
     )
 
 
-def _local_test_delivery_factory(_payload_type: int) -> _LiveDeliveryBoundary:
-    """Use direct decoded RTSP/TCP frames for loopback synthetic acceptance."""
+def _direct_rtsp_test_delivery_factory(_payload_type: int) -> _LiveDeliveryBoundary:
+    """Use direct decoded RTSP/TCP frames for bounded alpha acceptance."""
     return GStreamerDirectFrameDelivery(
         frame_goal=225,
         delivery_timeout_seconds=25.0,
@@ -611,7 +611,7 @@ def build_environment_operator_runtime(
                 payload_probe=payload_probe,
             )
             launcher = WindowsSingleLiveOperatorLauncher(
-                delivery_factory=_local_test_delivery_factory,
+                delivery_factory=_direct_rtsp_test_delivery_factory,
                 detection_provider=detection_provider,
             )
         except (TypeError, ValueError):
@@ -624,7 +624,9 @@ def build_environment_operator_runtime(
         stream_token = environment.get(STAGE_ONE_STREAM_TOKEN_ENV, _PUBLIC_TEST_STREAM_TOKEN)
         try:
             payload_type = (
-                None if payload_raw is None or not payload_raw.strip() else int(payload_raw)
+                _DEFAULT_PAYLOAD_TYPE
+                if payload_raw is None or not payload_raw.strip()
+                else int(payload_raw)
             )
             resolver = PublicTestSourceResolver(
                 public_source_uri,
@@ -633,7 +635,10 @@ def build_environment_operator_runtime(
                 payload_type=payload_type,
                 payload_probe=payload_probe,
             )
-            launcher = WindowsSingleLiveOperatorLauncher(detection_provider=detection_provider)
+            launcher = WindowsSingleLiveOperatorLauncher(
+                delivery_factory=_direct_rtsp_test_delivery_factory,
+                detection_provider=detection_provider,
+            )
         except (TypeError, ValueError):
             return None, None
         return resolver, launcher
