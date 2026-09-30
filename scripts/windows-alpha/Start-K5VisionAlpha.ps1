@@ -53,6 +53,7 @@ $operatorPassword = New-K5Token
 $sessionToken = $null
 $bootstrap = $null
 $process = $null
+$priorPath = $null
 
 try {
     $env:K5_CONTROL_PLANE_SITE_ID = "alpha-" + [Guid]::NewGuid().ToString("N")
@@ -62,8 +63,8 @@ try {
     $env:K5_CONTROL_PLANE_ADMIN_TOKEN = $adminToken
     $env:K5_GSTREAMER_ROOT = $gstreamerRoot
     $gstreamerBin = Join-Path $gstreamerRoot "bin"
-    $priorPath = $env:PATH
-    $env:PATH = $gstreamerBin + [IO.Path]::PathSeparator + $priorPath
+    $priorPath = [string]$env:PATH
+    $env:PATH = if ([string]::IsNullOrWhiteSpace($priorPath)) { $gstreamerBin } else { $gstreamerBin + [IO.Path]::PathSeparator + $priorPath }
     $env:GST_REGISTRY_1_0 = Join-Path $sessionRoot "gstreamer-registry.bin"
     $env:K5_PUBLIC_TEST_RTSP_SOURCE = $PublicRtspSource
     $env:K5_PUBLIC_TEST_SOURCE_IP = $publicSourceIp
