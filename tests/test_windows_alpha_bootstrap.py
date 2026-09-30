@@ -107,6 +107,8 @@ def test_windows_alpha_defaults_to_verified_local_synthetic_rtsp() -> None:
     assert '"x264enc","speed-preset=ultrafast","tune=zerolatency"' in text
     assert "format=I420" in text
     assert "foreach ($attempt in 1..20)" in text
+    assert '"fakesink","num-buffers=1","sync=false","async=false"' in text
+    assert '"identity","eos-after=1"' not in text
     assert "$probe.WaitForExit(3000)" in text
     assert "Synthetic RTSP diagnostics:" in text
     assert "publisher.stderr.log" in text
