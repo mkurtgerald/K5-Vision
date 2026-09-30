@@ -23,6 +23,14 @@ def test_windows_alpha_installer_is_revision_pinned_and_checkout_free() -> None:
     assert "pip install $repoRoot" not in text
 
 
+def test_windows_alpha_installer_accepts_python_312_without_legacy_launcher() -> None:
+    text = INSTALL.read_text(encoding="utf-8")
+    assert "Get-Command py.exe -ErrorAction SilentlyContinue" in text
+    assert '"python3.12.exe", "python.exe"' in text
+    assert "$pythonCommand = $candidate.Source" in text
+    assert "& $pythonCommand @pythonPrefixArgs -m venv $venv" in text
+
+
 def test_windows_alpha_installer_uses_reviewed_media_provisioner() -> None:
     text = INSTALL.read_text(encoding="utf-8")
     assert "provision-stage03-gstreamer.ps1" in text

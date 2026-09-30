@@ -19,10 +19,32 @@ foreach ($path in @($preflightSource, $launcherSource, $runtimeSource, $provisio
     if (-not (Test-Path -LiteralPath $path)) { throw "Required alpha bootstrap file is missing: $path" }
 }
 
+$pythonCommand = $null
+$pythonPrefixArgs = @()
+
 $py = Get-Command py.exe -ErrorAction SilentlyContinue
-if ($null -eq $py) { throw "Python 3.12 is required." }
-& $py.Source -3.12 -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)"
-if ($LASTEXITCODE -ne 0) { throw "Python 3.12 is required." }
+if ($null -ne $py) {
+    & $py.Source -3.12 -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)"
+    if ($LASTEXITCODE -eq 0) {
+        $pythonCommand = $py.Source
+        $pythonPrefixArgs = @("-3.12")
+    }
+}
+
+if ($null -eq $pythonCommand) {
+    foreach ($candidateName in @("python3.12.exe", "python.exe")) {
+        $candidate = Get-Command $candidateName -ErrorAction SilentlyContinue
+        if ($null -eq $candidate) { continue }
+        & $candidate.Source -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)"
+        if ($LASTEXITCODE -eq 0) {
+            $pythonCommand = $candidate.Source
+            $pythonPrefixArgs = @()
+            break
+        }
+    }
+}
+
+if ($null -eq $pythonCommand) { throw "Python 3.12 is required." }
 
 $priorRunnerTemp = $env:RUNNER_TEMP
 try {
@@ -37,7 +59,7 @@ finally {
 
 New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
 $venv = Join-Path $InstallRoot ".venv"
-& $py.Source -3.12 -m venv $venv
+& $pythonCommand @pythonPrefixArgs -m venv $venv
 if ($LASTEXITCODE -ne 0) { throw "Virtual environment creation failed." }
 $python = Join-Path $venv "Scripts\python.exe"
 & $python -m pip install --upgrade pip
