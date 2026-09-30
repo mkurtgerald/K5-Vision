@@ -253,6 +253,7 @@ try {
     $streamToken = $null
     $deviceName = $null
     $deviceTags = $null
+    $payloadType = $null
 
     if ([string]::IsNullOrWhiteSpace($PublicRtspSource)) {
         $synthetic = Start-K5SyntheticSource
@@ -262,6 +263,7 @@ try {
         $streamToken = $synthetic.StreamToken
         $deviceName = $synthetic.DeviceName
         $deviceTags = $synthetic.Tags
+        $payloadType = "96"
         $mediaMtxProcess = $synthetic.ServerProcess
         $publisherProcess = $synthetic.PublisherProcess
         $env:K5_LOCAL_TEST_RTSP_SOURCE = $sourceUri
@@ -300,7 +302,11 @@ try {
     $env:K5_GSTREAMER_ROOT = $gstreamerRoot
     $env:GST_REGISTRY_1_0 = Join-Path $sessionRoot "gstreamer-registry.bin"
     $env:K5_OPERATOR_STREAM_TOKEN = $streamToken
-    Remove-Item Env:K5_OPERATOR_RTP_PAYLOAD_TYPE -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace([string]$payloadType)) {
+        Remove-Item Env:K5_OPERATOR_RTP_PAYLOAD_TYPE -ErrorAction SilentlyContinue
+    } else {
+        $env:K5_OPERATOR_RTP_PAYLOAD_TYPE = $payloadType
+    }
     Remove-Item Env:K5_STAGE03_SOURCE -ErrorAction SilentlyContinue
     Remove-Item Env:K5_STAGE03_CAM_CRED -ErrorAction SilentlyContinue
     Remove-Item Env:K5_STAGE_ONE_RECORDING_ROOT -ErrorAction SilentlyContinue

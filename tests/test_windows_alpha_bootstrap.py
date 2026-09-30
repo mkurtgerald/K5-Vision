@@ -107,6 +107,8 @@ def test_windows_alpha_defaults_to_verified_local_synthetic_rtsp() -> None:
     assert "rtspclientsink" in text
     assert "rtsp://127.0.0.1:8554/k5synthetic" in text
     assert "K5_LOCAL_TEST_RTSP_SOURCE" in text
+    assert '$payloadType = "96"' in text
+    assert "$env:K5_OPERATOR_RTP_PAYLOAD_TYPE = $payloadType" in text
     assert '"alpha-local-synthetic","ephemeral","non-recording"' in text
     assert "Local synthetic RTSP publisher PASS; K5 native media probe pending." in text
     assert '"x264enc","speed-preset=ultrafast","tune=zerolatency"' in text
