@@ -292,3 +292,53 @@ def test_concurrency_budget_rejects_excess_without_resolving_second_source(
 
     asyncio.run(scenario())
     registry.close()
+
+
+def test_resolved_hostname_source_may_bind_to_enrolled_endpoint_ip(tmp_path: object) -> None:
+    registry, device = _registry(tmp_path)
+    source = ResolvedLiveSource(
+        "rtsp://stream.example.test/live",
+        96,
+        endpoint_ip="192.0.2.10",
+    )
+    resolver = _Resolver(source)
+    launcher = _Launcher()
+    coordinator = BoundedOperatorLaunchCoordinator(registry, resolver, launcher)
+
+    async def scenario() -> None:
+        receipt = await coordinator.launch(
+            _principal(),
+            OperatorLaunchRequest(
+                device_id=device.id,  # type: ignore[attr-defined]
+                stream_token="public-test",
+            ),
+        )
+        assert receipt.completed is True
+        assert launcher.sources == [source]
+
+    asyncio.run(scenario())
+    registry.close()
+
+
+def test_resolved_hostname_source_rejects_wrong_endpoint_binding(tmp_path: object) -> None:
+    registry, device = _registry(tmp_path)
+    source = ResolvedLiveSource(
+        "rtsp://stream.example.test/live",
+        96,
+        endpoint_ip="198.51.100.77",
+    )
+    coordinator = BoundedOperatorLaunchCoordinator(registry, _Resolver(source), _Launcher())
+
+    async def scenario() -> None:
+        with pytest.raises(OperatorLaunchError) as caught:
+            await coordinator.launch(
+                _principal(),
+                OperatorLaunchRequest(
+                    device_id=device.id,  # type: ignore[attr-defined]
+                    stream_token="public-test",
+                ),
+            )
+        assert caught.value.code == OperatorLaunchErrorCode.SOURCE_SCOPE_MISMATCH
+
+    asyncio.run(scenario())
+    registry.close()
