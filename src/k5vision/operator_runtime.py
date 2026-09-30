@@ -433,8 +433,8 @@ def _default_delivery_factory(payload_type: int) -> _LiveDeliveryBoundary:
 def _local_test_delivery_factory(_payload_type: int) -> _LiveDeliveryBoundary:
     """Use direct decoded RTSP/TCP frames for loopback synthetic acceptance."""
     return GStreamerDirectFrameDelivery(
-        frame_goal=60,
-        delivery_timeout_seconds=15.0,
+        frame_goal=225,
+        delivery_timeout_seconds=25.0,
         consumer_timeout_seconds=2.0,
         startup_probe_ms=500,
     )
