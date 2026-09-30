@@ -62,7 +62,10 @@ def _runtime_root() -> pathlib.Path:  # pragma: no cover
     return root
 
 
-def _find_runtime_library(  # pragma: no cover\n    bin_root: pathlib.Path, names: tuple[str, ...]\n) -> pathlib.Path:
+def _find_runtime_library(
+    bin_root: pathlib.Path,
+    names: tuple[str, ...],
+) -> pathlib.Path:  # pragma: no cover
     for name in names:
         candidate = bin_root / name
         if candidate.is_file():
@@ -157,7 +160,8 @@ class _CtypesRtpPullBackend:  # pragma: no cover
         if not sink:
             raise RuntimeError("direct RTSP RTP sink is unavailable")
         self._sink = ctypes.c_void_p(sink)
-        if core.gst_element_set_state(self._pipeline, _GST_STATE_PLAYING) == _GST_STATE_CHANGE_FAILURE:
+        state_result = core.gst_element_set_state(self._pipeline, _GST_STATE_PLAYING)
+        if state_result == _GST_STATE_CHANGE_FAILURE:
             raise RuntimeError("direct RTSP RTP pipeline failed to start")
         current = ctypes.c_int()
         pending = ctypes.c_int()
@@ -234,7 +238,7 @@ def _default_backend_factory(
     source_uri: str,
     max_packet_bytes: int,
     startup_probe_ms: int,
-) -> _RtpPullBackend:
+) -> _RtpPullBackend:  # pragma: no cover
     return _CtypesRtpPullBackend(source_uri, max_packet_bytes, startup_probe_ms)
 
 
