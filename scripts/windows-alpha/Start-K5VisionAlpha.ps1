@@ -61,6 +61,9 @@ try {
     $env:K5_CONTROL_PLANE_TOKEN = $writeToken
     $env:K5_CONTROL_PLANE_ADMIN_TOKEN = $adminToken
     $env:K5_GSTREAMER_ROOT = $gstreamerRoot
+    $gstreamerBin = Join-Path $gstreamerRoot "bin"
+    $priorPath = $env:PATH
+    $env:PATH = $gstreamerBin + [IO.Path]::PathSeparator + $priorPath
     $env:GST_REGISTRY_1_0 = Join-Path $sessionRoot "gstreamer-registry.bin"
     $env:K5_PUBLIC_TEST_RTSP_SOURCE = $PublicRtspSource
     $env:K5_PUBLIC_TEST_SOURCE_IP = $publicSourceIp
@@ -174,5 +177,6 @@ finally {
     $bootstrap = $null
     $writeToken = $null
     $adminToken = $null
+    if ($null -ne $priorPath) { $env:PATH = $priorPath }
     $publicSourceIp = $null
 }
