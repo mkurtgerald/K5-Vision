@@ -7,6 +7,7 @@ import pytest
 import k5vision.operator_runtime as operator_runtime_module
 from k5vision.domain.devices import Device, DeviceProtocol
 from k5vision.media.gstreamer_direct_frame_delivery import GStreamerDirectFrameDelivery
+from k5vision.operator_launch import OperatorLaunchError, OperatorLaunchErrorCode
 from k5vision.operator_runtime import (
     LocalTestSourceResolver,
     PublicTestSourceResolver,
