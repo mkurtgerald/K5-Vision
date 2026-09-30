@@ -14,7 +14,7 @@ The bootstrap:
 - verifies the installed revision;
 - removes its temporary bootstrap files.
 
-Launching the desktop shortcut runs the current **non-recording public RTSP operator test** through the normal K5 authentication, device-enrollment, and live-operator APIs. Public test media is not retained.
+Launching the desktop shortcut now defaults to a **non-recording local synthetic RTSP operator test** generated entirely on the Windows host. K5 uses the normal authentication, device-enrollment, and live-operator APIs; the generated test media and temporary session state are not retained. A credential-free public RTSP URL can still be supplied explicitly as an override.
 
 This is still an alpha bootstrap, not the final signed MSI/EXE installer.
 
