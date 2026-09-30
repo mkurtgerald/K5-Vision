@@ -273,12 +273,12 @@ class BoundedMixedPresentation:
             snapshot = await stream.delivery.run(stream.source_uri, frame_consumer)
         except asyncio.CancelledError:
             raise
-        except LivePresentationError:
+        except LivePresentationError as exc:
             if boundary_error is not None:
                 raise boundary_error from None
             raise MixedPresentationError(
                 MixedPresentationErrorCode.STREAM_FAILURE,
-                "mixed live presentation stream failed",
+                f"mixed live presentation stream failed at {exc.code.value}",
             ) from None
         except Exception:
             if boundary_error is not None:
