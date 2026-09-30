@@ -142,13 +142,13 @@ class BoundedPresentationController:
                     self._state = PresentationControllerState.STOPPED
                 self._task = None
                 return self.snapshot
-        except PresentationSessionError:
+        except PresentationSessionError as exc:
             async with self._lock:
                 self._state = PresentationControllerState.FAILED
                 self._task = None
             raise PresentationControllerError(
                 PresentationControllerErrorCode.SESSION_FAILURE,
-                "presentation controller session failed",
+                f"presentation controller session failed at {exc.code.value}: {exc}",
             ) from None
         except Exception:
             async with self._lock:
