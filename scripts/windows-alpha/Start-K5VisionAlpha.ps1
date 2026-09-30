@@ -179,7 +179,7 @@ paths:
     $source = "rtsp://127.0.0.1:8554/k5synthetic"
     $publisherArgs = @(
         "-q",
-        "videotestsrc","is-live=true","pattern=smpte",
+        "videotestsrc","is-live=true","pattern=ball","animation-mode=wall-time","flip=true",
         "!","video/x-raw,width=1280,height=720,format=I420,framerate=15/1",
         "!","videoconvert",
         "!","x264enc","speed-preset=ultrafast","tune=zerolatency","bitrate=2000","key-int-max=30",
@@ -385,6 +385,10 @@ try {
     Write-Host "No test-stream recording or retained media was created."
     if ($ExitAfterPublicTest) {
         Write-Host "Exiting after one bounded alpha acceptance run."
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($PublicRtspSource)) {
+        Write-Host "Synthetic visual acceptance run complete. Swagger will not be opened automatically."
         return
     }
     Start-Process "$baseUri/docs"
