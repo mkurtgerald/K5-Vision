@@ -174,3 +174,22 @@ def test_windows_alpha_test_does_not_retain_media_or_private_camera_config() -> 
     assert "Remove-Item Env:K5_STAGE03_CAM_CRED" in text
     assert "$env:K5_STAGE03_SOURCE =" not in text
     assert "$env:K5_STAGE03_CAM_CRED =" not in text
+
+
+def test_windows_alpha_installer_cleans_stale_venv_process_before_rebuild() -> None:
+    text = INSTALL.read_text(encoding="utf-8")
+    assert "Get-CimInstance Win32_Process" in text
+    assert "ExecutablePath" in text
+    assert "Stopping stale K5 Vision Alpha runtime process" in text
+    assert "Stop-Process -Id ([int]$staleProcess.ProcessId) -Force" in text
+    assert "Remove-Item -LiteralPath $venv -Recurse -Force" in text
+    assert "Existing K5 Vision Alpha runtime is still locked." in text
+
+
+def test_windows_alpha_launcher_rejects_occupied_control_plane_port() -> None:
+    text = START.read_text(encoding="utf-8")
+    guard = 'Test-K5TcpListener "127.0.0.1" $Port'
+    assert guard in text
+    assert "K5 Vision Alpha control-plane port $Port is already in use." in text
+    assert text.index(guard) < text.index('$arguments = @("-m","k5vision.cli","serve"')
+    assert '$health.status -eq "ok" -and -not $process.HasExited' in text
