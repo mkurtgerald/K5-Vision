@@ -104,6 +104,9 @@ def test_windows_alpha_defaults_to_verified_local_synthetic_rtsp() -> None:
     assert "rtpAddress: 127.0.0.1:18000" in text
     assert "rtcpAddress: 127.0.0.1:18001" in text
     assert "videotestsrc" in text
+    assert '"pattern=ball"' in text
+    assert '"animation-mode=wall-time"' in text
+    assert '"flip=true"' in text
     assert "rtspclientsink" in text
     assert "rtsp://127.0.0.1:8554/k5synthetic" in text
     assert "K5_LOCAL_TEST_RTSP_SOURCE" in text
@@ -118,6 +121,7 @@ def test_windows_alpha_defaults_to_verified_local_synthetic_rtsp() -> None:
     assert "deferring media readback to the K5 native live-source probe." in text
     assert "Synthetic RTSP diagnostics:" in text
     assert "publisher.stderr.log" in text
+    assert "Synthetic visual acceptance run complete. Swagger will not be opened automatically." in text
     assert 'Test-K5TcpListener "127.0.0.1" 8554' in text
     assert "Local synthetic RTSP port 8554 is already in use." in text
     assert "source: publisher" not in text
