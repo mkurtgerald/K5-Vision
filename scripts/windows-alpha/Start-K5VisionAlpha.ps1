@@ -135,6 +135,23 @@ paths:
 "@
     [IO.File]::WriteAllText($configPath, $config)
 
+    $mediaMtxVersion = @(& $mediaMtx --version 2>&1)
+    if ($LASTEXITCODE -ne 0 -or -not (($mediaMtxVersion -join " ").Contains($MediaMtxVersion))) {
+        foreach ($line in $mediaMtxVersion) { Write-Host ("mediamtx-version: " + $line) }
+        throw "Pinned MediaMTX executable failed its version probe."
+    }
+
+    $validation = @(& $mediaMtx --validate-conf $configPath 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        foreach ($line in $validation) { Write-Host ("mediamtx-validate: " + $line) }
+        throw "Local synthetic RTSP MediaMTX configuration is invalid."
+    }
+    foreach ($line in $validation) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$line)) {
+            Write-Host ("mediamtx-validate: " + $line)
+        }
+    }
+
     if (Test-K5TcpListener "127.0.0.1" 8554) {
         throw "Local synthetic RTSP port 8554 is already in use."
     }
