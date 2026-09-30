@@ -29,6 +29,7 @@ from k5vision.media.viewport_dispatch import ViewportBinding
 from k5vision.media.viewport_geometry import ViewportGeometry, ViewportLayout, ViewportPlacement
 from k5vision.media.windows_operator_runtime import (
     BoundedWindowsOperatorRuntime,
+    WindowsOperatorRuntimeError,
     WindowsOperatorRuntimeSnapshot,
     WindowsOperatorRuntimeState,
 )
@@ -543,6 +544,12 @@ class WindowsSingleLiveOperatorLauncher(OperatorLauncher):
         except OperatorLaunchError as exc:
             primary_error = exc
             raise
+        except WindowsOperatorRuntimeError as exc:
+            primary_error = exc
+            raise OperatorLaunchError(
+                OperatorLaunchErrorCode.LAUNCH_FAILURE,
+                f"live operator runtime failed at {exc.code.value}: {exc}",
+            ) from None
         except Exception as exc:
             primary_error = exc
             raise OperatorLaunchError(

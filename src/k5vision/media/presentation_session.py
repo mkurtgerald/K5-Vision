@@ -166,7 +166,7 @@ class BoundedPresentationSession:
                 finally:
                     self._state = PresentationSessionState.CANCELLED
                 raise
-            except MixedPresentationError:
+            except MixedPresentationError as exc:
                 try:
                     await self._close_dispatcher()
                 except PresentationSessionError:
@@ -175,7 +175,7 @@ class BoundedPresentationSession:
                 self._state = PresentationSessionState.FAILED
                 raise PresentationSessionError(
                     PresentationSessionErrorCode.PRESENTATION_FAILURE,
-                    "presentation session failed",
+                    f"presentation session failed at {exc.code.value}: {exc}",
                 ) from None
             except Exception:
                 try:

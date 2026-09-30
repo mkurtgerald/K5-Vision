@@ -262,7 +262,7 @@ class BoundedPresentationRuntime:
             )
         return PresentationRuntimeError(
             PresentationRuntimeErrorCode.CONTROL_FAILURE,
-            "presentation runtime control operation failed",
+            f"presentation runtime control operation failed at {exc.code.value}: {exc}",
         )
 
     async def start(
