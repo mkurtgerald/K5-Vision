@@ -247,6 +247,10 @@ try {
         $gstreamerBin + [IO.Path]::PathSeparator + $priorPath
     }
 
+    if (Test-K5TcpListener "127.0.0.1" $Port) {
+        throw "K5 Vision Alpha control-plane port $Port is already in use. Close any previous K5 Vision Alpha window or reinstall to clean the stale runtime."
+    }
+
     $sourceUri = $null
     $sourceIp = $null
     $rtspPort = $null
@@ -321,7 +325,7 @@ try {
         if ($process.HasExited) { break }
         try {
             $health = Invoke-RestMethod -Method Get -Uri "$baseUri/api/v1/health" -TimeoutSec 1
-            if ($health.status -eq "ok") { $ready = $true; break }
+            if ($health.status -eq "ok" -and -not $process.HasExited) { $ready = $true; break }
         } catch {
             Start-Sleep -Milliseconds 500
         }
