@@ -97,19 +97,20 @@ def test_windows_alpha_defaults_to_verified_local_synthetic_rtsp() -> None:
     assert "mediamtx_v$MediaMtxVersion" in text
     assert "Get-FileHash" in text
     assert "rtspAddress: 127.0.0.1:8554" in text
-    assert "rtspTransports: [tcp]" in text
+    assert "rtspTransports: [tcp, udp]" in text
+    assert "rtpAddress: 127.0.0.1:18000" in text
+    assert "rtcpAddress: 127.0.0.1:18001" in text
     assert "videotestsrc" in text
     assert "rtspclientsink" in text
     assert "rtsp://127.0.0.1:8554/k5synthetic" in text
     assert "K5_LOCAL_TEST_RTSP_SOURCE" in text
     assert '"alpha-local-synthetic","ephemeral","non-recording"' in text
-    assert "Local synthetic RTSP source PASS." in text
+    assert "Local synthetic RTSP publisher PASS; K5 native media probe pending." in text
     assert '"x264enc","speed-preset=ultrafast","tune=zerolatency"' in text
     assert "format=I420" in text
-    assert "foreach ($attempt in 1..20)" in text
-    assert '"fakesink","num-buffers=1","sync=false","async=false"' in text
     assert '"identity","eos-after=1"' not in text
-    assert "$probe.WaitForExit(3000)" in text
+    assert "probe.WaitForExit" not in text
+    assert "deferring media readback to the K5 native live-source probe." in text
     assert "Synthetic RTSP diagnostics:" in text
     assert "publisher.stderr.log" in text
     assert 'Test-K5TcpListener "127.0.0.1" 8554' in text
