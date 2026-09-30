@@ -206,7 +206,7 @@ paths:
         throw "Local synthetic RTSP source failed to remain available for K5 probing."
     }
 
-    Write-Host "Local synthetic RTSP source PASS."
+    Write-Host "Local synthetic RTSP publisher PASS; K5 native media probe pending."
     return @{
         Uri = $source
         Ip = "127.0.0.1"
