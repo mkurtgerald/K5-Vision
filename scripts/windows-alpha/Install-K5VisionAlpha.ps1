@@ -2,7 +2,7 @@
 param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "K5VisionAlpha"),
     [string]$GStreamerVersion = "1.28.7",
-    [string]$K5Revision = "1b5201bf7229e6db279964d833ad4a1daff2946f",
+    [string]$K5Revision = "611c1ac132bf0d1dcbea90e0a7843a4cc014894e",
     [switch]$SkipDesktopShortcut
 )
 $ErrorActionPreference = "Stop"
