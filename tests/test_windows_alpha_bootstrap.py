@@ -104,6 +104,13 @@ def test_windows_alpha_defaults_to_verified_local_synthetic_rtsp() -> None:
     assert "K5_LOCAL_TEST_RTSP_SOURCE" in text
     assert '"alpha-local-synthetic","ephemeral","non-recording"' in text
     assert "Local synthetic RTSP source PASS." in text
+    assert '"x264enc","speed-preset=ultrafast","tune=zerolatency"' in text
+    assert "format=I420" in text
+    assert "foreach ($attempt in 1..20)" in text
+    assert "$probe.WaitForExit(3000)" in text
+    assert "Synthetic RTSP diagnostics:" in text
+    assert "publisher.stderr.log" in text
+    assert "mediamtx.stderr.log" in text
 
 
 def test_windows_alpha_launches_authenticated_operator_without_recording() -> None:

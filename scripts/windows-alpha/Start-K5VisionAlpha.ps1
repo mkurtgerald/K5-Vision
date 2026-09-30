@@ -108,21 +108,10 @@ function Get-K5MediaMtx {
 }
 
 function Start-K5SyntheticSource {
-    foreach ($element in @("videotestsrc","videoconvert","h264parse","rtspclientsink")) {
+    foreach ($element in @("videotestsrc","videoconvert","x264enc","h264parse","rtspclientsink","rtspsrc","queue","identity","fakesink")) {
         if (-not (Test-K5GStreamerElement $element)) {
             throw "Reviewed GStreamer runtime is missing required synthetic test element: $element"
         }
-    }
-
-    $encoder = $null
-    foreach ($candidate in @("x264enc","mfh264enc","openh264enc","avenc_h264")) {
-        if (Test-K5GStreamerElement $candidate) {
-            $encoder = $candidate
-            break
-        }
-    }
-    if ($null -eq $encoder) {
-        throw "Reviewed GStreamer runtime does not contain a supported H.264 encoder."
     }
 
     $mediaMtx = Get-K5MediaMtx
@@ -147,7 +136,9 @@ paths:
 "@
     [IO.File]::WriteAllText($configPath, $config)
 
-    $server = Start-Process -FilePath $mediaMtx -ArgumentList @($configPath) -PassThru -WindowStyle Hidden
+    $serverOut = Join-Path $sessionRoot "mediamtx.stdout.log"
+    $serverErr = Join-Path $sessionRoot "mediamtx.stderr.log"
+    $server = Start-Process -FilePath $mediaMtx -ArgumentList @($configPath) -PassThru -WindowStyle Hidden -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr
     $serverReady = $false
     foreach ($attempt in 1..40) {
         if ($server.HasExited) { break }
@@ -166,30 +157,58 @@ paths:
     $publisherArgs = @(
         "-q",
         "videotestsrc","is-live=true","pattern=smpte",
-        "!","video/x-raw,width=1280,height=720,framerate=15/1",
+        "!","video/x-raw,width=1280,height=720,format=I420,framerate=15/1",
         "!","videoconvert",
-        "!",$encoder,
+        "!","x264enc","speed-preset=ultrafast","tune=zerolatency","bitrate=2000","key-int-max=30",
         "!","video/x-h264,profile=baseline",
         "!","h264parse","config-interval=1",
         "!","rtspclientsink","protocols=tcp","location=$source"
     )
-    $publisher = Start-Process -FilePath $gstLaunch -ArgumentList $publisherArgs -PassThru -WindowStyle Hidden
-    Start-Sleep -Seconds 2
-    if ($publisher.HasExited) {
-        Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
-        throw "Local synthetic RTSP publisher failed to start."
-    }
+    $publisherOut = Join-Path $sessionRoot "publisher.stdout.log"
+    $publisherErr = Join-Path $sessionRoot "publisher.stderr.log"
+    $publisher = Start-Process -FilePath $gstLaunch -ArgumentList $publisherArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $publisherOut -RedirectStandardError $publisherErr
 
     $probeArgs = @(
         "-q",
-        "rtspsrc","location=$source","protocols=tcp","latency=50","tcp-timeout=5000000","teardown-timeout=0",
+        "rtspsrc","location=$source","protocols=tcp","latency=50","tcp-timeout=2000000","teardown-timeout=0",
         "!","queue","!","identity","eos-after=1","!","fakesink","sync=false"
     )
-    $probe = Start-Process -FilePath $gstLaunch -ArgumentList $probeArgs -Wait -PassThru -WindowStyle Hidden
-    if ($probe.ExitCode -ne 0) {
+    $sourceReady = $false
+    $probeExitCode = $null
+    foreach ($attempt in 1..20) {
+        if ($publisher.HasExited -or $server.HasExited) { break }
+        $probeOut = Join-Path $sessionRoot ("probe-{0}.stdout.log" -f $attempt)
+        $probeErr = Join-Path $sessionRoot ("probe-{0}.stderr.log" -f $attempt)
+        $probe = Start-Process -FilePath $gstLaunch -ArgumentList $probeArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $probeOut -RedirectStandardError $probeErr
+        if (-not $probe.WaitForExit(3000)) {
+            Stop-Process -Id $probe.Id -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $probe.Id -ErrorAction SilentlyContinue
+            $probeExitCode = -1
+        } else {
+            $probeExitCode = $probe.ExitCode
+            if ($probeExitCode -eq 0) {
+                $sourceReady = $true
+                break
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    if (-not $sourceReady) {
+        $publisherState = if ($publisher.HasExited) { "exited:$($publisher.ExitCode)" } else { "running" }
+        $serverState = if ($server.HasExited) { "exited:$($server.ExitCode)" } else { "running" }
+        Write-Host ("Synthetic RTSP diagnostics: server={0}, publisher={1}, lastProbe={2}" -f $serverState, $publisherState, $probeExitCode)
+        if (Test-Path -LiteralPath $publisherErr) {
+            $publisherTail = @(Get-Content -LiteralPath $publisherErr -Tail 8 -ErrorAction SilentlyContinue)
+            foreach ($line in $publisherTail) { Write-Host ("publisher: " + $line) }
+        }
+        if (Test-Path -LiteralPath $serverErr) {
+            $serverTail = @(Get-Content -LiteralPath $serverErr -Tail 8 -ErrorAction SilentlyContinue)
+            foreach ($line in $serverTail) { Write-Host ("mediamtx: " + $line) }
+        }
         Stop-Process -Id $publisher.Id -Force -ErrorAction SilentlyContinue
         Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
-        throw "Local synthetic RTSP source failed its readback probe."
+        throw "Local synthetic RTSP source failed its bounded readiness probe."
     }
 
     Write-Host "Local synthetic RTSP source PASS."
