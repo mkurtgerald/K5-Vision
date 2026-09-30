@@ -120,8 +120,18 @@ def test_windows_alpha_defaults_to_verified_local_synthetic_rtsp() -> None:
     assert 'Write-Host "Starting local MediaMTX RTSP server..."' in text
     assert "Start-Process -FilePath $mediaMtx" in text
     assert "-PassThru -NoNewWindow" in text
-    assert "-RedirectStandardOutput" not in text.split("$server = Start-Process -FilePath $mediaMtx", 1)[1].split("$serverReady", 1)[0]
-    assert "-WindowStyle Hidden" not in text.split("$server = Start-Process -FilePath $mediaMtx", 1)[1].split("$serverReady", 1)[0]
+    assert (
+        "-RedirectStandardOutput"
+        not in text.split("$server = Start-Process -FilePath $mediaMtx", 1)[1].split(
+            "$serverReady", 1
+        )[0]
+    )
+    assert (
+        "-WindowStyle Hidden"
+        not in text.split("$server = Start-Process -FilePath $mediaMtx", 1)[1].split(
+            "$serverReady", 1
+        )[0]
+    )
 
 
 def test_windows_alpha_launches_authenticated_operator_without_recording() -> None:
