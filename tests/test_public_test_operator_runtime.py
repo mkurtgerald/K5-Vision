@@ -148,6 +148,11 @@ def test_local_test_environment_builder_is_mutually_exclusive() -> None:
 
     assert isinstance(resolver, LocalTestSourceResolver)
     assert isinstance(launcher, WindowsSingleLiveOperatorLauncher)
+    delivery = launcher._delivery_factory(96)
+    relay_factory = delivery._rtp_delivery._relay_factory
+    assert relay_factory is not None
+    relay = relay_factory(50000)
+    assert relay._rtsp_transport == "tcp"
 
     resolver, launcher = build_environment_operator_runtime(
         {
