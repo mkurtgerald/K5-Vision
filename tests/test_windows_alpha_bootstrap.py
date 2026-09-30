@@ -21,6 +21,9 @@ def test_windows_alpha_installer_is_revision_pinned_and_checkout_free() -> None:
     assert "https://github.com/mkurtgerald/K5-Vision/archive/$K5Revision.zip" in text
     assert "K5Revision -notmatch '^[0-9a-fA-F]{40}$'" in text
     assert "pip install $repoRoot" not in text
+    assert "-m pip install --force-reinstall --no-deps $packageUri" in text
+    assert "LOCAL_TEST_SOURCE_ENV" in text
+    assert "Installed K5 Python runtime capability verification PASS." in text
 
 
 def test_windows_alpha_installer_accepts_python_312_without_legacy_launcher() -> None:
