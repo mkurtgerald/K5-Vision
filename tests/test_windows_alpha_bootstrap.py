@@ -195,7 +195,6 @@ def test_windows_alpha_launcher_rejects_occupied_control_plane_port() -> None:
     assert '$health.status -eq "ok" -and -not $process.HasExited' in text
 
 
-
 def test_windows_alpha_installer_installs_reviewed_runtime_dependencies() -> None:
     text = INSTALL.read_text(encoding="utf-8")
     requirements = ALPHA / "runtime-requirements.txt"
