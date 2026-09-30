@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import enum
 from dataclasses import dataclass
+from ipaddress import ip_address
 from typing import Annotated, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -108,12 +109,19 @@ class ResolvedLiveSource:
 
     source_uri: str
     payload_type: int
+    endpoint_ip: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_uri, str) or not self.source_uri.strip():
             raise ValueError("resolved live source is invalid")
         if isinstance(self.payload_type, bool) or not 96 <= self.payload_type <= 127:
             raise ValueError("resolved live source payload type is invalid")
+        if self.endpoint_ip is not None:
+            try:
+                normalized_endpoint = str(ip_address(self.endpoint_ip))
+            except ValueError as exc:
+                raise ValueError("resolved live source endpoint is invalid") from exc
+            object.__setattr__(self, "endpoint_ip", normalized_endpoint)
 
 
 class OperatorSourceResolver(Protocol):
@@ -205,11 +213,18 @@ class BoundedOperatorLaunchCoordinator:
         except ValueError:
             source_host = None
             parsed = None
+        device_host = str(device.host).casefold()
+        source_host_matches = bool(
+            source_host is not None and source_host.casefold() == device_host
+        )
+        endpoint_matches = bool(
+            source.endpoint_ip is not None and source.endpoint_ip.casefold() == device_host
+        )
         if (
             parsed is None
             or parsed.scheme.casefold() not in {"rtsp", "rtsps"}
             or source_host is None
-            or source_host.casefold() != str(device.host).casefold()
+            or not (source_host_matches or endpoint_matches)
         ):
             raise OperatorLaunchError(
                 OperatorLaunchErrorCode.SOURCE_SCOPE_MISMATCH,
