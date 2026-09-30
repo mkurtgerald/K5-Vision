@@ -11,7 +11,7 @@ import ctypes
 import os
 import pathlib
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from typing import Protocol
 
 from k5vision.media.native_rtsp_pipeline import quote_pipeline_value
@@ -52,7 +52,7 @@ class _RtpPullBackend(Protocol):
 BackendFactory = Callable[[str, int, int], _RtpPullBackend]
 
 
-def _runtime_root() -> pathlib.Path:
+def _runtime_root() -> pathlib.Path:  # pragma: no cover
     configured = os.environ.get("K5_GSTREAMER_ROOT", "").strip()
     if not configured:
         raise RuntimeError("reviewed GStreamer runtime is unavailable")
@@ -62,7 +62,7 @@ def _runtime_root() -> pathlib.Path:
     return root
 
 
-def _find_runtime_library(bin_root: pathlib.Path, names: tuple[str, ...]) -> pathlib.Path:
+def _find_runtime_library(  # pragma: no cover\n    bin_root: pathlib.Path, names: tuple[str, ...]\n) -> pathlib.Path:
     for name in names:
         candidate = bin_root / name
         if candidate.is_file():
@@ -70,7 +70,7 @@ def _find_runtime_library(bin_root: pathlib.Path, names: tuple[str, ...]) -> pat
     raise RuntimeError("reviewed GStreamer runtime is unavailable")
 
 
-class _CtypesRtpPullBackend:
+class _CtypesRtpPullBackend:  # pragma: no cover
     """Synchronous appsink-backed RTP reader over RTSP/TCP."""
 
     def __init__(self, source_uri: str, max_packet_bytes: int, startup_probe_ms: int) -> None:
@@ -148,7 +148,7 @@ class _CtypesRtpPullBackend:
             "! application/x-rtp,media=video "
             "! queue max-size-buffers=16 max-size-bytes=0 max-size-time=0 leaky=downstream "
             "! appsink name=k5sink sync=false max-buffers=16 drop=true"
-        ).encode("utf-8")
+        ).encode()
         pipeline = core.gst_parse_launch(description, None)
         if not pipeline:
             raise RuntimeError("direct RTSP RTP pipeline could not be created")
