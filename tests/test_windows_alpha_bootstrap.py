@@ -111,6 +111,10 @@ def test_windows_alpha_defaults_to_verified_local_synthetic_rtsp() -> None:
     assert "Synthetic RTSP diagnostics:" in text
     assert "publisher.stderr.log" in text
     assert "mediamtx.stderr.log" in text
+    assert "mediamtx.stdout.log" in text
+    assert 'Test-K5TcpListener "127.0.0.1" 8554' in text
+    assert "Local synthetic RTSP port 8554 is already in use." in text
+    assert "source: publisher" not in text
 
 
 def test_windows_alpha_launches_authenticated_operator_without_recording() -> None:
