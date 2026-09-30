@@ -15,10 +15,10 @@ from collections.abc import Callable
 from typing import Protocol
 
 from k5vision.media.gstreamer_playback_decoder import (
-    NativePlaybackDecoderError,
-    NativePlaybackDecoderErrorCode,
     _GST_STATE_CHANGE_FAILURE,
     _GST_STATE_PLAYING,
+    NativePlaybackDecoderError,
+    NativePlaybackDecoderErrorCode,
 )
 from k5vision.media.live_presentation import (
     LivePresentationError,
