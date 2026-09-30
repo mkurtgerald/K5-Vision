@@ -192,10 +192,11 @@ paths:
     $probeArgs = @(
         "-q",
         "rtspsrc","location=$source","protocols=tcp","latency=50","tcp-timeout=2000000","teardown-timeout=0",
-        "!","queue","!","identity","eos-after=1","!","fakesink","sync=false"
+        "!","queue",
+        "!","fakesink","num-buffers=1","sync=false","async=false"
     )
     $sourceReady = $false
-    $probeExitCode = $null
+    $probeExitCode = "not-run"
     foreach ($attempt in 1..20) {
         if ($publisher.HasExited -or $server.HasExited) { break }
         $probeOut = Join-Path $sessionRoot ("probe-{0}.stdout.log" -f $attempt)
