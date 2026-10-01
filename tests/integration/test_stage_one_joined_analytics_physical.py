@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -18,7 +19,7 @@ import pytest
 
 from k5vision.media.live_presentation import LivePresentationSnapshot, LivePresentationState
 from k5vision.media.presentation_frame import PixelFormat, PresentationVideoFrame
-from k5vision.operator_launch import ResolvedLiveSource
+from k5vision.operator_launch import OperatorLaunchMetrics, ResolvedLiveSource
 from k5vision.operator_runtime import WindowsSingleLiveOperatorLauncher
 
 pytestmark = pytest.mark.skipif(
@@ -27,6 +28,45 @@ pytestmark = pytest.mark.skipif(
 )
 
 _MAX_FRAMES = 60
+_MAX_COUNTER = 1_000_000
+
+
+def _source_free_evidence(
+    metrics: OperatorLaunchMetrics,
+    *,
+    provider_calls: int,
+    tracked_detections: int,
+    revision: str,
+    analytics_revision: str,
+) -> dict[str, object]:
+    """Retain only exact revisions and positive same-execution aggregate counters."""
+    if not all(re.fullmatch(r"[0-9a-fA-F]{40}", sha) for sha in (revision, analytics_revision)):
+        raise ValueError("joined witness requires exact reviewed revisions")
+    counters = {
+        "delivered_frames": metrics.delivered_frames,
+        "presentations": metrics.presentations,
+        "analytics_provider_calls": provider_calls,
+        "analytics_tracked_detections": tracked_detections,
+        "analytics_provider_submissions": metrics.analytics_provider_submissions,
+        "analytics_provider_completions": metrics.analytics_provider_completions,
+        "analytics_rendered_boxes": metrics.analytics_rendered_boxes,
+    }
+    if not all(type(value) is int and 1 <= value <= _MAX_COUNTER for value in counters.values()):
+        raise ValueError("joined witness requires positive bounded counters")
+    if metrics.analytics_enabled is not True or (
+        type(metrics.analytics_failures) is not int or metrics.analytics_failures != 0
+    ):
+        raise ValueError("joined witness requires successful analytics")
+    return {
+        "schema_version": "1",
+        "revision": revision.lower(),
+        "analytics_revision": analytics_revision.lower(),
+        "execution_context": "reviewed-video-windows-x64",
+        "windows_live_launch_completed": True,
+        "analytics_enabled": True,
+        "analytics_failures": 0,
+        **counters,
+    }
 
 
 class _JoinedAnalyticsProvider:
@@ -185,6 +225,11 @@ class _ReviewedVideoDelivery:
 
 
 def test_reviewed_video_detector_tracker_overlay_reaches_windows_operator() -> None:
+    output_value = os.getenv("K5_STAGE_ONE_JOINED_ANALYTICS_OUTPUT")
+    assert output_value
+    output = Path(output_value)
+    # A failed retry must not leave an earlier successful receipt available for upload.
+    output.unlink(missing_ok=True)
     root_value = os.getenv("K5_ANALYTICS_EVIDENCE_ROOT")
     assert root_value
     evidence_root = Path(root_value).resolve(strict=True)
@@ -206,11 +251,12 @@ def test_reviewed_video_detector_tracker_overlay_reaches_windows_operator() -> N
         )
     )
 
-    assert metrics.delivered_frames >= 1
-    assert metrics.presentations >= 1
-    assert metrics.analytics_enabled is True
-    assert metrics.analytics_provider_submissions >= 1
-    assert metrics.analytics_provider_completions >= 1
-    assert metrics.analytics_failures == 0
-    assert provider.tracked_detections >= 1
-    assert metrics.analytics_rendered_boxes >= 1
+    evidence = _source_free_evidence(
+        metrics,
+        provider_calls=provider.provider_calls,
+        tracked_detections=provider.tracked_detections,
+        revision=os.getenv("K5_STAGE_ONE_REVISION", ""),
+        analytics_revision=os.getenv("ANALYTICS_LAB_SHA", ""),
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
