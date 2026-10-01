@@ -1,13 +1,58 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+from unittest.mock import Mock
 
 import pytest
 
-from k5vision.media.gstreamer_direct_frame_delivery import GStreamerDirectFrameDelivery
+from k5vision.media.gstreamer_direct_frame_delivery import (
+    GStreamerDirectFrameDelivery,
+    _DirectRtspFrameBackend,
+)
 from k5vision.media.live_presentation import LivePresentationError, LivePresentationErrorCode
 from k5vision.media.presentation_decoder import _PresentationPayload
 from k5vision.media.presentation_frame import PixelFormat
+
+
+@pytest.mark.parametrize("timeout_ms", [500, 5_000, 30_000])
+def test_direct_backend_preserves_64_bit_native_startup_timeout(timeout_ms: int) -> None:
+    observed: list[int] = []
+    native_signature = ctypes.CFUNCTYPE(
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_uint64,
+    )
+
+    @native_signature
+    def native_get_state(_pipeline, _current, _pending, timeout_ns):
+        observed.append(timeout_ns)
+        return 2
+
+    # Model a freshly loaded native symbol: its argument types are undeclared
+    # until the backend binds them. A plain Mock cannot expose C int truncation.
+    untyped_get_state = ctypes.CFUNCTYPE(ctypes.c_int)(
+        ctypes.cast(native_get_state, ctypes.c_void_p).value
+    )
+    backend = _DirectRtspFrameBackend.__new__(_DirectRtspFrameBackend)
+    backend._core = Mock()
+    backend._app = Mock()
+    backend._core.gst_element_get_state = untyped_get_state
+    backend._bind_signatures()
+
+    current = ctypes.c_int()
+    pending = ctypes.c_int()
+    result = backend._core.gst_element_get_state(
+        ctypes.c_void_p(),
+        ctypes.byref(current),
+        ctypes.byref(pending),
+        timeout_ms * 1_000_000,
+    )
+
+    assert result == 2
+    assert observed == [timeout_ms * 1_000_000]
 
 
 def _payload(byte_value: int) -> _PresentationPayload:

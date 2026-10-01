@@ -8,6 +8,7 @@ on:
       - "src/k5vision/operator_runtime.py"
       - "tests/test_windows_alpha_bootstrap.py"
       - "tests/test_public_test_operator_runtime.py"
+      - "tests/test_windows_alpha_direct_witness.py"
       - ".github/workflows/windows-alpha-script-smoke.yml"
   push:
     branches: [main]
@@ -16,6 +17,7 @@ on:
       - "src/k5vision/operator_runtime.py"
       - "tests/test_windows_alpha_bootstrap.py"
       - "tests/test_public_test_operator_runtime.py"
+      - "tests/test_windows_alpha_direct_witness.py"
       - ".github/workflows/windows-alpha-script-smoke.yml"
 
 permissions:
@@ -77,4 +79,4 @@ jobs:
       - name: Run Windows alpha boundary regressions
         shell: powershell
         run: |
-          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py -q --no-cov
+          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py -q --no-cov

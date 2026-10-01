@@ -1,4 +1,8 @@
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 ALPHA = ROOT / "scripts" / "windows-alpha"
@@ -7,7 +11,7 @@ PREFLIGHT = ALPHA / "Test-K5VisionAlpha.ps1"
 RUN = ALPHA / "Run-K5VisionAlpha.ps1"
 START = ALPHA / "Start-K5VisionAlpha.ps1"
 PROVISION = ROOT / "scripts" / "provision-stage03-gstreamer.ps1"
-PIN = "4fee528fff1fb2dad5f77a2557d92961845215d7"
+PIN = "d531d50d479f46af6ceed324a7cc379745becb61"
 
 
 def test_windows_alpha_bootstrap_files_exist() -> None:
@@ -213,3 +217,93 @@ def test_windows_alpha_installer_installs_reviewed_runtime_dependencies() -> Non
     assert "-m pip install --force-reinstall --no-deps $packageUri" in text
     assert "-m pip check" in text
     assert "K5 Vision Alpha runtime dependency verification PASS." in text
+
+
+def test_synthetic_source_owns_partial_startup_until_successful_return() -> None:
+    text = START.read_text(encoding="utf-8")
+    source = text.split("function Start-K5SyntheticSource {", 1)[1].split("\n$writeToken", 1)[0]
+    assert "$server = $null\n    $publisher = $null\n    try {" in source
+    assert "$serverHandle = $server.Handle" in source
+    assert "$publisherHandle = $publisher.Handle" in source
+    assert "foreach ($owned in @($publisher, $server))" in source
+    assert "if (-not $owned.HasExited) { $owned.Kill() }" in source
+    assert "$owned.WaitForExit(5000)" in source
+    assert "throw $startupFailure" in source
+    assert "owned process cleanup was incomplete" in source
+    assert "Get-Process" not in source
+    assert "Get-CimInstance" not in source
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires native Windows process cleanup")
+def test_publisher_launch_failure_stops_owned_server_only(tmp_path: Path) -> None:
+    launcher = str(START).replace("'", "''")
+    temporary = str(tmp_path).replace("'", "''")
+    script = r"""
+$ErrorActionPreference = "Stop"
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    '__LAUNCHER__', [ref]$tokens, [ref]$parseErrors
+)
+if ($parseErrors.Count -ne 0) { throw 'Launcher parse failed.' }
+$function = $ast.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Start-K5SyntheticSource'
+}, $true)
+if ($null -eq $function) { throw 'Synthetic source function missing.' }
+. ([scriptblock]::Create($function.Extent.Text))
+$hostExe = (Get-Process -Id $PID).Path
+$sessionRoot = '__TEMPORARY__'
+$MediaMtxVersion = '1.21.1'
+$gstLaunch = 'injected-publisher'
+$script:ownedServer = $null
+$script:publisherAttempted = $false
+function Test-K5GStreamerElement { return $true }
+function Get-K5MediaMtx { return 'Test-K5MediaMtxExecutable' }
+function Test-K5MediaMtxExecutable { $global:LASTEXITCODE = 0; return '1.21.1' }
+function Test-K5TcpListener { return $null -ne $script:ownedServer }
+function Start-Process {
+    param($FilePath, $ArgumentList, [switch]$PassThru, [switch]$NoNewWindow,
+          $WindowStyle, $RedirectStandardOutput, $RedirectStandardError)
+    if ($FilePath -eq 'injected-publisher') {
+        $script:publisherAttempted = $true
+        throw 'injected_publisher_launch_failure'
+    }
+    $arguments = @('-NoProfile', '-NonInteractive', '-Command', '"Start-Sleep -Seconds 30"')
+    $script:ownedServer = Microsoft.PowerShell.Management\Start-Process `
+        -FilePath $hostExe -ArgumentList $arguments -PassThru
+    return $script:ownedServer
+}
+$foreign = Microsoft.PowerShell.Management\Start-Process -FilePath $hostExe `
+    -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', '"Start-Sleep -Seconds 30"') `
+    -PassThru
+$foreignHandle = $foreign.Handle
+try {
+    try {
+        $null = Start-K5SyntheticSource
+        throw 'publisher_failure_was_accepted'
+    } catch {
+        if ($_.Exception.Message -ne 'injected_publisher_launch_failure') { throw }
+    }
+    if (-not $script:publisherAttempted) { throw 'Publisher was not attempted.' }
+    if ($null -eq $script:ownedServer -or -not $script:ownedServer.HasExited) {
+        throw 'Owned server survived publisher launch failure.'
+    }
+    if ($foreign.HasExited) { throw 'An unrelated process was terminated.' }
+} finally {
+    foreach ($child in @($script:ownedServer, $foreign)) {
+        if ($null -ne $child -and -not $child.HasExited) {
+            $child.Kill()
+            $null = $child.WaitForExit(5000)
+        }
+    }
+}
+""".replace("__LAUNCHER__", launcher).replace("__TEMPORARY__", temporary)
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -157,7 +157,10 @@ def test_joined_workflow_validates_both_receipts_before_explicit_upload() -> Non
     text = _WORKFLOW.read_text(encoding="utf-8")
     validation = text.split("      - name: Assert retained witness is source-free\n")[1]
     assert "foreach ($output in @($env:K5_STAGE_ONE_OUTPUT, " in validation
-    assert "$env:K5_STAGE_ONE_JOINED_ANALYTICS_OUTPUT))" in validation
+    assert (
+        "$env:K5_STAGE_ONE_JOINED_ANALYTICS_OUTPUT, $env:K5_ALPHA_DIRECT_RTSP_OUTPUT))"
+        in validation
+    )
     assert "Test-Path -LiteralPath $output" in validation
     assert "Get-Content -LiteralPath $output -Raw" in validation
     upload = text.split("      - name: Upload source-free Stage One witness\n")[1]
