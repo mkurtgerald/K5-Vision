@@ -487,23 +487,44 @@ def test_snapshot_command_is_sid_only_bounded_and_unicode_safe(windows_harness, 
     assert path.replace("'", "''") in script
     assert "NTAccount" not in script and ".Translate(" not in script
     assert windows_harness._TRUSTED_INSTALLER in script
-    assert "Get-Acl -LiteralPath $path" in script
+    assert "Get-Acl" not in script and "Test-Path" not in script
+    assert (
+        "$sections = [System.Security.AccessControl.AccessControlSections]::Owner -bor\n"
+        "    [System.Security.AccessControl.AccessControlSections]::Access"
+    ) in script
+    assert "$attributes = [System.IO.File]::GetAttributes($path)" in script
+    assert "(($attributes -band [System.IO.FileAttributes]::Directory) -ne 0)" in script
+    assert (
+        "$acl = if ($directory) {\n"
+        "        [System.IO.Directory]::GetAccessControl($path, $sections)\n"
+        "    } else {\n"
+        "        [System.IO.File]::GetAccessControl($path, $sections)\n"
+        "    }"
+    ) in script
     assert "$acl.GetOwner([System.Security.Principal.SecurityIdentifier])" in script
     assert "$acl.GetAccessRules($true, $true,\n" in script
     assert "[System.Security.Principal.SecurityIdentifier]) | ForEach-Object" in script
     for stage in (
         "script-start",
         "current-user",
+        "path-kind",
         "acl-read",
         "descriptor-read",
         "sid-owner",
         "sid-rules",
-        "path-kind",
         "item-complete",
         "json-serialize",
         "complete",
     ):
         assert "K5_SECURITY_STAGE:" + stage + ":" in script
+    assert (
+        script.index("K5_SECURITY_STAGE:path-kind:")
+        < script.index("[System.IO.File]::GetAttributes($path)")
+        < script.index("K5_SECURITY_STAGE:acl-read:")
+        < script.index("[System.IO.Directory]::GetAccessControl($path, $sections)")
+        < script.index("[System.IO.File]::GetAccessControl($path, $sections)")
+        < script.index("K5_SECURITY_STAGE:descriptor-read:")
+    )
     assert options["timeout"] == 30
     assert options["stdin"] == subprocess.DEVNULL
     assert options["encoding"] == "utf-8"
@@ -511,7 +532,9 @@ def test_snapshot_command_is_sid_only_bounded_and_unicode_safe(windows_harness, 
 
 
 @pytest.mark.parametrize("output_type", [bytes, str])
-@pytest.mark.parametrize("last_stage", ["script-start", "acl-read", "sid-rules", "json-serialize"])
+@pytest.mark.parametrize(
+    "last_stage", ["script-start", "path-kind", "acl-read", "sid-rules", "json-serialize"]
+)
 def test_snapshot_timeout_preserves_only_scalar_partial_progress(
     windows_harness, monkeypatch, output_type, last_stage
 ):
@@ -545,7 +568,9 @@ def test_snapshot_timeout_preserves_only_scalar_partial_progress(
     assert diagnostic["completed_items"] == 1
     assert diagnostic["stdout_bytes"] == len(stdout)
     assert diagnostic["stderr_bytes"] == len(stderr)
-    assert diagnostic["item_index"] == (0 if last_stage in {"acl-read", "sid-rules"} else None)
+    assert diagnostic["item_index"] == (
+        0 if last_stage in {"path-kind", "acl-read", "sid-rules"} else None
+    )
     assert failure.value.__context__ is None
     assert failure.value.pytrace is False
 

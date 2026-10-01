@@ -165,10 +165,19 @@ $ErrorActionPreference = 'Stop'
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 try { $current = $identity.User.Value } finally { $identity.Dispose() }
 $paths = @(__PATH_LITERALS__)
+$sections = [System.Security.AccessControl.AccessControlSections]::Owner -bor
+    [System.Security.AccessControl.AccessControlSections]::Access
 $items = @(for ($index = 0; $index -lt $paths.Count; $index++) {
     $path = $paths[$index]
+    [Console]::Error.WriteLine("K5_SECURITY_STAGE:path-kind:$index")
+    $attributes = [System.IO.File]::GetAttributes($path)
+    $directory = (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0)
     [Console]::Error.WriteLine("K5_SECURITY_STAGE:acl-read:$index")
-    $acl = Get-Acl -LiteralPath $path
+    $acl = if ($directory) {
+        [System.IO.Directory]::GetAccessControl($path, $sections)
+    } else {
+        [System.IO.File]::GetAccessControl($path, $sections)
+    }
     [Console]::Error.WriteLine("K5_SECURITY_STAGE:descriptor-read:$index")
     $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new(
         $acl.GetSecurityDescriptorBinaryForm(), 0)
@@ -186,8 +195,6 @@ $items = @(for ($index = 0; $index -lt $paths.Count; $index++) {
             propagation = [int]$_.PropagationFlags
         }
     })
-    [Console]::Error.WriteLine("K5_SECURITY_STAGE:path-kind:$index")
-    $directory = Test-Path -LiteralPath $path -PathType Container
     [ordered]@{
         path = $path
         directory = $directory
