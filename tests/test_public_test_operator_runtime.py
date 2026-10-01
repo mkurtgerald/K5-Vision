@@ -153,9 +153,8 @@ def test_local_test_environment_builder_is_mutually_exclusive() -> None:
     assert isinstance(launcher, WindowsSingleLiveOperatorLauncher)
     delivery = launcher._delivery_factory(96)
     assert isinstance(delivery, GStreamerDirectFrameDelivery)
-    assert delivery._frame_goal == 30
-    assert delivery._delivery_timeout_seconds == 45.0
-    assert delivery._startup_probe_ms == 5_000
+    assert delivery._frame_goal == 225
+    assert delivery._delivery_timeout_seconds == 25.0
     assert delivery._startup_probe_ms == 500
 
     resolver, launcher = build_environment_operator_runtime(
@@ -167,7 +166,6 @@ def test_local_test_environment_builder_is_mutually_exclusive() -> None:
     )
     assert resolver is None
     assert launcher is None
-
 
 def test_public_test_environment_builder_keeps_private_mode_separate(
     monkeypatch: pytest.MonkeyPatch,
@@ -186,8 +184,9 @@ def test_public_test_environment_builder_keeps_private_mode_separate(
     assert isinstance(launcher, WindowsSingleLiveOperatorLauncher)
     delivery = launcher._delivery_factory(96)
     assert isinstance(delivery, GStreamerDirectFrameDelivery)
-    assert delivery._frame_goal == 225
-    assert delivery._delivery_timeout_seconds == 25.0
+    assert delivery._frame_goal == 30
+    assert delivery._delivery_timeout_seconds == 45.0
+    assert delivery._startup_probe_ms == 5_000
 
     resolver, launcher = build_environment_operator_runtime(
         {
@@ -199,7 +198,6 @@ def test_public_test_environment_builder_keeps_private_mode_separate(
     )
     assert resolver is None
     assert launcher is None
-
 
 def test_public_test_environment_builder_skips_udp_payload_probe_by_default(
     monkeypatch: pytest.MonkeyPatch,
