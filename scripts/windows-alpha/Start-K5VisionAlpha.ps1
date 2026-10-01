@@ -159,63 +159,84 @@ paths:
     }
 
     Write-Host "Starting local MediaMTX RTSP server..."
-    $server = Start-Process -FilePath $mediaMtx -ArgumentList @($configPath) -PassThru -NoNewWindow
-    $serverReady = $false
-    foreach ($attempt in 1..40) {
-        if ($server.HasExited) { break }
-        if (Test-K5TcpListener "127.0.0.1" 8554) {
-            $serverReady = $true
-            break
+    $server = $null
+    $publisher = $null
+    try {
+        $server = Start-Process -FilePath $mediaMtx -ArgumentList @($configPath) -PassThru -NoNewWindow
+        $serverHandle = $server.Handle
+        $serverReady = $false
+        foreach ($attempt in 1..40) {
+            if ($server.HasExited) { break }
+            if (Test-K5TcpListener "127.0.0.1" 8554) {
+                $serverReady = $true
+                break
+            }
+            Start-Sleep -Milliseconds 250
         }
-        Start-Sleep -Milliseconds 250
-    }
-    if (-not $serverReady) {
-        $serverState = if ($server.HasExited) { "exited:$($server.ExitCode)" } else { "running" }
-        Write-Host ("Synthetic RTSP server diagnostics: state={0}" -f $serverState)
-        if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue }
-        throw "Local synthetic RTSP server failed to start."
-    }
-
-    $source = "rtsp://127.0.0.1:8554/k5synthetic"
-    $publisherArgs = @(
-        "-q",
-        "videotestsrc","is-live=true","pattern=ball","animation-mode=wall-time","flip=true",
-        "!","video/x-raw,width=1280,height=720,format=I420,framerate=15/1",
-        "!","videoconvert",
-        "!","x264enc","speed-preset=ultrafast","tune=zerolatency","bitrate=2000","key-int-max=30",
-        "!","video/x-h264,profile=baseline",
-        "!","h264parse","config-interval=1",
-        "!","rtspclientsink","protocols=tcp","location=$source"
-    )
-    $publisherOut = Join-Path $sessionRoot "publisher.stdout.log"
-    $publisherErr = Join-Path $sessionRoot "publisher.stderr.log"
-    $publisher = Start-Process -FilePath $gstLaunch -ArgumentList $publisherArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $publisherOut -RedirectStandardError $publisherErr
-
-    Write-Host "Synthetic RTSP publisher started; deferring media readback to the K5 native live-source probe."
-    Start-Sleep -Milliseconds 750
-    if ($publisher.HasExited -or $server.HasExited) {
-        $publisherState = if ($publisher.HasExited) { "exited:$($publisher.ExitCode)" } else { "running" }
-        $serverState = if ($server.HasExited) { "exited:$($server.ExitCode)" } else { "running" }
-        Write-Host ("Synthetic RTSP diagnostics: server={0}, publisher={1}" -f $serverState, $publisherState)
-        if (Test-Path -LiteralPath $publisherErr) {
-            $publisherTail = @(Get-Content -LiteralPath $publisherErr -Tail 8 -ErrorAction SilentlyContinue)
-            foreach ($line in $publisherTail) { Write-Host ("publisher: " + $line) }
+        if (-not $serverReady) {
+            $serverState = if ($server.HasExited) { "exited:$($server.ExitCode)" } else { "running" }
+            Write-Host ("Synthetic RTSP server diagnostics: state={0}" -f $serverState)
+            throw "Local synthetic RTSP server failed to start."
         }
-        Stop-Process -Id $publisher.Id -Force -ErrorAction SilentlyContinue
-        Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
-        throw "Local synthetic RTSP source failed to remain available for K5 probing."
-    }
 
-    Write-Host "Local synthetic RTSP publisher PASS; K5 native media probe pending."
-    return @{
-        Uri = $source
-        Ip = "127.0.0.1"
-        Port = 8554
-        StreamToken = "local-test"
-        DeviceName = "K5 Local Synthetic Test"
-        Tags = @("alpha-local-synthetic","ephemeral","non-recording")
-        ServerProcess = $server
-        PublisherProcess = $publisher
+        $source = "rtsp://127.0.0.1:8554/k5synthetic"
+        $publisherArgs = @(
+            "-q",
+            "videotestsrc","is-live=true","pattern=ball","animation-mode=wall-time","flip=true",
+            "!","video/x-raw,width=1280,height=720,format=I420,framerate=15/1",
+            "!","videoconvert",
+            "!","x264enc","speed-preset=ultrafast","tune=zerolatency","bitrate=2000","key-int-max=30",
+            "!","video/x-h264,profile=baseline",
+            "!","h264parse","config-interval=1",
+            "!","rtspclientsink","protocols=tcp","location=$source"
+        )
+        $publisherOut = Join-Path $sessionRoot "publisher.stdout.log"
+        $publisherErr = Join-Path $sessionRoot "publisher.stderr.log"
+        $publisher = Start-Process -FilePath $gstLaunch -ArgumentList $publisherArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $publisherOut -RedirectStandardError $publisherErr
+        $publisherHandle = $publisher.Handle
+
+        Write-Host "Synthetic RTSP publisher started; deferring media readback to the K5 native live-source probe."
+        Start-Sleep -Milliseconds 750
+        if ($publisher.HasExited -or $server.HasExited) {
+            $publisherState = if ($publisher.HasExited) { "exited:$($publisher.ExitCode)" } else { "running" }
+            $serverState = if ($server.HasExited) { "exited:$($server.ExitCode)" } else { "running" }
+            Write-Host ("Synthetic RTSP diagnostics: server={0}, publisher={1}" -f $serverState, $publisherState)
+            if (Test-Path -LiteralPath $publisherErr) {
+                $publisherTail = @(Get-Content -LiteralPath $publisherErr -Tail 8 -ErrorAction SilentlyContinue)
+                foreach ($line in $publisherTail) { Write-Host ("publisher: " + $line) }
+            }
+            throw "Local synthetic RTSP source failed to remain available for K5 probing."
+        }
+
+        Write-Host "Local synthetic RTSP publisher PASS; K5 native media probe pending."
+        return @{
+            Uri = $source
+            Ip = "127.0.0.1"
+            Port = 8554
+            StreamToken = "local-test"
+            DeviceName = "K5 Local Synthetic Test"
+            Tags = @("alpha-local-synthetic","ephemeral","non-recording")
+            ServerProcess = $server
+            PublisherProcess = $publisher
+        }
+    } catch {
+        # Ownership transfers only after a successful return. If publisher
+        # creation fails, the outer launcher has not received either process.
+        $startupFailure = $_
+        $cleanupComplete = $true
+        foreach ($owned in @($publisher, $server)) {
+            if ($null -eq $owned) { continue }
+            try {
+                if (-not $owned.HasExited) { $owned.Kill() }
+                if (-not $owned.WaitForExit(5000)) { $cleanupComplete = $false }
+            } catch {
+                $cleanupComplete = $false
+            }
+        }
+        if (-not $cleanupComplete) {
+            throw "Local synthetic RTSP startup failed and owned process cleanup was incomplete."
+        }
+        throw $startupFailure
     }
 }
 
