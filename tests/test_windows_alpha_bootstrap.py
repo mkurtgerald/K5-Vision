@@ -34,6 +34,11 @@ def test_windows_alpha_installer_accepts_python_312_without_legacy_launcher() ->
     assert "& $pythonCommand @pythonPrefixArgs -m venv $venv" in text
 
 
+def test_windows_alpha_gstreamer_download_suppresses_slow_progress_renderer() -> None:
+    text = PROVISION.read_text(encoding="utf-8")
+    assert '$ProgressPreference = "SilentlyContinue"' in text
+
+
 def test_windows_alpha_installer_uses_reviewed_media_provisioner() -> None:
     text = INSTALL.read_text(encoding="utf-8")
     assert "provision-stage03-gstreamer.ps1" in text
