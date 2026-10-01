@@ -156,6 +156,7 @@ def test_local_test_environment_builder_is_mutually_exclusive() -> None:
     assert delivery._frame_goal == 30
     assert delivery._delivery_timeout_seconds == 45.0
     assert delivery._startup_probe_ms == 5_000
+    assert delivery._startup_probe_ms == 500
 
     resolver, launcher = build_environment_operator_runtime(
         {
