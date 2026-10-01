@@ -437,13 +437,23 @@ def _default_delivery_factory(payload_type: int) -> _LiveDeliveryBoundary:
     )
 
 
-def _direct_rtsp_test_delivery_factory(_payload_type: int) -> _LiveDeliveryBoundary:
-    """Use direct decoded RTSP/TCP frames for bounded alpha acceptance."""
+def _local_direct_rtsp_test_delivery_factory(_payload_type: int) -> _LiveDeliveryBoundary:
+    """Use direct decoded RTSP/TCP frames for bounded local alpha acceptance."""
     return GStreamerDirectFrameDelivery(
         frame_goal=225,
         delivery_timeout_seconds=25.0,
         consumer_timeout_seconds=2.0,
         startup_probe_ms=500,
+    )
+
+
+def _public_direct_rtsp_test_delivery_factory(_payload_type: int) -> _LiveDeliveryBoundary:
+    """Allow slower public RTSP startup while still proving real decoded video."""
+    return GStreamerDirectFrameDelivery(
+        frame_goal=30,
+        delivery_timeout_seconds=45.0,
+        consumer_timeout_seconds=2.0,
+        startup_probe_ms=5_000,
     )
 
 
@@ -618,7 +628,7 @@ def build_environment_operator_runtime(
                 payload_probe=payload_probe,
             )
             launcher = WindowsSingleLiveOperatorLauncher(
-                delivery_factory=_direct_rtsp_test_delivery_factory,
+                delivery_factory=_local_direct_rtsp_test_delivery_factory,
                 detection_provider=detection_provider,
             )
         except (TypeError, ValueError):
@@ -643,7 +653,7 @@ def build_environment_operator_runtime(
                 payload_probe=payload_probe,
             )
             launcher = WindowsSingleLiveOperatorLauncher(
-                delivery_factory=_direct_rtsp_test_delivery_factory,
+                delivery_factory=_public_direct_rtsp_test_delivery_factory,
                 detection_provider=detection_provider,
             )
         except (TypeError, ValueError):
