@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 
 import pytest
 from fastapi.testclient import TestClient
@@ -249,7 +250,7 @@ def test_foreign_site_database_is_rejected(tmp_path, password):
     state = initialize_identity_state(
         tmp_path / "identity", username="recovery-admin", password=password
     )
-    with sqlite3.connect(state.database_path) as connection:
+    with closing(sqlite3.connect(state.database_path)) as connection, connection:
         connection.execute("UPDATE users SET site_id = 'foreign'")
     with pytest.raises(IdentityStateError):
         load_identity_state(state.directory)
@@ -457,7 +458,7 @@ def test_damaged_registry_is_rejected_without_mutation(tmp_path, password, sql):
     state = initialize_identity_state(
         tmp_path / "identity", username="recovery-admin", password=password
     )
-    with sqlite3.connect(state.database_path) as connection:
+    with closing(sqlite3.connect(state.database_path)) as connection, connection:
         connection.execute(sql)
     before = state.database_path.read_bytes()
     with pytest.raises(IdentityStateError):

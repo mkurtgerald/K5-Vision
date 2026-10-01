@@ -7,11 +7,13 @@ no fixture changes ACLs, creates OS accounts, or connects to network shares.
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import json
 import multiprocessing
 import os
 import platform
+import re
 import secrets
 import shutil
 import socket
@@ -19,7 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -38,6 +40,8 @@ from k5vision.services.user_registry import UserRegistry, UserRegistryConflictEr
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="native Windows qualification")
 
 _TRUSTED_MACHINE_SIDS = {"S-1-5-18", "S-1-5-32-544"}  # SYSTEM, Administrators
+# Fixed service SID documented by Microsoft, MSDN Magazine, November 2008:
+# "Access Control: Understanding Windows File And Registry Permissions".
 _TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
 _REPLACEMENT_RIGHTS = (
     0x00010000
@@ -108,22 +112,69 @@ def _assert_secret_free(secrets_to_check, *payloads):
             raise AssertionError("disposable credential or session appeared in retained output")
 
 
+def _security_snapshot_diagnostics(stdout, stderr, path_count):
+    # Retain only scalar progress from partial output, never command/error text,
+    # paths, credentials, audit records, or the partially serialized descriptor.
+    def raw(value):
+        if value is None:
+            return b""
+        return value if isinstance(value, bytes) else value.encode("utf-8")
+
+    stdout, stderr = raw(stdout), raw(stderr)
+    diagnostic = {
+        "last_stage": "no-script-marker",
+        "item_index": None,
+        "completed_items": 0,
+        "stdout_bytes": len(stdout),
+        "stderr_bytes": len(stderr),
+    }
+    completed = set()
+    global_stages = {"script-start", "current-user", "json-serialize", "complete"}
+    item_stages = {
+        "acl-read",
+        "descriptor-read",
+        "sid-owner",
+        "sid-rules",
+        "path-kind",
+        "item-complete",
+    }
+    for line in stderr.decode("utf-8", errors="replace").splitlines():
+        match = re.fullmatch(r"K5_SECURITY_STAGE:([a-z-]+):([0-9]{1,4})", line)
+        if match is None:
+            continue
+        stage, index = match[1], int(match[2])
+        if stage in global_stages and index == 0:
+            diagnostic.update(last_stage=stage, item_index=None)
+        elif stage in item_stages and index < path_count:
+            diagnostic.update(last_stage=stage, item_index=index)
+            if stage == "item-complete":
+                completed.add(index)
+    diagnostic["completed_items"] = len(completed)
+    return json.dumps(diagnostic, sort_keys=True)
+
+
 def _security_snapshot(paths):
     # Read-only native evidence independent of the application's ctypes reader.
+    paths = list(paths)
     literals = ",".join("'" + str(path).replace("'", "''") + "'" for path in paths)
     script = r"""
+[Console]::Error.WriteLine('K5_SECURITY_STAGE:script-start:0')
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-$installer = $null
-try {
-    $account = [System.Security.Principal.NTAccount]::new('NT SERVICE', 'TrustedInstaller')
-    $installer = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
-} catch [System.Security.Principal.IdentityNotMappedException] { }
-$items = @(__PATH_LITERALS__) | ForEach-Object {
-    $acl = Get-Acl -LiteralPath $_
+[Console]::Error.WriteLine('K5_SECURITY_STAGE:current-user:0')
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+try { $current = $identity.User.Value } finally { $identity.Dispose() }
+$paths = @(__PATH_LITERALS__)
+$items = @(for ($index = 0; $index -lt $paths.Count; $index++) {
+    $path = $paths[$index]
+    [Console]::Error.WriteLine("K5_SECURITY_STAGE:acl-read:$index")
+    $acl = Get-Acl -LiteralPath $path
+    [Console]::Error.WriteLine("K5_SECURITY_STAGE:descriptor-read:$index")
     $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new(
         $acl.GetSecurityDescriptorBinaryForm(), 0)
+    [Console]::Error.WriteLine("K5_SECURITY_STAGE:sid-owner:$index")
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    [Console]::Error.WriteLine("K5_SECURITY_STAGE:sid-rules:$index")
     $rules = @($acl.GetAccessRules($true, $true,
         [System.Security.Principal.SecurityIdentifier]) | ForEach-Object {
         [ordered]@{
@@ -135,29 +186,59 @@ $items = @(__PATH_LITERALS__) | ForEach-Object {
             propagation = [int]$_.PropagationFlags
         }
     })
+    [Console]::Error.WriteLine("K5_SECURITY_STAGE:path-kind:$index")
+    $directory = Test-Path -LiteralPath $path -PathType Container
     [ordered]@{
-        path = $_
-        directory = (Test-Path -LiteralPath $_ -PathType Container)
-        owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        path = $path
+        directory = $directory
+        owner = $owner
         dacl_present = (($raw.ControlFlags -band 4) -ne 0)
         dacl_nonnull = ($null -ne $raw.DiscretionaryAcl)
         rules = $rules
     }
-}
-[ordered]@{ current_user = $current; trusted_installer = $installer; items = @($items) } |
-    ConvertTo-Json -Depth 7 -Compress
-""".replace("__PATH_LITERALS__", literals)
-    result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=_PROCESS_TIMEOUT,
-        env=_clean_process_environment(),
-        check=False,
-    )
-    if result.returncode:
-        pytest.fail("read-only native security evidence could not be collected")
+    [Console]::Error.WriteLine("K5_SECURITY_STAGE:item-complete:$index")
+})
+[Console]::Error.WriteLine('K5_SECURITY_STAGE:json-serialize:0')
+[ordered]@{
+    current_user = $current
+    trusted_installer = '__TRUSTED_INSTALLER_SID__'
+    items = $items
+} | ConvertTo-Json -Depth 7 -Compress
+[Console]::Error.WriteLine('K5_SECURITY_STAGE:complete:0')
+""".replace("__PATH_LITERALS__", literals).replace("__TRUSTED_INSTALLER_SID__", _TRUSTED_INSTALLER)
+    # UTF-16LE is PowerShell's documented EncodedCommand format. No stdin and no
+    # command-line quoting roundtrip for the disposable Unicode fixture paths.
+    command = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    failure = None
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                command,
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_PROCESS_TIMEOUT,
+            env=_clean_process_environment(),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        failure = "read-only native security evidence timed out after 30 seconds; "
+        failure += _security_snapshot_diagnostics(exc.stdout, exc.stderr, len(paths))
+    else:
+        if result.returncode:
+            failure = "read-only native security evidence process failed; "
+            failure += _security_snapshot_diagnostics(result.stdout, result.stderr, len(paths))
+    if failure is not None:
+        # Fail outside the exception handler so pytest never renders the raw
+        # TimeoutExpired command/output or its implicit exception chain.
+        pytest.fail(failure, pytrace=False)
     return json.loads(result.stdout)
 
 
@@ -582,7 +663,8 @@ def _assert_one_bootstrap(database, site_id, outcomes):
         audit = json.dumps([event.model_dump(mode="json") for event in events])
     finally:
         registry.close()
-    with sqlite3.connect(database) as connection:
+    # sqlite3.Connection.__exit__ ends transactions; it does not close the handle.
+    with closing(sqlite3.connect(database)) as connection:
         for table, expected in (("users", 1), ("user_credentials", 1), ("user_audit", 2)):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == expected
             assert connection.execute(f"SELECT DISTINCT site_id FROM {table}").fetchall() == [

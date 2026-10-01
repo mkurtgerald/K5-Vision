@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import ctypes
+import importlib.util
+import json
 import os
 import secrets
 import stat
 import struct
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -440,3 +444,263 @@ def test_dangling_junction_sidecars_refused_before_sqlite_open(tmp_path, monkeyp
     monkeypatch.setattr(identity.sqlite3, "connect", lambda *a, **kw: pytest.fail("SQLite opened"))
     with pytest.raises(identity.IdentityStateError, match="linked identity"):
         identity.load_identity_state(state.directory)
+
+
+def _recovery_test_module(name):
+    # Load helpers without applying their native-only module marker to this
+    # portable caller. No PowerShell, native accounts, or ACL changes are used.
+    path = Path(__file__).with_name(name + ".py")
+    spec = importlib.util.spec_from_file_location("portable_" + name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def windows_harness():
+    return _recovery_test_module("test_recovery_admin_windows")
+
+
+def test_snapshot_command_is_sid_only_bounded_and_unicode_safe(windows_harness, monkeypatch):
+    calls = []
+    snapshot = {"current_user": USER, "items": []}
+    monkeypatch.setattr(
+        windows_harness.subprocess,
+        "run",
+        lambda *args, **kwargs: (
+            calls.append((args, kwargs))
+            or SimpleNamespace(returncode=0, stdout=json.dumps(snapshot), stderr="")
+        ),
+    )
+    path = r"C:\K5 Recovery-Δ-O'Brien\identity"
+    assert windows_harness._security_snapshot([path]) == snapshot
+    (command,), options = calls[0]
+    assert command[:-1] == [
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+    ]
+    script = base64.b64decode(command[-1]).decode("utf-16le")
+    assert path.replace("'", "''") in script
+    assert "NTAccount" not in script and ".Translate(" not in script
+    assert windows_harness._TRUSTED_INSTALLER in script
+    assert "Get-Acl -LiteralPath $path" in script
+    assert "$acl.GetOwner([System.Security.Principal.SecurityIdentifier])" in script
+    assert "$acl.GetAccessRules($true, $true,\n" in script
+    assert "[System.Security.Principal.SecurityIdentifier]) | ForEach-Object" in script
+    for stage in (
+        "script-start",
+        "current-user",
+        "acl-read",
+        "descriptor-read",
+        "sid-owner",
+        "sid-rules",
+        "path-kind",
+        "item-complete",
+        "json-serialize",
+        "complete",
+    ):
+        assert "K5_SECURITY_STAGE:" + stage + ":" in script
+    assert options["timeout"] == 30
+    assert options["stdin"] == subprocess.DEVNULL
+    assert options["encoding"] == "utf-8"
+    assert options["capture_output"] is True and options["check"] is False
+
+
+@pytest.mark.parametrize("output_type", [bytes, str])
+@pytest.mark.parametrize("last_stage", ["script-start", "acl-read", "sid-rules", "json-serialize"])
+def test_snapshot_timeout_preserves_only_scalar_partial_progress(
+    windows_harness, monkeypatch, output_type, last_stage
+):
+    secret = secrets.token_urlsafe(24)
+    stdout = '{"incomplete": "' + secret
+    stderr = "\n".join(
+        [
+            secret,
+            "K5_SECURITY_STAGE:script-start:0",
+            "K5_SECURITY_STAGE:item-complete:0",
+            f"K5_SECURITY_STAGE:{last_stage}:0",
+            "K5_SECURITY_STAGE:untrusted-name:0",
+            "K5_SECURITY_STAGE:acl-read:9999",
+            "K5_SECURITY_STAGE:complete:0 " + secret,
+        ]
+    )
+    if output_type is bytes:
+        stdout, stderr = stdout.encode(), stderr.encode()
+
+    def timed_out(*args, **kwargs):
+        raise subprocess.TimeoutExpired(secret, 30, output=stdout, stderr=stderr)
+
+    monkeypatch.setattr(windows_harness.subprocess, "run", timed_out)
+    with pytest.raises(pytest.fail.Exception) as failure:
+        windows_harness._security_snapshot([r"C:\fixture"])
+    message = str(failure.value)
+    assert secret not in message and "C:\\fixture" not in message
+    assert "timed out after 30 seconds" in message
+    diagnostic = json.loads(message.split("; ", 1)[1])
+    assert diagnostic["last_stage"] == last_stage
+    assert diagnostic["completed_items"] == 1
+    assert diagnostic["stdout_bytes"] == len(stdout)
+    assert diagnostic["stderr_bytes"] == len(stderr)
+    assert diagnostic["item_index"] == (0 if last_stage in {"acl-read", "sid-rules"} else None)
+    assert failure.value.__context__ is None
+    assert failure.value.pytrace is False
+
+
+def test_snapshot_timeout_before_any_script_marker_is_not_attributed(windows_harness, monkeypatch):
+    def timed_out(*args, **kwargs):
+        raise subprocess.TimeoutExpired("unretained-command", 30)
+
+    monkeypatch.setattr(windows_harness.subprocess, "run", timed_out)
+    with pytest.raises(pytest.fail.Exception) as failure:
+        windows_harness._security_snapshot([r"C:\fixture"])
+    diagnostic = json.loads(str(failure.value).split("; ", 1)[1])
+    assert diagnostic == {
+        "last_stage": "no-script-marker",
+        "item_index": None,
+        "completed_items": 0,
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+    }
+
+
+def test_snapshot_nonzero_exit_retains_stage_not_arbitrary_output(windows_harness, monkeypatch):
+    secret = secrets.token_urlsafe(24)
+    monkeypatch.setattr(
+        windows_harness.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout=secret,
+            stderr="K5_SECURITY_STAGE:acl-read:0\n" + secret,
+        ),
+    )
+    with pytest.raises(pytest.fail.Exception) as failure:
+        windows_harness._security_snapshot([r"C:\fixture"])
+    assert secret not in str(failure.value)
+    assert "process failed" in str(failure.value)
+    assert json.loads(str(failure.value).split("; ", 1)[1])["last_stage"] == "acl-read"
+
+
+@pytest.mark.parametrize("private", [False, True])
+def test_snapshot_known_installer_sid_remains_ancestor_only(windows_harness, private):
+    snapshot = {
+        "current_user": USER,
+        "trusted_installer": windows_harness._TRUSTED_INSTALLER,
+        "items": [
+            {
+                "path": "fixture",
+                "directory": False,
+                "owner": windows_harness._TRUSTED_INSTALLER,
+                "dacl_present": True,
+                "dacl_nonnull": True,
+                "rules": [],
+            }
+        ],
+    }
+    if private:
+        with pytest.raises(AssertionError):
+            windows_harness._assert_private_security(snapshot, {"fixture"})
+    else:
+        windows_harness._assert_private_security(snapshot, set())
+
+
+@pytest.mark.parametrize("failure", [None, "wrong-count", "query-error"])
+def test_bootstrap_count_helper_closes_sqlite_on_success_and_failure(
+    windows_harness, monkeypatch, tmp_path, failure
+):
+    database = tmp_path / "users.sqlite3"
+    database.write_bytes(b"disposable fixture")
+    closed = []
+    events = [
+        SimpleNamespace(action=action, actor="local-admin-setup", model_dump=lambda **kw: {})
+        for action in ("created", "password-initialized")
+    ]
+    registry = SimpleNamespace(
+        list=lambda: [SimpleNamespace(username="admin-0")],
+        verify_password=lambda **kwargs: object(),
+        audit_events=lambda: events,
+        close=lambda: closed.append("registry"),
+    )
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass  # SQLite's transaction context deliberately does not close.
+
+        def execute(self, sql):
+            assert closed == ["registry"]
+            if failure == "query-error":
+                raise RuntimeError("disposable query failure")
+            expected = 2 if sql.endswith("user_audit") else 1
+            return SimpleNamespace(
+                fetchone=lambda: (0 if failure == "wrong-count" else expected,),
+                fetchall=lambda: [("native-race",)],
+            )
+
+        def close(self):
+            closed.append("sqlite")
+
+    monkeypatch.setattr(windows_harness, "UserRegistry", lambda **kw: registry)
+    monkeypatch.setattr(windows_harness.sqlite3, "connect", lambda *a: Connection())
+    outcomes = [{"status": "created", "index": 0, "password": secrets.token_urlsafe(24)}]
+    if failure is None:
+        windows_harness._assert_one_bootstrap(database, "native-race", outcomes)
+    else:
+        with pytest.raises(AssertionError if failure == "wrong-count" else RuntimeError):
+            windows_harness._assert_one_bootstrap(database, "native-race", outcomes)
+    assert closed == ["registry", "sqlite"]
+
+
+@pytest.mark.parametrize("query_fails", [False, True])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "test_foreign_site_database_is_rejected",
+        "test_damaged_registry_is_rejected_without_mutation",
+    ],
+)
+def test_recovery_mutation_fixtures_end_transaction_then_close(
+    monkeypatch, tmp_path, name, query_fails
+):
+    module = _recovery_test_module("test_recovery_admin")
+    database = tmp_path / "users.sqlite3"
+    database.write_bytes(b"disposable fixture")
+    state = SimpleNamespace(directory=tmp_path, database_path=database)
+    lifecycle = []
+
+    class Connection:
+        def __enter__(self):
+            lifecycle.append("begin")
+            return self
+
+        def __exit__(self, kind, value, traceback):
+            lifecycle.append("rollback" if kind else "commit")
+
+        def execute(self, sql):
+            lifecycle.append("execute")
+            if query_fails:
+                raise RuntimeError("disposable mutation failure")
+
+        def close(self):
+            lifecycle.append("close")
+
+    def reject(_):
+        assert lifecycle == ["begin", "execute", "commit", "close"]
+        raise module.IdentityStateError()
+
+    monkeypatch.setattr(module, "initialize_identity_state", lambda *a, **kw: state)
+    monkeypatch.setattr(module, "load_identity_state", reject)
+    monkeypatch.setattr(module.sqlite3, "connect", lambda *a: Connection())
+    kwargs = {"sql": "DELETE FROM user_audit"} if "damaged" in name else {}
+    if query_fails:
+        with pytest.raises(RuntimeError, match="disposable mutation failure"):
+            getattr(module, name)(tmp_path, secrets.token_urlsafe(24), **kwargs)
+    else:
+        getattr(module, name)(tmp_path, secrets.token_urlsafe(24), **kwargs)
+    assert lifecycle == ["begin", "execute", "rollback" if query_fails else "commit", "close"]
