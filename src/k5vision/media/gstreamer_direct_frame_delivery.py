@@ -47,6 +47,18 @@ BackendFactory = Callable[[str, int, int], _FramePullBackend]
 class _DirectRtspFrameBackend(_PresentationCtypesBackend):  # pragma: no cover
     """Windows-native RTSP/TCP -> decoded BGRx appsink backend."""
 
+    def _bind_signatures(self) -> None:
+        super()._bind_signatures()
+        # GstClockTime is 64-bit nanoseconds. Without an explicit signature,
+        # ctypes converts Python integers to C int and truncates a 5-second wait.
+        self._core.gst_element_get_state.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_uint64,
+        ]
+        self._core.gst_element_get_state.restype = ctypes.c_int
+
     def __init__(
         self,
         source_uri: str,
