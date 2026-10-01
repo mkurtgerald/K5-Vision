@@ -6,6 +6,15 @@ on:
       - "Install-K5VisionAlpha.ps1"
       - "scripts/windows-alpha/**"
       - "src/k5vision/operator_runtime.py"
+      - "src/k5vision/cli.py"
+      - "src/k5vision/identity_state.py"
+      - "src/k5vision/windows_identity_security.py"
+      - "src/k5vision/recovery_admin.py"
+      - "src/k5vision/services/user_registry.py"
+      - "tests/test_recovery_admin.py"
+      - "tests/test_recovery_admin_windows.py"
+      - "tests/test_windows_identity_security.py"
+      - "docs/RECOVERY_ADMIN.md"
       - "tests/test_windows_alpha_bootstrap.py"
       - "tests/test_public_test_operator_runtime.py"
       - "tests/test_windows_alpha_direct_witness.py"
@@ -15,6 +24,15 @@ on:
     paths:
       - "scripts/windows-alpha/**"
       - "src/k5vision/operator_runtime.py"
+      - "src/k5vision/cli.py"
+      - "src/k5vision/identity_state.py"
+      - "src/k5vision/windows_identity_security.py"
+      - "src/k5vision/recovery_admin.py"
+      - "src/k5vision/services/user_registry.py"
+      - "tests/test_recovery_admin.py"
+      - "tests/test_recovery_admin_windows.py"
+      - "tests/test_windows_identity_security.py"
+      - "docs/RECOVERY_ADMIN.md"
       - "tests/test_windows_alpha_bootstrap.py"
       - "tests/test_public_test_operator_runtime.py"
       - "tests/test_windows_alpha_direct_witness.py"
@@ -30,6 +48,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Parse Windows alpha PowerShell
         shell: powershell
@@ -80,3 +101,42 @@ jobs:
         shell: powershell
         run: |
           pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py -q --no-cov
+
+      - name: Qualify Windows local recovery identity
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $probe = Join-Path $env:RUNNER_TEMP "k5-alpha-runtime-probe"
+          $env:K5_RECOVERY_TEST_PYTHON = Join-Path $probe "Scripts\python.exe"
+          if (-not (Test-Path -LiteralPath $env:K5_RECOVERY_TEST_PYTHON -PathType Leaf)) {
+              throw "Clean installed runtime probe is missing."
+          }
+          $qualification = @'
+          import os
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+          from uuid import uuid4
+          from k5vision.identity_state import validate_new_identity_directory
+
+          root = Path(os.environ["LOCALAPPDATA"]) / ("K5 Recovery pytest-" + uuid4().hex)
+          validate_new_identity_directory(root)
+          root.mkdir(mode=0o700)
+          try:
+              base = root / "pytest"
+              validate_new_identity_directory(base)
+              result = subprocess.run([
+                  sys.executable, "-m", "pytest",
+                  "tests/test_recovery_admin.py",
+                  "tests/test_recovery_admin_windows.py",
+                  "tests/test_windows_identity_security.py",
+                  "-q", "-rP", "--no-cov", "-o", "junit_family=xunit1",
+                  "--junitxml=recovery-windows-results.xml", "--basetemp", str(base),
+              ], check=False, timeout=600)
+              raise SystemExit(result.returncode)
+          finally:
+              shutil.rmtree(root)
+          '@
+          $qualification | python -
+          if ($LASTEXITCODE -ne 0) { throw "Windows local recovery identity qualification failed." }

@@ -21,6 +21,11 @@ from k5vision.services.user_registry import (
     MAX_USER_CAPACITY,
     UserRegistry,
 )
+from k5vision.windows_identity_security import (
+    WindowsIdentitySecurityError,
+    check_windows_security,
+    check_windows_volume,
+)
 
 _MANIFEST = "identity.json"
 _DATABASE = "users.sqlite3"
@@ -28,10 +33,27 @@ _SITE_ENV = "K5_CONTROL_PLANE_SITE_ID"
 _DATABASE_ENV = "K5_USER_DB_PATH"
 _TEST_ENV = ("K5_LOCAL_TEST_RTSP_SOURCE", "K5_PUBLIC_TEST_RTSP_SOURCE")
 _MAX_MANIFEST_BYTES = 1024
+_WINDOWS = os.name == "nt"
 
 
 class IdentityStateError(RuntimeError):
     """Durable state is absent, inconsistent or unsafe to use."""
+
+
+def _windows_admission(path: Path, *, private: bool, directory: bool = False) -> None:
+    if _WINDOWS:
+        try:
+            check_windows_security(path, private=private, require_file_inheritance=directory)
+        except (
+            WindowsIdentitySecurityError,
+            OSError,
+            ValueError,
+            TypeError,
+            AttributeError,
+        ) as exc:
+            raise IdentityStateError(
+                "Windows identity ownership or access is unsafe or unsupported"
+            ) from exc
 
 
 @dataclass(frozen=True)
@@ -50,6 +72,19 @@ def _checked_path(value: str | Path) -> Path:
         raise IdentityStateError("identity directory must be an absolute local directory")
     if path.drive.startswith("\\\\"):
         raise IdentityStateError("network identity directories are not supported")
+    if _WINDOWS:
+        try:
+            check_windows_volume(path)
+        except (
+            WindowsIdentitySecurityError,
+            OSError,
+            ValueError,
+            TypeError,
+            AttributeError,
+        ) as exc:
+            raise IdentityStateError(
+                "Windows identity requires a supported fixed local volume"
+            ) from exc
     # Never resolve a link and then bless its foreign destination. Windows
     # junctions/mount points are reparse points even when is_symlink is false.
     for component in reversed((path, *path.parents)):
@@ -61,6 +96,10 @@ def _checked_path(value: str | Path) -> Path:
             raise IdentityStateError("linked identity paths are not supported")
         if component != path and not stat.S_ISDIR(info.st_mode):
             raise IdentityStateError("identity parent is not a directory")
+        # Check the immediate parent before touching the leaf: an empty shared
+        # parent can otherwise be turned into a junction between path probes.
+        immediate_parent = component == path.parent
+        _windows_admission(component, private=immediate_parent, directory=immediate_parent)
         if os.name == "posix" and stat.S_ISDIR(info.st_mode):
             if info.st_uid not in (0, os.geteuid()):
                 raise IdentityStateError("identity ancestors must have trusted ownership")
@@ -77,6 +116,7 @@ def validate_new_identity_directory(value: str | Path) -> Path:
     parent = path.parent.stat()
     if os.name == "posix" and (parent.st_uid != os.geteuid() or parent.st_mode & 0o022):
         raise IdentityStateError("identity parent must be owned and protected from other writers")
+    _windows_admission(path.parent, private=True, directory=True)
     return path
 
 
@@ -85,6 +125,7 @@ def _regular_file(path: Path) -> os.stat_result:
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise IdentityStateError("identity files must be ordinary unlinked files")
+    _windows_admission(path, private=True)
     return info
 
 
@@ -105,6 +146,8 @@ def _same_directory(path: Path, expected: os.stat_result) -> None:
         expected.st_ino,
     ):
         raise IdentityStateError("identity directory changed during setup")
+    _windows_admission(path.parent, private=True, directory=True)
+    _windows_admission(path, private=True, directory=True)
 
 
 def _validate_registry(connection: sqlite3.Connection, site_id: str) -> None:
@@ -215,8 +258,9 @@ def initialize_identity_state(
     state = IdentityState(path, f"install-{uuid4().hex}")
     path.mkdir(mode=0o700)
     directory_identity = path.lstat()
-    # A newly created directory inherits the owner's Windows ACL; no existing
-    # directory's access settings are changed. Use a private per-user parent.
+    # Python 3.12.4+ applies a restricted Windows ACL for mode 0700. Admission
+    # verifies the result and private inheritance on every supported patch;
+    # no existing directory's access settings are changed.
     _same_directory(path, directory_identity)
     descriptor = os.open(state.database_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
@@ -246,6 +290,8 @@ def load_identity_state(directory: str | Path) -> IdentityState:
             raise IdentityStateError("identity directory is unavailable")
         if os.name == "posix" and (info.st_uid != os.geteuid() or info.st_mode & 0o077):
             raise IdentityStateError("identity directory must be private to its owner")
+        _windows_admission(path.parent, private=True, directory=True)
+        _windows_admission(path, private=True, directory=True)
         manifest_path = path / _MANIFEST
         before = _regular_file(manifest_path)
         if before.st_size > _MAX_MANIFEST_BYTES:
@@ -275,8 +321,11 @@ def load_identity_state(directory: str | Path) -> IdentityState:
         _regular_file(state.database_path)
         for suffix in ("-journal", "-wal", "-shm"):
             sibling = Path(str(state.database_path) + suffix)
-            if sibling.exists() or sibling.is_symlink():
-                _regular_file(sibling)
+            try:
+                sibling.lstat()
+            except FileNotFoundError:
+                continue
+            _regular_file(sibling)
         connection = sqlite3.connect(state.database_path.as_uri() + "?mode=ro", uri=True)
         try:
             _validate_registry(connection, site_id)
