@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 if ($env:OS -ne "Windows_NT") { throw "Windows is required." }
 
-$K5Revision = "4fee528fff1fb2dad5f77a2557d92961845215d7"
+$K5Revision = "5939983dc8040c0dcba45adabe0645c972b0cb8f"
 $bootstrapRoot = Join-Path $env:TEMP ("K5VisionBootstrap-" + [Guid]::NewGuid().ToString("N"))
 $archivePath = Join-Path $bootstrapRoot "k5vision.zip"
 $extractRoot = Join-Path $bootstrapRoot "source"
