@@ -167,6 +167,7 @@ def test_local_test_environment_builder_is_mutually_exclusive() -> None:
     assert resolver is None
     assert launcher is None
 
+
 def test_public_test_environment_builder_keeps_private_mode_separate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
