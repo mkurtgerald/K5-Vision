@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -43,6 +45,34 @@ def _metrics(**changes: object) -> SimpleNamespace:
             **changes,
         }
     )
+
+
+def test_rtsp_witness_collects_with_bare_pytest_without_pythonpath() -> None:
+    """Match CI's console entry point, which does not add the checkout to sys.path."""
+    pytest_executable = Path(sys.executable).with_name(
+        "pytest.exe" if os.name == "nt" else "pytest"
+    )
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [
+            str(pytest_executable),
+            _TEST,
+            "--collect-only",
+            "--no-cov",
+            "-o",
+            "addopts=",
+            "-q",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 test collected" in result.stdout
 
 
 @pytest.fixture

@@ -8,6 +8,7 @@ recordings, source URI, paths, credentials, or frame payloads are retained.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 import socket
@@ -20,10 +21,16 @@ import pytest
 from k5vision.media.gstreamer_direct_frame_delivery import GStreamerDirectFrameDelivery
 from k5vision.operator_launch import ResolvedLiveSource
 from k5vision.operator_runtime import WindowsSingleLiveOperatorLauncher
-from tests.integration.test_stage_one_joined_analytics_physical import (
-    _JoinedAnalyticsProvider,
-    _source_free_evidence,
+
+_JOINED_SPEC = importlib.util.spec_from_file_location(
+    "k5_joined_analytics_witness",
+    Path(__file__).with_name("test_stage_one_joined_analytics_physical.py"),
 )
+assert _JOINED_SPEC is not None and _JOINED_SPEC.loader is not None
+_JOINED_MODULE = importlib.util.module_from_spec(_JOINED_SPEC)
+_JOINED_SPEC.loader.exec_module(_JOINED_MODULE)
+_JoinedAnalyticsProvider = _JOINED_MODULE._JoinedAnalyticsProvider
+_source_free_evidence = _JOINED_MODULE._source_free_evidence
 
 pytestmark = pytest.mark.skipif(
     os.getenv("K5_STAGE_ONE_RTSP_JOINED_ANALYTICS_PHYSICAL") != "1",
