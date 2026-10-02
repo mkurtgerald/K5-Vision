@@ -20,7 +20,6 @@ import pytest
 from k5vision.media.gstreamer_direct_frame_delivery import GStreamerDirectFrameDelivery
 from k5vision.operator_launch import ResolvedLiveSource
 from k5vision.operator_runtime import WindowsSingleLiveOperatorLauncher
-
 from tests.integration.test_stage_one_joined_analytics_physical import (
     _JoinedAnalyticsProvider,
     _source_free_evidence,
@@ -189,7 +188,9 @@ def test_rtsp_detector_tracker_overlay_reaches_windows_operator(tmp_path: Path) 
         def delivery_factory(payload_type: int) -> GStreamerDirectFrameDelivery:
             assert 96 <= payload_type <= 127
             return GStreamerDirectFrameDelivery(
-                frame_goal=8,
+                # At 15 fps, eight frames can end before an in-budget detector
+                # finishes. Keep later frames available for the real overlay.
+                frame_goal=60,
                 delivery_timeout_seconds=60.0,
                 consumer_timeout_seconds=10.0,
                 pull_poll_ms=100,
@@ -208,8 +209,10 @@ def test_rtsp_detector_tracker_overlay_reaches_windows_operator(tmp_path: Path) 
             )
         )
     finally:
-        _stop_owned_process(publisher)
-        _stop_owned_process(server)
+        try:
+            _stop_owned_process(publisher)
+        finally:
+            _stop_owned_process(server)
 
     evidence = _source_free_evidence(
         metrics,
