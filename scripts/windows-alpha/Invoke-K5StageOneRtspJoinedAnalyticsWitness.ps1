@@ -39,10 +39,11 @@ $receipt = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
 foreach ($field in @(
     "delivered_frames",
     "presentations",
-    "provider_calls",
-    "analytics_completions",
-    "tracked_detections",
-    "rendered_boxes"
+    "analytics_provider_calls",
+    "analytics_provider_submissions",
+    "analytics_provider_completions",
+    "analytics_tracked_detections",
+    "analytics_rendered_boxes"
 )) {
     if ([int64]$receipt.$field -lt 1) {
         throw "RTSP-joined Stage One receipt failed positive evidence field '$field'."
