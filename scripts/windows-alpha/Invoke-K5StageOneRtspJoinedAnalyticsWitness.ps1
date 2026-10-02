@@ -35,22 +35,11 @@ if (-not (Test-Path -LiteralPath $outputPath)) {
     throw "RTSP-joined Stage One physical witness did not produce a receipt."
 }
 
-$receipt = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
-foreach ($field in @(
-    "delivered_frames",
-    "presentations",
-    "analytics_provider_calls",
-    "analytics_provider_submissions",
-    "analytics_provider_completions",
-    "analytics_tracked_detections",
-    "analytics_rendered_boxes"
-)) {
-    if ([int64]$receipt.$field -lt 1) {
-        throw "RTSP-joined Stage One receipt failed positive evidence field '$field'."
-    }
-}
-if ([int64]$receipt.analytics_failures -ne 0) {
-    throw "RTSP-joined Stage One receipt reported analytics failures."
+# Validate before any unbounded read or coercive PowerShell JSON conversion.
+# The workflow reuses this exact scalar contract at the artifact boundary.
+python scripts/validate_stage_one_rtsp_witness.py
+if ($LASTEXITCODE -ne 0) {
+    throw "RTSP-joined Stage One receipt failed source-free validation."
 }
 
-Write-Host "RTSP-joined Stage One witness passed; source-free receipt: $outputPath"
+Write-Host "RTSP-joined Stage One witness passed; source-free receipt validated."
