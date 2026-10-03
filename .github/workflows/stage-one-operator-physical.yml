@@ -24,6 +24,7 @@ jobs:
       K5_STAGE_ONE_OPERATOR_PHYSICAL: "1"
       K5_STAGE_ONE_OUTPUT: artifacts\stage-one-operator-physical.json
       K5_STAGE_ONE_JOINED_ANALYTICS_OUTPUT: artifacts\stage-one-joined-analytics-physical.json
+      K5_STAGE_ONE_RTSP_JOINED_ANALYTICS_OUTPUT: artifacts\stage-one-rtsp-joined-analytics-physical.json
       K5_ALPHA_DIRECT_RTSP_OUTPUT: artifacts\alpha-direct-rtsp-physical.json
       K5_STAGE_ONE_REVISION: ${{ github.sha }}
 
@@ -67,6 +68,11 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Require idle exact physical host before provisioning
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
 
       - name: Checkout exact reviewed Analytics-lab revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -186,12 +192,33 @@ jobs:
         shell: powershell
         run: .\scripts\windows-alpha\Invoke-K5VisionAlphaWitness.ps1 -Output $env:K5_ALPHA_DIRECT_RTSP_OUTPUT
 
+      - name: Recheck exact physical host before joined RTSP witness
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
+
+      - name: Prove reviewed clip RTSP joined analytics Windows presentation
+        id: rtsp_joined
+        timeout-minutes: 5
+        shell: powershell
+        run: .\scripts\windows-alpha\Invoke-K5StageOneRtspJoinedAnalyticsWitness.ps1 -Output $env:K5_STAGE_ONE_RTSP_JOINED_ANALYTICS_OUTPUT
+
+      - name: Verify joined RTSP process cleanup
+        if: always() && (steps.rtsp_joined.outcome == 'success' || steps.rtsp_joined.outcome == 'failure' || steps.rtsp_joined.outcome == 'cancelled')
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
+
       - name: Assert retained witness is source-free
         id: safe_evidence
         if: always()
+        timeout-minutes: 1
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+          # The fourth receipt is read only by its bounded, exact scalar validator.
+          python scripts/validate_stage_one_rtsp_witness.py
+          if ($LASTEXITCODE -ne 0) { throw "Joined RTSP retained receipt validation failed." }
           foreach ($output in @($env:K5_STAGE_ONE_OUTPUT, $env:K5_STAGE_ONE_JOINED_ANALYTICS_OUTPUT, $env:K5_ALPHA_DIRECT_RTSP_OUTPUT)) {
             if (-not (Test-Path -LiteralPath $output)) {
               throw "Required Stage One witness was not produced."
@@ -226,5 +253,6 @@ jobs:
             artifacts/stage-one-operator-physical.json
             artifacts/stage-one-joined-analytics-physical.json
             artifacts/alpha-direct-rtsp-physical.json
+            artifacts/stage-one-rtsp-joined-analytics-physical.json
           if-no-files-found: error
           retention-days: 14
