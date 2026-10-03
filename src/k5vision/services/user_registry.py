@@ -13,7 +13,7 @@ from hmac import compare_digest
 from pathlib import Path
 from uuid import UUID
 
-from k5vision.domain.users import UserAccount, UserAuditEvent, UserCreate, UserPatch
+from k5vision.domain.users import UserAccount, UserAuditEvent, UserCreate, UserPatch, UserRole
 
 DEFAULT_USER_CAPACITY = 1024
 MAX_USER_CAPACITY = 100_000
@@ -283,6 +283,54 @@ class UserRegistry:
                 if connection.in_transaction:
                     connection.execute("ROLLBACK")
                 raise UserRegistryStorageError("user registry update failed") from exc
+
+    def bootstrap_administrator(self, request: UserCreate, *, password: str) -> UserAccount:
+        """Initialize a new local installation, never recover or replace existing access.
+
+        This is a local setup operation, deliberately not an HTTP endpoint. The
+        empty-registry check, ordinary password verifier, account and audit are
+        committed together. Any prior identity, credential or audit closes it.
+        """
+        if request.role is not UserRole.ADMINISTRATOR or not request.enabled:
+            raise ValueError("local setup requires an enabled administrator")
+        if type(password) is not str or not 12 <= len(password) <= 256:
+            raise ValueError("password must be between 12 and 256 characters")
+        salt = secrets.token_bytes(_SALT_BYTES)
+        verifier = _derive_credential(password, salt)
+        actor = "local-admin-setup"
+        with self._lock:
+            connection = self._require_connection()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                for table in ("users", "user_credentials", "user_audit"):
+                    if connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                        raise UserRegistryConflictError("local administrator setup is closed")
+                user = self._insert_user(connection, request, actor=actor)
+                connection.execute(
+                    """
+                    INSERT INTO user_credentials (
+                        site_id, user_id, scheme, credential_kind, salt, verifier, expires_at
+                    ) VALUES (?, ?, ?, 'password', ?, ?, NULL)
+                    """,
+                    (self._site_id, str(user.id), _CREDENTIAL_SCHEME, salt, verifier),
+                )
+                self._append_audit(
+                    connection,
+                    user_id=user.id,
+                    action="password-initialized",
+                    actor=actor,
+                    changed_fields=("credential_state",),
+                )
+                connection.execute("COMMIT")
+                return user
+            except UserRegistryConflictError:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            except sqlite3.Error as exc:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise UserRegistryStorageError("local administrator setup failed") from exc
 
     def create_with_bootstrap(
         self,
