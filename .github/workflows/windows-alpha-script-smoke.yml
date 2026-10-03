@@ -16,6 +16,7 @@ on:
       - "tests/test_windows_identity_security.py"
       - "docs/RECOVERY_ADMIN.md"
       - "tests/test_windows_alpha_bootstrap.py"
+      - "tests/test_windows_alpha_upgrade.py"
       - "tests/test_public_test_operator_runtime.py"
       - "tests/test_windows_alpha_direct_witness.py"
       - ".github/workflows/windows-alpha-script-smoke.yml"
@@ -34,6 +35,7 @@ on:
       - "tests/test_windows_identity_security.py"
       - "docs/RECOVERY_ADMIN.md"
       - "tests/test_windows_alpha_bootstrap.py"
+      - "tests/test_windows_alpha_upgrade.py"
       - "tests/test_public_test_operator_runtime.py"
       - "tests/test_windows_alpha_direct_witness.py"
       - ".github/workflows/windows-alpha-script-smoke.yml"
@@ -100,7 +102,7 @@ jobs:
       - name: Run Windows alpha boundary regressions
         shell: powershell
         run: |
-          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py -q --no-cov
+          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_windows_alpha_upgrade.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py -q --no-cov
 
       - name: Qualify Windows local recovery identity
         shell: powershell

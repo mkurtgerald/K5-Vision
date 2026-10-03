@@ -25,3 +25,36 @@ This bootstrap provides a bounded Windows test path for the reviewed K5 Vision a
 Physical private-camera acceptance remains a separate gate and does not reuse synthetic/public-test evidence.
 
 This remains an alpha bootstrap, not a signed MSI/EXE installer.
+
+## Upgrade and recovery
+
+Close K5 before reinstalling. The installer refuses an active installed Python
+runtime or a Python process whose executable cannot be identified; it does not
+stop any process. Only one installer may operate on an installation at a time.
+
+A replacement is downloaded into an isolated wheelhouse, installed into a
+candidate environment, and checked by the camera-free preflight while the prior
+installation remains untouched. Activation backs up only `.venv`, the three
+launcher/preflight scripts, the two revision records, and the desktop shortcut
+when requested. It recreates the venv at its final path using the verified local
+wheels and repeats preflight before committing. Configuration and user data are
+not moved or deleted. Existing installations do not reprovision shared GStreamer;
+the requested GStreamer version must already be present and pass preflight.
+
+A failed activation restores the previous managed paths and shortcut. A journal
+allows a later invocation to finish recovery if the installer is interrupted or
+a locked file prevents rollback. Close K5 and rerun the same installer with the
+same install root and desktop location; do not delete the reported recovery
+workspace. A committed upgrade may retain that workspace until a later retry can
+clean it up. This is recoverable activation, not an atomic swap across all files:
+do not launch K5 while upgrading. Unattended replacement of a running application
+and native Windows upgrade acceptance remain separate qualification concerns.
+
+The source and one-file bootstrap revision pins are unchanged by this repair.
+The root one-file bootstrap still downloads the pre-transaction `d531d50` payload
+and does **not** deliver this repair. Use of this source installer requires
+`install_transaction.py` and the existing scripts from the same reviewed source
+payload. The one-file delivery path needs a separate exact installer-payload pin
+update after native Windows qualification; no helper is downloaded separately.
+This repair does not qualify an installed analytics product or a production
+deployment.
