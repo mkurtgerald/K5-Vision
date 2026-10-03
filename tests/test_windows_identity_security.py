@@ -462,18 +462,166 @@ def windows_harness():
     return _recovery_test_module("test_recovery_admin_windows")
 
 
+def _snapshot_protocol_fixture(windows_harness, paths):
+    records = [f"K5_SECURITY_SNAPSHOT|1|{len(paths)}|{USER}|{windows_harness._TRUSTED_INSTALLER}"]
+    items = []
+    for index, path in enumerate(paths):
+        records.append(f"I|{index}|1|{USER}|1|1|2")
+        records.append(f"R|{USER}|Allow|{FULL}|0|3|0")
+        records.append(f"R|{FOREIGN}|Deny|-2147483648|1|2|2")
+        items.append(
+            {
+                "path": str(path),
+                "directory": True,
+                "owner": USER,
+                "dacl_present": True,
+                "dacl_nonnull": True,
+                "rules": [
+                    {
+                        "sid": USER,
+                        "kind": "Allow",
+                        "mask": FULL,
+                        "inherited": False,
+                        "inheritance": 3,
+                        "propagation": 0,
+                    },
+                    {
+                        "sid": FOREIGN,
+                        "kind": "Deny",
+                        "mask": -2147483648,
+                        "inherited": True,
+                        "inheritance": 2,
+                        "propagation": 2,
+                    },
+                ],
+            }
+        )
+    records.append(f"E|{len(paths)}")
+    return "\n".join(records) + "\n", {
+        "current_user": USER,
+        "trusted_installer": windows_harness._TRUSTED_INSTALLER,
+        "items": items,
+    }
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_snapshot_scalar_protocol_preserves_native_fields_and_path_order(windows_harness, newline):
+    paths = [r"C:\K5-Δ-O'Brien\identity", r"C:\second"]
+    wire, expected = _snapshot_protocol_fixture(windows_harness, paths)
+    decoded = windows_harness._decode_security_snapshot(wire.replace("\n", newline), paths)
+    assert decoded == expected
+    windows_harness._assert_private_security(decoded, set(paths))
+
+
+def test_snapshot_scalar_protocol_preserves_empty_rules_and_false_dacl_flags(windows_harness):
+    wire, _ = _snapshot_protocol_fixture(windows_harness, ["fixture"])
+    lines = wire.splitlines()
+    wire = "\n".join([lines[0], f"I|0|0|{USER}|0|0|0", lines[-1]]) + "\n"
+    snapshot = windows_harness._decode_security_snapshot(wire, ["fixture"])
+    item = snapshot["items"][0]
+    assert item["rules"] == []
+    assert item["directory"] is item["dacl_present"] is item["dacl_nonnull"] is False
+    with pytest.raises(AssertionError):
+        windows_harness._assert_private_security(snapshot, {"fixture"})
+
+
+@pytest.mark.parametrize(
+    "alter",
+    [
+        lambda s: "",
+        lambda s: s[:-1],
+        lambda s: s[: s.index("E|")],
+        lambda s: s + "E|2\n",
+        lambda s: s + "unexpected\n",
+        lambda s: s.replace("|1|2|", "|2|2|", 1),
+        lambda s: s.replace("|1|2|", "|1|1|", 1),
+        lambda s: s.replace("I|1|", "I|0|"),
+        lambda s: s.replace("I|0|", "I|1|"),
+        lambda s: s.replace("I|1|", "I|2|"),
+        lambda s: s.replace("E|2", "E|1"),
+        lambda s: s.replace("E|2", "E|02"),
+        lambda s: s.replace("I|0|1|", "I|0|true|"),
+        lambda s: s.replace("I|0|1|", "I|0|2|"),
+        lambda s: s.replace("I|0|1|", "I|0|-0|"),
+        lambda s: s.replace("|1|1|2\n", "|1|1|257\n", 1),
+        lambda s: s.replace("|1|1|2\n", "|1|1|1\n", 1),
+        lambda s: s.replace("|Allow|", "|Unknown|"),
+        lambda s: s.replace("|Allow|", "|Allow|extra|"),
+        lambda s: s.replace("-2147483648", "-2147483649"),
+        lambda s: s.replace("-2147483648", "2147483648"),
+        lambda s: s.replace("|0|3|0\n", "|0|4|0\n"),
+        lambda s: s.replace("|0|3|0\n", "|0|3|4\n"),
+        lambda s: s.replace("|0|3|0\n", "|2|3|0\n"),
+        lambda s: s.replace(USER, "S-2-5-1"),
+        lambda s: s.replace(USER, "S-1-05-1"),
+        lambda s: s.replace(USER, "S-1-281474976710656-1"),
+        lambda s: s.replace(USER, "S-1-5-4294967296"),
+        lambda s: s.replace("K5_SECURITY_SNAPSHOT", "unexpected"),
+        lambda s: "secret-path-Δ\n" + s,
+    ],
+)
+def test_snapshot_scalar_protocol_rejects_malformed_or_partial_output(windows_harness, alter):
+    paths = ["first", "second"]
+    wire, _ = _snapshot_protocol_fixture(windows_harness, paths)
+    with pytest.raises(ValueError):
+        windows_harness._decode_security_snapshot(alter(wire), paths)
+
+
+@pytest.mark.parametrize("paths", [[], ["fixture"] * 65])
+def test_snapshot_path_count_refused_before_native_execution(windows_harness, monkeypatch, paths):
+    monkeypatch.setattr(windows_harness.subprocess, "run", lambda *a, **k: pytest.fail("executed"))
+    with pytest.raises(pytest.fail.Exception, match="path count"):
+        windows_harness._security_snapshot(paths)
+
+
+def test_snapshot_size_bound_and_installer_identity_are_enforced(windows_harness):
+    wire, _ = _snapshot_protocol_fixture(windows_harness, ["fixture"])
+    for invalid in (
+        "x" * (windows_harness._MAX_SNAPSHOT_BYTES + 1),
+        wire.replace(windows_harness._TRUSTED_INSTALLER, USER),
+    ):
+        with pytest.raises(ValueError):
+            windows_harness._decode_security_snapshot(invalid, ["fixture"])
+
+
+def test_snapshot_bad_transport_is_sanitized_without_exception_context(
+    windows_harness, monkeypatch
+):
+    secret = secrets.token_urlsafe(24)
+    monkeypatch.setattr(
+        windows_harness.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=secret, stderr=secret),
+    )
+    with pytest.raises(pytest.fail.Exception) as failure:
+        windows_harness._security_snapshot(["private-fixture"])
+    assert "output was invalid" in str(failure.value)
+    assert secret not in str(failure.value) and "private-fixture" not in str(failure.value)
+    assert failure.value.__context__ is None and failure.value.pytrace is False
+
+
+def test_snapshot_stderr_classification_never_retains_clixml_payload(windows_harness):
+    secret = secrets.token_urlsafe(24)
+    stderr = "#< CLIXML\nK5_SECURITY_STAGE:snapshot-write:0\n" + secret
+    result = windows_harness._security_snapshot_diagnostics(secret, stderr, 1)
+    assert secret not in result
+    diagnostic = json.loads(result)
+    assert diagnostic["stderr_format"] == "clixml"
+    assert diagnostic["unrecognized_stderr_lines"] == 1
+    assert diagnostic["last_stage"] == "snapshot-write"
+
+
 def test_snapshot_command_is_sid_only_bounded_and_unicode_safe(windows_harness, monkeypatch):
     calls = []
-    snapshot = {"current_user": USER, "items": []}
+    path = r"C:\K5 Recovery-Δ-O'Brien\identity"
+    wire, snapshot = _snapshot_protocol_fixture(windows_harness, [path])
     monkeypatch.setattr(
         windows_harness.subprocess,
         "run",
         lambda *args, **kwargs: (
-            calls.append((args, kwargs))
-            or SimpleNamespace(returncode=0, stdout=json.dumps(snapshot), stderr="")
+            calls.append((args, kwargs)) or SimpleNamespace(returncode=0, stdout=wire, stderr="")
         ),
     )
-    path = r"C:\K5 Recovery-Δ-O'Brien\identity"
     assert windows_harness._security_snapshot([path]) == snapshot
     (command,), options = calls[0]
     assert command[:-1] == [
@@ -503,7 +651,14 @@ def test_snapshot_command_is_sid_only_bounded_and_unicode_safe(windows_harness, 
     ) in script
     assert "$acl.GetOwner([System.Security.Principal.SecurityIdentifier])" in script
     assert "$acl.GetAccessRules($true, $true,\n" in script
-    assert "[System.Security.Principal.SecurityIdentifier]) | ForEach-Object" in script
+    assert "[System.Security.Principal.SecurityIdentifier]))" in script
+    assert "ConvertTo-Json" not in script and "ForEach-Object" not in script
+    assert "[Console]::Out.WriteLine" in script
+    assert "foreach ($rule in $rules)" in script
+    assert "[System.Globalization.CultureInfo]::InvariantCulture" in script
+    assert "if ($rules.Count -gt 256)" in script
+    assert "K5_SECURITY_SNAPSHOT|1|" in script
+    assert "[Console]::Out.WriteLine('E|'" in script
     for stage in (
         "script-start",
         "current-user",
@@ -513,7 +668,7 @@ def test_snapshot_command_is_sid_only_bounded_and_unicode_safe(windows_harness, 
         "sid-owner",
         "sid-rules",
         "item-complete",
-        "json-serialize",
+        "snapshot-write",
         "complete",
     ):
         assert "K5_SECURITY_STAGE:" + stage + ":" in script
@@ -533,7 +688,8 @@ def test_snapshot_command_is_sid_only_bounded_and_unicode_safe(windows_harness, 
 
 @pytest.mark.parametrize("output_type", [bytes, str])
 @pytest.mark.parametrize(
-    "last_stage", ["script-start", "path-kind", "acl-read", "sid-rules", "json-serialize"]
+    "last_stage",
+    ["script-start", "path-kind", "acl-read", "sid-rules", "json-serialize", "snapshot-write"],
 )
 def test_snapshot_timeout_preserves_only_scalar_partial_progress(
     windows_harness, monkeypatch, output_type, last_stage
@@ -569,7 +725,7 @@ def test_snapshot_timeout_preserves_only_scalar_partial_progress(
     assert diagnostic["stdout_bytes"] == len(stdout)
     assert diagnostic["stderr_bytes"] == len(stderr)
     assert diagnostic["item_index"] == (
-        0 if last_stage in {"path-kind", "acl-read", "sid-rules"} else None
+        0 if last_stage in {"path-kind", "acl-read", "sid-rules", "snapshot-write"} else None
     )
     assert failure.value.__context__ is None
     assert failure.value.pytrace is False
@@ -589,6 +745,8 @@ def test_snapshot_timeout_before_any_script_marker_is_not_attributed(windows_har
         "completed_items": 0,
         "stdout_bytes": 0,
         "stderr_bytes": 0,
+        "stderr_format": "plain",
+        "unrecognized_stderr_lines": 0,
     }
 
 
