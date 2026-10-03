@@ -1,0 +1,581 @@
+{
+  "distribution_name": "k5-analytics-runtime",
+  "distribution_version": "0.0.0+gc8b347ae538991a0c0ce38eabc2dc17b566531d3",
+  "files": [
+    {
+      "git_blob_sha1": "d4bbb32e54a815cdd7a4a0b5ca83a862e8d6482d",
+      "sha256": "edafd927297339bf0be10d1eb87686094b2ca2614ac2a4f9cdfd97b9fa0e91da",
+      "size": 2869,
+      "source": "analytics",
+      "source_path": "LICENSE",
+      "wheel_path": "k5_analytics_runtime-0.0.0+gc8b347ae538991a0c0ce38eabc2dc17b566531d3.dist-info/licenses/Analytics-Lab-LICENSE"
+    },
+    {
+      "git_blob_sha1": "92ca528fb86aa09d49a866cbb5203ed3eff3bde2",
+      "sha256": "057b29f28bf880b1d1cf913b6eec7fc2b42f47664f6ecf80e10a2b6a729cc1d9",
+      "size": 13887,
+      "source": "analytics",
+      "source_path": "THIRD_PARTY.md",
+      "wheel_path": "k5_analytics_runtime-0.0.0+gc8b347ae538991a0c0ce38eabc2dc17b566531d3.dist-info/licenses/THIRD_PARTY.md"
+    },
+    {
+      "git_blob_sha1": "cceab5057a89834489fb20e1fd111d2cd0e6bee1",
+      "sha256": "50a3e65bcccd3412e3dc6ffa9b95fbdccc30e3f6a87436ac7b16b9bdfbfe734f",
+      "size": 107,
+      "source": "analytics",
+      "source_path": "analytics_lab/__init__.py",
+      "wheel_path": "analytics_lab/__init__.py"
+    },
+    {
+      "git_blob_sha1": "55c28778deabce05c6e5afbbbf0a12b3bf71cd4e",
+      "sha256": "eecc72d5d127561761f32e5443b914d854480a9b1c59bdafcf7dfa7ef43e3854",
+      "size": 1670,
+      "source": "analytics",
+      "source_path": "analytics_lab/__main__.py",
+      "wheel_path": "analytics_lab/__main__.py"
+    },
+    {
+      "git_blob_sha1": "6d1a2f16f6a819db2e2960d85293ea53ecad0cf5",
+      "sha256": "d08cbe80a399407a569e83406288f79989af1f42620107fc6e53267dd267cd2d",
+      "size": 7070,
+      "source": "analytics",
+      "source_path": "analytics_lab/artifacts.py",
+      "wheel_path": "analytics_lab/artifacts.py"
+    },
+    {
+      "git_blob_sha1": "4ab266fbcb5061478d270a622d6d6dba2d4aa396",
+      "sha256": "4683c95311430330afe23ed8f3da4197977b228ec532a75ded807bd8f4be2ba4",
+      "size": 12988,
+      "source": "analytics",
+      "source_path": "analytics_lab/bytetrack.py",
+      "wheel_path": "analytics_lab/bytetrack.py"
+    },
+    {
+      "git_blob_sha1": "593ea19954c6ca137e5dada6338545de6b99f0d1",
+      "sha256": "8b5373df6a77ac37c1832a87d66227f477b70ff6d8775e438f65d10ba26b5f7c",
+      "size": 5858,
+      "source": "analytics",
+      "source_path": "analytics_lab/detector_continuity.py",
+      "wheel_path": "analytics_lab/detector_continuity.py"
+    },
+    {
+      "git_blob_sha1": "731988176ebfb2abf5db9fb6e970e684dc49e2a4",
+      "sha256": "fcb6aa6a1754ed00553fc1ea5042bff090bc0807f9ad556bc10b69737d33674a",
+      "size": 6600,
+      "source": "analytics",
+      "source_path": "analytics_lab/detector_diagnostics.py",
+      "wheel_path": "analytics_lab/detector_diagnostics.py"
+    },
+    {
+      "git_blob_sha1": "1aa7c2860cd5f084dfbae452d107e405b08fafb6",
+      "sha256": "cffef118586b6ec55d76e93f1fad25cf964549904449e878e63d2a523dc1f7f9",
+      "size": 3683,
+      "source": "analytics",
+      "source_path": "analytics_lab/detector_orientation_fallback.py",
+      "wheel_path": "analytics_lab/detector_orientation_fallback.py"
+    },
+    {
+      "git_blob_sha1": "0ff37ae55c8abdc3e8c66a4e2575d0139d32330f",
+      "sha256": "382d72f214b09f2e4c9a1b24e2537f4e2fb59eb5e6c35340c7122066e2e18242",
+      "size": 16658,
+      "source": "analytics",
+      "source_path": "analytics_lab/detector_shootout.py",
+      "wheel_path": "analytics_lab/detector_shootout.py"
+    },
+    {
+      "git_blob_sha1": "11865c9e96ba1039772f9832958b7a60c06da112",
+      "sha256": "21803156fac7ac60bf0dd7402dd971dfa9538c8e8484a2a036f3bfaa4efa1f0f",
+      "size": 13420,
+      "source": "analytics",
+      "source_path": "analytics_lab/detector_thresholds.py",
+      "wheel_path": "analytics_lab/detector_thresholds.py"
+    },
+    {
+      "git_blob_sha1": "f9095051cb65b98f4a796c7ae90679237587dfe1",
+      "sha256": "67aafc9de6d6c5f8ed21096743f32379a4cc4f44b6d4b5f3be8ed03b5661490c",
+      "size": 15144,
+      "source": "analytics",
+      "source_path": "analytics_lab/evaluation.py",
+      "wheel_path": "analytics_lab/evaluation.py"
+    },
+    {
+      "git_blob_sha1": "8c3e1e5840199231fa5e17378acd6345252680dc",
+      "sha256": "cef5de68b09a3ad42b6a91e2b202cc0c48a8aa5cb0b9cbf08645c133afc43f14",
+      "size": 8199,
+      "source": "analytics",
+      "source_path": "analytics_lab/face_donor_facessd_admission.py",
+      "wheel_path": "analytics_lab/face_donor_facessd_admission.py"
+    },
+    {
+      "git_blob_sha1": "f7664818db2d6a2ca733c0b6336b4f119c71eba2",
+      "sha256": "51c4e729f2c1ad57adae9a5756f4313d9595a65b10c50d255bed60f2b0302403",
+      "size": 6035,
+      "source": "analytics",
+      "source_path": "analytics_lab/face_donor_facessd_opencv_probe.py",
+      "wheel_path": "analytics_lab/face_donor_facessd_opencv_probe.py"
+    },
+    {
+      "git_blob_sha1": "4eef724ebd2eaf937e0b2a8db31a548ba83c64ab",
+      "sha256": "9850471116416db4160cf282c51fdde970a3c0e8ad8626d19a8e35ace142a330",
+      "size": 7947,
+      "source": "analytics",
+      "source_path": "analytics_lab/face_donor_facessd_rewrite_probe.py",
+      "wheel_path": "analytics_lab/face_donor_facessd_rewrite_probe.py"
+    },
+    {
+      "git_blob_sha1": "a5b96ba0505aae5a810eb8523a6752f976c04262",
+      "sha256": "af792f879765cd60852b3146b57a3b8e4b4ba4de334c01222398725096b63cb2",
+      "size": 13350,
+      "source": "analytics",
+      "source_path": "analytics_lab/face_privacy.py",
+      "wheel_path": "analytics_lab/face_privacy.py"
+    },
+    {
+      "git_blob_sha1": "8c5a0a3e519708b29570f9ccc3719c8fa9e602e1",
+      "sha256": "856e45eb899ffc964b9cb71e1d4df2ec54d1fe67f4c22c515002ace9224eb9c9",
+      "size": 2178,
+      "source": "analytics",
+      "source_path": "analytics_lab/face_privacy_evidence.py",
+      "wheel_path": "analytics_lab/face_privacy_evidence.py"
+    },
+    {
+      "git_blob_sha1": "bafd6ee4848eb97f115bd189b0d96b412bef7504",
+      "sha256": "c6b48a8bceccb67613e0b1ccb859458cf335923e85e369872defc62ca2314a88",
+      "size": 13093,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_acquisition.py",
+      "wheel_path": "analytics_lab/figshare_acquisition.py"
+    },
+    {
+      "git_blob_sha1": "69867693c9a331a38e42ff0178dc4144ee1cf163",
+      "sha256": "0c859878dc06bca9f16e278d6d8c731f77f6102914e87139d12c7542187b45f4",
+      "size": 6274,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_generalization.py",
+      "wheel_path": "analytics_lab/figshare_generalization.py"
+    },
+    {
+      "git_blob_sha1": "d3395024aad92113d0cd262c731cd89672cf1af3",
+      "sha256": "65bb636e2f68f6655fbb8191413f3532a9c32388d4094f4f57c814c7f6426c65",
+      "size": 6223,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_generalization2_admission.py",
+      "wheel_path": "analytics_lab/figshare_generalization2_admission.py"
+    },
+    {
+      "git_blob_sha1": "70526edd1ca1c2ac7c67514b122ea902f21d8e56",
+      "sha256": "b127a5b3f17f4a01f3b0a4d2a53a1f2a84256f5bb128ea98162a771b481726ec",
+      "size": 10077,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_generalization2_person_down_diagnostic.py",
+      "wheel_path": "analytics_lab/figshare_generalization2_person_down_diagnostic.py"
+    },
+    {
+      "git_blob_sha1": "61a255f4412df9708a7f0976f98a87dcb3f2b35b",
+      "sha256": "dcc888ee4ca8536f0010cadb1ac59a0b6d15d1bd4ff2798d05281a01450415d6",
+      "size": 6219,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_generalization3_admission.py",
+      "wheel_path": "analytics_lab/figshare_generalization3_admission.py"
+    },
+    {
+      "git_blob_sha1": "370ba76c4e1de68384ea24d714731b273011373b",
+      "sha256": "28c492c02bc91fdfbe62c052f46a41dfc16ef3f6a8c83b957c194122c0350409",
+      "size": 9783,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_generalization3_person_down_diagnostic.py",
+      "wheel_path": "analytics_lab/figshare_generalization3_person_down_diagnostic.py"
+    },
+    {
+      "git_blob_sha1": "68ebb305d63175f27eda2fc58e963b60c4bdf859",
+      "sha256": "ee03467886298c1dec247cd3afe72dd3aaa6a51363080046e048eb136d797ec8",
+      "size": 5791,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_generalization4_admission.py",
+      "wheel_path": "analytics_lab/figshare_generalization4_admission.py"
+    },
+    {
+      "git_blob_sha1": "6f91881bcbb595a353e088100759b924d2ac2ca5",
+      "sha256": "eb34361b67511518eed87a8db5aba8b256f50a88eea5f6744b76ee6593f9391e",
+      "size": 9359,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_generalization4_person_down_diagnostic.py",
+      "wheel_path": "analytics_lab/figshare_generalization4_person_down_diagnostic.py"
+    },
+    {
+      "git_blob_sha1": "89b2b6584e096d389dedc1326925779f41ec2165",
+      "sha256": "fbaa8685b611d1628b15e1c04e593597f8b59f1576121ee1d78a9d2e6edd939a",
+      "size": 6637,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_generalization5_admission.py",
+      "wheel_path": "analytics_lab/figshare_generalization5_admission.py"
+    },
+    {
+      "git_blob_sha1": "f924449e4020b630ebf1d42f3fc49d33a01b9329",
+      "sha256": "69162894733ddd4bf330215cf9a1f69dd61dc447649fb260003c02bc5b3b5468",
+      "size": 9379,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_generalization5_person_down_diagnostic.py",
+      "wheel_path": "analytics_lab/figshare_generalization5_person_down_diagnostic.py"
+    },
+    {
+      "git_blob_sha1": "7e22fb4824ccb25cfb9a26a4daa6a0bd81b2f5ef",
+      "sha256": "d2b1fe964514084c3cb5f4693bc35e5c789638f3d9e79c7977f1ab68be224151",
+      "size": 11758,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_member_admission.py",
+      "wheel_path": "analytics_lab/figshare_member_admission.py"
+    },
+    {
+      "git_blob_sha1": "735590b685f298fcb2db11b34574854454b0e37c",
+      "sha256": "27e8c24d98d81c6853df30f191dba15d45b30f7c8612b1dbcccf4af6879ab3e3",
+      "size": 9613,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_person_down_diagnostic.py",
+      "wheel_path": "analytics_lab/figshare_person_down_diagnostic.py"
+    },
+    {
+      "git_blob_sha1": "560db2cf444d06cf752c5a38b3e1622c9553863e",
+      "sha256": "c9a676619268869e7ba19c112c0b9bd6fad699bbb218275243892b7c5032252f",
+      "size": 10370,
+      "source": "analytics",
+      "source_path": "analytics_lab/figshare_probe.py",
+      "wheel_path": "analytics_lab/figshare_probe.py"
+    },
+    {
+      "git_blob_sha1": "fe206b0c436f367be7031ffceb43a48ee899c5ec",
+      "sha256": "6913c9d5d9557b3666ffdc5e6897721e715090f96295c2b3d264213756d04387",
+      "size": 7910,
+      "source": "analytics",
+      "source_path": "analytics_lab/iou_tracker.py",
+      "wheel_path": "analytics_lab/iou_tracker.py"
+    },
+    {
+      "git_blob_sha1": "095b25396064cc90ec1a70822084e1ac44286891",
+      "sha256": "001d7de1df2812a623b6f9b192ff20b28434ae09b1126287dbe5c156fa10a273",
+      "size": 8734,
+      "source": "analytics",
+      "source_path": "analytics_lab/lpr_front_envelope_evidence.py",
+      "wheel_path": "analytics_lab/lpr_front_envelope_evidence.py"
+    },
+    {
+      "git_blob_sha1": "e8f80537aa1fd448eea9a36df10229c3130cf590",
+      "sha256": "346923b3c0ae523c76498f24386bf785b5f4888d41f83501920c731be0e6df07",
+      "size": 19615,
+      "source": "analytics",
+      "source_path": "analytics_lab/lpr_ocr.py",
+      "wheel_path": "analytics_lab/lpr_ocr.py"
+    },
+    {
+      "git_blob_sha1": "c2c53d339a01af619d454e02f10895ac95532020",
+      "sha256": "157a48b0ff375e3c4946dcd2148e3768df5182568b80adf18bcd5e34c2cc2a45",
+      "size": 14227,
+      "source": "analytics",
+      "source_path": "analytics_lab/lpr_ocr_exact_evidence.py",
+      "wheel_path": "analytics_lab/lpr_ocr_exact_evidence.py"
+    },
+    {
+      "git_blob_sha1": "ddb00bbfae1b4c0873563235a55b94fd5dcabaaa",
+      "sha256": "ccfa90fc4984e97a0321ddfe79fb8ae0503d60bc0fcbeaffe8aa834c6c112d90",
+      "size": 6103,
+      "source": "analytics",
+      "source_path": "analytics_lab/lpr_ocr_fixed_crop_evidence.py",
+      "wheel_path": "analytics_lab/lpr_ocr_fixed_crop_evidence.py"
+    },
+    {
+      "git_blob_sha1": "743fd4dd9cf498ce1db6d277747d6240931596f3",
+      "sha256": "a80f05d389f9d5557f53b85da70d674a2da62813c36af3c26060965983161fb5",
+      "size": 10186,
+      "source": "analytics",
+      "source_path": "analytics_lab/lpr_ocr_sc_evidence.py",
+      "wheel_path": "analytics_lab/lpr_ocr_sc_evidence.py"
+    },
+    {
+      "git_blob_sha1": "9e396df49d47495f000a65e23eb1dcf0cf9e5a4f",
+      "sha256": "54973b775acff4e5dd4710c8bb14cf7fd17b1929281e8883e0fd283e31ee5774",
+      "size": 10153,
+      "source": "analytics",
+      "source_path": "analytics_lab/lpr_ocr_wa_evidence.py",
+      "wheel_path": "analytics_lab/lpr_ocr_wa_evidence.py"
+    },
+    {
+      "git_blob_sha1": "0af618766988db2dca9a13bd0119d3f7384aa1a2",
+      "sha256": "e2de82df0a62fa0d8b85a2496dea7c1a9b2d0c7326cca98e984126403830ba41",
+      "size": 10570,
+      "source": "analytics",
+      "source_path": "analytics_lab/lpr_plate_proposals.py",
+      "wheel_path": "analytics_lab/lpr_plate_proposals.py"
+    },
+    {
+      "git_blob_sha1": "1be3d29d09d914ff5b0b6984584330e546f269a0",
+      "sha256": "d6c2e85797c474087be0ab5720b0eda2feaff9a43eb1432f64ca5d15e10c69ad",
+      "size": 7272,
+      "source": "analytics",
+      "source_path": "analytics_lab/lpr_vehicle_scene_evidence.py",
+      "wheel_path": "analytics_lab/lpr_vehicle_scene_evidence.py"
+    },
+    {
+      "git_blob_sha1": "f37b557d7c224630b8b7641a5a2465046f64e729",
+      "sha256": "e6377f7337b4712d9ffbb0d2b4161dc98b560404cdb4cf5008213374b275af5a",
+      "size": 7383,
+      "source": "analytics",
+      "source_path": "analytics_lab/lpr_wikimedia_evidence.py",
+      "wheel_path": "analytics_lab/lpr_wikimedia_evidence.py"
+    },
+    {
+      "git_blob_sha1": "585389afbee4241468bf71f6a61bce17de40d7c6",
+      "sha256": "bb0be8dbbb8581db8bed7a3d2c57469212f54e554af4be4e94d51e32fdb62be9",
+      "size": 17998,
+      "source": "analytics",
+      "source_path": "analytics_lab/openpose_association_diagnostics.py",
+      "wheel_path": "analytics_lab/openpose_association_diagnostics.py"
+    },
+    {
+      "git_blob_sha1": "e477a04ae2ef60f7600209b70a82ab42e7502565",
+      "sha256": "2e46860df4a221593fd8f21c546945b2d415e1864a2779dbbf85a62894b838fb",
+      "size": 12853,
+      "source": "analytics",
+      "source_path": "analytics_lab/openpose_diagnostics.py",
+      "wheel_path": "analytics_lab/openpose_diagnostics.py"
+    },
+    {
+      "git_blob_sha1": "3f74ff5fac9bcb92d21590bb77b91d83832ab947",
+      "sha256": "11390fbef02fba5e02a51ce40ff64b664ca4e469781b9f13cf9dfe9e15057fe8",
+      "size": 447,
+      "source": "analytics",
+      "source_path": "analytics_lab/openpose_diagnostics_v2.py",
+      "wheel_path": "analytics_lab/openpose_diagnostics_v2.py"
+    },
+    {
+      "git_blob_sha1": "c34d080e81cf61f7a79fb0b04620cd8657111acd",
+      "sha256": "8228c280f344c5e508526e6cf507e5f2bf49304fde2e96fe1050a66b24af91d0",
+      "size": 7323,
+      "source": "analytics",
+      "source_path": "analytics_lab/openpose_pose_geometry.py",
+      "wheel_path": "analytics_lab/openpose_pose_geometry.py"
+    },
+    {
+      "git_blob_sha1": "a3abbf977dacdb10c84787e04ae755b10c644ab6",
+      "sha256": "18dbac9dc3ade8c5fd2db9d5437d7b69d4a8431343b678910b49acfc042c5f0d",
+      "size": 17874,
+      "source": "analytics",
+      "source_path": "analytics_lab/openpose_reference.py",
+      "wheel_path": "analytics_lab/openpose_reference.py"
+    },
+    {
+      "git_blob_sha1": "dffb1c4e2e9c20d9b2598732c877c48f5c73d735",
+      "sha256": "9f3612f59f65bba6bf0bbb2746ddbda98be22cf21eea692acf0667f7832238b2",
+      "size": 14450,
+      "source": "analytics",
+      "source_path": "analytics_lab/openvino_omz.py",
+      "wheel_path": "analytics_lab/openvino_omz.py"
+    },
+    {
+      "git_blob_sha1": "0de755ce83373812ee637c24865493a124785648",
+      "sha256": "76d23338271e81b9dba6fb81149a5d178b3479c164ba972e099728bf36849799",
+      "size": 6697,
+      "source": "analytics",
+      "source_path": "analytics_lab/openvino_pipeline.py",
+      "wheel_path": "analytics_lab/openvino_pipeline.py"
+    },
+    {
+      "git_blob_sha1": "e43683d9bbd8e93e05a746217c04b05b079c019a",
+      "sha256": "8006e7265457e052c5e5d169bc2e1f24755262acbae07a36c6ea2c01e3039586",
+      "size": 14522,
+      "source": "analytics",
+      "source_path": "analytics_lab/perception.py",
+      "wheel_path": "analytics_lab/perception.py"
+    },
+    {
+      "git_blob_sha1": "244d05ab59fdf1493563ec0485c1380be042e96a",
+      "sha256": "6baeb036761232fd4ad8e29965d0e5d79ef0b13b6fe6e893c15e211aec0bc223",
+      "size": 18133,
+      "source": "analytics",
+      "source_path": "analytics_lab/person_down_e2e_diagnostics.py",
+      "wheel_path": "analytics_lab/person_down_e2e_diagnostics.py"
+    },
+    {
+      "git_blob_sha1": "22dad04a0ed06e04230e72c9c9fd030477461986",
+      "sha256": "56aefe6fac36dc0931868dfb03a65ea989e42cbd71b9f42b769fb5ebfe051e90",
+      "size": 22396,
+      "source": "analytics",
+      "source_path": "analytics_lab/person_down_orientation_diagnostics.py",
+      "wheel_path": "analytics_lab/person_down_orientation_diagnostics.py"
+    },
+    {
+      "git_blob_sha1": "e2b1fa283d6d4fb7fc7ae0ba84c2ded8ca28005b",
+      "sha256": "4123873949cb0be33122a55330715edb2bf5698b4dec053457050679273c625a",
+      "size": 5310,
+      "source": "analytics",
+      "source_path": "analytics_lab/pose_adaptation_readiness.py",
+      "wheel_path": "analytics_lab/pose_adaptation_readiness.py"
+    },
+    {
+      "git_blob_sha1": "123f75d270e999e2820c041f5d87bccf3b365df7",
+      "sha256": "8a06696b603ad849c27df1b1cf5ad04d052562f89bfe5a24056e5954e67e0799",
+      "size": 13544,
+      "source": "analytics",
+      "source_path": "analytics_lab/pose_diagnostics.py",
+      "wheel_path": "analytics_lab/pose_diagnostics.py"
+    },
+    {
+      "git_blob_sha1": "30ee20db9e4d2084299301bf0a17af2bdb9cece5",
+      "sha256": "516ada9aa7525fac09f848fbcc38d8098afc05e0064a84f663bcfa73db775efc",
+      "size": 9722,
+      "source": "analytics",
+      "source_path": "analytics_lab/posture_quality_diagnostics.py",
+      "wheel_path": "analytics_lab/posture_quality_diagnostics.py"
+    },
+    {
+      "git_blob_sha1": "a9f4fba239d25fb7748449d761fb36097fa737fc",
+      "sha256": "86a206c76612631b5e9a36f0b0fc58d4882a320a35c3f7418fce283daf362274",
+      "size": 5220,
+      "source": "analytics",
+      "source_path": "analytics_lab/source_rights.py",
+      "wheel_path": "analytics_lab/source_rights.py"
+    },
+    {
+      "git_blob_sha1": "0adbcdb3e5014d2ff8440818703c7cbdcee762af",
+      "sha256": "0634090a2e3e31dd04d7d3b9e66f235ac9892d99a913ebe115350275aad66e4a",
+      "size": 9615,
+      "source": "analytics",
+      "source_path": "analytics_lab/temporal.py",
+      "wheel_path": "analytics_lab/temporal.py"
+    },
+    {
+      "git_blob_sha1": "467a3c816259a02be8ae2fa9c084b177a8fa5908",
+      "sha256": "7ad9ab93f03cbc8dc0de2b35131fe37f6bed7612108f6d2dad614457babfe858",
+      "size": 7097,
+      "source": "analytics",
+      "source_path": "analytics_lab/tracking.py",
+      "wheel_path": "analytics_lab/tracking.py"
+    },
+    {
+      "git_blob_sha1": "78e200f5b84fb1aa009793fbc37c2a2f4a4d6178",
+      "sha256": "bf20ac091bf210905edcf009d8d2ade450947976fb770fd7f7954f4f83101a73",
+      "size": 5046,
+      "source": "analytics",
+      "source_path": "analytics_lab/tracking_annotations.py",
+      "wheel_path": "analytics_lab/tracking_annotations.py"
+    },
+    {
+      "git_blob_sha1": "7c69f76fbccd10b44eebc998dc90a8e2a9800baa",
+      "sha256": "0e36673aa0eaf9e84fe5823df4c984d002b2e3dd845ef46175a1f32fabae065b",
+      "size": 4553,
+      "source": "analytics",
+      "source_path": "analytics_lab/tracking_benchmark_plan.py",
+      "wheel_path": "analytics_lab/tracking_benchmark_plan.py"
+    },
+    {
+      "git_blob_sha1": "ebd32f8dad714c254afa83165851221f9671ecd1",
+      "sha256": "be7b0d7b730acc015bb1f7f508b3467dcb0e395cd68ca215c75586c40f33a257",
+      "size": 10678,
+      "source": "analytics",
+      "source_path": "analytics_lab/tracking_evaluation.py",
+      "wheel_path": "analytics_lab/tracking_evaluation.py"
+    },
+    {
+      "git_blob_sha1": "cca8d7861db5a76781c0ef8a68fc42cc3b11ca27",
+      "sha256": "a78ab479ee140b0cad46981b39eea9d26ec38751885ed6aae42f8a0471ec479a",
+      "size": 5900,
+      "source": "analytics",
+      "source_path": "analytics_lab/tracking_evidence.py",
+      "wheel_path": "analytics_lab/tracking_evidence.py"
+    },
+    {
+      "git_blob_sha1": "aef50248d2344ebc3cc50c0b1d9b69fc4b35b258",
+      "sha256": "ee21f93cda3de3b48308d7b34ae87c8cadecf30d89eb413e2e1ce56da7cefbdd",
+      "size": 9264,
+      "source": "analytics",
+      "source_path": "analytics_lab/tracking_ground_truth_package.py",
+      "wheel_path": "analytics_lab/tracking_ground_truth_package.py"
+    },
+    {
+      "git_blob_sha1": "5b5ac47598398cd7a9670f9c342e90fbb89d139c",
+      "sha256": "fd60338661d73767e0930289249751a205b24a0eb93d2df21eb63f21472faeaf",
+      "size": 10328,
+      "source": "analytics",
+      "source_path": "analytics_lab/tracking_head_to_head.py",
+      "wheel_path": "analytics_lab/tracking_head_to_head.py"
+    },
+    {
+      "git_blob_sha1": "9acd3516829f52b95c03b26a634a628f683e8101",
+      "sha256": "2f82082d2a6df4dc747152b079bf1d650e22e6d921689b58a732cf8286f02fa1",
+      "size": 6875,
+      "source": "analytics",
+      "source_path": "analytics_lab/uvify_tracking.py",
+      "wheel_path": "analytics_lab/uvify_tracking.py"
+    },
+    {
+      "git_blob_sha1": "8dbce4300345664a66b8974ae98fb2ea0c6a773a",
+      "sha256": "2d08576f9ffddc4ebba7149673f377a61c9595feb0576f1b5a022592d6aabcdf",
+      "size": 16562,
+      "source": "analytics",
+      "source_path": "analytics_lab/validation.py",
+      "wheel_path": "analytics_lab/validation.py"
+    },
+    {
+      "git_blob_sha1": "23e481e1c0bb2f7df169b810c0a9cd3999cee1f3",
+      "sha256": "b0d8a2b8427f8ad423af4848bebd5ec3e63811fc2e1a89f4e817f5264273b90b",
+      "size": 8866,
+      "source": "analytics",
+      "source_path": "analytics_lab/validation_cli.py",
+      "wheel_path": "analytics_lab/validation_cli.py"
+    },
+    {
+      "git_blob_sha1": "df238cbec99456cd8c6dc5b7d083f2d49ee341d9",
+      "sha256": "3b8cee578ebf3660dc8007fa9a2627b38ace7f1ce6f8b015bf76cea19108579d",
+      "size": 16740,
+      "source": "analytics",
+      "source_path": "analytics_lab/validation_seed.py",
+      "wheel_path": "analytics_lab/validation_seed.py"
+    },
+    {
+      "git_blob_sha1": "f7405082f8d849d7498ae988cd9e0df8e5092e0e",
+      "sha256": "9d7acb177473bef6097a4c513abde530af281a3438435bc93ae5ef2063831da6",
+      "size": 9951,
+      "source": "analytics",
+      "source_path": "analytics_lab/video.py",
+      "wheel_path": "analytics_lab/video.py"
+    },
+    {
+      "git_blob_sha1": "7e97dccc62b38f54cb60e0d95be9dfbcec2a5c30",
+      "sha256": "ff4cdb8f15f3881e86b0c8355ae08087724e7e727ec11e4db48de896b873f284",
+      "size": 4835,
+      "source": "analytics",
+      "source_path": "analytics_lab/wikimedia_tracking_admission.py",
+      "wheel_path": "analytics_lab/wikimedia_tracking_admission.py"
+    },
+    {
+      "git_blob_sha1": "f6709588f3cbf4049025ad286058818b7731a5ac",
+      "sha256": "f687e27495ad2b8698ba23eb2221d671312520aea311d6af41b54819f6a24d54",
+      "size": 9248,
+      "source": "analytics",
+      "source_path": "analytics_lab/wikimedia_tracking_frame_evidence.py",
+      "wheel_path": "analytics_lab/wikimedia_tracking_frame_evidence.py"
+    },
+    {
+      "git_blob_sha1": "dfba850f8da707522d7b1d71636ba3ed6c7d0a28",
+      "sha256": "e9d83751678cbaba6dfba902ea39215c423d93425e58f8450d6001f7261696f9",
+      "size": 1067,
+      "source": "analytics",
+      "source_path": "third_party/licenses/ByteTrack-MIT.txt",
+      "wheel_path": "k5_analytics_runtime-0.0.0+gc8b347ae538991a0c0ce38eabc2dc17b566531d3.dist-info/licenses/ByteTrack-MIT.txt"
+    },
+    {
+      "git_blob_sha1": "261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "size": 11357,
+      "source": "supplemental-notice",
+      "source_path": "analytics-runtime-Apache-2.0.txt",
+      "source_repository": "https://github.com/openvinotoolkit/open_model_zoo",
+      "source_revision": "6697dead54ed1cdd664b0313189c2cb52ee6335e",
+      "upstream_path": "LICENSE",
+      "wheel_path": "k5_analytics_runtime-0.0.0+gc8b347ae538991a0c0ce38eabc2dc17b566531d3.dist-info/licenses/Apache-2.0.txt"
+    }
+  ],
+  "qualification": "engineering-only; no production or commercial redistribution clearance",
+  "schema_version": 1,
+  "source_repository": "https://github.com/mkurtgerald/Analytics-lab",
+  "source_revision": "c8b347ae538991a0c0ce38eabc2dc17b566531d3"
+}
