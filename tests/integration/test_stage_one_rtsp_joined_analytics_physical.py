@@ -11,6 +11,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
 import socket
 import subprocess
 import time
@@ -18,7 +19,14 @@ from pathlib import Path
 
 import pytest
 
-from k5vision.media.gstreamer_direct_frame_delivery import GStreamerDirectFrameDelivery
+from k5vision.media.gstreamer_direct_frame_delivery import (
+    GStreamerDirectFrameDelivery,
+    _DirectRtspFrameBackend,
+)
+from k5vision.media.gstreamer_playback_decoder import (
+    NativePlaybackDecoderError,
+    NativePlaybackDecoderErrorCode,
+)
 from k5vision.operator_launch import ResolvedLiveSource
 from k5vision.operator_runtime import WindowsSingleLiveOperatorLauncher
 
@@ -61,15 +69,135 @@ def _free_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _wait_for_loopback_listener(port: int, *, timeout_seconds: float = 8.0) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
+def _wait_for_loopback_listener(port: int, *, deadline: float) -> None:
+    while (remaining := deadline - time.monotonic()) > 0:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.25):
-                return
+            with socket.create_connection(("127.0.0.1", port), timeout=min(0.25, remaining)):
+                if time.monotonic() < deadline:
+                    return
         except OSError:
-            time.sleep(0.1)
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
     raise RuntimeError("loopback RTSP server did not become ready")
+
+
+def _probe_reviewed_rtsp_publication(port: int, *, deadline: float) -> bool:
+    """Read a bounded SDP from only the owned loopback fixture; retain no response."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return False
+    with socket.create_connection(("127.0.0.1", port), timeout=min(0.25, remaining)) as peer:
+
+        def bounded_timeout() -> float:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            return min(0.25, remaining)
+
+        peer.settimeout(bounded_timeout())
+        peer.sendall(
+            f"DESCRIBE rtsp://127.0.0.1:{port}/k5reviewed RTSP/1.0\r\n"
+            "CSeq: 1\r\nAccept: application/sdp\r\n\r\n".encode("ascii")
+        )
+        response = bytearray()
+
+        def receive() -> bytes:
+            peer.settimeout(bounded_timeout())
+            chunk = peer.recv(min(1024, 8193 - len(response)))
+            bounded_timeout()
+            if not chunk:
+                raise ConnectionError
+            response.extend(chunk)
+            if len(response) > 8192:
+                raise RuntimeError("reviewed RTSP publication response exceeded bound")
+            return chunk
+
+        while b"\r\n\r\n" not in response:
+            receive()
+            if len(response) > 4096:
+                raise RuntimeError("reviewed RTSP publication headers exceeded bound")
+        header_bytes, _, body = response.partition(b"\r\n\r\n")
+        try:
+            lines = header_bytes.decode("ascii").split("\r\n")
+            status = re.fullmatch(r"RTSP/1\.0 ([0-9]{3})(?: [^\r\n]*)?", lines[0])
+            headers: dict[str, str] = {}
+            for line in lines[1:]:
+                key, value = line.split(":", 1)
+                key = key.strip().lower()
+                if not key or key in headers:
+                    raise ValueError
+                headers[key] = value.strip()
+            if status is None or headers.get("cseq") != "1":
+                raise ValueError
+            length_text = headers.get("content-length", "0")
+            if not re.fullmatch(r"[0-9]{1,4}", length_text):
+                raise ValueError
+            body_length = int(length_text)
+            if body_length > 4096 or len(body) > body_length:
+                raise ValueError
+        except (UnicodeError, ValueError):
+            raise RuntimeError("reviewed RTSP publication response was invalid") from None
+        if status.group(1) in {"404", "503"}:
+            return False
+        if status.group(1) != "200":
+            raise RuntimeError("reviewed RTSP publication status was rejected")
+        if headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/sdp":
+            raise RuntimeError("reviewed RTSP publication SDP was unavailable")
+        while len(body) < body_length:
+            receive()
+            body = response.partition(b"\r\n\r\n")[2]
+            if len(body) > body_length:
+                raise RuntimeError("reviewed RTSP publication response was invalid")
+        try:
+            sdp = body.decode("ascii")
+        except UnicodeError:
+            raise RuntimeError("reviewed RTSP publication SDP was invalid") from None
+        # The owned fixture and ResolvedLiveSource below use the same H264 payload.
+        if not re.search(r"(?m)^m=video [0-9]+ RTP/AVP(?: [0-9]+)* 96(?: [0-9]+)*\r?$", sdp):
+            raise RuntimeError("reviewed RTSP publication video was unavailable")
+        if not re.search(r"(?mi)^a=rtpmap:96 H264/90000\r?$", sdp):
+            raise RuntimeError("reviewed RTSP publication codec was unsupported")
+        bounded_timeout()
+        return True
+
+
+def _wait_for_reviewed_rtsp_publication(
+    port: int,
+    server: subprocess.Popen[bytes],
+    publisher: subprocess.Popen[bytes],
+    *,
+    deadline: float,
+) -> None:
+    # Listener startup and publication share the existing eight-second startup budget.
+    while time.monotonic() < deadline:
+        if server.poll() is not None or publisher.poll() is not None:
+            raise RuntimeError("reviewed RTSP publication process exited before readiness")
+        try:
+            ready = _probe_reviewed_rtsp_publication(port, deadline=deadline)
+        except OSError:
+            ready = False
+        if ready:
+            if server.poll() is not None or publisher.poll() is not None:
+                raise RuntimeError("reviewed RTSP publication process exited before readiness")
+            if time.monotonic() >= deadline:
+                break
+            return
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    raise RuntimeError("reviewed RTSP publication readiness deadline expired")
+
+
+def _decoder_init_failure_category(error: Exception) -> str:
+    """Return only fixed project-owned labels, never native errors or source details."""
+    if not isinstance(error, NativePlaybackDecoderError):
+        return "unexpected_initialization_failure"
+    if error.code is NativePlaybackDecoderErrorCode.RUNTIME_UNAVAILABLE:
+        return "runtime_unavailable"
+    return {
+        "native decoder initialization failed": "native_initialization_failed",
+        "direct live decoder pipeline could not be created": "pipeline_creation_failed",
+        "direct live decoder sink is unavailable": "pipeline_sink_unavailable",
+        "direct live decoder pipeline failed to start": "pipeline_start_failed",
+        "direct live decoder pipeline failed during startup": "pipeline_startup_failed",
+    }.get(str(error), "native_initialization_failure")
 
 
 def _stop_owned_process(process: subprocess.Popen[bytes] | None) -> None:
@@ -144,13 +272,14 @@ def test_rtsp_detector_tracker_overlay_reaches_windows_operator(tmp_path: Path) 
     publisher: subprocess.Popen[bytes] | None = None
     provider = _JoinedAnalyticsProvider(evidence_root)
     try:
+        readiness_deadline = time.monotonic() + 8.0
         server = subprocess.Popen(
             [str(mediamtx), str(config_path)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        _wait_for_loopback_listener(port)
+        _wait_for_loopback_listener(port, deadline=readiness_deadline)
         if server.poll() is not None:
             raise RuntimeError("loopback RTSP server exited during startup")
 
@@ -188,9 +317,17 @@ def test_rtsp_detector_tracker_overlay_reaches_windows_operator(tmp_path: Path) 
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        time.sleep(0.75)
-        if publisher.poll() is not None or server.poll() is not None:
-            raise RuntimeError("loopback reviewed-video RTSP publisher failed to remain available")
+        _wait_for_reviewed_rtsp_publication(port, server, publisher, deadline=readiness_deadline)
+        decoder_failure: list[str] = []
+
+        def backend_factory(
+            source: str, max_bytes: int, startup_ms: int
+        ) -> _DirectRtspFrameBackend:
+            try:
+                return _DirectRtspFrameBackend(source, max_bytes, startup_ms)
+            except Exception as error:
+                decoder_failure.append(_decoder_init_failure_category(error))
+                raise
 
         def delivery_factory(payload_type: int) -> GStreamerDirectFrameDelivery:
             assert 96 <= payload_type <= 127
@@ -202,19 +339,27 @@ def test_rtsp_detector_tracker_overlay_reaches_windows_operator(tmp_path: Path) 
                 consumer_timeout_seconds=10.0,
                 pull_poll_ms=100,
                 startup_probe_ms=5_000,
+                backend_factory=backend_factory,
             )
 
         launcher = WindowsSingleLiveOperatorLauncher(
             delivery_factory=delivery_factory,
             detection_provider=provider,
         )
-        metrics = asyncio.run(
-            launcher.run(
-                ResolvedLiveSource(source_uri, 96),
-                width=1280,
-                height=720,
+        try:
+            metrics = asyncio.run(
+                launcher.run(
+                    ResolvedLiveSource(source_uri, 96),
+                    width=1280,
+                    height=720,
+                )
             )
-        )
+        except Exception:
+            if decoder_failure:
+                raise RuntimeError(
+                    "RTSP joined decoder initialization failed: " + decoder_failure[0]
+                ) from None
+            raise
     finally:
         try:
             _stop_owned_process(publisher)
