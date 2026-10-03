@@ -1,0 +1,1 @@
+Stage-One fallback branch created for public RTSP -> analytics -> detections -> tracker -> overlay -> operator-screen acceptance work. No production behavior changed in this commit.
