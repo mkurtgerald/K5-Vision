@@ -111,13 +111,18 @@ def notification_categories(data: bytes) -> list[tuple[str, str]]:
     return [(classify_temp(name), action) for name, action in _notification_events(data)]
 
 
+# Exact observed profiles: (ps1 files, psm1 files, distinct names, total events).
+# No zero-pair, asymmetric, partial or open-ended cardinality is admitted.
+POLICY_PROFILES = frozenset({(1, 1, 2, 6), (2, 2, 4, 12)})
+
+
 class PolicyLifecycle:
-    """Exact four-file observed initialization profile, with no ignored events.
+    """One complete pair OR two complete pairs, with no ignored events.
 
     Microsoft's application-control documentation defines top-level random 8.3
     .ps1/.psm1 policy probes. GetAppLockerPolicy writes/deletes paired files.
-    The qualification profile requires two pairs, one add/write/delete each. Its
-    notification cardinality is intentionally fail-closed, not an OS-wide claim.
+    Each file requires one add/write/delete. The finite profiles reflect the
+    separately observed native and hosted traces, not an OS-wide frequency claim.
     The lowercase alphanumeric 8.3 alphabet is the approved documented shape,
     not an assertion of the exact .NET random-name generator.
     Names only establish a documented shape; the watcher does not identify writers.
@@ -156,9 +161,8 @@ class PolicyLifecycle:
     def complete(self) -> bool:
         return (
             not self.invalid
-            and self.extensions == {"ps1": 2, "psm1": 2}
-            and self.events == 12
-            and len(self.states) == 4
+            and (self.extensions["ps1"], self.extensions["psm1"], len(self.states), self.events)
+            in POLICY_PROFILES
             and all(v == "removed" for v in self.states.values())
         )
 
@@ -236,14 +240,20 @@ def validate_summary(value):
             and value["process_unknown"] == 0
         )
     if value["policy_lifecycles_complete"]:
+        file_count = value["policy_ps1_files"] + value["policy_psm1_files"]
         need(
-            value["policy_ps1_files"] == value["policy_psm1_files"] == 2
-            and value["temp_events"] == 12
+            (
+                value["policy_ps1_files"],
+                value["policy_psm1_files"],
+                file_count,
+                value["temp_events"],
+            )
+            in POLICY_PROFILES
         )
         need(
             all(
                 value["temp_policy_probe_" + action]
-                == (4 if action in {"added", "modified", "removed"} else 0)
+                == (file_count if action in {"added", "modified", "removed"} else 0)
                 for action in ACTIONS.values()
             )
         )

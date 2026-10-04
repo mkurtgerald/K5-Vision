@@ -1335,3 +1335,132 @@ def test_hosted_capture_overrides_construction_only_and_keeps_real_validation():
     assert "alpha.invoke_start(" in text and "boundary.validate_invalid_initialization(" in text
     assert "monkeypatch.setattr(common, 'WindowsJob'" not in text
     assert "owned_observations=owned_observations" in text and "admitted_images=admitted" in text
+
+
+def single_pair_summary():
+    value = valid_initialization_summary()
+    value.update(policy_ps1_files=1, policy_psm1_files=1, temp_events=6)
+    for action in ("added", "modified", "removed"):
+        value["temp_policy_probe_" + action] = 2
+    return value
+
+
+def test_observed_single_pair_completes_exact_lifecycle():
+    trace = boundary.PolicyLifecycle()
+    for name in POLICY_NAMES[:2]:
+        for action in ("added", "modified", "removed"):
+            trace.observe(name, action)
+    assert trace.complete()
+    assert trace.extensions == {"ps1": 1, "psm1": 1} and trace.events == 6
+
+
+def test_observed_single_pair_summary_is_accepted():
+    boundary.validate_invalid_initialization(single_pair_summary())
+
+
+def test_policy_profiles_are_exact_finite_cases_and_keep_summary_schema():
+    assert boundary.POLICY_PROFILES == frozenset({(1, 1, 2, 6), (2, 2, 4, 12)})
+    one, two = single_pair_summary(), valid_initialization_summary()
+    assert one.keys() == two.keys() == boundary.SUMMARY_FIELDS
+    assert one["schema_version"] == two["schema_version"] == "owned-preflight-initialization-v1"
+    boundary.validate_invalid_initialization(one)
+    boundary.validate_invalid_initialization(two)
+
+
+@pytest.mark.parametrize(
+    "ps1,psm1,events,actions",
+    [
+        (0, 0, 0, 0),
+        (3, 3, 18, 6),
+        (1, 0, 3, 1),
+        (0, 1, 3, 1),
+        (1, 2, 9, 3),
+        (2, 1, 9, 3),
+        (2, 0, 6, 2),
+        (0, 2, 6, 2),
+        (1, 1, 12, 4),
+        (2, 2, 6, 2),
+        (1, 1, 5, 2),
+        (2, 2, 13, 4),
+    ],
+)
+def test_policy_union_rejects_every_other_aggregate_profile(ps1, psm1, events, actions):
+    value = valid_initialization_summary()
+    value.update(policy_ps1_files=ps1, policy_psm1_files=psm1, temp_events=events)
+    for action in ("added", "modified", "removed"):
+        value["temp_policy_probe_" + action] = actions
+    with pytest.raises(ObservationFailure):
+        boundary.validate_invalid_initialization(value)
+
+
+def test_lifecycle_zero_asymmetric_and_three_pairs_never_complete():
+    trace = boundary.PolicyLifecycle()
+    assert not trace.complete()
+    for name in POLICY_NAMES[:3]:
+        for action in ("added", "modified", "removed"):
+            trace.observe(name, action)
+    assert trace.extensions == {"ps1": 2, "psm1": 1} and not trace.complete()
+    for action in ("added", "modified", "removed"):
+        trace.observe(POLICY_NAMES[3], action)
+    assert trace.complete()
+    with pytest.raises(ObservationFailure, match="policy_contract"):
+        trace.observe("__PSScriptPolicyTest_eeeeeeee.eee.ps1", "added")
+    assert trace.invalid and not trace.complete()
+    with pytest.raises(ObservationFailure):
+        trace.observe("__PSScriptPolicyTest_ffffffff.fff.psm1", "added")
+
+
+def test_second_pair_must_finish_before_first_pair_can_be_certified_again():
+    trace = boundary.PolicyLifecycle()
+    for name in POLICY_NAMES[:2]:
+        for action in ("added", "modified", "removed"):
+            trace.observe(name, action)
+    assert trace.complete()
+    for name in POLICY_NAMES[2:]:
+        trace.observe(name, "added")
+        assert not trace.complete()
+    trace.observe(POLICY_NAMES[2], "modified")
+    trace.observe(POLICY_NAMES[2], "removed")
+    assert not trace.complete()
+    trace.observe(POLICY_NAMES[3], "modified")
+    assert not trace.complete()
+    trace.observe(POLICY_NAMES[3], "removed")
+    assert trace.complete()
+
+
+@pytest.mark.parametrize("action", ["added", "modified", "removed", "renamed_from", "renamed_to"])
+def test_completed_single_pair_cannot_be_recreated_or_reused(action):
+    trace = boundary.PolicyLifecycle()
+    for name in POLICY_NAMES[:2]:
+        for event in ("added", "modified", "removed"):
+            trace.observe(name, event)
+    assert trace.complete()
+    with pytest.raises(ObservationFailure):
+        trace.observe(POLICY_NAMES[0], action)
+    assert trace.invalid and not trace.complete()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"temp_policy_probe_removed": 1},
+        {"temp_policy_probe_modified": 3},
+        {"temp_policy_probe_renamed_to": 1},
+        {"temp_other_owned_temp_added": 1},
+        {"temp_alpha_session_added": 1},
+        {"temp_drain_complete": False},
+        {"policy_lifecycles_complete": False},
+        {"temporary_root_empty": False},
+        {"cleanup_complete": False},
+        {"process_unknown": 1},
+        {"job_total": 4},
+        {"job_active": 1},
+        {"error": "access_denied"},
+        {"policy_ps1_files": True},
+    ],
+)
+def test_single_pair_cannot_bypass_any_other_initialization_gate(change):
+    value = single_pair_summary()
+    value.update(change)
+    with pytest.raises(ObservationFailure):
+        boundary.validate_invalid_initialization(value)

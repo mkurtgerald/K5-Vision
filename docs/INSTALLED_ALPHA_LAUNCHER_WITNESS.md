@@ -164,9 +164,11 @@ No `PublicRtspSource` or `AnalyticsPreflightOnly` override is passed.
 2. Require the launcher's exact fixed refusal and exit 23 from the envelope
 3. The independently hosted-qualified observer must account for every TEMP
    notification, including create-then-delete. Its narrow policy-probe-shaped
-   profile requires exactly four distinct top-level
-   `__PSScriptPolicyTest_<8dot3>.ps1/.psm1` names, two of each extension, each with
-   exactly one add, modification and removal in that order. Every other name,
+   profile accepts exactly one complete pair (one `.ps1`, one `.psm1`, six
+   events) OR two complete pairs (two of each extension, twelve events). Each
+   distinct top-level `__PSScriptPolicyTest_<8dot3>.ps1/.psm1` name requires
+   exactly one add, modification and removal in that order. Zero/three pairs,
+   asymmetric counts and partially completed pairs fail. Every other name,
    session, event, duplicate, rename, incomplete lifecycle or excess fails.
    Names establish only a documented shape; they do not identify the writer
 4. Exactly five distinct owned births must reconcile with kernel Job accounting:
@@ -205,15 +207,23 @@ complete five-process observation. The additional process relative to the
 four-process model was the admitted console host, and only policy-probe-shaped
 TEMP events were observed. Candidate
 `1adcb117fed1a12fc07210f66a03396465f7cf52` independently qualified the strict
-per-file lifecycle and process profile on hosted Windows. This does not by itself
-qualify the installed media launches on the coordinated native runner.
+two-pair per-file lifecycle and process profile on hosted Windows. Native
+candidate `cb050f695fb563f82baf930e37332af495c6a15f` subsequently observed one
+complete pair with six events, the same five admitted process births, complete
+drain and cleanup, and the expected refusal. Its two-pair-only predicate rejected
+that trace before the valid media launches. The profile now admits exactly these
+two complete cases. These initialization observations do not qualify the two
+installed media launches on the coordinated native runner.
 
 The documented name shape comes from [Microsoft's PowerShell application-control
 reference](https://learn.microsoft.com/en-us/powershell/scripting/security/app-control/application-control).
 CPython's [3.12.10 venv launcher](https://github.com/python/cpython/blob/v3.12.10/PC/launcher.c)
-starts its redirected interpreter with creation flags zero. The exact profile is
-retained conservatively; a differing platform trace fails rather than broadening
-these requirements automatically.
+starts its redirected interpreter with creation flags zero. PowerShell's
+[GetAppLockerPolicy implementation](https://github.com/PowerShell/PowerShell/blob/master/src/System.Management.Automation/security/wldpNativeMethods.cs)
+creates/deletes paired probes and caches policy. That makes frequency variation
+plausible, but does not establish the cause of the difference between these two
+hosts. A trace outside the two explicit complete profiles still fails rather
+than broadening the requirements automatically.
 
 Failure logs retain validated `K5_OWNED_PREFLIGHT_INITIALIZATION` scalar summaries
 and fixed `K5_OWNED_PREFLIGHT_FAILURE` records (schema, stage, phase, helper error),

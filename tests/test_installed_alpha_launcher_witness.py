@@ -1803,3 +1803,71 @@ def test_failed_observer_start_and_close_keep_outer_layout_owned(monkeypatch, tm
     assert '"phase":"setup"' in text and '"error":"access_denied"' in text
     assert '"phase":"cleanup"' in text and '"error":"cleanup_incomplete"' in text
     assert "owned_layout_cleanup" in text
+
+
+def test_observed_single_pair_passes_real_invalid_path_gates(monkeypatch, tmp_path):
+    trace = witness.boundary.PolicyLifecycle()
+    for name in ("__PSScriptPolicyTest_aaaaaaaa.aaa.ps1", "__PSScriptPolicyTest_bbbbbbbb.bbb.psm1"):
+        for action in ("added", "modified", "removed"):
+            trace.observe(name, action)
+    profile = {
+        "policy_ps1_files": 1,
+        "policy_psm1_files": 1,
+        "temp_events": 6,
+        "policy_lifecycles_complete": trace.complete(),
+        **{"temp_policy_probe_" + action: 2 for action in ("added", "modified", "removed")},
+    }
+    state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True, profile_overrides=profile)
+    tracked = []
+    result = witness.invoke_start(
+        ["actual Start"],
+        work=tmp_path,
+        env={"TEMP": str(sessions)},
+        operation="probe_admission",
+        invalid=True,
+        admitted_images={},
+        owned_observations=tracked,
+    )
+    assert result == {
+        "invalid_config_refused": True,
+        "invalid_config_no_session": True,
+        "invalid_config_no_media": True,
+    }
+    assert state["closed"] and state["observation_closed"] and len(tracked) == 1
+    witness.boundary.validate_invalid_initialization(tracked[0].summary)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"exit_code": 0},
+        {"exit_code": 24},
+        {"output": b""},
+        {"output": REFUSAL_OUTPUT + b"K5 Vision Alpha health check PASS.\n"},
+        {"active": 1},
+        {"leave_session": True},
+        {"cleanup_failure": True},
+    ],
+)
+def test_single_pair_cannot_bypass_refusal_activity_or_cleanup(monkeypatch, tmp_path, overrides):
+    profile = {
+        "policy_ps1_files": 1,
+        "policy_psm1_files": 1,
+        "temp_events": 6,
+        "policy_lifecycles_complete": True,
+        **{"temp_policy_probe_" + action: 2 for action in ("added", "modified", "removed")},
+    }
+    state, sessions = invoke_fixture(
+        monkeypatch, tmp_path, invalid=True, profile_overrides=profile, **overrides
+    )
+    with pytest.raises(witness.AlphaWitnessError):
+        witness.invoke_start(
+            ["actual Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+            admitted_images={},
+            owned_observations=[],
+        )
+    assert state["closed"] and state["observation_closed"]
