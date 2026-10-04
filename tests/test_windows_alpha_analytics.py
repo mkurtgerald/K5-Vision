@@ -5753,7 +5753,7 @@ __PRODUCT_SUCCESS_RETURN__
 '@
     $fixture = $ast.ParamBlock.Extent.Text + [char]10 +
         $body.Replace('__PRODUCT_SUCCESS_RETURN__', $success[0].Extent.Text)
-    [IO.File]::WriteAllText((Join-Path $InstallRoot 'Start-K5VisionAlpha.ps1'),
+    [IO.File]::WriteAllText([IO.Path]::Combine($InstallRoot, 'Start-K5VisionAlpha.ps1'),
         $fixture, [Text.UTF8Encoding]::new($false))
     [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=facade_source_selected')
     [Console]::Out.Flush()
@@ -6045,12 +6045,21 @@ def test_windows_run_facade_uses_script_result_not_ambient_native_status(
     if observed is None:
         # Outside the handler: raw subprocess/path exception context must not be retained.
         pytest.fail("Source-bound nonmedia Run facade fixture failed", pytrace=False)
-    assert observed["initial"] == initial and observed["case"] == case
-    assert observed["source_kind"] == source_kind
-    assert observed["entered"] == observed["cleanup"] == 1 and observed["arguments_valid"]
-    if case != "child_exit_nonzero":
-        assert observed["ambient_after"] == RUN_FACADE_INITIALS[initial]
-    assert observed["outcome"] == RUN_FACADE_CASES[case], observed
+    matches = (
+        observed["initial"] == initial
+        and observed["case"] == case
+        and observed["source_kind"] == source_kind
+        and observed["entered"] == observed["cleanup"] == 1
+        and observed["arguments_valid"]
+        and (
+            case == "child_exit_nonzero"
+            or observed["ambient_after"] == RUN_FACADE_INITIALS[initial]
+        )
+        and observed["outcome"] == RUN_FACADE_CASES[case]
+    )
+    if not matches:
+        print(RUN_FACADE_PREFIX.decode() + json.dumps(observed, separators=(",", ":")))
+        pytest.fail("Run facade violated the script-result contract", pytrace=False)
 
 
 def test_run_facade_fixture_is_source_bound_nonmedia_and_does_not_seed_success():
@@ -6112,7 +6121,10 @@ def test_run_facade_record_rejects_unbounded_private_or_untyped_observations():
             _run_facade_record(invalid)
 
 
-def test_run_facade_capture_failure_has_no_raw_exception_context(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("result_failure", [False, True])
+def test_run_facade_failures_have_no_raw_exception_context(
+    tmp_path, monkeypatch, capsys, result_failure
+):
     from types import SimpleNamespace
 
     common = SimpleNamespace(
@@ -6148,6 +6160,8 @@ def test_run_facade_capture_failure_has_no_raw_exception_context(tmp_path, monke
 
     def fail_capture(*args, **kwargs):
         calls.append(True)
+        if result_failure:
+            return b""
         raise subprocess.TimeoutExpired(
             ["PRIVATE_FACADE_COMMAND"],
             15,
@@ -6156,6 +6170,21 @@ def test_run_facade_capture_failure_has_no_raw_exception_context(tmp_path, monke
         )
 
     monkeypatch.setitem(namespace, "_capture_element_child", fail_capture)
+    monkeypatch.setitem(
+        namespace,
+        "_run_facade_child_record",
+        lambda output: dict(
+            schema_version="run-facade-return-v1",
+            initial="absent",
+            case="success",
+            source_kind="synthetic",
+            outcome="wrapper_failure",
+            entered=1,
+            cleanup=1,
+            arguments_valid=True,
+            ambient_after=None,
+        ),
+    )
     with pytest.raises(pytest.fail.Exception) as failure:
         test_windows_run_facade_uses_script_result_not_ambient_native_status(
             tmp_path, "synthetic", "absent", "success"
@@ -6164,6 +6193,9 @@ def test_run_facade_capture_failure_has_no_raw_exception_context(tmp_path, monke
     assert calls == [True]
     capture = capsys.readouterr()
     assert "PRIVATE_FACADE" not in str(failure.value) + capture.out + capture.err
+    if result_failure:
+        assert RUN_FACADE_PREFIX.decode() in capture.out
+        assert '"outcome":"wrapper_failure"' in capture.out
 
 
 def test_run_facade_child_record_requires_complete_qualified_utility_prefix():
@@ -6271,3 +6303,24 @@ def test_run_facade_owned_wait_preserves_child_stderr_refusal(child_stderr):
     else:
         owned.wait(5)
     assert waited == [5]
+
+
+def test_run_facade_checks_each_script_invocation_status_immediately():
+    source = (ALPHA / "Run-K5VisionAlpha.ps1").read_text()
+    guard = '    if (-not $?) { throw "K5 Vision Alpha launcher failed." }'
+    for invocation in (
+        "    & $launcher -Port $Port -ExitAfterPublicTest:$ExitAfterPublicTest",
+        "    & $launcher -Port $Port -PublicRtspSource $PublicRtspSource "
+        "-ExitAfterPublicTest:$ExitAfterPublicTest",
+    ):
+        assert invocation + "\n" + guard in source
+    assert source.count(guard) == 2
+    assert "$LASTEXITCODE" not in source
+    assert '$ErrorActionPreference = "Stop"' in source
+    assert "Set-StrictMode -Version Latest" in source
+    # Fixture preparation must not autoload path cmdlets before actual Run admission.
+    preparation = RUN_FACADE_SCRIPT.split("__PRODUCT_SUCCESS_RETURN__", 2)[-1].split(
+        "$global:K5FacadeCase = $Case", 1
+    )[0]
+    assert "[IO.Path]::Combine($InstallRoot, 'Start-K5VisionAlpha.ps1')" in preparation
+    assert "Join-Path" not in preparation

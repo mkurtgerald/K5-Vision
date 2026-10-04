@@ -15,7 +15,8 @@ if (-not (Test-Path -LiteralPath $launcher)) { throw "Run Install-K5VisionAlpha.
 
 if ([string]::IsNullOrWhiteSpace($PublicRtspSource)) {
     & $launcher -Port $Port -ExitAfterPublicTest:$ExitAfterPublicTest
+    if (-not $?) { throw "K5 Vision Alpha launcher failed." }
 } else {
     & $launcher -Port $Port -PublicRtspSource $PublicRtspSource -ExitAfterPublicTest:$ExitAfterPublicTest
+    if (-not $?) { throw "K5 Vision Alpha launcher failed." }
 }
-if ($LASTEXITCODE -ne 0) { throw "K5 Vision Alpha launcher failed." }
