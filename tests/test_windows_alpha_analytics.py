@@ -2995,6 +2995,8 @@ def _capture_element_child(common, arguments, *, cwd, env, context):
                     RUN_FACADE_MANAGEMENT_PREFIX.decode()
                     + json.dumps(binding, separators=(",", ":"))
                 )
+            for inner in _test_native_inner_records(complete):
+                print(TEST_NATIVE_INNER_PREFIX.decode() + json.dumps(inner, separators=(",", ":")))
             for checkpoint in checkpoints:
                 print(ELEMENT_CHECKPOINT_PREFIX.decode() + checkpoint)
             for argument in arguments:
@@ -6618,20 +6620,223 @@ def _test_native_call_source(boundary):
     return block, block.replace(anchor, "& $Executable $Name ", 1)
 
 
-def _test_native_probe_script(boundary):
+TEST_NATIVE_INNER_PREFIX = b"K5_TEST_NATIVE_INNER="
+TEST_NATIVE_INNER_SCHEMA = "test-native-inner-v1"
+TEST_NATIVE_INNER_CHECKPOINTS = (
+    "test_caller_entered",
+    "test_caller_inputs_verified",
+    "test_caller_completed",
+    "test_caller_finally",
+)
+ELEMENT_CHECKPOINTS.update(TEST_NATIVE_INNER_CHECKPOINTS)
+
+
+def _test_native_inner_record(raw):
+    pairs = json.loads(raw, object_pairs_hook=list)
+    if type(pairs) is not list or any(type(p) is not tuple or len(p) != 2 for p in pairs):
+        raise ValueError("Invalid Test inner observation")
+    value = dict(pairs)
+    booleans = {
+        "entered",
+        "executable_equal",
+        "name_equal",
+        "executable_hash_equal",
+        "name_hash_equal",
+        "application_bound",
+        "block_returned",
+        "local_present",
+        "global_present",
+        "effective_present",
+    }
+    if len(value) != len(pairs) or value.keys() != booleans | {
+        "schema_version",
+        "local_exit",
+        "global_exit",
+        "effective_exit",
+        "error_origin",
+        "undefined_variable",
+    }:
+        raise ValueError("Invalid Test inner fields")
+    if value["schema_version"] != TEST_NATIVE_INNER_SCHEMA or any(
+        type(value[key]) is not bool for key in booleans
+    ):
+        raise ValueError("Invalid Test inner types")
+    for scope in ("local", "global", "effective"):
+        code = value[scope + "_exit"]
+        if value[scope + "_present"]:
+            if type(code) is not int or not -(2**31) <= code < 2**31:
+                raise ValueError("Invalid Test inner status")
+        elif code is not None:
+            raise ValueError("Invalid absent Test inner status")
+    if (
+        type(value["error_origin"]) is not str
+        or value["error_origin"] not in {"none", "native_call", "validator", "unknown"}
+        or type(value["undefined_variable"]) is not str
+        or value["undefined_variable"] not in {"none", "last_exit", "other"}
+    ):
+        raise ValueError("Invalid Test inner category")
+    return value
+
+
+def _test_native_inner_records(raw):
+    lines = [line for line in raw.splitlines() if line.startswith(TEST_NATIVE_INNER_PREFIX)]
+    if len(lines) > 1:
+        raise ValueError("Duplicate Test inner observation")
+    return [_test_native_inner_record(line[len(TEST_NATIVE_INNER_PREFIX) :]) for line in lines]
+
+
+TEST_NATIVE_INNER_SCRIPT = r"""
+$testExpectedExecutable = [Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String('__EXECUTABLE__'))
+$testExpectedName = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__NAME__'))
+$testInner = [ordered]@{
+    schema_version='test-native-inner-v1'; entered=$true
+    executable_equal=$false; name_equal=$false
+    executable_hash_equal=$false; name_hash_equal=$false
+    application_bound=$false; block_returned=$false
+    error_origin='none'; undefined_variable='none'
+}
+[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=test_caller_entered')
+[Console]::Out.Flush()
+try {
+    $testInner.executable_equal = [string]::Equals($Executable, $testExpectedExecutable,
+        [StringComparison]::Ordinal)
+    $testInner.name_equal = [string]::Equals($Name, $testExpectedName, [StringComparison]::Ordinal)
+    $testHasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $testExecutableHash = [BitConverter]::ToString($testHasher.ComputeHash(
+            [Text.Encoding]::UTF8.GetBytes($Executable))).Replace('-','').ToLowerInvariant()
+        $testNameHash = [BitConverter]::ToString($testHasher.ComputeHash(
+            [Text.Encoding]::UTF8.GetBytes($Name))).Replace('-','').ToLowerInvariant()
+    } finally { $testHasher.Dispose() }
+    $testInner.executable_hash_equal = $testExecutableHash -ceq '__EXECUTABLE_HASH__'
+    $testInner.name_hash_equal = $testNameHash -ceq '__NAME_HASH__'
+    if (-not ($testInner.executable_equal -and $testInner.name_equal -and
+        $testInner.executable_hash_equal -and $testInner.name_hash_equal)) { return }
+    $testCommand = Get-Command -Name $Executable -ErrorAction Stop
+    $testInner.application_bound = $testCommand -is [Management.Automation.ApplicationInfo] -and
+        [string]::Equals([IO.Path]::GetFullPath($testCommand.Path),
+            [IO.Path]::GetFullPath($testExpectedExecutable), [StringComparison]::OrdinalIgnoreCase)
+    if (-not $testInner.application_bound) { return }
+    [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=test_caller_inputs_verified')
+    [Console]::Out.Flush()
+__UNCHANGED_BLOCK__
+    $testInner.block_returned = $true
+} catch {
+    $testInner.error_origin = 'unknown'
+    $testFailure = $_
+    if ($testFailure.FullyQualifiedErrorId.Split(',')[0] -ceq 'VariableIsUndefined') {
+        $testInner.undefined_variable = 'other'
+    }
+    $testStream = $null; $testHasher = $null
+    try {
+        $testStream = [IO.File]::OpenRead($PSCommandPath)
+        if ($testStream.Length -le 0 -or $testStream.Length -gt 32768) { throw 'fixture_identity' }
+        $testHasher = [Security.Cryptography.SHA256]::Create()
+        $testSourceHash = [BitConverter]::ToString($testHasher.ComputeHash(
+            $testStream)).Replace('-','').ToLowerInvariant()
+        $testInfo = $testFailure.InvocationInfo
+        if ($testSourceHash -ceq $global:K5TestCallerHash -and $null -ne $testInfo -and
+            [string]::Equals([IO.Path]::GetFullPath($testInfo.ScriptName),
+                [IO.Path]::GetFullPath($PSCommandPath), [StringComparison]::OrdinalIgnoreCase)) {
+            if ($testInfo.ScriptLineNumber -eq __CALL_LINE__) {
+                $testInner.error_origin = 'native_call'
+            } elseif ($testInfo.ScriptLineNumber -ge __VALIDATOR_START__ -and
+                    $testInfo.ScriptLineNumber -le __VALIDATOR_END__) {
+                $testInner.error_origin = 'validator'
+                if ($testInner.undefined_variable -ceq 'other' -and
+                    $testInfo.Line.Contains('$LASTEXITCODE')) {
+                    $testInner.undefined_variable = 'last_exit'
+                }
+            }
+        }
+    } catch { $testInner.error_origin = 'unknown' }
+    finally {
+        if ($null -ne $testHasher) { $testHasher.Dispose() }
+        if ($null -ne $testStream) { $testStream.Dispose() }
+    }
+    throw
+} finally {
+    # Observe only after the unchanged adjacent native call and validator.
+    # Never initialize or reset native status, and snapshot before any output.
+    $testLocal = $ExecutionContext.SessionState.PSVariable.Get('local:LASTEXITCODE')
+    $testGlobal = $ExecutionContext.SessionState.PSVariable.Get('global:LASTEXITCODE')
+    $testEffective = $ExecutionContext.SessionState.PSVariable.Get('LASTEXITCODE')
+    $testStatusText = @()
+    foreach ($testVariable in @($testLocal, $testGlobal, $testEffective)) {
+        if ($null -eq $testVariable) { $testStatusText += @('false','null') }
+        else {
+            if ($testVariable.Value -isnot [int]) { throw 'fixture_invalid' }
+            $testStatusText += @('true',$testVariable.Value.ToString(
+                [Globalization.CultureInfo]::InvariantCulture))
+        }
+    }
+    $testJson = ('{{"schema_version":"test-native-inner-v1","entered":{0},' +
+        '"executable_equal":{1},"name_equal":{2},"executable_hash_equal":{3},' +
+        '"name_hash_equal":{4},"application_bound":{5},"block_returned":{6},' +
+        '"local_present":{7},"local_exit":{8},"global_present":{9},"global_exit":{10},' +
+        '"effective_present":{11},"effective_exit":{12},"error_origin":"{13}",' +
+        '"undefined_variable":"{14}"}}') -f
+        $testInner.entered.ToString().ToLowerInvariant(),
+        $testInner.executable_equal.ToString().ToLowerInvariant(),
+        $testInner.name_equal.ToString().ToLowerInvariant(),
+        $testInner.executable_hash_equal.ToString().ToLowerInvariant(),
+        $testInner.name_hash_equal.ToString().ToLowerInvariant(),
+        $testInner.application_bound.ToString().ToLowerInvariant(),
+        $testInner.block_returned.ToString().ToLowerInvariant(),
+        $testStatusText[0],$testStatusText[1],$testStatusText[2],$testStatusText[3],
+        $testStatusText[4],$testStatusText[5],$testInner.error_origin,$testInner.undefined_variable
+    if ($testInner.block_returned) {
+        [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=test_caller_completed')
+        [Console]::Out.Flush()
+    }
+    [Console]::Out.WriteLine('K5_TEST_NATIVE_INNER=' + $testJson)
+    [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=test_caller_finally')
+    [Console]::Out.Flush()
+}
+"""
+
+
+def _test_native_probe_script(boundary, executable, argument):
+    import base64
+
     _, block = _test_native_call_source(boundary)
+    body = TEST_NATIVE_INNER_SCRIPT
+    for before, after in (
+        ("__EXECUTABLE__", base64.b64encode(str(executable).encode("utf8")).decode("ascii")),
+        ("__NAME__", base64.b64encode(argument.encode("utf8")).decode("ascii")),
+        ("__EXECUTABLE_HASH__", hashlib.sha256(str(executable).encode("utf8")).hexdigest()),
+        ("__NAME_HASH__", hashlib.sha256(argument.encode("utf8")).hexdigest()),
+        ("__UNCHANGED_BLOCK__", block),
+    ):
+        if body.count(before) != 1:
+            raise ValueError("Invalid inner observation anchor")
+        body = body.replace(before, after, 1)
     caller = (
         "[CmdletBinding()]\nparam([string]$Executable,[string]$Name)\n"
         "$ErrorActionPreference = 'Stop'\nSet-StrictMode -Version Latest\n"
-        "$gstreamerVersion = '1.28.7'\n" + block + "\n"
+        "$gstreamerVersion = '1.28.7'\n" + body
     )
+    first = caller[: caller.index(block)].count("\n") + 1
+    for before, after in (
+        ("__CALL_LINE__", first),
+        ("__VALIDATOR_START__", first + 1),
+        ("__VALIDATOR_END__", first + len(block.splitlines()) - 1),
+    ):
+        if caller.count(before) != 1:
+            raise ValueError("Invalid inner line anchor")
+        caller = caller.replace(before, str(after), 1)
+    if len(caller.encode("utf8")) > 32768 or caller.count(block) != 1:
+        raise ValueError("Invalid bounded caller observation")
+    caller_hash = hashlib.sha256(caller.encode("utf8")).hexdigest()
     replacements = (
         ("$Variant -cnotin @('original','process')", "$Variant -cne 'original'"),
         (ELEMENT_HISTORICAL_HELPER, caller),
         (
             "    . ([scriptblock]::Create($selected))",
             "    $caller = [IO.Path]::Combine($PSScriptRoot,'test-native-caller.ps1')\n"
-            "    [IO.File]::WriteAllText($caller,$selected,[Text.UTF8Encoding]::new($false))",
+            "    [IO.File]::WriteAllText($caller,$selected,[Text.UTF8Encoding]::new($false))\n"
+            "    $global:K5TestCallerHash = '" + caller_hash + "'",
         ),
         (
             "        $answer = Test-K5GStreamerElement -Name $Name\n"
@@ -6703,6 +6908,31 @@ def _test_native_reference_script(boundary):
 
 def _parse_test_native_probe(raw, boundary):
     lines = raw.splitlines()
+    inner = _test_native_inner_records(raw)
+    if len(inner) != 1:
+        raise ValueError("Missing Test inner observation")
+    observed = []
+    filtered = []
+    for line in lines:
+        if line.startswith(TEST_NATIVE_INNER_PREFIX):
+            continue
+        if (
+            line.startswith(ELEMENT_CHECKPOINT_PREFIX)
+            and line[len(ELEMENT_CHECKPOINT_PREFIX) :].decode("ascii")
+            in TEST_NATIVE_INNER_CHECKPOINTS
+        ):
+            observed.append(line[len(ELEMENT_CHECKPOINT_PREFIX) :].decode("ascii"))
+            continue
+        filtered.append(line)
+    wanted = ["test_caller_entered"]
+    if inner[0]["application_bound"]:
+        wanted.append("test_caller_inputs_verified")
+    if inner[0]["block_returned"]:
+        wanted.append("test_caller_completed")
+    wanted.append("test_caller_finally")
+    if observed != wanted:
+        raise ValueError("Invalid inner checkpoint order")
+    lines = filtered
     # Only the exact source-free oracle literal may be forwarded by the original
     # command shape. Suppression/capture is not rewritten to simplify this probe.
     literal = TEST_NATIVE_CALLS[boundary][4].rstrip(b"\n")
@@ -6717,7 +6947,7 @@ def _parse_test_native_probe(raw, boundary):
     if lines[5:8] != expected[:3] or lines[9] != expected[3]:
         raise ValueError("Unqualified Management prefix")
     _element_require_utility_observation(_run_facade_management_as_utility(lines[8]))
-    return _parse_imported_element_probe(b"\n".join([*lines[:5], lines[10]]) + b"\n")
+    return _parse_imported_element_probe(b"\n".join([*lines[:5], lines[10]]) + b"\n"), inner[0]
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Requires actual GUI/CUI Test native semantics")
@@ -6754,11 +6984,6 @@ def test_windows_test_facade_native_calls_observe_real_exit(tmp_path, boundary):
             _test_native_reference_script(boundary), encoding="ascii", newline="\n"
         )
         probe = tmp_path / "test-probe.ps1"
-        probe.write_text(
-            _run_facade_bind_modules(_test_native_probe_script(boundary), shell, common),
-            encoding="ascii",
-            newline="\n",
-        )
         test_identity = common.file_hash(TEST)
         for kind, executable, subsystem in (
             ("ConsoleApplication", base, 3),
@@ -6771,6 +6996,13 @@ def test_windows_test_facade_native_calls_observe_real_exit(tmp_path, boundary):
             for case, actual_exit in (("zero", 0), ("nonzero", 7)):
                 context = _element_context("reference", kind, case)
                 argument = _test_native_argument(fixture, boundary, case)
+                probe.write_text(
+                    _run_facade_bind_modules(
+                        _test_native_probe_script(boundary, executable, argument), shell, common
+                    ),
+                    encoding="ascii",
+                    newline="\n",
+                )
                 output = _capture_element_child(
                     common,
                     [str(base), "-I", "-B", "-S", str(reference), str(executable), argument, case],
@@ -6840,7 +7072,19 @@ def test_windows_test_facade_native_calls_observe_real_exit(tmp_path, boundary):
                         env=env,
                         context=context,
                     )
-                    record = _parse_test_native_probe(output, boundary)
+                    record, inner = _parse_test_native_probe(output, boundary)
+                    if not all(
+                        inner[key]
+                        for key in (
+                            "entered",
+                            "executable_equal",
+                            "name_equal",
+                            "executable_hash_equal",
+                            "name_hash_equal",
+                            "application_bound",
+                        )
+                    ):
+                        raise ValueError("Test native caller transport not qualified")
                     valid = (
                         record["fresh_session"]
                         and record["application_bound"]
@@ -6877,7 +7121,7 @@ def test_test_native_projection_preserves_actual_argv_redirect_and_validator(bou
     source, projected = _test_native_call_source(boundary)
     executable = TEST_NATIVE_CALLS[boundary][2]
     assert projected.replace("& $Executable $Name ", "& " + executable + " ", 1) == source
-    script = _test_native_probe_script(boundary)
+    script = _test_native_probe_script(boundary, "owned.exe", "owned-argument")
     assert projected in script and RUN_FACADE_MANAGEMENT_IMPORT in script
     assert "& $caller -Executable $Executable -Name $Name" in script
     assert "$answer = Test-K5GStreamerElement" not in script
@@ -6944,10 +7188,18 @@ def test_test_native_record_retains_only_complete_qualified_scalar_evidence():
         process_cleaned=False,
     )
     value = ELEMENT_PROBE_PREFIX + json.dumps(record).encode()
-    wire = b"\n".join([*utility, *management, value]) + b"\n"
-    assert _parse_test_native_probe(wire, "gst_version") == record
+    inner = _test_native_inner_fixture()
+    inner_wire = TEST_NATIVE_INNER_PREFIX + json.dumps(inner).encode()
+    checkpoints = [
+        ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in TEST_NATIVE_INNER_CHECKPOINTS
+    ]
+    wire = (
+        b"\n".join([*utility, *management, *checkpoints[:3], inner_wire, checkpoints[3], value])
+        + b"\n"
+    )
+    assert _parse_test_native_probe(wire, "gst_version") == (record, inner)
     for boundary, case in TEST_NATIVE_CALLS.items():
-        assert _parse_test_native_probe(wire + case[4], boundary) == record
+        assert _parse_test_native_probe(wire + case[4], boundary) == (record, inner)
         with pytest.raises(ValueError):
             _parse_test_native_probe(wire + case[4] * 2, boundary)
     for malformed in (
@@ -6960,3 +7212,79 @@ def test_test_native_record_retains_only_complete_qualified_scalar_evidence():
     ):
         with pytest.raises(ValueError):
             _parse_test_native_probe(malformed, "gst_version")
+
+
+def _test_native_inner_fixture():
+    return dict(
+        schema_version=TEST_NATIVE_INNER_SCHEMA,
+        entered=True,
+        executable_equal=True,
+        name_equal=True,
+        executable_hash_equal=True,
+        name_hash_equal=True,
+        application_bound=True,
+        block_returned=True,
+        local_present=False,
+        local_exit=None,
+        global_present=True,
+        global_exit=0,
+        effective_present=True,
+        effective_exit=0,
+        error_origin="none",
+        undefined_variable="none",
+    )
+
+
+@pytest.mark.parametrize("boundary", sorted(TEST_NATIVE_CALLS))
+def test_test_native_inner_diagnostic_preserves_adjacent_call_and_validator(boundary):
+    import base64
+
+    executable, argument = "C:/owned runtime/python.exe", "-fixed-owned-argument"
+    script = _test_native_probe_script(boundary, executable, argument)
+    _, block = _test_native_call_source(boundary)
+    assert script.count(block) == 1
+    selected = script.split("        $selected = @'\n", 1)[1].split("\n'@", 1)[0]
+    digest = hashlib.sha256(selected.encode("utf8")).hexdigest()
+    assert "$global:K5TestCallerHash = '" + digest + "'" in script
+    assert base64.b64encode(executable.encode()).decode() in selected
+    assert base64.b64encode(argument.encode()).decode() in selected
+    assert hashlib.sha256(executable.encode()).hexdigest() in selected
+    assert hashlib.sha256(argument.encode()).hexdigest() in selected
+    call_line = selected[: selected.index(block)].count("\n") + 1
+    assert "$testInfo.ScriptLineNumber -eq " + str(call_line) in selected
+    assert "$testInfo.ScriptLineNumber -ge " + str(call_line + 1) in selected
+    assert (
+        "$testInfo.ScriptLineNumber -le " + str(call_line + len(block.splitlines()) - 1) in selected
+    )
+    assert selected.index(block) < selected.index("$testInner.block_returned = $true")
+    final = selected.split("} finally {\n    # Observe only after", 1)[1]
+    assert final.index("PSVariable.Get('local:LASTEXITCODE')") < final.index("[Console]::Out")
+    assert final.index("PSVariable.Get('global:LASTEXITCODE')") < final.index("[Console]::Out")
+    assert final.index("PSVariable.Get('LASTEXITCODE')") < final.index("[Console]::Out")
+    assert final.index("$testStatusText[5],$testInner.error_origin") < final.index("[Console]::Out")
+    assert not re.search(r"\$(?:global:|local:)?LASTEXITCODE\s*=", selected)
+    assert "[Diagnostics.Process]" not in selected and "Start-Sleep" not in selected
+    assert "$testSourceHash -ceq $global:K5TestCallerHash" in selected
+    assert "$testInfo.Line.Contains('$LASTEXITCODE')" in selected
+    assert "GetFullPath($testInfo.ScriptName)" in selected
+
+
+def test_test_native_inner_records_reject_untyped_private_or_duplicate_data():
+    value = _test_native_inner_fixture()
+    raw = TEST_NATIVE_INNER_PREFIX + json.dumps(value).encode() + b"\n"
+    assert _test_native_inner_records(raw) == [value]
+    for altered in (
+        {**value, "path": "PRIVATE"},
+        {**value, "local_exit": 0},
+        {**value, "global_exit": True},
+        {**value, "entered": 1},
+        {**value, "error_origin": []},
+        {**value, "undefined_variable": "PRIVATE"},
+        {**value, "effective_exit": 2**31},
+        {**value, "name_hash_equal": "true"},
+    ):
+        with pytest.raises(ValueError):
+            _test_native_inner_records(TEST_NATIVE_INNER_PREFIX + json.dumps(altered).encode())
+    for bad in (raw + raw, raw.replace(b'"entered": true', b'"entered": true,"entered":false')):
+        with pytest.raises(ValueError):
+            _test_native_inner_records(bad)
