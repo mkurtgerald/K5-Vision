@@ -5632,3 +5632,358 @@ def test_public_native_line_parser_matches_cr_lf_crlf_and_one_terminal_delimiter
         if text.endswith(("\r", "\n")):
             lines = lines[:-1]
         assert (len(lines) == 1 and bool(lines[0].strip())) is accepted
+
+
+RUN_FACADE_PREFIX = b"K5_RUN_FACADE_RESULT="
+RUN_FACADE_CASES = {
+    "success": "returned",
+    "child_throw": "child_failure",
+    "cleanup_throw": "cleanup_failure",
+    "child_exit_nonzero": "wrapper_failure",
+}
+RUN_FACADE_INITIALS = {"absent": None, "stale_zero": 0, "stale_nonzero": 9}
+RUN_FACADE_SCRIPT = r"""
+param([string]$Run, [string]$RunHash, [string]$StartSource, [string]$StartHash,
+      [string]$InstallRoot, [string]$Initial, [string]$Case, [string]$SourceKind)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+function Read-K5FacadeSource([string]$Path, [string]$Expected, [int]$Maximum) {
+    $stream = [IO.File]::OpenRead($Path)
+    $bytes = [byte[]]::new($Maximum + 1)
+    $total = 0
+    try {
+        while ($total -lt $bytes.Length) {
+            $count = $stream.Read($bytes, $total, $bytes.Length - $total)
+            if ($count -eq 0) { break }
+            $total += $count
+        }
+    } finally { $stream.Dispose() }
+    if ($total -gt $Maximum) { throw 'fixture_identity' }
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $actual = [BitConverter]::ToString(
+            $hasher.ComputeHash($bytes, 0, $total)).Replace('-', '').ToLowerInvariant()
+        if ($actual -cne $Expected) { throw 'fixture_identity' }
+    } finally { $hasher.Dispose() }
+    return [Text.UTF8Encoding]::new($false, $true).GetString($bytes, 0, $total)
+}
+try {
+    if ($Initial -cnotin @('absent','stale_zero','stale_nonzero') -or
+        $Case -cnotin @('success','child_throw','cleanup_throw','child_exit_nonzero') -or
+        $SourceKind -cnotin @('synthetic','public')) { throw 'fixture_arguments' }
+    $runSource = Read-K5FacadeSource $Run $RunHash 16384
+    $source = Read-K5FacadeSource $StartSource $StartHash 65536
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput(
+        $source, [ref]$tokens, [ref]$errors)
+    if ($errors.Count -ne 0 -or $null -eq $ast.ParamBlock) { throw 'fixture_identity' }
+    $topTry = @()
+    foreach ($statement in $ast.EndBlock.Statements) {
+        if ($statement -is [Management.Automation.Language.TryStatementAst]) {
+            $topTry += ,$statement
+        }
+    }
+    if ($topTry.Count -ne 1) { throw 'fixture_identity' }
+    $success = @()
+    foreach ($statement in $topTry[0].Body.Statements) {
+        if ($statement -is [Management.Automation.Language.IfStatementAst] -and
+            $statement.Extent.Text.StartsWith('if ($ExitAfterPublicTest) {')) {
+            $success += ,$statement
+        }
+    }
+    if ($success.Count -ne 1) { throw 'fixture_identity' }
+    if ($success[0].Clauses.Count -ne 1 -or $null -ne $success[0].ElseClause -or
+        $success[0].Clauses[0].Item1.Extent.Text -cne '$ExitAfterPublicTest') {
+        throw 'fixture_identity'
+    }
+    $statements = @($success[0].Clauses[0].Item2.Statements)
+    if ($statements.Count -ne 2 -or
+        $statements[0] -isnot [Management.Automation.Language.PipelineAst] -or
+        $statements[1] -isnot [Management.Automation.Language.ReturnStatementAst] -or
+        $statements[1].Extent.Text -cne 'return') { throw 'fixture_identity' }
+    $commands = @($statements[0].PipelineElements)
+    if ($commands.Count -ne 1 -or
+        $commands[0] -isnot [Management.Automation.Language.CommandAst] -or
+        $commands[0].GetCommandName() -cne 'Write-Host' -or
+        $commands[0].CommandElements.Count -ne 2 -or
+        $commands[0].CommandElements[1] -isnot
+            [Management.Automation.Language.StringConstantExpressionAst] -or
+        $commands[0].CommandElements[1].Value -cne
+            'Exiting after one bounded alpha acceptance run.') { throw 'fixture_identity' }
+    # Only the actual product parameter block and final success-return statement
+    # are used. This is a nonmedia facade fixture, never a full Start execution.
+    $body = @'
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+try {
+    $global:K5FacadeEntered += 1
+    if ($Port -ne 8017 -or -not $ExitAfterPublicTest -or $AnalyticsPreflightOnly -or
+        $PublicRtspSource -cne $global:K5FacadeExpectedSource -or
+        -not $PSBoundParameters.ContainsKey('Port') -or
+        -not $PSBoundParameters.ContainsKey('ExitAfterPublicTest') -or
+        $PSBoundParameters.ContainsKey('AnalyticsPreflightOnly') -or
+        $PSBoundParameters.ContainsKey('PublicRtspSource') -ne
+            $global:K5FacadePublicBound -or
+        $PSBoundParameters.Count -ne (2 + [int]$global:K5FacadePublicBound)) {
+        throw 'fixture_arguments'
+    }
+    $global:K5FacadeArgumentsValid = $true
+    if ($global:K5FacadeCase -ceq 'child_throw') { throw 'K5 facade fixture child failure.' }
+    # Synthetic compatibility control; the current product Start has no exit statement.
+    if ($global:K5FacadeCase -ceq 'child_exit_nonzero') { exit 7 }
+__PRODUCT_SUCCESS_RETURN__
+    throw 'fixture_return_missing'
+} finally {
+    $global:K5FacadeCleanup += 1
+    if ($global:K5FacadeCase -ceq 'cleanup_throw') { throw 'K5 facade fixture cleanup failure.' }
+}
+'@
+    $fixture = $ast.ParamBlock.Extent.Text + [char]10 +
+        $body.Replace('__PRODUCT_SUCCESS_RETURN__', $success[0].Extent.Text)
+    [IO.File]::WriteAllText((Join-Path $InstallRoot 'Start-K5VisionAlpha.ps1'),
+        $fixture, [Text.UTF8Encoding]::new($false))
+    $global:K5FacadeCase = $Case
+    $global:K5FacadeEntered = 0
+    $global:K5FacadeCleanup = 0
+    $global:K5FacadeArgumentsValid = $false
+    $global:K5FacadeExpectedSource = if ($SourceKind -ceq 'public') {
+        'rtsp://example.invalid:8554/owned%20path'
+    } else { '' }
+    $global:K5FacadePublicBound = $SourceKind -ceq 'public'
+    if ($null -ne (Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue)) {
+        throw 'fixture_not_fresh'
+    }
+    if ($Initial -ceq 'stale_zero') { $global:LASTEXITCODE = 0 }
+    elseif ($Initial -ceq 'stale_nonzero') { $global:LASTEXITCODE = 9 }
+    $outcome = 'returned'
+    try {
+        & $Run -InstallRoot $InstallRoot -Port 8017 -ExitAfterPublicTest `
+            -PublicRtspSource $global:K5FacadeExpectedSource
+    } catch {
+        if ($_.FullyQualifiedErrorId.Split(',')[0] -ceq 'VariableIsUndefined' -and
+            [IO.Path]::GetFullPath($_.InvocationInfo.ScriptName) -ceq
+                [IO.Path]::GetFullPath($Run) -and
+            $_.InvocationInfo.Line.Contains('$LASTEXITCODE') -and
+            $runSource.Contains($_.InvocationInfo.Line.Trim())) {
+            $outcome = 'variable_undefined'
+        } elseif ($_.Exception.Message -ceq 'K5 Vision Alpha launcher failed.') {
+            $outcome = 'wrapper_failure'
+        } elseif ($_.Exception.Message -ceq 'K5 facade fixture child failure.') {
+            $outcome = 'child_failure'
+        } elseif ($_.Exception.Message -ceq 'K5 facade fixture cleanup failure.') {
+            $outcome = 'cleanup_failure'
+        } else { $outcome = 'unexpected_error' }
+    }
+    $null = Read-K5FacadeSource $Run $RunHash 16384
+    $ambient = Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+    $ambientJson = 'null'
+    if ($null -ne $ambient) {
+        if ($ambient.Value -isnot [int] -or $ambient.Value -notin @(0,7,9)) {
+            throw 'fixture_ambient'
+        }
+        $ambientJson = [string]$ambient.Value
+    }
+    $json = '{"schema_version":"run-facade-return-v1","initial":"' + $Initial +
+        '","case":"' + $Case + '","source_kind":"' + $SourceKind +
+        '","outcome":"' + $outcome + '","entered":' +
+        [string]$global:K5FacadeEntered + ',"cleanup":' +
+        [string]$global:K5FacadeCleanup + ',"arguments_valid":' +
+        $global:K5FacadeArgumentsValid.ToString().ToLowerInvariant() +
+        ',"ambient_after":' + $ambientJson + '}'
+    [Console]::Out.WriteLine('K5_RUN_FACADE_RESULT=' + $json)
+    exit 0
+} catch {
+    [Console]::Out.WriteLine('K5_RUN_FACADE_FIXTURE_FAILED')
+    exit 1
+}
+"""
+
+
+def _run_facade_record(output):
+    if type(output) is not bytes or len(output) > 2048:
+        raise ValueError("Invalid fixed facade observation")
+    records = []
+    success_messages = 0
+    for line in output.splitlines():
+        if line.startswith(RUN_FACADE_PREFIX):
+            pairs = json.loads(line[len(RUN_FACADE_PREFIX) :], object_pairs_hook=list)
+            if type(pairs) is not list or any(type(pair) is not tuple for pair in pairs):
+                raise ValueError("Invalid fixed facade observation")
+            value = dict(pairs)
+            if len(value) != len(pairs):
+                raise ValueError("Invalid fixed facade observation")
+            records.append(value)
+        elif line == b"Exiting after one bounded alpha acceptance run.":
+            success_messages += 1
+        else:
+            raise ValueError("Invalid fixed facade observation")
+    if len(records) != 1 or success_messages > 1:
+        raise ValueError("Invalid fixed facade observation")
+    value = records[0]
+    if value.keys() != {
+        "schema_version",
+        "initial",
+        "case",
+        "source_kind",
+        "outcome",
+        "entered",
+        "cleanup",
+        "arguments_valid",
+        "ambient_after",
+    }:
+        raise ValueError("Invalid fixed facade observation")
+    enums = {
+        "schema_version": {"run-facade-return-v1"},
+        "initial": set(RUN_FACADE_INITIALS),
+        "case": set(RUN_FACADE_CASES),
+        "source_kind": {"synthetic", "public"},
+        "outcome": set(RUN_FACADE_CASES.values()) | {"variable_undefined", "unexpected_error"},
+    }
+    if any(
+        type(value[key]) is not str or value[key] not in options for key, options in enums.items()
+    ):
+        raise ValueError("Invalid fixed facade observation")
+    if type(value["arguments_valid"]) is not bool or any(
+        type(value[key]) is not int or not 0 <= value[key] <= 2 for key in ("entered", "cleanup")
+    ):
+        raise ValueError("Invalid fixed facade observation")
+    if value["ambient_after"] is not None and (
+        type(value["ambient_after"]) is not int or value["ambient_after"] not in (0, 7, 9)
+    ):
+        raise ValueError("Invalid fixed facade observation")
+    return value
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires actual Windows Run facade")
+@pytest.mark.parametrize("source_kind", ["synthetic", "public"])
+@pytest.mark.parametrize("initial", sorted(RUN_FACADE_INITIALS))
+@pytest.mark.parametrize("case", sorted(RUN_FACADE_CASES))
+def test_windows_run_facade_uses_script_result_not_ambient_native_status(
+    tmp_path, source_kind, initial, case
+):
+    import os
+
+    installed = tmp_path / "owned facade with spaces"
+    installed.mkdir()
+    run_bytes = (ALPHA / "Run-K5VisionAlpha.ps1").read_bytes()
+    run = installed / "Run-K5VisionAlpha.ps1"
+    run.write_bytes(run_bytes)
+    harness = tmp_path / "run-facade.ps1"
+    harness.write_text(RUN_FACADE_SCRIPT, encoding="ascii", newline="\n")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper()
+        in {
+            "SYSTEMROOT",
+            "WINDIR",
+            "SYSTEMDRIVE",
+            "COMSPEC",
+            "OS",
+            "PATH",
+        }
+    }
+    for key in ("TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+        path = tmp_path / key
+        path.mkdir()
+        env[key] = str(path)
+    shell = Path(os.environ["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    try:
+        result = subprocess.run(
+            [
+                str(shell),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(harness),
+                "-Run",
+                str(run),
+                "-RunHash",
+                hashlib.sha256(run_bytes).hexdigest(),
+                "-StartSource",
+                str(START),
+                "-StartHash",
+                hashlib.sha256(START.read_bytes()).hexdigest(),
+                "-InstallRoot",
+                str(installed),
+                "-Initial",
+                initial,
+                "-Case",
+                case,
+                "-SourceKind",
+                source_kind,
+            ],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        if result.returncode != 0 or result.stderr:
+            raise ValueError("Invalid fixture exit")
+        observed = _run_facade_record(result.stdout)
+    except Exception:
+        pytest.fail("Source-bound nonmedia Run facade fixture failed", pytrace=False)
+    assert observed["initial"] == initial and observed["case"] == case
+    assert observed["source_kind"] == source_kind
+    assert observed["entered"] == observed["cleanup"] == 1 and observed["arguments_valid"]
+    if case != "child_exit_nonzero":
+        assert observed["ambient_after"] == RUN_FACADE_INITIALS[initial]
+    assert observed["outcome"] == RUN_FACADE_CASES[case], observed
+
+
+def test_run_facade_fixture_is_source_bound_nonmedia_and_does_not_seed_success():
+    source = RUN_FACADE_SCRIPT
+    assert "$bytes = [byte[]]::new($Maximum + 1)" in source
+    assert "$hasher.ComputeHash($bytes, 0, $total)" in source
+    assert "$stream.Dispose()" in source and "$hasher.Dispose()" in source
+    assert "$ast.ParamBlock.Extent.Text" in source
+    assert "$success[0].Extent.Text" in source
+    assert "$statements.Count -ne 2" in source
+    assert "$topTry[0].Body.Statements" in source
+    assert "$success[0].Clauses.Count -ne 1" in source
+    assert "$commands[0].GetCommandName() -cne 'Write-Host'" in source
+    assert "InvocationInfo.Line.Contains('$LASTEXITCODE')" in source
+    assert "$global:LASTEXITCODE = 0" in source  # Explicit stale-input control only.
+    assert "$Initial -ceq 'stale_zero'" in source
+    assert "& $Run -InstallRoot $InstallRoot" in source
+    assert "& $StartSource" not in source and "Start-Process" not in source
+    assert "[Diagnostics.Process]" not in source and "Invoke-RestMethod" not in source
+    assert source.count("Read-K5FacadeSource $Run $RunHash 16384") == 2
+    assert len(source.encode("ascii")) < 16384
+    start = START.read_text()
+    assert start.count("if ($ExitAfterPublicTest) {") == 1
+    assert "Exiting after one bounded alpha acceptance run." in start
+
+
+def test_run_facade_record_rejects_unbounded_private_or_untyped_observations():
+    value = dict(
+        schema_version="run-facade-return-v1",
+        initial="absent",
+        case="success",
+        source_kind="synthetic",
+        outcome="returned",
+        entered=1,
+        cleanup=1,
+        arguments_valid=True,
+        ambient_after=None,
+    )
+
+    def encode(item):
+        return RUN_FACADE_PREFIX + json.dumps(item).encode() + b"\n"
+
+    assert _run_facade_record(encode(value)) == value
+    for invalid in (
+        b"private path\n" + encode(value),
+        encode(value) * 2,
+        b"x" * 2049,
+        encode({**value, "extra": "private"}),
+        encode({**value, "entered": True}),
+        encode({**value, "ambient_after": True}),
+        encode({**value, "outcome": "private"}),
+        RUN_FACADE_PREFIX
+        + b'{"schema_version":"run-facade-return-v1","schema_version":"duplicate"}',
+    ):
+        with pytest.raises(ValueError):
+            _run_facade_record(invalid)
