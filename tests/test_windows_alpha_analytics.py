@@ -1837,6 +1837,10 @@ def _element_python_argument(script: Path, case: str) -> str:
 
 ELEMENT_CHILD_PREFIX = b"K5_ELEMENT_CHILD_FAILURE="
 ELEMENT_CHILD_PHASES = {
+    "utility_manifest",
+    "utility_import",
+    "utility_binding",
+    "utility_cmdlet",
     "source_select",
     "command_admission",
     "probe_invoke",
@@ -1890,23 +1894,95 @@ function Write-K5ElementChildFailure([object]$Failure, [string]$Phase, [string]$
             $exception = $exception.InnerException
         }
     }
-    $record = [ordered]@{
-        schema_version = 'element-child-failure-v1'
-        phase = $Phase
-        boundary = $Boundary
-        error = $category
-        hresult = $code
+    if ($Phase -cnotin @('utility_manifest','utility_import','utility_binding','utility_cmdlet',
+        'source_select','command_admission','probe_invoke','probe_record',
+        'reference_start','reference_wait','reference_exit','reference_cleanup') -or
+        $Boundary -cnotin @('primary','cleanup')) { throw 'fixture_diagnostic_invalid' }
+    $codeText = 'null'
+    if ($null -ne $code) {
+        $codeText = $code.ToString([Globalization.CultureInfo]::InvariantCulture)
     }
-    Write-Output ('K5_ELEMENT_CHILD_FAILURE=' + ($record | ConvertTo-Json -Compress))
+    $json = ('{{"schema_version":"element-child-failure-v1","phase":"{0}",' +
+        '"boundary":"{1}","error":"{2}","hresult":{3}}}') -f
+        $Phase, $Boundary, $category, $codeText
+    [Console]::Out.WriteLine('K5_ELEMENT_CHILD_FAILURE=' + $json)
+    [Console]::Out.Flush()
 }
+"""
+ELEMENT_UTILITY_IMPORT = r"""
+$fixturePhase = 'utility_manifest'
+[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_manifest_requested')
+[Console]::Out.Flush()
+$expectedHome = '__UTILITY_HOME__'
+if (-not [string]::Equals([IO.Path]::GetFullPath($PSHOME), $expectedHome,
+        [StringComparison]::OrdinalIgnoreCase)) { throw 'fixture_identity' }
+$utilityBase = [IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Utility')
+$utilityManifest = [IO.Path]::Combine($utilityBase, 'Microsoft.PowerShell.Utility.psd1')
+foreach ($checkedPath in @($PSHOME, [IO.Path]::Combine($PSHOME, 'Modules'),
+        $utilityBase, $utilityManifest)) {
+    if (([IO.File]::GetAttributes($checkedPath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'fixture_identity'
+    }
+}
+$manifestStream = [IO.File]::OpenRead($utilityManifest)
+$manifestHasher = $null
+try {
+    if ($manifestStream.Length -le 0 -or $manifestStream.Length -gt 65536) {
+        throw 'fixture_identity'
+    }
+    $manifestHasher = [Security.Cryptography.SHA256]::Create()
+    $manifestBytes = $manifestHasher.ComputeHash($manifestStream)
+    $manifestHash = [BitConverter]::ToString($manifestBytes).Replace('-', '').ToLowerInvariant()
+    if ($manifestHash -cne '__UTILITY_SHA256__') { throw 'fixture_identity' }
+} finally {
+    if ($null -ne $manifestHasher) { $manifestHasher.Dispose() }
+    $manifestStream.Dispose()
+}
+$fixturePhase = 'utility_import'
+[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_import_requested')
+[Console]::Out.Flush()
+$utilityModules = @(
+    Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -PassThru -ErrorAction Stop
+)
+[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_import_returned')
+[Console]::Out.Flush()
+$fixturePhase = 'utility_binding'
+if ($utilityModules.Count -ne 1 -or
+    $utilityModules[0] -isnot [Management.Automation.PSModuleInfo]) {
+    throw 'fixture_identity'
+}
+$utilityModule = $utilityModules[0]
+if ($utilityModule.Name -cne 'Microsoft.PowerShell.Utility' -or
+    -not [string]::Equals([IO.Path]::GetFullPath($utilityModule.ModuleBase), $utilityBase,
+        [StringComparison]::OrdinalIgnoreCase) -or
+    -not [string]::Equals([IO.Path]::GetFullPath($utilityModule.Path), $utilityManifest,
+        [StringComparison]::OrdinalIgnoreCase)) { throw 'fixture_identity' }
+$utilityWriteOutput = $utilityModule.ExportedCmdlets['Write-Output']
+if ($utilityWriteOutput -isnot [Management.Automation.CmdletInfo] -or
+    $utilityWriteOutput.ImplementingType.FullName -cne
+        'Microsoft.PowerShell.Commands.WriteOutputCommand') {
+    throw 'fixture_identity'
+}
+$utilityAssembly = $utilityWriteOutput.ImplementingType.Assembly.GetName()
+$utilityToken = $utilityAssembly.GetPublicKeyToken()
+$coreToken = [Management.Automation.PSObject].Assembly.GetName().GetPublicKeyToken()
+if ($utilityAssembly.Name -cne 'Microsoft.PowerShell.Commands.Utility' -or
+    $utilityToken.Length -ne 8 -or $coreToken.Length -ne 8 -or
+    [BitConverter]::ToString($utilityToken) -cne [BitConverter]::ToString($coreToken)) {
+    throw 'fixture_identity'
+}
+[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_binding_verified')
+[Console]::Out.Flush()
 """
 ELEMENT_PROBE_SCRIPT = r"""
 param([string]$Start, [string]$Executable, [string]$Name, [string]$Variant, [string]$Initial)
 $ErrorActionPreference = 'Stop'
-Set-StrictMode -Version Latest
 __ELEMENT_CHILD_DIAGNOSTICS__
-$fixturePhase = 'source_select'
+$fixturePhase = 'utility_manifest'
 try {
+__ELEMENT_UTILITY_IMPORT__
+    Set-StrictMode -Version Latest
+    $fixturePhase = 'source_select'
     if ($Variant -cnotin @('original','pipeline') -or
         $Initial -cnotin @('absent','stale_zero','stale_nonzero')) { throw 'fixture_invalid' }
     if ($null -ne (Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue)) {
@@ -1975,21 +2051,39 @@ try {
         if ($last.Value -isnot [int] -or $last.Value -notin @(0,7,9)) { throw 'fixture_invalid' }
         $value = $last.Value
     }
-    $record = [ordered]@{
-        schema_version = 'element-native-exit-probe-v1'
-        variant = $Variant
-        initial = $Initial
-        fresh_session = $true
-        command_kind = $kind
-        application_bound = $bound
-        outcome = $outcome
-        last_exit = $value
-        waited_floor = $watch.ElapsedMilliseconds -ge 400
+    $valueText = 'null'
+    if ($null -ne $value) {
+        $valueText = $value.ToString([Globalization.CultureInfo]::InvariantCulture)
     }
-    Write-Output ('K5_ELEMENT_PROBE=' + ($record | ConvertTo-Json -Compress))
+    $boundText = $bound.ToString().ToLowerInvariant()
+    $waitedText = ($watch.ElapsedMilliseconds -ge 400).ToString().ToLowerInvariant()
+    $json = ('{{"schema_version":"element-native-exit-probe-v1","variant":"{0}",' +
+        '"initial":"{1}","fresh_session":true,"command_kind":"{2}",' +
+        '"application_bound":{3},"outcome":"{4}","last_exit":{5},"waited_floor":{6}}}') -f
+        $Variant, $Initial, $kind, $boundText, $outcome, $valueText, $waitedText
+    [Console]::Out.WriteLine('K5_ELEMENT_PROBE=' + $json)
+    [Console]::Out.Flush()
     exit 0
 } catch { Write-K5ElementChildFailure $_ $fixturePhase 'primary'; exit 1 }
-""".replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS)
+""".replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS).replace(
+    "__ELEMENT_UTILITY_IMPORT__", ELEMENT_UTILITY_IMPORT
+)
+ELEMENT_UTILITY_CONTROL = (
+    "$ErrorActionPreference = 'Stop'\n"
+    + ELEMENT_CHILD_DIAGNOSTICS
+    + "\n$fixturePhase = 'utility_manifest'\ntry {\n"
+    + ELEMENT_UTILITY_IMPORT
+    + r"""
+$fixturePhase = 'utility_cmdlet'
+[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_cmdlet_requested')
+[Console]::Out.Flush()
+& $utilityWriteOutput 'K5_ELEMENT_CHECKPOINT=utility_cmdlet_result'
+[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_cmdlet_returned')
+[Console]::Out.Flush()
+exit 0
+} catch { Write-K5ElementChildFailure $_ $fixturePhase 'primary'; exit 1 }
+"""
+)
 ELEMENT_REFERENCE_SCRIPT = r"""
 import json
 import subprocess
@@ -2075,12 +2169,14 @@ sys.exit(1 if failed else 0)
 """
 ELEMENT_CHECKPOINT_PREFIX = b"K5_ELEMENT_CHECKPOINT="
 ELEMENT_CHECKPOINTS = {
+    "utility_manifest_requested",
+    "utility_import_requested",
+    "utility_import_returned",
+    "utility_binding_verified",
+    "utility_cmdlet_requested",
+    "utility_cmdlet_result",
+    "utility_cmdlet_returned",
     "shell_control_entered",
-    "shell_console_entered",
-    "shell_console_exit",
-    "shell_body_entered",
-    "shell_write_output_requested",
-    "shell_write_output_returned",
     "shell_control_exit",
     "python_control_entered",
     "reference_entered",
@@ -2148,37 +2244,50 @@ exit 0
 """.replace("__EXPECTED__", expected).replace("__HASH__", digest)
 
 
-ELEMENT_PARAMETER_CONTROL = "\nparam([string]$Name = '')\n$ErrorActionPreference = 'Stop'\nexit 0\n"
-ELEMENT_CONSOLE_CONTROL = (
-    ELEMENT_PARAMETER_CONTROL.removesuffix("exit 0\n")
-    + """[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shell_console_entered')
-[Console]::Out.Flush()
-[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shell_console_exit')
-[Console]::Out.Flush()
-exit 0
-"""
-)
-
-
-def _element_instrument_control_script(argument):
+def _element_direct_control_script(argument):
     original = _element_control_script(argument)
-    selected = original
-    for anchor, checkpoint in (
-        ("param([string]$Name = '')\n", "shell_body_entered"),
-        ("$ErrorActionPreference = 'Stop'\n", "shell_write_output_requested"),
+    replacements = (
         (
-            "Write-Output 'K5_ELEMENT_CHECKPOINT=shell_control_entered'\n",
-            "shell_write_output_returned",
+            "Write-Output 'K5_ELEMENT_CHECKPOINT=shell_control_entered'",
+            "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shell_control_entered'); "
+            "[Console]::Out.Flush()",
         ),
+        (
+            "Write-Output 'K5_ELEMENT_CHECKPOINT=shell_control_exit'",
+            "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shell_control_exit'); "
+            "[Console]::Out.Flush()",
+        ),
+        (
+            "Write-Output ('K5_ELEMENT_ARGV=' + ($record | ConvertTo-Json -Compress))",
+            '[Console]::Out.WriteLine((\'K5_ELEMENT_ARGV={{"equal":{0},"hash_equal":{1}}}\' -f '
+            "$equal.ToString().ToLowerInvariant(), $hashEqual.ToString().ToLowerInvariant())); "
+            "[Console]::Out.Flush()",
+        ),
+    )
+    for before, after in replacements:
+        if original.count(before) != 1:
+            raise ValueError("Invalid fixed output anchor")
+        original = original.replace(before, after, 1)
+    return original
+
+
+def _element_bind_utility(script, powershell, common):
+    home = common.local_path(powershell).parent
+    manifest = common.local_path(
+        home / "Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1"
+    )
+    with manifest.open("rb") as stream:
+        raw = stream.read(65537)
+    if not raw or len(raw) > 65536:
+        raise ValueError("Invalid scoped manifest")
+    for marker, value in (
+        ("__UTILITY_HOME__", str(home).replace("'", "''")),
+        ("__UTILITY_SHA256__", hashlib.sha256(raw).hexdigest()),
     ):
-        if original.count(anchor) != 1 or checkpoint in original:
-            raise ValueError("Invalid fixed checkpoint anchor")
-        insertion = (
-            "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=" + checkpoint + "')\n"
-            "[Console]::Out.Flush()\n"
-        )
-        selected = selected.replace(anchor, anchor + insertion, 1)
-    return selected
+        if script.count(marker) != 1:
+            raise ValueError("Invalid scoped module template")
+        script = script.replace(marker, value, 1)
+    return script
 
 
 def _pe_fixture_subsystem(path: Path) -> int:
@@ -2236,13 +2345,33 @@ def _parse_element_probe(raw: bytes) -> dict:
     return value
 
 
+def _parse_imported_element_probe(raw):
+    lines = raw.splitlines()
+    if (
+        len(raw) > 4096
+        or not raw.endswith(b"\n")
+        or len(lines) != 5
+        or lines[:4]
+        != [
+            ELEMENT_CHECKPOINT_PREFIX + name.encode("ascii")
+            for name in (
+                "utility_manifest_requested",
+                "utility_import_requested",
+                "utility_import_returned",
+                "utility_binding_verified",
+            )
+        ]
+    ):
+        raise ValueError("Invalid official import observation")
+    return _parse_element_probe(lines[4] + b"\n")
+
+
 ELEMENT_FIXTURE_PREFIX = "K5_ELEMENT_FIXTURE_DIAGNOSTIC="
 ELEMENT_FIXTURE_PHASES = {
-    "shell_parameter_control",
-    "shell_console_control",
-    "shell_write_output_control",
+    "shell_direct_control",
+    "shell_utility_control",
+    "utility_admission",
     "python_control",
-    "argv_control",
     "module_load",
     "runtime_admission",
     "environment",
@@ -2506,33 +2635,35 @@ def _capture_element_child(common, arguments, *, cwd, env, context):
     return bytes(result)
 
 
-def _element_body_controls(common, commands, *, cwd, env):
-    # 1abac198 localized the stall to the body even with DEVNULL. Bracket only
-    # its first command; neither a checkpoint nor a timeout establishes a cause.
-    expected = (
-        ("shell_parameter_control", []),
-        ("shell_console_control", ["shell_console_entered", "shell_console_exit"]),
-        (
-            "shell_write_output_control",
-            [
-                "shell_body_entered",
-                "shell_write_output_requested",
-                "shell_control_entered",
-                "shell_write_output_returned",
-                "shell_control_exit",
-            ],
-        ),
-    )
-    context = _element_context("shell_parameter_control")
+def _element_utility_controls(common, direct_command, utility_command, *, cwd, env):
+    # c6079f32 proved the first Write-Output boundary stalls; compare an exact
+    # official import with direct fixture output, retaining every native gate.
+    context = _element_context("shell_direct_control")
     try:
-        for command, (phase, checkpoints) in zip(commands, expected, strict=True):
-            context = _element_context(phase)
-            output = _capture_element_child(common, command, cwd=cwd, env=env, context=context)
-            if output.splitlines() != [
-                ELEMENT_CHECKPOINT_PREFIX + name.encode("ascii") for name in checkpoints
-            ]:
-                raise ValueError("Invalid fixed body control")
-            _element_diagnostic(context, "passed")
+        output = _capture_element_child(common, direct_command, cwd=cwd, env=env, context=context)
+        if output.splitlines() != [
+            b"K5_ELEMENT_CHECKPOINT=shell_control_entered",
+            b'K5_ELEMENT_ARGV={"equal":true,"hash_equal":true}',
+            b"K5_ELEMENT_CHECKPOINT=shell_control_exit",
+        ]:
+            raise ValueError("Invalid fixed direct control")
+        _element_diagnostic(context, "passed")
+        context = _element_context("shell_utility_control")
+        output = _capture_element_child(common, utility_command, cwd=cwd, env=env, context=context)
+        if output.splitlines() != [
+            ELEMENT_CHECKPOINT_PREFIX + name.encode("ascii")
+            for name in (
+                "utility_manifest_requested",
+                "utility_import_requested",
+                "utility_import_returned",
+                "utility_binding_verified",
+                "utility_cmdlet_requested",
+                "utility_cmdlet_result",
+                "utility_cmdlet_returned",
+            )
+        ]:
+            raise ValueError("Invalid official module control")
+        _element_diagnostic(context, "passed")
     except _ElementCaptureFailure:
         raise
     except Exception as error:
@@ -2612,27 +2743,28 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
         reference = tmp_path / "reference.py"
         reference.write_text(ELEMENT_REFERENCE_SCRIPT, encoding="ascii", newline="\n")
         probe = tmp_path / "probe.ps1"
-        probe.write_text(ELEMENT_PROBE_SCRIPT, encoding="ascii", newline="\n")
+        context = _element_context("utility_admission")
+        probe.write_text(
+            _element_bind_utility(ELEMENT_PROBE_SCRIPT, powershell, common),
+            encoding="ascii",
+            newline="\n",
+        )
         control = tmp_path / "control.ps1"
         control_argument = _element_python_argument(fixture, "zero")
         control.write_text(
-            _element_control_script(control_argument), encoding="ascii", newline="\n"
+            _element_direct_control_script(control_argument), encoding="ascii", newline="\n"
         )
-        parameter_control = tmp_path / "parameter-control.ps1"
-        parameter_control.write_text(ELEMENT_PARAMETER_CONTROL, encoding="ascii", newline="\n")
-        console_control = tmp_path / "console-control.ps1"
-        console_control.write_text(ELEMENT_CONSOLE_CONTROL, encoding="ascii", newline="\n")
-        body_control = tmp_path / "body-control.ps1"
-        body_control.write_text(
-            _element_instrument_control_script(control_argument), encoding="ascii", newline="\n"
+        utility_control = tmp_path / "utility-control.ps1"
+        utility_control.write_text(
+            _element_bind_utility(ELEMENT_UTILITY_CONTROL, powershell, common),
+            encoding="ascii",
+            newline="\n",
         )
         shell_arguments = [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-File"]
-        _element_body_controls(
+        _element_utility_controls(
             common,
-            [
-                shell_arguments + [str(script)]
-                for script in (parameter_control, console_control, body_control)
-            ],
+            shell_arguments + [str(control), "-Name:", control_argument],
+            shell_arguments + [str(utility_control)],
             cwd=tmp_path,
             env=env,
         )
@@ -2654,13 +2786,6 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
         )
         if output.strip() != b"K5_ELEMENT_CHECKPOINT=python_control_entered":
             raise ValueError("Invalid Python control")
-        context = _element_context("argv_control")
-        output = capture(control, "-Name:", control_argument)
-        _, checkpoints, arguments = _element_complete_records(output)
-        if checkpoints != ["shell_control_entered", "shell_control_exit"] or arguments != [
-            {"equal": True, "hash_equal": True},
-        ]:
-            raise ValueError("Invalid argument control")
         for kind, (executable, identity) in binaries.items():
             for name in ("zero", "nonzero", "stderr_zero", "stderr_nonzero"):
                 expected_exit = 0 if name.endswith("zero") and not name.endswith("nonzero") else 7
@@ -2712,7 +2837,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                             raise ValueError("Owned executable changed")
                         if _element_python_argument(fixture, name) != argument:
                             raise ValueError("Owned script changed")
-                        result = _parse_element_probe(
+                        result = _parse_imported_element_probe(
                             capture(
                                 probe,
                                 "-Start",
@@ -2760,7 +2885,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
             for initial in ("absent", "stale_zero", "stale_nonzero"):
                 for variant in ("original", "pipeline"):
                     context = _element_context("negative", expected_kind, "zero", variant, initial)
-                    result = _parse_element_probe(
+                    result = _parse_imported_element_probe(
                         capture(
                             probe,
                             "-Start",
@@ -3071,9 +3196,8 @@ def test_element_fixture_child_contexts_and_reference_cleanup_are_fixed():
     ]
     section = section.split("def test_element_probe_parser", 1)[0]
     for phase in ELEMENT_FIXTURE_PHASES - {
-        "shell_parameter_control",
-        "shell_console_control",
-        "shell_write_output_control",
+        "shell_direct_control",
+        "shell_utility_control",
     }:
         assert f'_element_context("{phase}"' in section
     assert "_capture_element_child(" in section and "common.capture(" not in section
@@ -3436,116 +3560,290 @@ def test_element_exit_zero_partial_failure_suffix_is_rejected(tmp_path, monkeypa
     assert any(r["error"] == "output_invalid" for r in _fixture_records(output.out))
 
 
-def test_element_body_controls_use_fixed_direct_checkpoints_and_preserve_original():
+def test_element_utility_route_is_exact_scoped_and_keeps_native_acceptance():
     import inspect
 
-    original = _element_control_script("-fixed")
-    header = "\nparam([string]$Name = '')\n$ErrorActionPreference = 'Stop'\n"
-    assert original.startswith(header)
-    assert ELEMENT_PARAMETER_CONTROL == header + "exit 0\n"
-    assert ELEMENT_CONSOLE_CONTROL == (
-        header
-        + "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shell_console_entered')\n"
-        + "[Console]::Out.Flush()\n"
-        + "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shell_console_exit')\n"
-        + "[Console]::Out.Flush()\nexit 0\n"
-    )
-    instrumented = _element_instrument_control_script("-fixed")
-    stripped = instrumented
-    names = ("shell_body_entered", "shell_write_output_requested", "shell_write_output_returned")
-    for name in names:
-        insertion = (
-            "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=" + name + "')\n"
-            "[Console]::Out.Flush()\n"
-        )
-        assert stripped.count(insertion) == 1
-        stripped = stripped.replace(insertion, "", 1)
-    assert stripped.encode("ascii") == original.encode("ascii")
     assert (
-        instrumented.index("param(")
-        < instrumented.index(names[0])
-        < instrumented.index("$ErrorActionPreference")
-        < instrumented.index(names[1])
-        < instrumented.index("Write-Output")
-        < instrumented.index(names[2])
-        < instrumented.index("if ($Name")
+        "Microsoft.PowerShell.Core\\Import-Module -Name $utilityManifest -PassThru"
+        in ELEMENT_UTILITY_IMPORT
     )
+    assert "$PSHOME" in ELEMENT_UTILITY_IMPORT and "__UTILITY_HOME__" in ELEMENT_UTILITY_IMPORT
+    assert "__UTILITY_SHA256__" in ELEMENT_UTILITY_IMPORT
+    assert "ExportedCmdlets['Write-Output']" in ELEMENT_UTILITY_IMPORT
+    assert "Microsoft.PowerShell.Commands.WriteOutputCommand" in ELEMENT_UTILITY_IMPORT
+    assert "Microsoft.PowerShell.Commands.Utility" in ELEMENT_UTILITY_IMPORT
+    assert "GetPublicKeyToken()" in ELEMENT_UTILITY_IMPORT
+    assert (
+        "Get-Command" not in ELEMENT_UTILITY_IMPORT
+        and "$env:PSModulePath" not in ELEMENT_UTILITY_IMPORT
+    )
+    assert ELEMENT_PROBE_SCRIPT.index(ELEMENT_UTILITY_IMPORT) < ELEMENT_PROBE_SCRIPT.index(
+        "Get-Variable LASTEXITCODE"
+    )
+    assert "Get-Variable LASTEXITCODE -Scope Global" in ELEMENT_PROBE_SCRIPT
+    assert "Set-Alias -Name K5FixtureAlias" in ELEMENT_PROBE_SCRIPT
+    assert "$selected = $original.Replace($needle, $needle + ' | Out-Null')" in ELEMENT_PROBE_SCRIPT
+    assert "Get-Command -Name $gstInspect -ErrorAction Stop" in ELEMENT_PROBE_SCRIPT
+    assert "ConvertTo-Json" not in ELEMENT_PROBE_SCRIPT
+    assert "Write-Output (" not in ELEMENT_PROBE_SCRIPT
     main = inspect.getsource(test_windows_exact_element_probe_uses_fresh_actual_native_exit)
-    assert "_element_body_controls(" in main
-    assert "_element_cross_controls(" not in main and "exit-zero.ps1" not in main
-    assert main.index("_element_body_controls(") < main.index('_element_context("python_control")')
-    assert "_element_instrument_control_script(control_argument)" in main
-    capture = inspect.getsource(_capture_element_child)
-    assert (
-        capture.index("reader.start()")
-        < capture.index("reader.join(15)")
-        < capture.index("owned.wait(5)")
+    assert "_element_body_controls(" not in main
+    assert "_element_utility_controls(" in main
+    assert main.index("_element_utility_controls(") < main.index(
+        '_element_context("python_control")'
     )
+    assert "_element_bind_utility(ELEMENT_PROBE_SCRIPT" in main
     test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
 
 
-@pytest.mark.parametrize("mutation", ["missing", "duplicate", "unexpected_checkpoint"])
-def test_element_body_insertion_rejects_ambiguous_anchors(mutation, monkeypatch):
+def test_element_imported_probe_requires_complete_exact_prefix_and_existing_schema():
+    record = dict(
+        schema_version=ELEMENT_PROBE_SCHEMA,
+        variant="original",
+        initial="absent",
+        fresh_session=True,
+        command_kind="application",
+        application_bound=True,
+        outcome="true",
+        last_exit=0,
+        waited_floor=True,
+    )
+    prefix = b"".join(
+        ELEMENT_CHECKPOINT_PREFIX + name.encode() + b"\n"
+        for name in (
+            "utility_manifest_requested",
+            "utility_import_requested",
+            "utility_import_returned",
+            "utility_binding_verified",
+        )
+    )
+    payload = ELEMENT_PROBE_PREFIX + json.dumps(record).encode() + b"\n"
+    raw = prefix + payload
+    assert _parse_imported_element_probe(raw) == _parse_element_probe(payload) == record
+    lines = raw.splitlines(keepends=True)
+    for forged in (
+        payload,
+        raw[:-1],
+        prefix + payload + payload,
+        raw + b"PRIVATE\n",
+        b"PRIVATE\n" + raw,
+        b"".join(lines[1:]),
+        b"".join([lines[1], lines[0], *lines[2:]]),
+        b"".join([lines[0], lines[0], *lines[2:]]),
+        b"x" * 4097,
+        prefix + ELEMENT_PROBE_PREFIX + b'{"raw":"PRIVATE"}\n',
+    ):
+        with pytest.raises(ValueError):
+            _parse_imported_element_probe(forged)
+
+
+def test_element_direct_output_preserves_control_bytes_except_fixed_serialization():
+    direct = _element_direct_control_script("-fixed")
     original = _element_control_script("-fixed")
-    anchor = "Write-Output 'K5_ELEMENT_CHECKPOINT=shell_control_entered'\n"
-    changed = (
-        original.replace(anchor, "")
-        if mutation == "missing"
-        else original + anchor
-        if mutation == "duplicate"
-        else original + "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shell_body_entered')\n"
+    for name in ("shell_control_entered", "shell_control_exit"):
+        before = (
+            "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=" + name + "'); [Console]::Out.Flush()"
+        )
+        assert direct.count(before) == 1
+        direct = direct.replace(before, "Write-Output 'K5_ELEMENT_CHECKPOINT=" + name + "'", 1)
+    before = (
+        '[Console]::Out.WriteLine((\'K5_ELEMENT_ARGV={{"equal":{0},"hash_equal":{1}}}\' -f '
+        "$equal.ToString().ToLowerInvariant(), $hashEqual.ToString().ToLowerInvariant())); "
+        "[Console]::Out.Flush()"
     )
-    monkeypatch.setitem(
-        _element_instrument_control_script.__globals__, "_element_control_script", lambda _: changed
+    assert direct.count(before) == 1
+    direct = direct.replace(
+        before, "Write-Output ('K5_ELEMENT_ARGV=' + ($record | ConvertTo-Json -Compress))", 1
     )
-    with pytest.raises(ValueError):
-        _element_instrument_control_script("-fixed")
+    assert direct.encode() == original.encode()
+    generated = _element_direct_control_script("-fixed")
+    assert "Write-Output" not in generated and "ConvertTo-Json" not in generated
+    assert "if (-not $equal -or -not $hashEqual) { exit 1 }" in generated
+    template = re.search(r"'K5_ELEMENT_ARGV=(.*?)' -f", generated).group(1)
+    for equal in (True, False):
+        for hashed in (True, False):
+            raw = (
+                ELEMENT_ARGV_PREFIX
+                + template.format(str(equal).lower(), str(hashed).lower()).encode()
+                + b"\n"
+            )
+            assert _element_complete_records(raw)[2] == [dict(equal=equal, hash_equal=hashed)]
 
 
-@pytest.mark.parametrize("fail_at", [0, 1, 2])
-@pytest.mark.parametrize("failure", ["none", "timeout", "cleanup", "unknown", "extra", "missing"])
-def test_element_body_controls_stop_before_matrix_on_every_failure(
-    fail_at, failure, tmp_path, monkeypatch, capsys
+def test_element_fixed_json_templates_preserve_scalar_fields_without_cmdlets():
+    def template(source):
+        expression = source.split("$json = (", 1)[1].split(") -f", 1)[0]
+        return "".join(re.findall(r"'([^']*)'", expression))
+
+    error_template = template(ELEMENT_CHILD_DIAGNOSTICS)
+    for phase in ELEMENT_CHILD_PHASES:
+        assert "'" + phase + "'" in ELEMENT_CHILD_DIAGNOSTICS
+        for boundary in ("primary", "cleanup"):
+            for code in (None, -(2**31), 0, 2**31 - 1):
+                raw = (
+                    ELEMENT_CHILD_PREFIX
+                    + error_template.format(
+                        phase, boundary, "unknown", "null" if code is None else str(code)
+                    ).encode()
+                    + b"\n"
+                )
+                assert _element_child_records(raw) == [
+                    dict(
+                        schema_version="element-child-failure-v1",
+                        phase=phase,
+                        boundary=boundary,
+                        error="unknown",
+                        hresult=code,
+                    )
+                ]
+    probe_template = template(ELEMENT_PROBE_SCRIPT.split("$fixturePhase = 'probe_record'", 1)[1])
+    for outcome in ELEMENT_PROBE_OUTCOMES:
+        for code in (None, 0, 7, 9):
+            for bound in (True, False):
+                raw = (
+                    ELEMENT_PROBE_PREFIX
+                    + probe_template.format(
+                        "pipeline",
+                        "stale_zero",
+                        "application",
+                        str(bound).lower(),
+                        outcome,
+                        "null" if code is None else str(code),
+                        "false",
+                    ).encode()
+                    + b"\n"
+                )
+                assert _parse_element_probe(raw) == dict(
+                    schema_version=ELEMENT_PROBE_SCHEMA,
+                    variant="pipeline",
+                    initial="stale_zero",
+                    fresh_session=True,
+                    command_kind="application",
+                    application_bound=bound,
+                    outcome=outcome,
+                    last_exit=code,
+                    waited_floor=False,
+                )
+    assert "ConvertTo-Json" not in ELEMENT_CHILD_DIAGNOSTICS
+    assert "$Boundary -cnotin @('primary','cleanup')" in ELEMENT_CHILD_DIAGNOSTICS
+    assert "$Phase -cnotin @(" in ELEMENT_CHILD_DIAGNOSTICS
+    assert (
+        "$value -notin @(0,7,9)" not in ELEMENT_PROBE_SCRIPT
+    )  # The admitted Value is checked first.
+    assert "$last.Value -notin @(0,7,9)" in ELEMENT_PROBE_SCRIPT
+
+
+@pytest.mark.parametrize(
+    "mode", ["valid", "missing", "empty", "oversize", "alias", "denied", "template", "duplicate"]
+)
+def test_element_manifest_binding_is_bounded_exact_and_does_not_search(mode, tmp_path, monkeypatch):
+    common = _startup_witness().common
+    home = tmp_path / "PowerShell home'owned"
+    home.mkdir()
+    powershell = home / "powershell.exe"
+    powershell.write_bytes(b"owned-shell-placeholder")
+    manifest = home / "Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1"
+    manifest.parent.mkdir(parents=True)
+    raw = b"@{ModuleVersion='3.1.0.0'}"
+    if mode != "missing":
+        manifest.write_bytes(
+            b"" if mode == "empty" else b"x" * 65537 if mode == "oversize" else raw
+        )
+    if mode == "alias":
+        target = manifest.with_suffix(".owned")
+        manifest.rename(target)
+        manifest.symlink_to(target)
+    calls = []
+    checked = common.local_path
+
+    def local(path):
+        calls.append(path)
+        if mode == "denied":
+            raise PermissionError("PRIVATE_DENIAL")
+        return checked(path)
+
+    monkeypatch.setattr(common, "local_path", local)
+    source = ELEMENT_UTILITY_CONTROL
+    if mode == "template":
+        source = source.replace("__UTILITY_SHA256__", "0" * 64)
+    elif mode == "duplicate":
+        source += "__UTILITY_HOME__"
+    if mode == "valid":
+        bound = _element_bind_utility(source, powershell, common)
+        expected_hash = hashlib.sha256(raw).hexdigest()
+        assert expected_hash in bound and "__UTILITY_" not in bound
+        assert str(home).replace("'", "''") in bound
+        manifest.write_bytes(raw + b"changed")
+        assert hashlib.sha256(manifest.read_bytes()).hexdigest() not in bound
+        assert "if ($manifestHash -cne '" + expected_hash + "')" in bound
+    else:
+        with pytest.raises((ValueError, OSError, common.WitnessError)):
+            _element_bind_utility(source, powershell, common)
+    assert calls == ([powershell] if mode == "denied" else [powershell, manifest])
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "none",
+        "direct_timeout",
+        "direct_extra",
+        "utility_timeout",
+        "utility_missing",
+        "utility_unknown",
+    ],
+)
+def test_element_utility_controls_require_both_routes_before_matrix(
+    failure, tmp_path, monkeypatch, capsys
 ):
     common = _startup_witness().common
-    commands = [["powershell.exe", "-File", str(tmp_path / f"control-{i}.ps1")] for i in range(3)]
+    direct = ["powershell.exe", "-File", "direct.ps1", "-Name:", "-fixed"]
+    utility = ["powershell.exe", "-File", "utility.ps1"]
     env = {"fixed": "admitted"}
-    phases = ("shell_parameter_control", "shell_console_control", "shell_write_output_control")
-    expected = [
-        b"",
-        b"K5_ELEMENT_CHECKPOINT=shell_console_entered\nK5_ELEMENT_CHECKPOINT=shell_console_exit\n",
-        b"K5_ELEMENT_CHECKPOINT=shell_body_entered\n"
-        b"K5_ELEMENT_CHECKPOINT=shell_write_output_requested\n"
-        b"K5_ELEMENT_CHECKPOINT=shell_control_entered\n"
-        b"K5_ELEMENT_CHECKPOINT=shell_write_output_returned\n"
-        b"K5_ELEMENT_CHECKPOINT=shell_control_exit\n",
-    ]
     calls = []
 
     def capture(_common, command, **kwargs):
-        index = len(calls)
-        assert _common is common and command is commands[index]
-        assert kwargs == dict(cwd=tmp_path, env=env, context=_element_context(phases[index]))
-        calls.append(index)
-        if index == fail_at:
-            if failure in {"timeout", "cleanup"}:
-                raise _ElementCaptureFailure
-            if failure == "unknown":
-                raise RuntimeError("PRIVATE_FAILURE")
-            if failure == "extra":
-                return expected[index] + b"PRIVATE_EXTRA\n"
-            if failure == "missing":
-                return b"PRIVATE" if index == 0 else b""
-        return expected[index]
+        assert _common is common and kwargs["cwd"] == tmp_path and kwargs["env"] is env
+        first = command is direct
+        assert first or command is utility
+        phase = "shell_direct_control" if first else "shell_utility_control"
+        assert kwargs["context"] == _element_context(phase)
+        calls.append(phase)
+        if failure == ("direct_timeout" if first else "utility_timeout"):
+            raise _ElementCaptureFailure
+        if not first and failure == "utility_unknown":
+            raise RuntimeError("PRIVATE_FAILURE")
+        if first:
+            raw = (
+                b"K5_ELEMENT_CHECKPOINT=shell_control_entered\n"
+                b'K5_ELEMENT_ARGV={"equal":true,"hash_equal":true}\n'
+                b"K5_ELEMENT_CHECKPOINT=shell_control_exit\n"
+            )
+            return raw + b"PRIVATE_EXTRA\n" if failure == "direct_extra" else raw
+        raw = b"".join(
+            ELEMENT_CHECKPOINT_PREFIX + name.encode() + b"\n"
+            for name in (
+                "utility_manifest_requested",
+                "utility_import_requested",
+                "utility_import_returned",
+                "utility_binding_verified",
+                "utility_cmdlet_requested",
+                "utility_cmdlet_result",
+                "utility_cmdlet_returned",
+            )
+        )
+        return b"" if failure == "utility_missing" else raw
 
-    monkeypatch.setitem(_element_body_controls.__globals__, "_capture_element_child", capture)
+    monkeypatch.setitem(_element_utility_controls.__globals__, "_capture_element_child", capture)
     if failure == "none":
-        _element_body_controls(common, commands, cwd=tmp_path, env=env)
+        _element_utility_controls(common, direct, utility, cwd=tmp_path, env=env)
     else:
         with pytest.raises(_ElementCaptureFailure):
-            _element_body_controls(common, commands, cwd=tmp_path, env=env)
-    assert calls == list(range(3 if failure == "none" else fail_at + 1))
+            _element_utility_controls(common, direct, utility, cwd=tmp_path, env=env)
+    assert calls == (
+        ["shell_direct_control"]
+        if failure.startswith("direct_")
+        else ["shell_direct_control", "shell_utility_control"]
+    )
     output = capsys.readouterr()
     assert "PRIVATE" not in output.out + output.err
-    passed = [r["phase"] for r in _fixture_records(output.out) if r["status"] == "passed"]
-    assert passed == list(phases if failure == "none" else phases[:fail_at])
