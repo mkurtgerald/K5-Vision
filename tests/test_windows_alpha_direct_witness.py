@@ -75,21 +75,33 @@ $function = $ast.Find({ param($node)
 }, $true)
 if ($null -eq $function) { throw 'missing helper' }
 . ([scriptblock]::Create($function.Extent.Text))
+# Optional test-only negative control replaces the validator, never the product.
+__NEGATIVE_CONTROL__
 $path = '__PAYLOAD__'
 $arguments = @{
     Path=$path; ExpectedSize=__SIZE__; ExpectedBlob='__BLOB__'; ExpectedSha256='__SHA__'
 }
 Assert-K5PinnedLauncherBytes @arguments
+$checks = 1
 foreach ($text in @("reviewed launcher`r`n", "changed! launcher`n")) {
     $bytes = [Text.Encoding]::ASCII.GetBytes($text)
     [IO.File]::WriteAllBytes($path, $bytes)
     try { Assert-K5PinnedLauncherBytes @arguments; throw 'tamper accepted' }
-    catch { if ($_.Exception.Message -ne 'launcher_mismatch') { throw } }
+    catch {
+        if ($_.Exception.Message -ne 'launcher_mismatch') { throw }
+        $checks += 1
+    }
 }
 [IO.File]::WriteAllBytes($path, [Text.Encoding]::ASCII.GetBytes("reviewed launcher`n"))
 $arguments.ExpectedBlob = '0000000000000000000000000000000000000000'
 try { Assert-K5PinnedLauncherBytes @arguments; throw 'blob mismatch accepted' }
-catch { if ($_.Exception.Message -ne 'launcher_mismatch') { throw } }
+catch {
+    if ($_.Exception.Message -ne 'launcher_mismatch') { throw }
+    $checks += 1
+}
+if ($checks -ne 4) { throw 'Validator outcomes were incomplete.' }
+Write-Output 'baseline-byte-validator-ok:4'
+exit 0
 """
     for key, value in {
         "__WITNESS__": str(WITNESS).replace("'", "''"),
@@ -99,14 +111,36 @@ catch { if ($_.Exception.Message -ne 'launcher_mismatch') { throw } }
         "__SHA__": sha256,
     }.items():
         script = script.replace(key, value)
-    result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+    # -Command inherits the last command's success status. An expected caught
+    # refusal must not masquerade as a test-process failure. Success is explicit
+    # only after every positive/negative assertion, and is itself checked here.
+    for negative_control in (False, True):
+        override = (
+            "function Assert-K5PinnedLauncherBytes { "
+            "param($Path, $ExpectedSize, $ExpectedBlob, $ExpectedSha256) }"
+            if negative_control
+            else ""
+        )
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script.replace("__NEGATIVE_CONTROL__", override),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if negative_control:
+            assert result.returncode != 0
+            assert "baseline-byte-validator-ok" not in result.stdout
+        else:
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert result.stdout.strip() == "baseline-byte-validator-ok:4"
+            assert result.stderr == ""
 
 
 def test_witness_reuses_existing_physical_job_and_source_free_artifact() -> None:
