@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -777,7 +778,11 @@ catch {
         target = tmp_path / "start-fixture.ps1"
         target.write_text(fixture, encoding="ascii", newline="\n")
         envelope = tmp_path / "envelope.ps1"
-        envelope.write_text(module.ENVELOPE, encoding="ascii", newline="\n")
+        envelope.write_text(
+            module.bind_start_envelope(hashlib.sha256(fixture.encode("ascii")).hexdigest()),
+            encoding="ascii",
+            newline="\n",
+        )
         result = subprocess.run(
             [
                 "powershell.exe",
@@ -904,8 +909,16 @@ def test_windows_start_error_projection_checks_real_file_line_and_operation(tmp_
         expected_line = fixture.splitlines().index(stop) + 1
         target = tmp_path / "source-fixture.ps1"
         envelope = tmp_path / "envelope.ps1"
-        envelope.write_text(module.ENVELOPE, encoding="ascii", newline="\n")
-        for extra, expected_origin in (("", "start"), ("\n#" + "x" * 65536, "unknown")):
+        admitted = hashlib.sha256(fixture.encode("ascii")).hexdigest()
+        cases = (
+            ("", module.bind_start_envelope(admitted), "start"),
+            ("", module.ENVELOPE, "unknown"),
+            ("", module.bind_start_envelope("a" * 64), "unknown"),
+            ("\n# replaced bytes", module.bind_start_envelope(admitted), "unknown"),
+            ("\n#" + "x" * 65536, module.bind_start_envelope(admitted), "unknown"),
+        )
+        for extra, bound_envelope, expected_origin in cases:
+            envelope.write_text(bound_envelope, encoding="ascii", newline="\n")
             target.write_text(fixture + extra, encoding="ascii", newline="\n")
             result = subprocess.run(
                 [
@@ -1026,6 +1039,7 @@ ERROR_BOUNDARY_CASES = {
         "}"
     ),
     "foreign_known": '& (Join-Path $PSScriptRoot "foreign.ps1")',
+    "foreign_runtime": '& (Join-Path $PSScriptRoot "foreign-runtime.ps1")',
 }
 ERROR_BOUNDARY_EXPECTED_IDS = {
     "direct_known": "known_throw",
@@ -1038,6 +1052,7 @@ ERROR_BOUNDARY_EXPECTED_IDS = {
     "native_stderr": "native_stderr",
     "native_all_streams": "element_missing",
     "foreign_known": "known_throw",
+    "foreign_runtime": "variable_undefined",
 }
 
 # Test-only, observational insertion after the original catch saves $fatal. All
@@ -1365,14 +1380,13 @@ def test_windows_post_admission_error_boundary_preserves_useful_projection(tmp_p
             encoding="ascii",
             newline="\n",
         )
-        control = tmp_path / "control.ps1"
-        control.write_bytes(module.ENVELOPE.encode("ascii"))
-        observer = tmp_path / "observer.ps1"
-        observer.write_bytes(
-            _observed_envelope(module.ENVELOPE, module.START_OPERATION_ANCHORS).encode("ascii")
+        (installed / "foreign-runtime.ps1").write_text(
+            "Set-StrictMode -Version Latest\n$null = $K5ForeignUndefinedVariable\n",
+            encoding="ascii",
+            newline="\n",
         )
-        if control.read_bytes() != module.ENVELOPE.encode("ascii"):
-            raise ValueError("Invalid fixture envelope")
+        control = tmp_path / "control.ps1"
+        observer = tmp_path / "observer.ps1"
         environment = {**os.environ, "TEMP": str(sessions), "TMP": str(sessions)}
         for case, fault in ERROR_BOUNDARY_CASES.items():
             injection = fault + '\nthrow "fixture_fault_did_not_terminate"\n'
@@ -1380,6 +1394,13 @@ def test_windows_post_admission_error_boundary_preserves_useful_projection(tmp_p
             if fixture.replace(injection, "", 1) != source or len(fixture.splitlines()) > 4096:
                 raise ValueError("Invalid fixture source")
             target.write_text(fixture, encoding="ascii", newline="\n")
+            bound = module.bind_start_envelope(hashlib.sha256(fixture.encode("ascii")).hexdigest())
+            control.write_bytes(bound.encode("ascii"))
+            observer.write_bytes(
+                _observed_envelope(bound, module.START_OPERATION_ANCHORS).encode("ascii")
+            )
+            if control.read_bytes() != bound.encode("ascii"):
+                raise ValueError("Invalid fixture envelope")
             outcomes = []
             for envelope, observed in ((control, False), (observer, True)):
                 result = subprocess.run(
@@ -1430,11 +1451,15 @@ def test_windows_post_admission_error_boundary_preserves_useful_projection(tmp_p
             ):
                 raise ValueError("Unexpected error boundary shape")
             recoverable = any(shape[f"record_{slot}_line_in_start"] for slot in range(4))
-            if case == "foreign_known":
+            if case in {"foreign_known", "foreign_runtime"}:
                 if projection["origin"] != "unknown":
                     regressions.append(case)
             elif (
-                not recoverable
+                (
+                    case in {"missing_variable", "missing_property", "null_method"}
+                    and projection["error_class"] != ERROR_BOUNDARY_EXPECTED_IDS[case]
+                )
+                or not recoverable
                 or projection["origin"] != "start"
                 or projection["operation"] == "unknown"
                 or projection["error_class"] == "unknown"
@@ -1579,3 +1604,174 @@ def test_all_streams_fixture_keeps_exact_gstreamer_probe_body():
         'throw "Reviewed GStreamer runtime is missing required synthetic test element: ' in fixture
     )
     assert ERROR_BOUNDARY_EXPECTED_IDS["native_all_streams"] == "element_missing"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows typed ErrorRecord graphs")
+def test_windows_error_selector_rejects_cycles_caps_and_competing_foreign_leaf(tmp_path: Path):
+    import os
+
+    module = _startup_witness()
+    complete = False
+    try:
+        source = START.read_text()
+        marker = "Set-StrictMode -Version Latest\n"
+        fault = "if ($Port -eq 8012) { $null = 1 / 0 }\n$null = $K5FixtureUndefinedVariable\n"
+        fixture = source.replace(marker, marker + fault, 1)
+        start = tmp_path / "Start-K5VisionAlpha.ps1"
+        start.write_text(fixture, encoding="ascii", newline="\n")
+        foreign = tmp_path / "foreign-runtime.ps1"
+        foreign.write_text(
+            "Set-StrictMode -Version Latest\n$null = $K5ForeignUndefinedVariable\n",
+            encoding="ascii",
+            newline="\n",
+        )
+        bound = module.bind_start_envelope(hashlib.sha256(fixture.encode("ascii")).hexdigest())
+        entry = "try {\n    & $Start -Port $Port -ExitAfterPublicTest\n"
+        if bound.count(entry) != 1:
+            raise ValueError("Invalid projection fixture")
+        # Exact projection functions; do not execute the envelope's launcher tail.
+        functions = bound.split(entry, 1)[0]
+        harness = r"""
+try {
+    try { & $Start -Port $Port -ExitAfterPublicTest } catch { $owned = $_.Exception.ErrorRecord }
+    try { & $Start -Port 8012 -ExitAfterPublicTest }
+    catch { $arithmetic = $_.Exception.ErrorRecord }
+    try { & (Join-Path (Split-Path -Parent $Start) 'foreign-runtime.ps1') }
+    catch { $foreign = $_.Exception.ErrorRecord }
+    if ($owned -isnot [System.Management.Automation.ErrorRecord] -or
+        $foreign -isnot [System.Management.Automation.ErrorRecord] -or
+        $arithmetic -isnot [System.Management.Automation.ErrorRecord] -or
+        $null -eq $arithmetic.InvocationInfo -or
+        $arithmetic.InvocationInfo.ScriptName -cne $Start -or
+        $null -eq $owned.InvocationInfo -or $null -eq $foreign.InvocationInfo -or
+        $owned.InvocationInfo.ScriptName -cne $Start -or
+        $foreign.InvocationInfo.ScriptName -ceq $Start) { throw 'fixture_invalid' }
+    # The two-argument RuntimeException constructor and virtual ErrorRecord
+    # getter are present in Windows PowerShell 5.1. No newer three-argument API.
+    $automationAssembly = [System.Management.Automation.RuntimeException].Assembly.Location
+    Add-Type -ReferencedAssemblies $automationAssembly -TypeDefinition @'
+using System;
+using System.Management.Automation;
+public sealed class K5FixtureRuntime : RuntimeException {
+    public ErrorRecord Link;
+    public K5FixtureRuntime(Exception inner) : base("PRIVATE_GRAPH_SENTINEL", inner) {}
+    public override ErrorRecord ErrorRecord { get { return Link; } }
+}
+public sealed class K5FixtureMethod : MethodInvocationException {
+    public ErrorRecord Link;
+    public K5FixtureMethod() : base("PRIVATE_GRAPH_SENTINEL") {}
+    public override ErrorRecord ErrorRecord { get { return Link; } }
+}
+'@
+    function New-K5FixtureRecord([Exception]$Exception) {
+        return [System.Management.Automation.ErrorRecord]::new(
+            $Exception, 'PRIVATE_GRAPH_ID',
+            [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+    }
+    $graphs = [Collections.Generic.List[object]]::new()
+    $cycleException = [K5FixtureRuntime]::new($null)
+    $cycle = New-K5FixtureRecord $cycleException
+    $cycleException.Link = $cycle
+    $graphs.Add($cycle)
+
+    $depthException = [Exception]::new('PRIVATE_GRAPH_SENTINEL')
+    foreach ($index in 1..5) {
+        $depthException = [Exception]::new('PRIVATE_GRAPH_SENTINEL', $depthException)
+    }
+    $graphs.Add((New-K5FixtureRecord $depthException))
+
+    $p0Exception = [System.Management.Automation.RuntimeException]::new('PRIVATE_GRAPH_SENTINEL')
+    $p1Exception = [System.Management.Automation.RuntimeException]::new('PRIVATE_GRAPH_SENTINEL')
+    $placeholder0 = $p0Exception.ErrorRecord
+    $placeholder1 = $p1Exception.ErrorRecord
+    if ($null -ne $placeholder0.InvocationInfo -or $null -ne $placeholder1.InvocationInfo -or
+        $placeholder0.Exception -isnot
+            [System.Management.Automation.ParentContainsErrorRecordException]) {
+        throw 'fixture_invalid'
+    }
+    $tail = [Exception]::new('PRIVATE_GRAPH_SENTINEL', [Exception]::new('PRIVATE_GRAPH_SENTINEL'))
+    $nodeInner = [K5FixtureRuntime]::new($tail)
+    $nodeInner.Link = $placeholder1
+    $nodeRoot = [K5FixtureRuntime]::new($nodeInner)
+    $nodeRoot.Link = $placeholder0
+    $graphs.Add((New-K5FixtureRecord $nodeRoot))
+
+    $unexpected = [K5FixtureRuntime]::new($null)
+    $unexpected.Link = New-K5FixtureRecord ([Exception]::new('PRIVATE_GRAPH_SENTINEL'))
+    $graphs.Add((New-K5FixtureRecord $unexpected))
+
+    # Independent leaves at unequal depths: choosing the deeper owned branch
+    # would conceal the shallower foreign provenance and must remain unknown.
+    $ownedBranch = [K5FixtureRuntime]::new($null)
+    $ownedBranch.Link = $owned
+    $foreignBranch = [K5FixtureRuntime]::new($ownedBranch)
+    $foreignBranch.Link = $foreign
+    $graphs.Add((New-K5FixtureRecord $foreignBranch))
+    foreach ($graph in $graphs) {
+        if ($null -ne (Get-K5SourceFailure -Root $graph)) { throw 'fixture_invalid' }
+        Write-K5StartError -Failure $graph -Phase 'primary'
+    }
+    $singleBranch = [K5FixtureRuntime]::new($null)
+    $singleBranch.Link = $owned
+    $single = New-K5FixtureRecord $singleBranch
+    if (-not [object]::ReferenceEquals((Get-K5SourceFailure -Root $single), $owned)) {
+        throw 'fixture_invalid'
+    }
+    Write-K5StartError -Failure $single -Phase 'primary'
+    $methodWrapper = [K5FixtureMethod]::new()
+    $methodWrapper.Link = $arithmetic
+    $methodRecord = New-K5FixtureRecord $methodWrapper
+    if (-not [object]::ReferenceEquals((Get-K5SourceFailure -Root $methodRecord), $arithmetic)) {
+        throw 'fixture_invalid'
+    }
+    Write-K5StartError -Failure $methodRecord -Phase 'primary'
+    Write-Output 'K5_GRAPH_BOUNDS=passed'
+    exit 0
+} catch { exit 1 }
+"""
+        probe = tmp_path / "graph-probe.ps1"
+        probe.write_text(functions + harness, encoding="ascii", newline="\n")
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(probe),
+                "-Start",
+                str(start),
+                "-Port",
+                "8011",
+            ],
+            capture_output=True,
+            timeout=30,
+            check=False,
+            env={**os.environ, "TEMP": str(tmp_path), "TMP": str(tmp_path)},
+        )
+        if result.returncode != 0 or result.stderr or len(result.stdout) > 8192:
+            raise ValueError("Invalid graph fixture")
+        lines = result.stdout.splitlines()
+        if len(lines) != 8 or lines[-1] != b"K5_GRAPH_BOUNDS=passed":
+            raise ValueError("Invalid graph fixture")
+        records = []
+        for line in lines[:-1]:
+            if not line.startswith(module.START_ERROR_PREFIX):
+                raise ValueError("Invalid graph fixture")
+            records.append(module.parse_start_error(line[len(module.START_ERROR_PREFIX) :]))
+        for record in records[:-2]:
+            if any(
+                record[key] != "unknown"
+                for key in ("origin", "operation", "error_class", "failure")
+            ):
+                raise ValueError("Invalid graph projection")
+        for record, expected_class in zip(
+            records[-2:], ("variable_undefined", "method_binding"), strict=True
+        ):
+            if record["origin"] != "start" or record["error_class"] != expected_class:
+                raise ValueError("Invalid graph projection")
+        complete = True
+    except Exception:
+        pass
+    if not complete:
+        pytest.fail("Typed ErrorRecord graph bounds fixture failed", pytrace=False)

@@ -334,6 +334,9 @@ def test_invalid_then_two_successful_installed_launches(monkeypatch, tmp_path: P
 
     def invoke(command, **kwargs):
         assert "Start-K5VisionAlpha.ps1" in " ".join(command)
+        assert (tmp_path / "invoke-start.ps1").read_text() == witness.bind_start_envelope(
+            expected_identities["start_script_sha256"]
+        )
         calls.append(("start", kwargs.get("invalid", False)))
         if kwargs.get("invalid"):
             assert kwargs["admitted_images"] == {"explicit": "images"}
@@ -2090,3 +2093,50 @@ def test_projection_failure_without_primary_remains_fatal_and_cleans(
         assert state["observation_closed"]
     assert caught.value.alpha_diagnostic["contract"] == "startup_diagnostic_projection"
     assert caught.value.alpha_diagnostic["stage"] == "cleanup"
+
+
+@pytest.mark.parametrize("error_class", ["variable_undefined", "property_missing", "null_method"])
+def test_proven_nested_runtime_ids_have_explicit_bounded_classes(error_class):
+    value = start_error(
+        origin="start", source_line=153, operation="runtime_admission", error_class=error_class
+    )
+    witness.validate_start_error(value)
+
+
+def test_diagnostic_envelope_binds_independently_admitted_start_hash():
+    digest = "a" * 64
+    bound = witness.bind_start_envelope(digest)
+    assert digest in bound
+    assert "__ADMITTED_START_SHA256__" not in bound
+    assert "& $Start -Port $Port -ExitAfterPublicTest" in bound
+    for bad in (None, "", "0" * 64, "a" * 63, "A" * 64, "private-path"):
+        with pytest.raises((ValueError, witness.common.WitnessError)):
+            witness.bind_start_envelope(bad)
+
+
+def test_source_selector_is_typed_bounded_and_does_not_prefer_an_owned_branch():
+    selector = witness.ENVELOPE.split("function Get-K5SourceFailure {", 1)[1].split(
+        "function Write-K5StartError {", 1
+    )[0]
+    for exact in (
+        "$seen.Count -ge 8",
+        "$entry.Depth -gt 4",
+        "$records -gt 4",
+        "[object]::ReferenceEquals",
+        "$node -is [System.Management.Automation.ErrorRecord]",
+        "$node -is [System.Management.Automation.RuntimeException]",
+        "$node.ErrorRecord",
+        "$node.InnerException",
+        "$candidates.Count -gt 1",
+        "$entry.Path",
+        "[System.Management.Automation.ParentContainsErrorRecordException]",
+    ):
+        assert exact in selector
+    assert "$Start" not in selector  # Trust is applied only after provenance selection.
+    assert "PSCommandPath" not in selector
+    assert "GetFullPath($info.ScriptName)" in witness.ENVELOPE
+    assert "$hasher.ComputeHash($buffer, 0, $count)" in witness.ENVELOPE
+    assert "$actualHash -cne $admittedStartSha256" in witness.ENVELOPE
+    assert witness.ENVELOPE.index("$actualHash -cne") < witness.ENVELOPE.index(
+        "$record.origin = 'start'"
+    )

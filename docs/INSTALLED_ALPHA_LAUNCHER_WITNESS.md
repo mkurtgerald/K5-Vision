@@ -288,3 +288,30 @@ token and wrong/empty/decorated/multiline/nonzero responses, plus genuine typed
 startup-and-cleanup failures and foreign/malformed metadata. Portable tests check
 strict scalar schemas, source-anchor uniqueness, bounded parsing, milestone caps,
 raw-value rejection and preservation of ownership cleanup on projection failure.
+
+The hosted propagation matrix on `22223c8` completed all ten non-media cases.
+Exactly three generic runtime failures lost classification: undefined variable,
+missing property, and null method invocation. Their outer ErrorRecords described
+the caller, while a nested `RuntimeException.ErrorRecord` carried the checked
+Start origin and the corresponding fixed runtime ID. The other seven controls,
+including both native stderr redirection styles, retained useful classification.
+This demonstrates a projection defect; the earlier native startup cause remains
+unestablished.
+
+The repaired projection traverses only typed ErrorRecord, RuntimeException's
+ErrorRecord, and Exception.InnerException edges. It caps the graph at eight nodes,
+four records and depth four, rejects repeated references, and preserves the source
+ancestry. A source-bearing descendant supersedes its caller, including when the
+leaf is foreign. Independent competing source-bearing branches remain unknown,
+regardless of their relative depth. An empty ParentContainsErrorRecordException
+placeholder cannot erase a useful caller. Unexpected non-placeholder metadata,
+cycles, ambiguity and incomplete traversal remain unknown. Only the three observed
+runtime ID prefixes gain explicit fixed error classes.
+
+`bind_start_envelope` embeds the already admitted `start_script_sha256` expectation
+in the owned envelope without changing Start's arguments. The catch-time bounded
+read must match that SHA-256 before source path, line and anchor mapping can grant
+Start origin. It never derives its trust value from that reread. Unbound templates,
+wrong hashes and replaced source cannot grant source trust. Additional Windows
+negatives exercise foreign runtime leaves, uneven competing branches, graph caps
+and cycles; the original control and dual-failure fixtures remain in the same gate.

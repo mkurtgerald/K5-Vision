@@ -398,6 +398,9 @@ START_ERROR_CLASSES = {
     "access_denied",
     "missing_resource",
     "win32",
+    "variable_undefined",
+    "property_missing",
+    "null_method",
     "unknown",
 }
 START_FAILURES = set(START_FAILURE_MESSAGES.values()) | {
@@ -497,6 +500,76 @@ def validate_start_observation(value: object) -> None:
 ENVELOPE = r"""param([string]$Start, [int]$Port)
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+$admittedStartSha256 = '__ADMITTED_START_SHA256__'
+function Get-K5SourceFailure {
+    param([System.Management.Automation.ErrorRecord]$Root)
+    try {
+        $queue = [Collections.Generic.Queue[object]]::new()
+        $seen = [Collections.Generic.List[object]]::new()
+        $candidates = [Collections.Generic.List[object]]::new()
+        $queue.Enqueue([pscustomobject]@{ Value = $Root; Depth = 0; Path = @() })
+        $records = 0
+        while ($queue.Count -gt 0) {
+            if ($seen.Count -ge 8) { return $null }
+            $entry = $queue.Dequeue()
+            $node = $entry.Value
+            if ($entry.Depth -gt 4) { return $null }
+            foreach ($prior in $seen) {
+                if ([object]::ReferenceEquals($node, $prior)) { return $null }
+            }
+            $seen.Add($node)
+            $path = @($entry.Path) + @($node)
+            if ($node -is [System.Management.Automation.ErrorRecord]) {
+                $records++
+                if ($records -gt 4) { return $null }
+                $info = $node.InvocationInfo
+                if ($null -ne $info -and -not [string]::IsNullOrEmpty($info.ScriptName)) {
+                    if ($info.ScriptLineNumber -lt 1 -or $info.ScriptLineNumber -gt 4096) {
+                        return $null
+                    }
+                    # A descendant replaces its caller, even if the descendant
+                    # is foreign. Independent source-bearing branches are never
+                    # resolved by depth or by preferring an owned pathname.
+                    for ($index = $candidates.Count - 1; $index -ge 0; $index--) {
+                        foreach ($ancestor in $entry.Path) {
+                            if ([object]::ReferenceEquals($candidates[$index], $ancestor)) {
+                                $candidates.RemoveAt($index)
+                                break
+                            }
+                        }
+                    }
+                    $candidates.Add($node)
+                } elseif ($entry.Depth -gt 0 -and
+                          $node.Exception -isnot
+                            [System.Management.Automation.ParentContainsErrorRecordException]) {
+                    return $null
+                }
+                # A no-provenance ParentContains placeholder is not a competing
+                # origin and cannot erase a qualified caller's useful metadata.
+                $queue.Enqueue([pscustomobject]@{
+                    Value = $node.Exception; Depth = $entry.Depth + 1; Path = $path
+                })
+            } elseif ($node -is [Exception]) {
+                if ($node -is [System.Management.Automation.RuntimeException]) {
+                    $linked = $node.ErrorRecord
+                    if ($linked -is [System.Management.Automation.ErrorRecord]) {
+                        $queue.Enqueue([pscustomobject]@{
+                            Value = $linked; Depth = $entry.Depth + 1; Path = $path
+                        })
+                    }
+                }
+                if ($null -ne $node.InnerException) {
+                    $queue.Enqueue([pscustomobject]@{
+                        Value = $node.InnerException; Depth = $entry.Depth + 1; Path = $path
+                    })
+                }
+            } else { return $null }
+        }
+        if ($candidates.Count -gt 1) { return $null }
+        if ($candidates.Count -eq 1) { return $candidates[0] }
+        return $Root
+    } catch { return $null }
+}
 function Write-K5StartError {
     param([System.Management.Automation.ErrorRecord]$Failure, [string]$Phase)
     $record = [ordered]@{
@@ -507,6 +580,12 @@ function Write-K5StartError {
         operation = 'unknown'
         error_class = 'unknown'
         failure = 'unknown'
+    }
+    $originalFailure = $Failure
+    $Failure = Get-K5SourceFailure -Root $Failure
+    if ($null -eq $Failure) {
+        Write-Output ('K5_ALPHA_START_ERROR=' + ($record | ConvertTo-Json -Compress))
+        return
     }
     try {
         $message = $Failure.Exception.Message
@@ -526,12 +605,23 @@ function Write-K5StartError {
         if ($message -cmatch $portPattern) {
             $record.failure = 'control_port_occupied'
         }
+        $runtimeId = ''
+        if ($Failure.FullyQualifiedErrorId.Length -le 512) {
+            $runtimeId = $Failure.FullyQualifiedErrorId.Split(',')[0]
+        }
         if ($record.failure -cne 'unknown') { $record.error_class = 'known_throw' }
+        elseif ($runtimeId -ceq 'VariableIsUndefined') {
+            $record.error_class = 'variable_undefined'
+        } elseif ($runtimeId -ceq 'PropertyNotFoundStrict') {
+            $record.error_class = 'property_missing'
+        } elseif ($runtimeId -ceq 'InvokeMethodOnNull') {
+            $record.error_class = 'null_method'
+        }
         elseif ($Failure.FullyQualifiedErrorId -cin
                 @('NativeCommandError', 'NativeCommandErrorMessage')) {
             $record.error_class = 'native_stderr'
         } else {
-            $exception = $Failure.Exception
+            $exception = $originalFailure.Exception
             for ($depth = 0; $depth -lt 4 -and $null -ne $exception; $depth++) {
                 if ($exception -is [System.Management.Automation.MethodException] -or
                     $exception -is [System.Management.Automation.MethodInvocationException]) {
@@ -568,6 +658,13 @@ function Write-K5StartError {
                 }
                 if ($count -gt 65536) { throw 'unknown' }
             } finally { $stream.Dispose() }
+            if ($admittedStartSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                $admittedStartSha256 -ceq ('0' * 64)) { throw 'unknown' }
+            $hasher = [Security.Cryptography.SHA256]::Create()
+            try { $digest = $hasher.ComputeHash($buffer, 0, $count) }
+            finally { $hasher.Dispose() }
+            $actualHash = [BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant()
+            if ($actualHash -cne $admittedStartSha256) { throw 'unknown' }
             $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
             $lines = $utf8.GetString($buffer, 0, $count).Replace("`r`n", "`n").Split("`n")
             if ($lines.Count -gt 4096 -or $info.ScriptLineNumber -gt $lines.Count) {
@@ -629,6 +726,17 @@ try {
 """.replace(
     "__KNOWN_MESSAGES__", json.dumps(list(START_FAILURE_MESSAGES.items())).replace("'", "''")
 ).replace("__OPERATION_ANCHORS__", json.dumps(START_OPERATION_ANCHORS).replace("'", "''"))
+
+
+def bind_start_envelope(expected_sha256: str) -> str:
+    """Bind the prior admitted Git/script identity, never derive trust from a reread."""
+    if (
+        type(expected_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or expected_sha256 == "0" * 64
+    ):
+        raise ValueError("invalid admitted Start identity")
+    return ENVELOPE.replace("__ADMITTED_START_SHA256__", expected_sha256)
 
 
 def validate_expectations(
@@ -1393,7 +1501,9 @@ def launch_sequence(
     owned_observations: list,
 ) -> None:
     envelope = work / "invoke-start.ps1"
-    envelope.write_text(ENVELOPE, encoding="ascii", newline="\n")
+    envelope.write_text(
+        bind_start_envelope(expected["start_script_sha256"]), encoding="ascii", newline="\n"
+    )
     invalid_config = work / "invalid-analytics.json"
     invalid_config.write_bytes(b'{"schema_version":1,"provider":"invalid-selected-provider"}')
     port = common.free_port()
