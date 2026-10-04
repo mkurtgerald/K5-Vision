@@ -38,6 +38,33 @@ def open_count():
 """
 
 
+def test_existing_windows_smoke_qualifies_exact_app_lifetime_paths() -> None:
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github/workflows/windows-alpha-script-smoke.yml"
+    ).read_text()
+    triggers = workflow.split("permissions:", 1)[0]
+    for path in (
+        "src/k5vision/main.py",
+        "src/k5vision/stage_one_app.py",
+        "tests/test_app_resource_lifetime.py",
+    ):
+        assert triggers.count(f'- "{path}"') == 2
+    regression = workflow.split("- name: Run Windows alpha boundary regressions", 1)[1]
+    regression = regression.split("- name:", 1)[0]
+    for path in (
+        "tests/test_one_file_windows_bootstrap.py",
+        "tests/test_windows_alpha_bootstrap.py",
+        "tests/test_public_test_operator_runtime.py",
+        "tests/test_windows_alpha_direct_witness.py",
+        "tests/test_app_resource_lifetime.py",
+    ):
+        assert regression.count(path) == 1
+    assert "runs-on: windows-latest" in workflow
+    assert workflow.count("runs-on:") == 1
+    assert "permissions:\n  contents: read" in workflow
+    assert "--no-cov" in regression
+
+
 def _fresh_process(tmp_path: Path, script: str) -> None:
     environment = {
         key: value

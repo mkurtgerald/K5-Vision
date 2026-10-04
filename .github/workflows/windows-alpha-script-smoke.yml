@@ -6,6 +6,9 @@ on:
       - "Install-K5VisionAlpha.ps1"
       - "scripts/windows-alpha/**"
       - "src/k5vision/operator_runtime.py"
+      - "src/k5vision/main.py"
+      - "src/k5vision/stage_one_app.py"
+      - "tests/test_app_resource_lifetime.py"
       - "src/k5vision/cli.py"
       - "src/k5vision/identity_state.py"
       - "src/k5vision/windows_identity_security.py"
@@ -24,6 +27,9 @@ on:
     paths:
       - "scripts/windows-alpha/**"
       - "src/k5vision/operator_runtime.py"
+      - "src/k5vision/main.py"
+      - "src/k5vision/stage_one_app.py"
+      - "tests/test_app_resource_lifetime.py"
       - "src/k5vision/cli.py"
       - "src/k5vision/identity_state.py"
       - "src/k5vision/windows_identity_security.py"
@@ -100,7 +106,7 @@ jobs:
       - name: Run Windows alpha boundary regressions
         shell: powershell
         run: |
-          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py -q --no-cov
+          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py tests/test_app_resource_lifetime.py -q --no-cov
 
       - name: Qualify Windows local recovery identity
         shell: powershell
