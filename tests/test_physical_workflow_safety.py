@@ -6,6 +6,7 @@ import pytest
 
 _WORKFLOW = ".github/workflows/physical-validation.yml"
 _WORKFLOWS = Path(".github/workflows")
+_INSTALLED_CANDIDATE = "installed-analytics-candidate.yml"
 _PHYSICAL = tuple(
     path
     for path in sorted(_WORKFLOWS.glob("*.yml"))
@@ -99,9 +100,11 @@ def test_stage03_private_source_never_enters_probe_process_argv() -> None:
 
 
 def test_qualification_inventory_remains_present() -> None:
-    assert len(_PHYSICAL) == 26
+    assert len(_PHYSICAL) == 27
     names = {path.name for path in _PHYSICAL}
     assert _TARGETED_DISPATCH.issubset(names)
+    assert _INSTALLED_CANDIDATE in names
+    assert len(names - {_INSTALLED_CANDIDATE}) == 26
     assert all(path.is_file() for path in _PHYSICAL)
 
 
@@ -110,6 +113,23 @@ def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
     triggers = text.split("\non:\n", maxsplit=1)[1].split("\npermissions:", maxsplit=1)[0]
     admission = text.split("\njobs:\n", maxsplit=1)[1].split("    runs-on:", maxsplit=1)[0]
+
+    if path.name == _INSTALLED_CANDIDATE:
+        assert (
+            "  push:\n    branches:\n      - feat/installed-analytics-operator-20261003\n"
+            in triggers
+        )
+        assert "pull_request:" not in triggers and "workflow_dispatch:" not in triggers
+        assert "github.repository == 'mkurtgerald/K5-Vision'" in admission
+        assert "github.ref == 'refs/heads/feat/installed-analytics-operator-20261003'" in admission
+        assert "K5_EXPECTED_SHA: ${{ github.sha }}" in text
+        assert "$head.commit.sha -cne $env:K5_EXPECTED_SHA" in text
+        assert "          ref: ${{ github.sha }}\n" in text
+        assert "          persist-credentials: false\n" in text
+        assert "event=pull_request&head_sha=$env:K5_EXPECTED_SHA" in text
+        assert "if (-not $qualified" in text
+        assert "secrets." not in text
+        return
 
     if path.name == "stage-one-operator-physical.yml":
         assert "  push:\n    branches:\n      - main\n" in triggers
@@ -179,7 +199,14 @@ def test_qualification_upload_requires_its_validation_outcome(path: Path) -> Non
     if validators:
         assert len(validators) == 1
         validation = validators[0]
-        assert "        if: always()\n" in validation
+        if path.name == _INSTALLED_CANDIDATE:
+            # A rejected candidate must not execute leftover workspace code
+            # after its pre-checkout hosted/head gate fails. This route uploads
+            # only the separately verified successful installed receipt.
+            assert "        if: steps.installed_witness.outcome == 'success'\n" in validation
+            assert "--validate-receipt" in validation
+        else:
+            assert "        if: always()\n" in validation
         assert "source-free" in validation.split("\n", maxsplit=1)[0]
         assert "throw " in validation
         for upload in uploads:
