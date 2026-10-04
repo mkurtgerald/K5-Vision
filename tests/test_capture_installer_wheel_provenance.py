@@ -370,7 +370,12 @@ def test_capture_hook_and_branch_route_keep_prior_admission_and_cleanup():
     assert "@($legacyBranch, $launcherBranch, $upgradeBranch)" in text
     assert '$upgradeBranch = "' + branch + '"' in text
     assert "group: stage-one-operator-physical" in text and "cancel-in-progress: false" in text
-    assert text.count("    runs-on:") == 1
+    assert text.count("    runs-on:") == 2
+    assert text.count("    runs-on: [self-hosted,") == 1
+    native = text.split("\n  installed-analytics-candidate:\n", 1)[1]
+    assert "needs: hosted_admission" in native
+    assert "needs.hosted_admission.result == 'success'" in native
+    assert "needs.hosted_admission.outputs.qualified_sha == github.sha" in native
     assert "if ($env:K5_CANDIDATE_BRANCH -ceq $legacyBranch)" in text
     for identifier in ("355859781", "369354936", "361865932", "362514400", "364801702"):
         assert identifier in text

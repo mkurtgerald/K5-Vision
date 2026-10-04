@@ -36,21 +36,91 @@ on:
       - tests/test_installed_analytics_candidate_workflow.py
       - tests/test_windows_alpha_analytics.py
 
-# Shares the existing K5 physical lane; never cancel an already running owner.
+# Shares the existing K5 physical lane only after hosted admission succeeds.
 # Cross-repository launch coordination and fresh host admission remain required.
-concurrency:
-  group: stage-one-operator-physical
-  cancel-in-progress: false
-
 permissions:
   contents: read
   actions: read
 
 jobs:
-  installed-analytics-candidate:
+  hosted_admission:
+    name: hosted-candidate-admission
     if: github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003')
+    runs-on: windows-latest
+    timeout-minutes: 10
+    outputs:
+      qualified_sha: ${{ steps.qualify.outputs.qualified_sha }}
+    env:
+      K5_CANDIDATE_BRANCH: ${{ github.ref_name }}
+      K5_EXPECTED_SHA: ${{ github.sha }}
+    steps:
+      - name: Require exact trusted head and green hosted PR qualification
+        id: qualify
+        timeout-minutes: 9
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Test-K5CandidateHostedGates {
+            if ($env:GITHUB_REPOSITORY -cne "mkurtgerald/K5-Vision") { throw "Untrusted candidate repository refused." }
+            if ($env:K5_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "Exact candidate SHA required." }
+            $legacyBranch = "feat/installed-analytics-operator-20261003"
+            $launcherBranch = "feat/alpha-analytics-preflight-20261004"
+            $upgradeBranch = "fix/transactional-alpha-upgrade-20261003"
+            if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $upgradeBranch)) { throw "Unreviewed candidate branch refused." }
+            $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
+            $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+            # PR319/321 require three applicable hosted gates; PR318 retains all five.
+            $required = @{
+              "355859781" = "CI"
+              "369354936" = "Windows Alpha Script Smoke"
+              "361865932" = "PR Run Dedupe"
+            }
+            if ($env:K5_CANDIDATE_BRANCH -ceq $legacyBranch) {
+              $required["362514400"] = "Current Gate Viewport Editor Qualification"
+              $required["364801702"] = "Stage One Analytics Compatibility"
+            }
+            $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+            if ($head.name -cne $env:K5_CANDIDATE_BRANCH) { throw "Candidate branch identity mismatch." }
+            if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch has advanced; no physical work admitted." }
+            $uri = "https://api.github.com/repos/mkurtgerald/K5-Vision/actions/runs?event=pull_request&head_sha=$env:K5_EXPECTED_SHA&per_page=100"
+            $response = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri $uri
+            if ($null -eq $response -or $response.workflow_runs -isnot [System.Array]) { throw "Malformed hosted qualification response." }
+            $qualified = $true
+            foreach ($id in $required.Keys) {
+              $matching = @($response.workflow_runs | Where-Object {
+                [string]$_.workflow_id -ceq $id -and $_.head_sha -ceq $env:K5_EXPECTED_SHA -and
+                $_.event -ceq "pull_request" -and $_.head_branch -ceq $env:K5_CANDIDATE_BRANCH -and
+                $_.name -ceq $required[$id] -and
+                $_.repository.full_name -ceq "mkurtgerald/K5-Vision" -and
+                $_.head_repository.full_name -ceq "mkurtgerald/K5-Vision"
+              } | Sort-Object -Property id -Descending)
+              if ($matching.Count -eq 0) { $qualified = $false; continue }
+              if (@($matching | Where-Object { $_.status -ceq "completed" -and $_.conclusion -cne "success" }).Count -ne 0) {
+                throw "An exact-candidate hosted qualification failed; native execution refused."
+              }
+              if ($matching[0].status -cne "completed" -or $matching[0].conclusion -cne "success") { $qualified = $false }
+            }
+            return $qualified
+          }
+          $deadline = [DateTime]::UtcNow.AddMinutes(8)
+          $qualified = $false
+          while ([DateTime]::UtcNow -lt $deadline) {
+            if (Test-K5CandidateHostedGates) { $qualified = $true; break }
+            Start-Sleep -Seconds 15
+          }
+          if (-not $qualified -or [DateTime]::UtcNow -ge $deadline) { throw "Exact hosted qualification did not pass within the admission budget." }
+          "qualified_sha=$env:K5_EXPECTED_SHA" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+  installed-analytics-candidate:
+    needs: hosted_admission
+    if: needs.hosted_admission.result == 'success' && needs.hosted_admission.outputs.qualified_sha == github.sha && (github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'))
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
-    timeout-minutes: 35
+    timeout-minutes: 25
+    concurrency:
+      group: stage-one-operator-physical
+      cancel-in-progress: false
     env:
       PYTHONHOME: ""
       PYTHONPYCACHEPREFIX: ""
@@ -66,47 +136,49 @@ jobs:
       K5_ALPHA_LAUNCHER_OUTPUT: artifacts\installed-alpha-start-script-witness.json
 
     steps:
-      - name: Require exact trusted head and green hosted PR qualification
-        timeout-minutes: 7
+      - name: Revalidate exact admitted candidate before native work
+        timeout-minutes: 1
         shell: powershell
         env:
           K5_GITHUB_TOKEN: ${{ github.token }}
           K5_EXPECTED_SHA: ${{ github.sha }}
+          K5_ADMITTED_SHA: ${{ needs.hosted_admission.outputs.qualified_sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "Exact candidate SHA required." }
-          $legacyBranch = "feat/installed-analytics-operator-20261003"
-          $launcherBranch = "feat/alpha-analytics-preflight-20261004"
-          $upgradeBranch = "fix/transactional-alpha-upgrade-20261003"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $upgradeBranch)) { throw "Unreviewed candidate branch refused." }
-          $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
-          $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
-          # PR319 and PR321 require CI, Alpha smoke and dedupe. PR318 retains
-          # its additional operator_runtime.py gates, so its original
-          # viewport and Analytics compatibility requirements remain in force.
-          # No native workflow or intentionally untriggered gate is counted.
-          $required = @{
-            "355859781" = "CI"
-            "369354936" = "Windows Alpha Script Smoke"
-            "361865932" = "PR Run Dedupe"
-          }
-          if ($env:K5_CANDIDATE_BRANCH -ceq $legacyBranch) {
-            $required["362514400"] = "Current Gate Viewport Editor Qualification"
-            $required["364801702"] = "Stage One Analytics Compatibility"
-          }
-          $deadline = [DateTime]::UtcNow.AddMinutes(6)
-          $qualified = $false
-          while ([DateTime]::UtcNow -lt $deadline) {
+          if ($env:K5_ADMITTED_SHA -cne $env:K5_EXPECTED_SHA) { throw "Hosted admission does not bind this exact candidate." }
+          function Test-K5CandidateHostedGates {
+            if ($env:GITHUB_REPOSITORY -cne "mkurtgerald/K5-Vision") { throw "Untrusted candidate repository refused." }
+            if ($env:K5_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "Exact candidate SHA required." }
+            $legacyBranch = "feat/installed-analytics-operator-20261003"
+            $launcherBranch = "feat/alpha-analytics-preflight-20261004"
+            $upgradeBranch = "fix/transactional-alpha-upgrade-20261003"
+            if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $upgradeBranch)) { throw "Unreviewed candidate branch refused." }
+            $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
+            $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+            # PR319/321 require three applicable hosted gates; PR318 retains all five.
+            $required = @{
+              "355859781" = "CI"
+              "369354936" = "Windows Alpha Script Smoke"
+              "361865932" = "PR Run Dedupe"
+            }
+            if ($env:K5_CANDIDATE_BRANCH -ceq $legacyBranch) {
+              $required["362514400"] = "Current Gate Viewport Editor Qualification"
+              $required["364801702"] = "Stage One Analytics Compatibility"
+            }
             $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+            if ($head.name -cne $env:K5_CANDIDATE_BRANCH) { throw "Candidate branch identity mismatch." }
             if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch has advanced; no physical work admitted." }
             $uri = "https://api.github.com/repos/mkurtgerald/K5-Vision/actions/runs?event=pull_request&head_sha=$env:K5_EXPECTED_SHA&per_page=100"
             $response = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri $uri
+            if ($null -eq $response -or $response.workflow_runs -isnot [System.Array]) { throw "Malformed hosted qualification response." }
             $qualified = $true
             foreach ($id in $required.Keys) {
               $matching = @($response.workflow_runs | Where-Object {
                 [string]$_.workflow_id -ceq $id -and $_.head_sha -ceq $env:K5_EXPECTED_SHA -and
                 $_.event -ceq "pull_request" -and $_.head_branch -ceq $env:K5_CANDIDATE_BRANCH -and
-                $_.name -ceq $required[$id]
+                $_.name -ceq $required[$id] -and
+                $_.repository.full_name -ceq "mkurtgerald/K5-Vision" -and
+                $_.head_repository.full_name -ceq "mkurtgerald/K5-Vision"
               } | Sort-Object -Property id -Descending)
               if ($matching.Count -eq 0) { $qualified = $false; continue }
               if (@($matching | Where-Object { $_.status -ceq "completed" -and $_.conclusion -cne "success" }).Count -ne 0) {
@@ -114,10 +186,9 @@ jobs:
               }
               if ($matching[0].status -cne "completed" -or $matching[0].conclusion -cne "success") { $qualified = $false }
             }
-            if ($qualified) { break }
-            Start-Sleep -Seconds 15
+            return $qualified
           }
-          if (-not $qualified -or [DateTime]::UtcNow -ge $deadline) { throw "Exact hosted qualification did not pass within the admission budget." }
+          if (-not (Test-K5CandidateHostedGates)) { throw "Exact hosted qualification is no longer green; no physical work admitted." }
 
       - name: Admit existing Git before immutable checkouts
         timeout-minutes: 1

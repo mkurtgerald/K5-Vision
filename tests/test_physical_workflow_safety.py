@@ -115,6 +115,12 @@ def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
     admission = text.split("\njobs:\n", maxsplit=1)[1].split("    runs-on:", maxsplit=1)[0]
 
     if path.name == _INSTALLED_CANDIDATE:
+        admission = text.split("\n  installed-analytics-candidate:\n", 1)[1].split(
+            "    runs-on:", 1
+        )[0]
+        assert "needs: hosted_admission" in admission
+        assert "needs.hosted_admission.result == 'success'" in admission
+        assert "needs.hosted_admission.outputs.qualified_sha == github.sha" in admission
         assert (
             "  push:\n    branches:\n      - feat/installed-analytics-operator-20261003\n"
             "      - feat/alpha-analytics-preflight-20261004\n"
