@@ -1787,24 +1787,56 @@ ELEMENT_PROBE_OUTCOMES = {
     "command_missing",
     "unexpected",
 }
-ELEMENT_PROBE_NATIVE_SOURCE = r"""
-using System;
-using System.Threading;
-public static class K5OwnedExitFixture {
-    public static int Main(string[] args) {
-        if (args.Length != 1) return 31;
-        bool zero = args[0] == "zero" || args[0] == "stderr_zero";
-        bool nonzero = args[0] == "nonzero" || args[0] == "stderr_nonzero";
-        if (!zero && !nonzero) return 32;
-        Thread.Sleep(500);
-        if (args[0].StartsWith("stderr_")) Console.Error.Write("PRIVATE_NATIVE_FIXTURE");
-        return zero ? 0 : 7;
-    }
-}
+ELEMENT_PROBE_PYTHON_SOURCE = r"""
+import os
+import sys
+import time
+
+try:
+    if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
+        os._exit(31)
+    if (os.path.normcase(sys.base_prefix) != os.path.normcase(_fixture_prefix)
+            or tuple(sys.version_info[:3]) != _fixture_version):
+        os._exit(32)
+    if _fixture_case not in ('zero', 'nonzero', 'stderr_zero', 'stderr_nonzero'):
+        os._exit(33)
+    time.sleep(0.5)
+    if _fixture_case.startswith('stderr_'):
+        if os.write(2, b'PRIVATE_NATIVE_FIXTURE') != 22:
+            os._exit(34)
+    os._exit(0 if _fixture_case in ('zero', 'stderr_zero') else 7)
+except BaseException:
+    os._exit(35)
 """
+
+
+def _element_python_argument(script: Path, case: str) -> str:
+    import base64
+
+    if case not in {"zero", "nonzero", "stderr_zero", "stderr_nonzero"}:
+        raise ValueError("Invalid fixed case")
+    expected = ELEMENT_PROBE_PYTHON_SOURCE.encode("ascii")
+    with script.open("rb") as stream:
+        if stream.read(len(expected) + 1) != expected:
+            raise ValueError("Invalid owned script identity")
+    # A single native argument preserves the exact [string]$Name helper. CPython
+    # parses clustered -I/-B/-S and an attached -c expression. The outer expression
+    # contains no whitespace/double quotes, avoiding legacy PowerShell argv quoting.
+    loader = (
+        "import hashlib,os,sys\n"
+        + f"with open({str(script)!r}, 'rb') as f: data = f.read(16385)\n"
+        + f"if hashlib.sha256(data).hexdigest() != {hashlib.sha256(expected).hexdigest()!r}: "
+        + "os._exit(36)\n"
+        + f"_fixture_case={case!r}\n_fixture_prefix={sys.base_prefix!r}\n"
+        + f"_fixture_version={sys.version_info[:3]!r}\n"
+        + "exec(compile(data, '<owned-element-fixture>', 'exec'))\n"
+    )
+    encoded = base64.b64encode(loader.encode("utf-8")).decode("ascii")
+    return "-IBScexec(__import__('base64').b64decode('" + encoded + "'))"
+
+
 ELEMENT_CHILD_PREFIX = b"K5_ELEMENT_CHILD_FAILURE="
 ELEMENT_CHILD_PHASES = {
-    "compile",
     "source_select",
     "command_admission",
     "probe_invoke",
@@ -1816,7 +1848,6 @@ ELEMENT_CHILD_PHASES = {
 }
 ELEMENT_CHILD_ERRORS = {
     "unknown",
-    "compiler_error",
     "command_missing",
     "variable_undefined",
     "property_missing",
@@ -1834,10 +1865,7 @@ function Write-K5ElementChildFailure([object]$Failure, [string]$Phase, [string]$
     $code = $null
     if ($Failure -is [Management.Automation.ErrorRecord]) {
         $id = $Failure.FullyQualifiedErrorId.Split(',')[0]
-        if ($id -cin @(
-            'COMPILER_ERRORS','SOURCE_CODE_ERROR','CompilerErrors','AddTypeCompilerError')) {
-            $category = 'compiler_error'
-        } elseif ($id -ceq 'CommandNotFoundException') { $category = 'command_missing' }
+        if ($id -ceq 'CommandNotFoundException') { $category = 'command_missing' }
         elseif ($id -ceq 'VariableIsUndefined') { $category = 'variable_undefined' }
         elseif ($id -cin @('PropertyNotFoundStrict','PropertyNotFound')) {
             $category = 'property_missing'
@@ -1872,18 +1900,6 @@ function Write-K5ElementChildFailure([object]$Failure, [string]$Phase, [string]$
     Write-Output ('K5_ELEMENT_CHILD_FAILURE=' + ($record | ConvertTo-Json -Compress))
 }
 """
-ELEMENT_COMPILE_SCRIPT = (
-    "param([string]$Root, [string]$Kind)\n$ErrorActionPreference='Stop'\n"
-    + ELEMENT_CHILD_DIAGNOSTICS
-    + "try {\n$code = @'\n"
-    + ELEMENT_PROBE_NATIVE_SOURCE
-    + "\n'@\n"
-    + "if ($Kind -cnotin @('ConsoleApplication','WindowsApplication')) { throw 'invalid' }\n"
-    + "Add-Type -TypeDefinition $code -OutputType $Kind "
-    + "-OutputAssembly (Join-Path $Root ($Kind + '.exe'))\n"
-    + "Write-Output 'K5_NATIVE_COMPILE=passed'; exit 0\n"
-    + "} catch { Write-K5ElementChildFailure $_ 'compile' 'primary'; exit 1 }\n"
-)
 ELEMENT_PROBE_SCRIPT = r"""
 param([string]$Start, [string]$Executable, [string]$Name, [string]$Variant, [string]$Initial)
 $ErrorActionPreference = 'Stop'
@@ -1975,7 +1991,7 @@ try {
 } catch { Write-K5ElementChildFailure $_ $fixturePhase 'primary'; exit 1 }
 """.replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS)
 ELEMENT_REFERENCE_SCRIPT = r"""
-param([string]$Executable, [string]$Name)
+param([string]$Executable, [string]$Name, [string]$Case)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 __ELEMENT_CHILD_DIAGNOSTICS__
@@ -1991,18 +2007,43 @@ try {
     $process.StartInfo.CreateNoWindow = $true
     $process.StartInfo.RedirectStandardOutput = $true
     $process.StartInfo.RedirectStandardError = $true
+    $deadline = [Diagnostics.Stopwatch]::StartNew()
     $started = $process.Start()
     if (-not $started) { throw 'fixture_invalid' }
     $handle = $process.Handle
-    $out = $process.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null)
-    $err = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+    $stdout = New-Object byte[] 65
+    $stderr = New-Object byte[] 65
+    $out = $process.StandardOutput.BaseStream.ReadAsync($stdout, 0, 65)
+    $err = $process.StandardError.BaseStream.ReadAsync($stderr, 0, 65)
     $fixturePhase = 'reference_wait'
-    if (-not $process.WaitForExit(5000) -or
-        -not [Threading.Tasks.Task]::WaitAll(@($out,$err), 5000)) {
-        throw [TimeoutException]::new('fixture_timeout')
+    if (-not $process.WaitForExit(5000)) { throw [TimeoutException]::new('fixture_timeout') }
+    $remaining = [Math]::Min(5000, 10000 - $deadline.ElapsedMilliseconds)
+    if ($remaining -le 0 -or -not $out.Wait([int]$remaining) -or $out.Result -ne 0) {
+        throw 'fixture_stdout_invalid'
     }
+    $used = 0
+    do {
+        $remaining = [Math]::Min(5000, 10000 - $deadline.ElapsedMilliseconds)
+        if ($remaining -le 0 -or -not $err.Wait([int]$remaining)) {
+            throw [TimeoutException]::new('fixture_timeout')
+        }
+        $count = $err.Result
+        $used += $count
+        if ($used -gt 64) { throw 'fixture_stdio_invalid' }
+        if ($count -eq 0) { break }
+        $err = $process.StandardError.BaseStream.ReadAsync($stderr, $used, 65 - $used)
+    } while ($true)
     $fixturePhase = 'reference_exit'
     if ($process.ExitCode -notin @(0,7)) { throw 'fixture_invalid' }
+    if ($Case -cnotin @('zero','nonzero','stderr_zero','stderr_nonzero')) {
+        throw 'fixture_invalid'
+    }
+    $expected = if ($Case.StartsWith('stderr_')) { 'PRIVATE_NATIVE_FIXTURE' } else { '' }
+    # Compare complete bounded stderr only after EOF and the actual process exit.
+    if ($used -ne $expected.Length -or
+        [Text.Encoding]::ASCII.GetString($stderr, 0, $used) -cne $expected) {
+        throw 'fixture_stdio_invalid'
+    }
     Write-Output ('K5_NATIVE_REFERENCE=' + $process.ExitCode)
 } catch {
     $failed = $true
@@ -2090,8 +2131,6 @@ ELEMENT_FIXTURE_PHASES = {
     "module_load",
     "runtime_admission",
     "environment",
-    "compiler_script",
-    "compile",
     "pe_admission",
     "fixture_scripts",
     "reference",
@@ -2217,7 +2256,7 @@ def _element_child_records(raw):
     records = []
     for line in raw.splitlines():
         if not line.startswith(ELEMENT_CHILD_PREFIX):
-            continue  # Never echo unrecognized child output, including compiler diagnostics.
+            continue  # Unrecognized native output is never echoed.
         pairs = json.loads(line[len(ELEMENT_CHILD_PREFIX) :], object_pairs_hook=list)
         if type(pairs) is not list or any(
             type(pair) is not tuple or len(pair) != 2 for pair in pairs
@@ -2360,9 +2399,9 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
         powershell = common.local_path(
             Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
         )
-        context = _element_context("compiler_script")
-        compile_script = tmp_path / "compile.ps1"
-        compile_script.write_text(ELEMENT_COMPILE_SCRIPT, encoding="ascii", newline="\n")
+        context = _element_context("fixture_scripts")
+        fixture = tmp_path / "owned-element-fixture.py"
+        fixture.write_bytes(ELEMENT_PROBE_PYTHON_SOURCE.encode("ascii"))
 
         def capture(script, *arguments):
             return _capture_element_child(
@@ -2381,20 +2420,21 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                 context=context,
             )
 
-        for kind in ("ConsoleApplication", "WindowsApplication"):
-            context = _element_context("compile", kind)
-            if (
-                capture(compile_script, "-Root", tmp_path, "-Kind", kind).strip()
-                != b"K5_NATIVE_COMPILE=passed"
-            ):
-                raise ValueError("Invalid compiler result")
         binaries = {}
-        for kind, expected_subsystem in (("ConsoleApplication", 3), ("WindowsApplication", 2)):
+        for kind, candidate, expected_subsystem in (
+            ("ConsoleApplication", base, 3),
+            ("WindowsApplication", base.with_name("pythonw.exe"), 2),
+        ):
             context = _element_context("pe_admission", kind)
-            executable = tmp_path / (kind + ".exe")
-            if _pe_fixture_subsystem(executable) != expected_subsystem:
-                raise ValueError("Invalid compiler subsystem")
+            executable = common.local_path(candidate)
+            if (
+                executable.parent != base.parent
+                or _pe_fixture_subsystem(executable) != expected_subsystem
+            ):
+                raise ValueError("Invalid admitted runtime subsystem")
             binaries[kind] = (executable, common.file_hash(executable))
+        if binaries["ConsoleApplication"][1] != base_hash:
+            raise ValueError("Admitted base runtime changed")
         context = _element_context("fixture_scripts")
         reference = tmp_path / "reference.ps1"
         reference.write_text(ELEMENT_REFERENCE_SCRIPT, encoding="ascii", newline="\n")
@@ -2404,7 +2444,18 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
             for name in ("zero", "nonzero", "stderr_zero", "stderr_nonzero"):
                 expected_exit = 0 if name.endswith("zero") and not name.endswith("nonzero") else 7
                 context = _element_context("reference", kind, name)
-                actual = capture(reference, "-Executable", executable, "-Name", name).strip()
+                if common.file_hash(executable) != identity:
+                    raise ValueError("Admitted runtime changed")
+                argument = _element_python_argument(fixture, name)
+                actual = capture(
+                    reference,
+                    "-Executable",
+                    executable,
+                    "-Name:",
+                    argument,
+                    "-Case",
+                    name,
+                ).strip()
                 if actual != b"K5_NATIVE_REFERENCE=" + str(expected_exit).encode():
                     raise ValueError("Actual reference exit mismatch")
                 print("K5_NATIVE_REFERENCE_CASE=" + kind + ":" + name + ":" + str(expected_exit))
@@ -2419,6 +2470,8 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                         context = _element_context("probe", kind, name, variant, initial)
                         if common.file_hash(executable) != identity:
                             raise ValueError("Owned executable changed")
+                        if _element_python_argument(fixture, name) != argument:
+                            raise ValueError("Owned script changed")
                         result = _parse_element_probe(
                             capture(
                                 probe,
@@ -2426,8 +2479,8 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                                 START,
                                 "-Executable",
                                 executable,
-                                "-Name",
-                                name,
+                                "-Name:",
+                                argument,
                                 "-Variant",
                                 variant,
                                 "-Initial",
@@ -2474,7 +2527,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                             START,
                             "-Executable",
                             command,
-                            "-Name",
+                            "-Name:",
                             "zero",
                             "-Variant",
                             variant,
@@ -2591,7 +2644,8 @@ def test_element_probe_comparison_changes_only_downstream_pipeline():
     assert "$process.WaitForExit(5000)" in ELEMENT_REFERENCE_SCRIPT
     assert "$process.ExitCode" in ELEMENT_REFERENCE_SCRIPT
     assert "$process.Kill()" in ELEMENT_REFERENCE_SCRIPT
-    assert "CopyToAsync([IO.Stream]::Null)" in ELEMENT_REFERENCE_SCRIPT
+    assert "ReadAsync($stderr, 0, 65)" in ELEMENT_REFERENCE_SCRIPT
+    assert "$used -ne $expected.Length" in ELEMENT_REFERENCE_SCRIPT
     test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
 
 
@@ -2636,7 +2690,7 @@ def _fixture_records(output):
 
 
 def test_element_fixture_diagnostic_contract_rejects_raw_and_coerced_values(capsys):
-    value = _element_diagnostic(_element_context("compile", "WindowsApplication"), "started")
+    value = _element_diagnostic(_element_context("reference", "WindowsApplication"), "started")
     assert _fixture_records(capsys.readouterr().out) == [value]
     for patch in (
         {"path": "PRIVATE_PATH"},
@@ -2657,9 +2711,9 @@ def test_element_fixture_diagnostic_contract_rejects_raw_and_coerced_values(caps
 def test_element_child_failure_parser_is_strict_and_source_free():
     value = dict(
         schema_version="element-child-failure-v1",
-        phase="compile",
+        phase="reference_start",
         boundary="primary",
-        error="compiler_error",
+        error="method_binding",
         hresult=-2146233087,
     )
     raw = ELEMENT_CHILD_PREFIX + json.dumps(value).encode() + b"\n"
@@ -2702,9 +2756,9 @@ def test_element_capture_preserves_primary_and_owned_cleanup(mode, monkeypatch, 
             + json.dumps(
                 dict(
                     schema_version="element-child-failure-v1",
-                    phase="compile",
+                    phase="reference_start",
                     boundary="primary",
-                    error="compiler_error",
+                    error="method_binding",
                     hresult=-2146233087,
                 )
             ).encode()
@@ -2745,17 +2799,17 @@ def test_element_capture_preserves_primary_and_owned_cleanup(mode, monkeypatch, 
             ["PRIVATE_COMMAND"],
             cwd=tmp_path,
             env={},
-            context=_element_context("compile", "ConsoleApplication"),
+            context=_element_context("reference", "ConsoleApplication"),
         )
     output = capsys.readouterr()
     assert "PRIVATE" not in output.out + output.err
     assert closed == [True]
     records = _fixture_records(output.out)
-    assert all(record["phase"] == "compile" for record in records)
+    assert all(record["phase"] == "reference" for record in records)
     failures = [record for record in records if record["status"] == "failed"]
     assert failures
     if mode in {"nonzero", "dual"}:
-        assert failures[0]["child_error"] == "compiler_error"
+        assert failures[0]["child_error"] == "method_binding"
         primary = next(record for record in failures if record["boundary"] == "primary")
         assert primary["error"] == "child_failed"
         assert primary["child_exit"] == primary["relay_exit"] == 1
@@ -2781,7 +2835,8 @@ def test_element_fixture_child_contexts_and_reference_cleanup_are_fixed():
     )
     assert ELEMENT_REFERENCE_SCRIPT.index("'primary'") < ELEMENT_REFERENCE_SCRIPT.index("'cleanup'")
     assert "if ($failed) { exit 1 }" in ELEMENT_REFERENCE_SCRIPT
-    assert "Write-K5ElementChildFailure $_ 'compile' 'primary'" in ELEMENT_COMPILE_SCRIPT
+    assert "Add-Type" not in section and "ELEMENT_COMPILE_SCRIPT" not in section
+    assert 'base.with_name("pythonw.exe")' in section
 
 
 def test_element_fixture_module_load_failure_is_fixed(tmp_path, monkeypatch, capsys):
@@ -2918,3 +2973,49 @@ def test_element_capture_stuck_collector_never_reports_cleanup_success(
         "child_timeout",
         "cleanup_incomplete",
     ]
+
+
+@pytest.mark.parametrize("case", ["zero", "nonzero", "stderr_zero", "stderr_nonzero"])
+def test_element_python_single_argument_binds_flags_source_exit_and_stderr(tmp_path, case):
+    script = tmp_path / "owned fixture.py"
+    script.write_bytes(ELEMENT_PROBE_PYTHON_SOURCE.encode("ascii"))
+    argument = _element_python_argument(script, case)
+    assert argument.startswith("-IBSc") and not any(c.isspace() or c == '"' for c in argument)
+    result = subprocess.run([sys.executable, argument], capture_output=True, timeout=5, check=False)
+    assert result.returncode == (0 if case in {"zero", "stderr_zero"} else 7)
+    assert result.stdout == b""
+    assert result.stderr == (b"PRIVATE_NATIVE_FIXTURE" if case.startswith("stderr_") else b"")
+    # Flags and the admitted bytes are acceptance inputs, never defaults.
+    result = subprocess.run(
+        [sys.executable, "-c" + argument[5:]], capture_output=True, timeout=5, check=False
+    )
+    assert result.returncode == 31 and not result.stdout and not result.stderr
+    script.write_bytes(ELEMENT_PROBE_PYTHON_SOURCE.encode("ascii") + b"# changed")
+    with pytest.raises(ValueError):
+        _element_python_argument(script, case)
+    result = subprocess.run([sys.executable, argument], capture_output=True, timeout=5, check=False)
+    assert result.returncode == 36 and not result.stdout and not result.stderr
+
+
+def test_element_runtime_pair_replaces_compiler_without_widening_probe_or_budget():
+    source = Path(__file__).read_text()
+    section = source.split("def test_windows_exact_element_probe_uses_fresh_actual_native_exit", 1)[
+        1
+    ]
+    section = section.split("def test_element_probe_parser", 1)[0]
+    assert "Add-Type" not in section and "compile.ps1" not in section
+    assert '"-Name",' not in section and section.count('"-Name:",') == 3
+    assert '("ConsoleApplication", base, 3)' in section
+    assert '("WindowsApplication", base.with_name("pythonw.exe"), 2)' in section
+    assert "executable.parent != base.parent" in section
+    assert section.count("common.file_hash(executable) != identity") == 2
+    assert "$selected = $original.Replace($needle, $needle + ' | Out-Null')" in ELEMENT_PROBE_SCRIPT
+    assert "$process.StartInfo.Arguments = $Name" in ELEMENT_REFERENCE_SCRIPT
+    assert "$process.ExitCode" in ELEMENT_REFERENCE_SCRIPT
+    assert "$used -ne $expected.Length" in ELEMENT_REFERENCE_SCRIPT
+    assert "if ($count -eq 0) { break }" in ELEMENT_REFERENCE_SCRIPT
+    assert "ReadAsync($stderr, $used, 65 - $used)" in ELEMENT_REFERENCE_SCRIPT
+    assert "$used -gt 64" in ELEMENT_REFERENCE_SCRIPT
+    assert "10000 - $deadline.ElapsedMilliseconds" in ELEMENT_REFERENCE_SCRIPT
+    assert "reference_wait" in ELEMENT_REFERENCE_SCRIPT
+    test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
