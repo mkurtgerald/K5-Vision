@@ -21,6 +21,7 @@ import subprocess
 import sys
 import sysconfig
 import zipfile
+import zlib
 from collections.abc import Callable, Iterator
 from email.parser import BytesParser
 from pathlib import Path
@@ -116,16 +117,166 @@ def _ps_literal(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def _admit(condition: bool) -> None:
+# Diagnostic values are deliberately independent of artifact paths and metadata.
+# Consumers must use this fixed vocabulary, never str/repr of an underlying error.
+OFFLINE_ADMISSION_SCALAR_MAX = 2**31 - 1
+OFFLINE_ADMISSION_CONTRACTS = frozenset(
+    {
+        "admission",
+        "path-absolute",
+        "path-local",
+        "path-components",
+        "path-link",
+        "path-access",
+        "file-present",
+        "file-read",
+        "file-record-fields",
+        "file-size-limit",
+        "file-hash-format",
+        "file-hash",
+        "file-size",
+        "requirements-target",
+        "requirements-present",
+        "requirements-size",
+        "requirements-read",
+        "requirements-hash",
+        "requirements-syntax",
+        "requirements-duplicate",
+        "requirements-count",
+        "requirements-target-count",
+        "manifest-digest-format",
+        "manifest-directory",
+        "manifest-present",
+        "manifest-size",
+        "manifest-read",
+        "manifest-digest",
+        "manifest-json",
+        "manifest-duplicate-key",
+        "manifest-fields",
+        "manifest-schema",
+        "installer-revision",
+        "runtime-revision",
+        "host-base-prefix",
+        "host-no-venv",
+        "host-bootstrap",
+        "host-identity",
+        "host-implementation",
+        "host-platform",
+        "host-version",
+        "installer-payload",
+        "wheel-count",
+        "wheel-record-fields",
+        "wheel-name",
+        "wheel-filename",
+        "wheel-duplicate-filename",
+        "wheel-version",
+        "wheel-pip-hash",
+        "wheel-inventory",
+        "wheel-filename-structure",
+        "wheel-filename-name",
+        "wheel-filename-name-match",
+        "wheel-filename-version",
+        "wheel-filename-build",
+        "wheel-tags-record",
+        "wheel-tags-match",
+        "wheel-tags-supported",
+        "tag-length",
+        "tag-format",
+        "tag-components",
+        "tag-expansion",
+        "archive-open",
+        "archive-read",
+        "archive-member-count",
+        "archive-duplicate-member",
+        "archive-expanded-size",
+        "archive-member-path",
+        "archive-member-component",
+        "archive-member-collision",
+        "archive-member-symlink",
+        "archive-member-encrypted",
+        "archive-foreign-metadata",
+        "archive-file-directory-collision",
+        "metadata-present",
+        "metadata-size",
+        "wheel-metadata-present",
+        "wheel-metadata-size",
+        "metadata-name-format",
+        "metadata-name",
+        "metadata-version",
+        "wheel-metadata-version",
+        "wheel-metadata-tag-count",
+        "wheel-metadata-tags",
+        "runtime-member-scope",
+        "runtime-payload-fields",
+        "runtime-payload-members",
+        "runtime-file-record",
+        "runtime-file-size",
+        "runtime-file-hash",
+        "offline-arguments",
+        "offline-path-overlap",
+    }
+)
+
+
+class OfflineAdmissionError(RuntimeError):
+    """A refusal with a fixed contract and optional bounded non-identifying scalars.
+
+    ``contract`` belongs to OFFLINE_ADMISSION_CONTRACTS. ``expected`` and
+    ``observed`` are None, exact bools, or exact ints from zero through
+    OFFLINE_ADMISSION_SCALAR_MAX. Unrecognized diagnostic values are discarded;
+    the refusal itself and the historical RuntimeError message are unchanged.
+    """
+
+    def __init__(
+        self,
+        contract: str = "admission",
+        *,
+        expected: bool | int | None = None,
+        observed: bool | int | None = None,
+    ) -> None:
+        super().__init__("Offline wheelhouse admission failed; no online fallback is permitted.")
+        valid = type(contract) is str and contract in OFFLINE_ADMISSION_CONTRACTS
+        self.contract = contract if valid else "admission"
+        self.expected = self._scalar(expected) if valid else None
+        self.observed = self._scalar(observed) if valid else None
+
+    @staticmethod
+    def _scalar(value: object) -> bool | int | None:
+        if type(value) is bool or (
+            type(value) is int and 0 <= value <= OFFLINE_ADMISSION_SCALAR_MAX
+        ):
+            return value
+        return None
+
+
+def _admit(
+    condition: bool,
+    contract: str = "admission",
+    *,
+    expected: bool | int | None = None,
+    observed: bool | int | None = None,
+) -> None:
     if not condition:
-        raise RuntimeError("Offline wheelhouse admission failed; no online fallback is permitted.")
+        raise OfflineAdmissionError(contract, expected=expected, observed=observed)
+
+
+def _offline_plain_ancestors(path: Path) -> None:
+    try:
+        _plain_ancestors(path)
+    except RuntimeError:
+        raise OfflineAdmissionError("path-link") from None
+    except OSError:
+        raise OfflineAdmissionError("path-access") from None
 
 
 def _sha256(path: Path) -> str:
-    _plain_ancestors(path)
-    _admit(path.is_file())
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+    _offline_plain_ancestors(path)
+    _admit(path.is_file(), "file-present")
+    try:
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+    except OSError:
+        raise OfflineAdmissionError("file-read") from None
 
 
 def runtime_versions(path: Path, *, target_platform: str = "win32") -> dict[str, str]:
@@ -134,11 +285,16 @@ def runtime_versions(path: Path, *, target_platform: str = "win32") -> dict[str,
     Only the literal reviewed pyreadline3 Windows marker is supported. This is
     not a requirements resolver or a general-purpose marker interpreter.
     """
-    _admit(target_platform in ("win32", "linux", "darwin"))
-    _plain_ancestors(path)
-    _admit(path.is_file() and path.stat().st_size <= 16384)
-    raw = path.read_bytes()
-    _admit(hashlib.sha256(raw).hexdigest() == REQUIREMENTS_SHA256)
+    _admit(target_platform in ("win32", "linux", "darwin"), "requirements-target")
+    _offline_plain_ancestors(path)
+    _admit(path.is_file(), "requirements-present")
+    try:
+        size = path.stat().st_size
+        _admit(size <= 16384, "requirements-size", expected=16384, observed=size)
+        raw = path.read_bytes()
+    except OSError:
+        raise OfflineAdmissionError("requirements-read") from None
+    _admit(hashlib.sha256(raw).hexdigest() == REQUIREMENTS_SHA256, "requirements-hash")
     versions = {}
     seen = set()
     for line in raw.decode("utf-8").splitlines():
@@ -148,43 +304,64 @@ def runtime_versions(path: Path, *, target_platform: str = "win32") -> dict[str,
         if windows_only:
             line = "pyreadline3==3.5.6"
         match = re.fullmatch(r"([a-z0-9-]+)==([0-9]+(?:\.[0-9]+)+)", line)
-        _admit(match is not None and match[1] not in seen)
+        _admit(match is not None, "requirements-syntax")
+        _admit(match[1] not in seen, "requirements-duplicate")
         seen.add(match[1])
         if not windows_only or target_platform == "win32":
             versions[match[1]] = match[2]
-    _admit(len(seen) == 28 and len(versions) == (28 if target_platform == "win32" else 27))
+    _admit(len(seen) == 28, "requirements-count", expected=28, observed=len(seen))
+    expected = 28 if target_platform == "win32" else 27
+    _admit(
+        len(versions) == expected,
+        "requirements-target-count",
+        expected=expected,
+        observed=len(versions),
+    )
     return versions
 
 
 def _unique_json(items: list[tuple[str, object]]) -> dict:
     result = {}
     for key, value in items:
-        _admit(key not in result)
+        _admit(key not in result, "manifest-duplicate-key")
         result[key] = value
     return result
 
 
 def _file_record(path: Path, record: dict) -> None:
-    _admit(isinstance(record, dict) and record.keys() == {"size", "sha256"})
-    _admit(type(record["size"]) is int and 0 < record["size"] <= 256 * 1024 * 1024)
+    _admit(isinstance(record, dict) and record.keys() == {"size", "sha256"}, "file-record-fields")
     _admit(
-        isinstance(record["sha256"], str) and bool(re.fullmatch("[0-9a-f]{64}", record["sha256"]))
+        type(record["size"]) is int and 0 < record["size"] <= 256 * 1024 * 1024,
+        "file-size-limit",
     )
-    _admit(_sha256(path) == record["sha256"] and path.stat().st_size == record["size"])
+    _admit(
+        isinstance(record["sha256"], str) and bool(re.fullmatch("[0-9a-f]{64}", record["sha256"])),
+        "file-hash-format",
+    )
+    _admit(_sha256(path) == record["sha256"], "file-hash")
+    try:
+        size = path.stat().st_size
+    except OSError:
+        raise OfflineAdmissionError("file-read") from None
+    _admit(size == record["size"], "file-size", expected=record["size"], observed=size)
 
 
 def _host_identity() -> dict:
-    _admit(sys.prefix == sys.base_prefix)
+    _admit(sys.prefix == sys.base_prefix, "host-base-prefix")
     # -S on Python 3.12 can mask a venv prefix; do not admit its executable.
     executable = Path(sys.executable)
     _admit(
         not any(
             (parent / "pyvenv.cfg").exists()
             for parent in (executable.parent, executable.parent.parent)
-        )
+        ),
+        "host-no-venv",
     )
-    version = ensurepip.version()
-    bundled = Path(ensurepip.__file__).parent / "_bundled" / f"pip-{version}-py3-none-any.whl"
+    try:
+        version = ensurepip.version()
+        bundled = Path(ensurepip.__file__).parent / "_bundled" / f"pip-{version}-py3-none-any.whl"
+    except (OSError, ValueError):
+        raise OfflineAdmissionError("host-bootstrap") from None
     return {
         "implementation": sys.implementation.name,
         "version": ".".join(map(str, sys.version_info[:3])),
@@ -196,12 +373,20 @@ def _host_identity() -> dict:
 
 
 def _tags(value: str) -> set[str]:
-    _admit(len(value) <= 128)
+    _admit(isinstance(value, str), "tag-format")
+    _admit(len(value) <= 128, "tag-length", expected=128, observed=len(value))
     parts = value.split("-")
-    _admit(len(parts) == 3 and all(re.fullmatch(r"[a-z0-9_]+(?:\.[a-z0-9_]+)*", p) for p in parts))
+    _admit(
+        len(parts) == 3 and all(re.fullmatch(r"[a-z0-9_]+(?:\.[a-z0-9_]+)*", p) for p in parts),
+        "tag-format",
+    )
     tokens = [part.split(".") for part in parts]
-    _admit(all(len(group) <= 8 and len(group) == len(set(group)) for group in tokens))
-    _admit(len(tokens[0]) * len(tokens[1]) * len(tokens[2]) <= 64)
+    _admit(
+        all(len(group) <= 8 and len(group) == len(set(group)) for group in tokens),
+        "tag-components",
+    )
+    count = len(tokens[0]) * len(tokens[1]) * len(tokens[2])
+    _admit(count <= 64, "tag-expansion", expected=64, observed=count)
     return {"-".join(tag) for tag in itertools.product(*tokens)}
 
 
@@ -216,10 +401,28 @@ def _windows_component(part: str) -> bool:
 
 
 def _offline_path(path: Path) -> None:
-    _admit(path.is_absolute())
-    _admit(not str(path).startswith(("\\\\", "//")))
-    _admit(all(_windows_component(part) for part in path.parts if part != path.anchor))
-    _plain_ancestors(path)
+    _admit(path.is_absolute(), "path-absolute")
+    _admit(not str(path).startswith(("\\\\", "//")), "path-local")
+    _admit(
+        all(_windows_component(part) for part in path.parts if part != path.anchor),
+        "path-components",
+    )
+    _offline_plain_ancestors(path)
+
+
+@contextlib.contextmanager
+def _offline_archive(path: Path) -> Iterator[zipfile.ZipFile]:
+    try:
+        archive = zipfile.ZipFile(path)
+    except (OSError, UnicodeError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        raise OfflineAdmissionError("archive-open") from None
+    try:
+        with archive:
+            yield archive
+    except OfflineAdmissionError:
+        raise
+    except (OSError, ValueError, EOFError, RuntimeError, zipfile.BadZipFile, zlib.error):
+        raise OfflineAdmissionError("archive-read") from None
 
 
 class OfflineWheelhouse:
@@ -231,13 +434,22 @@ class OfflineWheelhouse:
     """
 
     def __init__(self, directory: Path, manifest: Path, digest: str, source: Path, revision: str):
-        _admit(bool(re.fullmatch("[0-9a-f]{64}", digest)))
+        _admit(bool(re.fullmatch("[0-9a-f]{64}", digest)), "manifest-digest-format")
         _offline_path(directory)
         _offline_path(manifest)
-        _admit(directory.is_dir() and manifest.is_file() and manifest.stat().st_size <= 1024 * 1024)
-        raw = manifest.read_bytes()
-        _admit(hashlib.sha256(raw).hexdigest() == digest)
-        data = json.loads(raw, object_pairs_hook=_unique_json)
+        _admit(directory.is_dir(), "manifest-directory")
+        _admit(manifest.is_file(), "manifest-present")
+        try:
+            size = manifest.stat().st_size
+            _admit(size <= 1024 * 1024, "manifest-size", expected=1024 * 1024, observed=size)
+            raw = manifest.read_bytes()
+        except OSError:
+            raise OfflineAdmissionError("manifest-read") from None
+        _admit(hashlib.sha256(raw).hexdigest() == digest, "manifest-digest")
+        try:
+            data = json.loads(raw, object_pairs_hook=_unique_json)
+        except ValueError:
+            raise OfflineAdmissionError("manifest-json") from None
         _admit(
             isinstance(data, dict)
             and data.keys()
@@ -249,24 +461,34 @@ class OfflineWheelhouse:
                 "installer_payload",
                 "runtime_payload",
                 "wheels",
-            }
+            },
+            "manifest-fields",
         )
-        _admit(data["schema_version"] == WHEELHOUSE_FORMAT)
+        _admit(data["schema_version"] == WHEELHOUSE_FORMAT, "manifest-schema")
         _admit(
             isinstance(data["installer_revision"], str)
-            and bool(re.fullmatch("[0-9a-f]{40}", data["installer_revision"]))
+            and bool(re.fullmatch("[0-9a-f]{40}", data["installer_revision"])),
+            "installer-revision",
         )
-        _admit(data["runtime_revision"] == revision)
+        _admit(data["runtime_revision"] == revision, "runtime-revision")
         host = _host_identity()
-        _admit(data["python"] == host and host["implementation"] == "cpython")
-        _admit(host["platform"] == "win_amd64" and host["version"].startswith("3.12."))
+        _admit(data["python"] == host, "host-identity")
+        _admit(host["implementation"] == "cpython", "host-implementation")
+        _admit(host["platform"] == "win_amd64", "host-platform")
+        _admit(host["version"].startswith("3.12."), "host-version")
         self.directory, self.source, self.data = directory, source, data
         self.verify_source()
         versions = runtime_versions(source / "runtime-requirements.txt", target_platform="win32")
         versions.update({"k5-vision": "0.1.0", "pip": host["ensurepip_version"]})
         self.versions = versions
         wheels = data["wheels"]
-        _admit(isinstance(wheels, list) and len(wheels) == len(versions))
+        _admit(isinstance(wheels, list), "wheel-count")
+        _admit(
+            len(wheels) == len(versions),
+            "wheel-count",
+            expected=len(versions),
+            observed=len(wheels),
+        )
         self.wheels = {}
         names = set()
         for record in wheels:
@@ -280,24 +502,29 @@ class OfflineWheelhouse:
                     "tags",
                     "size",
                     "sha256",
-                }
+                },
+                "wheel-record-fields",
             )
             name, filename = record["name"], record["filename"]
-            _admit(isinstance(name, str) and name in versions and name not in names)
+            _admit(isinstance(name, str) and name in versions and name not in names, "wheel-name")
             _admit(
                 isinstance(filename, str)
-                and bool(re.fullmatch(r"[A-Za-z0-9_.+!-]+\.whl", filename))
+                and bool(re.fullmatch(r"[A-Za-z0-9_.+!-]+\.whl", filename)),
+                "wheel-filename",
             )
-            _admit(filename not in self.wheels and record["version"] == versions[name])
+            _admit(filename not in self.wheels, "wheel-duplicate-filename")
+            _admit(record["version"] == versions[name], "wheel-version")
             self.wheels[filename] = record
             names.add(name)
             if name == "pip":
-                _admit(record["sha256"] == host["ensurepip_wheel_sha256"])
+                _admit(record["sha256"] == host["ensurepip_wheel_sha256"], "wheel-pip-hash")
         self.verify_wheels(directory)
 
     def verify_source(self) -> None:
         payload = self.data["installer_payload"]
-        _admit(isinstance(payload, dict) and payload.keys() == set(PAYLOAD_FILES))
+        _admit(
+            isinstance(payload, dict) and payload.keys() == set(PAYLOAD_FILES), "installer-payload"
+        )
         for name, record in payload.items():
             _file_record(self.source.parent.parent / name, record)
 
@@ -308,8 +535,8 @@ class OfflineWheelhouse:
             )
 
     def verify_wheels(self, directory: Path) -> None:
-        _plain_ancestors(directory)
-        _admit({path.name for path in directory.iterdir()} == self.wheels.keys())
+        _offline_plain_ancestors(directory)
+        _admit({path.name for path in directory.iterdir()} == self.wheels.keys(), "wheel-inventory")
         for filename, record in self.wheels.items():
             path = directory / filename
             _file_record(path, {key: record[key] for key in ("size", "sha256")})
@@ -317,17 +544,25 @@ class OfflineWheelhouse:
 
     def verify_metadata(self, path: Path, record: dict) -> None:
         parts = path.name[:-4].split("-")
-        _admit(len(parts) in (5, 6))
-        _admit(bool(re.fullmatch(r"[A-Za-z0-9_]+", parts[0])))
-        _admit(re.sub(r"[-_.]+", "-", parts[0]).lower() == record["name"])
-        _admit(parts[1] == record["version"])
+        _admit(len(parts) in (5, 6), "wheel-filename-structure")
+        _admit(bool(re.fullmatch(r"[A-Za-z0-9_]+", parts[0])), "wheel-filename-name")
+        _admit(
+            re.sub(r"[-_.]+", "-", parts[0]).lower() == record["name"],
+            "wheel-filename-name-match",
+        )
+        _admit(parts[1] == record["version"], "wheel-filename-version")
         if len(parts) == 6:
-            _admit(bool(re.fullmatch(r"[0-9][A-Za-z0-9_]*", parts[2])))
+            _admit(bool(re.fullmatch(r"[0-9][A-Za-z0-9_]*", parts[2])), "wheel-filename-build")
         tags = _tags("-".join(parts[-3:]))
         _admit(
-            isinstance(record["tags"], list) and all(isinstance(tag, str) for tag in record["tags"])
+            isinstance(record["tags"], list)
+            and all(isinstance(tag, str) for tag in record["tags"]),
+            "wheel-tags-record",
         )
-        _admit(len(record["tags"]) == len(set(record["tags"])) and set(record["tags"]) == tags)
+        _admit(
+            len(record["tags"]) == len(set(record["tags"])) and set(record["tags"]) == tags,
+            "wheel-tags-match",
+        )
         supported = {
             f"{python}-{abi}-{platform}"
             for python, abi, platform in (
@@ -341,59 +576,112 @@ class OfflineWheelhouse:
             )
         }
         supported.update(f"cp3{minor}-abi3-win_amd64" for minor in range(2, 13))
-        _admit(bool(tags & supported))
+        _admit(bool(tags & supported), "wheel-tags-supported")
         prefix = f"{parts[0]}-{parts[1]}.dist-info/"
-        with zipfile.ZipFile(path) as archive:
+        with _offline_archive(path) as archive:
             entries = archive.infolist()
             _admit(
-                len(entries) <= 10000 and len({item.filename for item in entries}) == len(entries)
+                len(entries) <= 10000,
+                "archive-member-count",
+                expected=10000,
+                observed=len(entries),
             )
-            _admit(sum(item.file_size for item in entries) <= 512 * 1024 * 1024)
+            _admit(
+                len({item.filename for item in entries}) == len(entries),
+                "archive-duplicate-member",
+            )
+            size = sum(item.file_size for item in entries)
+            _admit(
+                size <= 512 * 1024 * 1024,
+                "archive-expanded-size",
+                expected=512 * 1024 * 1024,
+                observed=size,
+            )
             canonical = {}
             for item in entries:
                 name = item.filename
-                _admit(not name.startswith("/") and "\\" not in name and ":" not in name)
+                _admit(
+                    not name.startswith("/") and "\\" not in name and ":" not in name,
+                    "archive-member-path",
+                )
                 parts = name.rstrip("/").split("/")
-                _admit(all(_windows_component(part) for part in parts))
+                _admit(all(_windows_component(part) for part in parts), "archive-member-component")
                 key = "/".join(parts).casefold()
-                _admit(key not in canonical)
+                _admit(key not in canonical, "archive-member-collision")
                 canonical[key] = item.is_dir()
-                _admit(not stat.S_ISLNK(item.external_attr >> 16) and not item.flag_bits & 1)
+                _admit(not stat.S_ISLNK(item.external_attr >> 16), "archive-member-symlink")
+                _admit(not item.flag_bits & 1, "archive-member-encrypted")
                 if ".dist-info/" in name.casefold():
-                    _admit(name.startswith(prefix))
+                    _admit(name.startswith(prefix), "archive-foreign-metadata")
             for key in canonical:
                 parts = key.split("/")
                 for index in range(1, len(parts)):
-                    _admit(canonical.get("/".join(parts[:index]), True))
+                    _admit(
+                        canonical.get("/".join(parts[:index]), True),
+                        "archive-file-directory-collision",
+                    )
             metadata = []
-            for name in ("METADATA", "WHEEL"):
-                info = archive.getinfo(prefix + name)
-                _admit(info.file_size <= 65536)
+            for name, missing, limit in (
+                ("METADATA", "metadata-present", "metadata-size"),
+                ("WHEEL", "wheel-metadata-present", "wheel-metadata-size"),
+            ):
+                try:
+                    info = archive.getinfo(prefix + name)
+                except KeyError:
+                    raise OfflineAdmissionError(missing) from None
+                _admit(info.file_size <= 65536, limit, expected=65536, observed=info.file_size)
                 metadata.append(BytesParser().parsebytes(archive.read(info)))
             package, wheel = metadata
             names = package.get_all("Name", [])
-            _admit(len(names) == 1 and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", names[0])))
-            _admit(re.sub(r"[-_.]+", "-", names[0]).lower() == record["name"])
-            _admit(package.get_all("Version") == [record["version"]])
-            _admit(wheel.get_all("Wheel-Version") == ["1.0"])
+            _admit(
+                len(names) == 1
+                and isinstance(names[0], str)
+                and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", names[0])),
+                "metadata-name-format",
+            )
+            _admit(re.sub(r"[-_.]+", "-", names[0]).lower() == record["name"], "metadata-name")
+            _admit(package.get_all("Version") == [record["version"]], "metadata-version")
+            _admit(wheel.get_all("Wheel-Version") == ["1.0"], "wheel-metadata-version")
             declared = wheel.get_all("Tag", [])
-            _admit(0 < len(declared) <= 64)
-            _admit(set().union(*(_tags(tag) for tag in declared)) == tags)
+            _admit(
+                0 < len(declared) <= 64,
+                "wheel-metadata-tag-count",
+                expected=64,
+                observed=len(declared),
+            )
+            _admit(set().union(*(_tags(tag) for tag in declared)) == tags, "wheel-metadata-tags")
             if record["name"] == "k5-vision":
-                _admit(all(item.filename.startswith(("k5vision/", prefix)) for item in entries))
+                _admit(
+                    all(item.filename.startswith(("k5vision/", prefix)) for item in entries),
+                    "runtime-member-scope",
+                )
                 payload = self.data["runtime_payload"]
-                _admit(isinstance(payload, dict) and 0 < len(payload) <= 1024)
+                _admit(
+                    isinstance(payload, dict) and 0 < len(payload) <= 1024, "runtime-payload-fields"
+                )
                 actual = {
                     item.filename
                     for item in entries
                     if item.filename.startswith("k5vision/") and not item.is_dir()
                 }
-                _admit(actual == payload.keys() and "k5vision/cli.py" in actual)
+                _admit(
+                    actual == payload.keys() and "k5vision/cli.py" in actual,
+                    "runtime-payload-members",
+                )
                 for name, expected in payload.items():
-                    _admit(isinstance(expected, dict) and expected.keys() == {"size", "sha256"})
+                    _admit(
+                        isinstance(expected, dict) and expected.keys() == {"size", "sha256"},
+                        "runtime-file-record",
+                    )
                     content = archive.read(name)
-                    _admit(type(expected["size"]) is int and len(content) == expected["size"])
-                    _admit(hashlib.sha256(content).hexdigest() == expected["sha256"])
+                    _admit(
+                        type(expected["size"]) is int and len(content) == expected["size"],
+                        "runtime-file-size",
+                    )
+                    _admit(
+                        hashlib.sha256(content).hexdigest() == expected["sha256"],
+                        "runtime-file-hash",
+                    )
 
     def copy_to(self, destination: Path) -> None:
         self.verify_source()
@@ -433,7 +721,9 @@ class Installer:
         self.journal = self.work / "transaction.json"
         supplied = (wheelhouse, wheelhouse_manifest, wheelhouse_manifest_sha256)
         _admit(
-            all(value is None for value in supplied) or all(value is not None for value in supplied)
+            all(value is None for value in supplied)
+            or all(value is not None for value in supplied),
+            "offline-arguments",
         )
         if wheelhouse is not None:
             _offline_path(self.root)
@@ -451,7 +741,10 @@ class Installer:
         )
         if self.offline is not None:
             for path in (wheelhouse, wheelhouse_manifest, self.source):
-                _admit(not path.is_relative_to(self.root) and not self.root.is_relative_to(path))
+                _admit(
+                    not path.is_relative_to(self.root) and not self.root.is_relative_to(path),
+                    "offline-path-overlap",
+                )
 
     def command(self, args: list[str | Path], *, capture: bool = False) -> str:
         # Ambient pip/Python overrides must not redirect writes out of the

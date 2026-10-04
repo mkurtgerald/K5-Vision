@@ -483,3 +483,185 @@ def test_existing_windows_gate_tracks_every_new_provenance_input_and_test():
     ):
         assert path in boundary
     assert text.count("runs-on:") == 1 and "permissions:\n  contents: read" in text
+
+
+@pytest.mark.parametrize("stage", sorted(capture.DIAGNOSTIC_STAGES - {"unknown"}))
+def test_every_capture_stage_has_fixed_private_failure_context(bundle, monkeypatch, stage):
+    diagnostic = capture.CaptureDiagnostics()
+    original = diagnostic.enter
+
+    def refuse(current, **fields):
+        original(current, **fields)
+        if current == stage:
+            raise RuntimeError(
+                "PRIVATE_CANARY C:\\account\\secret.whl https://private.invalid/token"
+            )
+
+    monkeypatch.setattr(diagnostic, "enter", refuse)
+    with pytest.raises(RuntimeError) as caught:
+        capture.capture(
+            bundle.args,
+            tools=bundle.tools,
+            storage_policy=bundle.policy,
+            identity_reader=lambda: bundle.identity,
+            diagnostics=diagnostic,
+        )
+    record = capture.failure_diagnostic(caught.value, diagnostic, bundle.tools)
+    assert record["stage"] == stage and record["error_class"] == "runtime_error"
+    assert record["code"] == "capture_refused" and record["contract"] == stage
+    assert not record["cleanup_known"] and not record["cleanup_pending"]
+    expected = (
+        "report_published"
+        if stage == "complete"
+        else "retained"
+        if stage in {"post_retention_recheck", "retained_report", "report_publication"}
+        else "not_started"
+    )
+    assert record["retention_state"] == expected
+    encoded = json.dumps(record)
+    assert "PRIVATE_CANARY" not in encoded and str(bundle.launcher) not in encoded
+    assert "https:" not in encoded and "\\\\" not in encoded
+    if stage == "wheel_metadata":
+        assert record["package"] == "annotated-doc"
+        assert record["role"] == "alpha_runtime" and record["wheel_index"] == 1
+
+
+def test_retention_error_does_not_claim_absence_of_retained_state(bundle, monkeypatch):
+    diagnostic = capture.CaptureDiagnostics()
+
+    def uncertain(*args, **kwargs):
+        raise OSError(5, "PRIVATE_CANARY /private/path")
+
+    monkeypatch.setattr(bundle.tools.storage, "retain_bundle", uncertain)
+    with pytest.raises(OSError) as caught:
+        capture.capture(
+            bundle.args,
+            tools=bundle.tools,
+            storage_policy=bundle.policy,
+            identity_reader=lambda: bundle.identity,
+            diagnostics=diagnostic,
+        )
+    record = capture.failure_diagnostic(caught.value, diagnostic, bundle.tools)
+    assert record["stage"] == "retention" and record["retention_state"] == "in_progress"
+    assert record["error_class"] == "io_error" and record["errno"] == 5
+    assert record["cleanup_known"] is False
+    assert "PRIVATE_CANARY" not in json.dumps(record)
+
+
+def test_offline_and_storage_contract_details_are_bounded(bundle):
+    diagnostic = capture.CaptureDiagnostics()
+    diagnostic.enter("wheel_metadata", package="pip", role="ensurepip", wheel_index=34)
+    transaction = bundle.tools.transaction
+    error = transaction.OfflineAdmissionError("admission", expected=36, observed=35)
+    record = capture.failure_diagnostic(error, diagnostic, bundle.tools)
+    assert record["error_class"] == "offline_admission" and record["contract"] == "admission"
+    assert record["expected"] == 36 and record["observed"] == 35
+    assert record["package"] == "pip" and record["wheel_index"] == 34
+    error.contract, error.expected, error.observed = "PRIVATE_CANARY", "/private/account", 2**100
+    record = capture.failure_diagnostic(error, diagnostic, bundle.tools)
+    assert record["contract"] == "wheel_metadata"
+    assert record["expected"] is None and record["observed"] is None
+    assert "PRIVATE_CANARY" not in json.dumps(record)
+    diagnostic.enter("retention")
+    diagnostic.retention("in_progress")
+    error = bundle.tools.storage.StorageError("storage_identity", cleanup_pending=True)
+    record = capture.failure_diagnostic(error, diagnostic, bundle.tools)
+    assert record["cleanup_known"] and record["cleanup_pending"]
+    assert record["code"] == "storage_identity" and record["retention_state"] == "in_progress"
+
+
+@pytest.mark.parametrize(
+    ("exception", "category"),
+    [
+        (FileNotFoundError("PRIVATE_CANARY"), "missing_file"),
+        (PermissionError("PRIVATE_CANARY"), "permission_error"),
+        (zipfile.BadZipFile("PRIVATE_CANARY"), "invalid_zip"),
+        (KeyError("PRIVATE_CANARY"), "missing_key"),
+        (ImportError("PRIVATE_CANARY"), "import_error"),
+        (AttributeError("PRIVATE_CANARY"), "attribute_error"),
+        (TypeError("PRIVATE_CANARY"), "type_error"),
+        (ValueError("PRIVATE_CANARY"), "value_error"),
+        (AssertionError("PRIVATE_CANARY"), "assertion_error"),
+        (RuntimeError("PRIVATE_CANARY"), "runtime_error"),
+        (KeyboardInterrupt("PRIVATE_CANARY"), "interrupted"),
+    ],
+)
+def test_exception_categories_never_include_private_exception_data(exception, category):
+    diagnostic = capture.CaptureDiagnostics()
+    diagnostic.enter("retained_report")
+    diagnostic.retention("retained")
+    record = capture.failure_diagnostic(exception, diagnostic)
+    assert record["error_class"] == category and record["retention_state"] == "retained"
+    assert not record["cleanup_known"]
+    assert "PRIVATE_CANARY" not in json.dumps(record)
+
+
+def test_untrusted_diagnostic_fields_and_project_error_codes_do_not_escape(bundle):
+    diagnostic = capture.CaptureDiagnostics()
+    diagnostic.enter(
+        "PRIVATE_CANARY",
+        package="PRIVATE_CANARY",
+        role="PRIVATE_CANARY",
+        expected="PRIVATE_CANARY",
+        observed=2**100,
+        wheel_index=999,
+    )
+    for error in (
+        capture.CaptureError("PRIVATE_CANARY"),
+        bundle.tools.closure.ClosureError("PRIVATE_CANARY"),
+        bundle.tools.alpha.common.WitnessError("PRIVATE_CANARY"),
+    ):
+        record = capture.failure_diagnostic(error, diagnostic, bundle.tools)
+        assert record["stage"] == "unknown" and record["package"] is None
+        assert record["role"] is None and record["wheel_index"] is None
+        assert "PRIVATE_CANARY" not in json.dumps(record)
+
+
+def test_alpha_validator_contract_is_projected_only_after_full_validation(bundle):
+    alpha = bundle.tools.alpha
+    diagnostic = capture.CaptureDiagnostics()
+    diagnostic.enter("start_receipt_validate")
+    error = alpha.AlphaWitnessError(alpha.alpha_diagnostic("admission", "input_schema"))
+    record = capture.failure_diagnostic(error, diagnostic, bundle.tools)
+    assert record["error_class"] == "alpha_contract" and record["contract"] == "input_schema"
+    error.alpha_diagnostic["field"] = "PRIVATE_CANARY"
+    record = capture.failure_diagnostic(error, diagnostic, bundle.tools)
+    assert record["contract"] == "start_receipt_validate" and record["field"] is None
+    assert "PRIVATE_CANARY" not in json.dumps(record)
+
+
+def test_main_loading_error_emits_fixed_diagnostic_without_exception_text(monkeypatch, capsys):
+    monkeypatch.setattr(
+        capture.sys,
+        "argv",
+        ["capture"]
+        + [
+            item
+            for name in (
+                "launcher-root",
+                "receipt",
+                "normal-receipt",
+                "workspace",
+                "runner-workspace",
+                "runner-temp",
+                "output",
+                "revision",
+                "run-id",
+                "run-attempt",
+                "base-python-sha256",
+            )
+            for item in ("--" + name, "generated-placeholder")
+        ],
+    )
+
+    def failed_load():
+        raise RuntimeError("PRIVATE_CANARY C:\\private\\source.py")
+
+    monkeypatch.setattr(capture, "load_tools", failed_load)
+    assert capture.main() == 1
+    output = capsys.readouterr().out
+    assert output.startswith("K5_WHEEL_PROVENANCE_FAILED=")
+    record = json.loads(output.split("=", 1)[1])
+    assert record["stage"] == "tool_loading" and record["error_class"] == "runtime_error"
+    assert record["retention_state"] == "not_started" and not record["cleanup_known"]
+    assert "PRIVATE_CANARY" not in output

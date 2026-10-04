@@ -1174,3 +1174,391 @@ def test_snapshot_nested_keys_are_platform_independent(path_class):
     root.exists.return_value = True
     root.rglob.return_value = [entry]
     assert snapshot(root) == {"config/private.json": b"generated configuration"}
+
+
+OFFLINE_REFUSAL = "Offline wheelhouse admission failed; no online fallback is permitted."
+
+
+def assert_offline_contract(action, contract, *, expected=None, observed=None):
+    with pytest.raises(transaction.OfflineAdmissionError) as refusal:
+        action()
+    error = refusal.value
+    assert isinstance(error, RuntimeError)
+    assert str(error) == OFFLINE_REFUSAL
+    assert error.args == (OFFLINE_REFUSAL,)
+    assert vars(error) == {"contract": contract, "expected": expected, "observed": observed}
+    assert contract in transaction.OFFLINE_ADMISSION_CONTRACTS
+    return error
+
+
+@pytest.mark.parametrize("scalar", [None, False, True, 0, 1, 2**31 - 1])
+def test_offline_diagnostic_contract_keeps_legacy_message_and_bounded_scalars(scalar, capsys):
+    assert_offline_contract(
+        lambda: transaction._admit(False, "wheel-count", expected=scalar, observed=scalar),
+        "wheel-count",
+        expected=scalar,
+        observed=scalar,
+    )
+    assert transaction._admit(True, "wheel-count", expected=scalar, observed=scalar) is None
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("scalar", ["private path or metadata", -1, 2**31, 1.0, [], {}])
+def test_offline_diagnostic_contract_discards_unbounded_or_identifying_scalars(scalar):
+    assert_offline_contract(
+        lambda: transaction._admit(False, "metadata-size", expected=scalar, observed=scalar),
+        "metadata-size",
+    )
+
+
+@pytest.mark.parametrize("contract", ["private wheel name", "", None, [], 1])
+def test_offline_diagnostic_contract_discards_unknown_labels_and_their_scalars(contract):
+    assert_offline_contract(
+        lambda: transaction._admit(False, contract, expected=1, observed=2), "admission"
+    )
+
+
+def test_offline_diagnostic_contract_does_not_coerce_external_objects():
+    class External:
+        def __repr__(self):
+            raise AssertionError("external diagnostic data must not be formatted")
+
+        __str__ = __repr__
+
+    class IntSubclass(int):
+        pass
+
+    class StrSubclass(str):
+        pass
+
+    assert_offline_contract(lambda: transaction._admit(False, External()), "admission")
+    assert_offline_contract(
+        lambda: transaction._admit(False, StrSubclass("wheel-count")), "admission"
+    )
+    assert_offline_contract(
+        lambda: transaction._admit(
+            False, "wheel-count", expected=External(), observed=IntSubclass(1)
+        ),
+        "wheel-count",
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "contract"),
+    [
+        ("anyio.whl", "wheel-filename-structure"),
+        ("any.io-4.15.1-py3-none-any.whl", "wheel-filename-name"),
+        ("private_name-4.15.1-py3-none-any.whl", "wheel-filename-name-match"),
+        ("anyio-9.9.9-py3-none-any.whl", "wheel-filename-version"),
+        ("anyio-4.15.1-privatebuild-py3-none-any.whl", "wheel-filename-build"),
+        ("anyio-4.15.1-PY3-none-any.whl", "tag-format"),
+    ],
+)
+def test_offline_filename_diagnostics_are_fixed_labels_without_opening_files(filename, contract):
+    wheelhouse = object.__new__(transaction.OfflineWheelhouse)
+    record = {"name": "anyio", "version": "4.15.1", "tags": ["py3-none-any"]}
+    assert_offline_contract(lambda: wheelhouse.verify_metadata(Path(filename), record), contract)
+
+
+@pytest.mark.parametrize(
+    ("tags", "contract"),
+    [
+        (None, "wheel-tags-record"),
+        ([1], "wheel-tags-record"),
+        (["private_tag"], "wheel-tags-match"),
+    ],
+)
+def test_offline_record_tag_diagnostics_do_not_echo_tags(tags, contract):
+    wheelhouse = object.__new__(transaction.OfflineWheelhouse)
+    record = {"name": "anyio", "version": "4.15.1", "tags": tags}
+    assert_offline_contract(
+        lambda: wheelhouse.verify_metadata(Path("anyio-4.15.1-py3-none-any.whl"), record), contract
+    )
+
+
+def test_offline_unsupported_filename_tags_keep_admission_closed():
+    wheelhouse = object.__new__(transaction.OfflineWheelhouse)
+    record = {"name": "anyio", "version": "4.15.1", "tags": ["cp311-cp311-win_amd64"]}
+    assert_offline_contract(
+        lambda: wheelhouse.verify_metadata(Path("anyio-4.15.1-cp311-cp311-win_amd64.whl"), record),
+        "wheel-tags-supported",
+    )
+
+
+@pytest.mark.parametrize(
+    ("member", "content", "contract", "expected", "observed"),
+    [
+        ("METADATA", None, "metadata-present", None, None),
+        ("WHEEL", None, "wheel-metadata-present", None, None),
+        ("METADATA", b"x" * 65537, "metadata-size", 65536, 65537),
+        ("WHEEL", b"x" * 65537, "wheel-metadata-size", 65536, 65537),
+        ("METADATA", b"malformed private metadata\n", "metadata-name-format", None, None),
+        ("METADATA", b"Name: private-name\nVersion: 4.15.1\n", "metadata-name", None, None),
+        ("METADATA", b"Name: \xff\nVersion: 4.15.1\n", "metadata-name-format", None, None),
+        ("METADATA", b"Name: anyio\nName: anyio\n", "metadata-name-format", None, None),
+        ("METADATA", b"Name: anyio\n", "metadata-version", None, None),
+        ("METADATA", b"Name: anyio\nVersion: private-version\n", "metadata-version", None, None),
+        ("WHEEL", b"Tag: py3-none-any\n", "wheel-metadata-version", None, None),
+        ("WHEEL", b"Wheel-Version: 1.0\n", "wheel-metadata-tag-count", 64, 0),
+        ("WHEEL", b"Wheel-Version: 1.0\nTag: \xff\n", "tag-format", None, None),
+        (
+            "WHEEL",
+            b"Wheel-Version: 1.0\nTag: py312-none-any\n",
+            "wheel-metadata-tags",
+            None,
+            None,
+        ),
+        (
+            "WHEEL",
+            b"Wheel-Version: 1.0\n" + b"Tag: py3-none-any\n" * 65,
+            "wheel-metadata-tag-count",
+            64,
+            65,
+        ),
+    ],
+)
+def test_offline_metadata_diagnostics_refuse_missing_malformed_and_oversize_headers(
+    offline_bundle, member, content, contract, expected, observed, capsys
+):
+    def edit(files):
+        name = "anyio-4.15.1.dist-info/" + member
+        if content is None:
+            del files[name]
+        else:
+            files[name] = content
+
+    offline_bundle.edit_wheel("anyio", edit)
+    run = Mock()
+    error = assert_offline_contract(
+        lambda: offline_bundle.installer(run=run), contract, expected=expected, observed=observed
+    )
+    assert "private" not in repr(error) + repr(vars(error))
+    assert not offline_bundle.root.exists()
+    run.assert_not_called()
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "foreign-1.0.dist-info/METADATA",
+        "anyio/vendor/foreign-1.0.dist-info/METADATA",
+        "anyio/vendor/anyio-4.15.1.dist-info/WHEEL",
+        "FOREIGN-4.15.1.DIST-INFO/METADATA",
+    ],
+)
+def test_offline_nested_or_foreign_metadata_stays_rejected_with_fixed_diagnostic(
+    offline_bundle, member
+):
+    offline_bundle.edit_wheel("anyio", lambda files: files.update({member: b"private metadata"}))
+    assert_offline_contract(offline_bundle.installer, "archive-foreign-metadata")
+    assert not offline_bundle.root.exists()
+
+
+def test_offline_own_nested_metadata_files_remain_admitted(offline_bundle):
+    offline_bundle.edit_wheel(
+        "anyio",
+        lambda files: files.update(
+            {"anyio-4.15.1.dist-info/licenses/LICENSE": b"generated license"}
+        ),
+    )
+    run = Mock()
+    installer = offline_bundle.installer(run=run)
+    assert installer.offline.versions["anyio"] == "4.15.1"
+    assert not offline_bundle.root.exists()
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("member", "contract"),
+    [
+        ("/private-path", "archive-member-path"),
+        ("private:path", "archive-member-path"),
+        (r"anyio\private-path", "archive-member-path"),
+        ("anyio/../private-path", "archive-member-component"),
+        ("anyio/NUL.txt", "archive-member-component"),
+        ("ANYIO/__init__.py", "archive-member-collision"),
+        ("anyio", "archive-file-directory-collision"),
+    ],
+)
+def test_offline_archive_member_diagnostics_are_nonidentifying(offline_bundle, member, contract):
+    offline_bundle.edit_wheel("anyio", lambda files: files.update({member: b"generated fixture"}))
+    assert_offline_contract(offline_bundle.installer, contract)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "contract", "expected", "observed"),
+    [
+        ("symlink", "archive-member-symlink", None, None),
+        ("encrypted", "archive-member-encrypted", None, None),
+        ("duplicate", "archive-duplicate-member", None, None),
+        ("count", "archive-member-count", 10000, 10001),
+        ("expanded", "archive-expanded-size", 512 * 1024 * 1024, 512 * 1024 * 1024 + 1),
+    ],
+)
+def test_offline_archive_resource_and_entry_guards_keep_fixed_diagnostics(
+    offline_bundle, monkeypatch, mutation, contract, expected, observed
+):
+    import stat
+
+    # Mutate only generated ZipInfo fixtures; no oversized archive is allocated.
+    original = transaction.zipfile.ZipFile.infolist
+
+    def infolist(archive):
+        entries = original(archive)
+        if mutation == "symlink":
+            entries[0].external_attr = (stat.S_IFLNK | 0o777) << 16
+        elif mutation == "encrypted":
+            entries[0].flag_bits |= 1
+        elif mutation == "duplicate":
+            entries.append(entries[0])
+        elif mutation == "count":
+            entries = [entries[0]] * 10001
+        elif mutation == "expanded":
+            for item in entries:
+                item.file_size = 0
+            entries[0].file_size = 512 * 1024 * 1024 + 1
+        return entries
+
+    monkeypatch.setattr(transaction.zipfile.ZipFile, "infolist", infolist)
+    assert_offline_contract(
+        offline_bundle.installer, contract, expected=expected, observed=observed
+    )
+
+
+def test_offline_malformed_archive_has_a_fixed_refusal_without_raw_exception(offline_bundle):
+    record = next(item for item in offline_bundle.data["wheels"] if item["name"] == "anyio")
+    path = offline_bundle.wheels / record["filename"]
+    path.write_bytes(b"private malformed archive")
+    record.update(offline_bundle.record(path))
+    assert_offline_contract(offline_bundle.installer, "archive-open")
+
+
+@pytest.mark.parametrize("error_class", [transaction.zipfile.BadZipFile, transaction.zlib.error])
+def test_offline_archive_read_error_suppresses_external_exception_text(
+    offline_bundle, monkeypatch, error_class
+):
+    read = Mock(side_effect=error_class("private path and archive metadata"))
+    monkeypatch.setattr(transaction.zipfile.ZipFile, "read", read)
+    error = assert_offline_contract(offline_bundle.installer, "archive-read")
+    assert error.__suppress_context__
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "contract"),
+    [
+        ("implementation", "private-implementation", "host-implementation"),
+        ("platform", "private-platform", "host-platform"),
+        ("version", "3.11.0", "host-version"),
+    ],
+)
+def test_offline_host_diagnostics_never_default_failed_identity(
+    offline_bundle, monkeypatch, field, value, contract
+):
+    host = dict(offline_bundle.data["python"])
+    host[field] = value
+    offline_bundle.data["python"] = dict(host)
+    monkeypatch.setattr(transaction, "_host_identity", lambda: host)
+    assert_offline_contract(offline_bundle.installer, contract)
+
+
+def test_offline_host_mismatch_is_labeled_without_identity_contents(offline_bundle):
+    offline_bundle.data["python"]["version"] = "private-version"
+    assert_offline_contract(offline_bundle.installer, "host-identity")
+
+
+def test_offline_requirements_hash_and_wheel_count_have_specific_diagnostics(offline_bundle):
+    offline_bundle.data["wheels"].pop()
+    assert_offline_contract(offline_bundle.installer, "wheel-count", expected=30, observed=29)
+    requirements = offline_bundle.source / "runtime-requirements.txt"
+    requirements.write_bytes(b"private requirements")
+    assert_offline_contract(lambda: transaction.runtime_versions(requirements), "requirements-hash")
+
+
+def test_offline_requirements_count_is_labeled_without_pin_data(tmp_path, monkeypatch):
+    import hashlib
+
+    path = tmp_path / "generated-requirements.txt"
+    raw = b"anyio==4.15.1\n"
+    path.write_bytes(raw)
+    # Reach the existing count predicate with a generated hash-bound fixture.
+    monkeypatch.setattr(transaction, "REQUIREMENTS_SHA256", hashlib.sha256(raw).hexdigest())
+    assert_offline_contract(
+        lambda: transaction.runtime_versions(path), "requirements-count", expected=28, observed=1
+    )
+
+
+def test_offline_path_refusal_suppresses_link_and_access_details(tmp_path, monkeypatch):
+    inspect = Mock(side_effect=RuntimeError("private link path"))
+    monkeypatch.setattr(transaction, "_plain_ancestors", inspect)
+    assert_offline_contract(lambda: transaction._offline_path(tmp_path), "path-link")
+    inspect.side_effect = OSError("private inaccessible path")
+    assert_offline_contract(lambda: transaction._offline_path(tmp_path), "path-access")
+
+
+@pytest.mark.parametrize(
+    ("change", "contract"),
+    [
+        ("member", "runtime-member-scope"),
+        ("fields", "runtime-payload-fields"),
+        ("members", "runtime-payload-members"),
+        ("record", "runtime-file-record"),
+        ("size", "runtime-file-size"),
+        ("hash", "runtime-file-hash"),
+    ],
+)
+def test_offline_runtime_payload_refusals_are_labeled_without_content(
+    offline_bundle, change, contract
+):
+    payload = offline_bundle.data["runtime_payload"]
+    if change == "member":
+        offline_bundle.edit_wheel(
+            "k5-vision", lambda files: files.update({"private.py": b"private"})
+        )
+    elif change == "fields":
+        offline_bundle.data["runtime_payload"] = []
+    elif change == "members":
+        payload["k5vision/private.py"] = dict(payload["k5vision/cli.py"])
+    elif change == "record":
+        payload["k5vision/cli.py"] = {}
+    elif change == "size":
+        payload["k5vision/cli.py"]["size"] = True
+    else:
+        payload["k5vision/cli.py"]["sha256"] = "private-hash"
+    assert_offline_contract(offline_bundle.installer, contract)
+    assert not offline_bundle.root.exists()
+
+
+@pytest.mark.parametrize("content", [b"{private malformed JSON", b"\xff"])
+def test_offline_manifest_parse_refusal_is_labeled_without_raw_data(offline_bundle, content):
+    args = offline_bundle.write()
+    offline_bundle.manifest.write_bytes(content)
+    args["wheelhouse_manifest_sha256"] = offline_bundle.record(offline_bundle.manifest)["sha256"]
+    error = assert_offline_contract(
+        lambda: transaction.Installer(
+            offline_bundle.root,
+            offline_bundle.source,
+            Path("powershell.exe"),
+            "c" * 40,
+            "1.28.7",
+            **args,
+        ),
+        "manifest-json",
+    )
+    assert error.__suppress_context__
+    assert not offline_bundle.root.exists()
+
+
+def test_offline_host_venv_refusals_precede_bootstrap_identity(tmp_path, monkeypatch):
+    version = Mock(side_effect=AssertionError("must not query ensurepip in refused venv"))
+    monkeypatch.setattr(transaction.ensurepip, "version", version)
+    monkeypatch.setattr(transaction.sys, "prefix", "generated-prefix")
+    monkeypatch.setattr(transaction.sys, "base_prefix", "generated-base-prefix")
+    assert_offline_contract(transaction._host_identity, "host-base-prefix")
+    monkeypatch.setattr(transaction.sys, "prefix", "generated-base-prefix")
+    executable = tmp_path / "generated-venv" / "Scripts" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    (executable.parent.parent / "pyvenv.cfg").write_text("generated fixture")
+    monkeypatch.setattr(transaction.sys, "executable", str(executable))
+    assert_offline_contract(transaction._host_identity, "host-no-venv")
+    version.assert_not_called()
