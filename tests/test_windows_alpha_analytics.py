@@ -1991,84 +1991,156 @@ try {
 } catch { Write-K5ElementChildFailure $_ $fixturePhase 'primary'; exit 1 }
 """.replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS)
 ELEMENT_REFERENCE_SCRIPT = r"""
-param([string]$Executable, [string]$Name, [string]$Case)
-$ErrorActionPreference = 'Stop'
-Set-StrictMode -Version Latest
-__ELEMENT_CHILD_DIAGNOSTICS__
-$process = $null
-$started = $false
-$failed = $false
-$fixturePhase = 'reference_start'
-try {
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo.FileName = $Executable
-    $process.StartInfo.Arguments = $Name
-    $process.StartInfo.UseShellExecute = $false
-    $process.StartInfo.CreateNoWindow = $true
-    $process.StartInfo.RedirectStandardOutput = $true
-    $process.StartInfo.RedirectStandardError = $true
-    $deadline = [Diagnostics.Stopwatch]::StartNew()
-    $started = $process.Start()
-    if (-not $started) { throw 'fixture_invalid' }
-    $handle = $process.Handle
-    $stdout = New-Object byte[] 65
-    $stderr = New-Object byte[] 65
-    $out = $process.StandardOutput.BaseStream.ReadAsync($stdout, 0, 65)
-    $err = $process.StandardError.BaseStream.ReadAsync($stderr, 0, 65)
-    $fixturePhase = 'reference_wait'
-    if (-not $process.WaitForExit(5000)) { throw [TimeoutException]::new('fixture_timeout') }
-    $remaining = [Math]::Min(5000, 10000 - $deadline.ElapsedMilliseconds)
-    if ($remaining -le 0 -or -not $out.Wait([int]$remaining) -or $out.Result -ne 0) {
-        throw 'fixture_stdout_invalid'
-    }
-    $used = 0
-    do {
-        $remaining = [Math]::Min(5000, 10000 - $deadline.ElapsedMilliseconds)
-        if ($remaining -le 0 -or -not $err.Wait([int]$remaining)) {
-            throw [TimeoutException]::new('fixture_timeout')
-        }
-        $count = $err.Result
-        $used += $count
-        if ($used -gt 64) { throw 'fixture_stdio_invalid' }
-        if ($count -eq 0) { break }
-        $err = $process.StandardError.BaseStream.ReadAsync($stderr, $used, 65 - $used)
-    } while ($true)
-    $fixturePhase = 'reference_exit'
-    if ($process.ExitCode -notin @(0,7)) { throw 'fixture_invalid' }
-    if ($Case -cnotin @('zero','nonzero','stderr_zero','stderr_nonzero')) {
-        throw 'fixture_invalid'
-    }
-    $expected = if ($Case.StartsWith('stderr_')) { 'PRIVATE_NATIVE_FIXTURE' } else { '' }
-    # Compare complete bounded stderr only after EOF and the actual process exit.
-    if ($used -ne $expected.Length -or
-        [Text.Encoding]::ASCII.GetString($stderr, 0, $used) -cne $expected) {
-        throw 'fixture_stdio_invalid'
-    }
-    Write-Output ('K5_NATIVE_REFERENCE=' + $process.ExitCode)
-} catch {
-    $failed = $true
-    Write-K5ElementChildFailure $_ $fixturePhase 'primary'
-} finally {
-    try {
-        if ($started -and -not $process.HasExited) {
-            $process.Kill()
-            if (-not $process.WaitForExit(5000)) {
-                throw [TimeoutException]::new('fixture_cleanup')
-            }
-        }
-    } catch {
-        $failed = $true
-        Write-K5ElementChildFailure $_ 'reference_cleanup' 'cleanup'
-    } finally {
-        try { if ($null -ne $process) { $process.Dispose() } }
-        catch {
-            $failed = $true
-            Write-K5ElementChildFailure $_ 'reference_cleanup' 'cleanup'
-        }
-    }
+import json
+import subprocess
+import sys
+import threading
+import time
+
+
+def checkpoint(value):
+    print('K5_ELEMENT_CHECKPOINT=' + value, flush=True)
+
+
+def failure(phase, boundary, error):
+    print('K5_ELEMENT_CHILD_FAILURE=' + json.dumps(dict(
+        schema_version='element-child-failure-v1', phase=phase, boundary=boundary,
+        error='timeout' if isinstance(error, subprocess.TimeoutExpired) else
+              'permission_denied' if isinstance(error, PermissionError) else
+              'file_missing' if isinstance(error, FileNotFoundError) else 'unknown',
+        hresult=None,
+    ), separators=(',', ':')), flush=True)
+
+
+checkpoint('reference_entered')
+child = None
+readers = []
+outputs = [None, None]
+failed = False
+phase = 'reference_start'
+try:
+    if len(sys.argv) != 4 or sys.argv[3] not in ('zero','nonzero','stderr_zero','stderr_nonzero'):
+        raise ValueError()
+    executable, argument, case = sys.argv[1:]
+    checkpoint('reference_start_requested')
+    child = subprocess.Popen([executable, argument], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    checkpoint('reference_started')
+    deadline = time.monotonic() + 10
+
+    def read(index, stream):
+        try:
+            outputs[index] = stream.read(65)
+        except BaseException:
+            outputs[index] = None
+
+    for index, stream in enumerate((child.stdout, child.stderr)):
+        reader = threading.Thread(target=read, args=(index, stream), daemon=True)
+        reader.start()
+        readers.append(reader)
+    phase = 'reference_wait'
+    code = child.wait(timeout=5)
+    checkpoint('reference_waited')
+    for reader in readers:
+        reader.join(max(0, min(5, deadline - time.monotonic())))
+    if any(reader.is_alive() for reader in readers):
+        raise subprocess.TimeoutExpired('owned', 5)
+    phase = 'reference_exit'
+    expected = b'PRIVATE_NATIVE_FIXTURE' if case.startswith('stderr_') else b''
+    if outputs != [b'', expected] or code != (0 if case in ('zero','stderr_zero') else 7):
+        raise ValueError()
+    checkpoint('reference_stdio_verified')
+    print('K5_NATIVE_REFERENCE=' + str(code), flush=True)
+except BaseException as error:
+    failed = True
+    failure(phase, 'primary', error)
+finally:
+    try:
+        if child is not None:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            for reader in readers:
+                reader.join(max(0, deadline - time.monotonic()))
+            if any(reader.is_alive() for reader in readers):
+                raise subprocess.TimeoutExpired('owned', 5)
+            child.stdout.close()
+            child.stderr.close()
+        checkpoint('reference_cleanup_complete')
+    except BaseException as error:
+        failed = True
+        failure('reference_cleanup', 'cleanup', error)
+sys.exit(1 if failed else 0)
+"""
+ELEMENT_CHECKPOINT_PREFIX = b"K5_ELEMENT_CHECKPOINT="
+ELEMENT_CHECKPOINTS = {
+    "shell_control_entered",
+    "shell_control_exit",
+    "python_control_entered",
+    "reference_entered",
+    "reference_start_requested",
+    "reference_started",
+    "reference_waited",
+    "reference_stdio_verified",
+    "reference_cleanup_complete",
 }
-if ($failed) { exit 1 }
-""".replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS)
+ELEMENT_ARGV_PREFIX = b"K5_ELEMENT_ARGV="
+
+
+def _element_complete_records(raw):
+    """Only complete fixed lines can survive a timeout; a suffix proves nothing."""
+    if len(raw) > 4096:
+        raise ValueError("Invalid checkpoint bytes")
+    complete = raw[: raw.rfind(b"\n") + 1]
+    checkpoints = []
+    arguments = []
+    for line in complete.splitlines():
+        if line.startswith(ELEMENT_CHECKPOINT_PREFIX):
+            value = line[len(ELEMENT_CHECKPOINT_PREFIX) :].decode("ascii")
+            if value not in ELEMENT_CHECKPOINTS or value in checkpoints:
+                raise ValueError("Invalid checkpoint")
+            checkpoints.append(value)
+        elif line.startswith(ELEMENT_ARGV_PREFIX):
+            pairs = json.loads(line[len(ELEMENT_ARGV_PREFIX) :], object_pairs_hook=list)
+            if (
+                type(pairs) is not list
+                or len(pairs) != 2
+                or any(type(pair) is not tuple or len(pair) != 2 for pair in pairs)
+            ):
+                raise ValueError("Invalid argument observation")
+            value = dict(pairs)
+            if value.keys() != {"equal", "hash_equal"} or any(
+                type(v) is not bool for v in value.values()
+            ):
+                raise ValueError("Invalid argument observation")
+            arguments.append(value)
+            if len(arguments) > 1:
+                raise ValueError("Invalid argument observation")
+    return complete, checkpoints, arguments
+
+
+def _element_control_script(argument):
+    expected = argument.replace("'", "''")
+    digest = hashlib.sha256(argument.encode("ascii")).hexdigest()
+    return r"""
+param([string]$Name = '')
+$ErrorActionPreference = 'Stop'
+Write-Output 'K5_ELEMENT_CHECKPOINT=shell_control_entered'
+if ($Name -cne '') {
+    $equal = $Name -ceq '__EXPECTED__'
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Name)) }
+    finally { $sha.Dispose() }
+    $actual = ([BitConverter]::ToString($bytes)).Replace('-', '').ToLowerInvariant()
+    $hashEqual = $actual -ceq '__HASH__'
+    $record = @{equal=$equal;hash_equal=$hashEqual}
+    Write-Output ('K5_ELEMENT_ARGV=' + ($record | ConvertTo-Json -Compress))
+    if (-not $equal -or -not $hashEqual) { exit 1 }
+}
+Write-Output 'K5_ELEMENT_CHECKPOINT=shell_control_exit'
+exit 0
+""".replace("__EXPECTED__", expected).replace("__HASH__", digest)
 
 
 def _pe_fixture_subsystem(path: Path) -> int:
@@ -2128,6 +2200,10 @@ def _parse_element_probe(raw: bytes) -> dict:
 
 ELEMENT_FIXTURE_PREFIX = "K5_ELEMENT_FIXTURE_DIAGNOSTIC="
 ELEMENT_FIXTURE_PHASES = {
+    "shell_devnull_control",
+    "shell_captured_control",
+    "python_control",
+    "argv_control",
     "module_load",
     "runtime_admission",
     "environment",
@@ -2300,7 +2376,8 @@ def _capture_element_child(common, arguments, *, cwd, env, context):
 
     owned = reader = stream = None
     reader_started = False
-    result = []
+    result = bytearray()
+    read_failed = []
     failed = False
 
     def emit(status, error=None, **kwargs):
@@ -2325,9 +2402,13 @@ def _capture_element_child(common, arguments, *, cwd, env, context):
 
         def read():
             try:
-                result.append(stream.read(4097))
+                while len(result) < 4097:
+                    block = stream.read1(4097 - len(result))
+                    if not block:
+                        break
+                    result.extend(block)
             except Exception:
-                result.append(None)
+                read_failed.append(True)
 
         reader = threading.Thread(target=read, daemon=True)
         reader.start()
@@ -2335,11 +2416,8 @@ def _capture_element_child(common, arguments, *, cwd, env, context):
         reader.join(15)
         if reader.is_alive():
             raise owned.failure("child_timeout", timed_out=True)
-        if len(result) != 1 or type(result[0]) is not bytes or len(result[0]) > 4096:
+        if read_failed or len(result) > 4096:
             raise common.WitnessError("output_invalid")
-        for child in _element_child_records(result[0]):
-            failed = True
-            emit("failed", boundary="child_" + child["boundary"], child=child)
         owned.wait(5)
     except Exception as error:
         failed = True
@@ -2365,9 +2443,50 @@ def _capture_element_child(common, arguments, *, cwd, env, context):
                 emit("failed", error, boundary="owned_cleanup")
         if owned is not None and not cleanup_failed:
             emit("passed", boundary="owned_cleanup")
+    # The buffer is inspected only after the reader ends, including after a
+    # timed-out Job was closed. No partial/raw suffix is ever printed.
+    if reader_started and not reader.is_alive():
+        try:
+            complete, checkpoints, arguments = _element_complete_records(bytes(result))
+            if not failed and len(complete) != len(result):
+                raise common.WitnessError("output_invalid")
+            for child in _element_child_records(complete):
+                failed = True
+                emit("failed", boundary="child_" + child["boundary"], child=child)
+            for checkpoint in checkpoints:
+                print(ELEMENT_CHECKPOINT_PREFIX.decode() + checkpoint)
+            for argument in arguments:
+                print(ELEMENT_ARGV_PREFIX.decode() + json.dumps(argument, separators=(",", ":")))
+                if argument != {"equal": True, "hash_equal": True}:
+                    failed = True
+        except Exception as error:
+            failed = True
+            emit("failed", error)
     if failed:
         raise _ElementCaptureFailure from None
-    return result[0]
+    return bytes(result)
+
+
+def _element_devnull_control(common, arguments, *, cwd, env, context):
+    _element_diagnostic(context, "started")
+    try:
+        common.run(arguments, cwd=cwd, env=env, operation="probe_admission", seconds=15)
+    except Exception as error:
+        try:
+            _element_diagnostic(context, "failed", error, common=common)
+            known = type(error) is common.WitnessError
+            if known and error.args in (("child_failed",), ("child_timeout",)):
+                _element_diagnostic(context, "passed", boundary="owned_cleanup")
+            elif known and error.args == ("cleanup_incomplete",):
+                _element_diagnostic(
+                    context, "failed", error, common=common, boundary="owned_cleanup"
+                )
+            # Other exceptions do not establish whether ownership cleanup finished.
+        except Exception:
+            pass
+        raise _ElementCaptureFailure from None
+    _element_diagnostic(context, "passed", boundary="owned_cleanup")
+    _element_diagnostic(context, "passed")
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows GUI/CUI process semantics")
@@ -2436,10 +2555,57 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
         if binaries["ConsoleApplication"][1] != base_hash:
             raise ValueError("Admitted base runtime changed")
         context = _element_context("fixture_scripts")
-        reference = tmp_path / "reference.ps1"
+        reference = tmp_path / "reference.py"
         reference.write_text(ELEMENT_REFERENCE_SCRIPT, encoding="ascii", newline="\n")
         probe = tmp_path / "probe.ps1"
         probe.write_text(ELEMENT_PROBE_SCRIPT, encoding="ascii", newline="\n")
+        control = tmp_path / "control.ps1"
+        control_argument = _element_python_argument(fixture, "zero")
+        control.write_text(
+            _element_control_script(control_argument), encoding="ascii", newline="\n"
+        )
+        control_command = [
+            str(powershell),
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(control),
+        ]
+        context = _element_context("shell_devnull_control")
+        _element_devnull_control(common, control_command, cwd=tmp_path, env=env, context=context)
+        context = _element_context("shell_captured_control")
+        output = capture(control)
+        if output.splitlines() != [
+            b"K5_ELEMENT_CHECKPOINT=shell_control_entered",
+            b"K5_ELEMENT_CHECKPOINT=shell_control_exit",
+        ]:
+            raise ValueError("Invalid shell control")
+        context = _element_context("python_control")
+        output = _capture_element_child(
+            common,
+            [
+                str(base),
+                "-I",
+                "-B",
+                "-S",
+                "-c",
+                "print('K5_ELEMENT_CHECKPOINT=python_control_entered',flush=True);"
+                "raise SystemExit(0)",
+            ],
+            cwd=tmp_path,
+            env=env,
+            context=context,
+        )
+        if output.strip() != b"K5_ELEMENT_CHECKPOINT=python_control_entered":
+            raise ValueError("Invalid Python control")
+        context = _element_context("argv_control")
+        output = capture(control, "-Name:", control_argument)
+        _, checkpoints, arguments = _element_complete_records(output)
+        if checkpoints != ["shell_control_entered", "shell_control_exit"] or arguments != [
+            {"equal": True, "hash_equal": True},
+        ]:
+            raise ValueError("Invalid argument control")
         for kind, (executable, identity) in binaries.items():
             for name in ("zero", "nonzero", "stderr_zero", "stderr_nonzero"):
                 expected_exit = 0 if name.endswith("zero") and not name.endswith("nonzero") else 7
@@ -2447,14 +2613,33 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                 if common.file_hash(executable) != identity:
                     raise ValueError("Admitted runtime changed")
                 argument = _element_python_argument(fixture, name)
-                actual = capture(
-                    reference,
-                    "-Executable",
-                    executable,
-                    "-Name:",
-                    argument,
-                    "-Case",
-                    name,
+                if reference.read_bytes() != ELEMENT_REFERENCE_SCRIPT.encode("ascii"):
+                    raise ValueError("Invalid oracle identity")
+                raw = _capture_element_child(
+                    common,
+                    [str(base), "-I", "-B", "-S", str(reference), str(executable), argument, name],
+                    cwd=tmp_path,
+                    env=env,
+                    context=context,
+                )
+                complete, checkpoints, observations = _element_complete_records(raw)
+                if (
+                    checkpoints
+                    != [
+                        "reference_entered",
+                        "reference_start_requested",
+                        "reference_started",
+                        "reference_waited",
+                        "reference_stdio_verified",
+                        "reference_cleanup_complete",
+                    ]
+                    or observations
+                ):
+                    raise ValueError("Invalid oracle checkpoints")
+                actual = b"\n".join(
+                    line
+                    for line in complete.splitlines()
+                    if not line.startswith(ELEMENT_CHECKPOINT_PREFIX)
                 ).strip()
                 if actual != b"K5_NATIVE_REFERENCE=" + str(expected_exit).encode():
                     raise ValueError("Actual reference exit mismatch")
@@ -2640,12 +2825,14 @@ def test_element_probe_comparison_changes_only_downstream_pipeline():
     assert "$selected = $original.Replace($needle, $needle + ' | Out-Null')" in ELEMENT_PROBE_SCRIPT
     assert "Get-Variable LASTEXITCODE -Scope Global" in ELEMENT_PROBE_SCRIPT
     assert "$global:LASTEXITCODE = 0" in ELEMENT_PROBE_SCRIPT  # Explicit stale-input case only.
-    assert "UseShellExecute = $false" in ELEMENT_REFERENCE_SCRIPT
-    assert "$process.WaitForExit(5000)" in ELEMENT_REFERENCE_SCRIPT
-    assert "$process.ExitCode" in ELEMENT_REFERENCE_SCRIPT
-    assert "$process.Kill()" in ELEMENT_REFERENCE_SCRIPT
-    assert "ReadAsync($stderr, 0, 65)" in ELEMENT_REFERENCE_SCRIPT
-    assert "$used -ne $expected.Length" in ELEMENT_REFERENCE_SCRIPT
+    assert (
+        "subprocess.Popen([executable, argument], stdin=subprocess.DEVNULL"
+        in ELEMENT_REFERENCE_SCRIPT
+    )
+    assert "child.wait(timeout=5)" in ELEMENT_REFERENCE_SCRIPT
+    assert "child.kill()" in ELEMENT_REFERENCE_SCRIPT
+    assert "stream.read(65)" in ELEMENT_REFERENCE_SCRIPT
+    assert "outputs != [b'', expected]" in ELEMENT_REFERENCE_SCRIPT
     test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
 
 
@@ -2762,9 +2949,10 @@ def test_element_capture_preserves_primary_and_owned_cleanup(mode, monkeypatch, 
                     hresult=-2146233087,
                 )
             ).encode()
+            + b"\n"
         )
     elif mode == "malformed":
-        raw = ELEMENT_CHILD_PREFIX + b'{"PRIVATE_PATH": true}'
+        raw = ELEMENT_CHILD_PREFIX + b'{"PRIVATE_PATH": true}\n'
     elif mode == "oversize":
         raw = b"PRIVATE" * 700
 
@@ -2809,15 +2997,16 @@ def test_element_capture_preserves_primary_and_owned_cleanup(mode, monkeypatch, 
     failures = [record for record in records if record["status"] == "failed"]
     assert failures
     if mode in {"nonzero", "dual"}:
-        assert failures[0]["child_error"] == "method_binding"
+        assert failures[0]["error"] == "child_failed"
+        assert any(record["child_error"] == "method_binding" for record in failures)
         primary = next(record for record in failures if record["boundary"] == "primary")
         assert primary["error"] == "child_failed"
         assert primary["child_exit"] == primary["relay_exit"] == 1
     if mode == "timeout":
         assert failures[0]["timed_out"] and failures[0]["error"] == "child_timeout"
     if mode == "dual":
-        assert failures[-1]["boundary"] == "owned_cleanup"
-        assert failures[-1]["error"] == "cleanup_incomplete"
+        cleanup = next(record for record in failures if record["boundary"] == "owned_cleanup")
+        assert cleanup["error"] == "cleanup_incomplete"
 
 
 def test_element_fixture_child_contexts_and_reference_cleanup_are_fixed():
@@ -2829,12 +3018,10 @@ def test_element_fixture_child_contexts_and_reference_cleanup_are_fixed():
     for phase in ELEMENT_FIXTURE_PHASES:
         assert f'_element_context("{phase}"' in section
     assert "_capture_element_child(" in section and "common.capture(" not in section
-    assert "Write-K5ElementChildFailure $_ $fixturePhase 'primary'" in ELEMENT_REFERENCE_SCRIPT
-    assert (
-        "Write-K5ElementChildFailure $_ 'reference_cleanup' 'cleanup'" in ELEMENT_REFERENCE_SCRIPT
-    )
+    assert "failure(phase, 'primary', error)" in ELEMENT_REFERENCE_SCRIPT
+    assert "failure('reference_cleanup', 'cleanup', error)" in ELEMENT_REFERENCE_SCRIPT
     assert ELEMENT_REFERENCE_SCRIPT.index("'primary'") < ELEMENT_REFERENCE_SCRIPT.index("'cleanup'")
-    assert "if ($failed) { exit 1 }" in ELEMENT_REFERENCE_SCRIPT
+    assert "sys.exit(1 if failed else 0)" in ELEMENT_REFERENCE_SCRIPT
     assert "Add-Type" not in section and "ELEMENT_COMPILE_SCRIPT" not in section
     assert 'base.with_name("pythonw.exe")' in section
 
@@ -2873,7 +3060,7 @@ def test_element_capture_emission_failure_cannot_skip_cleanup_or_pass(
 
     class Owned:
         def __init__(self, *args, **kwargs):
-            self.process = SimpleNamespace(stdout=io.BytesIO(b"K5_NATIVE_COMPILE=passed"))
+            self.process = SimpleNamespace(stdout=io.BytesIO(b"K5_NATIVE_COMPILE=passed\n"))
 
         def wait(self, _seconds):
             if primary:
@@ -3010,12 +3197,229 @@ def test_element_runtime_pair_replaces_compiler_without_widening_probe_or_budget
     assert "executable.parent != base.parent" in section
     assert section.count("common.file_hash(executable) != identity") == 2
     assert "$selected = $original.Replace($needle, $needle + ' | Out-Null')" in ELEMENT_PROBE_SCRIPT
-    assert "$process.StartInfo.Arguments = $Name" in ELEMENT_REFERENCE_SCRIPT
-    assert "$process.ExitCode" in ELEMENT_REFERENCE_SCRIPT
-    assert "$used -ne $expected.Length" in ELEMENT_REFERENCE_SCRIPT
-    assert "if ($count -eq 0) { break }" in ELEMENT_REFERENCE_SCRIPT
-    assert "ReadAsync($stderr, $used, 65 - $used)" in ELEMENT_REFERENCE_SCRIPT
-    assert "$used -gt 64" in ELEMENT_REFERENCE_SCRIPT
-    assert "10000 - $deadline.ElapsedMilliseconds" in ELEMENT_REFERENCE_SCRIPT
+    assert "Popen([executable, argument]" in ELEMENT_REFERENCE_SCRIPT
+    assert "code = child.wait(timeout=5)" in ELEMENT_REFERENCE_SCRIPT
+    assert "outputs != [b'', expected]" in ELEMENT_REFERENCE_SCRIPT
+    assert "stream.read(65)" in ELEMENT_REFERENCE_SCRIPT
+    assert "time.monotonic() + 10" in ELEMENT_REFERENCE_SCRIPT
     assert "reference_wait" in ELEMENT_REFERENCE_SCRIPT
     test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
+
+
+def test_element_timeout_recovers_only_complete_checkpoints_after_cleanup(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import threading
+    from types import SimpleNamespace
+
+    common = _startup_witness().common
+    release, ready = threading.Event(), threading.Event()
+    raw = b"PRIVATE_RAW\nK5_ELEMENT_CHECKPOINT=reference_entered\n"
+    suffix = b"K5_ELEMENT_CHECKPOINT=reference_sta"
+    closed = []
+    thread_type = threading.Thread
+
+    class Stream:
+        index = 0
+
+        def read(self, limit):  # Also exercises the exact preceding EOF-only implementation.
+            ready.set()
+            assert release.wait(2)
+            return raw + suffix
+
+        def read1(self, limit):
+            self.index += 1
+            if self.index == 1:
+                ready.set()
+                return raw
+            if self.index == 2:
+                assert release.wait(2)
+                return suffix
+            return b""
+
+        def close(self):
+            closed.append("stream")
+
+    class Reader:
+        def __init__(self, **kwargs):
+            self.thread = thread_type(**kwargs)
+
+        def start(self):
+            self.thread.start()
+
+        def join(self, seconds):
+            if seconds == 15:
+                assert ready.wait(2)
+            else:
+                self.thread.join(seconds)
+
+        def is_alive(self):
+            return self.thread.is_alive()
+
+    class Owned:
+        def __init__(self, *args, **kwargs):
+            self.process = SimpleNamespace(stdout=Stream())
+
+        def failure(self, code, *, timed_out):
+            return common.WitnessError(
+                code,
+                common.diagnostic(
+                    "probe_admission",
+                    gate_state="started",
+                    timed_out=timed_out,
+                ),
+            )
+
+        def close(self):
+            closed.append("job")
+            release.set()
+
+    monkeypatch.setattr(threading, "Thread", Reader)
+    monkeypatch.setattr(common, "OwnedProcess", Owned)
+    with pytest.raises(_ElementCaptureFailure):
+        _capture_element_child(
+            common, [], cwd=tmp_path, env={}, context=_element_context("reference")
+        )
+    output = capsys.readouterr()
+    assert closed == ["job", "stream"]
+    assert "PRIVATE" not in output.out + output.err
+    assert output.out.splitlines()[-1] == "K5_ELEMENT_CHECKPOINT=reference_entered"
+    assert "reference_sta" not in output.out
+    failures = [value for value in _fixture_records(output.out) if value["status"] == "failed"]
+    assert failures[0]["error"] == "child_timeout" and failures[0]["timed_out"]
+
+
+def test_element_checkpoint_and_argv_records_reject_forged_or_partial_evidence():
+    raw = b'K5_ELEMENT_ARGV={"equal":true,"hash_equal":true}\n'
+    assert _element_complete_records(raw)[2] == [{"equal": True, "hash_equal": True}]
+    assert _element_complete_records(raw[:-1]) == (b"", [], [])
+    for bad in (
+        raw + raw,
+        b"x" * 4097,
+        b"K5_ELEMENT_CHECKPOINT=PRIVATE\n",
+        b"K5_ELEMENT_CHECKPOINT=reference_entered\n" * 2,
+        b'K5_ELEMENT_ARGV={"equal":1,"hash_equal":true}\n',
+        b'K5_ELEMENT_ARGV={"equal":true,"equal":true}\n',
+        b'K5_ELEMENT_ARGV={"equal":true,"hash_equal":true,"raw":"PRIVATE"}\n',
+    ):
+        with pytest.raises(ValueError):
+            _element_complete_records(bad)
+
+
+@pytest.mark.parametrize("case", ["zero", "nonzero", "stderr_zero", "stderr_nonzero"])
+def test_element_direct_python_reference_proves_real_exit_and_bounded_stdio(tmp_path, case):
+    fixture = tmp_path / "owned fixture.py"
+    fixture.write_bytes(ELEMENT_PROBE_PYTHON_SOURCE.encode("ascii"))
+    oracle = tmp_path / "oracle.py"
+    oracle.write_bytes(ELEMENT_REFERENCE_SCRIPT.encode("ascii"))
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-S",
+            str(oracle),
+            sys.executable,
+            _element_python_argument(fixture, case),
+            case,
+        ],
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0 and not result.stderr and len(result.stdout) <= 4096
+    complete, checkpoints, arguments = _element_complete_records(result.stdout)
+    assert checkpoints == [
+        "reference_entered",
+        "reference_start_requested",
+        "reference_started",
+        "reference_waited",
+        "reference_stdio_verified",
+        "reference_cleanup_complete",
+    ]
+    assert arguments == []
+    assert b"K5_NATIVE_REFERENCE=" + (b"0" if case in {"zero", "stderr_zero"} else b"7") in complete
+    assert "PRIVATE" not in result.stdout.decode()
+
+
+def test_element_exit_zero_partial_failure_suffix_is_rejected(tmp_path, monkeypatch, capsys):
+    import io
+    from types import SimpleNamespace
+
+    common = _startup_witness().common
+    closed = []
+
+    class Owned:
+        def __init__(self, *args, **kwargs):
+            self.process = SimpleNamespace(
+                stdout=io.BytesIO(
+                    b"K5_ELEMENT_CHECKPOINT=reference_entered\nK5_NATIVE_REFERENCE=0\n"
+                    b'K5_ELEMENT_CHILD_FAILURE={"PRIVATE_PARTIAL":'
+                )
+            )
+
+        def wait(self, seconds):
+            pass
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(common, "OwnedProcess", Owned)
+    with pytest.raises(_ElementCaptureFailure):
+        _capture_element_child(
+            common, [], cwd=tmp_path, env={}, context=_element_context("reference")
+        )
+    assert closed == [True]
+    output = capsys.readouterr()
+    assert "PRIVATE" not in output.out + output.err
+    assert any(r["error"] == "output_invalid" for r in _fixture_records(output.out))
+
+
+def test_element_devnull_timeout_preserves_primary_and_successful_owned_cleanup(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    common = _startup_witness().common
+
+    def run(arguments, **kwargs):
+        assert kwargs["seconds"] == 15 and "stdout" not in kwargs
+        raise common.WitnessError(
+            "child_timeout",
+            common.diagnostic(
+                "probe_admission",
+                timed_out=True,
+                gate_state="started",
+            ),
+        )
+
+    monkeypatch.setattr(common, "run", run)
+    with pytest.raises(_ElementCaptureFailure):
+        _element_devnull_control(
+            common, [], cwd=tmp_path, env={}, context=_element_context("shell_devnull_control")
+        )
+    records = _fixture_records(capsys.readouterr().out)
+    assert records[1]["error"] == "child_timeout" and records[1]["timed_out"]
+    assert records[2]["boundary"] == "owned_cleanup" and records[2]["status"] == "passed"
+
+
+def test_element_devnull_unexpected_failure_leaves_cleanup_unconfirmed(
+    tmp_path, monkeypatch, capsys
+):
+    common = _startup_witness().common
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("PRIVATE_UNEXPECTED")
+
+    monkeypatch.setattr(common, "run", fail)
+    with pytest.raises(_ElementCaptureFailure):
+        _element_devnull_control(
+            common, [], cwd=tmp_path, env={}, context=_element_context("shell_devnull_control")
+        )
+    output = capsys.readouterr()
+    assert "PRIVATE" not in output.out + output.err
+    records = _fixture_records(output.out)
+    assert records[-1]["error"] == "unexpected"
+    assert not any(r["boundary"] == "owned_cleanup" for r in records)
