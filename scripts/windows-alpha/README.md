@@ -58,3 +58,96 @@ payload. The one-file delivery path needs a separate exact installer-payload pin
 update after native Windows qualification; no helper is downloaded separately.
 This repair does not qualify an installed analytics product or a production
 deployment.
+
+## Explicit supplied offline wheelhouse
+
+The source installer also accepts a closed, independently reviewed wheelhouse.
+All three arguments must be supplied together, with an explicit exact runtime
+revision selected through the existing `-K5Revision` parameter:
+
+```powershell
+.\Install-K5VisionAlpha.ps1 -InstallRoot $OwnedInstallRoot `
+  -K5Revision $ReviewedRuntimeRevision -SkipDesktopShortcut `
+  -Wheelhouse $ReviewedWheelDirectory `
+  -WheelhouseManifest $ReviewedManifestPath `
+  -WheelhouseManifestSha256 $IndependentlyApprovedManifestSha256
+```
+
+These are review inputs, not values to discover from an untrusted neighboring
+file. A matching hash authenticates bytes only when the expected digest came
+from an independently approved record. Before approving that digest, establish
+source provenance, licensing, host compatibility and the complete artifact
+inventory. No qualified wheelhouse or manifest is supplied by this change.
+
+The offline path has no index access, dependency resolver, source build, pip
+upgrade download or online fallback. It verifies and copies the supplied wheels
+into its owned staging directory, verifies the copies, and uses only explicit
+local wheels with `--no-index --no-deps`. It never provisions GStreamer, even for
+a fresh installation: an already reviewed runtime must be available where the
+existing preflight expects it. Absence or mismatch fails staged preflight.
+The legacy online path is unchanged when none of the offline arguments is used;
+its open-ended pip/build inputs are not qualified by this offline contract.
+
+### Manifest contract
+
+Use UTF-8 JSON, at most 1 MiB, with no duplicate or additional keys. The top-level
+keys are:
+
+- `schema_version`: exactly `k5-alpha-wheelhouse-v1`
+- `installer_revision`: the exact reviewed installer commit, recorded for the
+  external provenance review; the helper verifies the complete listed bytes
+- `runtime_revision`: the exact K5 commit matching `-K5Revision`
+- `python`: exact `implementation`, three-part `version`, `platform`,
+  `executable_sha256`, `ensurepip_version`, and `ensurepip_wheel_sha256`
+- `installer_payload`: byte records for the seven fixed paths in the helper's
+  `PAYLOAD_FILES`, including the wrapper, helper, launcher/preflight files,
+  runtime requirements and GStreamer provisioner
+- `runtime_payload`: every `k5vision/` file in the K5 wheel, independently compared
+  against the exact runtime source; `k5vision/cli.py` is required
+- `wheels`: the closed artifact list described below
+
+Payload byte records have exactly `size` and lowercase `sha256` fields. Each
+wheel entry has exactly `filename`, normalized `name`, exact `version`, expanded
+`tags`, `size` and lowercase `sha256`. The expected digest covers the complete
+manifest, binding the source revisions to those exact payload/artifact records.
+A source-revision string alone is never sufficient provenance.
+
+This initial contract admits only base CPython 3.12 on Windows x64 and its exact
+executable and bundled ensurepip wheel identity. It requires precisely the 27
+versions in the unchanged, hash-bound `runtime-requirements.txt`, K5 `0.1.0`, and
+the identical pip wheel bundled with that admitted Python. The wheelhouse must
+contain exactly those 29 wheels and no other entry. Metadata, filename versions,
+compatible Windows/pure-Python tags, paths, archive bounds and source payload
+bytes are checked; links, reparse points, duplicate names and unexpected files
+are refused. Keep wheelhouse, manifest and installer source outside the install
+root. They must remain unchanged while installation runs.
+
+The wheel inventory is closed before any install state is created. Wheel and
+script bytes are checked again when staged and before activation. Dependency
+constraints are checked by `pip check` in the staged environment; a separate
+installed-distribution check requires exactly the admitted versions with no
+extra or duplicate distribution. Those checks are repeated at the final path.
+A failure leaves the previous installation unchanged or invokes the existing
+journaled rollback. The existing lock, active/unknown Python refusal and
+interrupted-recovery rules are unchanged.
+
+This route consumes prebuilt artifacts. If a wheel must be built separately,
+its Python, pip, backend and full build-dependency closure need separately
+reviewed exact versions and hashes; do not obtain them from unconstrained live
+resolution. Missing artifact hashes are a qualification blocker, not permission
+to select a newer version or bypass admission.
+
+### Qualification limits
+
+Portable source tests use generated wheel metadata and mocked commands. They
+exercise refusal, copy verification, command isolation and transaction recovery;
+they do not execute supplied packages or establish native installer acceptance.
+Actual admitted Windows wheel inputs, native process/file/COM behavior and the
+full installed upgrade boundary still require independent qualification.
+
+Both default revision pins remain unchanged. The old default `d531d50` runtime
+lacks `analytics-preflight`, which the current installed Test/Start scripts
+require, so it fails current staged preflight. Use an explicitly qualified exact
+runtime for this source-only qualification route. The root one-file bootstrap
+still does not deliver this helper or its offline parameters; changing its
+payload/runtime selection remains a separate reviewed delivery change.

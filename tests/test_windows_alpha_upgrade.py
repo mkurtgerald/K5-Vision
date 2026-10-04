@@ -670,3 +670,469 @@ def test_interrupted_first_journal_write_is_retry_safe(previous, monkeypatch, fa
     installer.install(skip_shortcut=True)
     assert (previous / ".venv" / "runtime").read_bytes() == b"new runtime"
     assert not installer.work.exists()
+
+
+@pytest.fixture
+def offline_bundle(tmp_path, monkeypatch):
+    """Generated metadata/artifacts only; no package installation or wheel code runs."""
+    import hashlib
+    import zipfile
+    from types import SimpleNamespace
+
+    source_root = tmp_path / "payload"
+    source = source_root / "scripts" / "windows-alpha"
+    for name in transaction.PAYLOAD_FILES:
+        target = source_root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Generate canonical LF fixtures even when the test checkout uses CRLF.
+        # Production admission still requires the original exact payload bytes.
+        target.write_bytes((ROOT / name).read_bytes().replace(b"\r\n", b"\n"))
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    versions = dict(
+        line.split("==")
+        for line in (source / "runtime-requirements.txt").read_text().splitlines()
+        if line and not line.startswith("#")
+    )
+    versions.update({"k5-vision": "0.1.0", "pip": "25.0.1"})
+
+    def record(path):
+        content = path.read_bytes()
+        return {"size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+
+    records = []
+    runtime = b"# generated runtime identity fixture, never executed\n"
+    for name, version in versions.items():
+        escaped = name.replace("-", "_")
+        filename = f"{escaped}-{version}-py3-none-any.whl"
+        with zipfile.ZipFile(wheels / filename, "w") as archive:
+            prefix = f"{escaped}-{version}.dist-info/"
+            archive.writestr(
+                prefix + "METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+            )
+            archive.writestr(prefix + "WHEEL", "Wheel-Version: 1.0\nTag: py3-none-any\n")
+            archive.writestr(prefix + "RECORD", "")
+            archive.writestr(
+                "k5vision/cli.py" if name == "k5-vision" else f"{escaped}/__init__.py", runtime
+            )
+        records.append(
+            {
+                "filename": filename,
+                "name": name,
+                "version": version,
+                "tags": ["py3-none-any"],
+                **record(wheels / filename),
+            }
+        )
+    pip = next(r for r in records if r["name"] == "pip")
+    host = {
+        "implementation": "cpython",
+        "version": "3.12.10",
+        "platform": "win_amd64",
+        "executable_sha256": "a" * 64,
+        "ensurepip_version": "25.0.1",
+        "ensurepip_wheel_sha256": pip["sha256"],
+    }
+    monkeypatch.setattr(transaction, "_host_identity", lambda: dict(host))
+    data = {
+        "schema_version": transaction.WHEELHOUSE_FORMAT,
+        "installer_revision": "b" * 40,
+        "runtime_revision": "c" * 40,
+        "python": dict(host),
+        "installer_payload": {
+            name: record(source_root / name) for name in transaction.PAYLOAD_FILES
+        },
+        "runtime_payload": {
+            "k5vision/cli.py": {"size": len(runtime), "sha256": hashlib.sha256(runtime).hexdigest()}
+        },
+        "wheels": records,
+    }
+    manifest = tmp_path / "manifest.json"
+
+    def write():
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+        return {
+            "wheelhouse": wheels,
+            "wheelhouse_manifest": manifest,
+            "wheelhouse_manifest_sha256": record(manifest)["sha256"],
+        }
+
+    def installer(root=None, **kwargs):
+        return transaction.Installer(
+            root or tmp_path / "installed",
+            source,
+            Path("powershell.exe"),
+            "c" * 40,
+            "1.28.7",
+            **write(),
+            **kwargs,
+        )
+
+    def edit_wheel(name, edit):
+        entry = next(r for r in records if r["name"] == name)
+        path = wheels / entry["filename"]
+        with zipfile.ZipFile(path) as archive:
+            files = {i.filename: archive.read(i) for i in archive.infolist()}
+        edit(files)
+        with zipfile.ZipFile(path, "w") as archive:
+            for filename, content in files.items():
+                archive.writestr(filename, content)
+        entry.update(record(path))
+
+    return SimpleNamespace(
+        source=source,
+        root=tmp_path / "installed",
+        wheels=wheels,
+        manifest=manifest,
+        data=data,
+        write=write,
+        installer=installer,
+        edit_wheel=edit_wheel,
+        record=record,
+    )
+
+
+def test_offline_admission_copies_exact_closed_wheel_set_without_commands(offline_bundle):
+    run = Mock()
+    installer = offline_bundle.installer(run=run)
+    installer.work.mkdir(parents=True)
+    installer.prepare_wheels()
+    assert installer.wheel_hashes() == {
+        r["filename"]: r["sha256"] for r in offline_bundle.data["wheels"]
+    }
+    assert installer.offline.versions["pip"] == "25.0.1"
+    assert len(installer.offline.versions) == 29
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("present", [(0,), (1,), (2,), (0, 1), (0, 2), (1, 2)])
+def test_offline_partial_arguments_never_fall_back(offline_bundle, present):
+    all_args = offline_bundle.write()
+    kwargs = {key: value for i, (key, value) in enumerate(all_args.items()) if i in present}
+    with pytest.raises(RuntimeError, match="no online fallback"):
+        transaction.Installer(
+            offline_bundle.root,
+            offline_bundle.source,
+            Path("powershell.exe"),
+            "c" * 40,
+            "1.28.7",
+            **kwargs,
+        )
+    assert not offline_bundle.root.exists()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "digest",
+        "runtime",
+        "host",
+        "schema",
+        "payload",
+        "closure_missing",
+        "closure_extra",
+        "duplicate_name",
+        "version",
+        "tags",
+        "size_bool",
+        "pip_hash",
+        "runtime_payload",
+        "source_revision",
+    ],
+)
+def test_offline_manifest_rejects_identity_and_closure_mismatch(offline_bundle, change):
+    data = offline_bundle.data
+    if change == "runtime":
+        data["runtime_revision"] = "d" * 40
+    elif change == "host":
+        data["python"]["version"] = "3.12.99"
+    elif change == "schema":
+        data["schema_version"] = "unrecognized"
+    elif change == "payload":
+        data["installer_payload"][transaction.PAYLOAD_FILES[0]]["sha256"] = "0" * 64
+    elif change == "closure_missing":
+        data["wheels"].pop()
+    elif change == "closure_extra":
+        data["wheels"].append(dict(data["wheels"][0]))
+    elif change == "duplicate_name":
+        data["wheels"][1]["name"] = data["wheels"][0]["name"]
+    elif change == "version":
+        data["wheels"][0]["version"] = "99.0"
+    elif change == "tags":
+        data["wheels"][0]["tags"] = ["cp311-cp311-linux_x86_64"]
+    elif change == "size_bool":
+        data["wheels"][0]["size"] = True
+    elif change == "pip_hash":
+        next(r for r in data["wheels"] if r["name"] == "pip")["sha256"] = "0" * 64
+    elif change == "runtime_payload":
+        data["runtime_payload"]["k5vision/cli.py"]["sha256"] = "0" * 64
+    elif change == "source_revision":
+        data["installer_revision"] = "main"
+    args = offline_bundle.write()
+    if change == "digest":
+        args["wheelhouse_manifest_sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="admission failed"):
+        transaction.Installer(
+            offline_bundle.root,
+            offline_bundle.source,
+            Path("powershell.exe"),
+            "c" * 40,
+            "1.28.7",
+            **args,
+        )
+    assert not offline_bundle.root.exists()
+
+
+@pytest.mark.parametrize("extra", ["surprise.whl", "unexpected.txt", "directory"])
+def test_offline_directory_requires_exact_inventory(offline_bundle, extra):
+    path = offline_bundle.wheels / extra
+    path.mkdir() if extra == "directory" else path.write_bytes(b"unexpected")
+    with pytest.raises(RuntimeError, match="admission failed"):
+        offline_bundle.installer()
+    assert not offline_bundle.root.exists()
+
+
+@pytest.mark.parametrize(
+    "kind", ["name", "version", "duplicate_name", "wheel_tag", "traversal", "extra_runtime"]
+)
+def test_offline_wheel_metadata_must_match_admitted_artifact(offline_bundle, kind):
+    def edit(files):
+        meta = "k5_vision-0.1.0.dist-info/METADATA"
+        if kind == "name":
+            files[meta] = files[meta].replace(b"Name: k5-vision", b"Name: other")
+        elif kind == "version":
+            files[meta] = files[meta].replace(b"Version: 0.1.0", b"Version: 9.9.9")
+        elif kind == "duplicate_name":
+            files[meta] += b"Name: k5-vision\n"
+        elif kind == "wheel_tag":
+            files["k5_vision-0.1.0.dist-info/WHEEL"] = (
+                b"Wheel-Version: 1.0\nTag: cp311-cp311-win_amd64\n"
+            )
+        elif kind == "traversal":
+            files["../escape.py"] = b"no"
+        elif kind == "extra_runtime":
+            files["unadmitted.py"] = b"no"
+
+    offline_bundle.edit_wheel("k5-vision", edit)
+    with pytest.raises(RuntimeError, match="admission failed"):
+        offline_bundle.installer()
+
+
+def test_offline_duplicate_json_keys_are_refused_even_with_matching_digest(offline_bundle):
+    import hashlib
+
+    args = offline_bundle.write()
+    raw = offline_bundle.manifest.read_bytes().replace(
+        b'{"schema_version":', b'{"schema_version":"duplicate", "schema_version":', 1
+    )
+    offline_bundle.manifest.write_bytes(raw)
+    args["wheelhouse_manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(RuntimeError, match="admission failed"):
+        transaction.Installer(
+            offline_bundle.root,
+            offline_bundle.source,
+            Path("powershell.exe"),
+            "c" * 40,
+            "1.28.7",
+            **args,
+        )
+
+
+def test_offline_runtime_versions_cannot_be_redefined_by_supplied_manifest(offline_bundle):
+    requirements = offline_bundle.source / "runtime-requirements.txt"
+    requirements.write_text(requirements.read_text().replace("anyio==4.15.1", "anyio==4.15.2"))
+    offline_bundle.data["installer_payload"]["scripts/windows-alpha/runtime-requirements.txt"] = (
+        offline_bundle.record(requirements)
+    )
+    with pytest.raises(RuntimeError, match="admission failed"):
+        offline_bundle.installer()
+
+
+@pytest.mark.parametrize("change", ["wheel", "source", "copied_wheel"])
+def test_offline_inputs_are_rechecked_before_use(offline_bundle, monkeypatch, change):
+    installer = offline_bundle.installer(run=Mock())
+    installer.work.mkdir(parents=True)
+    if change == "wheel":
+        next(offline_bundle.wheels.glob("*.whl")).write_bytes(b"tamper")
+    elif change == "source":
+        (offline_bundle.source / "Run-K5VisionAlpha.ps1").write_bytes(b"tamper")
+    else:
+        copy = transaction.shutil.copyfile
+
+        def tamper(source, destination):
+            copy(source, destination)
+            Path(destination).write_bytes(b"tamper")
+
+        monkeypatch.setattr(transaction.shutil, "copyfile", tamper)
+    with pytest.raises(RuntimeError, match="admission failed"):
+        installer.prepare_wheels()
+    installer.run.assert_not_called()
+
+
+def offline_command_fixture(bundle, root, fail=None):
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        if "venv" in args:
+            (Path(args[-1]) / "Scripts").mkdir(parents=True)
+            (Path(args[-1]) / "Scripts" / "python.exe").write_bytes(b"not executable fixture")
+        if fail and fail(args):
+            raise subprocess.CalledProcessError(1, args)
+        return subprocess.CompletedProcess(args, 0, "[]")
+
+    return bundle.installer(root=root, run=run), calls
+
+
+@pytest.mark.parametrize("failure", [None, "pip_check", "installed_closure", "active_preflight"])
+def test_offline_real_transaction_uses_mocked_closed_commands_and_rolls_back(
+    offline_bundle, previous, failure
+):
+    before = snapshot(previous)
+
+    def fail(args):
+        if failure == "pip_check":
+            return args[-3:] == ["-m", "pip", "check"]
+        if failure == "installed_closure":
+            return "Installed wheel closure mismatch" in args[-1]
+        return failure == "active_preflight" and args[-2:] == ["-InstallRoot", str(previous)]
+
+    installer, calls = offline_command_fixture(offline_bundle, previous, fail if failure else None)
+    if failure:
+        with pytest.raises(subprocess.CalledProcessError):
+            installer.install(skip_shortcut=True)
+        assert snapshot(previous) == before
+    else:
+        installer.install(skip_shortcut=True)
+        assert (previous / "config/private.json").read_bytes() == before["config/private.json"]
+        assert (previous / "k5-revision.txt").read_text() == "c" * 40
+    assert not installer.work.exists()
+    assert all(
+        "wheel" not in args and not any("https://" in arg for arg in args) for args, _ in calls
+    )
+    installs = [args for args, _ in calls if "install" in args]
+    assert installs and all("--no-index" in args and "--no-deps" in args for args in installs)
+    assert all(kwargs["env"]["PIP_NO_INDEX"] == "1" for _, kwargs in calls)
+    assert all("provision-stage03-gstreamer.ps1" not in str(args) for args, _ in calls)
+
+
+def test_offline_fresh_install_never_provisions_shared_runtime(offline_bundle):
+    installer, calls = offline_command_fixture(offline_bundle, offline_bundle.root)
+    installer.install(skip_shortcut=True)
+    assert all("provision-stage03-gstreamer.ps1" not in str(args) for args, _ in calls)
+    assert any("Installed wheel closure mismatch" in args[-1] for args, _ in calls)
+
+
+def test_offline_wrapper_forwards_all_inputs_without_default_pin_change():
+    text = (SOURCE / "Install-K5VisionAlpha.ps1").read_text()
+    for parameter in ("Wheelhouse", "WheelhouseManifest", "WheelhouseManifestSha256"):
+        assert f'[string]${parameter} = ""' in text
+    assert '"--wheelhouse", $Wheelhouse' in text
+    assert '"--wheelhouse-manifest", $WheelhouseManifest' in text
+    assert '"--wheelhouse-manifest-sha256", $WheelhouseManifestSha256' in text
+    assert "$PSBoundParameters.ContainsKey($name)" in text
+    assert "if ($offlineCount -ne 0 -and $offlineCount -ne 3)" in text
+    assert '$K5Revision = "d531d50d479f46af6ceed324a7cc379745becb61"' in text
+
+
+def test_offline_bootstrap_isolation_precedes_every_python_execution():
+    text = (SOURCE / "Install-K5VisionAlpha.ps1").read_text()
+    assert 'if ($offlineCount -eq 3) { $pythonIsolation = @("-I", "-S", "-B") }' in text
+    assert "& $py.Source -3.12 @pythonIsolation -c" in text
+    assert "& $candidate.Source @pythonIsolation -c" in text
+    assert "& $pythonCommand @pythonPrefixArgs @pythonIsolation @arguments" in text
+    assert text.index("$pythonIsolation = @()") < text.index("$py = Get-Command")
+
+
+def test_offline_venv_creation_excludes_ambient_site_code(offline_bundle):
+    installer, calls = offline_command_fixture(offline_bundle, offline_bundle.root)
+    installer.install(skip_shortcut=True)
+    creates = [args for args, _ in calls if "venv" in args]
+    assert creates and all(args[1:4] == ["-I", "-S", "-B"] for args in creates)
+    # The installed venv needs site initialization on 3.12, but no user site.
+    pip_calls = [args for args, _ in calls if "pip" in args]
+    assert pip_calls and all(args[1:3] == ["-I", "-B"] and "-S" not in args for args in pip_calls)
+
+
+@pytest.mark.parametrize("component", ["..", "bad.", "bad ", "NUL", "COM1.txt", "aux"])
+def test_offline_install_root_refuses_windows_path_aliases_before_mutation(
+    offline_bundle, component
+):
+    root = offline_bundle.root / component / "child"
+    with pytest.raises(RuntimeError, match="admission failed"):
+        offline_bundle.installer(root=root)
+    assert not offline_bundle.root.exists()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "k5vision/CLI.py",
+        "k5vision/cli.py.",
+        "k5vision/NUL.py",
+        "k5vision/COM1",
+        "k5vision/cli.py ",
+        "k5vision//other.py",
+    ],
+)
+def test_offline_wheel_rejects_windows_aliases_even_in_trusted_payload(offline_bundle, name):
+    import hashlib
+
+    content = b"different generated fixture"
+    offline_bundle.edit_wheel("k5-vision", lambda files: files.update({name: content}))
+    offline_bundle.data["runtime_payload"][name] = {
+        "size": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+    with pytest.raises(RuntimeError, match="admission failed"):
+        offline_bundle.installer()
+
+
+def test_offline_wheel_rejects_file_directory_collision(offline_bundle):
+    offline_bundle.edit_wheel(
+        "anyio", lambda files: files.update({"anyio": b"file collides with directory"})
+    )
+    with pytest.raises(RuntimeError, match="admission failed"):
+        offline_bundle.installer()
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "py3.py3-none-any",
+        "a" * 129 + "-none-any",
+        ".".join(f"py{i}" for i in range(9)) + "-none-any",
+        "a.b.c.d.e-f.g.h.i.j-k.l.m",
+    ],
+)
+def test_offline_tag_expansion_is_bounded_before_cartesian_product(monkeypatch, tag):
+    product = Mock(side_effect=AssertionError("unbounded expansion"))
+    monkeypatch.setattr(transaction.itertools, "product", product)
+    with pytest.raises(RuntimeError, match="admission failed"):
+        transaction._tags(tag)
+    product.assert_not_called()
+
+
+def test_offline_wheel_refuses_excessive_tag_headers(offline_bundle):
+    offline_bundle.edit_wheel(
+        "anyio",
+        lambda files: files.update(
+            {
+                "anyio-4.15.1.dist-info/WHEEL": b"Wheel-Version: 1.0\n"
+                + b"Tag: py3-none-any\n" * 65,
+            }
+        ),
+    )
+    with pytest.raises(RuntimeError, match="admission failed"):
+        offline_bundle.installer()
+
+
+@pytest.mark.parametrize("value", [r"\\server\share\wheels", r"\\?\C:\wheels"])
+def test_offline_network_and_device_paths_are_refused_before_filesystem_access(monkeypatch, value):
+    from pathlib import PureWindowsPath
+
+    inspect = Mock()
+    monkeypatch.setattr(transaction, "_plain_ancestors", inspect)
+    with pytest.raises(RuntimeError, match="admission failed"):
+        transaction._offline_path(PureWindowsPath(value))
+    inspect.assert_not_called()

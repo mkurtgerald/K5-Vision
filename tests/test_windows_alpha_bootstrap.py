@@ -37,7 +37,7 @@ def test_windows_alpha_installer_accepts_python_312_without_legacy_launcher() ->
     assert "Get-Command py.exe -ErrorAction SilentlyContinue" in text
     assert '"python3.12.exe", "python.exe"' in text
     assert "$pythonCommand = $candidate.Source" in text
-    assert "& $pythonCommand @pythonPrefixArgs @arguments" in text
+    assert "& $pythonCommand @pythonPrefixArgs @pythonIsolation @arguments" in text
     assert '"--revision", $K5Revision' in text
 
 

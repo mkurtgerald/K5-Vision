@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ensurepip
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -17,7 +19,10 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
+import zipfile
 from collections.abc import Callable, Iterator
+from email.parser import BytesParser
 from pathlib import Path
 
 FILES = (
@@ -31,6 +36,17 @@ MANAGED = (".venv", *FILES)
 WORKSPACE = ".k5-alpha-upgrade"
 LOCK = ".k5-alpha-install.lock"
 FORMAT = "k5-alpha-upgrade-v1"
+WHEELHOUSE_FORMAT = "k5-alpha-wheelhouse-v1"
+REQUIREMENTS_SHA256 = "ba1ae7620ce4f660fc5e6a7fd2ace352e9c1859972cb09e8b7f76449272fcb52"
+PAYLOAD_FILES = (
+    "scripts/windows-alpha/Install-K5VisionAlpha.ps1",
+    "scripts/windows-alpha/install_transaction.py",
+    "scripts/windows-alpha/Test-K5VisionAlpha.ps1",
+    "scripts/windows-alpha/Start-K5VisionAlpha.ps1",
+    "scripts/windows-alpha/Run-K5VisionAlpha.ps1",
+    "scripts/windows-alpha/runtime-requirements.txt",
+    "scripts/provision-stage03-gstreamer.ps1",
+)
 RUNTIME_PROBE = (
     "from k5vision.operator_runtime import LOCAL_TEST_SOURCE_ENV; "
     "raise SystemExit(0 if LOCAL_TEST_SOURCE_ENV == 'K5_LOCAL_TEST_RTSP_SOURCE' else 1)"
@@ -100,6 +116,275 @@ def _ps_literal(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _admit(condition: bool) -> None:
+    if not condition:
+        raise RuntimeError("Offline wheelhouse admission failed; no online fallback is permitted.")
+
+
+def _sha256(path: Path) -> str:
+    _plain_ancestors(path)
+    _admit(path.is_file())
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _unique_json(items: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in items:
+        _admit(key not in result)
+        result[key] = value
+    return result
+
+
+def _file_record(path: Path, record: dict) -> None:
+    _admit(isinstance(record, dict) and record.keys() == {"size", "sha256"})
+    _admit(type(record["size"]) is int and 0 < record["size"] <= 256 * 1024 * 1024)
+    _admit(
+        isinstance(record["sha256"], str) and bool(re.fullmatch("[0-9a-f]{64}", record["sha256"]))
+    )
+    _admit(_sha256(path) == record["sha256"] and path.stat().st_size == record["size"])
+
+
+def _host_identity() -> dict:
+    _admit(sys.prefix == sys.base_prefix)
+    # -S on Python 3.12 can mask a venv prefix; do not admit its executable.
+    executable = Path(sys.executable)
+    _admit(
+        not any(
+            (parent / "pyvenv.cfg").exists()
+            for parent in (executable.parent, executable.parent.parent)
+        )
+    )
+    version = ensurepip.version()
+    bundled = Path(ensurepip.__file__).parent / "_bundled" / f"pip-{version}-py3-none-any.whl"
+    return {
+        "implementation": sys.implementation.name,
+        "version": ".".join(map(str, sys.version_info[:3])),
+        "platform": sysconfig.get_platform().replace("-", "_"),
+        "executable_sha256": _sha256(Path(sys.executable)),
+        "ensurepip_version": version,
+        "ensurepip_wheel_sha256": _sha256(bundled),
+    }
+
+
+def _tags(value: str) -> set[str]:
+    _admit(len(value) <= 128)
+    parts = value.split("-")
+    _admit(len(parts) == 3 and all(re.fullmatch(r"[a-z0-9_]+(?:\.[a-z0-9_]+)*", p) for p in parts))
+    tokens = [part.split(".") for part in parts]
+    _admit(all(len(group) <= 8 and len(group) == len(set(group)) for group in tokens))
+    _admit(len(tokens[0]) * len(tokens[1]) * len(tokens[2]) <= 64)
+    return {"-".join(tag) for tag in itertools.product(*tokens)}
+
+
+def _windows_component(part: str) -> bool:
+    return (
+        bool(part)
+        and part not in (".", "..")
+        and not part.endswith((".", " "))
+        and not any(ord(character) < 32 or character in '<>:"\\|?*' for character in part)
+        and not re.fullmatch(r"(?i)(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])", part.split(".")[0])
+    )
+
+
+def _offline_path(path: Path) -> None:
+    _admit(path.is_absolute())
+    _admit(not str(path).startswith(("\\\\", "//")))
+    _admit(all(_windows_component(part) for part in path.parts if part != path.anchor))
+    _plain_ancestors(path)
+
+
+class OfflineWheelhouse:
+    """An external reviewed digest is the trust anchor, never a self-declared hash.
+
+    Admission executes no wheel code, installer or resolver. Runtime dependency
+    closure is fixed to the reviewed requirements; real pip check and installed
+    version verification run only in the disposable stage before activation.
+    """
+
+    def __init__(self, directory: Path, manifest: Path, digest: str, source: Path, revision: str):
+        _admit(bool(re.fullmatch("[0-9a-f]{64}", digest)))
+        _offline_path(directory)
+        _offline_path(manifest)
+        _admit(directory.is_dir() and manifest.is_file() and manifest.stat().st_size <= 1024 * 1024)
+        raw = manifest.read_bytes()
+        _admit(hashlib.sha256(raw).hexdigest() == digest)
+        data = json.loads(raw, object_pairs_hook=_unique_json)
+        _admit(
+            isinstance(data, dict)
+            and data.keys()
+            == {
+                "schema_version",
+                "installer_revision",
+                "runtime_revision",
+                "python",
+                "installer_payload",
+                "runtime_payload",
+                "wheels",
+            }
+        )
+        _admit(data["schema_version"] == WHEELHOUSE_FORMAT)
+        _admit(
+            isinstance(data["installer_revision"], str)
+            and bool(re.fullmatch("[0-9a-f]{40}", data["installer_revision"]))
+        )
+        _admit(data["runtime_revision"] == revision)
+        host = _host_identity()
+        _admit(data["python"] == host and host["implementation"] == "cpython")
+        _admit(host["platform"] == "win_amd64" and host["version"].startswith("3.12."))
+        self.directory, self.source, self.data = directory, source, data
+        self.verify_source()
+        requirements = source / "runtime-requirements.txt"
+        _admit(_sha256(requirements) == REQUIREMENTS_SHA256)
+        versions = {}
+        for line in requirements.read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            match = re.fullmatch(r"([a-z0-9-]+)==([0-9]+(?:\.[0-9]+)+)", line)
+            _admit(match is not None and match[1] not in versions)
+            versions[match[1]] = match[2]
+        _admit(len(versions) == 27)
+        versions.update({"k5-vision": "0.1.0", "pip": host["ensurepip_version"]})
+        self.versions = versions
+        wheels = data["wheels"]
+        _admit(isinstance(wheels, list) and len(wheels) == len(versions))
+        self.wheels = {}
+        names = set()
+        for record in wheels:
+            _admit(
+                isinstance(record, dict)
+                and record.keys()
+                == {
+                    "filename",
+                    "name",
+                    "version",
+                    "tags",
+                    "size",
+                    "sha256",
+                }
+            )
+            name, filename = record["name"], record["filename"]
+            _admit(isinstance(name, str) and name in versions and name not in names)
+            _admit(
+                isinstance(filename, str)
+                and bool(re.fullmatch(r"[A-Za-z0-9_.+!-]+\.whl", filename))
+            )
+            _admit(filename not in self.wheels and record["version"] == versions[name])
+            self.wheels[filename] = record
+            names.add(name)
+            if name == "pip":
+                _admit(record["sha256"] == host["ensurepip_wheel_sha256"])
+        self.verify_wheels(directory)
+
+    def verify_source(self) -> None:
+        payload = self.data["installer_payload"]
+        _admit(isinstance(payload, dict) and payload.keys() == set(PAYLOAD_FILES))
+        for name, record in payload.items():
+            _file_record(self.source.parent.parent / name, record)
+
+    def verify_scripts(self, destination: Path) -> None:
+        for name in FILES[:3]:
+            _file_record(
+                destination / name, self.data["installer_payload"]["scripts/windows-alpha/" + name]
+            )
+
+    def verify_wheels(self, directory: Path) -> None:
+        _plain_ancestors(directory)
+        _admit({path.name for path in directory.iterdir()} == self.wheels.keys())
+        for filename, record in self.wheels.items():
+            path = directory / filename
+            _file_record(path, {key: record[key] for key in ("size", "sha256")})
+            self.verify_metadata(path, record)
+
+    def verify_metadata(self, path: Path, record: dict) -> None:
+        parts = path.name[:-4].split("-")
+        _admit(len(parts) in (5, 6))
+        _admit(bool(re.fullmatch(r"[A-Za-z0-9_]+", parts[0])))
+        _admit(re.sub(r"[-_.]+", "-", parts[0]).lower() == record["name"])
+        _admit(parts[1] == record["version"])
+        if len(parts) == 6:
+            _admit(bool(re.fullmatch(r"[0-9][A-Za-z0-9_]*", parts[2])))
+        tags = _tags("-".join(parts[-3:]))
+        _admit(
+            isinstance(record["tags"], list) and all(isinstance(tag, str) for tag in record["tags"])
+        )
+        _admit(len(record["tags"]) == len(set(record["tags"])) and set(record["tags"]) == tags)
+        supported = {
+            f"{python}-{abi}-{platform}"
+            for python, abi, platform in (
+                ("py3", "none", "any"),
+                ("py312", "none", "any"),
+                ("cp312", "none", "any"),
+                ("py3", "none", "win_amd64"),
+                ("py312", "none", "win_amd64"),
+                ("cp312", "none", "win_amd64"),
+                ("cp312", "cp312", "win_amd64"),
+            )
+        }
+        supported.update(f"cp3{minor}-abi3-win_amd64" for minor in range(2, 13))
+        _admit(bool(tags & supported))
+        prefix = f"{parts[0]}-{parts[1]}.dist-info/"
+        with zipfile.ZipFile(path) as archive:
+            entries = archive.infolist()
+            _admit(
+                len(entries) <= 10000 and len({item.filename for item in entries}) == len(entries)
+            )
+            _admit(sum(item.file_size for item in entries) <= 512 * 1024 * 1024)
+            canonical = {}
+            for item in entries:
+                name = item.filename
+                _admit(not name.startswith("/") and "\\" not in name and ":" not in name)
+                parts = name.rstrip("/").split("/")
+                _admit(all(_windows_component(part) for part in parts))
+                key = "/".join(parts).casefold()
+                _admit(key not in canonical)
+                canonical[key] = item.is_dir()
+                _admit(not stat.S_ISLNK(item.external_attr >> 16) and not item.flag_bits & 1)
+                if ".dist-info/" in name.casefold():
+                    _admit(name.startswith(prefix))
+            for key in canonical:
+                parts = key.split("/")
+                for index in range(1, len(parts)):
+                    _admit(canonical.get("/".join(parts[:index]), True))
+            metadata = []
+            for name in ("METADATA", "WHEEL"):
+                info = archive.getinfo(prefix + name)
+                _admit(info.file_size <= 65536)
+                metadata.append(BytesParser().parsebytes(archive.read(info)))
+            package, wheel = metadata
+            names = package.get_all("Name", [])
+            _admit(len(names) == 1 and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", names[0])))
+            _admit(re.sub(r"[-_.]+", "-", names[0]).lower() == record["name"])
+            _admit(package.get_all("Version") == [record["version"]])
+            _admit(wheel.get_all("Wheel-Version") == ["1.0"])
+            declared = wheel.get_all("Tag", [])
+            _admit(0 < len(declared) <= 64)
+            _admit(set().union(*(_tags(tag) for tag in declared)) == tags)
+            if record["name"] == "k5-vision":
+                _admit(all(item.filename.startswith(("k5vision/", prefix)) for item in entries))
+                payload = self.data["runtime_payload"]
+                _admit(isinstance(payload, dict) and 0 < len(payload) <= 1024)
+                actual = {
+                    item.filename
+                    for item in entries
+                    if item.filename.startswith("k5vision/") and not item.is_dir()
+                }
+                _admit(actual == payload.keys() and "k5vision/cli.py" in actual)
+                for name, expected in payload.items():
+                    _admit(isinstance(expected, dict) and expected.keys() == {"size", "sha256"})
+                    content = archive.read(name)
+                    _admit(type(expected["size"]) is int and len(content) == expected["size"])
+                    _admit(hashlib.sha256(content).hexdigest() == expected["sha256"])
+
+    def copy_to(self, destination: Path) -> None:
+        self.verify_source()
+        self.verify_wheels(self.directory)
+        destination.mkdir()
+        for filename in self.wheels:
+            shutil.copyfile(self.directory / filename, destination / filename)
+        self.verify_wheels(destination)
+
+
 class Installer:
     def __init__(
         self,
@@ -111,6 +396,9 @@ class Installer:
         shortcut: Path | None = None,
         *,
         run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+        wheelhouse: Path | None = None,
+        wheelhouse_manifest: Path | None = None,
+        wheelhouse_manifest_sha256: str | None = None,
     ) -> None:
         self.root = root.absolute()
         self.source = source.absolute()
@@ -124,6 +412,27 @@ class Installer:
         self.backup = self.work / "backup"
         self.wheels = self.work / "wheels"
         self.journal = self.work / "transaction.json"
+        supplied = (wheelhouse, wheelhouse_manifest, wheelhouse_manifest_sha256)
+        _admit(
+            all(value is None for value in supplied) or all(value is not None for value in supplied)
+        )
+        if wheelhouse is not None:
+            _offline_path(self.root)
+            _offline_path(self.source)
+        self.offline = (
+            OfflineWheelhouse(
+                wheelhouse,
+                wheelhouse_manifest,
+                wheelhouse_manifest_sha256,
+                self.source,
+                self.revision,
+            )
+            if wheelhouse is not None
+            else None
+        )
+        if self.offline is not None:
+            for path in (wheelhouse, wheelhouse_manifest, self.source):
+                _admit(not path.is_relative_to(self.root) and not self.root.is_relative_to(path))
 
     def command(self, args: list[str | Path], *, capture: bool = False) -> str:
         # Ambient pip/Python overrides must not redirect writes out of the
@@ -135,6 +444,10 @@ class Installer:
             and key.upper() not in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")
         }
         environment["PIP_CONFIG_FILE"] = os.devnull
+        if self.offline is not None:
+            environment.update(
+                PIP_NO_INDEX="1", PIP_DISABLE_PIP_VERSION_CHECK="1", PIP_NO_CACHE_DIR="1"
+            )
         result = self.run(
             [str(arg) for arg in args],
             check=True,
@@ -280,13 +593,22 @@ class Installer:
             # read of source files that could have changed during staging.
             for name in FILES:
                 shutil.copyfile(self.stage / name, destination / name)
+            if self.offline is not None:
+                self.offline.verify_scripts(destination)
             return
+        if self.offline is not None:
+            self.offline.verify_source()
         for name in FILES[:3]:
             shutil.copyfile(self.source / name, destination / name)
         (destination / "gstreamer-version.txt").write_text(self.gstreamer, encoding="ascii")
         (destination / "k5-revision.txt").write_text(self.revision, encoding="ascii")
+        if self.offline is not None:
+            self.offline.verify_scripts(destination)
 
     def prepare_wheels(self) -> None:
+        if self.offline is not None:
+            self.offline.copy_to(self.wheels)
+            return
         bootstrap = self.work / "builder"
         self.command([sys.executable, "-m", "venv", bootstrap])
         python = bootstrap / "Scripts" / "python.exe"
@@ -312,6 +634,8 @@ class Installer:
             raise RuntimeError("Expected exactly one reviewed K5 wheel.")
 
     def wheel_hashes(self) -> dict[str, str]:
+        if self.offline is not None:
+            self.offline.verify_wheels(self.wheels)
         hashes = {}
         for path in sorted(self.wheels.glob("*.whl")):
             _plain(path)
@@ -320,13 +644,18 @@ class Installer:
         return hashes
 
     def install_runtime(self, destination: Path) -> None:
+        if self.offline is not None:
+            self.offline.verify_wheels(self.wheels)
         destination.mkdir(exist_ok=True)
         venv = destination / ".venv"
-        self.command([sys.executable, "-m", "venv", venv])
+        isolated = ["-I", "-B"] if self.offline is not None else []
+        bootstrap = ["-I", "-S", "-B"] if self.offline is not None else []
+        self.command([sys.executable, *bootstrap, "-m", "venv", venv])
         python = venv / "Scripts" / "python.exe"
         self.command(
             [
                 python,
+                *isolated,
                 "-m",
                 "pip",
                 "install",
@@ -336,9 +665,25 @@ class Installer:
                 *sorted(self.wheels.glob("*.whl")),
             ]
         )
-        self.command([python, "-m", "pip", "check"])
-        self.command([python, "-m", "k5vision.cli", "--version"])
-        self.command([python, "-c", RUNTIME_PROBE])
+        self.command([python, *isolated, "-m", "pip", "check"])
+        if self.offline is not None:
+            # Check the complete installed closure; the resolver is never used.
+            expected = repr(self.offline.versions)
+            self.command(
+                [
+                    python,
+                    *isolated,
+                    "-c",
+                    "from importlib.metadata import distributions; import re; "
+                    "items=[(re.sub(r'[-_.]+','-',d.metadata['Name']).lower(),d.version) "
+                    "for d in distributions()]; "
+                    f"expected={expected}; "
+                    "assert len(items)==len(expected) and dict(items)==expected, "
+                    "'Installed wheel closure mismatch'",
+                ]
+            )
+        self.command([python, *isolated, "-m", "k5vision.cli", "--version"])
+        self.command([python, *isolated, "-c", RUNTIME_PROBE])
         self.materialize_files(destination)
 
     def preflight(self, destination: Path) -> None:
@@ -385,7 +730,9 @@ class Installer:
                 self.backup.mkdir()
                 # Never change the shared GStreamer runtime during an upgrade.
                 # A missing/different requested version fails candidate preflight.
-                if not any((self.root / name).exists() for name in MANAGED):
+                if self.offline is None and not any(
+                    (self.root / name).exists() for name in MANAGED
+                ):
                     self.command(
                         [
                             self.host,
@@ -461,6 +808,9 @@ def main() -> None:
     parser.add_argument("--gstreamer", required=True)
     parser.add_argument("--shortcut", type=Path)
     parser.add_argument("--skip-shortcut", action="store_true")
+    parser.add_argument("--wheelhouse", type=Path)
+    parser.add_argument("--wheelhouse-manifest", type=Path)
+    parser.add_argument("--wheelhouse-manifest-sha256")
     args = parser.parse_args()
     if os.name != "nt" or sys.version_info[:2] != (3, 12):
         parser.error("The Alpha installer requires Windows and Python 3.12.")
@@ -475,6 +825,9 @@ def main() -> None:
         args.revision,
         args.gstreamer,
         args.shortcut,
+        wheelhouse=args.wheelhouse,
+        wheelhouse_manifest=args.wheelhouse_manifest,
+        wheelhouse_manifest_sha256=args.wheelhouse_manifest_sha256,
     ).install(skip_shortcut=args.skip_shortcut)
     print(f"K5 Vision Alpha runtime installed from reviewed commit {args.revision.lower()}.")
     print("Camera-free preflight passed; no camera media was contacted or stored.")
