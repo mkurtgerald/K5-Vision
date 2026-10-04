@@ -1778,7 +1778,7 @@ public sealed class K5FixtureMethod : MethodInvocationException {
 
 
 ELEMENT_PROBE_PREFIX = b"K5_ELEMENT_PROBE="
-ELEMENT_PROBE_SCHEMA = "element-native-exit-probe-v1"
+ELEMENT_PROBE_SCHEMA = "element-native-exit-probe-v2"
 ELEMENT_PROBE_OUTCOMES = {
     "true",
     "false",
@@ -1786,6 +1786,9 @@ ELEMENT_PROBE_OUTCOMES = {
     "native_stderr",
     "command_missing",
     "unexpected",
+    "timeout",
+    "output_limit",
+    "cleanup_failed",
 }
 ELEMENT_PROBE_PYTHON_SOURCE = r"""
 import os
@@ -1798,9 +1801,22 @@ try:
     if (os.path.normcase(sys.base_prefix) != os.path.normcase(_fixture_prefix)
             or tuple(sys.version_info[:3]) != _fixture_version):
         os._exit(32)
-    if _fixture_case not in ('zero', 'nonzero', 'stderr_zero', 'stderr_nonzero'):
+    if _fixture_case not in ('zero', 'nonzero', 'stderr_zero', 'stderr_nonzero',
+                             'stdout_bound', 'stdout_overflow', 'timeout'):
         os._exit(33)
+    if _fixture_case == 'timeout':
+        time.sleep(30)
+        os._exit(37)
     time.sleep(0.5)
+    if _fixture_case in ('stdout_bound', 'stdout_overflow'):
+        size = 131072 if _fixture_case == 'stdout_bound' else 131073
+        data = b'x' * size
+        while data:
+            written = os.write(1, data)
+            if written <= 0:
+                os._exit(38)
+            data = data[written:]
+        os._exit(0)
     if _fixture_case.startswith('stderr_'):
         if os.write(2, b'PRIVATE_NATIVE_FIXTURE') != 22:
             os._exit(34)
@@ -1813,7 +1829,15 @@ except BaseException:
 def _element_python_argument(script: Path, case: str) -> str:
     import base64
 
-    if case not in {"zero", "nonzero", "stderr_zero", "stderr_nonzero"}:
+    if case not in {
+        "zero",
+        "nonzero",
+        "stderr_zero",
+        "stderr_nonzero",
+        "stdout_bound",
+        "stdout_overflow",
+        "timeout",
+    }:
         raise ValueError("Invalid fixed case")
     expected = ELEMENT_PROBE_PYTHON_SOURCE.encode("ascii")
     with script.open("rb") as stream:
@@ -2092,7 +2116,142 @@ if ($utilityAssembly.Name -cne 'Microsoft.PowerShell.Commands.Utility' -or
 [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_binding_verified')
 [Console]::Out.Flush()
 """.replace("__UTILITY_OBSERVATION__", ELEMENT_UTILITY_OBSERVATION)
-ELEMENT_PROBE_SCRIPT = r"""
+ELEMENT_PROCESS_PROTOTYPE = r"""
+function Test-K5GStreamerElement([string]$Name) {
+    $child = $null
+    $primaryFailure = $null
+    $started = $false
+    $childHandle = [IntPtr]::Zero
+    $outRead = $null; $errRead = $null
+    $stdoutStream = $null; $stderrStream = $null
+    try {
+        # Only one bounded token reaches the native argv parser. This includes
+        # actual element names and the admitted one-argument native probe.
+        if ($Name.Length -eq 0 -or $Name.Length -gt 8192 -or
+            $Name -match '[^\x21-\x7e]|["\\]' -or -not [IO.Path]::IsPathRooted($gstInspect)) {
+            throw [Management.Automation.CommandNotFoundException]::new(
+                'K5 native application required.')
+        }
+        $command = Get-Command -Name $gstInspect -ErrorAction Stop
+        if ($command -isnot [Management.Automation.ApplicationInfo] -or
+            -not [string]::Equals([IO.Path]::GetFullPath($command.Path),
+                [IO.Path]::GetFullPath($gstInspect), [StringComparison]::OrdinalIgnoreCase)) {
+            throw [Management.Automation.CommandNotFoundException]::new(
+                'K5 native application required.')
+        }
+        $info = [Diagnostics.ProcessStartInfo]::new()
+        $info.FileName = $command.Path
+        $info.Arguments = $Name
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardInput = $true
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        $child = [Diagnostics.Process]::new()
+        $child.StartInfo = $info
+        $started = $child.Start()
+        if (-not $started) { throw [InvalidOperationException]::new('K5 native start failed.') }
+        $childHandle = $child.Handle
+        $child.StandardInput.Close()
+        $stdoutStream = $child.StandardOutput.BaseStream
+        $stderrStream = $child.StandardError.BaseStream
+        $outBuffer = [byte[]]::new(4096)
+        $errBuffer = [byte[]]::new(4096)
+        $outRead = $stdoutStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+        $errRead = $stderrStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+        $outDone = $false; $errDone = $false
+        $outCount = 0; $errCount = 0
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        while ($true) {
+            if ($watch.Elapsed.TotalSeconds -ge 5) {
+                throw [TimeoutException]::new('K5 native timeout.')
+            }
+            if (-not $outDone -and $outRead.IsCompleted) {
+                $count = $outRead.GetAwaiter().GetResult()
+                if ($count -eq 0) { $outDone = $true }
+                else {
+                    $outCount += $count
+                    if ($outCount + $errCount -gt 131072) {
+                        throw [IO.InvalidDataException]::new('K5 native output limit.')
+                    }
+                    $outRead = $stdoutStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+                }
+            }
+            if (-not $errDone -and $errRead.IsCompleted) {
+                $count = $errRead.GetAwaiter().GetResult()
+                if ($count -eq 0) { $errDone = $true }
+                else {
+                    $errCount += $count
+                    if ($outCount + $errCount -gt 131072) {
+                        throw [IO.InvalidDataException]::new('K5 native output limit.')
+                    }
+                    $errRead = $stderrStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+                }
+            }
+            if ($child.HasExited -and $outDone -and $errDone) { break }
+            [Threading.Thread]::Sleep(10)
+        }
+        $exitCode = $child.ExitCode
+        if ($errCount -ne 0) { throw [IO.InvalidDataException]::new('K5 native stderr refused.') }
+        return $exitCode -eq 0
+    } catch {
+        $primaryFailure = $_
+        throw
+    } finally {
+        $cleanupWatch = [Diagnostics.Stopwatch]::StartNew()
+        $cleanupFailed = $false
+        try {
+            if ($started) {
+                if ($childHandle -eq [IntPtr]::Zero -or $child.Handle -ne $childHandle) {
+                    throw [InvalidOperationException]::new('K5 native cleanup failed.')
+                }
+                if (-not $child.HasExited) {
+                    $child.Kill()
+                    if (-not $child.WaitForExit(5000)) {
+                        throw [InvalidOperationException]::new('K5 native cleanup failed.')
+                    }
+                }
+            }
+        } catch { $cleanupFailed = $true }
+        foreach ($ownedStream in @($stdoutStream, $stderrStream)) {
+            try { if ($null -ne $ownedStream) { $ownedStream.Close() } }
+            catch { $cleanupFailed = $true }
+        }
+        try { if ($null -ne $child) { $child.Dispose() } }
+        catch { $cleanupFailed = $true }
+        while (($null -ne $outRead -and -not $outRead.IsCompleted) -or
+               ($null -ne $errRead -and -not $errRead.IsCompleted)) {
+            if ($cleanupWatch.Elapsed.TotalSeconds -ge 5) {
+                $cleanupFailed = $true
+                break
+            }
+            [Threading.Thread]::Sleep(10)
+        }
+        if ($cleanupFailed) {
+            $cleanupError = [InvalidOperationException]::new('K5 native cleanup failed.')
+            if ($primaryFailure -is [Management.Automation.ErrorRecord]) {
+                $cleanupError.Data['K5ElementPrimaryErrorRecord'] = $primaryFailure
+            }
+            throw $cleanupError
+        }
+        # The exact started Process and its streams are now closed.
+    }
+}
+"""
+ELEMENT_PROCESS_INSERTIONS = {
+    "        $exitCode = $child.ExitCode\n": "        $script:fixtureActualExit = $exitCode\n",
+    "        # The exact started Process and its streams are now closed.\n": (
+        "        $script:fixtureProcessCleaned = $true\n"
+    ),
+}
+ELEMENT_PROCESS_OBSERVED = ELEMENT_PROCESS_PROTOTYPE
+for _anchor, _insertion in ELEMENT_PROCESS_INSERTIONS.items():
+    if ELEMENT_PROCESS_OBSERVED.count(_anchor) != 1:
+        raise ValueError("Invalid process fixture anchor")
+    ELEMENT_PROCESS_OBSERVED = ELEMENT_PROCESS_OBSERVED.replace(_anchor, _anchor + _insertion, 1)
+
+ELEMENT_PROBE_SCRIPT = (
+    r"""
 param([string]$Start, [string]$Executable, [string]$Name, [string]$Variant, [string]$Initial)
 $ErrorActionPreference = 'Stop'
 __ELEMENT_CHILD_DIAGNOSTICS__
@@ -2101,7 +2260,7 @@ try {
 __ELEMENT_UTILITY_IMPORT__
     Set-StrictMode -Version Latest
     $fixturePhase = 'source_select'
-    if ($Variant -cnotin @('original','pipeline') -or
+    if ($Variant -cnotin @('original','process') -or
         $Initial -cnotin @('absent','stale_zero','stale_nonzero')) { throw 'fixture_invalid' }
     if ($null -ne (Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue)) {
         throw 'fixture_not_fresh'
@@ -2121,8 +2280,10 @@ __ELEMENT_UTILITY_IMPORT__
         throw 'fixture_invalid'
     }
     $selected = $original
-    if ($Variant -ceq 'pipeline') {
-        $selected = $original.Replace($needle, $needle + ' | Out-Null')
+    if ($Variant -ceq 'process') {
+        $selected = @'
+__ELEMENT_PROCESS_OBSERVED__
+'@
     }
     . ([scriptblock]::Create($selected))
     function K5FixtureNoNative { param($Name) }
@@ -2149,6 +2310,8 @@ __ELEMENT_UTILITY_IMPORT__
     if ($Initial -ceq 'stale_zero') { $global:LASTEXITCODE = 0 }
     elseif ($Initial -ceq 'stale_nonzero') { $global:LASTEXITCODE = 9 }
     $fixturePhase = 'probe_invoke'
+    $script:fixtureActualExit = $null
+    $script:fixtureProcessCleaned = $false
     $outcome = 'unexpected'
     $watch = [Diagnostics.Stopwatch]::StartNew()
     try {
@@ -2156,10 +2319,36 @@ __ELEMENT_UTILITY_IMPORT__
         if ($answer -is [bool]) { $outcome = if ($answer) { 'true' } else { 'false' } }
     } catch {
         $id = $_.FullyQualifiedErrorId.Split(',')[0]
-        if ($id -ceq 'VariableIsUndefined') { $outcome = 'variable_undefined' }
+        if ($_.Exception -is [TimeoutException]) { $outcome = 'timeout' }
+        elseif ($_.Exception -is [IO.InvalidDataException] -and
+                $_.Exception.Message -ceq 'K5 native stderr refused.') {
+            $outcome = 'native_stderr'
+        }
+        elseif ($_.Exception -is [IO.InvalidDataException] -and
+                $_.Exception.Message -ceq 'K5 native output limit.') { $outcome = 'output_limit' }
+        elseif ($_.Exception -is [InvalidOperationException] -and
+                $_.Exception.Message -ceq 'K5 native cleanup failed.') {
+            $outcome = 'cleanup_failed'
+        }
+        elseif ($_.Exception -is [Management.Automation.CommandNotFoundException]) {
+            $outcome = 'command_missing'
+        }
+        elseif ($id -ceq 'VariableIsUndefined') { $outcome = 'variable_undefined' }
         elseif ($id -cin @('NativeCommandError','NativeCommandErrorMessage')) {
             $outcome = 'native_stderr'
         } elseif ($id -ceq 'CommandNotFoundException') { $outcome = 'command_missing' }
+        if ($outcome -eq 'cleanup_failed') {
+            $linked = $_.Exception.Data['K5ElementPrimaryErrorRecord']
+            if ($linked -is [Management.Automation.ErrorRecord]) {
+                Write-K5ElementChildFailure $linked $fixturePhase 'primary'
+            }
+            Write-K5ElementChildFailure $_ $fixturePhase 'cleanup'
+            exit 1
+        }
+        if ($outcome -eq 'unexpected') {
+            Write-K5ElementChildFailure $_ $fixturePhase 'primary'
+            exit 1
+        }
     }
     $watch.Stop()
     $fixturePhase = 'probe_record'
@@ -2173,18 +2362,29 @@ __ELEMENT_UTILITY_IMPORT__
     if ($null -ne $value) {
         $valueText = $value.ToString([Globalization.CultureInfo]::InvariantCulture)
     }
+    $actualText = 'null'
+    if ($null -ne $script:fixtureActualExit) {
+        if ($script:fixtureActualExit -isnot [int] -or
+            $script:fixtureActualExit -notin @(0,7)) { throw 'fixture_invalid' }
+        $actualText = $script:fixtureActualExit.ToString(
+            [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $cleanedText = $script:fixtureProcessCleaned.ToString().ToLowerInvariant()
     $boundText = $bound.ToString().ToLowerInvariant()
     $waitedText = ($watch.ElapsedMilliseconds -ge 400).ToString().ToLowerInvariant()
-    $json = ('{{"schema_version":"element-native-exit-probe-v1","variant":"{0}",' +
+    $json = ('{{"schema_version":"element-native-exit-probe-v2","variant":"{0}",' +
         '"initial":"{1}","fresh_session":true,"command_kind":"{2}",' +
-        '"application_bound":{3},"outcome":"{4}","last_exit":{5},"waited_floor":{6}}}') -f
-        $Variant, $Initial, $kind, $boundText, $outcome, $valueText, $waitedText
+        '"application_bound":{3},"outcome":"{4}","last_exit":{5},"waited_floor":{6},' +
+        '"actual_exit":{7},"process_cleaned":{8}}}') -f
+        $Variant, $Initial, $kind, $boundText, $outcome, $valueText, $waitedText,
+        $actualText, $cleanedText
     [Console]::Out.WriteLine('K5_ELEMENT_PROBE=' + $json)
     [Console]::Out.Flush()
     exit 0
 } catch { Write-K5ElementChildFailure $_ $fixturePhase 'primary'; exit 1 }
-""".replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS).replace(
-    "__ELEMENT_UTILITY_IMPORT__", ELEMENT_UTILITY_IMPORT
+""".replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS)
+    .replace("__ELEMENT_UTILITY_IMPORT__", ELEMENT_UTILITY_IMPORT)
+    .replace("__ELEMENT_PROCESS_OBSERVED__", ELEMENT_PROCESS_OBSERVED)
 )
 ELEMENT_UTILITY_CONTROL = (
     "$ErrorActionPreference = 'Stop'\n"
@@ -2440,24 +2640,34 @@ def _parse_element_probe(raw: bytes) -> dict:
         "outcome",
         "last_exit",
         "waited_floor",
+        "actual_exit",
+        "process_cleaned",
     }:
         raise ValueError("Invalid element probe")
     for field, allowed in (
         ("schema_version", {ELEMENT_PROBE_SCHEMA}),
-        ("variant", {"original", "pipeline"}),
+        ("variant", {"original", "process"}),
         ("initial", {"absent", "stale_zero", "stale_nonzero"}),
         ("command_kind", {"application", "missing", "alias", "function"}),
         ("outcome", ELEMENT_PROBE_OUTCOMES),
     ):
         if type(value[field]) is not str or value[field] not in allowed:
             raise ValueError("Invalid element probe")
-    for field in ("fresh_session", "application_bound", "waited_floor"):
+    for field in ("fresh_session", "application_bound", "waited_floor", "process_cleaned"):
         if type(value[field]) is not bool:
             raise ValueError("Invalid element probe")
     if value["last_exit"] is not None and (
         type(value["last_exit"]) is not int or value["last_exit"] not in (0, 7, 9)
     ):
         raise ValueError("Invalid element probe")
+    if value["actual_exit"] is not None and (
+        type(value["actual_exit"]) is not int or value["actual_exit"] not in (0, 7)
+    ):
+        raise ValueError("Invalid actual exit")
+    if value["variant"] == "original" and (
+        value["actual_exit"] is not None or value["process_cleaned"]
+    ):
+        raise ValueError("Original has no Process observation")
     if value["application_bound"] and value["command_kind"] != "application":
         raise ValueError("Invalid element probe")
     return value
@@ -2588,8 +2798,17 @@ def _validate_element_diagnostic(value):
         "schema_version": {"element-fixture-diagnostic-v1"},
         "phase": ELEMENT_FIXTURE_PHASES,
         "kind": {"none", "ConsoleApplication", "WindowsApplication", "missing", "alias"},
-        "case": {"none", "zero", "nonzero", "stderr_zero", "stderr_nonzero"},
-        "variant": {"none", "original", "pipeline"},
+        "case": {
+            "none",
+            "zero",
+            "nonzero",
+            "stderr_zero",
+            "stderr_nonzero",
+            "stdout_bound",
+            "stdout_overflow",
+            "timeout",
+        },
+        "variant": {"none", "original", "process"},
         "initial": {"none", "absent", "stale_zero", "stale_nonzero"},
         "boundary": {"primary", "owned_cleanup", "child_primary", "child_cleanup"},
         "status": {"started", "passed", "failed"},
@@ -2879,7 +3098,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
     common = None
     context = _element_context("module_load")
     complete = False
-    original_misses = pipeline_misses = missing_refusals = 0
+    original_misses = process_misses = missing_refusals = 0
     try:
         module = _startup_witness()
         common = module.common
@@ -3000,7 +3219,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                     env=env,
                     context=context,
                 )
-                complete, checkpoints, observations = _element_complete_records(raw)
+                reference_output, checkpoints, observations = _element_complete_records(raw)
                 if (
                     checkpoints
                     != [
@@ -3016,7 +3235,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                     raise ValueError("Invalid oracle checkpoints")
                 actual = b"\n".join(
                     line
-                    for line in complete.splitlines()
+                    for line in reference_output.splitlines()
                     if not line.startswith(ELEMENT_CHECKPOINT_PREFIX)
                 ).strip()
                 if actual != b"K5_NATIVE_REFERENCE=" + str(expected_exit).encode():
@@ -3029,7 +3248,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                 )
                 for initial in states:
                     results = {}
-                    for variant in ("original", "pipeline"):
+                    for variant in ("original", "process"):
                         context = _element_context("probe", kind, name, variant, initial)
                         if common.file_hash(executable) != identity:
                             raise ValueError("Owned executable changed")
@@ -3051,7 +3270,9 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                             )
                         )
                         if (
-                            not result["fresh_session"]
+                            result["variant"] != variant
+                            or result["initial"] != initial
+                            or not result["fresh_session"]
                             or not result["application_bound"]
                             or result["command_kind"] != "application"
                         ):
@@ -3063,25 +3284,76 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                         )
                         results[variant] = result
                     for variant, result in results.items():
-                        if name.startswith("stderr"):
-                            correct = result["outcome"] == "native_stderr"
+                        expected_outcome = (
+                            "native_stderr"
+                            if name.startswith("stderr")
+                            else ("true" if expected_exit == 0 else "false")
+                        )
+                        if variant == "original":
+                            correct = result["outcome"] == expected_outcome and (
+                                name.startswith("stderr")
+                                or (result["last_exit"] == expected_exit and result["waited_floor"])
+                            )
                         else:
                             correct = (
-                                result["outcome"] == ("true" if expected_exit == 0 else "false")
-                                and result["last_exit"] == expected_exit
+                                result["outcome"] == expected_outcome
+                                and result["actual_exit"] == expected_exit
+                                and result["last_exit"]
+                                == {"absent": None, "stale_zero": 0, "stale_nonzero": 9}[initial]
                                 and result["waited_floor"]
+                                and result["process_cleaned"]
                             )
                         if not correct:
                             if variant == "original":
                                 original_misses += 1
                             else:
-                                pipeline_misses += 1
+                                process_misses += 1
+        for kind, (executable, identity) in binaries.items():
+            for name, expected_outcome, expected_exit in (
+                ("stdout_bound", "true", 0),
+                ("stdout_overflow", "output_limit", None),
+                ("timeout", "timeout", None),
+            ):
+                context = _element_context("probe", kind, name, "process", "stale_zero")
+                if common.file_hash(executable) != identity:
+                    raise ValueError("Admitted runtime changed")
+                argument = _element_python_argument(fixture, name)
+                result = _parse_imported_element_probe(
+                    capture(
+                        probe,
+                        "-Start",
+                        START,
+                        "-Executable",
+                        executable,
+                        "-Name:",
+                        argument,
+                        "-Variant",
+                        "process",
+                        "-Initial",
+                        "stale_zero",
+                    )
+                )
+                print("K5_ELEMENT_CASE=" + kind + ":" + name + ":stale_zero")
+                print(ELEMENT_PROBE_PREFIX.decode() + json.dumps(result, separators=(",", ":")))
+                if not (
+                    result["fresh_session"]
+                    and result["initial"] == "stale_zero"
+                    and result["application_bound"]
+                    and result["command_kind"] == "application"
+                    and result["variant"] == "process"
+                    and result["process_cleaned"]
+                    and result["last_exit"] == 0
+                    and result["waited_floor"]
+                    and result["outcome"] == expected_outcome
+                    and result["actual_exit"] == expected_exit
+                ):
+                    process_misses += 1
         for command, expected_kind in (
             (tmp_path / "missing.exe", "missing"),
             ("K5FixtureAlias", "alias"),
         ):
             for initial in ("absent", "stale_zero", "stale_nonzero"):
-                for variant in ("original", "pipeline"):
+                for variant in ("original", "process"):
                     context = _element_context("negative", expected_kind, "zero", variant, initial)
                     result = _parse_imported_element_probe(
                         capture(
@@ -3098,11 +3370,24 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                             initial,
                         )
                     )
-                    if result["command_kind"] != expected_kind or result["application_bound"]:
+                    if (
+                        result["variant"] != variant
+                        or result["initial"] != initial
+                        or result["command_kind"] != expected_kind
+                        or result["application_bound"]
+                    ):
                         raise ValueError("Non-application qualified as an owned executable")
                     if expected_kind == "missing" and initial == "stale_zero":
                         missing_refusals += int(result["outcome"] == "command_missing")
-                    # Observe substitution behavior; do not mislabel it as helper rejection.
+                    if variant == "process" and (
+                        result["outcome"] != "command_missing"
+                        or result["actual_exit"] is not None
+                        or not result["process_cleaned"]
+                        or result["last_exit"]
+                        != {"absent": None, "stale_zero": 0, "stale_nonzero": 9}[initial]
+                    ):
+                        process_misses += 1
+                    # Original substitution remains evidence, not helper admission.
                     print("K5_ELEMENT_CASE=" + expected_kind + ":zero:" + initial)
                     print(ELEMENT_PROBE_PREFIX.decode() + json.dumps(result, separators=(",", ":")))
         complete = True
@@ -3113,13 +3398,16 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
             _element_diagnostic(context, "failed", error, common=common)
         except Exception:
             pass  # Fixed pytest failure below; never expose a chained setup/printing error.
-    if not complete:
+    if complete is not True:
         pytest.fail("Owned native element-probe fixture failed", pytrace=False)
     try:
         print("K5_ELEMENT_ORIGINAL_MISSES=" + str(original_misses))
-        print("K5_ELEMENT_PIPELINE_MISSES=" + str(pipeline_misses))
+        print("K5_ELEMENT_PROCESS_MISSES=" + str(process_misses))
         print("K5_ELEMENT_MISSING_REFUSALS=" + str(missing_refusals))
-        matrix_failed = bool(original_misses or pipeline_misses or missing_refusals != 2)
+        # Original counters preserve the demonstrated baseline. Qualification
+        # below is exclusively for the hosted Process prototype, not Start.
+        matrix_failed = bool(process_misses or missing_refusals != 2)
+        print("K5_ELEMENT_PROCESS_QUALIFIED=" + str(not matrix_failed).lower())
         _element_diagnostic(
             _element_context("matrix"),
             "failed" if matrix_failed else "passed",
@@ -3129,13 +3417,9 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
         pytest.fail("Owned native element-probe reporting failed", pytrace=False)
     if missing_refusals != 2:
         pytest.fail("Missing executable did not refuse under stale-zero state", pytrace=False)
-    if original_misses:
+    if process_misses:
         pytest.fail(
-            "Original element probe did not bind its own native process exit", pytrace=False
-        )
-    if pipeline_misses:
-        pytest.fail(
-            "Candidate pipeline did not preserve actual exit/stderr semantics", pytrace=False
+            "Process prototype did not preserve actual exit/stderr semantics", pytrace=False
         )
 
 
@@ -3150,6 +3434,8 @@ def test_element_probe_parser_rejects_raw_duplicate_and_coerced_evidence():
         "outcome": "variable_undefined",
         "last_exit": None,
         "waited_floor": False,
+        "actual_exit": None,
+        "process_cleaned": False,
     }
     raw = ELEMENT_PROBE_PREFIX + json.dumps(value).encode() + b"\n"
     assert _parse_element_probe(raw) == value
@@ -3197,10 +3483,11 @@ def test_owned_fixture_pe_reader_checks_subsystem_and_bounds(tmp_path: Path):
             _pe_fixture_subsystem(path)
 
 
-def test_element_probe_comparison_changes_only_downstream_pipeline():
+def test_element_probe_comparison_preserves_original_and_selects_process_prototype():
     assert "$functions.Count -ne 1" in ELEMENT_PROBE_SCRIPT
     assert "$node.Name -ceq 'Test-K5GStreamerElement'" in ELEMENT_PROBE_SCRIPT
-    assert "$selected = $original.Replace($needle, $needle + ' | Out-Null')" in ELEMENT_PROBE_SCRIPT
+    assert ELEMENT_PROCESS_OBSERVED in ELEMENT_PROBE_SCRIPT
+    assert " | Out-Null" not in ELEMENT_PROBE_SCRIPT
     assert "Get-Variable LASTEXITCODE -Scope Global" in ELEMENT_PROBE_SCRIPT
     assert "$global:LASTEXITCODE = 0" in ELEMENT_PROBE_SCRIPT  # Explicit stale-input case only.
     assert (
@@ -3572,12 +3859,13 @@ def test_element_runtime_pair_replaces_compiler_without_widening_probe_or_budget
     ]
     section = section.split("def test_element_probe_parser", 1)[0]
     assert "Add-Type" not in section and "compile.ps1" not in section
-    assert '"-Name",' not in section and section.count('"-Name:",') == 3
+    assert '"-Name",' not in section and section.count('"-Name:",') == 4
     assert '("ConsoleApplication", base, 3)' in section
     assert '("WindowsApplication", base.with_name("pythonw.exe"), 2)' in section
     assert "executable.parent != base.parent" in section
-    assert section.count("common.file_hash(executable) != identity") == 2
-    assert "$selected = $original.Replace($needle, $needle + ' | Out-Null')" in ELEMENT_PROBE_SCRIPT
+    assert section.count("common.file_hash(executable) != identity") == 3
+    assert ELEMENT_PROCESS_OBSERVED in ELEMENT_PROBE_SCRIPT
+    assert " | Out-Null" not in ELEMENT_PROBE_SCRIPT
     assert "Popen([executable, argument]" in ELEMENT_REFERENCE_SCRIPT
     assert "code = child.wait(timeout=5)" in ELEMENT_REFERENCE_SCRIPT
     assert "outputs != [b'', expected]" in ELEMENT_REFERENCE_SCRIPT
@@ -3780,7 +4068,8 @@ def test_element_utility_route_is_exact_scoped_and_keeps_native_acceptance():
     )
     assert "Get-Variable LASTEXITCODE -Scope Global" in ELEMENT_PROBE_SCRIPT
     assert "Set-Alias -Name K5FixtureAlias" in ELEMENT_PROBE_SCRIPT
-    assert "$selected = $original.Replace($needle, $needle + ' | Out-Null')" in ELEMENT_PROBE_SCRIPT
+    assert ELEMENT_PROCESS_OBSERVED in ELEMENT_PROBE_SCRIPT
+    assert " | Out-Null" not in ELEMENT_PROBE_SCRIPT
     assert "Get-Command -Name $gstInspect -ErrorAction Stop" in ELEMENT_PROBE_SCRIPT
     assert "ConvertTo-Json" not in ELEMENT_PROBE_SCRIPT
     assert "Write-Output (" not in ELEMENT_PROBE_SCRIPT
@@ -3805,6 +4094,8 @@ def test_element_imported_probe_requires_complete_exact_prefix_and_existing_sche
         outcome="true",
         last_exit=0,
         waited_floor=True,
+        actual_exit=None,
+        process_cleaned=False,
     )
     prefix = b"".join(
         ELEMENT_CHECKPOINT_PREFIX + name.encode() + b"\n"
@@ -3903,19 +4194,21 @@ def test_element_fixed_json_templates_preserve_scalar_fields_without_cmdlets():
                 raw = (
                     ELEMENT_PROBE_PREFIX
                     + probe_template.format(
-                        "pipeline",
+                        "process",
                         "stale_zero",
                         "application",
                         str(bound).lower(),
                         outcome,
                         "null" if code is None else str(code),
                         "false",
+                        "null",
+                        "false",
                     ).encode()
                     + b"\n"
                 )
                 assert _parse_element_probe(raw) == dict(
                     schema_version=ELEMENT_PROBE_SCHEMA,
-                    variant="pipeline",
+                    variant="process",
                     initial="stale_zero",
                     fresh_session=True,
                     command_kind="application",
@@ -3923,6 +4216,8 @@ def test_element_fixed_json_templates_preserve_scalar_fields_without_cmdlets():
                     outcome=outcome,
                     last_exit=code,
                     waited_floor=False,
+                    actual_exit=None,
+                    process_cleaned=False,
                 )
     assert "ConvertTo-Json" not in ELEMENT_CHILD_DIAGNOSTICS
     assert "$Boundary -cnotin @('primary','cleanup')" in ELEMENT_CHILD_DIAGNOSTICS
@@ -4280,3 +4575,381 @@ def test_element_utility_each_retained_predicate_is_required(predicate):
     assert _element_utility_binding_records(raw)[0][predicate] is False
     with pytest.raises(ValueError):
         _element_require_utility_observation(raw)
+
+
+def test_element_process_candidate_binds_actual_exit_without_ambient_writes():
+    prototype = globals().get("ELEMENT_PROCESS_PROTOTYPE", "")
+    assert "$exitCode = $child.ExitCode" in prototype
+    assert "LASTEXITCODE" not in prototype
+    assert "$info.FileName = $command.Path" in prototype
+    assert "$info.Arguments = $Name" in prototype
+    assert "131072" in prototype and "$child.Kill()" in prototype
+    assert "ReadAsync" in prototype and "$child.Dispose()" in prototype
+
+
+def test_element_process_probe_has_distinct_actual_exit_schema():
+    assert ELEMENT_PROBE_SCHEMA == "element-native-exit-probe-v2"
+    assert '"actual_exit"' in ELEMENT_PROBE_SCRIPT
+    assert " | Out-Null" not in ELEMENT_PROBE_SCRIPT
+
+
+def test_element_process_scalar_observations_strip_to_exact_prototype():
+    stripped = ELEMENT_PROCESS_OBSERVED
+    assert set(ELEMENT_PROCESS_INSERTIONS.values()) == {
+        "        $script:fixtureActualExit = $exitCode\n",
+        "        $script:fixtureProcessCleaned = $true\n",
+    }
+    for anchor, insertion in ELEMENT_PROCESS_INSERTIONS.items():
+        assert stripped.count(anchor + insertion) == 1
+        stripped = stripped.replace(anchor + insertion, anchor, 1)
+    assert stripped.encode() == ELEMENT_PROCESS_PROTOTYPE.encode()
+    assert "fixture" not in ELEMENT_PROCESS_PROTOTYPE
+    assert ELEMENT_PROCESS_OBSERVED in ELEMENT_PROBE_SCRIPT
+
+
+def test_element_process_drains_concurrently_and_cleanup_is_owned_bounded():
+    source = ELEMENT_PROCESS_PROTOTYPE
+    first_read = source.index("$outRead = $stdoutStream.ReadAsync")
+    second_read = source.index("$errRead = $stderrStream.ReadAsync")
+    loop = source.index("while ($true)")
+    exited = source.index("if ($child.HasExited -and $outDone -and $errDone)")
+    actual = source.index("$exitCode = $child.ExitCode")
+    stderr = source.index("if ($errCount -ne 0)")
+    assert first_read < second_read < loop < exited < actual < stderr
+    assert source.count("$outCount + $errCount -gt 131072") == 2
+    assert source.count("$stdoutStream.ReadAsync") == source.count("$stderrStream.ReadAsync") == 2
+    assert "$watch.Elapsed.TotalSeconds -ge 5" in source
+    assert "$info.UseShellExecute = $false" in source
+    assert "$command -isnot [Management.Automation.ApplicationInfo]" in source
+    guard = source.index("$child.Handle -ne $childHandle")
+    kill = source.index("$child.Kill()")
+    dispose = source.index("$child.Dispose()")
+    tasks = source.index("while (($null -ne $outRead")
+    done = source.index("# The exact started Process")
+    assert guard < kill < dispose < tasks < done
+    assert "$child.WaitForExit(5000)" in source
+    assert "$cleanupWatch.Elapsed.TotalSeconds -ge 5" in source
+    assert "foreach ($ownedStream in @($stdoutStream, $stderrStream))" in source
+    assert "$ownedStream.Close()" in source and "catch { $cleanupFailed = $true }" in source
+    assert "GetProcessById" not in source and "Stop-Process" not in source
+    assert "ReadToEnd" not in source and "MemoryStream" not in source
+
+
+def test_element_process_name_guard_preserves_one_exact_bounded_native_argument(tmp_path):
+    expression = re.search(r"\$Name -match '([^']+)'", ELEMENT_PROCESS_PROTOTYPE).group(1)
+    script = tmp_path / "owned fixture 'one'.py"
+    script.write_bytes(ELEMENT_PROBE_PYTHON_SOURCE.encode("ascii"))
+    for name in ("rtspsrc", "d3d11h264dec", _element_python_argument(script, "zero")):
+        assert 0 < len(name) <= 8192 and re.search(expression, name) is None
+        assert subprocess.list2cmdline([name]) == name
+    for name in ("two names", "line\nfeed", "tab\tvalue", 'a"b', "a\\b", "a\x00b", "é"):
+        assert re.search(expression, name) is not None
+    assert "$Name.Length -eq 0 -or $Name.Length -gt 8192" in ELEMENT_PROCESS_PROTOTYPE
+    assert "$info.Arguments = $Name" in ELEMENT_PROCESS_PROTOTYPE
+
+
+@pytest.mark.parametrize("case,size", [("stdout_bound", 131072), ("stdout_overflow", 131073)])
+def test_element_process_output_cases_use_finite_owned_bytes(tmp_path, case, size):
+    script = tmp_path / "owned.py"
+    script.write_bytes(ELEMENT_PROBE_PYTHON_SOURCE.encode("ascii"))
+    argument = _element_python_argument(script, case)
+    result = subprocess.run([sys.executable, argument], capture_output=True, timeout=5, check=False)
+    assert result.returncode == 0 and not result.stderr
+    assert result.stdout == b"x" * size
+
+
+def test_element_process_record_rejects_forged_exit_cleanup_and_legacy_fields():
+    value = dict(
+        schema_version=ELEMENT_PROBE_SCHEMA,
+        variant="process",
+        initial="stale_nonzero",
+        fresh_session=True,
+        command_kind="application",
+        application_bound=True,
+        outcome="true",
+        last_exit=9,
+        waited_floor=True,
+        actual_exit=0,
+        process_cleaned=True,
+    )
+
+    def encoded(changes):
+        return ELEMENT_PROBE_PREFIX + json.dumps({**value, **changes}).encode() + b"\n"
+
+    assert _parse_element_probe(encoded({})) == value
+    for changes in (
+        {"actual_exit": True},
+        {"actual_exit": "0"},
+        {"actual_exit": 9},
+        {"actual_exit": 2**64},
+        {"process_cleaned": 1},
+        {"process_cleaned": "PRIVATE"},
+        {"schema_version": "element-native-exit-probe-v1"},
+        {"variant": "pipeline"},
+        {"variant": "original"},
+        {"raw": "PRIVATE"},
+    ):
+        with pytest.raises(ValueError):
+            _parse_element_probe(encoded(changes))
+
+
+def test_element_process_matrix_requires_real_exit_stale_independence_and_cleanup():
+    import inspect
+
+    source = inspect.getsource(test_windows_exact_element_probe_uses_fresh_actual_native_exit)
+    assert 'result["actual_exit"] == expected_exit' in source
+    assert 'result["process_cleaned"]' in source
+    assert 'result["waited_floor"]' in source
+    assert '"absent": None, "stale_zero": 0, "stale_nonzero": 9' in source
+    for case in ("stdout_bound", "stdout_overflow", "timeout"):
+        assert '"' + case + '"' in source
+    assert "matrix_failed = bool(process_misses or missing_refusals != 2)" in source
+    assert "if original_misses:" not in source
+    assert "K5_ELEMENT_ORIGINAL_MISSES=" in source
+    assert "K5_ELEMENT_PROCESS_QUALIFIED=" in source
+
+
+def _element_process_cleanup_fixture():
+    start = ELEMENT_PROCESS_PROTOTYPE.index("        $cleanupWatch = ")
+    end = ELEMENT_PROCESS_PROTOTYPE.index("        # The exact started Process", start)
+    cleanup = ELEMENT_PROCESS_PROTOTYPE[start:end]
+    return (
+        "$ErrorActionPreference='Stop'\nSet-StrictMode -Version Latest\n"
+        "function Invoke-OwnedCleanup {\n"
+        + cleanup
+        + "}\n"
+        + r"""
+foreach ($case in @('first_close','changed_handle','wait_failed','pending_read')) {
+    [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=process_cleanup_' + $case + '_requested')
+    [Console]::Out.Flush()
+    $script:secondClosed = $false; $script:disposed = $false; $script:killed = $false
+    $primaryFailure = [Management.Automation.ErrorRecord]::new(
+        [IO.IOException]::new('PRIVATE_STARTUP'), 'fixed',
+        [Management.Automation.ErrorCategory]::NotSpecified, $null)
+    $stdoutStream = [pscustomobject]@{}
+    $stdoutStream.PSObject.Members.Add([Management.Automation.PSScriptMethod]::new('Close', {
+        if ($case -ceq 'first_close') { throw 'PRIVATE_FIRST_CLOSE' }
+    }))
+    $stderrStream = [pscustomobject]@{}
+    $stderrStream.PSObject.Members.Add([Management.Automation.PSScriptMethod]::new('Close', {
+        $script:secondClosed = $true
+    }))
+    $child = [pscustomobject]@{Handle=[IntPtr]1;HasExited=$false}
+    $child.PSObject.Members.Add([Management.Automation.PSScriptMethod]::new('Kill', {
+        $script:killed = $true
+    }))
+    $child.PSObject.Members.Add([Management.Automation.PSScriptMethod]::new('WaitForExit', {
+        param($milliseconds)
+        if ($milliseconds -ne 5000) { throw 'PRIVATE_WAIT' }
+        return $false
+    }))
+    $child.PSObject.Members.Add([Management.Automation.PSScriptMethod]::new('Dispose', {
+        $script:disposed = $true
+    }))
+    $started = $case -in @('changed_handle','wait_failed')
+    $childHandle = if ($case -ceq 'changed_handle') { [IntPtr]2 } else { [IntPtr]1 }
+    $outRead = $null; $errRead = $null
+    if ($case -ceq 'pending_read') { $outRead = [pscustomobject]@{IsCompleted=$false} }
+    $refused = $false
+    try { Invoke-OwnedCleanup }
+    catch {
+        $refused = $_.Exception -is [InvalidOperationException] -and
+            $_.Exception.Message -ceq 'K5 native cleanup failed.' -and
+            [object]::ReferenceEquals(
+                $_.Exception.Data['K5ElementPrimaryErrorRecord'], $primaryFailure)
+    }
+    if (-not $refused -or -not $script:secondClosed -or -not $script:disposed -or
+        $script:killed -ne ($case -ceq 'wait_failed')) { exit 1 }
+    [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=process_cleanup_' + $case + '_passed')
+    [Console]::Out.Flush()
+}
+exit 0
+"""
+    )
+
+
+ELEMENT_CHECKPOINTS.update(
+    "process_cleanup_" + case + "_" + state
+    for case in ("first_close", "changed_handle", "wait_failed", "pending_read")
+    for state in ("requested", "passed")
+)
+
+
+def test_element_process_cleanup_failure_fixture_uses_exact_owned_finally():
+    script = _element_process_cleanup_fixture()
+    start = ELEMENT_PROCESS_PROTOTYPE.index("        $cleanupWatch = ")
+    end = ELEMENT_PROCESS_PROTOTYPE.index("        # The exact started Process", start)
+    assert script.count(ELEMENT_PROCESS_PROTOTYPE[start:end]) == 1
+    assert "Process]::new" not in script and "Get-Command" not in script
+    assert "ReferenceEquals" in script and "-not $script:secondClosed" in script
+    assert len(script.encode()) < 8192
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows PowerShell cleanup semantics")
+def test_windows_element_process_cleanup_failures_are_fatal_and_independent(tmp_path):
+    import os
+
+    common = None
+    context = _element_context("probe")
+    try:
+        module = _startup_witness()
+        common = module.common
+        base = common.local_path(Path(sys._base_executable))
+        binding = dict(
+            K5_WITNESS_BASE_PYTHON=str(base), K5_WITNESS_BASE_PYTHON_SHA256=common.file_hash(base)
+        )
+        supplied = {key: os.environ.get(key) for key in common.GATE_RUNTIME_KEYS}
+        if any(value is not None for value in supplied.values()) and supplied != binding:
+            raise ValueError("Invalid fixture runtime")
+        env = module.clean_environment(dict(os.environ), tmp_path)
+        env.update(binding)
+        for key in ("TEMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            Path(env[key]).mkdir(parents=True, exist_ok=True)
+        shell = common.local_path(
+            Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        script = tmp_path / "process-cleanup.ps1"
+        script.write_text(_element_process_cleanup_fixture(), encoding="ascii", newline="\n")
+        output = _capture_element_child(
+            common,
+            [str(shell), "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)],
+            cwd=tmp_path,
+            env=env,
+            context=context,
+        )
+        expected = [
+            ELEMENT_CHECKPOINT_PREFIX + ("process_cleanup_" + case + "_" + state).encode()
+            for case in ("first_close", "changed_handle", "wait_failed", "pending_read")
+            for state in ("requested", "passed")
+        ]
+        if output.splitlines() != expected:
+            raise ValueError("Invalid fixed cleanup result")
+    except Exception as error:
+        try:
+            _element_diagnostic(context, "failed", error, common=common)
+        except Exception:
+            pass
+        pytest.fail("Owned Process cleanup fixture failed", pytrace=False)
+
+
+def test_element_process_late_alias_failure_cannot_qualify(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    function = test_windows_exact_element_probe_uses_fresh_actual_native_exit
+    namespace = function.__globals__
+    keys = ("K5_WITNESS_BASE_PYTHON", "K5_WITNESS_BASE_PYTHON_SHA256")
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+    common = SimpleNamespace(
+        GATE_RUNTIME_KEYS=keys,
+        local_path=lambda path: Path(path),
+        file_hash=lambda path: "fixed",
+        admitted_gate_python=lambda env: None,
+    )
+    env = {
+        key: str(tmp_path / key)
+        for key in (
+            "TEMP",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "SYSTEMROOT",
+        )
+    }
+    monkeypatch.setitem(
+        namespace,
+        "_startup_witness",
+        lambda: SimpleNamespace(
+            common=common,
+            clean_environment=lambda *args: env.copy(),
+        ),
+    )
+    monkeypatch.setitem(namespace, "_element_bind_utility", lambda script, *args: script)
+    monkeypatch.setitem(
+        namespace, "_pe_fixture_subsystem", lambda path: 2 if path.name == "pythonw.exe" else 3
+    )
+    monkeypatch.setitem(namespace, "_element_utility_controls", lambda *args, **kwargs: None)
+    calls = []
+
+    def capture(common, arguments, *, cwd, env, context):
+        calls.append(context.copy())
+        phase, case = context["phase"], context["case"]
+        if phase == "python_control":
+            return b"K5_ELEMENT_CHECKPOINT=python_control_entered\n"
+        if phase == "reference":
+            code = 7 if case in ("nonzero", "stderr_nonzero") else 0
+            return (
+                b"".join(
+                    ELEMENT_CHECKPOINT_PREFIX + name.encode() + b"\n"
+                    for name in (
+                        "reference_entered",
+                        "reference_start_requested",
+                        "reference_started",
+                        "reference_waited",
+                        "reference_stdio_verified",
+                    )
+                )
+                + b"K5_NATIVE_REFERENCE="
+                + str(code).encode()
+                + b"\n"
+                + (ELEMENT_CHECKPOINT_PREFIX + b"reference_cleanup_complete\n")
+            )
+        kind = context["kind"] if phase == "negative" else "application"
+        if kind == "alias":
+            raise _ElementCaptureFailure
+        variant, initial = context["variant"], context["initial"]
+        outcome = (
+            "command_missing"
+            if kind == "missing"
+            else "native_stderr"
+            if case.startswith("stderr_")
+            else "output_limit"
+            if case == "stdout_overflow"
+            else "timeout"
+            if case == "timeout"
+            else "false"
+            if case == "nonzero"
+            else "true"
+        )
+        actual = 7 if case in ("nonzero", "stderr_nonzero") else 0
+        if kind == "missing" or case in ("timeout", "stdout_overflow") or variant == "original":
+            actual = None
+        value = dict(
+            schema_version=ELEMENT_PROBE_SCHEMA,
+            variant=variant,
+            initial=initial,
+            fresh_session=True,
+            command_kind=kind,
+            application_bound=kind == "application",
+            outcome=outcome,
+            last_exit={"absent": None, "stale_zero": 0, "stale_nonzero": 9}[initial],
+            waited_floor=True,
+            actual_exit=actual,
+            process_cleaned=variant == "process",
+        )
+        prefix = b"".join(
+            ELEMENT_CHECKPOINT_PREFIX + name.encode() + b"\n"
+            for name in (
+                "utility_manifest_requested",
+                "utility_import_requested",
+                "utility_import_returned",
+            )
+        )
+        return (
+            prefix
+            + _utility_observation_bytes()
+            + (
+                ELEMENT_CHECKPOINT_PREFIX
+                + b"utility_binding_verified\n"
+                + ELEMENT_PROBE_PREFIX
+                + json.dumps(value).encode()
+                + b"\n"
+            )
+        )
+
+    monkeypatch.setitem(namespace, "_capture_element_child", capture)
+    with pytest.raises(pytest.fail.Exception, match="Owned native element-probe fixture failed"):
+        function(tmp_path)
+    assert calls[-1]["kind"] == "alias"
+    assert sum(c["kind"] == "missing" for c in calls) == 6
+    assert "K5_ELEMENT_PROCESS_QUALIFIED=true" not in capsys.readouterr().out
