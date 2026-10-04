@@ -10,6 +10,14 @@ $outputPath = [IO.Path]::GetFullPath($Output)
 $pin = [regex]::Matches((Get-Content (Join-Path $repoRoot "Install-K5VisionAlpha.ps1") -Raw), '(?m)^\$K5Revision = "([0-9a-f]{40})"\r?$')
 if ($pin.Count -ne 1) { throw "Alpha witness requires one exact reviewed revision." }
 $revision = $pin[0].Groups[1].Value
+$reviewedBaselineRevision = "d531d50d479f46af6ceed324a7cc379745becb61"
+if ($revision -cne $reviewedBaselineRevision) { throw "Installed Alpha baseline revision requires review." }
+# Independent immutable source identity, not the newer candidate launcher or a
+# hash reported by installed code. Verified from this revision's Git tree:
+# https://github.com/mkurtgerald/K5-Vision/blob/d531d50d479f46af6ceed324a7cc379745becb61/scripts/windows-alpha/Start-K5VisionAlpha.ps1
+$expectedLauncherSize = 20863
+$expectedLauncherBlob = "fe1ca98340a6967de0fa92a86dd361efa6dc6805"
+$expectedLauncherHash = "e63fa030ec254bd4b8fa83cf90abd08fdfe351bf6fb4c40a215b1ad7bd60dd55"
 function Get-K5CanonicalHash([string]$Path) {
     # Ignore checkout line-ending conversion, but compare all source content.
     $text = [IO.File]::ReadAllText($Path).Replace("`r`n", "`n")
@@ -18,7 +26,6 @@ function Get-K5CanonicalHash([string]$Path) {
     finally { $hasher.Dispose() }
 }
 $expectedHash = Get-K5CanonicalHash (Join-Path $repoRoot "src\k5vision\media\gstreamer_direct_frame_delivery.py")
-$expectedLauncherHash = Get-K5CanonicalHash (Join-Path $PSScriptRoot "Start-K5VisionAlpha.ps1")
 $workRoot = Join-Path $env:RUNNER_TEMP ("k5-alpha-witness-" + [Guid]::NewGuid().ToString("N"))
 $installRoot = Join-Path $workRoot "installed"
 $hostExe = (Get-Process -Id $PID).Path
@@ -31,6 +38,53 @@ foreach ($name in @("RUNNER_TOOL_CACHE", "GITHUB_ENV", "GITHUB_PATH", "RUNNER_TE
     $preserved[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
 }
 New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
+
+function Assert-K5PinnedLauncherBytes {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [ValidateRange(1,65536)][int]$ExpectedSize,
+        [ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedBlob,
+        [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedSha256
+    )
+    $stream = $null
+    $sha256 = $null
+    $sha1 = $null
+    try {
+        $attributes = [IO.File]::GetAttributes($Path)
+        if ($attributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint)) {
+            throw "launcher_mismatch"
+        }
+        # Read only the declared bounded byte count under a non-write-sharing
+        # handle. No newline conversion or decoded-text equivalence is accepted.
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        if ($stream.Length -ne $ExpectedSize) { throw "launcher_mismatch" }
+        $bytes = New-Object byte[] $ExpectedSize
+        $offset = 0
+        while ($offset -lt $ExpectedSize) {
+            $count = $stream.Read($bytes, $offset, $ExpectedSize - $offset)
+            if ($count -eq 0) { throw "launcher_mismatch" }
+            $offset += $count
+        }
+        if ($stream.ReadByte() -ne -1) { throw "launcher_mismatch" }
+        $header = [Text.Encoding]::ASCII.GetBytes("blob " + $ExpectedSize + [char]0)
+        $gitBytes = New-Object byte[] ($header.Length + $ExpectedSize)
+        [Array]::Copy($header, 0, $gitBytes, 0, $header.Length)
+        [Array]::Copy($bytes, 0, $gitBytes, $header.Length, $ExpectedSize)
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        $sha1 = [Security.Cryptography.SHA1]::Create()
+        $actualSha256 = ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace("-", "").ToLowerInvariant()
+        $actualBlob = ([BitConverter]::ToString($sha1.ComputeHash($gitBytes))).Replace("-", "").ToLowerInvariant()
+        if ($actualSha256 -cne $ExpectedSha256 -or $actualBlob -cne $ExpectedBlob) {
+            throw "launcher_mismatch"
+        }
+    } catch {
+        throw "launcher_mismatch"
+    } finally {
+        if ($null -ne $sha1) { $sha1.Dispose() }
+        if ($null -ne $sha256) { $sha256.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
 
 function Invoke-K5Bounded([string]$Executable, [string[]]$Arguments, [int]$Seconds) {
     $stdout = Join-Path $workRoot "child.stdout.log"
@@ -86,6 +140,8 @@ try {
     $payloadRoot = Join-Path $extracted ("K5-Vision-" + $revision)
     $installer = Join-Path $payloadRoot "scripts\windows-alpha\Install-K5VisionAlpha.ps1"
     if (-not (Test-Path -LiteralPath $installer)) { throw "payload_unavailable" }
+    $payloadLauncher = Join-Path $payloadRoot "scripts\windows-alpha\Start-K5VisionAlpha.ps1"
+    Assert-K5PinnedLauncherBytes -Path $payloadLauncher -ExpectedSize $expectedLauncherSize -ExpectedBlob $expectedLauncherBlob -ExpectedSha256 $expectedLauncherHash
     $stage = "install"
     $null = Invoke-K5Bounded $hostExe @("-NoProfile", "-NonInteractive", "-File", ('"' + $installer + '"'), "-InstallRoot", ('"' + $installRoot + '"'), "-K5Revision", $revision, "-SkipDesktopShortcut") 300
 
@@ -95,7 +151,9 @@ try {
     $hashCode = "import hashlib,pathlib; import k5vision.media.gstreamer_direct_frame_delivery as m; print(hashlib.sha256(pathlib.Path(m.__file__).read_bytes().replace(b'\r\n',b'\n')).hexdigest())"
     $actualHash = (Invoke-K5Bounded $python @("-c", ('"' + $hashCode + '"')) 15).Trim()
     if ($actualHash -ne $expectedHash) { throw "runtime_mismatch" }
-    $installedLauncherHash = Get-K5CanonicalHash (Join-Path $installRoot "Start-K5VisionAlpha.ps1")
+    $installedLauncher = Join-Path $installRoot "Start-K5VisionAlpha.ps1"
+    Assert-K5PinnedLauncherBytes -Path $installedLauncher -ExpectedSize $expectedLauncherSize -ExpectedBlob $expectedLauncherBlob -ExpectedSha256 $expectedLauncherHash
+    $installedLauncherHash = Get-K5CanonicalHash $installedLauncher
     if ($installedLauncherHash -ne $expectedLauncherHash) { throw "launcher_mismatch" }
 
     $stage = "decoder_inventory"

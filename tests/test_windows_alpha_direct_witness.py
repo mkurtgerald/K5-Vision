@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
 import sys
@@ -13,6 +14,99 @@ ROOT = Path(__file__).resolve().parents[1]
 ALPHA = ROOT / "scripts" / "windows-alpha"
 WITNESS = ALPHA / "Invoke-K5VisionAlphaWitness.ps1"
 WORKFLOW = ROOT / ".github" / "workflows" / "stage-one-operator-physical.yml"
+
+
+def test_baseline_launcher_identity_is_pinned_independently_of_candidate_source() -> None:
+    text = WITNESS.read_text()
+    assert '$reviewedBaselineRevision = "d531d50d479f46af6ceed324a7cc379745becb61"' in text
+    assert "$revision -cne $reviewedBaselineRevision" in text
+    assert "$expectedLauncherSize = 20863" in text
+    assert '$expectedLauncherBlob = "fe1ca98340a6967de0fa92a86dd361efa6dc6805"' in text
+    assert (
+        '$expectedLauncherHash = "e63fa030ec254bd4b8fa83cf90abd08fdfe351bf6fb4c40a215b1ad7bd60dd55"'
+        in text
+    )
+    assert "$expectedLauncherHash = Get-K5CanonicalHash" not in text
+
+
+def test_baseline_validates_raw_launcher_bytes_before_install_and_after_copy() -> None:
+    text = WITNESS.read_text()
+    validation = (
+        "Assert-K5PinnedLauncherBytes -Path $payloadLauncher -ExpectedSize $expectedLauncherSize "
+        "-ExpectedBlob $expectedLauncherBlob -ExpectedSha256 $expectedLauncherHash"
+    )
+    assert validation in text
+    assert text.index(validation) < text.index("$null = Invoke-K5Bounded $hostExe")
+    installed = (
+        "Assert-K5PinnedLauncherBytes -Path $installedLauncher -ExpectedSize $expectedLauncherSize "
+        "-ExpectedBlob $expectedLauncherBlob -ExpectedSha256 $expectedLauncherHash"
+    )
+    assert installed in text
+    assert text.index(installed) < text.index("foreach ($attempt in 1..2)")
+    helper = text.split("function Assert-K5PinnedLauncherBytes", 1)[1].split(
+        "function Invoke-K5Bounded", 1
+    )[0]
+    assert "[IO.File]::Open($Path" in helper
+    assert "[IO.FileShare]::Read" in helper
+    assert "$stream.Length -ne $ExpectedSize" in helper
+    assert "$stream.Read($bytes, $offset, $ExpectedSize - $offset)" in helper
+    assert "[Security.Cryptography.SHA256]::Create()" in helper
+    assert "[Security.Cryptography.SHA1]::Create()" in helper
+    assert '$header = [Text.Encoding]::ASCII.GetBytes("blob " + $ExpectedSize + [char]0)' in helper
+    assert 'Replace("`r`n"' not in helper
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows PowerShell")
+def test_windows_baseline_byte_validator_rejects_crlf_and_tampering(tmp_path: Path) -> None:
+    payload = b"reviewed launcher\n"
+    path = tmp_path / "baseline.ps1"
+    path.write_bytes(payload)
+    sha256 = hashlib.sha256(payload).hexdigest()
+    blob = hashlib.sha1(b"blob " + str(len(payload)).encode() + b"\0" + payload).hexdigest()
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    '__WITNESS__', [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'parse' }
+$function = $ast.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Assert-K5PinnedLauncherBytes'
+}, $true)
+if ($null -eq $function) { throw 'missing helper' }
+. ([scriptblock]::Create($function.Extent.Text))
+$path = '__PAYLOAD__'
+$arguments = @{
+    Path=$path; ExpectedSize=__SIZE__; ExpectedBlob='__BLOB__'; ExpectedSha256='__SHA__'
+}
+Assert-K5PinnedLauncherBytes @arguments
+foreach ($text in @("reviewed launcher`r`n", "changed! launcher`n")) {
+    $bytes = [Text.Encoding]::ASCII.GetBytes($text)
+    [IO.File]::WriteAllBytes($path, $bytes)
+    try { Assert-K5PinnedLauncherBytes @arguments; throw 'tamper accepted' }
+    catch { if ($_.Exception.Message -ne 'launcher_mismatch') { throw } }
+}
+[IO.File]::WriteAllBytes($path, [Text.Encoding]::ASCII.GetBytes("reviewed launcher`n"))
+$arguments.ExpectedBlob = '0000000000000000000000000000000000000000'
+try { Assert-K5PinnedLauncherBytes @arguments; throw 'blob mismatch accepted' }
+catch { if ($_.Exception.Message -ne 'launcher_mismatch') { throw } }
+"""
+    for key, value in {
+        "__WITNESS__": str(WITNESS).replace("'", "''"),
+        "__PAYLOAD__": str(path).replace("'", "''"),
+        "__SIZE__": str(len(payload)),
+        "__BLOB__": blob,
+        "__SHA__": sha256,
+    }.items():
+        script = script.replace(key, value)
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_witness_reuses_existing_physical_job_and_source_free_artifact() -> None:

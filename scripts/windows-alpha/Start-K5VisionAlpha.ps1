@@ -2,7 +2,8 @@
 param(
     [ValidateRange(1024,65535)][int]$Port = 8000,
     [string]$PublicRtspSource = "",
-    [switch]$ExitAfterPublicTest
+    [switch]$ExitAfterPublicTest,
+    [switch]$AnalyticsPreflightOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,9 +14,141 @@ $MediaMtxVersion = "1.21.1"
 $MediaMtxArchiveSha256 = "faa97974861eb75a68b5aa326c78e7e7a6f670b5ef191bace78e715130381f23"
 $MediaMtxArchiveUri = "https://github.com/bluenviron/mediamtx/releases/download/v$MediaMtxVersion/mediamtx_v$MediaMtxVersion" + "_windows_amd64.zip"
 
+# Keep admission in the installed launcher so Test and Start cannot drift. This
+# child never receives a source URI or credential and cannot import the checkout.
+# No temporary directory, output log, session database, or media process is made.
+function Invoke-K5AnalyticsPreflight {
+    param(
+        [Parameter(Mandatory=$true)][string]$Python,
+        [ValidateRange(1,60)][int]$TimeoutSeconds = 30
+    )
+    $maximumOutputBytes = 4096
+    $failureMessage = "K5 analytics preflight failed. No alpha session was started."
+    $child = $null
+    $stdout = $null
+    $started = $false
+    try {
+        $info = New-Object System.Diagnostics.ProcessStartInfo
+        $info.FileName = $Python
+        $info.Arguments = "-I -B -m k5vision.cli analytics-preflight"
+        $info.WorkingDirectory = Split-Path -Parent $Python
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        # Inherit only Windows runtime/location variables and the explicit
+        # selection. Never pass unrelated source, credential, or database state.
+        # The CLI owns all package/model/config admission; the parent is unchanged.
+        $allowedEnvironment = @(
+            "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "PATH", "TEMP", "TMP",
+            "USERPROFILE", "LOCALAPPDATA", "APPDATA", "PROGRAMDATA", "K5_ANALYTICS_CONFIG"
+        )
+        foreach ($name in @($info.EnvironmentVariables.Keys)) {
+            if ($name -notin $allowedEnvironment) { $info.EnvironmentVariables.Remove($name) }
+        }
+        $child = New-Object System.Diagnostics.Process
+        $child.StartInfo = $info
+        $started = $child.Start()
+        if (-not $started) { throw $failureMessage }
+        $childHandle = $child.Handle
+        $stdout = New-Object System.IO.MemoryStream
+        $outBuffer = New-Object byte[] 1024
+        $errBuffer = New-Object byte[] 1
+        $outRead = $child.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+        $errRead = $child.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+        $outDone = $false
+        $errDone = $false
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        while ($true) {
+            if ($watch.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw $failureMessage }
+            if (-not $outDone -and $outRead.IsCompleted) {
+                $count = $outRead.GetAwaiter().GetResult()
+                if ($count -eq 0) { $outDone = $true }
+                else {
+                    if ($stdout.Length + $count -gt $maximumOutputBytes) { throw $failureMessage }
+                    $stdout.Write($outBuffer, 0, $count)
+                    $outRead = $child.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+                }
+            }
+            if (-not $errDone -and $errRead.IsCompleted) {
+                # Successful admission has no stderr. Reject immediately rather
+                # than buffering an exception, path, credential, or output flood.
+                if ($errRead.GetAwaiter().GetResult() -ne 0) { throw $failureMessage }
+                $errDone = $true
+            }
+            if ($child.HasExited -and $outDone -and $errDone) { break }
+            Start-Sleep -Milliseconds 10
+        }
+        if ($child.ExitCode -ne 0) { throw $failureMessage }
+        $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $json = $utf8.GetString($stdout.ToArray()).Trim()
+        # Match the CLI's canonical success records, never permissive JSON
+        # coercion (arrays, duplicate/escaped keys, and extra fields must fail).
+        if ($json -ceq '{"schema_version":"1","analytics_enabled":true,"status":"ready"}') {
+            return $true
+        }
+        if ($json -ceq '{"schema_version":"1","analytics_enabled":false,"status":"disabled"}') {
+            return $false
+        }
+        throw $failureMessage
+    } catch {
+        # Do not expose child output or raw Process/JSON/config exceptions.
+        throw $failureMessage
+    } finally {
+        try {
+            if ($started -and -not $child.HasExited) {
+                $child.Kill()
+                if (-not $child.WaitForExit(5000)) { throw $failureMessage }
+            }
+        } catch {
+            throw $failureMessage
+        } finally {
+            if ($null -ne $child) { $child.Dispose() }
+            if ($null -ne $stdout) { $stdout.Dispose() }
+        }
+    }
+}
+
+function Test-K5AlphaOperatorReceipt([object]$Receipt, [bool]$AnalyticsRequired) {
+    if ($null -eq $Receipt) { return $false }
+    $fields = @($Receipt.PSObject.Properties.Name)
+    foreach ($name in @("completed", "delivered_frames", "presentations")) {
+        if ($name -cnotin $fields) { return $false }
+    }
+    if ($Receipt.completed -isnot [bool] -or -not $Receipt.completed) { return $false }
+    $counterNames = @("delivered_frames", "presentations")
+    if ($AnalyticsRequired) {
+        foreach ($name in @("analytics_enabled", "analytics_provider_submissions",
+                            "analytics_provider_completions", "analytics_failures")) {
+            if ($name -cnotin $fields) { return $false }
+        }
+        if ($Receipt.analytics_enabled -isnot [bool] -or -not $Receipt.analytics_enabled) {
+            return $false
+        }
+        $counterNames += @("analytics_provider_submissions", "analytics_provider_completions",
+                           "analytics_failures")
+    }
+    foreach ($name in $counterNames) {
+        $counter = $Receipt.$name
+        if (($counter -isnot [int] -and $counter -isnot [long]) -or $counter -lt 0) {
+            return $false
+        }
+        if ($name -cne "analytics_failures" -and $counter -lt 1) { return $false }
+    }
+    if ($AnalyticsRequired -and ($Receipt.analytics_failures -ne 0 -or
+        $Receipt.analytics_provider_completions -gt $Receipt.analytics_provider_submissions)) {
+        return $false
+    }
+    return $true
+}
+
 $python = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 $versionRecord = Join-Path $PSScriptRoot "gstreamer-version.txt"
 if (-not (Test-Path -LiteralPath $python)) { throw "Run Install-K5VisionAlpha.ps1 first." }
+$analyticsRequired = Invoke-K5AnalyticsPreflight -Python $python
+if ($analyticsRequired) { Write-Host "K5 analytics configuration admitted; live provider acceptance is pending." }
+else { Write-Host "K5 analytics disabled; video-only alpha acceptance selected." }
+if ($AnalyticsPreflightOnly) { return }
 if (-not (Test-Path -LiteralPath $versionRecord)) { throw "Installed GStreamer version record is missing." }
 
 $gstreamerVersion = (Get-Content -LiteralPath $versionRecord -Raw).Trim()
@@ -297,7 +430,7 @@ try {
         Write-Host "Starting K5 Vision Alpha local synthetic operator test on http://127.0.0.1:$Port"
     } else {
         $resolveCode = "from k5vision.operator_runtime import resolve_public_test_source_ip; import sys; print(resolve_public_test_source_ip(sys.argv[1]))"
-        $resolved = @(& $python -c $resolveCode $PublicRtspSource 2>$null)
+        $resolved = @(& $python -I -B -c $resolveCode $PublicRtspSource 2>$null)
         if ($LASTEXITCODE -ne 0 -or $resolved.Count -ne 1) {
             throw "Public RTSP alpha source failed validation."
         }
@@ -338,7 +471,8 @@ try {
 
     Write-Host "Recording is disabled. Test media and temporary K5 state are not retained."
     $arguments = @("-m","k5vision.cli","serve","--operator","--host","127.0.0.1","--port",$Port)
-    $process = Start-Process -FilePath $python -ArgumentList $arguments -PassThru -NoNewWindow
+    $arguments = @("-I","-B") + $arguments
+    $process = Start-Process -FilePath $python -ArgumentList $arguments -PassThru -NoNewWindow -WorkingDirectory (Split-Path -Parent $python)
 
     $baseUri = "http://127.0.0.1:$Port"
     $ready = $false
@@ -402,8 +536,11 @@ try {
             height = 720
         }
     )
-    if (-not $receipt.completed -or $receipt.delivered_frames -lt 1 -or $receipt.presentations -lt 1) {
-        throw "K5 Windows operator alpha test did not complete cleanly."
+    if (-not (Test-K5AlphaOperatorReceipt -Receipt $receipt -AnalyticsRequired $analyticsRequired)) {
+        throw "K5 Windows operator alpha test did not complete the selected acceptance checks."
+    }
+    if ($analyticsRequired) {
+        Write-Host ("K5 analytics PASS: submissions={0}, completions={1}, failures=0" -f $receipt.analytics_provider_submissions, $receipt.analytics_provider_completions)
     }
 
     Write-Host ("K5 operator PASS: frames={0}, presentations={1}" -f $receipt.delivered_frames, $receipt.presentations)
