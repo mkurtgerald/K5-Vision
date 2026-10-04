@@ -600,6 +600,7 @@ class OfflineWheelhouse:
             canonical = {}
             for item in entries:
                 name = item.filename
+                _admit(item.orig_filename == name, "archive-member-path")
                 _admit(
                     not name.startswith("/") and "\\" not in name and ":" not in name,
                     "archive-member-path",

@@ -774,7 +774,11 @@ def offline_bundle(tmp_path, monkeypatch):
         edit(files)
         with zipfile.ZipFile(path, "w") as archive:
             for filename, content in files.items():
-                archive.writestr(filename, content)
+                # ZipInfo's constructor normalizes native separators and NULs.
+                # Preserve deliberately malformed generated wire names instead.
+                info = zipfile.ZipInfo("generated-member")
+                info.filename = info.orig_filename = filename
+                archive.writestr(info, content)
         entry.update(record(path))
 
     return SimpleNamespace(
@@ -1316,6 +1320,23 @@ def test_offline_unsupported_filename_tags_keep_admission_closed():
             65,
         ),
     ],
+    ids=[
+        "metadata-missing",
+        "wheel-metadata-missing",
+        "metadata-oversize",
+        "wheel-metadata-oversize",
+        "metadata-malformed",
+        "metadata-name-mismatch",
+        "metadata-name-invalid-encoding",
+        "metadata-name-duplicate",
+        "metadata-version-missing",
+        "metadata-version-mismatch",
+        "wheel-version-missing",
+        "wheel-tags-missing",
+        "wheel-tag-invalid-encoding",
+        "wheel-tags-mismatch",
+        "wheel-tags-excessive",
+    ],
 )
 def test_offline_metadata_diagnostics_refuse_missing_malformed_and_oversize_headers(
     offline_bundle, member, content, contract, expected, observed, capsys
@@ -1562,3 +1583,99 @@ def test_offline_host_venv_refusals_precede_bootstrap_identity(tmp_path, monkeyp
     monkeypatch.setattr(transaction.sys, "executable", str(executable))
     assert_offline_contract(transaction._host_identity, "host-no-venv")
     version.assert_not_called()
+
+
+def _raw_zip_header_names(path):
+    """Inspect generated local and central headers without normalizing names."""
+    import struct
+    import zipfile
+
+    raw = path.read_bytes()
+    local, central = [], []
+    with zipfile.ZipFile(path) as archive:
+        cursor = archive.start_dir
+        for info in archive.infolist():
+            offset = info.header_offset
+            assert raw[offset : offset + 4] == b"PK\x03\x04"
+            length = struct.unpack_from("<H", raw, offset + 26)[0]
+            local.append(raw[offset + 30 : offset + 30 + length])
+            assert raw[cursor : cursor + 4] == b"PK\x01\x02"
+            length, extra, comment = struct.unpack_from("<HHH", raw, cursor + 28)
+            central.append(raw[cursor + 46 : cursor + 46 + length])
+            cursor += 46 + length + extra + comment
+    return local, central
+
+
+def _model_windows_zip_reader(monkeypatch):
+    original = transaction.zipfile.ZipInfo.__init__
+
+    def windows_info(info, filename="NoName", date_time=(1980, 1, 1, 0, 0, 0)):
+        original(info, filename, date_time)
+        # The real Windows constructor preserves orig_filename while replacing
+        # native separators in filename. NUL truncation occurs on every OS.
+        info.filename = info.filename.replace("\\", "/")
+
+    monkeypatch.setattr(transaction.zipfile.ZipInfo, "__init__", windows_info)
+
+
+def _raw_member_fixture(bundle, members):
+    bundle.edit_wheel(
+        "anyio", lambda files: files.update({m: b"generated fixture" for m in members})
+    )
+    record = next(r for r in bundle.data["wheels"] if r["name"] == "anyio")
+    path = bundle.wheels / record["filename"]
+    local, central = _raw_zip_header_names(path)
+    for name in members:
+        assert name.encode("utf-8") in local and name.encode("utf-8") in central
+    return path
+
+
+@pytest.mark.parametrize(
+    "member",
+    ["anyio\\private-path", "anyio/private-path\x00discarded"],
+    ids=["raw-backslash", "raw-nul"],
+)
+def test_offline_raw_names_refused_under_windows_reader(offline_bundle, monkeypatch, member):
+    path = _raw_member_fixture(offline_bundle, [member])
+    _model_windows_zip_reader(monkeypatch)
+    with transaction.zipfile.ZipFile(path) as archive:
+        info = next(i for i in archive.infolist() if i.orig_filename == member)
+        assert info.filename != info.orig_filename
+    assert_offline_contract(offline_bundle.installer, "archive-member-path")
+    assert not offline_bundle.root.exists()
+
+
+def test_offline_raw_nul_refused_without_a_reader_model(offline_bundle):
+    member = "anyio/private-path\x00discarded"
+    path = _raw_member_fixture(offline_bundle, [member])
+    with transaction.zipfile.ZipFile(path) as archive:
+        info = next(i for i in archive.infolist() if i.orig_filename == member)
+        assert info.filename == "anyio/private-path"
+    assert_offline_contract(offline_bundle.installer, "archive-member-path")
+    assert not offline_bundle.root.exists()
+
+
+@pytest.mark.parametrize(
+    "alias",
+    ["anyio\\alias.bin", "anyio/alias.bin\x00discarded"],
+    ids=["separator-alias", "nul-alias"],
+)
+def test_offline_raw_alias_duplicates_stay_rejected(offline_bundle, monkeypatch, alias):
+    _raw_member_fixture(offline_bundle, ["anyio/alias.bin", alias])
+    _model_windows_zip_reader(monkeypatch)
+    assert_offline_contract(offline_bundle.installer, "archive-duplicate-member")
+    assert not offline_bundle.root.exists()
+
+
+def test_offline_metadata_ids_are_bounded_without_shrinking_payloads():
+    function = test_offline_metadata_diagnostics_refuse_missing_malformed_and_oversize_headers
+    marker = next(mark for mark in function.pytestmark if mark.name == "parametrize")
+    cases, ids = marker.args[1], marker.kwargs.get("ids")
+    assert isinstance(ids, list) and len(ids) == len(cases) == 15
+    assert len(set(ids)) == len(ids)
+    assert all(isinstance(value, str) and 0 < len(value) <= 48 for value in ids)
+    oversized = [case for case in cases if case[2] in {"metadata-size", "wheel-metadata-size"}]
+    assert len(oversized) == 2
+    assert all(case[1] == b"x" * 65537 and case[3:] == (65536, 65537) for case in oversized)
+    many_tags = next(case for case in cases if case[4] == 65)
+    assert many_tags[1].count(b"Tag: py3-none-any\n") == 65
