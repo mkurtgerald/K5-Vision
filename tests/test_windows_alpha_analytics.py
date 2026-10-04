@@ -1775,3 +1775,450 @@ public sealed class K5FixtureMethod : MethodInvocationException {
         pass
     if not complete:
         pytest.fail("Typed ErrorRecord graph bounds fixture failed", pytrace=False)
+
+
+ELEMENT_PROBE_PREFIX = b"K5_ELEMENT_PROBE="
+ELEMENT_PROBE_SCHEMA = "element-native-exit-probe-v1"
+ELEMENT_PROBE_OUTCOMES = {
+    "true",
+    "false",
+    "variable_undefined",
+    "native_stderr",
+    "command_missing",
+    "unexpected",
+}
+ELEMENT_PROBE_NATIVE_SOURCE = r"""
+using System;
+using System.Threading;
+public static class K5OwnedExitFixture {
+    public static int Main(string[] args) {
+        if (args.Length != 1) return 31;
+        bool zero = args[0] == "zero" || args[0] == "stderr_zero";
+        bool nonzero = args[0] == "nonzero" || args[0] == "stderr_nonzero";
+        if (!zero && !nonzero) return 32;
+        Thread.Sleep(500);
+        if (args[0].StartsWith("stderr_")) Console.Error.Write("PRIVATE_NATIVE_FIXTURE");
+        return zero ? 0 : 7;
+    }
+}
+"""
+ELEMENT_PROBE_SCRIPT = r"""
+param([string]$Start, [string]$Executable, [string]$Name, [string]$Variant, [string]$Initial)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+try {
+    if ($Variant -cnotin @('original','pipeline') -or
+        $Initial -cnotin @('absent','stale_zero','stale_nonzero')) { throw 'fixture_invalid' }
+    if ($null -ne (Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue)) {
+        throw 'fixture_not_fresh'
+    }
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $Start, [ref]$tokens, [ref]$errors)
+    $functions = @($ast.FindAll({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Test-K5GStreamerElement'
+    }, $true))
+    if ($errors.Count -ne 0 -or $functions.Count -ne 1) { throw 'fixture_invalid' }
+    $original = $functions[0].Extent.Text
+    $needle = '& $gstInspect $Name *> $null'
+    if (($original.Split(@($needle), [StringSplitOptions]::None)).Count -ne 2) {
+        throw 'fixture_invalid'
+    }
+    $selected = $original
+    if ($Variant -ceq 'pipeline') {
+        $selected = $original.Replace($needle, $needle + ' | Out-Null')
+    }
+    . ([scriptblock]::Create($selected))
+    function K5FixtureNoNative { param($Name) }
+    Set-Alias -Name K5FixtureAlias -Value K5FixtureNoNative
+    $gstInspect = $Executable
+    $kind = 'missing'
+    $bound = $false
+    try {
+        $command = Get-Command -Name $gstInspect -ErrorAction Stop
+        if ($command.CommandType -eq [Management.Automation.CommandTypes]::Application) {
+            $kind = 'application'
+            $bound = [string]::Equals([IO.Path]::GetFullPath($command.Path),
+                [IO.Path]::GetFullPath($Executable), [StringComparison]::OrdinalIgnoreCase)
+        } elseif ($command.CommandType -eq [Management.Automation.CommandTypes]::Alias) {
+            $kind = 'alias'
+        } elseif ($command.CommandType -eq [Management.Automation.CommandTypes]::Function) {
+            $kind = 'function'
+        } else { throw 'fixture_invalid' }
+    } catch {
+        if ($kind -cne 'missing') { throw 'fixture_invalid' }
+    }
+    # Deliberately stale inputs are negative fixtures, never a proposed repair.
+    if ($Initial -ceq 'stale_zero') { $global:LASTEXITCODE = 0 }
+    elseif ($Initial -ceq 'stale_nonzero') { $global:LASTEXITCODE = 9 }
+    $outcome = 'unexpected'
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $answer = Test-K5GStreamerElement -Name $Name
+        if ($answer -is [bool]) { $outcome = if ($answer) { 'true' } else { 'false' } }
+    } catch {
+        $id = $_.FullyQualifiedErrorId.Split(',')[0]
+        if ($id -ceq 'VariableIsUndefined') { $outcome = 'variable_undefined' }
+        elseif ($id -cin @('NativeCommandError','NativeCommandErrorMessage')) {
+            $outcome = 'native_stderr'
+        } elseif ($id -ceq 'CommandNotFoundException') { $outcome = 'command_missing' }
+    }
+    $watch.Stop()
+    $last = Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+    $value = $null
+    if ($null -ne $last) {
+        if ($last.Value -isnot [int] -or $last.Value -notin @(0,7,9)) { throw 'fixture_invalid' }
+        $value = $last.Value
+    }
+    $record = [ordered]@{
+        schema_version = 'element-native-exit-probe-v1'
+        variant = $Variant
+        initial = $Initial
+        fresh_session = $true
+        command_kind = $kind
+        application_bound = $bound
+        outcome = $outcome
+        last_exit = $value
+        waited_floor = $watch.ElapsedMilliseconds -ge 400
+    }
+    Write-Output ('K5_ELEMENT_PROBE=' + ($record | ConvertTo-Json -Compress))
+    exit 0
+} catch { Write-Output 'K5_ELEMENT_FIXTURE=failed'; exit 1 }
+"""
+ELEMENT_REFERENCE_SCRIPT = r"""
+param([string]$Executable, [string]$Name)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$process = [Diagnostics.Process]::new()
+$started = $false
+try {
+    $process.StartInfo.FileName = $Executable
+    $process.StartInfo.Arguments = $Name
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
+    $started = $process.Start()
+    if (-not $started) { throw 'fixture_invalid' }
+    $handle = $process.Handle
+    $out = $process.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null)
+    $err = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+    if (-not $process.WaitForExit(5000) -or
+        -not [Threading.Tasks.Task]::WaitAll(@($out,$err), 5000)) { throw 'fixture_invalid' }
+    if ($process.ExitCode -notin @(0,7)) { throw 'fixture_invalid' }
+    Write-Output ('K5_NATIVE_REFERENCE=' + $process.ExitCode)
+} finally {
+    if ($started -and -not $process.HasExited) {
+        $process.Kill()
+        if (-not $process.WaitForExit(5000)) { throw 'fixture_cleanup' }
+    }
+    $process.Dispose()
+}
+"""
+
+
+def _pe_fixture_subsystem(path: Path) -> int:
+    import struct
+
+    with path.open("rb") as stream:
+        raw = stream.read(1_048_577)
+    if len(raw) > 1_048_576 or len(raw) < 256 or raw[:2] != b"MZ":
+        raise ValueError("Invalid owned fixture PE")
+    offset = struct.unpack_from("<I", raw, 0x3C)[0]
+    if offset + 94 > len(raw) or raw[offset : offset + 4] != b"PE\0\0":
+        raise ValueError("Invalid owned fixture PE")
+    if struct.unpack_from("<H", raw, offset + 24)[0] not in (0x10B, 0x20B):
+        raise ValueError("Invalid owned fixture PE")
+    return struct.unpack_from("<H", raw, offset + 24 + 68)[0]
+
+
+def _parse_element_probe(raw: bytes) -> dict:
+    if len(raw) > 2048 or len(raw.splitlines()) != 1 or not raw.startswith(ELEMENT_PROBE_PREFIX):
+        raise ValueError("Invalid element probe")
+    pairs = json.loads(raw[len(ELEMENT_PROBE_PREFIX) :], object_pairs_hook=list)
+    if type(pairs) is not list or any(type(pair) is not tuple or len(pair) != 2 for pair in pairs):
+        raise ValueError("Invalid element probe")
+    value = dict(pairs)
+    if len(value) != len(pairs) or value.keys() != {
+        "schema_version",
+        "variant",
+        "initial",
+        "fresh_session",
+        "command_kind",
+        "application_bound",
+        "outcome",
+        "last_exit",
+        "waited_floor",
+    }:
+        raise ValueError("Invalid element probe")
+    for field, allowed in (
+        ("schema_version", {ELEMENT_PROBE_SCHEMA}),
+        ("variant", {"original", "pipeline"}),
+        ("initial", {"absent", "stale_zero", "stale_nonzero"}),
+        ("command_kind", {"application", "missing", "alias", "function"}),
+        ("outcome", ELEMENT_PROBE_OUTCOMES),
+    ):
+        if type(value[field]) is not str or value[field] not in allowed:
+            raise ValueError("Invalid element probe")
+    for field in ("fresh_session", "application_bound", "waited_floor"):
+        if type(value[field]) is not bool:
+            raise ValueError("Invalid element probe")
+    if value["last_exit"] is not None and (
+        type(value["last_exit"]) is not int or value["last_exit"] not in (0, 7, 9)
+    ):
+        raise ValueError("Invalid element probe")
+    if value["application_bound"] and value["command_kind"] != "application":
+        raise ValueError("Invalid element probe")
+    return value
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows GUI/CUI process semantics")
+def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Path):
+    import os
+
+    module = _startup_witness()
+    common = module.common
+    complete = False
+    original_misses = pipeline_misses = missing_refusals = 0
+    try:
+        base = common.local_path(Path(sys._base_executable))
+        base_hash = common.file_hash(base)
+        supplied = {key: os.environ.get(key) for key in common.GATE_RUNTIME_KEYS}
+        if any(value is not None for value in supplied.values()) and supplied != {
+            "K5_WITNESS_BASE_PYTHON": str(base),
+            "K5_WITNESS_BASE_PYTHON_SHA256": base_hash,
+        }:
+            raise ValueError("Invalid fixture base binding")
+        env = module.clean_environment(dict(os.environ), tmp_path)
+        env.update(K5_WITNESS_BASE_PYTHON=str(base), K5_WITNESS_BASE_PYTHON_SHA256=base_hash)
+        for name in ("TEMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            Path(env[name]).mkdir(parents=True, exist_ok=True)
+        common.admitted_gate_python(env)
+        powershell = common.local_path(
+            Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        compile_script = tmp_path / "compile.ps1"
+        compile_script.write_text(
+            "param([string]$Root, [string]$Kind)\n$ErrorActionPreference='Stop'\ntry {\n"
+            + "$code = @'\n"
+            + ELEMENT_PROBE_NATIVE_SOURCE
+            + "\n'@\n"
+            + "if ($Kind -cnotin @('ConsoleApplication','WindowsApplication')) "
+            "{ throw 'invalid' }\n" + "Add-Type -TypeDefinition $code -OutputType $Kind "
+            "-OutputAssembly (Join-Path $Root ($Kind + '.exe'))\n"
+            + "Write-Output 'K5_NATIVE_COMPILE=passed'; exit 0\n} catch { exit 1 }\n",
+            encoding="ascii",
+            newline="\n",
+        )
+
+        def capture(script, *arguments):
+            return common.capture(
+                [
+                    str(powershell),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-File",
+                    str(script),
+                    *map(str, arguments),
+                ],
+                cwd=tmp_path,
+                env=env,
+                operation="probe_admission",
+                limit=4096,
+            )
+
+        for kind in ("ConsoleApplication", "WindowsApplication"):
+            if (
+                capture(compile_script, "-Root", tmp_path, "-Kind", kind).strip()
+                != b"K5_NATIVE_COMPILE=passed"
+            ):
+                raise ValueError("Invalid compiler result")
+        binaries = {}
+        for kind, expected_subsystem in (("ConsoleApplication", 3), ("WindowsApplication", 2)):
+            executable = tmp_path / (kind + ".exe")
+            if _pe_fixture_subsystem(executable) != expected_subsystem:
+                raise ValueError("Invalid compiler subsystem")
+            binaries[kind] = (executable, common.file_hash(executable))
+        reference = tmp_path / "reference.ps1"
+        reference.write_text(ELEMENT_REFERENCE_SCRIPT, encoding="ascii", newline="\n")
+        probe = tmp_path / "probe.ps1"
+        probe.write_text(ELEMENT_PROBE_SCRIPT, encoding="ascii", newline="\n")
+        for kind, (executable, identity) in binaries.items():
+            for name in ("zero", "nonzero", "stderr_zero", "stderr_nonzero"):
+                expected_exit = 0 if name.endswith("zero") and not name.endswith("nonzero") else 7
+                actual = capture(reference, "-Executable", executable, "-Name", name).strip()
+                if actual != b"K5_NATIVE_REFERENCE=" + str(expected_exit).encode():
+                    raise ValueError("Actual reference exit mismatch")
+                print("K5_NATIVE_REFERENCE_CASE=" + kind + ":" + name + ":" + str(expected_exit))
+                states = (
+                    ("absent", "stale_zero", "stale_nonzero")
+                    if not name.startswith("stderr")
+                    else ("absent",)
+                )
+                for initial in states:
+                    results = {}
+                    for variant in ("original", "pipeline"):
+                        if common.file_hash(executable) != identity:
+                            raise ValueError("Owned executable changed")
+                        result = _parse_element_probe(
+                            capture(
+                                probe,
+                                "-Start",
+                                START,
+                                "-Executable",
+                                executable,
+                                "-Name",
+                                name,
+                                "-Variant",
+                                variant,
+                                "-Initial",
+                                initial,
+                            )
+                        )
+                        if (
+                            not result["fresh_session"]
+                            or not result["application_bound"]
+                            or result["command_kind"] != "application"
+                        ):
+                            raise ValueError("Owned application identity missing")
+                        print("K5_ELEMENT_CASE=" + kind + ":" + name + ":" + initial)
+                        print(
+                            ELEMENT_PROBE_PREFIX.decode()
+                            + json.dumps(result, separators=(",", ":"))
+                        )
+                        results[variant] = result
+                    for variant, result in results.items():
+                        if name.startswith("stderr"):
+                            correct = result["outcome"] == "native_stderr"
+                        else:
+                            correct = (
+                                result["outcome"] == ("true" if expected_exit == 0 else "false")
+                                and result["last_exit"] == expected_exit
+                                and result["waited_floor"]
+                            )
+                        if not correct:
+                            if variant == "original":
+                                original_misses += 1
+                            else:
+                                pipeline_misses += 1
+        for command, expected_kind in (
+            (tmp_path / "missing.exe", "missing"),
+            ("K5FixtureAlias", "alias"),
+        ):
+            for initial in ("absent", "stale_zero", "stale_nonzero"):
+                for variant in ("original", "pipeline"):
+                    result = _parse_element_probe(
+                        capture(
+                            probe,
+                            "-Start",
+                            START,
+                            "-Executable",
+                            command,
+                            "-Name",
+                            "zero",
+                            "-Variant",
+                            variant,
+                            "-Initial",
+                            initial,
+                        )
+                    )
+                    if result["command_kind"] != expected_kind or result["application_bound"]:
+                        raise ValueError("Non-application qualified as an owned executable")
+                    if expected_kind == "missing" and initial == "stale_zero":
+                        missing_refusals += int(result["outcome"] == "command_missing")
+                    # Observe substitution behavior; do not mislabel it as helper rejection.
+                    print("K5_ELEMENT_CASE=" + expected_kind + ":zero:" + initial)
+                    print(ELEMENT_PROBE_PREFIX.decode() + json.dumps(result, separators=(",", ":")))
+        complete = True
+    except Exception:
+        pass  # All children are bounded by their own Job; no raw error/paths escape.
+    if not complete:
+        pytest.fail("Owned native element-probe fixture failed", pytrace=False)
+    print("K5_ELEMENT_ORIGINAL_MISSES=" + str(original_misses))
+    print("K5_ELEMENT_PIPELINE_MISSES=" + str(pipeline_misses))
+    print("K5_ELEMENT_MISSING_REFUSALS=" + str(missing_refusals))
+    if missing_refusals != 2:
+        pytest.fail("Missing executable did not refuse under stale-zero state", pytrace=False)
+    if original_misses:
+        pytest.fail(
+            "Original element probe did not bind its own native process exit", pytrace=False
+        )
+    if pipeline_misses:
+        pytest.fail(
+            "Candidate pipeline did not preserve actual exit/stderr semantics", pytrace=False
+        )
+
+
+def test_element_probe_parser_rejects_raw_duplicate_and_coerced_evidence():
+    value = {
+        "schema_version": ELEMENT_PROBE_SCHEMA,
+        "variant": "original",
+        "initial": "absent",
+        "fresh_session": True,
+        "command_kind": "application",
+        "application_bound": True,
+        "outcome": "variable_undefined",
+        "last_exit": None,
+        "waited_floor": False,
+    }
+    raw = ELEMENT_PROBE_PREFIX + json.dumps(value).encode() + b"\n"
+    assert _parse_element_probe(raw) == value
+    for change in (
+        {"raw": "PRIVATE_VALUE"},
+        {"outcome": "PRIVATE_VALUE"},
+        {"last_exit": True},
+        {"last_exit": 8},
+        {"application_bound": 1},
+        {"waited_floor": "true"},
+        {"command_kind": "alias"},
+        {"variant": []},
+        {"initial": "guessed"},
+    ):
+        with pytest.raises(ValueError):
+            _parse_element_probe(ELEMENT_PROBE_PREFIX + json.dumps({**value, **change}).encode())
+    for bad in (
+        raw + raw,
+        b"PRIVATE_RAW\n" + raw,
+        b"x" * 2049,
+        ELEMENT_PROBE_PREFIX + b"[]",
+        raw.rstrip()[:-1] + b',"last_exit":null}',
+    ):
+        with pytest.raises(ValueError):
+            _parse_element_probe(bad)
+
+
+def test_owned_fixture_pe_reader_checks_subsystem_and_bounds(tmp_path: Path):
+    import struct
+
+    raw = bytearray(512)
+    raw[:2] = b"MZ"
+    struct.pack_into("<I", raw, 0x3C, 128)
+    raw[128:132] = b"PE\0\0"
+    path = tmp_path / "owned-fixture.exe"
+    for magic in (0x10B, 0x20B):
+        for subsystem in (2, 3):
+            struct.pack_into("<H", raw, 152, magic)
+            struct.pack_into("<H", raw, 220, subsystem)
+            path.write_bytes(raw)
+            assert _pe_fixture_subsystem(path) == subsystem
+    for bad in (b"MZ", b"x" * 512, bytes(raw[:200]), b"x" * 1_048_577):
+        path.write_bytes(bad)
+        with pytest.raises(ValueError):
+            _pe_fixture_subsystem(path)
+
+
+def test_element_probe_comparison_changes_only_downstream_pipeline():
+    assert "$functions.Count -ne 1" in ELEMENT_PROBE_SCRIPT
+    assert "$node.Name -ceq 'Test-K5GStreamerElement'" in ELEMENT_PROBE_SCRIPT
+    assert "$selected = $original.Replace($needle, $needle + ' | Out-Null')" in ELEMENT_PROBE_SCRIPT
+    assert "Get-Variable LASTEXITCODE -Scope Global" in ELEMENT_PROBE_SCRIPT
+    assert "$global:LASTEXITCODE = 0" in ELEMENT_PROBE_SCRIPT  # Explicit stale-input case only.
+    assert "UseShellExecute = $false" in ELEMENT_REFERENCE_SCRIPT
+    assert "$process.WaitForExit(5000)" in ELEMENT_REFERENCE_SCRIPT
+    assert "$process.ExitCode" in ELEMENT_REFERENCE_SCRIPT
+    assert "$process.Kill()" in ELEMENT_REFERENCE_SCRIPT
+    assert "CopyToAsync([IO.Stream]::Null)" in ELEMENT_REFERENCE_SCRIPT
+    test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
