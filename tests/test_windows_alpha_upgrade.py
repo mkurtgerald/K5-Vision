@@ -72,7 +72,7 @@ def snapshot(root):
     if not root.exists():
         return {}
     return {
-        str(path.relative_to(root)): path.read_bytes()
+        path.relative_to(root).as_posix(): path.read_bytes()
         for path in root.rglob("*")
         if path.is_file()
         and transaction.WORKSPACE not in path.parts
@@ -1136,3 +1136,20 @@ def test_offline_network_and_device_paths_are_refused_before_filesystem_access(m
     with pytest.raises(RuntimeError, match="admission failed"):
         transaction._offline_path(PureWindowsPath(value))
     inspect.assert_not_called()
+
+
+@pytest.mark.parametrize("path_class", ["PureWindowsPath", "PurePosixPath"])
+def test_snapshot_nested_keys_are_platform_independent(path_class):
+    import pathlib
+
+    relative = getattr(pathlib, path_class)("config") / "private.json"
+    entry = Mock()
+    entry.is_file.return_value = True
+    entry.parts = relative.parts
+    entry.name = relative.name
+    entry.relative_to.return_value = relative
+    entry.read_bytes.return_value = b"generated configuration"
+    root = Mock()
+    root.exists.return_value = True
+    root.rglob.return_value = [entry]
+    assert snapshot(root) == {"config/private.json": b"generated configuration"}
