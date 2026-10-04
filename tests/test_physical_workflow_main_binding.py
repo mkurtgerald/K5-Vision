@@ -25,8 +25,9 @@ def test_physical_qualifications_remain_main_bound_except_exact_installed_candid
             events = text.split("\non:\n", maxsplit=1)[1].split("\nconcurrency:", maxsplit=1)[0]
             assert (
                 "  push:\n    branches:\n      - feat/installed-analytics-operator-20261003\n"
-                in events
+                "      - feat/alpha-analytics-preflight-20261004\n    paths:\n" in events
             )
+            assert "github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'" in admission
             for forbidden in ("pull_request:", "workflow_dispatch:", "workflow_call:"):
                 assert forbidden not in events
             assert "$head.commit.sha -cne $env:K5_EXPECTED_SHA" in text
