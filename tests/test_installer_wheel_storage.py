@@ -529,21 +529,119 @@ class StorageTests(unittest.TestCase):
         self.assertTrue((partial / "OWNER.json").is_file())
         self.assertFalse((partial / "COMPLETE.json").exists())
 
+    @contextmanager
+    def tracked_output_streams(self):
+        streams = {}
+        original = storage._Owned.file
+
+        def capture(owned, path, payload=None):
+            result = original(owned, path, payload)
+            if payload is None:
+                streams[path] = result
+            return result
+
+        with mock.patch.object(storage._Owned, "file", new=capture):
+            yield streams
+
     def test_replaced_partial_file_is_not_deleted(self):
         sentinel = self.base / "sentinel"
         sentinel.write_text("foreign")
+        injected = []
+        original_seal = storage._Owned.seal
 
-        def inject(number):
-            if number == 2:
-                destination = next(self.partial().rglob("*.whl"))
-                destination.unlink()
-                destination.symlink_to(sentinel)
+        with self.tracked_output_streams() as streams:
 
-        self.policy.capacity_hook = inject
-        error = self.fails("storage_path")
+            def inject(owned, destination):
+                if destination in streams:
+                    # Real production stream closure, not a mocked close flag.
+                    self.assertTrue(streams[destination].closed)
+                    injected.append(destination)
+                    destination.unlink()
+                    destination.symlink_to(sentinel)
+                return original_seal(owned, destination)
+
+            with mock.patch.object(storage._Owned, "seal", new=inject):
+                error = self.fails("storage_path")
+        self.assertEqual(1, len(injected))
         self.assertTrue(error.cleanup_pending)
         self.assertEqual("foreign", sentinel.read_text())
-        self.assertTrue(next(self.partial().rglob("*.whl")).is_symlink())
+        self.assertTrue(injected[0].is_symlink())
+        self.assertFalse((self.partial() / "COMPLETE.json").exists())
+        self.assertEqual(0, self.policy.publications)
+
+    def test_closed_destination_identity_replacement_preserves_both_files(self):
+        injected = []
+        original_seal = storage._Owned.seal
+
+        with self.tracked_output_streams() as streams:
+
+            def inject(owned, destination):
+                if destination in streams:
+                    self.assertTrue(streams[destination].closed)
+                    original = destination.read_bytes()
+                    prior = destination.with_suffix(".prior")
+                    destination.rename(prior)
+                    destination.write_bytes(b"foreign replacement")
+                    injected.append((destination, prior, original))
+                return original_seal(owned, destination)
+
+            with mock.patch.object(storage._Owned, "seal", new=inject):
+                error = self.fails("storage_identity")
+        self.assertEqual(1, len(injected))
+        destination, prior, original = injected[0]
+        self.assertTrue(error.cleanup_pending)
+        self.assertEqual(original, prior.read_bytes())
+        self.assertEqual(b"foreign replacement", destination.read_bytes())
+        self.assertNotEqual(storage._identity(prior.stat()), storage._identity(destination.stat()))
+        self.assertFalse((self.partial() / "COMPLETE.json").exists())
+        self.assertEqual(0, self.policy.publications)
+
+    def test_open_destination_delete_boundary_is_fail_closed(self):
+        sentinel = self.base / "sentinel"
+        sentinel.write_text("foreign")
+        attempts, blocked = [], []
+
+        with self.tracked_output_streams() as streams:
+
+            def inject(number):
+                if number == 2:
+                    destination = next(self.partial().rglob("*.whl"))
+                    self.assertFalse(streams[destination].closed)
+                    attempts.append(
+                        (
+                            destination,
+                            storage._identity(destination.stat()),
+                            destination.read_bytes(),
+                        )
+                    )
+                    try:
+                        destination.unlink()
+                    except PermissionError as error:
+                        # Only the exact Windows sharing refusal is expected.
+                        # Another I/O error must not satisfy this regression.
+                        self.assertEqual("nt", os.name)
+                        self.assertEqual(32, error.winerror)
+                        blocked.append("unlink-sharing-violation")
+                        raise
+                    destination.symlink_to(sentinel)
+
+            self.policy.capacity_hook = inject
+            error = self.fails("storage_io" if os.name == "nt" else "storage_path")
+        self.assertEqual(1, len(attempts))
+        destination, identity, original = attempts[0]
+        self.assertTrue(streams[destination].closed)
+        self.assertTrue(error.cleanup_pending)
+        self.assertEqual("foreign", sentinel.read_text())
+        if os.name == "nt":
+            self.assertEqual(["unlink-sharing-violation"], blocked)
+            self.assertFalse(destination.is_symlink())
+            self.assertEqual(identity, storage._identity(destination.stat()))
+            self.assertEqual(original, destination.read_bytes())
+        else:
+            self.assertEqual([], blocked)
+            self.assertTrue(destination.is_symlink())
+        self.assertFalse((self.partial() / "COMPLETE.json").exists())
+        self.assertEqual(0, self.policy.publications)
 
     def test_post_hash_destination_change_prevents_publication(self):
         self.records = self.records[:1]
