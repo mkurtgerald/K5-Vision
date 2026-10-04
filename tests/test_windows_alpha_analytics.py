@@ -2076,6 +2076,11 @@ sys.exit(1 if failed else 0)
 ELEMENT_CHECKPOINT_PREFIX = b"K5_ELEMENT_CHECKPOINT="
 ELEMENT_CHECKPOINTS = {
     "shell_control_entered",
+    "shell_console_entered",
+    "shell_console_exit",
+    "shell_body_entered",
+    "shell_write_output_requested",
+    "shell_write_output_returned",
     "shell_control_exit",
     "python_control_entered",
     "reference_entered",
@@ -2143,6 +2148,39 @@ exit 0
 """.replace("__EXPECTED__", expected).replace("__HASH__", digest)
 
 
+ELEMENT_PARAMETER_CONTROL = "\nparam([string]$Name = '')\n$ErrorActionPreference = 'Stop'\nexit 0\n"
+ELEMENT_CONSOLE_CONTROL = (
+    ELEMENT_PARAMETER_CONTROL.removesuffix("exit 0\n")
+    + """[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shell_console_entered')
+[Console]::Out.Flush()
+[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shell_console_exit')
+[Console]::Out.Flush()
+exit 0
+"""
+)
+
+
+def _element_instrument_control_script(argument):
+    original = _element_control_script(argument)
+    selected = original
+    for anchor, checkpoint in (
+        ("param([string]$Name = '')\n", "shell_body_entered"),
+        ("$ErrorActionPreference = 'Stop'\n", "shell_write_output_requested"),
+        (
+            "Write-Output 'K5_ELEMENT_CHECKPOINT=shell_control_entered'\n",
+            "shell_write_output_returned",
+        ),
+    ):
+        if original.count(anchor) != 1 or checkpoint in original:
+            raise ValueError("Invalid fixed checkpoint anchor")
+        insertion = (
+            "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=" + checkpoint + "')\n"
+            "[Console]::Out.Flush()\n"
+        )
+        selected = selected.replace(anchor, anchor + insertion, 1)
+    return selected
+
+
 def _pe_fixture_subsystem(path: Path) -> int:
     import struct
 
@@ -2200,9 +2238,9 @@ def _parse_element_probe(raw: bytes) -> dict:
 
 ELEMENT_FIXTURE_PREFIX = "K5_ELEMENT_FIXTURE_DIAGNOSTIC="
 ELEMENT_FIXTURE_PHASES = {
-    "shell_body_devnull_control",
-    "shell_exit_captured_control",
-    "shell_captured_control",
+    "shell_parameter_control",
+    "shell_console_control",
+    "shell_write_output_control",
     "python_control",
     "argv_control",
     "module_load",
@@ -2468,67 +2506,33 @@ def _capture_element_child(common, arguments, *, cwd, env, context):
     return bytes(result)
 
 
-def _element_devnull_control(
-    common,
-    arguments,
-    *,
-    cwd,
-    env,
-    context,
-    allow_observed_failure=False,
-):
-    _element_diagnostic(context, "started")
-    observed_failure = False
+def _element_body_controls(common, commands, *, cwd, env):
+    # 1abac198 localized the stall to the body even with DEVNULL. Bracket only
+    # its first command; neither a checkpoint nor a timeout establishes a cause.
+    expected = (
+        ("shell_parameter_control", []),
+        ("shell_console_control", ["shell_console_entered", "shell_console_exit"]),
+        (
+            "shell_write_output_control",
+            [
+                "shell_body_entered",
+                "shell_write_output_requested",
+                "shell_control_entered",
+                "shell_write_output_returned",
+                "shell_control_exit",
+            ],
+        ),
+    )
+    context = _element_context("shell_parameter_control")
     try:
-        common.run(arguments, cwd=cwd, env=env, operation="probe_admission", seconds=15)
-    except Exception as error:
-        try:
-            _element_diagnostic(context, "failed", error, common=common)
-            known = type(error) is common.WitnessError
-            if known and error.args in (("child_failed",), ("child_timeout",)):
-                _element_diagnostic(context, "passed", boundary="owned_cleanup")
-                observed_failure = True
-            elif known and error.args == ("cleanup_incomplete",):
-                _element_diagnostic(
-                    context, "failed", error, common=common, boundary="owned_cleanup"
-                )
-            # Other exceptions do not establish whether ownership cleanup finished.
-        except Exception:
-            observed_failure = False
-        if allow_observed_failure and observed_failure:
-            return False
-        raise _ElementCaptureFailure from None
-    _element_diagnostic(context, "passed", boundary="owned_cleanup")
-    _element_diagnostic(context, "passed")
-    return True
-
-
-def _element_cross_controls(common, body_command, exit_command, *, cwd, env):
-    # d561 qualified the literal File/Command and capture on/off controls. Keep
-    # only the missing body-versus-PIPE cross-check; do not alter reader ordering.
-    context = _element_context("shell_body_devnull_control")
-    try:
-        body_ok = _element_devnull_control(
-            common,
-            body_command,
-            cwd=cwd,
-            env=env,
-            context=context,
-            allow_observed_failure=True,
-        )
-        context = _element_context("shell_exit_captured_control")
-        if _capture_element_child(common, exit_command, cwd=cwd, env=env, context=context) != b"":
-            raise ValueError("Invalid literal PIPE control")
-        _element_diagnostic(context, "passed")
-        if not body_ok:
-            raise _ElementCaptureFailure  # The earlier fixed primary remains the failure.
-        context = _element_context("shell_captured_control")
-        output = _capture_element_child(common, body_command, cwd=cwd, env=env, context=context)
-        if output.splitlines() != [
-            b"K5_ELEMENT_CHECKPOINT=shell_control_entered",
-            b"K5_ELEMENT_CHECKPOINT=shell_control_exit",
-        ]:
-            raise ValueError("Invalid output-body PIPE control")
+        for command, (phase, checkpoints) in zip(commands, expected, strict=True):
+            context = _element_context(phase)
+            output = _capture_element_child(common, command, cwd=cwd, env=env, context=context)
+            if output.splitlines() != [
+                ELEMENT_CHECKPOINT_PREFIX + name.encode("ascii") for name in checkpoints
+            ]:
+                raise ValueError("Invalid fixed body control")
+            _element_diagnostic(context, "passed")
     except _ElementCaptureFailure:
         raise
     except Exception as error:
@@ -2614,13 +2618,21 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
         control.write_text(
             _element_control_script(control_argument), encoding="ascii", newline="\n"
         )
-        exit_control = tmp_path / "exit-zero.ps1"
-        exit_control.write_bytes(b"exit 0\n")
+        parameter_control = tmp_path / "parameter-control.ps1"
+        parameter_control.write_text(ELEMENT_PARAMETER_CONTROL, encoding="ascii", newline="\n")
+        console_control = tmp_path / "console-control.ps1"
+        console_control.write_text(ELEMENT_CONSOLE_CONTROL, encoding="ascii", newline="\n")
+        body_control = tmp_path / "body-control.ps1"
+        body_control.write_text(
+            _element_instrument_control_script(control_argument), encoding="ascii", newline="\n"
+        )
         shell_arguments = [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-File"]
-        _element_cross_controls(
+        _element_body_controls(
             common,
-            shell_arguments + [str(control)],
-            shell_arguments + [str(exit_control)],
+            [
+                shell_arguments + [str(script)]
+                for script in (parameter_control, console_control, body_control)
+            ],
             cwd=tmp_path,
             env=env,
         )
@@ -3059,9 +3071,9 @@ def test_element_fixture_child_contexts_and_reference_cleanup_are_fixed():
     ]
     section = section.split("def test_element_probe_parser", 1)[0]
     for phase in ELEMENT_FIXTURE_PHASES - {
-        "shell_body_devnull_control",
-        "shell_exit_captured_control",
-        "shell_captured_control",
+        "shell_parameter_control",
+        "shell_console_control",
+        "shell_write_output_control",
     }:
         assert f'_element_context("{phase}"' in section
     assert "_capture_element_child(" in section and "common.capture(" not in section
@@ -3424,153 +3436,116 @@ def test_element_exit_zero_partial_failure_suffix_is_rejected(tmp_path, monkeypa
     assert any(r["error"] == "output_invalid" for r in _fixture_records(output.out))
 
 
-def test_element_devnull_timeout_preserves_primary_and_successful_owned_cleanup(
-    tmp_path,
-    monkeypatch,
-    capsys,
-):
-    common = _startup_witness().common
-
-    def run(arguments, **kwargs):
-        assert kwargs["seconds"] == 15 and "stdout" not in kwargs
-        raise common.WitnessError(
-            "child_timeout",
-            common.diagnostic(
-                "probe_admission",
-                timed_out=True,
-                gate_state="started",
-            ),
-        )
-
-    monkeypatch.setattr(common, "run", run)
-    with pytest.raises(_ElementCaptureFailure):
-        _element_devnull_control(
-            common, [], cwd=tmp_path, env={}, context=_element_context("shell_body_devnull_control")
-        )
-    records = _fixture_records(capsys.readouterr().out)
-    assert records[1]["error"] == "child_timeout" and records[1]["timed_out"]
-    assert records[2]["boundary"] == "owned_cleanup" and records[2]["status"] == "passed"
-
-
-def test_element_devnull_unexpected_failure_leaves_cleanup_unconfirmed(
-    tmp_path, monkeypatch, capsys
-):
-    common = _startup_witness().common
-
-    def fail(*args, **kwargs):
-        raise RuntimeError("PRIVATE_UNEXPECTED")
-
-    monkeypatch.setattr(common, "run", fail)
-    with pytest.raises(_ElementCaptureFailure):
-        _element_devnull_control(
-            common, [], cwd=tmp_path, env={}, context=_element_context("shell_body_devnull_control")
-        )
-    output = capsys.readouterr()
-    assert "PRIVATE" not in output.out + output.err
-    records = _fixture_records(output.out)
-    assert records[-1]["error"] == "unexpected"
-    assert not any(r["boundary"] == "owned_cleanup" for r in records)
-
-
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "pass",
-        "body_timeout",
-        "body_unknown",
-        "body_cleanup",
-        "exit_timeout",
-        "exit_extra",
-        "body_pipe_timeout",
-        "body_pipe_extra",
-    ],
-)
-def test_element_cross_controls_preserve_body_argv_and_block_every_failure(
-    mode,
-    tmp_path,
-    monkeypatch,
-    capsys,
-):
-    common = _startup_witness().common
-    body = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", "control.ps1"]
-    literal = body[:-1] + ["exit-zero.ps1"]
-    env = {"fixed": "admitted"}
-    calls = []
-
-    def run(command, **kwargs):
-        assert command is body
-        assert kwargs == dict(cwd=tmp_path, env=env, operation="probe_admission", seconds=15)
-        calls.append("body_devnull")
-        if mode == "body_timeout":
-            raise common.WitnessError(
-                "child_timeout",
-                common.diagnostic(
-                    "probe_admission",
-                    timed_out=True,
-                    gate_state="started",
-                ),
-            )
-        if mode == "body_cleanup":
-            raise common.WitnessError("cleanup_incomplete")
-        if mode == "body_unknown":
-            raise RuntimeError("PRIVATE_FAILURE")
-
-    def capture(_common, command, **kwargs):
-        assert _common is common and kwargs["cwd"] == tmp_path and kwargs["env"] is env
-        if command is literal:
-            calls.append("exit_pipe")
-            assert kwargs["context"]["phase"] == "shell_exit_captured_control"
-            if mode == "exit_timeout":
-                raise _ElementCaptureFailure
-            return b"PRIVATE_EXTRA" if mode == "exit_extra" else b""
-        assert command is body
-        calls.append("body_pipe")
-        assert kwargs["context"]["phase"] == "shell_captured_control"
-        if mode == "body_pipe_timeout":
-            raise _ElementCaptureFailure
-        raw = (
-            b"K5_ELEMENT_CHECKPOINT=shell_control_entered\n"
-            b"K5_ELEMENT_CHECKPOINT=shell_control_exit\n"
-        )
-        return raw + b"PRIVATE_EXTRA" if mode == "body_pipe_extra" else raw
-
-    monkeypatch.setattr(common, "run", run)
-    monkeypatch.setitem(_element_cross_controls.__globals__, "_capture_element_child", capture)
-    if mode == "pass":
-        _element_cross_controls(common, body, literal, cwd=tmp_path, env=env)
-    else:
-        with pytest.raises((ValueError, _ElementCaptureFailure)):
-            _element_cross_controls(common, body, literal, cwd=tmp_path, env=env)
-    assert calls == (
-        ["body_devnull"]
-        if mode in {"body_unknown", "body_cleanup"}
-        else ["body_devnull", "exit_pipe"]
-        if mode in {"body_timeout", "exit_timeout", "exit_extra"}
-        else ["body_devnull", "exit_pipe", "body_pipe"]
-    )
-    output = capsys.readouterr()
-    assert "PRIVATE" not in output.out + output.err
-    if mode == "body_timeout":
-        records = _fixture_records(output.out)
-        assert any(r["error"] == "child_timeout" and r["timed_out"] for r in records)
-
-
-def test_element_cross_controls_retire_qualified_capture_axis_without_wait_order_change():
+def test_element_body_controls_use_fixed_direct_checkpoints_and_preserve_original():
     import inspect
 
+    original = _element_control_script("-fixed")
+    header = "\nparam([string]$Name = '')\n$ErrorActionPreference = 'Stop'\n"
+    assert original.startswith(header)
+    assert ELEMENT_PARAMETER_CONTROL == header + "exit 0\n"
+    assert ELEMENT_CONSOLE_CONTROL == (
+        header
+        + "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shell_console_entered')\n"
+        + "[Console]::Out.Flush()\n"
+        + "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shell_console_exit')\n"
+        + "[Console]::Out.Flush()\nexit 0\n"
+    )
+    instrumented = _element_instrument_control_script("-fixed")
+    stripped = instrumented
+    names = ("shell_body_entered", "shell_write_output_requested", "shell_write_output_returned")
+    for name in names:
+        insertion = (
+            "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=" + name + "')\n"
+            "[Console]::Out.Flush()\n"
+        )
+        assert stripped.count(insertion) == 1
+        stripped = stripped.replace(insertion, "", 1)
+    assert stripped.encode("ascii") == original.encode("ascii")
+    assert (
+        instrumented.index("param(")
+        < instrumented.index(names[0])
+        < instrumented.index("$ErrorActionPreference")
+        < instrumented.index(names[1])
+        < instrumented.index("Write-Output")
+        < instrumented.index(names[2])
+        < instrumented.index("if ($Name")
+    )
     main = inspect.getsource(test_windows_exact_element_probe_uses_fresh_actual_native_exit)
-    assert "_element_capture_controls(" not in main and "capfd" not in main
-    assert "_element_cross_controls(" in main
-    assert "shell_arguments + [str(control)]" in main
-    assert "shell_arguments + [str(exit_control)]" in main
-    assert 'exit_control.write_bytes(b"exit 0\\n")' in main
+    assert "_element_body_controls(" in main
+    assert "_element_cross_controls(" not in main and "exit-zero.ps1" not in main
+    assert main.index("_element_body_controls(") < main.index('_element_context("python_control")')
+    assert "_element_instrument_control_script(control_argument)" in main
     capture = inspect.getsource(_capture_element_child)
     assert (
         capture.index("reader.start()")
         < capture.index("reader.join(15)")
         < capture.index("owned.wait(5)")
     )
-    workflow = (ROOT / ".github/workflows/windows-alpha-script-smoke.yml").read_text()
-    suite = next(line for line in workflow.splitlines() if line.strip().startswith("pytest "))
-    assert "tests/test_windows_alpha_analytics.py" in suite and " -s" not in suite
     test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "unexpected_checkpoint"])
+def test_element_body_insertion_rejects_ambiguous_anchors(mutation, monkeypatch):
+    original = _element_control_script("-fixed")
+    anchor = "Write-Output 'K5_ELEMENT_CHECKPOINT=shell_control_entered'\n"
+    changed = (
+        original.replace(anchor, "")
+        if mutation == "missing"
+        else original + anchor
+        if mutation == "duplicate"
+        else original + "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shell_body_entered')\n"
+    )
+    monkeypatch.setitem(
+        _element_instrument_control_script.__globals__, "_element_control_script", lambda _: changed
+    )
+    with pytest.raises(ValueError):
+        _element_instrument_control_script("-fixed")
+
+
+@pytest.mark.parametrize("fail_at", [0, 1, 2])
+@pytest.mark.parametrize("failure", ["none", "timeout", "cleanup", "unknown", "extra", "missing"])
+def test_element_body_controls_stop_before_matrix_on_every_failure(
+    fail_at, failure, tmp_path, monkeypatch, capsys
+):
+    common = _startup_witness().common
+    commands = [["powershell.exe", "-File", str(tmp_path / f"control-{i}.ps1")] for i in range(3)]
+    env = {"fixed": "admitted"}
+    phases = ("shell_parameter_control", "shell_console_control", "shell_write_output_control")
+    expected = [
+        b"",
+        b"K5_ELEMENT_CHECKPOINT=shell_console_entered\nK5_ELEMENT_CHECKPOINT=shell_console_exit\n",
+        b"K5_ELEMENT_CHECKPOINT=shell_body_entered\n"
+        b"K5_ELEMENT_CHECKPOINT=shell_write_output_requested\n"
+        b"K5_ELEMENT_CHECKPOINT=shell_control_entered\n"
+        b"K5_ELEMENT_CHECKPOINT=shell_write_output_returned\n"
+        b"K5_ELEMENT_CHECKPOINT=shell_control_exit\n",
+    ]
+    calls = []
+
+    def capture(_common, command, **kwargs):
+        index = len(calls)
+        assert _common is common and command is commands[index]
+        assert kwargs == dict(cwd=tmp_path, env=env, context=_element_context(phases[index]))
+        calls.append(index)
+        if index == fail_at:
+            if failure in {"timeout", "cleanup"}:
+                raise _ElementCaptureFailure
+            if failure == "unknown":
+                raise RuntimeError("PRIVATE_FAILURE")
+            if failure == "extra":
+                return expected[index] + b"PRIVATE_EXTRA\n"
+            if failure == "missing":
+                return b"PRIVATE" if index == 0 else b""
+        return expected[index]
+
+    monkeypatch.setitem(_element_body_controls.__globals__, "_capture_element_child", capture)
+    if failure == "none":
+        _element_body_controls(common, commands, cwd=tmp_path, env=env)
+    else:
+        with pytest.raises(_ElementCaptureFailure):
+            _element_body_controls(common, commands, cwd=tmp_path, env=env)
+    assert calls == list(range(3 if failure == "none" else fail_at + 1))
+    output = capsys.readouterr()
+    assert "PRIVATE" not in output.out + output.err
+    passed = [r["phase"] for r in _fixture_records(output.out) if r["status"] == "passed"]
+    assert passed == list(phases if failure == "none" else phases[:fail_at])
