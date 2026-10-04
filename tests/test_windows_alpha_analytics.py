@@ -1914,7 +1914,7 @@ function Write-K5ElementChildFailure([object]$Failure, [string]$Phase, [string]$
 ELEMENT_UTILITY_OBSERVATION = r"""
 function Write-K5UtilityBindingObservation {
     $observed = [ordered]@{
-        schema_version = 'element-utility-binding-v1'
+        schema_version = 'element-utility-binding-v2'
         pshome_verified = $true; manifest_hash_verified = $true; manifest_reparse_clear = $true
         module_count_ok = $false; module_type_ok = $false; module_name_ok = $false
         module_base_ok = $false; module_path_ok = $false; cmdlet_type_ok = $false
@@ -1959,9 +1959,10 @@ function Write-K5UtilityBindingObservation {
             }
             $observedKey = $observedPair.Item1.Value
             if ($observedKey -in @('RootModule','NestedModules')) {
-                if ($observedDeclarations.ContainsKey($observedKey) -or
-                    $observedPair.Item2.Statements.Count -ne 1) { throw 'observation_unsupported' }
-                $observedPipeline = $observedPair.Item2.Statements[0]
+                if ($observedDeclarations.ContainsKey($observedKey)) {
+                    throw 'observation_unsupported'
+                }
+                $observedPipeline = $observedPair.Item2
                 if ($observedPipeline -isnot [Management.Automation.Language.PipelineAst] -or
                     $observedPipeline.PipelineElements.Count -ne 1 -or
                     $observedPipeline.PipelineElements[0] -isnot
@@ -2042,15 +2043,15 @@ function Write-K5UtilityBindingObservation {
         catch { $observed.metadata_complete = $false }
         try {
             $observedBase = [IO.Path]::GetFullPath($observedModule.ModuleBase)
-            $observed.module_base_ok = [string]::Equals($observedBase, $utilityBase,
+            $observed.module_base_ok = [string]::Equals($observedBase, $expectedHome,
                 [StringComparison]::OrdinalIgnoreCase)
             $observed.module_base_kind = 'other'
             if ($observed.module_base_ok) {
-                $observed.module_base_kind = 'admitted_module_directory'
-            }
-            elseif ([string]::Equals($observedBase, $expectedHome,
-                [StringComparison]::OrdinalIgnoreCase)) {
                 $observed.module_base_kind = 'exact_pshome'
+            }
+            elseif ([string]::Equals($observedBase, $utilityBase,
+                [StringComparison]::OrdinalIgnoreCase)) {
+                $observed.module_base_kind = 'admitted_module_directory'
             }
         } catch { $observed.metadata_complete = $false }
         try {
@@ -2123,7 +2124,7 @@ function Write-K5UtilityBindingObservation {
          $observed.nested_modules_kind -in @('utility_dll_only','utility_dll_and_psm1')) -and
         $observed.module_path_kind -in
             @('exact_pshome_utility_dll','exact_verified_export_assembly'))
-    $observedJson = ('{{"schema_version":"element-utility-binding-v1","pshome_verified":{0}' +
+    $observedJson = ('{{"schema_version":"element-utility-binding-v2","pshome_verified":{0}' +
         ',"manifest_hash_verified":{1},"manifest_reparse_clear":{2},"module_count_ok":{3}' +
         ',"module_type_ok":{4},"module_name_ok":{5},"module_base_ok":{6},"module_path_ok":{7}' +
         ',"cmdlet_type_ok":{8},"implementation_type_ok":{9},"assembly_name_ok":{10}' +
@@ -2215,7 +2216,7 @@ if ($utilityModules.Count -ne 1 -or
 }
 $utilityModule = $utilityModules[0]
 if ($utilityModule.Name -cne 'Microsoft.PowerShell.Utility' -or
-    -not [string]::Equals([IO.Path]::GetFullPath($utilityModule.ModuleBase), $utilityBase,
+    -not [string]::Equals([IO.Path]::GetFullPath($utilityModule.ModuleBase), $expectedHome,
         [StringComparison]::OrdinalIgnoreCase) -or
     -not [string]::Equals([IO.Path]::GetFullPath($utilityModule.Path), $utilityManifest,
         [StringComparison]::OrdinalIgnoreCase)) { throw 'fixture_identity' }
@@ -2626,7 +2627,7 @@ ELEMENT_UTILITY_PREDICATES = {
     "metadata_complete",
 }
 ELEMENT_UTILITY_CATEGORIES = {
-    "schema_version": {"element-utility-binding-v1"},
+    "schema_version": {"element-utility-binding-v2"},
     "manifest_shape": {"supported", "unsupported"},
     "root_module_kind": {"absent", "utility_dll", "other_literal", "unavailable"},
     "nested_modules_kind": {
@@ -2675,9 +2676,9 @@ def _element_utility_binding_records(raw):
         for key, allowed in ELEMENT_UTILITY_CATEGORIES.items():
             if type(value[key]) is not str or value[key] not in allowed:
                 raise ValueError("Invalid utility observation")
-        if value["module_base_ok"] != (
-            value["module_base_kind"] == "admitted_module_directory"
-        ) or value["module_path_ok"] != (value["module_path_kind"] == "admitted_manifest"):
+        if value["module_base_ok"] != (value["module_base_kind"] == "exact_pshome") or value[
+            "module_path_ok"
+        ] != (value["module_path_kind"] == "admitted_manifest"):
             raise ValueError("Inconsistent utility observation")
         signed = all(
             value[key]
@@ -4249,7 +4250,7 @@ def test_element_utility_controls_require_both_routes_before_matrix(
     assert "PRIVATE" not in output.out + output.err
 
 
-def test_element_utility_binding_observation_preserves_admission_conjunction():
+def test_element_utility_binding_changes_only_qualified_pshome_predicate():
     import hashlib
 
     assert ELEMENT_UTILITY_BINDING_PREFIX == b"K5_ELEMENT_UTILITY_BINDING="
@@ -4257,8 +4258,13 @@ def test_element_utility_binding_observation_preserves_admission_conjunction():
     end = ELEMENT_UTILITY_IMPORT.index(
         "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_binding_verified')", start
     )
+    binding = ELEMENT_UTILITY_IMPORT[start:end]
+    corrected = "GetFullPath($utilityModule.ModuleBase), $expectedHome,"
+    original = "GetFullPath($utilityModule.ModuleBase), $utilityBase,"
+    assert binding.count(corrected) == 1
+    # Restore only the demonstrated correction to compare every other original predicate.
     assert (
-        hashlib.sha256(ELEMENT_UTILITY_IMPORT[start:end].encode()).hexdigest()
+        hashlib.sha256(binding.replace(corrected, original, 1).encode()).hexdigest()
         == "04c584d32785502b86e82295c0e3f87bb8d894a12b3d0294e53ca975954db0f3"
     )
     assert ELEMENT_UTILITY_IMPORT.index("Write-K5UtilityBindingObservation") < start
@@ -4271,12 +4277,12 @@ def test_element_utility_binding_observation_preserves_admission_conjunction():
 def _utility_observation_bytes(**changes):
     value = {key: True for key in ELEMENT_UTILITY_PREDICATES}
     value.update(
-        schema_version="element-utility-binding-v1",
+        schema_version="element-utility-binding-v2",
         declared_binary_path_match=False,
         manifest_shape="supported",
         root_module_kind="absent",
         nested_modules_kind="utility_dll_and_psm1",
-        module_base_kind="admitted_module_directory",
+        module_base_kind="exact_pshome",
         module_path_kind="admitted_manifest",
     )
     value.update(changes)
@@ -4303,7 +4309,7 @@ def test_element_utility_binding_record_rejects_raw_forged_and_inconsistent_fiel
         ELEMENT_UTILITY_BINDING_PREFIX + b"[]",
         _utility_observation_bytes(raw="PRIVATE_PATH"),
         valid.rstrip()[:-1] + b',"token_match":true}\n',
-        _utility_observation_bytes(module_base_kind="exact_pshome"),
+        _utility_observation_bytes(module_base_kind="admitted_module_directory"),
         _utility_observation_bytes(module_base_ok=False),
         _utility_observation_bytes(module_path_ok=False),
         _utility_observation_bytes(module_path_kind="exact_pshome_utility_dll"),
@@ -4318,7 +4324,9 @@ def test_element_utility_binding_record_rejects_raw_forged_and_inconsistent_fiel
         with pytest.raises(ValueError):
             _element_utility_binding_records(forged)
     # Diagnostics may report a complete mismatch; they cannot permit execution.
-    mismatch = _utility_observation_bytes(module_base_ok=False, module_base_kind="exact_pshome")
+    mismatch = _utility_observation_bytes(
+        module_base_ok=False, module_base_kind="admitted_module_directory"
+    )
     assert not _element_utility_binding_records(mismatch)[0]["module_base_ok"]
     for rejected in (
         mismatch,
@@ -4560,3 +4568,48 @@ def test_windows_utility_manifest_ast_literals_and_unsupported_forms(tmp_path):
         except Exception:
             pass
         pytest.fail("Owned manifest AST fixture failed", pytrace=False)
+
+
+def test_element_manifest_value_uses_documented_statement_ast_directly():
+    # HashtableAst's tuple value is StatementAst; PipelineAst has no Statements property.
+    assert "$observedPipeline = $observedPair.Item2\n" in ELEMENT_UTILITY_OBSERVATION
+    assert "$observedPair.Item2.Statements" not in ELEMENT_UTILITY_OBSERVATION
+    assignment = ELEMENT_UTILITY_OBSERVATION.index("$observedPipeline = $observedPair.Item2\n")
+    assert (
+        ELEMENT_UTILITY_OBSERVATION.index(
+            "$observedPipeline -isnot [Management.Automation.Language.PipelineAst]", assignment
+        )
+        > assignment
+    )
+    assert any(case == "empty" for case, *_ in UTILITY_AST_CASES)
+
+
+def test_element_module_base_requires_only_qualified_pshome():
+    assert "GetFullPath($utilityModule.ModuleBase), $expectedHome," in ELEMENT_UTILITY_IMPORT
+    assert (
+        "$observed.module_base_ok = [string]::Equals($observedBase, $expectedHome,"
+        in ELEMENT_UTILITY_OBSERVATION
+    )
+    valid = _utility_observation_bytes(module_base_ok=True, module_base_kind="exact_pshome")
+    _element_require_utility_observation(valid)
+    for kind in (
+        "admitted_module_directory",
+        "exact_verified_export_directory",
+        "other",
+        "unavailable",
+    ):
+        observation = _utility_observation_bytes(module_base_ok=False, module_base_kind=kind)
+        _element_utility_binding_records(observation)
+        with pytest.raises(ValueError):
+            _element_require_utility_observation(observation)
+
+
+def test_element_binding_v2_refuses_legacy_expected_base_semantics():
+    assert ELEMENT_UTILITY_CATEGORIES["schema_version"] == {"element-utility-binding-v2"}
+    with pytest.raises(ValueError):
+        _element_utility_binding_records(
+            _utility_observation_bytes(
+                schema_version="element-utility-binding-v1",
+                module_base_kind="admitted_module_directory",
+            )
+        )
