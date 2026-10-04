@@ -24,8 +24,8 @@ from k5vision.operator_runtime import build_environment_operator_runtime
 
 
 def create_app(**kwargs: object) -> FastAPI:
-    # main also exports an eager default app. Defer that module import until
-    # explicit analytics admission succeeds, before any configured DB can open.
+    # Keep the factory import behind explicit analytics admission. Importing the
+    # factory itself does not construct the separate default ASGI application.
     from k5vision.main import create_app as create_control_plane
 
     return create_control_plane(**kwargs)
