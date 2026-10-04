@@ -2773,7 +2773,7 @@ def _validate_element_diagnostic(value):
             "timeout",
         },
         "variant": {"none", "original", "process"},
-        "initial": {"none", "absent", "stale_zero", "stale_nonzero"},
+        "initial": {"none", "absent", "stale_zero", "stale_nonzero", "stale_seven"},
         "boundary": {"primary", "owned_cleanup", "child_primary", "child_cleanup"},
         "status": {"started", "passed", "failed"},
         "error": ELEMENT_FIXTURE_ERRORS,
@@ -2988,6 +2988,11 @@ def _capture_element_child(common, arguments, *, cwd, env, context):
             for binding in _element_utility_binding_records(complete):
                 print(
                     ELEMENT_UTILITY_BINDING_PREFIX.decode()
+                    + json.dumps(binding, separators=(",", ":"))
+                )
+            for binding in _run_facade_management_binding_records(complete):
+                print(
+                    RUN_FACADE_MANAGEMENT_PREFIX.decode()
                     + json.dumps(binding, separators=(",", ":"))
                 )
             for checkpoint in checkpoints:
@@ -5641,15 +5646,70 @@ RUN_FACADE_CASES = {
     "cleanup_throw": "cleanup_failure",
     "child_exit_nonzero": "wrapper_failure",
 }
-RUN_FACADE_INITIALS = {"absent": None, "stale_zero": 0, "stale_nonzero": 9}
+RUN_FACADE_INITIALS = {"absent": None, "stale_zero": 0, "stale_nonzero": 9, "stale_seven": 7}
+RUN_FACADE_SCENARIOS = [
+    (initial, case)
+    for case in sorted(RUN_FACADE_CASES)
+    for initial in ("absent", "stale_nonzero", "stale_zero")
+] + [("stale_seven", case) for case in ("success", "child_exit_nonzero")]
+# Exact comparison from b3ddecf414ed25ed6f6a36048771122c3505bb5c Run lines 29-32.
+# This is a policy projection, not a claim that the historical full Run completed.
+RUN_FACADE_HISTORICAL_COMPARISON = (
+    "    $nativeExitChanged = -not $nativeExitBeforePresent -or "
+    "$nativeExitAfterValue -ne $nativeExitBeforeValue\n"
+    "    if ($nativeExitChanged -and $nativeExitAfterValue -ne 0) {\n"
+    '        throw "K5 Vision Alpha launcher failed."\n'
+    "    }"
+)
 RUN_FACADE_CHECKPOINTS = (
     "facade_source_requested",
     "facade_source_selected",
     "facade_invoke_requested",
     "facade_invoke_returned",
 )
-ELEMENT_CHECKPOINTS.update(RUN_FACADE_CHECKPOINTS)
-RUN_FACADE_SCRIPT = r"""
+RUN_FACADE_MANAGEMENT_CHECKPOINTS = (
+    "management_manifest_requested",
+    "management_import_requested",
+    "management_import_returned",
+    "management_binding_verified",
+)
+RUN_FACADE_MANAGEMENT_PREFIX = b"K5_ELEMENT_MANAGEMENT_BINDING="
+# Reuse the qualified, bounded manifest import/metadata observer without changing
+# it for existing probes. Only the exact PSHOME module and exported command differ.
+RUN_FACADE_MANAGEMENT_IMPORT = (
+    ELEMENT_UTILITY_IMPORT.replace("UTILITY", "MANAGEMENT")
+    .replace("Utility", "Management")
+    .replace("utility", "management")
+    .replace("Write-Output", "Join-Path")
+    .replace("WriteOutputCommand", "JoinPathCommand")
+    .replace("-Name $managementManifest -PassThru", "-Name $managementManifest -Global -PassThru")
+    # Keep the existing child-error phase vocabulary; checkpoints identify the module.
+    .replace("$fixturePhase = 'management_", "$fixturePhase = 'utility_")
+)
+RUN_FACADE_MANAGEMENT_TEST_PATH = r"""
+$managementTestPath = $managementModule.ExportedCmdlets['Test-Path']
+if ($managementTestPath -isnot [Management.Automation.CmdletInfo] -or
+    $managementTestPath.ImplementingType.FullName -cne
+        'Microsoft.PowerShell.Commands.TestPathCommand') { throw 'fixture_identity' }
+$managementTestAssembly = $managementTestPath.ImplementingType.Assembly.GetName()
+$managementTestToken = $managementTestAssembly.GetPublicKeyToken()
+if ($managementTestAssembly.Name -cne 'Microsoft.PowerShell.Commands.Management' -or
+    $managementTestToken.Length -ne 8 -or $coreToken.Length -ne 8 -or
+    [BitConverter]::ToString($managementTestToken) -cne [BitConverter]::ToString($coreToken)) {
+    throw 'fixture_identity'
+}
+"""
+_management_verified = (
+    "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=management_binding_verified')"
+)
+if RUN_FACADE_MANAGEMENT_IMPORT.count(_management_verified) != 1:
+    raise ValueError("Invalid scoped Management verification anchor")
+RUN_FACADE_MANAGEMENT_IMPORT = RUN_FACADE_MANAGEMENT_IMPORT.replace(
+    _management_verified, RUN_FACADE_MANAGEMENT_TEST_PATH + _management_verified, 1
+)
+ELEMENT_CHECKPOINTS.update((*RUN_FACADE_MANAGEMENT_CHECKPOINTS, *RUN_FACADE_CHECKPOINTS))
+RUN_FACADE_SCRIPT = (
+    r"""
 param([string]$Run, [string]$RunHash, [string]$StartSource, [string]$StartHash,
       [string]$InstallRoot, [string]$Initial, [string]$Case, [string]$SourceKind)
 $ErrorActionPreference = 'Stop'
@@ -5678,12 +5738,31 @@ function Read-K5FacadeSource([string]$Path, [string]$Expected, [int]$Maximum) {
 $fixturePhase = 'utility_manifest'
 try {
 __ELEMENT_UTILITY_IMPORT__
+__FACADE_MANAGEMENT_IMPORT__
     $fixturePhase = 'source_select'
     [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=facade_source_requested')
     [Console]::Out.Flush()
-    if ($Initial -cnotin @('absent','stale_zero','stale_nonzero') -or
+    if ($Initial -cnotin @('absent','stale_zero','stale_nonzero','stale_seven') -or
         $Case -cnotin @('success','child_throw','cleanup_throw','child_exit_nonzero') -or
         $SourceKind -cnotin @('synthetic','public')) { throw 'fixture_arguments' }
+    # Execute only the immutable historical comparison, with fixed scalar inputs.
+    # The changed-code control must reject; the equal-code collision must not.
+    # No automatic variable, child result, or actual Run source is altered here.
+    $historicalControls = 0
+    foreach ($comparison in @(@(0,7,$true), @(7,7,$false), @(7,0,$false))) {
+        $nativeExitBeforePresent = $true
+        $nativeExitBeforeValue = $comparison[0]
+        $nativeExitAfterValue = $comparison[1]
+        $historicalRejected = $false
+        try {
+__HISTORICAL_COMPARISON__
+        } catch {
+            if ($_.Exception.Message -cne 'K5 Vision Alpha launcher failed.') { throw }
+            $historicalRejected = $true
+        }
+        if ($historicalRejected -ne $comparison[2]) { throw 'fixture_identity' }
+        $historicalControls += 1
+    }
     $runSource = Read-K5FacadeSource $Run $RunHash 16384
     $source = Read-K5FacadeSource $StartSource $StartHash 65536
     $tokens = $null; $errors = $null
@@ -5771,6 +5850,7 @@ __PRODUCT_SUCCESS_RETURN__
     }
     if ($Initial -ceq 'stale_zero') { $global:LASTEXITCODE = 0 }
     elseif ($Initial -ceq 'stale_nonzero') { $global:LASTEXITCODE = 9 }
+    elseif ($Initial -ceq 'stale_seven') { $global:LASTEXITCODE = 7 }
     $outcome = 'returned'
     $fixturePhase = 'probe_invoke'
     [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=facade_invoke_requested')
@@ -5811,6 +5891,7 @@ __PRODUCT_SUCCESS_RETURN__
         [string]$global:K5FacadeEntered + ',"cleanup":' +
         [string]$global:K5FacadeCleanup + ',"arguments_valid":' +
         $global:K5FacadeArgumentsValid.ToString().ToLowerInvariant() +
+        ',"historical_collision":' + ($historicalControls -eq 3).ToString().ToLowerInvariant() +
         ',"ambient_after":' + $ambientJson + '}'
     [Console]::Out.WriteLine('K5_RUN_FACADE_RESULT=' + $json)
     [Console]::Out.Flush()
@@ -5819,9 +5900,67 @@ __PRODUCT_SUCCESS_RETURN__
     Write-K5ElementChildFailure $_ $fixturePhase 'primary'
     exit 1
 }
-""".replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS).replace(
-    "__ELEMENT_UTILITY_IMPORT__", ELEMENT_UTILITY_IMPORT
+""".replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS)
+    .replace("__ELEMENT_UTILITY_IMPORT__", ELEMENT_UTILITY_IMPORT)
+    .replace("__HISTORICAL_COMPARISON__", RUN_FACADE_HISTORICAL_COMPARISON)
+    .replace("__FACADE_MANAGEMENT_IMPORT__", RUN_FACADE_MANAGEMENT_IMPORT)
 )
+
+
+def _run_facade_bind_modules(script, powershell, common):
+    script = _element_bind_utility(script, powershell, common)
+    home = common.local_path(powershell).parent
+    manifest = common.local_path(
+        home / "Modules/Microsoft.PowerShell.Management/Microsoft.PowerShell.Management.psd1"
+    )
+    with manifest.open("rb") as stream:
+        raw = stream.read(65537)
+    if not raw or len(raw) > 65536:
+        raise ValueError("Invalid scoped Management manifest")
+    for marker, value in (
+        ("__MANAGEMENT_HOME__", str(home).replace("'", "''")),
+        ("__MANAGEMENT_SHA256__", hashlib.sha256(raw).hexdigest()),
+    ):
+        if script.count(marker) != 1:
+            raise ValueError("Invalid scoped Management template")
+        script = script.replace(marker, value, 1)
+    return script
+
+
+def _run_facade_management_as_utility(line):
+    if type(line) is not bytes or not line.startswith(RUN_FACADE_MANAGEMENT_PREFIX):
+        raise ValueError("Invalid scoped Management observation")
+    normalized = ELEMENT_UTILITY_BINDING_PREFIX + line[len(RUN_FACADE_MANAGEMENT_PREFIX) :].replace(
+        b"management", b"utility"
+    )
+    restored = RUN_FACADE_MANAGEMENT_PREFIX + normalized[
+        len(ELEMENT_UTILITY_BINDING_PREFIX) :
+    ].replace(b"utility", b"management")
+    if restored != line:
+        raise ValueError("Invalid scoped Management schema")
+    return normalized
+
+
+def _run_facade_management_binding_records(raw):
+    if len(raw) > 4096:
+        raise ValueError("Invalid scoped Management observations")
+    records = []
+    for line in raw.splitlines():
+        if not line.startswith(RUN_FACADE_MANAGEMENT_PREFIX):
+            continue
+        normalized = _run_facade_management_as_utility(line)
+        for value in _element_utility_binding_records(normalized + b"\n"):
+            records.append(
+                {
+                    key.replace("utility", "management"): item.replace("utility", "management")
+                    if type(item) is str
+                    else item
+                    for key, item in value.items()
+                }
+            )
+    if len(records) > 1:
+        raise ValueError("Duplicate scoped Management observation")
+    return records
 
 
 def _run_facade_record(output):
@@ -5854,6 +5993,7 @@ def _run_facade_record(output):
         "entered",
         "cleanup",
         "arguments_valid",
+        "historical_collision",
         "ambient_after",
     }:
         raise ValueError("Invalid fixed facade observation")
@@ -5868,7 +6008,9 @@ def _run_facade_record(output):
         type(value[key]) is not str or value[key] not in options for key, options in enums.items()
     ):
         raise ValueError("Invalid fixed facade observation")
-    if type(value["arguments_valid"]) is not bool or any(
+    if any(
+        type(value[key]) is not bool for key in ("arguments_valid", "historical_collision")
+    ) or any(
         type(value[key]) is not int or not 0 <= value[key] <= 2 for key in ("entered", "cleanup")
     ):
         raise ValueError("Invalid fixed facade observation")
@@ -5886,23 +6028,34 @@ def _run_facade_child_record(output):
         "utility_import_requested",
         "utility_import_returned",
         "utility_binding_verified",
+        *RUN_FACADE_MANAGEMENT_CHECKPOINTS,
         *RUN_FACADE_CHECKPOINTS,
     ]
     if complete != output or checkpoints != expected or arguments:
         raise ValueError("Incomplete fixed facade observations")
     lines = output.splitlines()
     if (
-        len(lines) not in (10, 11)
+        len(lines) not in (15, 16)
         or lines[:3] != [ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in expected[:3]]
         or lines[4] != ELEMENT_CHECKPOINT_PREFIX + b"utility_binding_verified"
     ):
         raise ValueError("Invalid scoped Utility observation")
     _element_require_utility_observation(lines[3])
-    if lines[5:8] != [
+    if (
+        lines[5:8]
+        != [
+            ELEMENT_CHECKPOINT_PREFIX + name.encode()
+            for name in RUN_FACADE_MANAGEMENT_CHECKPOINTS[:3]
+        ]
+        or lines[9] != ELEMENT_CHECKPOINT_PREFIX + b"management_binding_verified"
+    ):
+        raise ValueError("Invalid scoped Management observation order")
+    _element_require_utility_observation(_run_facade_management_as_utility(lines[8]))
+    if lines[10:13] != [
         ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in RUN_FACADE_CHECKPOINTS[:3]
     ]:
         raise ValueError("Invalid fixed facade stage order")
-    tail = lines[8:]
+    tail = lines[13:]
     retained = []
     if tail[0] == b"Exiting after one bounded alpha acceptance run.":
         retained.append(tail.pop(0))
@@ -5964,8 +6117,7 @@ def _run_facade_capture_classes(common):
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Requires actual Windows Run facade")
 @pytest.mark.parametrize("source_kind", ["synthetic", "public"])
-@pytest.mark.parametrize("initial", sorted(RUN_FACADE_INITIALS))
-@pytest.mark.parametrize("case", sorted(RUN_FACADE_CASES))
+@pytest.mark.parametrize("initial,case", RUN_FACADE_SCENARIOS)
 def test_windows_run_facade_uses_script_result_not_ambient_native_status(
     tmp_path, source_kind, initial, case
 ):
@@ -6000,7 +6152,7 @@ def test_windows_run_facade_uses_script_result_not_ambient_native_status(
         run.write_bytes(run_bytes)
         harness = tmp_path / "run-facade.ps1"
         harness.write_text(
-            _element_bind_utility(RUN_FACADE_SCRIPT, shell, common),
+            _run_facade_bind_modules(RUN_FACADE_SCRIPT, shell, common),
             encoding="ascii",
             newline="\n",
         )
@@ -6051,6 +6203,7 @@ def test_windows_run_facade_uses_script_result_not_ambient_native_status(
         and observed["source_kind"] == source_kind
         and observed["entered"] == observed["cleanup"] == 1
         and observed["arguments_valid"]
+        and observed["historical_collision"]
         and (
             case == "child_exit_nonzero"
             or observed["ambient_after"] == RUN_FACADE_INITIALS[initial]
@@ -6099,6 +6252,7 @@ def test_run_facade_record_rejects_unbounded_private_or_untyped_observations():
         entered=1,
         cleanup=1,
         arguments_valid=True,
+        historical_collision=True,
         ambient_after=None,
     )
 
@@ -6154,7 +6308,7 @@ def test_run_facade_failures_have_no_raw_exception_context(
             clean_environment=lambda *args: env.copy(),
         ),
     )
-    monkeypatch.setitem(namespace, "_element_bind_utility", lambda script, *args: script)
+    monkeypatch.setitem(namespace, "_run_facade_bind_modules", lambda script, *args: script)
 
     calls = []
 
@@ -6182,6 +6336,7 @@ def test_run_facade_failures_have_no_raw_exception_context(
             entered=1,
             cleanup=1,
             arguments_valid=True,
+            historical_collision=True,
             ambient_after=None,
         ),
     )
@@ -6198,7 +6353,7 @@ def test_run_facade_failures_have_no_raw_exception_context(
         assert '"outcome":"wrapper_failure"' in capture.out
 
 
-def test_run_facade_child_record_requires_complete_qualified_utility_prefix():
+def test_run_facade_child_record_requires_both_qualified_module_prefixes():
     utility = [
         ELEMENT_CHECKPOINT_PREFIX + name.encode()
         for name in (
@@ -6209,6 +6364,16 @@ def test_run_facade_child_record_requires_complete_qualified_utility_prefix():
     ]
     utility += [_utility_observation_bytes().rstrip(b"\n")]
     utility += [ELEMENT_CHECKPOINT_PREFIX + b"utility_binding_verified"]
+    utility += [
+        ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in RUN_FACADE_MANAGEMENT_CHECKPOINTS[:3]
+    ]
+    utility += [
+        _utility_observation_bytes()
+        .rstrip(b"\n")
+        .replace(b"UTILITY", b"MANAGEMENT")
+        .replace(b"utility", b"management")
+    ]
+    utility += [ELEMENT_CHECKPOINT_PREFIX + b"management_binding_verified"]
     stages = [ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in RUN_FACADE_CHECKPOINTS]
     value = dict(
         schema_version="run-facade-return-v1",
@@ -6219,6 +6384,7 @@ def test_run_facade_child_record_requires_complete_qualified_utility_prefix():
         entered=1,
         cleanup=1,
         arguments_valid=True,
+        historical_collision=True,
         ambient_after=None,
     )
     record = RUN_FACADE_PREFIX + json.dumps(value).encode()
@@ -6232,10 +6398,79 @@ def test_run_facade_child_record_requires_complete_qualified_utility_prefix():
         b"\n".join([record, *utility[:2], utility[3], utility[2], utility[4], *stages]) + b"\n",
         b"\n".join([*utility, *stages[:-1], record, stages[-1]]) + b"\n",
         output + b"PRIVATE_FACADE_OUTPUT\n",
+        b"\n".join([*utility[:8], *utility[9:], *stages, record]) + b"\n",
+        output.replace(b"management_binding_verified", b"management_import_returned"),
+        output.replace(b"element-management-binding-v3", b"element-utility-binding-v3"),
         output[:-1],
     ):
         with pytest.raises(ValueError):
             _run_facade_child_record(malformed)
+
+
+def test_run_facade_management_binding_reuses_exact_module_admission_before_run(tmp_path):
+    from types import SimpleNamespace
+
+    source = RUN_FACADE_MANAGEMENT_IMPORT
+    assert "__MANAGEMENT_HOME__" in source and "__MANAGEMENT_SHA256__" in source
+    assert "'Modules\\Microsoft.PowerShell.Management'" in source
+    assert "'Microsoft.PowerShell.Management.psd1'" in source
+    assert "[IO.FileAttributes]::ReparsePoint" in source
+    assert "$manifestStream.Length -gt 65536" in source
+    assert "$manifestStream.Dispose()" in source and "$manifestHasher.Dispose()" in source
+    assert "-Name $managementManifest -Global -PassThru -ErrorAction Stop" in source
+    assert "$managementModule.ModuleBase), $expectedHome" in source
+    assert "$managementModule.Path), $managementManifest" in source
+    for command, implementation in (
+        ("Join-Path", "JoinPathCommand"),
+        ("Test-Path", "TestPathCommand"),
+    ):
+        assert f".ExportedCmdlets['{command}']" in source
+        assert f"'Microsoft.PowerShell.Commands.{implementation}'" in source
+    assert "$managementTestToken.Length -ne 8 -or $coreToken.Length -ne 8" in source
+    assert (
+        "[BitConverter]::ToString($managementTestToken) -cne [BitConverter]::ToString($coreToken)"
+        in source
+    )
+    assert "Parser]::Parse" not in source and "Get-Command" not in source
+    assert source.index(RUN_FACADE_MANAGEMENT_TEST_PATH) < source.index(_management_verified)
+    assert RUN_FACADE_SCRIPT.index(source) < RUN_FACADE_SCRIPT.index("& $Run -InstallRoot")
+    common = SimpleNamespace(local_path=lambda path: Path(path))
+    shell = tmp_path / "powershell.exe"
+    for name in ("Utility", "Management"):
+        manifest = (
+            tmp_path / f"Modules/Microsoft.PowerShell.{name}/Microsoft.PowerShell.{name}.psd1"
+        )
+        manifest.parent.mkdir(parents=True)
+        manifest.write_bytes(name.encode("ascii"))
+    bound = _run_facade_bind_modules(RUN_FACADE_SCRIPT, shell, common)
+    for name in ("UTILITY", "MANAGEMENT"):
+        assert f"__{name}_HOME__" not in bound and f"__{name}_SHA256__" not in bound
+        assert hashlib.sha256(name.title().encode("ascii")).hexdigest() in bound
+    manifest.write_bytes(b"x" * 65537)
+    with pytest.raises(ValueError, match="^Invalid scoped Management manifest$"):
+        _run_facade_bind_modules(RUN_FACADE_SCRIPT, shell, common)
+
+
+def test_run_facade_management_observation_is_fixed_typed_and_source_free():
+    record = (
+        _utility_observation_bytes()
+        .replace(b"UTILITY", b"MANAGEMENT")
+        .replace(b"utility", b"management")
+    )
+    observed = _run_facade_management_binding_records(record)
+    assert len(observed) == 1
+    assert observed[0]["schema_version"] == "element-management-binding-v3"
+    assert observed[0]["module_base_kind"] == "exact_pshome"
+    for malformed in (
+        record * 2,
+        record.replace(b"element-management-binding-v3", b"element-utility-binding-v3"),
+        record.replace(b'"module_base_kind":"exact_pshome"', b'"module_base_kind":"PRIVATE_PATH"'),
+        record.replace(b'"module_count_ok":true', b'"module_count_ok":1'),
+        record.replace(b'"module_count_ok":true', b'"module_count_ok":true,"module_count_ok":true'),
+        record + b"x" * 4097,
+    ):
+        with pytest.raises(ValueError):
+            _run_facade_management_binding_records(malformed)
 
 
 def test_run_facade_stderr_observer_accepts_only_exact_relay_protocol():
@@ -6305,19 +6540,22 @@ def test_run_facade_owned_wait_preserves_child_stderr_refusal(child_stderr):
     assert waited == [5]
 
 
-def test_run_facade_checks_each_script_invocation_status_immediately():
-    source = (ALPHA / "Run-K5VisionAlpha.ps1").read_text()
-    guard = '    if (-not $?) { throw "K5 Vision Alpha launcher failed." }'
-    for invocation in (
-        "    & $launcher -Port $Port -ExitAfterPublicTest:$ExitAfterPublicTest",
-        "    & $launcher -Port $Port -PublicRtspSource $PublicRtspSource "
-        "-ExitAfterPublicTest:$ExitAfterPublicTest",
-    ):
-        assert invocation + "\n" + guard in source
-    assert source.count(guard) == 2
-    assert "$LASTEXITCODE" not in source
-    assert '$ErrorActionPreference = "Stop"' in source
-    assert "Set-StrictMode -Version Latest" in source
+def test_run_facade_matrix_covers_equal_nonzero_success_and_failure_without_syntax_lock():
+    assert len(RUN_FACADE_SCENARIOS) == len(set(RUN_FACADE_SCENARIOS)) == 14
+    assert set(RUN_FACADE_SCENARIOS) == {
+        (initial, case)
+        for initial in ("absent", "stale_zero", "stale_nonzero")
+        for case in RUN_FACADE_CASES
+    } | {("stale_seven", "success"), ("stale_seven", "child_exit_nonzero")}
+    assert RUN_FACADE_INITIALS["stale_seven"] == 7
+    assert "elseif ($Initial -ceq 'stale_seven') { $global:LASTEXITCODE = 7 }" in RUN_FACADE_SCRIPT
+    assert "if ($global:K5FacadeCase -ceq 'child_exit_nonzero') { exit 7 }" in RUN_FACADE_SCRIPT
+    assert hashlib.sha256(RUN_FACADE_HISTORICAL_COMPARISON.encode("ascii")).hexdigest() == (
+        "881ec07c4e790320e4af0e2fa8e582986e0f484096c658be4d694c7c8a114c96"
+    )
+    assert RUN_FACADE_HISTORICAL_COMPARISON in RUN_FACADE_SCRIPT
+    assert "@(0,7,$true), @(7,7,$false), @(7,0,$false)" in RUN_FACADE_SCRIPT
+    # Actual Windows observations enforce the contract, not a chosen source spelling.
     # Fixture preparation must not autoload path cmdlets before actual Run admission.
     preparation = RUN_FACADE_SCRIPT.split("__PRODUCT_SUCCESS_RETURN__", 2)[-1].split(
         "$global:K5FacadeCase = $Case", 1
