@@ -5435,7 +5435,7 @@ def test_shared_native_python_oracle_checks_exact_vectors_and_fixed_output(tmp_p
         next(node.value for node in tree.body if isinstance(node, ast.Assign))
     )
     target = tmp_path / "owned oracle.py"
-    target.write_text(python)
+    target.write_text(python, encoding="utf-8", newline="\n")
     for mode, _, code, _ in SHARED_NATIVE_CASES[boundary]:
         if code is None:
             continue  # These are pre-launch argument refusals in the real Windows helper.
@@ -5471,6 +5471,30 @@ def test_shared_native_python_oracle_checks_exact_vectors_and_fixed_output(tmp_p
             command + ["unexpected"], capture_output=True, timeout=5, check=False
         )
         assert wrong.returncode == 41 and not wrong.stdout and not wrong.stderr
+
+
+@pytest.mark.parametrize("boundary", sorted(SHARED_NATIVE_CASES))
+def test_shared_native_python_oracle_uses_utf8_under_cp1252_default(
+    tmp_path, monkeypatch, boundary
+):
+    original_write_text = Path.write_text
+    writes = []
+
+    def write_with_legacy_default(path, data, encoding=None, errors=None, newline=None):
+        writes.append((encoding, newline))
+        return original_write_text(
+            path,
+            data,
+            encoding="cp1252" if encoding is None else encoding,
+            errors=errors,
+            newline=newline,
+        )
+
+    monkeypatch.setattr(Path, "write_text", write_with_legacy_default)
+    test_shared_native_python_oracle_checks_exact_vectors_and_fixed_output(tmp_path, boundary)
+    assert writes == [("utf-8", "\n")]
+    raw = (tmp_path / "owned oracle.py").read_bytes()
+    assert "Ω".encode() in raw and b"\r" not in raw
 
 
 def test_shared_probe_operation_anchors_preserve_specific_callers():
