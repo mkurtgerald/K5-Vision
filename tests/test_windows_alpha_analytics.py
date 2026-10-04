@@ -387,7 +387,8 @@ try {
     $statements = @($functions[0].Body.EndBlock.Statements)
     $assignments = @($statements | Where-Object {
         $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-        $_.Right.Extent.Text -ceq '@(& $mediaMtx --version 2>&1)'
+        $_.Right.Extent.Text -ceq (
+            'Invoke-K5NativeProbe -Executable $mediaMtx -Arguments @("--version") -CaptureOutput')
     })
     if ($assignments.Count -ne 1) { throw 'fixture_invalid' }
     $assignment = $assignments[0]
@@ -409,16 +410,22 @@ try {
     # Execute only the candidate's exact scalar pin and exact two guard statements.
     # Python --version is the sole child; no synthetic helper or Start top level runs.
     . ([scriptblock]::Create($pin[0].Extent.Text))
+    $probeFunction = @($ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Invoke-K5NativeProbe'
+    }, $true))
+    if ($probeFunction.Count -ne 1) { throw 'fixture_invalid' }
+    . ([scriptblock]::Create($probeFunction[0].Extent.Text))
     $mediaMtx = $Python
     $code = @(
         'function Invoke-K5VersionGuardOnly {',
         $assignment.Extent.Text,
         '$script:pinPreserved = ($MediaMtxVersion -is [string] -and',
         '    $MediaMtxVersion -ceq ''1.21.1'')',
-        ('$testOutput = @($' + $outputName + ')'),
-        '$script:wrongProbeConfirmed = ($LASTEXITCODE -eq 0 -and',
-        '    $testOutput.Count -eq 1 -and',
-        '    ([string]$testOutput[0] -cmatch ''^Python [0-9]+\.[0-9]+\.[0-9]+[a-z0-9.+-]*$''))',
+        ('$testOutput = $' + $outputName),
+        '$script:wrongProbeConfirmed = ($testOutput.ExitCode -eq 0 -and',
+        '    $testOutput.Stdout.TrimEnd([char[]]@(13,10)) -cmatch',
+        '    ''^Python [0-9]+\.[0-9]+\.[0-9]+[a-z0-9.+-]*$'')',
         $guard.Extent.Text,
         '}'
     ) -join "`n"
@@ -577,7 +584,10 @@ def test_version_guard_record_retains_only_fixed_evidence() -> None:
 
 def test_version_guard_fixture_selects_only_source_pin_assignment_and_guard() -> None:
     assert "Set-StrictMode -Version Latest" in VERSION_GUARD_SCRIPT
-    assert "'@(& $mediaMtx --version 2>&1)'" in VERSION_GUARD_SCRIPT
+    assert (
+        'Invoke-K5NativeProbe -Executable $mediaMtx -Arguments @("--version") -CaptureOutput'
+        in VERSION_GUARD_SCRIPT
+    )
     assert "$guard = $statements[$index + 1]" in VERSION_GUARD_SCRIPT
     assert "$pin.Count -ne 1" in VERSION_GUARD_SCRIPT
     assert "$assignments.Count -ne 1" in VERSION_GUARD_SCRIPT
@@ -608,15 +618,16 @@ def test_version_guard_record_rejects_duplicate_fields_and_nested_values() -> No
             _version_guard_record(VERSION_GUARD_PREFIX + suffix, b"", 0)
 
 
-def test_media_mtx_version_guard_has_distinct_output_and_exact_official_token() -> None:
+def test_media_mtx_version_guard_has_distinct_output_and_exact_official_token():
     source = START.read_text()
-    assert "$mediaMtxVersionOutput = @(& $mediaMtx --version 2>&1)" in source
     guard = source.split("$mediaMtxVersionOutput =", 1)[1].split("$validation =", 1)[0]
-    assert "$LASTEXITCODE -ne 0" in guard
-    assert "$mediaMtxVersionOutput.Count -ne 1" in guard
-    assert "$mediaMtxVersionOutput[0] -isnot [string]" in guard
-    assert '$mediaMtxVersionOutput[0] -cne ("v" + $MediaMtxVersion)' in guard
+    assert 'Invoke-K5NativeProbe -Executable $mediaMtx -Arguments @("--version")' in guard
+    assert "$mediaMtxVersionOutput.ExitCode -ne 0" in guard
+    assert "$mediaMtxVersionOutput.Stdout -isnot [string]" in guard
+    assert "$mediaMtxVersionOutput.Stdout -cnotin" in guard
+    assert '("v" + $MediaMtxVersion)' in guard
     assert ".Contains(" not in guard and "-join" not in guard
+    assert "$LASTEXITCODE" not in guard
 
 
 def test_synthetic_cleanup_preserves_typed_primary_error_in_memory_only() -> None:
@@ -646,15 +657,17 @@ def test_windows_version_guard_exact_official_token_matrix(tmp_path: Path) -> No
         ([123], 0, False),
     ]
     data = json.dumps(
-        [dict(lines=lines, exit=exit_code, accept=accept) for lines, exit_code, accept in cases]
+        [
+            dict(text="\n".join(map(str, lines)), exit=exit_code, accept=accept)
+            for lines, exit_code, accept in cases
+        ]
     )
     script = (
         selection
         + r"""
     $code = @(
         'function Invoke-K5ControlledVersionGuard { param($case)',
-        ('Set-Variable -Name ' + $outputName + ' -Value @($case.lines)'),
-        '$LASTEXITCODE = $case.exit',
+        ('$' + $outputName + ' = [pscustomobject]@{ExitCode=$case.exit; Stdout=$case.text}'),
         $guard.Extent.Text,
         '}'
     ) -join "`n"
@@ -746,9 +759,13 @@ $gstLaunch = 'fixture_publisher'
 $script:server = $null
 function Test-K5GStreamerElement { return $true }
 function Get-K5MediaMtx { return 'Test-K5FixtureMediaMtx' }
-function Test-K5FixtureMediaMtx {
-    $global:LASTEXITCODE = 0
-    if ($args[0] -ceq '--version') { return 'v1.21.1' }
+function Invoke-K5NativeProbe {
+    param($Executable, [string[]]$Arguments, [switch]$CaptureOutput, [switch]$DiscardStderr)
+    if ($Executable -cne 'Test-K5FixtureMediaMtx' -or $DiscardStderr) {
+        throw 'fixture_invalid'
+    }
+    $text = if ($Arguments[0] -ceq '--version') { 'v1.21.1' } else { '' }
+    return [pscustomobject]@{ ExitCode = 0; Stdout = $text }
 }
 function Test-K5TcpListener { return $null -ne $script:server }
 function Start-Sleep { }
@@ -2117,12 +2134,20 @@ if ($utilityAssembly.Name -cne 'Microsoft.PowerShell.Commands.Utility' -or
 [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_binding_verified')
 [Console]::Out.Flush()
 """.replace("__UTILITY_OBSERVATION__", ELEMENT_UTILITY_OBSERVATION)
-# The exact helper qualified on Windows at 32008ac4, in the only two checkout
-# representations admitted here. Application packaging retains its raw hashes.
-ELEMENT_PRODUCT_HASHES = (
-    "363c93f0825c19d18c946598ab5020c7354483965f51666bc7eca90f7016c54f",
-    "623ca9b0321684af25f9f0e47bfc6ec58fe1401d4815f70ae807e48831e34dcd",
-)
+# Exact current source identities: the shared pump and its element wrapper.
+# Native packaging keeps raw source hashes; only these two test representations
+# are accepted before any line-ending conversion.
+ELEMENT_PRODUCT_HASHES = {
+    "Test-K5GStreamerElement": (
+        "7411df1749e08a316df8cf82fd8b99391b6200ffbf124bd1cb9f40c6f2ea8492",
+        "ea128d8494db74a3dbdc6da93f3e751047b0e8e5d1fcbe7d2472b45e20fd0414",
+    ),
+    "Invoke-K5NativeProbe": (
+        "95d57f2441a79c3bee6fdb6cdc0e64d6869aedde301294ef9440d890a2ef477f",
+        "4d3a655eb0266e2ea72e4806df3767b1bc979e14de4cff8f95f4d7d0176d20c6",
+    ),
+}
+
 ELEMENT_HISTORICAL_HELPER = r"""function Test-K5GStreamerElement([string]$Name) {
     & $gstInspect $Name *> $null
     return $LASTEXITCODE -eq 0
@@ -2132,13 +2157,15 @@ ELEMENT_HISTORICAL_HELPER = r"""function Test-K5GStreamerElement([string]$Name) 
 def _element_product_helper(source):
     if type(source) is not bytes or len(source) > 262144:
         raise ValueError("Invalid product helper source")
-    matches = re.findall(
-        rb"(?ms)^function Test-K5GStreamerElement\(\[string\]\$Name\) \{\r?\n.*?^\}", source
-    )
-    if len(matches) != 1 or hashlib.sha256(matches[0]).hexdigest() not in ELEMENT_PRODUCT_HASHES:
-        raise ValueError("Unqualified product helper source")
-    # Conversion occurs only after an exact admitted raw-byte digest matches.
-    return "\n" + matches[0].replace(b"\r\n", b"\n").decode("ascii") + "\n"
+    bodies = []
+    for name, digests in ELEMENT_PRODUCT_HASHES.items():
+        matches = re.findall(
+            rb"(?ms)^function " + name.encode() + rb"(?:\([^\r\n]*\))? \{\r?\n.*?^\}", source
+        )
+        if len(matches) != 1 or hashlib.sha256(matches[0]).hexdigest() not in digests:
+            raise ValueError("Unqualified product helper source")
+        bodies.append(matches[0].replace(b"\r\n", b"\n").decode("ascii"))
+    return "\n" + "\n\n".join(bodies) + "\n"
 
 
 ELEMENT_PRODUCT_HELPER = _element_product_helper(START.read_bytes())
@@ -2175,21 +2202,28 @@ __ELEMENT_UTILITY_IMPORT__
         $Start, [ref]$tokens, [ref]$errors)
     $functions = @($ast.FindAll({ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -ceq 'Test-K5GStreamerElement'
+        $node.Name -cin @('Test-K5GStreamerElement','Invoke-K5NativeProbe')
     }, $true))
-    if ($errors.Count -ne 0 -or $functions.Count -ne 1) { throw 'fixture_invalid' }
-    $actual = $functions[0].Extent.Text
+    if ($errors.Count -ne 0 -or $functions.Count -ne 2) { throw 'fixture_invalid' }
+    $helperNames = @('Test-K5GStreamerElement','Invoke-K5NativeProbe')
+    $helperHashes = @{ __QUALIFIED_ELEMENTS__ }
+    $actualParts = [Collections.Generic.List[string]]::new()
     $helperHasher = [Security.Cryptography.SHA256]::Create()
     try {
-        $helperBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($actual)
-        $helperHash = [BitConverter]::ToString(
-            $helperHasher.ComputeHash($helperBytes)).Replace('-', '').ToLowerInvariant()
-        if ($helperHash -cnotin @(
-            '__QUALIFIED_ELEMENT_LF__',
-            '__QUALIFIED_ELEMENT_CRLF__')) { throw 'fixture_identity' }
+        for ($index = 0; $index -lt 2; $index++) {
+            if ($functions[$index].Name -cne $helperNames[$index]) { throw 'fixture_identity' }
+            $actual = $functions[$index].Extent.Text
+            $helperBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($actual)
+            $helperHash = [BitConverter]::ToString(
+                $helperHasher.ComputeHash($helperBytes)).Replace('-', '').ToLowerInvariant()
+            if ($helperHash -cnotin $helperHashes[$helperNames[$index]]) {
+                throw 'fixture_identity'
+            }
+            $actualParts.Add($actual.Replace("`r`n", "`n"))
+        }
     } finally { $helperHasher.Dispose() }
     if ($Variant -ceq 'process') {
-        $selected = $actual.Replace("`r`n", "`n") + "`n"
+        $selected = [string]::Join("`n`n", $actualParts.ToArray()) + "`n"
 __ELEMENT_PROCESS_SCALAR_INSERTIONS__
     } else {
         # Frozen historical error/exit baseline; never the current product source.
@@ -2296,8 +2330,13 @@ __ELEMENT_HISTORICAL_HELPER__
 } catch { Write-K5ElementChildFailure $_ $fixturePhase 'primary'; exit 1 }
 """.replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS)
     .replace("__ELEMENT_UTILITY_IMPORT__", ELEMENT_UTILITY_IMPORT)
-    .replace("__QUALIFIED_ELEMENT_LF__", ELEMENT_PRODUCT_HASHES[0])
-    .replace("__QUALIFIED_ELEMENT_CRLF__", ELEMENT_PRODUCT_HASHES[1])
+    .replace(
+        "__QUALIFIED_ELEMENTS__",
+        "; ".join(
+            "'" + name + "' = @('" + "','".join(digests) + "')"
+            for name, digests in ELEMENT_PRODUCT_HASHES.items()
+        ),
+    )
     .replace("__ELEMENT_HISTORICAL_HELPER__", ELEMENT_HISTORICAL_HELPER)
     .replace(
         "__ELEMENT_PROCESS_SCALAR_INSERTIONS__",
@@ -3408,10 +3447,11 @@ def test_owned_fixture_pe_reader_checks_subsystem_and_bounds(tmp_path: Path):
 
 
 def test_element_probe_comparison_preserves_original_and_selects_process_prototype():
-    assert "$functions.Count -ne 1" in ELEMENT_PROBE_SCRIPT
-    assert "$node.Name -ceq 'Test-K5GStreamerElement'" in ELEMENT_PROBE_SCRIPT
+    assert "$functions.Count -ne 2" in ELEMENT_PROBE_SCRIPT
+    assert "@'" not in ELEMENT_PRODUCT_HELPER
+    assert "'Test-K5GStreamerElement','Invoke-K5NativeProbe'" in ELEMENT_PROBE_SCRIPT
     assert ELEMENT_PRODUCT_OBSERVED not in ELEMENT_PROBE_SCRIPT
-    assert "$actual = $functions[0].Extent.Text" in ELEMENT_PROBE_SCRIPT
+    assert "$actual = $functions[$index].Extent.Text" in ELEMENT_PROBE_SCRIPT
     assert " | Out-Null" not in ELEMENT_PROBE_SCRIPT
     assert "Get-Variable LASTEXITCODE -Scope Global" in ELEMENT_PROBE_SCRIPT
     assert "$global:LASTEXITCODE = 0" in ELEMENT_PROBE_SCRIPT  # Explicit stale-input case only.
@@ -3790,7 +3830,7 @@ def test_element_runtime_pair_replaces_compiler_without_widening_probe_or_budget
     assert "executable.parent != base.parent" in section
     assert section.count("common.file_hash(executable) != identity") == 3
     assert ELEMENT_PRODUCT_OBSERVED not in ELEMENT_PROBE_SCRIPT
-    assert "$actual = $functions[0].Extent.Text" in ELEMENT_PROBE_SCRIPT
+    assert "$actual = $functions[$index].Extent.Text" in ELEMENT_PROBE_SCRIPT
     assert " | Out-Null" not in ELEMENT_PROBE_SCRIPT
     assert "Popen([executable, argument]" in ELEMENT_REFERENCE_SCRIPT
     assert "code = child.wait(timeout=5)" in ELEMENT_REFERENCE_SCRIPT
@@ -3995,7 +4035,7 @@ def test_element_utility_route_is_exact_scoped_and_keeps_native_acceptance():
     assert "Get-Variable LASTEXITCODE -Scope Global" in ELEMENT_PROBE_SCRIPT
     assert "Set-Alias -Name K5FixtureAlias" in ELEMENT_PROBE_SCRIPT
     assert ELEMENT_PRODUCT_OBSERVED not in ELEMENT_PROBE_SCRIPT
-    assert "$actual = $functions[0].Extent.Text" in ELEMENT_PROBE_SCRIPT
+    assert "$actual = $functions[$index].Extent.Text" in ELEMENT_PROBE_SCRIPT
     assert " | Out-Null" not in ELEMENT_PROBE_SCRIPT
     assert "Get-Command -Name $gstInspect -ErrorAction Stop" in ELEMENT_PROBE_SCRIPT
     assert "ConvertTo-Json" not in ELEMENT_PROBE_SCRIPT
@@ -4509,7 +4549,7 @@ def test_element_process_candidate_binds_actual_exit_without_ambient_writes():
     assert "$exitCode = $child.ExitCode" in prototype
     assert "LASTEXITCODE" not in prototype
     assert "$info.FileName = $command.Path" in prototype
-    assert "$info.Arguments = $Name" in prototype
+    assert "$info.Arguments = [string]::Join" in prototype
     assert "131072" in prototype and "$child.Kill()" in prototype
     assert "ReadAsync" in prototype and "$child.Dispose()" in prototype
 
@@ -4532,7 +4572,7 @@ def test_element_process_scalar_observations_strip_to_exact_product_helper():
     assert stripped.encode() == ELEMENT_PRODUCT_HELPER.encode()
     assert "fixture" not in ELEMENT_PRODUCT_HELPER
     assert ELEMENT_PRODUCT_OBSERVED not in ELEMENT_PROBE_SCRIPT
-    assert "$actual = $functions[0].Extent.Text" in ELEMENT_PROBE_SCRIPT
+    assert "$actual = $functions[$index].Extent.Text" in ELEMENT_PROBE_SCRIPT
 
 
 def test_element_process_drains_concurrently_and_cleanup_is_owned_bounded():
@@ -4542,7 +4582,7 @@ def test_element_process_drains_concurrently_and_cleanup_is_owned_bounded():
     loop = source.index("while ($true)")
     exited = source.index("if ($child.HasExited -and $outDone -and $errDone)")
     actual = source.index("$exitCode = $child.ExitCode")
-    stderr = source.index("if ($errCount -ne 0)")
+    stderr = source.index("if ($errCount -ne 0 -and -not $DiscardStderr)")
     assert first_read < second_read < loop < exited < actual < stderr
     assert source.count("$outCount + $errCount -gt 131072") == 2
     assert source.count("$stdoutStream.ReadAsync") == source.count("$stderrStream.ReadAsync") == 2
@@ -4557,10 +4597,11 @@ def test_element_process_drains_concurrently_and_cleanup_is_owned_bounded():
     assert guard < kill < dispose < tasks < done
     assert "$child.WaitForExit(5000)" in source
     assert "$cleanupWatch.Elapsed.TotalSeconds -ge 5" in source
-    assert "foreach ($ownedStream in @($stdoutStream, $stderrStream))" in source
+    assert "foreach ($ownedStream in @($stdoutStream, $stderrStream, $capturedStdout))" in source
     assert "$ownedStream.Close()" in source and "catch { $cleanupFailed = $true }" in source
     assert "GetProcessById" not in source and "Stop-Process" not in source
-    assert "ReadToEnd" not in source and "MemoryStream" not in source
+    assert "ReadToEnd" not in source
+    assert "if ($CaptureOutput) { $capturedStdout = [IO.MemoryStream]::new() }" in source
 
 
 def test_element_process_name_guard_preserves_one_exact_bounded_native_argument(tmp_path):
@@ -4573,7 +4614,7 @@ def test_element_process_name_guard_preserves_one_exact_bounded_native_argument(
     for name in ("two names", "line\nfeed", "tab\tvalue", 'a"b', "a\\b", "a\x00b", "é"):
         assert re.search(expression, name) is not None
     assert "$Name.Length -eq 0 -or $Name.Length -gt 8192" in ELEMENT_PRODUCT_HELPER
-    assert "$info.Arguments = $Name" in ELEMENT_PRODUCT_HELPER
+    assert "$info.Arguments = [string]::Join" in ELEMENT_PRODUCT_HELPER
 
 
 @pytest.mark.parametrize("case,size", [("stdout_bound", 131072), ("stdout_overflow", 131073)])
@@ -4676,7 +4717,7 @@ foreach ($case in @('first_close','changed_handle','wait_failed','pending_read')
     }))
     $started = $case -in @('changed_handle','wait_failed')
     $childHandle = if ($case -ceq 'changed_handle') { [IntPtr]2 } else { [IntPtr]1 }
-    $outRead = $null; $errRead = $null
+    $outRead = $null; $errRead = $null; $capturedStdout = $null
     if ($case -ceq 'pending_read') { $outRead = [pscustomobject]@{IsCompleted=$false} }
     $refused = $false
     try { Invoke-OwnedCleanup }
@@ -4883,30 +4924,12 @@ def test_element_process_late_alias_failure_cannot_qualify(tmp_path, monkeypatch
     assert "K5_ELEMENT_PROCESS_QUALIFIED=true" not in capsys.readouterr().out
 
 
-def test_actual_start_element_helper_matches_hosted_qualified_hash():
-    source = START.read_bytes()
-    matches = re.findall(
-        rb"(?ms)^function Test-K5GStreamerElement\(\[string\]\$Name\) \{\r?\n.*?^\}", source
-    )
-    assert len(matches) == 1
-    assert hashlib.sha256(matches[0]).hexdigest() in {
-        "363c93f0825c19d18c946598ab5020c7354483965f51666bc7eca90f7016c54f",
-        "623ca9b0321684af25f9f0e47bfc6ec58fe1401d4815f70ae807e48831e34dcd",
-    }
+def test_actual_start_native_helpers_match_checked_source_hashes():
+    assert _element_product_helper(START.read_bytes()) == ELEMENT_PRODUCT_HELPER
 
 
-def test_element_matrix_selects_and_instruments_actual_admitted_start_extent():
-    assert "$actual = $functions[0].Extent.Text" in ELEMENT_PROBE_SCRIPT
-    assert '$selected = $actual.Replace("`r`n", "`n") + "`n"' in ELEMENT_PROBE_SCRIPT
-    assert "[Diagnostics.ProcessStartInfo]::new()" not in ELEMENT_PROBE_SCRIPT
-    assert "$helperHasher.ComputeHash" in ELEMENT_PROBE_SCRIPT
-
-
-def test_element_product_extraction_accepts_only_qualified_raw_representations():
+def test_element_product_extraction_accepts_only_checked_raw_representations():
     canonical = ELEMENT_PRODUCT_HELPER.strip("\n").encode("ascii")
-    assert hashlib.sha256(ELEMENT_PRODUCT_HELPER.encode()).hexdigest() == (
-        "ad703dbc3478618eb39a9fcbc22b67f1579372e722f31fe2210d51953b3d2a13"
-    )
     for source in (canonical, canonical.replace(b"\n", b"\r\n")):
         assert _element_product_helper(source) == ELEMENT_PRODUCT_HELPER
     for source in (
@@ -4922,39 +4945,667 @@ def test_element_product_extraction_accepts_only_qualified_raw_representations()
             _element_product_helper(source)
 
 
-def test_element_product_transfer_preserves_all_surrounding_start_bytes():
-    source = START.read_bytes()
-    canonical = ELEMENT_PRODUCT_HELPER.strip("\n").encode("ascii")
-    variants = (canonical, canonical.replace(b"\n", b"\r\n"))
-    actual = next(body for body in variants if source.count(body) == 1)
-    historical = ELEMENT_HISTORICAL_HELPER.encode("ascii")
-    if b"\r\n" in actual:
-        historical = historical.replace(b"\n", b"\r\n")
-    restored = source.replace(actual, historical, 1)
-    assert hashlib.sha256(restored).hexdigest() in {
-        "0239575c75c9131ea62097d7e984446d91e27c6d3f95b05b2187d791f8403cb4",
-        "683793019ace6e36f21d31ba095732232e6023bb76d01da5e8ca2046103feec8",
-    }
-    assert hashlib.sha256(ELEMENT_HISTORICAL_HELPER.encode()).hexdigest() == (
-        "a05ca4a8b4d90291ea4c8b2191a0a7dead7b400f0d7455c7fc08a81b9dfbb171"
-    )
-
-
 def test_element_actual_ast_selection_checks_raw_identity_before_scalar_insertions():
     source = ELEMENT_PROBE_SCRIPT
-    extent = source.index("$actual = $functions[0].Extent.Text")
-    admission = source.index("if ($helperHash -cnotin @(", extent)
-    selected = source.index('$selected = $actual.Replace("`r`n", "`n")', admission)
+    extent = source.index("$actual = $functions[$index].Extent.Text")
+    admission = source.index("if ($helperHash -cnotin $helperHashes", extent)
+    normalized = source.index('$actualParts.Add($actual.Replace("`r`n", "`n"))', admission)
+    selected = source.index('$selected = [string]::Join("`n`n",', normalized)
     instrumented = source.index("$selected = $selected.Replace($anchor", selected)
     invoked = source.index(". ([scriptblock]::Create($selected))", instrumented)
-    assert extent < admission < selected < instrumented < invoked
-    for digest in ELEMENT_PRODUCT_HASHES:
-        assert source.count(digest) == 1
+    assert extent < admission < normalized < selected < instrumented < invoked
+    for digests in ELEMENT_PRODUCT_HASHES.values():
+        for digest in digests:
+            assert source.count(digest) == 1
     assert source.count("if (($selected.Split(@($anchor)") == 2
     assert "$helperHasher.Dispose()" in source
-    assert ELEMENT_PRODUCT_HELPER.strip() not in source
+    assert "[Diagnostics.ProcessStartInfo]::new()" not in source
     assert ELEMENT_HISTORICAL_HELPER in source
     assert "ELEMENT_PROCESS_PROTOTYPE" not in globals()
-    for anchor, insertion in ELEMENT_PROCESS_INSERTIONS.items():
-        assert ("$anchor = '" + anchor.rstrip("\n") + "'") in source
-        assert ("$anchor + '" + insertion.rstrip("\n") + "'") in source
+
+
+def test_start_remaining_native_admissions_never_read_ambient_exit_status():
+    source = START.read_text()
+    assert "$LASTEXITCODE" not in source
+    for call in (
+        'Invoke-K5NativeProbe -Executable $mediaMtx -Arguments @("--version") -CaptureOutput',
+        'Invoke-K5NativeProbe -Executable $mediaMtx -Arguments @("--validate-conf", $configPath)',
+        "Invoke-K5NativeProbe -Executable $python "
+        '-Arguments @("-I", "-B", "-c", $resolveCode, $PublicRtspSource) '
+        "-CaptureOutput -DiscardStderr",
+    ):
+        assert call in source
+
+
+def test_start_shared_native_probe_is_single_actual_process_pump():
+    source = START.read_text()
+    assert source.count("function Invoke-K5NativeProbe {") == 1
+    helper = source.split("function Invoke-K5NativeProbe {", 1)[1].split(
+        "\nfunction Get-K5MediaMtx", 1
+    )[0]
+    assert "$info.Arguments = [string]::Join" in helper
+    assert "$exitCode = $child.ExitCode" in helper
+    assert "Stdout = $outputText" in helper
+
+
+SHARED_NATIVE_CASES = {
+    "version": (
+        ("version_ok", True, 0, "none"),
+        ("version_wrong", False, 0, "caller"),
+        ("version_multi", False, 0, "caller"),
+        ("version_empty", False, 0, "caller"),
+        ("version_nonzero", False, 7, "caller"),
+        ("version_stderr", False, 0, "stderr"),
+        ("version_utf8", False, 0, "decode"),
+    ),
+    "config": (
+        ("config_ok", True, 0, "none"),
+        ("config_nonzero", False, 7, "caller"),
+        ("config_stderr", False, 0, "stderr"),
+        ("config_bytes", True, 0, "none"),
+    ),
+    "public": (
+        ("public_ok", True, 0, "none"),
+        ("public_cr", True, 0, "none"),
+        ("public_crlf", True, 0, "none"),
+        ("public_cr_multi", False, 0, "caller"),
+        ("public_blank", False, 0, "caller"),
+        ("public_cr_blank", False, 0, "caller"),
+        ("public_empty", False, 0, "caller"),
+        ("public_multi", False, 0, "caller"),
+        ("public_nonzero", False, 7, "caller"),
+        ("public_stderr", True, 0, "none"),
+        ("public_utf8", False, 0, "decode"),
+    ),
+    "argv": (
+        ("argv_ok", True, 0, "none"),
+        ("argv_nul", False, None, "argument"),
+        ("argv_none", False, None, "argument"),
+        ("argv_count", False, None, "argument"),
+        ("argv_single", False, None, "argument"),
+        ("argv_total", False, None, "argument"),
+    ),
+}
+SHARED_ARGV = ["", "two words", 'inside"quote', "one\\", "two\\\\", '\\"', "Ω", "last\\"]
+ELEMENT_CHECKPOINTS.update(
+    "shared_" + mode + "_" + state
+    for cases in SHARED_NATIVE_CASES.values()
+    for mode, *_ in cases
+    for state in ("requested", "passed")
+)
+
+SHARED_NATIVE_SCRIPT = r"""
+param([string]$Start, [string]$StartHash, [string]$Python, [string]$Fixture,
+      [string]$ConfigPath, [string]$Boundary, [string]$Initial)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+__ELEMENT_CHILD_DIAGNOSTICS__
+$fixturePhase = 'utility_manifest'
+try {
+__ELEMENT_UTILITY_IMPORT__
+    $fixturePhase = 'source_select'
+    $stream = [IO.File]::OpenRead($Start)
+    $bytes = [byte[]]::new(262145)
+    $total = 0
+    try {
+        while ($total -lt $bytes.Length) {
+            $count = $stream.Read($bytes,$total,$bytes.Length - $total)
+            if ($count -eq 0) { break }
+            $total += $count
+        }
+    } finally { $stream.Dispose() }
+    if ($total -gt 262144) { throw 'fixture_identity' }
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $actualHash = [BitConverter]::ToString(
+            $hasher.ComputeHash($bytes,0,$total)).Replace('-','').ToLowerInvariant()
+        if ($actualHash -cne $StartHash) { throw 'fixture_identity' }
+    } finally { $hasher.Dispose() }
+    $source = [Text.UTF8Encoding]::new($false,$true).GetString($bytes,0,$total)
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
+    if ($errors.Count -ne 0) { throw 'fixture_identity' }
+    $helpers = @($ast.FindAll({param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Invoke-K5NativeProbe'
+    },$true))
+    if ($helpers.Count -ne 1) { throw 'fixture_identity' }
+    $helper = $helpers[0].Extent.Text.Replace("`r`n","`n") + "`n"
+    $signature = 'function Invoke-K5NativeProbe {'
+    if (($helper.Split(@($signature),[StringSplitOptions]::None)).Count -ne 2) {
+        throw 'fixture_identity'
+    }
+    $helper = $helper.Replace($signature,'function Invoke-K5NativeProbeActual {')
+__SHARED_OBSERVATIONS__
+    . ([scriptblock]::Create($helper))
+    $pin = @($ast.EndBlock.Statements | Where-Object {
+        $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $_.Left.Extent.Text -ceq '$MediaMtxVersion'
+    })
+    if ($pin.Count -ne 1 -or $pin[0].Right.Extent.Text -cne '"1.21.1"') {
+        throw 'fixture_identity'
+    }
+    . ([scriptblock]::Create($pin[0].Extent.Text))
+    $names = @{version='mediaMtxVersionOutput';config='validation';public='resolved'}
+    if ($Boundary -cne 'argv') {
+        if (-not $names.ContainsKey($Boundary)) { throw 'fixture_identity' }
+        $wanted = $names[$Boundary]
+        $assignments = @($ast.FindAll({param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+            $node.Left.VariablePath.UserPath -ceq $wanted -and
+            $node.Right.Extent.Text.StartsWith('Invoke-K5NativeProbe -Executable ')
+        },$true))
+        if ($assignments.Count -ne 1) { throw 'fixture_identity' }
+        $parent = $assignments[0].Parent
+        if ($parent -isnot [Management.Automation.Language.NamedBlockAst] -and
+            $parent -isnot [Management.Automation.Language.StatementBlockAst]) {
+            throw 'fixture_identity'
+        }
+        $statements = @($parent.Statements)
+        $first = [Array]::IndexOf($statements,$assignments[0])
+        $last = $first + 1
+        if ($Boundary -ceq 'public') {
+            $ends = @($statements | Where-Object {
+                $_ -is [Management.Automation.Language.IfStatementAst] -and
+                $_.Extent.Text.Contains('[string]::IsNullOrWhiteSpace($publicSourceIp)')
+            })
+            if ($ends.Count -ne 1) { throw 'fixture_identity' }
+            $last = [Array]::IndexOf($statements,$ends[0])
+        }
+        if ($first -lt 0 -or $last -le $first -or $last -ge $statements.Count -or
+            $last - $first -gt 12 -or
+            $statements[$last] -isnot [Management.Automation.Language.IfStatementAst]) {
+            throw 'fixture_identity'
+        }
+        $body = ''
+        for ($index=$first; $index -le $last; $index++) {
+            $body += $statements[$index].Extent.Text + "`n"
+        }
+        . ([scriptblock]::Create("function Invoke-K5CallerOnly {`n" + $body + "`n}"))
+    }
+    $resolveCode = '__RESOLVE_CODE__'
+    $PublicRtspSource = 'rtsp://example.invalid:8554/owned%20path'
+    $mediaMtx = $Python
+    $argv = ConvertFrom-Json '__ARGV__'
+    $cases = ConvertFrom-Json '__CASES__'
+    if ($null -ne (Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue)) {
+        throw 'fixture_not_fresh'
+    }
+    if ($Initial -ceq 'stale_zero') { $global:LASTEXITCODE = 0 }
+    elseif ($Initial -ceq 'stale_nonzero') { $global:LASTEXITCODE = 9 }
+    elseif ($Initial -cne 'absent') { throw 'fixture_invalid' }
+    # Only the executable/fixture prefix is substituted. The original caller's
+    # exact argument vector, capture policy and result validator execute below.
+    function Invoke-K5NativeProbe {
+        param($Executable,[string[]]$Arguments,[switch]$CaptureOutput,[switch]$DiscardStderr)
+        $expected = switch ($Boundary) {
+            'version' { ,@('--version') }
+            'config' { ,@('--validate-conf',$ConfigPath) }
+            'public' { ,@('-I','-B','-c',$resolveCode,$PublicRtspSource) }
+        }
+        if ($Executable -cne $Python -or $Arguments.Count -ne $expected.Count -or
+            [bool]$CaptureOutput -ne ($Boundary -cne 'config') -or
+            [bool]$DiscardStderr -ne ($Boundary -ceq 'public')) { throw 'fixture_policy' }
+        for ($index=0; $index -lt $expected.Count; $index++) {
+            if ($Arguments[$index] -cne $expected[$index]) { throw 'fixture_arguments' }
+        }
+        return Invoke-K5NativeProbeActual -Executable $Python `
+            -Arguments (@('-I','-B','-S',$Fixture,$case.mode) + $Arguments) `
+            -CaptureOutput:$CaptureOutput -DiscardStderr:$DiscardStderr
+    }
+    $callerMessages = @{
+        version='Pinned MediaMTX executable failed its version probe.'
+        config='Local synthetic RTSP MediaMTX configuration is invalid.'
+        public='Public RTSP alpha source failed validation.'
+    }
+    $fixturePhase = 'probe_invoke'
+    foreach ($case in $cases) {
+        [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shared_' + $case.mode + '_requested')
+        [Console]::Out.Flush()
+        $script:fixtureActualExit = $null; $script:fixtureProcessCleaned = $false
+        $accepted = $true; $known = $false
+        try {
+            if ($Boundary -ceq 'argv') {
+                $arguments = @('-I','-B','-S',$Fixture,$case.mode) + $argv
+                if ($case.mode -ceq 'argv_nul') { $arguments[-1] = [string][char]0 }
+                elseif ($case.mode -ceq 'argv_none') { $arguments = @() }
+                elseif ($case.mode -ceq 'argv_count') { $arguments = @('x') * 17 }
+                elseif ($case.mode -ceq 'argv_single') { $arguments = @('x' * 8193) }
+                elseif ($case.mode -ceq 'argv_total') { $arguments = @('x' * 6000) * 3 }
+                $result = Invoke-K5NativeProbeActual -Executable $Python `
+                    -Arguments $arguments -CaptureOutput
+                if ($result.ExitCode -ne 0 -or $result.Stdout -cne "argv-ok`n") {
+                    throw 'fixture_argv'
+                }
+            } else { Invoke-K5CallerOnly }
+        } catch {
+            $accepted = $false
+            if ($case.error -ceq 'caller' -and $callerMessages.ContainsKey($Boundary) -and
+                $_.Exception.Message -ceq $callerMessages[$Boundary]) { $known = $true }
+            $exception = $_.Exception
+            for ($depth=0; $depth -lt 4 -and $null -ne $exception; $depth++) {
+                if ($case.error -ceq 'stderr' -and $exception -is [IO.InvalidDataException] -and
+                    $exception.Message -ceq 'K5 native stderr refused.') { $known = $true }
+                if ($case.error -ceq 'decode' -and $exception -is [Text.DecoderFallbackException]) {
+                    $known = $true
+                }
+                if ($case.error -ceq 'argument' -and $exception -is [ArgumentException] -and
+                    $exception.Message -ceq 'K5 native arguments invalid.') { $known = $true }
+                $exception = $exception.InnerException
+            }
+            if (-not $known) { throw }
+        }
+        $ambient = Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+        $ambientValue = $null
+        if ($null -ne $ambient) { $ambientValue = $ambient.Value }
+        $expectedAmbient = if ($Initial -ceq 'absent') { $null }
+            elseif ($Initial -ceq 'stale_zero') { 0 } else { 9 }
+        if ($accepted -ne $case.accept -or $script:fixtureActualExit -ne $case.code -or
+            -not $script:fixtureProcessCleaned -or $ambientValue -ne $expectedAmbient -or
+            $MediaMtxVersion -cne '1.21.1') { throw 'fixture_result' }
+        [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=shared_' + $case.mode + '_passed')
+        [Console]::Out.Flush()
+    }
+    exit 0
+} catch { Write-K5ElementChildFailure $_ $fixturePhase 'primary'; exit 1 }
+"""
+
+
+def _shared_native_fixture(boundary, config_path):
+    resolve = re.findall(r'\$resolveCode = "([^"]+)"', START.read_text())
+    if len(resolve) != 1:
+        raise ValueError("Invalid source resolver selection")
+    expected = {
+        "version": ["--version"],
+        "config": ["--validate-conf", str(config_path)],
+        "public": ["-I", "-B", "-c", resolve[0], "rtsp://example.invalid:8554/owned%20path"],
+        "argv": SHARED_ARGV,
+    }
+    python = (
+        "import os,sys\nEXPECTED = "
+        + repr(expected)
+        + r"""
+try:
+    if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
+        os._exit(42)
+    mode = sys.argv[1]
+    boundary = mode.split('_')[0]
+    if sys.argv[2:] != EXPECTED[boundary]:
+        os._exit(41)
+    if boundary == 'version':
+        output = {'version_wrong':b'v1.21.10\n','version_multi':b'v1.21.1\nextra\n',
+                  'version_empty':b'','version_utf8':b'\xff'}.get(mode,b'v1.21.1\n')
+    elif boundary == 'config':
+        output = b'\xff' if mode == 'config_bytes' else (
+            'configuration file: ' + EXPECTED['config'][1] + '\nconfiguration file is valid\n'
+        ).encode()
+    elif boundary == 'public':
+        output = {'public_empty':b'','public_multi':b'8.8.8.8\n1.1.1.1\n',
+                  'public_cr':b'8.8.8.8\r','public_crlf':b'8.8.8.8\r\n',
+                  'public_cr_multi':b'8.8.8.8\r1.1.1.1',
+                  'public_blank':b'8.8.8.8\n\n','public_cr_blank':b'8.8.8.8\r\r',
+                  'public_utf8':b'\xff'}.get(mode,b'8.8.8.8\n')
+    else:
+        output = b'argv-ok\n'
+    if output:
+        os.write(1,output)
+    if mode.endswith('_stderr'):
+        os.write(2,b'PRIVATE_CAPTURED_STDERR')
+    os._exit(7 if mode.endswith('_nonzero') else 0)
+except BaseException:
+    os._exit(43)
+"""
+    )
+    cases = [
+        dict(mode=m, accept=a, code=c, error=e) for m, a, c, e in SHARED_NATIVE_CASES[boundary]
+    ]
+    insertions = []
+    for anchor, addition in ELEMENT_PROCESS_INSERTIONS.items():
+        before = anchor.rstrip("\n").replace("'", "''")
+        after = addition.rstrip("\n").replace("'", "''")
+        insertions.append(
+            "$anchor='" + before + '\' + "`n"\n'
+            "if (($helper.Split(@($anchor),[StringSplitOptions]::None)).Count -ne 2) "
+            "{ throw 'fixture_identity' }\n"
+            "$helper=$helper.Replace($anchor,$anchor + '" + after + '\' + "`n")'
+        )
+    script = (
+        SHARED_NATIVE_SCRIPT.replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS)
+        .replace("__ELEMENT_UTILITY_IMPORT__", ELEMENT_UTILITY_IMPORT)
+        .replace("__SHARED_OBSERVATIONS__", "\n".join(insertions))
+        .replace("__RESOLVE_CODE__", resolve[0].replace("'", "''"))
+        .replace("__ARGV__", json.dumps(SHARED_ARGV).replace("'", "''"))
+        .replace("__CASES__", json.dumps(cases).replace("'", "''"))
+    )
+    return script, python
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="Requires actual Windows native caller boundaries"
+)
+@pytest.mark.parametrize("boundary", sorted(SHARED_NATIVE_CASES))
+@pytest.mark.parametrize("initial", ["absent", "stale_zero", "stale_nonzero"])
+def test_windows_shared_native_caller_boundaries_and_exact_argv(tmp_path, boundary, initial):
+    import os
+
+    common = None
+    context = _element_context("probe", "ConsoleApplication", "zero", "process", initial)
+    try:
+        module = _startup_witness()
+        common = module.common
+        base = common.local_path(Path(sys._base_executable))
+        binding = dict(
+            K5_WITNESS_BASE_PYTHON=str(base), K5_WITNESS_BASE_PYTHON_SHA256=common.file_hash(base)
+        )
+        supplied = {key: os.environ.get(key) for key in common.GATE_RUNTIME_KEYS}
+        if any(value is not None for value in supplied.values()) and supplied != binding:
+            raise ValueError("Invalid admitted runtime")
+        env = module.clean_environment(dict(os.environ), tmp_path)
+        env.update(binding)
+        for key in ("TEMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            Path(env[key]).mkdir(parents=True, exist_ok=True)
+        shell = common.local_path(
+            Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        config_path = tmp_path / "owned config with spaces.yml"
+        script, python = _shared_native_fixture(boundary, config_path)
+        target = tmp_path / "shared-probe.ps1"
+        target.write_text(
+            _element_bind_utility(script, shell, common), encoding="ascii", newline="\n"
+        )
+        fixture = tmp_path / "owned script with spaces.py"
+        fixture.write_text(python, encoding="utf-8", newline="\n")
+        output = _capture_element_child(
+            common,
+            [
+                str(shell),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(target),
+                "-Start",
+                str(START),
+                "-StartHash",
+                common.file_hash(START),
+                "-Python",
+                str(base),
+                "-Fixture",
+                str(fixture),
+                "-ConfigPath",
+                str(config_path),
+                "-Boundary",
+                boundary,
+                "-Initial",
+                initial,
+            ],
+            cwd=tmp_path,
+            env=env,
+            context=context,
+        )
+        lines = output.splitlines()
+        expected = [
+            ELEMENT_CHECKPOINT_PREFIX + ("shared_" + mode + "_" + state).encode()
+            for mode, *_ in SHARED_NATIVE_CASES[boundary]
+            for state in ("requested", "passed")
+        ]
+        prefix = [
+            ELEMENT_CHECKPOINT_PREFIX + name.encode()
+            for name in (
+                "utility_manifest_requested",
+                "utility_import_requested",
+                "utility_import_returned",
+            )
+        ]
+        if (
+            lines[:3] != prefix
+            or len(lines) != 5 + len(expected)
+            or lines[4] != ELEMENT_CHECKPOINT_PREFIX + b"utility_binding_verified"
+            or lines[5:] != expected
+        ):
+            raise ValueError("Incomplete native caller evidence")
+        _element_require_utility_observation(lines[3])
+    except Exception as error:
+        try:
+            _element_diagnostic(context, "failed", error, common=common)
+        except Exception:
+            pass
+        pytest.fail("Owned shared native caller fixture failed", pytrace=False)
+
+
+def test_shared_probe_preserves_qualified_loop_and_owned_cleanup():
+    source = ELEMENT_PRODUCT_HELPER
+    start = source.index("        $watch = [Diagnostics.Stopwatch]::StartNew()")
+    end = source.index("        $exitCode = $child.ExitCode", start)
+    loop = source[start:end].replace(
+        " " * 20 + "if ($CaptureOutput) { $capturedStdout.Write($outBuffer, 0, $count) }\n",
+        "",
+    )
+    assert hashlib.sha256(loop.encode()).hexdigest() == (
+        "2519b1d0dd287a4d778f3c846924b9a15284c22dc06c9635d8c3730349d17ec7"
+    )
+    start = source.index("    } catch {\n        $primaryFailure = $_")
+    end = source.index("        # The exact started Process", start)
+    cleanup = source[start:end].replace(
+        "@($stdoutStream, $stderrStream, $capturedStdout)", "@($stdoutStream, $stderrStream)"
+    )
+    assert hashlib.sha256(cleanup.encode()).hexdigest() == (
+        "a936149e29a901ed1ab6f2de7758a85523c6de2f296ae6e533bdb68904ac3445"
+    )
+    assert "$capturedStdout = $null" in _element_process_cleanup_fixture()
+
+
+def test_shared_native_fixture_is_bounded_source_bound_and_policy_specific():
+    script, _ = _shared_native_fixture("version", Path("owned config.yml"))
+    assert "ReadAllBytes" not in script and "[byte[]]::new(262145)" in script
+    assert "$hasher.ComputeHash($bytes,0,$total)" in script
+    assert "$stream.Dispose()" in script and "$total -gt 262144" in script
+    assert "$_.Exception.Message -ceq $callerMessages[$Boundary]" in script
+    assert "$assignments.Count -ne 1" in script and "$helpers.Count -ne 1" in script
+    assert "$statements[$index].Extent.Text" in script
+    assert "$script:fixtureActualExit -ne $case.code" in script
+    assert "-not $script:fixtureProcessCleaned" in script
+    assert "$ambientValue -ne $expectedAmbient" in script
+    assert "[bool]$DiscardStderr -ne ($Boundary -ceq 'public')" in script
+    assert "[bool]$CaptureOutput -ne ($Boundary -cne 'config')" in script
+    assert "& $Start" not in script
+    assert len(script.encode()) < 32768
+    for cases in SHARED_NATIVE_CASES.values():
+        for mode, *_ in cases:
+            for state in ("requested", "passed"):
+                assert "shared_" + mode + "_" + state in ELEMENT_CHECKPOINTS
+    source = ELEMENT_PRODUCT_HELPER
+    assert source.index("$argument.IndexOf([char]0)") < source.index("$child.Start()")
+    for bound in (
+        "$Arguments.Count -gt 16",
+        "$argument.Length -gt 8192",
+        "$info.Arguments.Length -gt 16384",
+    ):
+        assert source.index(bound) < source.index("$child.Start()")
+
+
+@pytest.mark.parametrize("boundary", sorted(SHARED_NATIVE_CASES))
+def test_shared_native_python_oracle_checks_exact_vectors_and_fixed_output(tmp_path, boundary):
+    import ast
+
+    _, python = _shared_native_fixture(boundary, tmp_path / "owned config 'with spaces'.yml")
+    tree = ast.parse(python)
+    expected = ast.literal_eval(
+        next(node.value for node in tree.body if isinstance(node, ast.Assign))
+    )
+    target = tmp_path / "owned oracle.py"
+    target.write_text(python)
+    for mode, _, code, _ in SHARED_NATIVE_CASES[boundary]:
+        if code is None:
+            continue  # These are pre-launch argument refusals in the real Windows helper.
+        command = [sys.executable, "-I", "-B", "-S", str(target), mode, *expected[boundary]]
+        result = subprocess.run(command, capture_output=True, timeout=5, check=False)
+        assert result.returncode == code
+        assert len(result.stdout) < 4096
+        assert result.stderr == (b"PRIVATE_CAPTURED_STDERR" if mode.endswith("_stderr") else b"")
+        if mode.endswith("_utf8") or mode == "config_bytes":
+            assert result.stdout == b"\xff"
+        elif mode == "argv_ok":
+            assert result.stdout == b"argv-ok\n"
+        elif mode in {
+            "public_cr",
+            "public_crlf",
+            "public_cr_multi",
+            "public_blank",
+            "public_cr_blank",
+        }:
+            assert (
+                result.stdout
+                == {
+                    "public_cr": b"8.8.8.8\r",
+                    "public_crlf": b"8.8.8.8\r\n",
+                    "public_cr_multi": b"8.8.8.8\r1.1.1.1",
+                    "public_blank": b"8.8.8.8\n\n",
+                    "public_cr_blank": b"8.8.8.8\r\r",
+                }[mode]
+            )
+        elif mode.endswith("_ok") or mode.endswith("_nonzero") or mode.endswith("_stderr"):
+            assert result.stdout.endswith(b"\n")
+        wrong = subprocess.run(
+            command + ["unexpected"], capture_output=True, timeout=5, check=False
+        )
+        assert wrong.returncode == 41 and not wrong.stdout and not wrong.stderr
+
+
+def test_shared_probe_operation_anchors_preserve_specific_callers():
+    module = _startup_witness()
+    source = START.read_text().splitlines()
+    positioned = []
+    for anchor, operation in module.START_OPERATION_ANCHORS:
+        hits = [index + 1 for index, line in enumerate(source) if line.strip() == anchor]
+        assert len(hits) == 1
+        positioned.append((hits[0], operation))
+    assert positioned == sorted(positioned)
+    for needle, expected in (
+        ("$argument.IndexOf([char]0)", "unknown"),
+        ("$mediaMtxVersionOutput.Stdout -cnotin", "mediamtx_version"),
+        ("if ($validation.ExitCode -ne 0)", "mediamtx_config_validate"),
+    ):
+        line = next(index + 1 for index, text in enumerate(source) if needle in text)
+        assert [operation for at, operation in positioned if at <= line][-1] == expected
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="Requires Windows source-bound error projection"
+)
+@pytest.mark.parametrize("boundary", ["helper", "version", "config"])
+def test_windows_shared_probe_errors_keep_truthful_source_operation(tmp_path, boundary):
+    module = _startup_witness()
+    valid = False
+    try:
+        source = START.read_text()
+        functions = list(re.finditer(r"(?ms)^function [^\r\n]+\{\r?\n.*?^\}", source))
+        if not functions:
+            raise ValueError("Missing source functions")
+        # Define the actual functions in place, but never execute the launcher's
+        # top-level admission/session/media blocks in this source-line fixture.
+        parts = [source[: functions[0].start()]]
+        cursor = functions[0].start()
+        for function in functions:
+            parts += [
+                "\nif ($false) {\n",
+                source[cursor : function.start()],
+                "\n}\n",
+                function.group(),
+            ]
+            cursor = function.end()
+        parts += ["\nif ($false) {\n", source[cursor:], "\n}\n"]
+        if boundary == "helper":
+            parts.append("Invoke-K5NativeProbe -Executable 'relative' -Arguments @('owned')\n")
+        else:
+            parts.append(
+                r"""
+$sessionRoot = $PSScriptRoot
+function Test-K5GStreamerElement { return $true }
+function Get-K5MediaMtx { return 'owned-test-double' }
+function Invoke-K5NativeProbe { param($Executable,[string[]]$Arguments,
+    [switch]$CaptureOutput,[switch]$DiscardStderr)
+    if ($Arguments[0] -ceq '--version') {
+        return [pscustomobject]@{ExitCode=0;Stdout='__VERSION__'}
+    }
+    return [pscustomobject]@{ExitCode=7;Stdout=''}
+}
+$null = Start-K5SyntheticSource
+""".replace("__VERSION__", "wrong" if boundary == "version" else "v1.21.1")
+            )
+        fixture = "".join(parts)
+        target = tmp_path / "source-bound-fixture.ps1"
+        target.write_text(fixture, encoding="ascii", newline="\n")
+        envelope = tmp_path / "envelope.ps1"
+        envelope.write_text(
+            module.bind_start_envelope(hashlib.sha256(fixture.encode()).hexdigest()),
+            encoding="ascii",
+            newline="\n",
+        )
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(envelope),
+                "-Start",
+                str(target),
+                "-Port",
+                "8011",
+            ],
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        if result.returncode != 24 or result.stderr or len(result.stdout) > 2048:
+            raise ValueError("Invalid bounded projection")
+        records = [
+            module.parse_start_error(line[len(module.START_ERROR_PREFIX) :])
+            for line in result.stdout.splitlines()
+            if line.startswith(module.START_ERROR_PREFIX)
+        ]
+        expected = {
+            "helper": "unknown",
+            "version": "mediamtx_version",
+            "config": "mediamtx_config_validate",
+        }
+        if (
+            len(records) != 1
+            or records[0]["origin"] != "start"
+            or records[0]["operation"] != expected[boundary]
+        ):
+            raise ValueError("Invalid source operation")
+        valid = True
+    except Exception:
+        pass
+    if not valid:
+        pytest.fail("Bounded shared probe projection failed", pytrace=False)
+
+
+def test_public_native_line_parser_matches_cr_lf_crlf_and_one_terminal_delimiter():
+    source = START.read_text()
+    pattern = re.search(r'\$resolvedLines = @\(\$resolved.Stdout -split "([^"]+)"\)', source).group(
+        1
+    )
+    assert pattern == r"\r\n|\r|\n"
+    assert '$resolved.Stdout.EndsWith("`r") -or $resolved.Stdout.EndsWith("`n")' in source
+    for text, accepted in (
+        ("8.8.8.8", True),
+        ("8.8.8.8\n", True),
+        ("8.8.8.8\r", True),
+        ("8.8.8.8\r\n", True),
+        ("8.8.8.8\r1.1.1.1", False),
+        ("8.8.8.8\n1.1.1.1", False),
+        ("8.8.8.8\n\n", False),
+        ("8.8.8.8\r\r", False),
+        ("8.8.8.8\r\n\r\n", False),
+        ("", False),
+        (" \r", False),
+    ):
+        lines = re.split(pattern, text)
+        if text.endswith(("\r", "\n")):
+            lines = lines[:-1]
+        assert (len(lines) == 1 and bool(lines[0].strip())) is accepted

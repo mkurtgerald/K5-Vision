@@ -192,35 +192,75 @@ function Test-K5TcpListener([string]$HostName, [int]$TargetPort) {
 }
 
 function Test-K5GStreamerElement([string]$Name) {
+    if ($Name.Length -eq 0 -or $Name.Length -gt 8192 -or
+        $Name -match '[^\x21-\x7e]|["\\]') {
+        throw [Management.Automation.CommandNotFoundException]::new(
+            'K5 native application required.')
+    }
+    $result = Invoke-K5NativeProbe -Executable $gstInspect -Arguments @($Name)
+    return $result.ExitCode -eq 0
+}
+
+function Invoke-K5NativeProbe {
+    param([string]$Executable, [string[]]$Arguments,
+          [switch]$CaptureOutput, [switch]$DiscardStderr)
     $child = $null
     $primaryFailure = $null
     $started = $false
     $childHandle = [IntPtr]::Zero
     $outRead = $null; $errRead = $null
     $stdoutStream = $null; $stderrStream = $null
+    $capturedStdout = $null
     try {
-        # Only one bounded token reaches the native argv parser. This includes
-        # actual element names and the admitted one-argument native probe.
-        if ($Name.Length -eq 0 -or $Name.Length -gt 8192 -or
-            $Name -match '[^\x21-\x7e]|["\\]' -or -not [IO.Path]::IsPathRooted($gstInspect)) {
+        if (-not [IO.Path]::IsPathRooted($Executable)) {
             throw [Management.Automation.CommandNotFoundException]::new(
                 'K5 native application required.')
         }
-        $command = Get-Command -Name $gstInspect -ErrorAction Stop
+        if ($null -eq $Arguments -or $Arguments.Count -lt 1 -or $Arguments.Count -gt 16) {
+            throw [ArgumentException]::new('K5 native arguments invalid.')
+        }
+        # Encode one bounded Windows argv vector without a shell. Double every
+        # backslash before a quote and every trailing backslash inside quotes.
+        $quotedArguments = [Collections.Generic.List[string]]::new()
+        foreach ($argument in $Arguments) {
+            if ($null -eq $argument -or $argument.Length -gt 8192 -or
+                $argument.IndexOf([char]0) -ge 0) {
+                throw [ArgumentException]::new('K5 native arguments invalid.')
+            }
+            $encoded = [Text.StringBuilder]::new()
+            [void]$encoded.Append([char]34)
+            $slashes = 0
+            foreach ($character in $argument.ToCharArray()) {
+                if ($character -eq [char]92) { $slashes++; continue }
+                if ($character -eq [char]34) {
+                    [void]$encoded.Append([char]92, (2 * $slashes + 1))
+                } else { [void]$encoded.Append([char]92, $slashes) }
+                [void]$encoded.Append($character)
+                $slashes = 0
+            }
+            [void]$encoded.Append([char]92, (2 * $slashes))
+            [void]$encoded.Append([char]34)
+            $quotedArguments.Add($encoded.ToString())
+        }
+        $command = Get-Command -Name $Executable -ErrorAction Stop
         if ($command -isnot [Management.Automation.ApplicationInfo] -or
             -not [string]::Equals([IO.Path]::GetFullPath($command.Path),
-                [IO.Path]::GetFullPath($gstInspect), [StringComparison]::OrdinalIgnoreCase)) {
+                [IO.Path]::GetFullPath($Executable), [StringComparison]::OrdinalIgnoreCase)) {
             throw [Management.Automation.CommandNotFoundException]::new(
                 'K5 native application required.')
         }
         $info = [Diagnostics.ProcessStartInfo]::new()
         $info.FileName = $command.Path
-        $info.Arguments = $Name
+        $info.Arguments = [string]::Join(' ', $quotedArguments.ToArray())
+        if ($info.Arguments.Length -gt 16384) {
+            throw [ArgumentException]::new('K5 native arguments invalid.')
+        }
         $info.UseShellExecute = $false
         $info.CreateNoWindow = $true
         $info.RedirectStandardInput = $true
         $info.RedirectStandardOutput = $true
         $info.RedirectStandardError = $true
+        if ($CaptureOutput) { $capturedStdout = [IO.MemoryStream]::new() }
         $child = [Diagnostics.Process]::new()
         $child.StartInfo = $info
         $started = $child.Start()
@@ -248,6 +288,7 @@ function Test-K5GStreamerElement([string]$Name) {
                     if ($outCount + $errCount -gt 131072) {
                         throw [IO.InvalidDataException]::new('K5 native output limit.')
                     }
+                    if ($CaptureOutput) { $capturedStdout.Write($outBuffer, 0, $count) }
                     $outRead = $stdoutStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
                 }
             }
@@ -266,8 +307,14 @@ function Test-K5GStreamerElement([string]$Name) {
             [Threading.Thread]::Sleep(10)
         }
         $exitCode = $child.ExitCode
-        if ($errCount -ne 0) { throw [IO.InvalidDataException]::new('K5 native stderr refused.') }
-        return $exitCode -eq 0
+        if ($errCount -ne 0 -and -not $DiscardStderr) {
+            throw [IO.InvalidDataException]::new('K5 native stderr refused.')
+        }
+        $outputText = ''
+        if ($CaptureOutput) {
+            $outputText = [Text.UTF8Encoding]::new($false, $true).GetString($capturedStdout.ToArray())
+        }
+        return [pscustomobject]@{ ExitCode = $exitCode; Stdout = $outputText }
     } catch {
         $primaryFailure = $_
         throw
@@ -287,7 +334,7 @@ function Test-K5GStreamerElement([string]$Name) {
                 }
             }
         } catch { $cleanupFailed = $true }
-        foreach ($ownedStream in @($stdoutStream, $stderrStream)) {
+        foreach ($ownedStream in @($stdoutStream, $stderrStream, $capturedStdout)) {
             try { if ($null -ne $ownedStream) { $ownedStream.Close() } }
             catch { $cleanupFailed = $true }
         }
@@ -386,24 +433,21 @@ paths:
 "@
     [IO.File]::WriteAllText($configPath, $config)
 
-    $mediaMtxVersionOutput = @(& $mediaMtx --version 2>&1)
-    if ($LASTEXITCODE -ne 0 -or $mediaMtxVersionOutput.Count -ne 1 -or
-        $mediaMtxVersionOutput[0] -isnot [string] -or
-        $mediaMtxVersionOutput[0] -cne ("v" + $MediaMtxVersion)) {
-        foreach ($line in $mediaMtxVersionOutput) { Write-Host ("mediamtx-version: " + $line) }
+    $mediaMtxVersionOutput = Invoke-K5NativeProbe -Executable $mediaMtx -Arguments @("--version") -CaptureOutput
+    if ($mediaMtxVersionOutput.ExitCode -ne 0 -or
+        $mediaMtxVersionOutput.Stdout -isnot [string] -or
+        $mediaMtxVersionOutput.Stdout -cnotin @(
+            ("v" + $MediaMtxVersion), ("v" + $MediaMtxVersion + "`n"),
+            ("v" + $MediaMtxVersion + "`r`n"))) {
         throw "Pinned MediaMTX executable failed its version probe."
     }
 
-    $validation = @(& $mediaMtx --validate-conf $configPath 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-        foreach ($line in $validation) { Write-Host ("mediamtx-validate: " + $line) }
+    $validation = Invoke-K5NativeProbe -Executable $mediaMtx -Arguments @("--validate-conf", $configPath)
+    if ($validation.ExitCode -ne 0) {
         throw "Local synthetic RTSP MediaMTX configuration is invalid."
     }
-    foreach ($line in $validation) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$line)) {
-            Write-Host ("mediamtx-validate: " + $line)
-        }
-    }
+    # Validation output contains a local path and is never echoed or persisted.
+    $validation = $null
 
     if (Test-K5TcpListener "127.0.0.1" 8554) {
         throw "Local synthetic RTSP port 8554 is already in use."
@@ -554,11 +598,20 @@ try {
         Write-Host "Starting K5 Vision Alpha local synthetic operator test on http://127.0.0.1:$Port"
     } else {
         $resolveCode = "from k5vision.operator_runtime import resolve_public_test_source_ip; import sys; print(resolve_public_test_source_ip(sys.argv[1]))"
-        $resolved = @(& $python -I -B -c $resolveCode $PublicRtspSource 2>$null)
-        if ($LASTEXITCODE -ne 0 -or $resolved.Count -ne 1) {
+        $resolved = Invoke-K5NativeProbe -Executable $python -Arguments @("-I", "-B", "-c", $resolveCode, $PublicRtspSource) -CaptureOutput -DiscardStderr
+        if ($resolved.ExitCode -ne 0) {
             throw "Public RTSP alpha source failed validation."
         }
-        $publicSourceIp = ([string]$resolved[0]).Trim()
+        $resolvedLines = @($resolved.Stdout -split "\r\n|\r|\n")
+        if ($resolved.Stdout.EndsWith("`r") -or $resolved.Stdout.EndsWith("`n")) {
+            $resolvedLines = @($resolvedLines[0..($resolvedLines.Count - 2)])
+        }
+        if ($resolvedLines.Count -ne 1) {
+            throw "Public RTSP alpha source failed validation."
+        }
+        $publicSourceIp = ([string]$resolvedLines[0]).Trim()
+        $resolved = $null
+        $resolvedLines = $null
         if ([string]::IsNullOrWhiteSpace($publicSourceIp)) {
             throw "Public RTSP alpha source failed validation."
         }

@@ -309,12 +309,21 @@ START_OPERATION_ANCHORS = (
     ("function ConvertTo-K5Json([hashtable]$Value) {", "json_encode"),
     ("function Test-K5TcpListener([string]$HostName, [int]$TargetPort) {", "listener_probe"),
     ("function Test-K5GStreamerElement([string]$Name) {", "element_probe"),
+    ("function Invoke-K5NativeProbe {", "unknown"),
     ("function Get-K5MediaMtx {", "mediamtx_cache"),
     ("function Start-K5SyntheticSource {", "element_probe"),
     ("$mediaMtx = Get-K5MediaMtx", "mediamtx_cache"),
     ('$configPath = Join-Path $sessionRoot "mediamtx.yml"', "mediamtx_config_write"),
-    ("$mediaMtxVersionOutput = @(& $mediaMtx --version 2>&1)", "mediamtx_version"),
-    ("$validation = @(& $mediaMtx --validate-conf $configPath 2>&1)", "mediamtx_config_validate"),
+    (
+        "$mediaMtxVersionOutput = Invoke-K5NativeProbe -Executable $mediaMtx "
+        '-Arguments @("--version") -CaptureOutput',
+        "mediamtx_version",
+    ),
+    (
+        "$validation = Invoke-K5NativeProbe -Executable $mediaMtx "
+        '-Arguments @("--validate-conf", $configPath)',
+        "mediamtx_config_validate",
+    ),
     ('throw "Local synthetic RTSP port 8554 is already in use."', "rtsp_port_admission"),
     ('Write-Host "Starting local MediaMTX RTSP server..."', "server_start"),
     ("$serverReady = $false", "server_readiness"),
