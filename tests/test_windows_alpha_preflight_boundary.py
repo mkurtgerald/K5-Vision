@@ -14,7 +14,6 @@ import shutil
 import struct
 import sys
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -27,30 +26,25 @@ assert SPEC is not None and SPEC.loader is not None
 alpha = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(alpha)
 common = alpha.common
-MAX_PROCESSES = 32
-MAX_EVENTS = 256
-PROCESS_KINDS = {
-    "base_python",
-    "venv_python",
-    "powershell",
-    "console_host",
-    "dotnet_compiler",
-    "unknown",
-}
-TEMP_KINDS = {"policy_probe", "alpha_session", "other_owned_temp"}
-ACTIONS = {1: "added", 2: "removed", 3: "modified", 4: "renamed_from", 5: "renamed_to"}
-ERRORS = {
-    "none",
-    "access_denied",
-    "process_unavailable",
-    "ownership_unproven",
-    "native_error",
-    "limit",
-    "incomplete",
-    "fixture_admission",
-    "launcher_rejected",
-    "cleanup_incomplete",
-}
+HELPER_SPEC = importlib.util.spec_from_file_location(
+    "_windows_owned_preflight", ROOT / "scripts/windows_owned_preflight.py"
+)
+assert HELPER_SPEC is not None and HELPER_SPEC.loader is not None
+boundary = importlib.util.module_from_spec(HELPER_SPEC)
+HELPER_SPEC.loader.exec_module(boundary)
+MAX_PROCESSES, MAX_EVENTS = boundary.MAX_PROCESSES, boundary.MAX_EVENTS
+PROCESS_KINDS, TEMP_KINDS, ACTIONS, ERRORS = (
+    boundary.PROCESS_KINDS,
+    boundary.TEMP_KINDS,
+    boundary.ACTIONS,
+    boundary.ERRORS,
+)
+ObservationFailure, need = boundary.ObservationFailure, boundary.need
+classify_temp, notification_categories = boundary.classify_temp, boundary.notification_categories
+ProcessObserver, TempObserver = boundary.ProcessObserver, boundary.TempObserver
+process_record, observers_quiescent = boundary.process_record, boundary.observers_quiescent
+guarded_assignment = boundary.guarded_assignment
+
 COUNT_FIELDS = (
     {"job_total", "job_active", "distinct_births", "temp_events"}
     | {"process_" + key for key in PROCESS_KINDS}
@@ -63,6 +57,7 @@ BOOL_FIELDS = {
     "cleanup_complete",
     "temporary_root_empty",
     "old_gate_rejected",
+    "initialization_contract_verified",
 }
 FIELDS = (
     COUNT_FIELDS
@@ -72,52 +67,9 @@ FIELDS = (
 )
 
 
-class ObservationFailure(RuntimeError):
-    def __init__(self, code: str):
-        super().__init__(code if code in ERRORS else "native_error")
-
-
-def need(condition: bool, code="fixture_admission") -> None:
-    if not condition:
-        raise ObservationFailure(code)
-
-
-def classify_temp(name: str) -> str:
-    parts = name.replace("/", "\\").split("\\")
-    if len(parts) == 1 and re.fullmatch(
-        r"__PSScriptPolicyTest_[A-Za-z0-9._-]{1,80}\.(?:ps1|psm1)", name
-    ):
-        return "policy_probe"
-    if parts and re.fullmatch(r"K5VisionAlpha-[0-9a-fA-F]{32}", parts[0]):
-        return "alpha_session"
-    return "other_owned_temp"
-
-
-def notification_categories(data: bytes) -> list[tuple[str, str]]:
-    """Parse only a bounded owned-directory buffer; never return raw names."""
-    need(0 < len(data) <= 65_536, "limit")
-    offset, result = 0, []
-    while True:
-        need(offset + 12 <= len(data), "native_error")
-        following, action, length = struct.unpack_from("<III", data, offset)
-        need(action in ACTIONS and length % 2 == 0 and 0 < length <= 4096, "native_error")
-        end = offset + 12 + length
-        need(end <= len(data), "native_error")
-        try:
-            kind = classify_temp(data[offset + 12 : end].decode("utf-16-le", errors="strict"))
-        except UnicodeError:
-            raise ObservationFailure("native_error") from None
-        result.append((kind, ACTIONS[action]))
-        need(len(result) <= MAX_EVENTS, "limit")
-        if following == 0:
-            return result
-        need(following >= 12 + length and following % 4 == 0, "native_error")
-        offset += following
-
-
 def empty_record():
     return {
-        "schema_version": "owned-start-preflight-observation-v1",
+        "schema_version": "owned-start-preflight-qualification-v1",
         "error": "none",
         "old_contract": "none",
         **dict.fromkeys(COUNT_FIELDS, 0),
@@ -130,7 +82,7 @@ def validate_record(value):
     need(type(value) is dict and value.keys() == FIELDS)
     need(
         type(value["schema_version"]) is str
-        and value["schema_version"] == "owned-start-preflight-observation-v1"
+        and value["schema_version"] == "owned-start-preflight-qualification-v1"
     )
     need(type(value["error"]) is str and value["error"] in ERRORS)
     need(
@@ -158,354 +110,6 @@ def validate_record(value):
         )
         need(all(value["process_" + kind] == kinds.count(kind) for kind in PROCESS_KINDS))
     need(len(common.canonical(value)) <= common.MAX_BYTES)
-
-
-def api():
-    from ctypes import wintypes as w
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    signatures = {
-        "GetCurrentProcess": ([], w.HANDLE),
-        "DuplicateHandle": (
-            [w.HANDLE, w.HANDLE, w.HANDLE, ctypes.POINTER(w.HANDLE), w.DWORD, w.BOOL, w.DWORD],
-            w.BOOL,
-        ),
-        "CreateIoCompletionPort": ([w.HANDLE, w.HANDLE, ctypes.c_size_t, w.DWORD], w.HANDLE),
-        "GetQueuedCompletionStatus": (
-            [
-                w.HANDLE,
-                ctypes.POINTER(w.DWORD),
-                ctypes.POINTER(ctypes.c_size_t),
-                ctypes.POINTER(ctypes.c_void_p),
-                w.DWORD,
-            ],
-            w.BOOL,
-        ),
-        "PostQueuedCompletionStatus": (
-            [w.HANDLE, w.DWORD, ctypes.c_size_t, ctypes.c_void_p],
-            w.BOOL,
-        ),
-        "OpenProcess": ([w.DWORD, w.BOOL, w.DWORD], w.HANDLE),
-        "IsProcessInJob": ([w.HANDLE, w.HANDLE, ctypes.POINTER(w.BOOL)], w.BOOL),
-        "QueryFullProcessImageNameW": (
-            [w.HANDLE, w.DWORD, w.LPWSTR, ctypes.POINTER(w.DWORD)],
-            w.BOOL,
-        ),
-        "GetProcessTimes": (
-            [w.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p],
-            w.BOOL,
-        ),
-        "CloseHandle": ([w.HANDLE], w.BOOL),
-        "CreateFileW": (
-            [w.LPCWSTR, w.DWORD, w.DWORD, ctypes.c_void_p, w.DWORD, w.DWORD, w.HANDLE],
-            w.HANDLE,
-        ),
-        "CreateEventW": ([ctypes.c_void_p, w.BOOL, w.BOOL, w.LPCWSTR], w.HANDLE),
-        "ResetEvent": ([w.HANDLE], w.BOOL),
-        "WaitForSingleObject": ([w.HANDLE, w.DWORD], w.DWORD),
-        "ReadDirectoryChangesW": (
-            [
-                w.HANDLE,
-                ctypes.c_void_p,
-                w.DWORD,
-                w.BOOL,
-                w.DWORD,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-            ],
-            w.BOOL,
-        ),
-        "GetOverlappedResult": (
-            [w.HANDLE, ctypes.c_void_p, ctypes.POINTER(w.DWORD), w.BOOL],
-            w.BOOL,
-        ),
-        "CancelIoEx": ([w.HANDLE, ctypes.c_void_p], w.BOOL),
-    }
-    for name, (arguments, result) in signatures.items():
-        function = getattr(kernel, name)
-        function.argtypes, function.restype = arguments, result
-    return kernel
-
-
-def native_need(ok, *, missing=False):
-    if not ok:
-        code = ctypes.get_last_error()
-        raise ObservationFailure(
-            "access_denied"
-            if code == 5
-            else "process_unavailable"
-            if missing and code == 87
-            else "native_error"
-        )
-
-
-def process_class(path: str, admitted: dict[str, tuple[Path, str]]) -> str:
-    for kind, (expected, identity) in admitted.items():
-        if os.path.normcase(path) == os.path.normcase(str(expected)):
-            try:
-                need(common.file_hash(expected) == identity)
-            except PermissionError:
-                raise ObservationFailure("access_denied") from None
-            return kind
-    return "unknown"
-
-
-class ProcessObserver:
-    """Completion-port notifications from one owned Job, never global PID scans."""
-
-    def __init__(self, job, admitted, resources):
-        from ctypes import wintypes as w
-
-        class Association(ctypes.Structure):
-            _fields_ = [("key", ctypes.c_void_p), ("port", w.HANDLE)]
-
-        self.job, self.admitted, self.api = job, admitted, api()
-        self.resource_lock = threading.Lock()
-        self.closed = False
-        self.release_complete = False
-        duplicate = w.HANDLE()
-        current = self.api.GetCurrentProcess()
-        native_need(
-            self.api.DuplicateHandle(
-                current, job.handle, current, ctypes.byref(duplicate), 0, False, 2
-            )
-        )
-        self.job_query_handle = duplicate.value
-        self.port = self.api.CreateIoCompletionPort(ctypes.c_void_p(-1), None, 0, 1)
-        if not self.port:
-            self.api.CloseHandle(self.job_query_handle)
-            native_need(False)
-        self.births = {}
-        self.handles = []
-        self.error = "none"
-        self.stop = threading.Event()
-        association = Association(1, self.port)
-        try:
-            native_need(
-                job.api.SetInformationJobObject(
-                    job.handle, 7, ctypes.byref(association), ctypes.sizeof(association)
-                )
-            )
-            self.thread = threading.Thread(target=self._read, daemon=True)
-            resources.append(self)
-            self.thread.start()
-        except BaseException:
-            self.api.CloseHandle(self.port)
-            self.api.CloseHandle(self.job_query_handle)
-            self.closed = True
-            self.release_complete = True
-            raise
-
-    def _observe(self, pid):
-        from ctypes import wintypes as w
-
-        handle = self.api.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION only.
-        native_need(handle, missing=True)
-        try:
-            belongs = w.BOOL()
-            native_need(
-                self.api.IsProcessInJob(handle, self.job_query_handle, ctypes.byref(belongs))
-            )
-            need(bool(belongs.value), "ownership_unproven")
-            # Only after exact Job ownership is confirmed may image/birth be read.
-            created, exited, kernel, user = (ctypes.c_uint64() for _ in range(4))
-            native_need(
-                self.api.GetProcessTimes(
-                    handle,
-                    ctypes.byref(created),
-                    ctypes.byref(exited),
-                    ctypes.byref(kernel),
-                    ctypes.byref(user),
-                )
-            )
-            need(created.value > 0, "native_error")
-            key = (pid, created.value)
-            if key in self.births:
-                return
-            need(len(self.births) < MAX_PROCESSES, "limit")
-            buffer, count = ctypes.create_unicode_buffer(32768), w.DWORD(32768)
-            native_need(self.api.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(count)))
-            self.births[key] = process_class(buffer.value, self.admitted)
-            self.handles.append(handle)
-            handle = None  # Hold the birth's handle until observation cleanup.
-        finally:
-            if handle is not None:
-                need(bool(self.api.CloseHandle(handle)), "cleanup_incomplete")
-
-    def _read(self):
-        from ctypes import wintypes as w
-
-        try:
-            while not self.stop.is_set():
-                message, key, value = w.DWORD(), ctypes.c_size_t(), ctypes.c_void_p()
-                ready = self.api.GetQueuedCompletionStatus(
-                    self.port, ctypes.byref(message), ctypes.byref(key), ctypes.byref(value), 100
-                )
-                if not ready:
-                    if ctypes.get_last_error() == 258:
-                        continue
-                    native_need(False)
-                if key.value == 2:
-                    return
-                need(key.value == 1, "native_error")
-                if message.value == 6:  # JOB_OBJECT_MSG_NEW_PROCESS.
-                    need(value.value is not None and 0 < value.value < 2**32, "native_error")
-                    self._observe(value.value)
-        except BaseException as error:
-            self.error = str(error) if isinstance(error, ObservationFailure) else "native_error"
-            # Stop the owned execution on denial or incomplete/unsafe observation.
-            self.job.abort()
-        finally:
-            self._release()
-
-    def _release(self):
-        # Only the exited reader (or a caller after joining it) releases these.
-        # A separate Job handle stays valid even if the main Job owner times out.
-        with self.resource_lock:
-            if self.closed:
-                return
-            complete = True
-            for handle in [*self.handles, self.port, self.job_query_handle]:
-                complete = bool(self.api.CloseHandle(handle)) and complete
-            self.handles.clear()
-            self.closed = True
-            self.release_complete = complete
-            if not complete and self.error == "none":
-                self.error = "cleanup_incomplete"
-
-    def finish(self, expected_total):
-        deadline = time.monotonic() + 2
-        while (
-            len(self.births) < expected_total
-            and self.error == "none"
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.01)
-        self.stop.set()
-        with self.resource_lock:
-            if not self.closed:
-                self.api.PostQueuedCompletionStatus(self.port, 0, 2, None)
-        self.thread.join(3)
-        need(not self.thread.is_alive(), "cleanup_incomplete")
-        self._release()
-        need(self.release_complete, "cleanup_incomplete")
-
-
-class TempObserver:
-    """Overlapped notifications restricted to an owned TEMP directory tree."""
-
-    def __init__(self, root: Path, abort, resources):
-        from ctypes import wintypes as w
-
-        class Overlapped(ctypes.Structure):
-            _fields_ = [
-                ("internal", ctypes.c_size_t),
-                ("internal_high", ctypes.c_size_t),
-                ("offset", w.DWORD),
-                ("offset_high", w.DWORD),
-                ("event", w.HANDLE),
-            ]
-
-        self.api, self.error = api(), "none"
-        self.abort = abort
-        self.io_lock = threading.Lock()
-        self.closed = False
-        self.counts = dict.fromkeys(
-            ("temp_" + kind + "_" + action for kind in TEMP_KINDS for action in ACTIONS.values()), 0
-        )
-        self.total = 0
-        self.stop = threading.Event()
-        self.handle = self.api.CreateFileW(str(root), 1, 7, None, 3, 0x42000000, None)
-        native_need(self.handle not in (None, ctypes.c_void_p(-1).value))
-        self.event = self.api.CreateEventW(None, True, False, None)
-        if not self.event:
-            self.api.CloseHandle(self.handle)
-            native_need(False)
-        self.overlapped = Overlapped()
-        self.overlapped.event = self.event
-        self.buffer = ctypes.create_string_buffer(65_536)
-        self.begin = threading.Event()
-        self.thread = threading.Thread(target=self._read, daemon=True)
-        resources.append(self)
-        try:
-            # Start the waiter before issuing I/O, so failure to create a thread
-            # cannot leave a native request referencing an abandoned buffer.
-            self.thread.start()
-            self._issue()
-            self.begin.set()
-        except BaseException:
-            self.stop.set()
-            self.begin.set()
-            if self.thread.is_alive():
-                self.thread.join(3)
-            self.api.CloseHandle(self.event)
-            self.api.CloseHandle(self.handle)
-            raise
-
-    def _issue(self):
-        with self.io_lock:
-            if self.stop.is_set():
-                return False
-            native_need(self.api.ResetEvent(self.event))
-            native_need(
-                self.api.ReadDirectoryChangesW(
-                    self.handle,
-                    self.buffer,
-                    len(self.buffer),
-                    True,
-                    0x1B,
-                    None,
-                    ctypes.byref(self.overlapped),
-                    None,
-                )
-            )
-            return True
-
-    def _read(self):
-        from ctypes import wintypes as w
-
-        try:
-            need(self.begin.wait(3), "incomplete")
-            if self.stop.is_set():
-                return
-            while True:
-                status = self.api.WaitForSingleObject(self.event, 100)
-                if status == 258:
-                    continue
-                need(status == 0, "native_error")
-                count = w.DWORD()
-                success = self.api.GetOverlappedResult(
-                    self.handle, ctypes.byref(self.overlapped), ctypes.byref(count), False
-                )
-                if not success and ctypes.get_last_error() == 995 and self.stop.is_set():
-                    return
-                native_need(success)
-                for kind, action in notification_categories(self.buffer.raw[: count.value]):
-                    need(self.total < MAX_EVENTS, "limit")
-                    self.total += 1
-                    self.counts["temp_" + kind + "_" + action] += 1
-                if self.stop.is_set():
-                    return
-                if not self._issue():
-                    return
-        except BaseException as error:
-            self.error = str(error) if isinstance(error, ObservationFailure) else "native_error"
-            self.abort()
-
-    def finish(self):
-        with self.io_lock:
-            self.stop.set()
-            # Serialize cancellation against reissue; no new request after stop.
-            cancelled = self.api.CancelIoEx(self.handle, ctypes.byref(self.overlapped))
-            if not cancelled:
-                need(ctypes.get_last_error() == 1168, "cleanup_incomplete")
-        self.thread.join(3)
-        need(not self.thread.is_alive(), "cleanup_incomplete")
-        closed = bool(self.api.CloseHandle(self.event))
-        closed = bool(self.api.CloseHandle(self.handle)) and closed
-        self.closed = closed
-        need(closed, "cleanup_incomplete")
 
 
 IDENTITY_PROBE = """import hashlib, importlib.metadata, importlib.util, json, pathlib, site, sys
@@ -554,24 +158,6 @@ def trusted_payload_variants(source: Path):
     return result
 
 
-def process_record(record, job):
-    record["job_total"], record["job_active"] = job.final_total, job.final_active
-    record["distinct_births"] = len(job.observer.births)
-    for index, (_, kind) in enumerate(
-        sorted(job.observer.births.items(), key=lambda item: item[0][1]), 1
-    ):
-        record["process_" + kind] += 1
-        record[f"birth_{index}_class"] = kind
-    record["process_coverage_complete"] = (
-        job.observer.error == "none"
-        and 0 < job.final_total <= MAX_PROCESSES
-        and len(job.observer.births) == job.final_total
-        and record["process_unknown"] == 0
-    )
-    if job.observer.error != "none":
-        record["error"] = job.observer.error
-
-
 def copy_runtime(source_python: Path, target: Path, base: Path):
     source_python = common.local_path(source_python)
     need(
@@ -594,26 +180,6 @@ def copy_runtime(source_python: Path, target: Path, base: Path):
     before = alpha.tree_manifest(source)
     shutil.copytree(source, target)
     need(alpha.tree_manifest(target) == before and alpha.tree_manifest(source) == before)
-
-
-def observers_quiescent(resources):
-    return all(not observer.thread.is_alive() for observer in resources)
-
-
-def guarded_assignment(job, process, errors, assign):
-    """A recorded observer abort is terminal, including before Job assignment."""
-    with job.abort_lock:
-        current = errors()
-        if job.aborted or any(error != "none" for error in current):
-            job.aborted = True
-            raise ObservationFailure("incomplete")
-        assign(process)
-        # Assignment can wake the observer. Refuse gate opening if it detected a
-        # denial while assignment itself was in progress, before returning.
-        if any(error != "none" for error in errors()):
-            job.aborted = True
-            job.api.TerminateJobObject(job.handle, 1)
-            raise ObservationFailure("incomplete")
 
 
 def run_reproduction(tmp_path: Path, monkeypatch, record, resources):
@@ -683,87 +249,20 @@ def run_reproduction(tmp_path: Path, monkeypatch, record, resources):
         "venv_python": (python, common.file_hash(python)),
         "powershell": (shell, common.file_hash(shell)),
     }
-    for kind, relative in (
-        ("console_host", "System32/conhost.exe"),
-        ("dotnet_compiler", "Microsoft.NET/Framework64/v4.0.30319/csc.exe"),
-    ):
-        candidate = Path(env["SYSTEMROOT"]) / relative
-        if candidate.is_file():
-            candidate = common.local_path(candidate)
-            admitted[kind] = (candidate, common.file_hash(candidate))
+    console = common.local_path(Path(env["SYSTEMROOT"]) / "System32/conhost.exe")
+    admitted["console_host"] = (console, common.file_hash(console))
     envelope = owned / "invoke-start.ps1"
     envelope.write_text(alpha.ENVELOPE, encoding="ascii", newline="\n")
     need(not (installed / "gstreamer-version.txt").exists())
-    observed = []
-    original_job = common.WindowsJob
-
-    class ObservedJob(original_job):
-        def __init__(self):
-            super().__init__()
-            self.abort_lock = threading.Lock()
-            self.aborted = False
-            self.observation_open = True
-            self.resources_closed = False
-            self.observer = None
-            self.final_total = self.final_active = 0
-            try:
-                self.observer = ProcessObserver(self, admitted, resources)
-                observed.append(self)
-                need(watcher.error == "none", watcher.error)
-            except BaseException:
-                self.close()
-                raise
-
-        def abort(self):
-            with self.abort_lock:
-                self.aborted = True
-                if self.observation_open:
-                    self.api.TerminateJobObject(self.handle, 1)
-
-        def assign(self, process):
-            guarded_assignment(
-                self,
-                process,
-                lambda: (watcher.error, self.observer.error),
-                lambda child: original_job.assign(self, child),
-            )
-
-        def close(self):
-            failure = None
-            try:
-                native_need(self.api.TerminateJobObject(self.handle, 1))
-                deadline = time.monotonic() + 5
-                while True:
-                    state = self.accounting()
-                    self.final_total, self.final_active = (
-                        state.total_processes,
-                        state.active_processes,
-                    )
-                    if not self.final_active:
-                        break
-                    need(time.monotonic() < deadline, "cleanup_incomplete")
-                    time.sleep(0.01)
-                if self.observer is not None:
-                    self.observer.finish(self.final_total)
-            except BaseException as error:
-                failure = error
-            finally:
-                with self.abort_lock:
-                    self.observation_open = False
-                    super().close()
-                self.resources_closed = failure is None
-            if failure is not None:
-                raise ObservationFailure("cleanup_incomplete") from None
-
-    def abort_owned():
-        for job in observed:
-            job.abort()
-
-    watcher = TempObserver(Path(env["TEMP"]), abort_owned, resources)
+    observation = boundary.PreflightObservation(
+        common, temp_root=Path(env["TEMP"]), admitted_images=admitted
+    )
     old_error = None
+    summary = None
     try:
-        need(watcher.error == "none", watcher.error)
-        monkeypatch.setattr(common, "WindowsJob", ObservedJob)
+        observation.start()
+        resources.extend(observation.resources)
+        monkeypatch.setattr(common, "WindowsJob", observation.job_factory)
         try:
             alpha.invoke_start(
                 alpha.start_command(shell, envelope, installed, 8011),
@@ -778,23 +277,68 @@ def run_reproduction(tmp_path: Path, monkeypatch, record, resources):
             if isinstance(error, alpha.AlphaWitnessError):
                 record["old_contract"] = error.alpha_diagnostic["contract"]
                 alpha.emit_alpha_diagnostic(error.alpha_diagnostic)
-    finally:
-        watcher.finish()
-        record.update(watcher.counts)
-        record["temp_events"] = watcher.total
-        record["temporary_root_empty"] = not any(Path(env["TEMP"]).iterdir())
-        if len(observed) == 1:
-            job = observed[0]
-            process_record(record, job)
-        if watcher.error != "none":
-            record["error"] = watcher.error
-        record["cleanup_complete"] = watcher.closed and all(
-            job.resources_closed for job in observed
+        finally:
+            resources[:] = observation.resources
+        summary = observation.finish()
+        record.update(
+            {
+                key: value
+                for key, value in summary.items()
+                if key in COUNT_FIELDS | BOOL_FIELDS or key.startswith("birth_") or key == "error"
+            }
         )
-    need(len(observed) == 1 and record["process_coverage_complete"], "incomplete")
-    need(watcher.error == "none", watcher.error)
-    if old_error is not None:
-        raise ObservationFailure("launcher_rejected") from None
+        validate_expected_legacy_refusal(old_error)
+        boundary.validate_invalid_initialization(summary)
+        record["initialization_contract_verified"] = True
+    finally:
+        close_observation(observation, resources)
+        if summary is not None:
+            print("K5_OWNED_PREFLIGHT_INITIALIZATION=" + common.canonical(summary).decode("ascii"))
+
+
+def close_observation(observation, resources):
+    try:
+        observation.close()
+    finally:
+        resources[:] = observation.resources
+
+
+def remove_owned_fixture(owned, resources):
+    need(observers_quiescent(resources), "cleanup_incomplete")
+    if owned.exists():
+        shutil.rmtree(owned)
+
+
+def validate_expected_legacy_refusal(error):
+    need(isinstance(error, alpha.AlphaWitnessError), "launcher_rejected")
+    value = error.alpha_diagnostic
+    alpha.validate_alpha_diagnostic(value)
+    expected = {
+        "stage": "invalid_config",
+        "contract": "invalid_job_total",
+        "failure_code": "receipt_invalid",
+        "child_exit_code": 23,
+        "relay_exit_code": 23,
+        "gate_state": "exited",
+        "timed_out": False,
+        "collector_finished": True,
+        "output_invalid": False,
+        "sessions_empty": True,
+        "launcher_requested": True,
+        "launcher_returned": True,
+        "health_confirmed": False,
+        "operator_request_observed": False,
+        "job_total": 5,
+        "job_active": 0,
+        **{f"marker_{key}": int(key == "refusal") for key in alpha.MARKERS},
+    }
+    need(
+        all(
+            value[key] == expected_value and type(value[key]) is type(expected_value)
+            for key, expected_value in expected.items()
+        ),
+        "launcher_rejected",
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Hosted Windows owned-only boundary reproduction")
@@ -811,18 +355,16 @@ def test_windows_actual_start_bad_config_owned_observation(tmp_path, monkeypatch
     finally:
         try:
             owned = tmp_path / "owned-preflight"
-            need(observers_quiescent(resources), "cleanup_incomplete")
-            if owned.exists():
-                shutil.rmtree(owned)
+            remove_owned_fixture(owned, resources)
             record["cleanup_complete"] = record["cleanup_complete"] and not owned.exists()
         except BaseException:
             failure = record["error"] = "cleanup_incomplete"
         try:
             validate_record(record)
-            print("K5_OWNED_PREFLIGHT_OBSERVATION=" + common.canonical(record).decode("ascii"))
+            print("K5_OWNED_PREFLIGHT_QUALIFICATION=" + common.canonical(record).decode("ascii"))
         except BaseException:
             failure = "incomplete"
-            print("K5_OWNED_PREFLIGHT_OBSERVATION_INVALID")
+            print("K5_OWNED_PREFLIGHT_QUALIFICATION_INVALID")
     if failure is not None:
         pytest.fail("Owned Start preflight observation failed: " + failure, pytrace=False)
 
@@ -876,6 +418,7 @@ def test_hosted_reproduction_paths_cannot_trigger_native_candidate_job():
     changed = (
         "tests/test_windows_alpha_preflight_boundary.py",
         ".github/workflows/windows-alpha-script-smoke.yml",
+        "scripts/windows_owned_preflight.py",
     )
     assert patterns and all(
         not fnmatchcase(path, pattern) for path in changed for pattern in patterns
@@ -998,6 +541,7 @@ def test_temp_access_denial_aborts_only_owned_execution(monkeypatch):
 
     watcher = object.__new__(TempObserver)
     watcher.stop, watcher.error = threading.Event(), "none"
+    watcher.drain_requested, watcher.drained = threading.Event(), threading.Event()
     watcher.begin = threading.Event()
     watcher.begin.set()
     watcher.event, watcher.handle, watcher.overlapped = 1, 2, ctypes.c_uint64()
@@ -1070,6 +614,10 @@ def test_temp_finish_cancels_only_its_request_before_closing_handles():
 
     watcher = object.__new__(TempObserver)
     watcher.io_lock, watcher.stop = threading.Lock(), threading.Event()
+    watcher.error = "none"
+    watcher.drain_complete = False
+    watcher.drain_requested, watcher.drained = threading.Event(), threading.Event()
+    watcher.drained.set()
     watcher.handle, watcher.event, watcher.overlapped, watcher.closed = (
         1,
         2,
@@ -1164,3 +712,605 @@ def test_denial_during_assignment_terminates_before_return_to_gate_opener():
     with pytest.raises(ObservationFailure, match="incomplete"):
         guarded_assignment(job, object(), lambda: tuple(errors), assign)
     assert calls == ["assign", "terminate"] and job.aborted is True
+
+
+def load_boundary_helper():
+    spec = importlib.util.spec_from_file_location(
+        "_owned_preflight_contract", ROOT / "scripts/windows_owned_preflight.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_reviewed_initialization_requires_exact_classes_not_total_alone():
+    helper = load_boundary_helper()
+    expected = {
+        "base_python": 2,
+        "powershell": 1,
+        "venv_python": 1,
+        "console_host": 1,
+        "dotnet_compiler": 0,
+        "unknown": 0,
+    }
+    assert helper.EXPECTED_PROCESSES == expected
+    helper.validate_process_contract(expected, total=5, active=0, covered=5)
+    wrong = {**expected, "console_host": 0, "dotnet_compiler": 1}
+    with pytest.raises(helper.ObservationFailure):
+        helper.validate_process_contract(wrong, total=5, active=0, covered=5)
+
+
+def test_reviewed_policy_trace_requires_each_complete_lifecycle():
+    helper = load_boundary_helper()
+    trace = helper.PolicyLifecycle()
+    for name in (
+        "__PSScriptPolicyTest_aaaaaaaa.aaa.ps1",
+        "__PSScriptPolicyTest_bbbbbbbb.bbb.psm1",
+        "__PSScriptPolicyTest_cccccccc.ccc.ps1",
+        "__PSScriptPolicyTest_dddddddd.ddd.psm1",
+    ):
+        for action in ("added", "modified", "removed"):
+            trace.observe(name, action)
+    assert trace.complete()
+    with pytest.raises(helper.ObservationFailure):
+        trace.observe("__PSScriptPolicyTest_eeeeeeee.eee.ps1", "added")
+
+
+POLICY_NAMES = (
+    "__PSScriptPolicyTest_aaaaaaaa.aaa.ps1",
+    "__PSScriptPolicyTest_bbbbbbbb.bbb.psm1",
+    "__PSScriptPolicyTest_cccccccc.ccc.ps1",
+    "__PSScriptPolicyTest_dddddddd.ddd.psm1",
+)
+
+
+def complete_policy_trace():
+    trace = boundary.PolicyLifecycle()
+    for name in POLICY_NAMES:
+        for action in ("added", "modified", "removed"):
+            trace.observe(name, action)
+    return trace
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "__PSScriptPolicyTest_x.ps1",
+        "__PSScriptPolicyTest_aaaaaaaa.aaa.psd1",
+        "__PSScriptPolicyTest_AAAAAAAA.aaa.ps1",
+        "__PSScriptPolicyTest_aaaaaaaa.aaa.ps1:stream",
+        "sub/__PSScriptPolicyTest_aaaaaaaa.aaa.ps1",
+        "../__PSScriptPolicyTest_aaaaaaaa.aaa.ps1",
+        "K5VisionAlpha-" + "a" * 32,
+        "unrecognized-private-name",
+        None,
+    ],
+)
+def test_policy_lifecycle_rejects_non_exact_top_level_names(name):
+    trace = boundary.PolicyLifecycle()
+    with pytest.raises(ObservationFailure, match="unexpected_temp"):
+        trace.observe(name, "added")
+    assert trace.invalid and not trace.complete()
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        ("modified",),
+        ("removed",),
+        ("renamed_from",),
+        ("added", "added"),
+        ("added", "removed"),
+        ("added", "modified", "modified"),
+        ("added", "modified", "removed", "modified"),
+        ("added", "modified", "removed", "added"),
+    ],
+)
+def test_policy_lifecycle_rejects_every_unexpected_event_order(actions):
+    trace = boundary.PolicyLifecycle()
+    with pytest.raises(ObservationFailure):
+        for action in actions:
+            trace.observe(POLICY_NAMES[0], action)
+    assert trace.invalid and not trace.complete()
+    with pytest.raises(ObservationFailure):
+        trace.observe(POLICY_NAMES[1], "added")
+
+
+def test_lifecycle_error_is_terminal_even_after_complete_trace():
+    trace = complete_policy_trace()
+    assert trace.complete()
+    with pytest.raises(ObservationFailure):
+        trace.observe("__PSScriptPolicyTest_eeeeeeee.eee.ps1", "added")
+    assert not trace.complete()
+
+
+def test_policy_aggregate_counts_cannot_substitute_for_per_name_lifecycles():
+    trace = boundary.PolicyLifecycle()
+    for name in POLICY_NAMES:
+        trace.observe(name, "added")
+    trace.observe(POLICY_NAMES[0], "modified")
+    with pytest.raises(ObservationFailure):
+        trace.observe(POLICY_NAMES[0], "modified")
+    assert not trace.complete()
+    wrong_extensions = boundary.PolicyLifecycle()
+    for name in POLICY_NAMES[::2]:
+        wrong_extensions.observe(name, "added")
+    with pytest.raises(ObservationFailure):
+        wrong_extensions.observe("__PSScriptPolicyTest_eeeeeeee.eee.ps1", "added")
+    incomplete = boundary.PolicyLifecycle()
+    for name in POLICY_NAMES:
+        incomplete.observe(name, "added")
+        incomplete.observe(name, "modified")
+    assert not incomplete.complete()
+
+
+def valid_initialization_summary():
+    value = boundary.empty_summary()
+    value.update(
+        job_total=5, distinct_births=5, temp_events=12, policy_ps1_files=2, policy_psm1_files=2
+    )
+    value.update(dict.fromkeys(boundary.SUMMARY_BOOLEANS, True))
+    kinds = ["base_python", "powershell", "venv_python", "console_host", "base_python"]
+    for kind, count in boundary.EXPECTED_PROCESSES.items():
+        value["process_" + kind] = count
+    for index, kind in enumerate(kinds, 1):
+        value[f"birth_{index}_class"] = kind
+    for action in ("added", "modified", "removed"):
+        value["temp_policy_probe_" + action] = 4
+    return value
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"path": "raw private path"},
+        {"error": "raw private exception"},
+        {"birth_1_class": {}},
+        {"job_total": True},
+        {"job_active": 1},
+        {"distinct_births": 4},
+        {"job_total": 6},
+        {"temp_events": 257},
+        {"policy_ps1_files": 1},
+        {"policy_lifecycles_complete": False},
+        {"temp_drain_complete": False},
+        {"temp_other_owned_temp_added": 1},
+        {"temp_alpha_session_removed": 1},
+        {"temp_policy_probe_renamed_to": 1},
+        {"temp_policy_probe_modified": 5},
+        {"cleanup_complete": False},
+        {"temporary_root_empty": False},
+        {"process_coverage_complete": False},
+        {"error": "access_denied"},
+        {
+            "process_console_host": 0,
+            "process_dotnet_compiler": 1,
+            "birth_4_class": "dotnet_compiler",
+        },
+    ],
+)
+def test_initialization_summary_rejects_forged_or_unexpected_profiles(change):
+    value = valid_initialization_summary()
+    boundary.validate_invalid_initialization(value)
+    value.update(change)
+    with pytest.raises(ObservationFailure):
+        boundary.validate_invalid_initialization(value)
+
+
+def expected_refusal_error():
+    observations = {
+        "child_exit_code": 23,
+        "relay_exit_code": 23,
+        "gate_state": "exited",
+        "timed_out": False,
+        "collector_finished": True,
+        "output_invalid": False,
+        "sessions_empty": True,
+        "launcher_requested": True,
+        "launcher_returned": True,
+        "health_confirmed": False,
+        "operator_request_observed": False,
+        "job_total": 5,
+        "job_active": 0,
+        **{f"marker_{key}": int(key == "refusal") for key in alpha.MARKERS},
+    }
+    return alpha.AlphaWitnessError(
+        alpha.alpha_diagnostic("invalid_config", "invalid_job_total", observations=observations)
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"contract": "invalid_markers"},
+        {"stage": "launch_1"},
+        {"child_exit_code": 0},
+        {"relay_exit_code": 0},
+        {"gate_state": "waiting"},
+        {"timed_out": True},
+        {"collector_finished": False},
+        {"output_invalid": True},
+        {"sessions_empty": False},
+        {"health_confirmed": True},
+        {"operator_request_observed": True},
+        {"marker_refusal": 0},
+        {"marker_admitted": 1},
+        {"marker_synthetic": 1},
+        {"marker_analytics": 1},
+        {"marker_operator": 1},
+        {"marker_exit": 1},
+        {"job_active": 1},
+        {"job_total": 4},
+        {"launcher_requested": False},
+    ],
+)
+def test_hosted_green_requires_complete_exact_refusal_evidence(change):
+    error = expected_refusal_error()
+    validate_expected_legacy_refusal(error)
+    error.alpha_diagnostic.update(change)
+    with pytest.raises(ObservationFailure, match="launcher_rejected"):
+        validate_expected_legacy_refusal(error)
+
+
+def test_hosted_green_rejects_generic_old_gate_failure():
+    for error in (None, common.WitnessError("receipt_invalid"), RuntimeError("private output")):
+        with pytest.raises(ObservationFailure, match="launcher_rejected"):
+            validate_expected_legacy_refusal(error)
+
+
+def test_process_image_admission_requires_exact_path_and_hash(tmp_path):
+    admitted = tmp_path / "python.exe"
+    admitted.write_bytes(b"admitted")
+    identities = {"base_python": (admitted, common.file_hash(admitted))}
+    assert boundary.process_class(str(admitted), identities) == "base_python"
+    assert boundary.process_class(str(tmp_path / "elsewhere/python.exe"), identities) == "unknown"
+    admitted.write_bytes(b"tampered")
+    with pytest.raises(ObservationFailure):
+        boundary.process_class(str(admitted), identities)
+
+
+def fake_facade(monkeypatch, tmp_path, *, active=0):
+    from types import SimpleNamespace
+
+    calls = []
+    state = {"total": 5, "active": active}
+
+    class Job:
+        def __init__(self):
+            self.handle = 123
+            self.api = SimpleNamespace(TerminateJobObject=self.terminate)
+
+        def terminate(self, *_args):
+            calls.append("terminate")
+            state["active"] = 0
+            return True
+
+        def accounting(self):
+            return SimpleNamespace(total_processes=state["total"], active_processes=state["active"])
+
+        def assign(self, _process):
+            calls.append("assign")
+
+        def close(self):
+            calls.append("job_closed")
+
+    class Processes:
+        def __init__(self, _job, _admitted, resources):
+            self.error = "none"
+            self.births = {
+                (i + 1, (i + 1) * 100): kind
+                for i, kind in enumerate(
+                    ["base_python", "powershell", "venv_python", "console_host", "base_python"]
+                )
+            }
+            self.thread = SimpleNamespace(is_alive=lambda: False)
+            resources.append(self)
+
+        def finish(self, expected):
+            calls.append(("process_finished", expected))
+
+    class Temp:
+        def __init__(self, _root, abort, resources):
+            self.error, self.closed = "none", False
+            self.counts = {
+                key: value
+                for key, value in valid_initialization_summary().items()
+                if key.startswith("temp_") and key != "temp_events"
+            }
+            self.total, self.lifecycle = 12, complete_policy_trace()
+            self.drain_complete = True
+            self.thread = SimpleNamespace(is_alive=lambda: False)
+            resources.append(self)
+
+        def finish(self):
+            calls.append("temp_finished")
+            self.closed = True
+
+    monkeypatch.setattr(boundary, "ProcessObserver", Processes)
+    monkeypatch.setattr(boundary, "TempObserver", Temp)
+    admitted = {}
+    for kind in ("base_python", "powershell", "venv_python", "console_host"):
+        path = tmp_path / (kind + ".exe")
+        path.write_bytes(kind.encode())
+        admitted[kind] = (path, common.file_hash(path))
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    facade = boundary.PreflightObservation(
+        SimpleNamespace(WindowsJob=Job, local_path=common.local_path),
+        temp_root=temp,
+        admitted_images=admitted,
+    )
+    return facade, calls
+
+
+def test_facade_uses_explicit_single_job_factory_and_complete_profile(monkeypatch, tmp_path):
+    facade, calls = fake_facade(monkeypatch, tmp_path)
+    original = common.WindowsJob
+    facade.start()
+    job = facade.job_factory()
+    job.assign(object())
+    with pytest.raises(ObservationFailure):
+        facade.job_factory()
+    job.close()
+    summary = facade.finish()
+    boundary.validate_invalid_initialization(summary)
+    facade.close()
+    assert common.WindowsJob is original
+    assert calls == ["assign", "terminate", ("process_finished", 5), "job_closed", "temp_finished"]
+
+
+def test_facade_does_not_erase_active_survivors_through_forced_cleanup(monkeypatch, tmp_path):
+    facade, _calls = fake_facade(monkeypatch, tmp_path, active=1)
+    facade.start()
+    job = facade.job_factory()
+    job.close()
+    summary = facade.finish()
+    assert summary["job_active"] == 1 and summary["process_coverage_complete"] is False
+    with pytest.raises(ObservationFailure):
+        boundary.validate_invalid_initialization(summary)
+    facade.close()
+
+
+def test_facade_rechecks_admitted_images_after_owned_execution(monkeypatch, tmp_path):
+    facade, _calls = fake_facade(monkeypatch, tmp_path)
+    facade.start()
+    job = facade.job_factory()
+    job.close()
+    facade.admitted["console_host"][0].write_bytes(b"tamper")
+    with pytest.raises(ObservationFailure):
+        facade.finish()
+    facade.close()
+
+
+def test_live_observer_is_preserved_after_start_and_close_failure(tmp_path):
+    from types import SimpleNamespace
+
+    class FailedObservation:
+        def __init__(self):
+            self.resources = []
+
+        def start(self):
+            self.resources.append(SimpleNamespace(thread=SimpleNamespace(is_alive=lambda: True)))
+            raise ObservationFailure("native_error")
+
+        def close(self):
+            raise ObservationFailure("cleanup_incomplete")
+
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    (owned / "copy").write_bytes(b"still in use")
+    observation, resources = FailedObservation(), []
+    with pytest.raises(ObservationFailure, match="cleanup_incomplete"):
+        try:
+            observation.start()
+        finally:
+            close_observation(observation, resources)
+    assert resources == observation.resources and len(resources) == 1
+    with pytest.raises(ObservationFailure, match="cleanup_incomplete"):
+        remove_owned_fixture(owned, resources)
+    assert (owned / "copy").read_bytes() == b"still in use"
+
+
+@pytest.mark.parametrize("quota_excess", [False, True])
+def test_unexpected_process_identity_or_class_quota_aborts_owned_job(
+    monkeypatch, tmp_path, quota_excess
+):
+    observer, _calls, _births, aborted = fake_process_observer(monkeypatch, tmp_path)
+    if quota_excess:
+        observer.births = {(1, 10): "base_python", (2, 20): "base_python"}
+    else:
+        observer.admitted = {}
+
+    def notification(_port, message, key, value, _timeout):
+        message._obj.value, key._obj.value, value._obj.value = 6, 1, 30
+        return True
+
+    observer.api.GetQueuedCompletionStatus = notification
+    observer._read()
+    assert observer.error == "unexpected_process" and aborted == [True]
+    assert observer.births[(30, 100)] == ("base_python" if quota_excess else "unknown")
+
+
+def notification_buffer(events):
+    parts = []
+    for index, (name, action) in enumerate(events):
+        encoded = name.encode("utf-16-le")
+        padded = encoded + b"\0" * (-(12 + len(encoded)) % 4)
+        following = 12 + len(padded) if index + 1 < len(events) else 0
+        parts.append(struct.pack("<III", following, action, len(encoded)) + padded)
+    return b"".join(parts)
+
+
+def test_final_drain_consumes_extra_queued_event_before_certifying_profile():
+    from types import SimpleNamespace
+
+    watcher = object.__new__(TempObserver)
+    watcher.stop, watcher.begin = threading.Event(), threading.Event()
+    watcher.begin.set()
+    watcher.drain_requested, watcher.drained = threading.Event(), threading.Event()
+    watcher.io_lock, watcher.closed, watcher.error = threading.Lock(), False, "none"
+    watcher.event, watcher.handle, watcher.overlapped = 1, 2, ctypes.c_uint64()
+    watcher.buffer = ctypes.create_string_buffer(65_536)
+    watcher.counts = dict.fromkeys(
+        ("temp_" + kind + "_" + action for kind in TEMP_KINDS for action in ACTIONS.values()), 0
+    )
+    watcher.total, watcher.lifecycle = 0, boundary.PolicyLifecycle()
+    watcher.drain_complete = False
+    first_batch_processed, release_batch = threading.Event(), threading.Event()
+    observe = watcher.lifecycle.observe
+
+    def paused_observe(name, action):
+        observe(name, action)
+        if watcher.lifecycle.complete():
+            first_batch_processed.set()
+            assert release_batch.wait(3)
+
+    watcher.lifecycle.observe = paused_observe
+    first = notification_buffer([(name, action) for name in POLICY_NAMES for action in (1, 3, 2)])
+    extra = notification_buffer([("__PSScriptPolicyTest_eeeeeeee.eee.ps1", 1)])
+    current = [first]
+    watcher.buffer.raw = first
+    calls, aborted = [], []
+    watcher.abort = lambda: aborted.append(True)
+
+    def completed(_handle, _overlap, count, _wait):
+        count._obj.value = len(current[0])
+        return True
+
+    def reissue(*_args):
+        calls.append("reissue")
+        current[0] = extra
+        watcher.buffer.raw = extra
+        return True
+
+    watcher.api = SimpleNamespace(
+        WaitForSingleObject=lambda *_: 0,
+        GetOverlappedResult=completed,
+        ResetEvent=lambda *_: True,
+        ReadDirectoryChangesW=reissue,
+        CancelIoEx=lambda *_: calls.append("cancel") or True,
+        CloseHandle=lambda *_: True,
+    )
+    watcher.thread = threading.Thread(target=watcher._read)
+    watcher.thread.start()
+    assert first_batch_processed.wait(3)
+    failures = []
+
+    def finish():
+        try:
+            watcher.finish()
+        except BaseException as error:
+            failures.append(error)
+
+    closing = threading.Thread(target=finish)
+    closing.start()
+    assert watcher.drain_requested.wait(3)
+    assert not watcher.stop.is_set()  # No cancellation until the buffered batch is drained.
+    release_batch.set()
+    closing.join(3)
+    assert not closing.is_alive() and not failures
+    assert watcher.total == 13 and watcher.error == "policy_contract"
+    assert aborted == [True] and not watcher.lifecycle.complete()
+    assert calls == ["reissue", "cancel"]
+
+
+@pytest.mark.parametrize("queued_extra", [False, True])
+def test_successful_completion_racing_cancel_is_consumed_then_reissued(monkeypatch, queued_extra):
+    from types import SimpleNamespace
+
+    watcher = object.__new__(TempObserver)
+    watcher.stop, watcher.begin = threading.Event(), threading.Event()
+    watcher.begin.set()
+    watcher.drain_requested, watcher.drained = threading.Event(), threading.Event()
+    watcher.drain_requested.set()
+    watcher.drain_complete = False
+    watcher.io_lock, watcher.closed, watcher.error = threading.Lock(), False, "none"
+    watcher.event, watcher.handle, watcher.overlapped = 1, 2, ctypes.c_uint64()
+    watcher.buffer = ctypes.create_string_buffer(65_536)
+    watcher.counts = dict.fromkeys(
+        ("temp_" + kind + "_" + action for kind in TEMP_KINDS for action in ACTIONS.values()), 0
+    )
+    watcher.total, watcher.lifecycle = 9, boundary.PolicyLifecycle()
+    for name in POLICY_NAMES[:3]:
+        for action in ("added", "modified", "removed"):
+            watcher.lifecycle.observe(name, action)
+            watcher.counts["temp_policy_probe_" + action] += 1
+    pending = [notification_buffer([(POLICY_NAMES[3], action) for action in (1, 3, 2)])]
+    watcher.buffer.raw = pending[0]
+    waits = iter([258, 0, 0] if queued_extra else [258, 0, 258, 0])
+    calls, aborted = [], []
+    watcher.abort = lambda: aborted.append(True)
+
+    def completed(_handle, _overlap, count, _wait):
+        if pending[0] is None:
+            calls.append("confirmed_abort")
+            return False
+        calls.append("successful_bytes")
+        count._obj.value = len(pending[0])
+        return True
+
+    def reissue(*_args):
+        calls.append("reissue")
+        pending[0] = (
+            notification_buffer([("__PSScriptPolicyTest_eeeeeeee.eee.ps1", 1)])
+            if queued_extra
+            else None
+        )
+        if pending[0] is not None:
+            watcher.buffer.raw = pending[0]
+        return True
+
+    watcher.api = SimpleNamespace(
+        WaitForSingleObject=lambda *_: next(waits),
+        GetOverlappedResult=completed,
+        ResetEvent=lambda *_: True,
+        ReadDirectoryChangesW=reissue,
+        CancelIoEx=lambda *_: calls.append("cancel") or True,
+    )
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 995, raising=False)
+    watcher._read()
+    assert calls[:3] == ["cancel", "successful_bytes", "reissue"]
+    assert watcher.drained.is_set()
+    if queued_extra:
+        assert calls[3:] == ["successful_bytes"]
+        assert watcher.error == "policy_contract" and aborted == [True]
+        assert watcher.total == 13 and not watcher.drain_complete
+        assert not watcher.lifecycle.complete()
+    else:
+        assert calls[3:] == ["cancel", "confirmed_abort"]
+        assert watcher.error == "none" and not aborted
+        assert watcher.total == 12 and watcher.drain_complete and watcher.lifecycle.complete()
+
+
+def test_late_abort_after_emergency_timeout_cannot_certify_drain(monkeypatch):
+    from types import SimpleNamespace
+
+    watcher = object.__new__(TempObserver)
+    watcher.stop, watcher.begin = threading.Event(), threading.Event()
+    watcher.begin.set()
+    watcher.drain_requested, watcher.drained = threading.Event(), threading.Event()
+    watcher.drain_requested.set()
+    watcher.drain_complete, watcher.error = False, "none"
+    watcher.io_lock = threading.Lock()
+    watcher.event, watcher.handle, watcher.overlapped = 1, 2, ctypes.c_uint64()
+    calls, waits = [], iter([258, 0])
+
+    def completed(_handle, _overlap, _count, _wait):
+        # Simulate finish's deadline expiring after the reader issued CancelIoEx,
+        # but before its delayed completion is consumed by the reader.
+        watcher.error = "incomplete"
+        watcher.stop.set()
+        return False
+
+    watcher.api = SimpleNamespace(
+        WaitForSingleObject=lambda *_: next(waits),
+        GetOverlappedResult=completed,
+        CancelIoEx=lambda *_: calls.append("cancel") or True,
+    )
+    watcher.abort = lambda: calls.append("abort")
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 995, raising=False)
+    watcher._read()
+    assert calls == ["cancel"]
+    assert watcher.drained.is_set() and watcher.error == "incomplete"
+    assert watcher.drain_complete is False
