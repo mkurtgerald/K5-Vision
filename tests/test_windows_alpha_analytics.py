@@ -5642,11 +5642,19 @@ RUN_FACADE_CASES = {
     "child_exit_nonzero": "wrapper_failure",
 }
 RUN_FACADE_INITIALS = {"absent": None, "stale_zero": 0, "stale_nonzero": 9}
+RUN_FACADE_CHECKPOINTS = (
+    "facade_source_requested",
+    "facade_source_selected",
+    "facade_invoke_requested",
+    "facade_invoke_returned",
+)
+ELEMENT_CHECKPOINTS.update(RUN_FACADE_CHECKPOINTS)
 RUN_FACADE_SCRIPT = r"""
 param([string]$Run, [string]$RunHash, [string]$StartSource, [string]$StartHash,
       [string]$InstallRoot, [string]$Initial, [string]$Case, [string]$SourceKind)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+__ELEMENT_CHILD_DIAGNOSTICS__
 function Read-K5FacadeSource([string]$Path, [string]$Expected, [int]$Maximum) {
     $stream = [IO.File]::OpenRead($Path)
     $bytes = [byte[]]::new($Maximum + 1)
@@ -5667,7 +5675,12 @@ function Read-K5FacadeSource([string]$Path, [string]$Expected, [int]$Maximum) {
     } finally { $hasher.Dispose() }
     return [Text.UTF8Encoding]::new($false, $true).GetString($bytes, 0, $total)
 }
+$fixturePhase = 'utility_manifest'
 try {
+__ELEMENT_UTILITY_IMPORT__
+    $fixturePhase = 'source_select'
+    [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=facade_source_requested')
+    [Console]::Out.Flush()
     if ($Initial -cnotin @('absent','stale_zero','stale_nonzero') -or
         $Case -cnotin @('success','child_throw','cleanup_throw','child_exit_nonzero') -or
         $SourceKind -cnotin @('synthetic','public')) { throw 'fixture_arguments' }
@@ -5742,6 +5755,9 @@ __PRODUCT_SUCCESS_RETURN__
         $body.Replace('__PRODUCT_SUCCESS_RETURN__', $success[0].Extent.Text)
     [IO.File]::WriteAllText((Join-Path $InstallRoot 'Start-K5VisionAlpha.ps1'),
         $fixture, [Text.UTF8Encoding]::new($false))
+    [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=facade_source_selected')
+    [Console]::Out.Flush()
+    $fixturePhase = 'command_admission'
     $global:K5FacadeCase = $Case
     $global:K5FacadeEntered = 0
     $global:K5FacadeCleanup = 0
@@ -5756,6 +5772,9 @@ __PRODUCT_SUCCESS_RETURN__
     if ($Initial -ceq 'stale_zero') { $global:LASTEXITCODE = 0 }
     elseif ($Initial -ceq 'stale_nonzero') { $global:LASTEXITCODE = 9 }
     $outcome = 'returned'
+    $fixturePhase = 'probe_invoke'
+    [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=facade_invoke_requested')
+    [Console]::Out.Flush()
     try {
         & $Run -InstallRoot $InstallRoot -Port 8017 -ExitAfterPublicTest `
             -PublicRtspSource $global:K5FacadeExpectedSource
@@ -5774,6 +5793,9 @@ __PRODUCT_SUCCESS_RETURN__
             $outcome = 'cleanup_failure'
         } else { $outcome = 'unexpected_error' }
     }
+    [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=facade_invoke_returned')
+    [Console]::Out.Flush()
+    $fixturePhase = 'probe_record'
     $null = Read-K5FacadeSource $Run $RunHash 16384
     $ambient = Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
     $ambientJson = 'null'
@@ -5791,12 +5813,15 @@ __PRODUCT_SUCCESS_RETURN__
         $global:K5FacadeArgumentsValid.ToString().ToLowerInvariant() +
         ',"ambient_after":' + $ambientJson + '}'
     [Console]::Out.WriteLine('K5_RUN_FACADE_RESULT=' + $json)
+    [Console]::Out.Flush()
     exit 0
 } catch {
-    [Console]::Out.WriteLine('K5_RUN_FACADE_FIXTURE_FAILED')
+    Write-K5ElementChildFailure $_ $fixturePhase 'primary'
     exit 1
 }
-"""
+""".replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS).replace(
+    "__ELEMENT_UTILITY_IMPORT__", ELEMENT_UTILITY_IMPORT
+)
 
 
 def _run_facade_record(output):
@@ -5854,6 +5879,89 @@ def _run_facade_record(output):
     return value
 
 
+def _run_facade_child_record(output):
+    complete, checkpoints, arguments = _element_complete_records(output)
+    expected = [
+        "utility_manifest_requested",
+        "utility_import_requested",
+        "utility_import_returned",
+        "utility_binding_verified",
+        *RUN_FACADE_CHECKPOINTS,
+    ]
+    if complete != output or checkpoints != expected or arguments:
+        raise ValueError("Incomplete fixed facade observations")
+    lines = output.splitlines()
+    if (
+        len(lines) not in (10, 11)
+        or lines[:3] != [ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in expected[:3]]
+        or lines[4] != ELEMENT_CHECKPOINT_PREFIX + b"utility_binding_verified"
+    ):
+        raise ValueError("Invalid scoped Utility observation")
+    _element_require_utility_observation(lines[3])
+    if lines[5:8] != [
+        ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in RUN_FACADE_CHECKPOINTS[:3]
+    ]:
+        raise ValueError("Invalid fixed facade stage order")
+    tail = lines[8:]
+    retained = []
+    if tail[0] == b"Exiting after one bounded alpha acceptance run.":
+        retained.append(tail.pop(0))
+    if len(tail) != 2 or tail[0] != ELEMENT_CHECKPOINT_PREFIX + b"facade_invoke_returned":
+        raise ValueError("Invalid fixed facade result order")
+    return _run_facade_record(b"\n".join([*retained, tail[1]]) + b"\n")
+
+
+def _run_facade_capture_classes(common):
+    class StrictStderrSummary(common.StderrSummary):
+        def __init__(self, stream, *, gated, nonce=""):
+            if gated and re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+                raise ValueError("Invalid facade relay identity")
+            protocol = b""
+            if gated:
+                marker = "K5_GATE_" + nonce + "_"
+                protocol = "".join(
+                    "\n" + marker + value + "\n"
+                    for value in ("STATE=opened", "STATE=started", "EXIT=0")
+                ).encode("ascii")
+            self.facade_child_stderr_empty = False
+            self._facade_expected = (protocol, protocol.replace(b"\n", b"\r\n"))
+            self._facade_offset = 0
+            super().__init__(stream, gated=gated, nonce=nonce)
+
+        def _read(self, stream):
+            summary = self
+
+            class ObservedStream:
+                def read1(self, size):
+                    block = stream.read1(size)
+                    if block and summary._facade_expected:
+                        offset = summary._facade_offset
+                        summary._facade_expected = tuple(
+                            expected
+                            for expected in summary._facade_expected
+                            if expected[offset : offset + len(block)] == block
+                        )
+                        if summary._facade_expected:
+                            summary._facade_offset += len(block)
+                    return block
+
+                def close(self):
+                    stream.close()
+
+            super()._read(ObservedStream())
+            self.facade_child_stderr_empty = not self.read_failed and any(
+                self._facade_offset == len(expected) for expected in self._facade_expected
+            )
+
+    class StrictOwnedProcess(common.OwnedProcess):
+        def wait(self, seconds):
+            super().wait(seconds)
+            if self.stderr_summary.facade_child_stderr_empty is not True:
+                raise common.WitnessError("output_invalid")
+
+    return StrictStderrSummary, StrictOwnedProcess
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Requires actual Windows Run facade")
 @pytest.mark.parametrize("source_kind", ["synthetic", "public"])
 @pytest.mark.parametrize("initial", sorted(RUN_FACADE_INITIALS))
@@ -5863,33 +5971,41 @@ def test_windows_run_facade_uses_script_result_not_ambient_native_status(
 ):
     import os
 
-    installed = tmp_path / "owned facade with spaces"
-    installed.mkdir()
-    run_bytes = (ALPHA / "Run-K5VisionAlpha.ps1").read_bytes()
-    run = installed / "Run-K5VisionAlpha.ps1"
-    run.write_bytes(run_bytes)
-    harness = tmp_path / "run-facade.ps1"
-    harness.write_text(RUN_FACADE_SCRIPT, encoding="ascii", newline="\n")
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key.upper()
-        in {
-            "SYSTEMROOT",
-            "WINDIR",
-            "SYSTEMDRIVE",
-            "COMSPEC",
-            "OS",
-            "PATH",
-        }
-    }
-    for key in ("TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
-        path = tmp_path / key
-        path.mkdir()
-        env[key] = str(path)
-    shell = Path(os.environ["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    common = None
+    observed = None
+    context = _element_context("probe", initial=initial)
     try:
-        result = subprocess.run(
+        module = _startup_witness()
+        common = module.common
+        common.StderrSummary, common.OwnedProcess = _run_facade_capture_classes(common)
+        base = common.local_path(Path(sys._base_executable))
+        binding = dict(
+            K5_WITNESS_BASE_PYTHON=str(base),
+            K5_WITNESS_BASE_PYTHON_SHA256=common.file_hash(base),
+        )
+        supplied = {key: os.environ.get(key) for key in common.GATE_RUNTIME_KEYS}
+        if any(value is not None for value in supplied.values()) and supplied != binding:
+            raise ValueError("Invalid admitted facade runtime")
+        env = module.clean_environment(dict(os.environ), tmp_path)
+        env.update(binding)
+        for key in ("TEMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            Path(env[key]).mkdir(parents=True, exist_ok=True)
+        shell = common.local_path(
+            Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        installed = tmp_path / "owned facade with spaces"
+        installed.mkdir()
+        run_bytes = (ALPHA / "Run-K5VisionAlpha.ps1").read_bytes()
+        run = installed / "Run-K5VisionAlpha.ps1"
+        run.write_bytes(run_bytes)
+        harness = tmp_path / "run-facade.ps1"
+        harness.write_text(
+            _element_bind_utility(RUN_FACADE_SCRIPT, shell, common),
+            encoding="ascii",
+            newline="\n",
+        )
+        output = _capture_element_child(
+            common,
             [
                 str(shell),
                 "-NoLogo",
@@ -5916,14 +6032,18 @@ def test_windows_run_facade_uses_script_result_not_ambient_native_status(
             ],
             cwd=tmp_path,
             env=env,
-            capture_output=True,
-            timeout=15,
-            check=False,
+            context=context,
         )
-        if result.returncode != 0 or result.stderr:
-            raise ValueError("Invalid fixture exit")
-        observed = _run_facade_record(result.stdout)
-    except Exception:
+        observed = _run_facade_child_record(output)
+    except _ElementCaptureFailure:
+        pass  # The qualified capture has already emitted only fixed diagnostics.
+    except Exception as error:
+        try:
+            _element_diagnostic(context, "failed", error, common=common)
+        except Exception:
+            pass
+    if observed is None:
+        # Outside the handler: raw subprocess/path exception context must not be retained.
         pytest.fail("Source-bound nonmedia Run facade fixture failed", pytrace=False)
     assert observed["initial"] == initial and observed["case"] == case
     assert observed["source_kind"] == source_kind
@@ -5951,7 +6071,10 @@ def test_run_facade_fixture_is_source_bound_nonmedia_and_does_not_seed_success()
     assert "& $StartSource" not in source and "Start-Process" not in source
     assert "[Diagnostics.Process]" not in source and "Invoke-RestMethod" not in source
     assert source.count("Read-K5FacadeSource $Run $RunHash 16384") == 2
-    assert len(source.encode("ascii")) < 16384
+    assert len(source.encode("ascii")) < 32768
+    assert ELEMENT_UTILITY_IMPORT in source
+    assert ELEMENT_CHILD_DIAGNOSTICS in source
+    assert source.index(ELEMENT_UTILITY_IMPORT) < source.index("Get-Variable LASTEXITCODE")
     start = START.read_text()
     assert start.count("if ($ExitAfterPublicTest) {") == 1
     assert "Exiting after one bounded alpha acceptance run." in start
@@ -5987,3 +6110,164 @@ def test_run_facade_record_rejects_unbounded_private_or_untyped_observations():
     ):
         with pytest.raises(ValueError):
             _run_facade_record(invalid)
+
+
+def test_run_facade_capture_failure_has_no_raw_exception_context(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    common = SimpleNamespace(
+        GATE_RUNTIME_KEYS=(),
+        local_path=lambda path: Path(path),
+        file_hash=lambda path: "a" * 64,
+        WitnessError=type("FixtureWitnessError", (Exception,), {}),
+        StderrSummary=object,
+        OwnedProcess=object,
+    )
+    env = {
+        key: str(tmp_path / key)
+        for key in (
+            "SYSTEMROOT",
+            "TEMP",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+        )
+    }
+    namespace = test_windows_run_facade_uses_script_result_not_ambient_native_status.__globals__
+    monkeypatch.setitem(
+        namespace,
+        "_startup_witness",
+        lambda: SimpleNamespace(
+            common=common,
+            clean_environment=lambda *args: env.copy(),
+        ),
+    )
+    monkeypatch.setitem(namespace, "_element_bind_utility", lambda script, *args: script)
+
+    calls = []
+
+    def fail_capture(*args, **kwargs):
+        calls.append(True)
+        raise subprocess.TimeoutExpired(
+            ["PRIVATE_FACADE_COMMAND"],
+            15,
+            output=b"PRIVATE_FACADE_OUTPUT",
+            stderr=b"PRIVATE_FACADE_STDERR",
+        )
+
+    monkeypatch.setitem(namespace, "_capture_element_child", fail_capture)
+    with pytest.raises(pytest.fail.Exception) as failure:
+        test_windows_run_facade_uses_script_result_not_ambient_native_status(
+            tmp_path, "synthetic", "absent", "success"
+        )
+    assert failure.value.__context__ is None
+    assert calls == [True]
+    capture = capsys.readouterr()
+    assert "PRIVATE_FACADE" not in str(failure.value) + capture.out + capture.err
+
+
+def test_run_facade_child_record_requires_complete_qualified_utility_prefix():
+    utility = [
+        ELEMENT_CHECKPOINT_PREFIX + name.encode()
+        for name in (
+            "utility_manifest_requested",
+            "utility_import_requested",
+            "utility_import_returned",
+        )
+    ]
+    utility += [_utility_observation_bytes().rstrip(b"\n")]
+    utility += [ELEMENT_CHECKPOINT_PREFIX + b"utility_binding_verified"]
+    stages = [ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in RUN_FACADE_CHECKPOINTS]
+    value = dict(
+        schema_version="run-facade-return-v1",
+        initial="absent",
+        case="success",
+        source_kind="synthetic",
+        outcome="returned",
+        entered=1,
+        cleanup=1,
+        arguments_valid=True,
+        ambient_after=None,
+    )
+    record = RUN_FACADE_PREFIX + json.dumps(value).encode()
+    output = b"\n".join([*utility, *stages, record]) + b"\n"
+    assert _run_facade_child_record(output) == value
+    for malformed in (
+        b"\n".join([*utility[:3], *utility[4:], *stages, record]) + b"\n",
+        b"\n".join([*utility, *stages[1:], record]) + b"\n",
+        b"\n".join([*utility, *reversed(stages), record]) + b"\n",
+        b"\n".join([*utility, *stages, stages[-1], record]) + b"\n",
+        b"\n".join([record, *utility[:2], utility[3], utility[2], utility[4], *stages]) + b"\n",
+        b"\n".join([*utility, *stages[:-1], record, stages[-1]]) + b"\n",
+        output + b"PRIVATE_FACADE_OUTPUT\n",
+        output[:-1],
+    ):
+        with pytest.raises(ValueError):
+            _run_facade_child_record(malformed)
+
+
+def test_run_facade_stderr_observer_accepts_only_exact_relay_protocol():
+    import io
+
+    common = _startup_witness().common
+    summary_type, _ = _run_facade_capture_classes(common)
+    nonce = "1" * 32
+    marker = "K5_GATE_" + nonce + "_"
+    protocol = "".join(
+        "\n" + marker + item + "\n"
+        for item in (
+            "STATE=opened",
+            "STATE=started",
+            "EXIT=0",
+        )
+    ).encode()
+
+    class Chunked(io.BytesIO):
+        def read1(self, size=-1):
+            return super().read1(min(size, 3))
+
+    for wire, accepted in (
+        (protocol, True),
+        (protocol.replace(b"\n", b"\r\n"), True),
+        (b"PRIVATE_STDERR" + protocol, False),
+        (protocol + b"PRIVATE_STDERR", False),
+        (protocol.replace(b"STATE=started", b"PRIVATE_STDERR"), False),
+        (protocol.replace(b"EXIT=0", b"EXIT=7"), False),
+        (protocol.replace(nonce.encode(), b"2" * 32), False),
+        (protocol[:-1], False),
+    ):
+        summary = summary_type(Chunked(wire), gated=True, nonce=nonce)
+        assert summary.finish(1)
+        assert summary.facade_child_stderr_empty is accepted
+        assert not hasattr(summary, "raw")
+    for wire, accepted in ((b"", True), (b"PRIVATE_STDERR", False)):
+        summary = summary_type(Chunked(wire), gated=False)
+        assert summary.finish(1)
+        assert summary.facade_child_stderr_empty is accepted
+
+
+@pytest.mark.parametrize("child_stderr", [False, True])
+def test_run_facade_owned_wait_preserves_child_stderr_refusal(child_stderr):
+    import io
+
+    common = _startup_witness().common
+    waited = []
+
+    class CompletedOwned:
+        def __init__(self, summary):
+            self.stderr_summary = summary
+
+        def wait(self, seconds):
+            waited.append(seconds)
+            assert self.stderr_summary.finish(1)
+
+    common.OwnedProcess = CompletedOwned
+    summary_type, owned_type = _run_facade_capture_classes(common)
+    summary = summary_type(io.BytesIO(b"PRIVATE_STDERR" if child_stderr else b""), gated=False)
+    owned = owned_type(summary)
+    if child_stderr:
+        with pytest.raises(common.WitnessError, match="^output_invalid$"):
+            owned.wait(5)
+    else:
+        owned.wait(5)
+    assert waited == [5]
