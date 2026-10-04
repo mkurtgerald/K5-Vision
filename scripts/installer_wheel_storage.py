@@ -94,6 +94,22 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
 
+def _shared_state(info: os.stat_result) -> tuple:
+    # Path and descriptor views agree on these fields. In CPython 3.12.10
+    # Windows lstat exposes creation time as ctime, while fstat exposes change
+    # time. Compare ctime only within its original API, never across the two.
+    return (
+        _identity(info),
+        info.st_size,
+        info.st_mtime_ns,
+        getattr(info, "st_birthtime_ns", None),
+    )
+
+
+def _api_state(info: os.stat_result) -> tuple:
+    return _shared_state(info), info.st_ctime_ns
+
+
 def _ordinary(info: os.stat_result, *, directory: bool) -> None:
     _need(
         not stat.S_ISLNK(info.st_mode)
@@ -149,16 +165,17 @@ def _open_read(path: Path, policy):
     try:
         opened = os.fstat(descriptor)
         _ordinary(opened, directory=False)
-        _need(_identity(opened) == _identity(info), "storage_identity")
-        _same(path, _identity(info), policy, directory=False)
-        return os.fdopen(descriptor, "rb"), info
+        _need(_shared_state(opened) == _shared_state(info), "storage_identity")
+        checked = _same(path, _identity(info), policy, directory=False)
+        _need(_api_state(checked) == _api_state(info), "storage_identity")
+        return os.fdopen(descriptor, "rb"), info, opened
     except BaseException:
         os.close(descriptor)
         raise
 
 
 def _hash(path: Path, size: int, policy, expected=None) -> tuple[str, tuple[int, int]]:
-    stream, info = _open_read(path, policy)
+    stream, info, opened = _open_read(path, policy)
     identity = _identity(info)
     with stream:
         _need(expected is None or identity == expected, "storage_identity")
@@ -172,17 +189,10 @@ def _hash(path: Path, size: int, policy, expected=None) -> tuple[str, tuple[int,
             remaining -= len(block)
         _need(not stream.read(1), "storage_hash")
         after = os.fstat(stream.fileno())
-        _need(
-            (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-            == (info.st_size, info.st_mtime_ns, info.st_ctime_ns),
-            "storage_identity",
-        )
+        _ordinary(after, directory=False)
+        _need(_api_state(after) == _api_state(opened), "storage_identity")
     after = _same(path, identity, policy, directory=False)
-    _need(
-        (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-        == (info.st_size, info.st_mtime_ns, info.st_ctime_ns),
-        "storage_identity",
-    )
+    _need(_api_state(after) == _api_state(info), "storage_identity")
     return digest.hexdigest(), identity
 
 
@@ -775,7 +785,7 @@ def retain_bundle(
             if destination.parent not in owned.created:
                 owned.directory(destination.parent)
             source = record["source"]
-            stream, source_info = _open_read(source, policy)
+            stream, source_info, _ = _open_read(source, policy)
             with stream:
                 _need(_identity(source_info) == source_identities[source], "storage_identity")
                 _need(source_info.st_size == record["size"], "storage_hash")

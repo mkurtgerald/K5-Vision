@@ -913,7 +913,9 @@ class NativePublicationModelTests(unittest.TestCase):
                 Path("/owned/partial"), (1, 2), access=0x10080, sharing=1
             ) as handle:
                 self.assertEqual(123, handle)
-        self.assertEqual(("/owned/partial", 0x10080, 1, None, 3, 0x02200000, None), opened[0])
+        self.assertEqual(
+            (str(Path("/owned/partial")), 0x10080, 1, None, 3, 0x02200000, None), opened[0]
+        )
         self.assertEqual([456], closed_fd)
         self.assertEqual([], closed_native)
 
@@ -950,6 +952,114 @@ class NativePublicationModelTests(unittest.TestCase):
                 ):
                     self.fail("Transfer failure was ignored")
         policy._native.kernel.CloseHandle.assert_called_once_with(123)
+
+
+class HashSnapshotModelTests(unittest.TestCase):
+    """Model CPython 3.12 Windows path/handle clocks without native calls."""
+
+    def snapshot(self, *, descriptor=False, **changes):
+        return types.SimpleNamespace(
+            **{
+                "st_dev": 7,
+                "st_ino": 11,
+                "st_mode": 0o100600,
+                "st_nlink": 1,
+                "st_file_attributes": 0,
+                "st_size": 3,
+                "st_mtime_ns": 150,
+                # CPython 3.12.10 lstat exposes CreationTime, fstat ChangeTime.
+                "st_ctime_ns": 200 if descriptor else 100,
+                "st_birthtime_ns": 100,
+                **changes,
+            }
+        )
+
+    def exercise(self, *, opened=None, descriptor_after=None, path_checked=None, path_after=None):
+        before = self.snapshot()
+        opened = opened or self.snapshot(descriptor=True)
+        descriptor_after = descriptor_after or opened
+        path_checked = path_checked or before
+        path_after = path_after or before
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "generated.whl"
+            path.write_bytes(b"abc")
+            with (
+                mock.patch.object(storage, "_checked", return_value=before),
+                mock.patch.object(storage, "_same", side_effect=[path_checked, path_after]),
+                mock.patch.object(storage.os, "fstat", side_effect=[opened, descriptor_after]),
+            ):
+                return storage._hash(path, 3, FakePolicy(), (7, 11))
+
+    def test_stable_windows_split_ctime_semantics_are_admitted(self):
+        digest, identity = self.exercise()
+        self.assertEqual(hashlib.sha256(b"abc").hexdigest(), digest)
+        self.assertEqual((7, 11), identity)
+
+    def test_stable_same_ctime_semantics_are_admitted(self):
+        digest, _ = self.exercise(opened=self.snapshot())
+        self.assertEqual(hashlib.sha256(b"abc").hexdigest(), digest)
+
+    def test_descriptor_metadata_changes_are_refused(self):
+        for changes in (
+            {"st_ctime_ns": 201},
+            {"st_mtime_ns": 151},
+            {"st_size": 4},
+            {"st_birthtime_ns": 101},
+            {"st_ino": 12},
+            {"st_dev": 8},
+            {"st_ino": 0},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(storage.StorageError, "storage_identity"):
+                    self.exercise(descriptor_after=self.snapshot(descriptor=True, **changes))
+
+    def test_path_metadata_changes_are_refused(self):
+        for changes in (
+            {"st_ctime_ns": 101},
+            {"st_mtime_ns": 151},
+            {"st_size": 4},
+            {"st_birthtime_ns": 101},
+            {"st_ino": 12},
+            {"st_dev": 8},
+            {"st_ino": 0},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(storage.StorageError, "storage_identity"):
+                    self.exercise(path_after=self.snapshot(**changes))
+
+    def test_path_mutation_between_admission_and_open_is_refused(self):
+        for changes in (
+            {"st_ctime_ns": 101},
+            {"st_mtime_ns": 151},
+            {"st_size": 4},
+            {"st_birthtime_ns": 101},
+            {"st_ino": 12},
+            {"st_dev": 8},
+            {"st_ino": 0},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(storage.StorageError, "storage_identity"):
+                    self.exercise(path_checked=self.snapshot(**changes))
+
+    def test_cross_api_shared_field_disagreement_is_refused(self):
+        for changes in (
+            {"st_mtime_ns": 151},
+            {"st_size": 4},
+            {"st_birthtime_ns": 101},
+            {"st_ino": 12},
+            {"st_dev": 8},
+            {"st_ino": 0},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(storage.StorageError, "storage_identity"):
+                    self.exercise(opened=self.snapshot(descriptor=True, **changes))
+
+    def test_descriptor_reparse_or_hard_link_changes_are_refused(self):
+        for changes in ({"st_file_attributes": 0x400}, {"st_nlink": 2}):
+            for boundary in ("opened", "descriptor_after"):
+                with self.subTest(changes=changes, boundary=boundary):
+                    with self.assertRaisesRegex(storage.StorageError, "storage_path"):
+                        self.exercise(**{boundary: self.snapshot(descriptor=True, **changes)})
 
 
 class TokenOwnerModelTests(unittest.TestCase):
