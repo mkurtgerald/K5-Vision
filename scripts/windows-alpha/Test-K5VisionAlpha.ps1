@@ -30,13 +30,16 @@ if (-not $gstCoreReady -or -not (Test-Path -LiteralPath $gstLaunch)) { throw "Re
 & $launcher -AnalyticsPreflightOnly
 
 $output = @(& $gstLaunch --version 2>$null)
-if ($LASTEXITCODE -ne 0 -or -not (($output -join "`n").Contains("GStreamer $gstreamerVersion"))) {
+$gstLaunchSucceeded = $?
+if (-not $gstLaunchSucceeded -or -not (($output -join "`n").Contains("GStreamer $gstreamerVersion"))) {
     throw "Reviewed GStreamer runtime version verification failed."
 }
 & $python -I -B -m k5vision.cli --version
-if ($LASTEXITCODE -ne 0) { throw "Installed K5 CLI verification failed." }
+$cliVersionSucceeded = $?
+if (-not $cliVersionSucceeded) { throw "Installed K5 CLI verification failed." }
 & $python -I -B -m k5vision.cli --help *> $null
-if ($LASTEXITCODE -ne 0) { throw "Installed K5 CLI smoke test failed." }
+$cliHelpSucceeded = $?
+if (-not $cliHelpSucceeded) { throw "Installed K5 CLI smoke test failed." }
 
 Write-Host "K5 Vision Alpha preflight PASS"
 Write-Host "Reviewed K5 revision: $revision"
