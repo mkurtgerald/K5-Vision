@@ -37,7 +37,7 @@ WORKSPACE = ".k5-alpha-upgrade"
 LOCK = ".k5-alpha-install.lock"
 FORMAT = "k5-alpha-upgrade-v1"
 WHEELHOUSE_FORMAT = "k5-alpha-wheelhouse-v1"
-REQUIREMENTS_SHA256 = "ba1ae7620ce4f660fc5e6a7fd2ace352e9c1859972cb09e8b7f76449272fcb52"
+REQUIREMENTS_SHA256 = "1043752619f04dcfa6b58219936f1dd2c9be5497e52598ab9ff5fde026765efd"
 PAYLOAD_FILES = (
     "scripts/windows-alpha/Install-K5VisionAlpha.ps1",
     "scripts/windows-alpha/install_transaction.py",
@@ -126,6 +126,34 @@ def _sha256(path: Path) -> str:
     _admit(path.is_file())
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def runtime_versions(path: Path, *, target_platform: str = "win32") -> dict[str, str]:
+    """Return the hash-bound pins for an explicit target, never the build host.
+
+    Only the literal reviewed pyreadline3 Windows marker is supported. This is
+    not a requirements resolver or a general-purpose marker interpreter.
+    """
+    _admit(target_platform in ("win32", "linux", "darwin"))
+    _plain_ancestors(path)
+    _admit(path.is_file() and path.stat().st_size <= 16384)
+    raw = path.read_bytes()
+    _admit(hashlib.sha256(raw).hexdigest() == REQUIREMENTS_SHA256)
+    versions = {}
+    seen = set()
+    for line in raw.decode("utf-8").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        windows_only = line == 'pyreadline3==3.5.6; sys_platform == "win32"'
+        if windows_only:
+            line = "pyreadline3==3.5.6"
+        match = re.fullmatch(r"([a-z0-9-]+)==([0-9]+(?:\.[0-9]+)+)", line)
+        _admit(match is not None and match[1] not in seen)
+        seen.add(match[1])
+        if not windows_only or target_platform == "win32":
+            versions[match[1]] = match[2]
+    _admit(len(seen) == 28 and len(versions) == (28 if target_platform == "win32" else 27))
+    return versions
 
 
 def _unique_json(items: list[tuple[str, object]]) -> dict:
@@ -234,16 +262,7 @@ class OfflineWheelhouse:
         _admit(host["platform"] == "win_amd64" and host["version"].startswith("3.12."))
         self.directory, self.source, self.data = directory, source, data
         self.verify_source()
-        requirements = source / "runtime-requirements.txt"
-        _admit(_sha256(requirements) == REQUIREMENTS_SHA256)
-        versions = {}
-        for line in requirements.read_text(encoding="utf-8").splitlines():
-            if not line or line.startswith("#"):
-                continue
-            match = re.fullmatch(r"([a-z0-9-]+)==([0-9]+(?:\.[0-9]+)+)", line)
-            _admit(match is not None and match[1] not in versions)
-            versions[match[1]] = match[2]
-        _admit(len(versions) == 27)
+        versions = runtime_versions(source / "runtime-requirements.txt", target_platform="win32")
         versions.update({"k5-vision": "0.1.0", "pip": host["ensurepip_version"]})
         self.versions = versions
         wheels = data["wheels"]

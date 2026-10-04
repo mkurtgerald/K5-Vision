@@ -1391,14 +1391,23 @@ def wheel_payload(wheel: Path) -> dict[str, str]:
     return result
 
 
-def requirements(path: Path) -> dict[str, str]:
+def requirements(path: Path, *, target_platform: str | None = None) -> dict[str, str]:
+    """Read exact pins and the one reviewed Windows-only pin, without resolution."""
+    target_platform = sys.platform if target_platform is None else target_platform
+    require(target_platform in ("win32", "linux", "darwin"), "admission_failed")
     result = {}
-    for line in path.read_text().splitlines():
+    seen = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip() or line.startswith("#"):
             continue
+        windows_only = line == 'pyreadline3==3.5.6; sys_platform == "win32"'
+        if windows_only:
+            line = "pyreadline3==3.5.6"
         match = re.fullmatch(r"([a-z0-9-]+)==([0-9]+(?:\.[0-9]+)+)", line)
-        require(match is not None and match[1] not in result, "admission_failed")
-        result[match[1]] = match[2]
+        require(match is not None and match[1] not in seen, "admission_failed")
+        seen.add(match[1])
+        if not windows_only or target_platform == "win32":
+            result[match[1]] = match[2]
     require(bool(result), "admission_failed")
     return result
 

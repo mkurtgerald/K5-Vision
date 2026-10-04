@@ -26,6 +26,13 @@ on:
       - "tests/test_windows_alpha_analytics.py"
       - "tests/test_windows_alpha_preflight_boundary.py"
       - "scripts/windows_owned_preflight.py"
+      - "scripts/capture_installer_wheel_provenance.py"
+      - "scripts/installer_wheel_requirements.py"
+      - "scripts/installer_wheel_storage.py"
+      - "tests/test_capture_installer_wheel_provenance.py"
+      - "tests/test_installer_wheel_requirements.py"
+      - "tests/test_installer_wheel_storage.py"
+      - "tests/test_installer_runtime_platform_dependencies.py"
       - "scripts/installed_analytics_witness.py"
       - "scripts/installed_alpha_launcher_witness.py"
       - "tests/test_installed_analytics_witness.py"
@@ -58,6 +65,13 @@ on:
       - "tests/test_windows_alpha_analytics.py"
       - "tests/test_windows_alpha_preflight_boundary.py"
       - "scripts/windows_owned_preflight.py"
+      - "scripts/capture_installer_wheel_provenance.py"
+      - "scripts/installer_wheel_requirements.py"
+      - "scripts/installer_wheel_storage.py"
+      - "tests/test_capture_installer_wheel_provenance.py"
+      - "tests/test_installer_wheel_requirements.py"
+      - "tests/test_installer_wheel_storage.py"
+      - "tests/test_installer_runtime_platform_dependencies.py"
       - "scripts/installed_analytics_witness.py"
       - "scripts/installed_alpha_launcher_witness.py"
       - "tests/test_installed_analytics_witness.py"
@@ -129,7 +143,7 @@ jobs:
       - name: Run Windows alpha boundary regressions
         shell: powershell
         run: |
-          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_windows_alpha_upgrade.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py tests/test_app_resource_lifetime.py tests/test_windows_alpha_analytics.py tests/test_cli.py -q --no-cov
+          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_windows_alpha_upgrade.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py tests/test_app_resource_lifetime.py tests/test_windows_alpha_analytics.py tests/test_cli.py tests/test_capture_installer_wheel_provenance.py tests/test_installer_wheel_requirements.py tests/test_installer_wheel_storage.py tests/test_installer_runtime_platform_dependencies.py -q --no-cov
 
       - name: Qualify Windows local recovery identity
         shell: powershell

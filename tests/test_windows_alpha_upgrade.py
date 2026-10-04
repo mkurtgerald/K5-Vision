@@ -689,10 +689,8 @@ def offline_bundle(tmp_path, monkeypatch):
         target.write_bytes((ROOT / name).read_bytes().replace(b"\r\n", b"\n"))
     wheels = tmp_path / "wheels"
     wheels.mkdir()
-    versions = dict(
-        line.split("==")
-        for line in (source / "runtime-requirements.txt").read_text().splitlines()
-        if line and not line.startswith("#")
+    versions = transaction.runtime_versions(
+        source / "runtime-requirements.txt", target_platform="win32"
     )
     versions.update({"k5-vision": "0.1.0", "pip": "25.0.1"})
 
@@ -801,7 +799,30 @@ def test_offline_admission_copies_exact_closed_wheel_set_without_commands(offlin
         r["filename"]: r["sha256"] for r in offline_bundle.data["wheels"]
     }
     assert installer.offline.versions["pip"] == "25.0.1"
-    assert len(installer.offline.versions) == 29
+    assert installer.offline.versions["pyreadline3"] == "3.5.6"
+    assert len(installer.offline.versions) == 30
+    run.assert_not_called()
+
+
+def test_offline_admission_refuses_previous_inventory_without_windows_pin(offline_bundle):
+    records = offline_bundle.data["wheels"]
+    missing = next(record for record in records if record["name"] == "pyreadline3")
+    records.remove(missing)
+    (offline_bundle.wheels / missing["filename"]).unlink()
+    run = Mock()
+    with pytest.raises(RuntimeError, match="no online fallback"):
+        offline_bundle.installer(run=run)
+    assert not offline_bundle.root.exists()
+    run.assert_not_called()
+
+
+def test_offline_admission_keeps_platform_pin_version_exact(offline_bundle):
+    record = next(r for r in offline_bundle.data["wheels"] if r["name"] == "pyreadline3")
+    record["version"] = "3.5.7"
+    run = Mock()
+    with pytest.raises(RuntimeError, match="no online fallback"):
+        offline_bundle.installer(run=run)
+    assert not offline_bundle.root.exists()
     run.assert_not_called()
 
 

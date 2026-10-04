@@ -5,11 +5,23 @@ on:
     branches:
       - feat/installed-analytics-operator-20261003
       - feat/alpha-analytics-preflight-20261004
+      - fix/transactional-alpha-upgrade-20261003
     paths:
       - .github/workflows/installed-analytics-candidate.yml
       - scripts/installed_analytics_witness.py
       - scripts/installed_alpha_launcher_witness.py
       - scripts/windows_owned_preflight.py
+      - scripts/capture_installer_wheel_provenance.py
+      - scripts/installer_wheel_requirements.py
+      - scripts/installer_wheel_storage.py
+      - scripts/windows-alpha/Install-K5VisionAlpha.ps1
+      - scripts/windows-alpha/install_transaction.py
+      - tests/test_capture_installer_wheel_provenance.py
+      - tests/test_installer_wheel_requirements.py
+      - tests/test_installer_wheel_storage.py
+      - tests/test_installer_runtime_platform_dependencies.py
+      - tests/test_windows_alpha_upgrade.py
+      - tests/test_windows_alpha_bootstrap.py
       - scripts/build_analytics_runtime_wheel.py
       - scripts/windows-alpha/Invoke-K5InstalledAnalyticsWitness.ps1
       - scripts/windows-alpha/Start-K5VisionAlpha.ps1
@@ -36,7 +48,7 @@ permissions:
 
 jobs:
   installed-analytics-candidate:
-    if: github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004')
+    if: github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003')
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 35
     env:
@@ -65,11 +77,12 @@ jobs:
           if ($env:K5_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "Exact candidate SHA required." }
           $legacyBranch = "feat/installed-analytics-operator-20261003"
           $launcherBranch = "feat/alpha-analytics-preflight-20261004"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch)) { throw "Unreviewed candidate branch refused." }
+          $upgradeBranch = "fix/transactional-alpha-upgrade-20261003"
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $upgradeBranch)) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
-          # PR321's launcher/CLI paths trigger Alpha smoke; CI and PR dedupe are
-          # unfiltered. PR318 also changes operator_runtime.py, so its original
+          # PR319 and PR321 require CI, Alpha smoke and dedupe. PR318 retains
+          # its additional operator_runtime.py gates, so its original
           # viewport and Analytics compatibility requirements remain in force.
           # No native workflow or intentionally untriggered gate is counted.
           $required = @{
@@ -178,7 +191,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004")) { throw "Unreviewed candidate branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003")) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -243,7 +256,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004")) { throw "Unreviewed candidate branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003")) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -273,7 +286,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004")) { throw "Unreviewed candidate branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003")) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -313,7 +326,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Installed receipt violated exact source-free contract." }
 
       - name: Prepare independently bound offline Start-script inputs
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
         timeout-minutes: 6
         shell: powershell
         env:
@@ -321,7 +334,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cne "feat/alpha-analytics-preflight-20261004") { throw "Unreviewed launcher branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003")) { throw "Unreviewed launcher branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -399,7 +412,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Independent launcher input admission failed." }
 
       - name: Recheck fresh exact candidate before installed Start-script acceptance
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
         timeout-minutes: 1
         shell: powershell
         env:
@@ -407,21 +420,21 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cne "feat/alpha-analytics-preflight-20261004") { throw "Unreviewed launcher branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003")) { throw "Unreviewed launcher branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
           if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; Start-script acceptance refused." }
 
       - name: Recheck idle host before installed Start-script witness
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
         timeout-minutes: 1
         shell: powershell
         run: .\scripts\assert-stage-one-physical-admission.ps1
 
       - name: Prove installed Start-script refusal and two analytics launches
         id: alpha_launcher_witness
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
         timeout-minutes: 10
         shell: powershell
         run: |
@@ -450,6 +463,23 @@ jobs:
           $root = $env:K5_ALPHA_LAUNCHER_OWNED
           & $env:K5_WITNESS_BASE_PYTHON -I -B -S "$root\source\scripts\installed_alpha_launcher_witness.py" --validate-receipt --expectations "$root\installed-alpha-start-script-expectations.json" --output $env:K5_ALPHA_LAUNCHER_OUTPUT
           if ($LASTEXITCODE -ne 0) { throw "Installed Start-script receipt violated independent source-free contract." }
+
+      - name: Retain exact qualified wheel provenance locally
+        id: wheel_provenance
+        if: github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' && steps.safe_evidence.outcome == 'success' && steps.safe_alpha_evidence.outcome == 'success'
+        timeout-minutes: 3
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:K5_ALPHA_LAUNCHER_OWNED
+          $base = $env:K5_WITNESS_BASE_PYTHON
+          if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_WITNESS_BASE_PYTHON_SHA256) { throw "Admitted base Python changed." }
+          # Derive the actual pipeline directory; collector independently binds
+          # it to RUNNER_TEMP's parent and refuses aliases or another volume.
+          $runnerWorkspace = Split-Path -Parent $env:GITHUB_WORKSPACE
+          if (-not [string]::IsNullOrWhiteSpace($env:RUNNER_WORKSPACE) -and [IO.Path]::GetFullPath($env:RUNNER_WORKSPACE) -cne [IO.Path]::GetFullPath($runnerWorkspace)) { throw "Runner workspace admission mismatch." }
+          & $base -I -B -S "$root\source\scripts\capture_installer_wheel_provenance.py" --launcher-root $root --receipt $env:K5_ALPHA_LAUNCHER_OUTPUT --normal-receipt $env:K5_INSTALLED_ANALYTICS_OUTPUT --workspace $env:GITHUB_WORKSPACE --runner-workspace $runnerWorkspace --runner-temp $env:RUNNER_TEMP --revision $env:K5_STAGE_ONE_REVISION --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT --base-python-sha256 $env:K5_WITNESS_BASE_PYTHON_SHA256 --output artifacts\installed-alpha-wheel-provenance.json
+          if ($LASTEXITCODE -ne 0) { throw "Qualified wheel provenance capture failed closed." }
 
       - name: Remove only this job's disposable fixture and controller
         if: always()
@@ -486,5 +516,14 @@ jobs:
         with:
           name: installed-alpha-start-script-witness
           path: artifacts/installed-alpha-start-script-witness.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload source-free wheel provenance only
+        if: success() && steps.wheel_provenance.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: installed-alpha-wheel-provenance
+          path: artifacts/installed-alpha-wheel-provenance.json
           if-no-files-found: error
           retention-days: 14

@@ -85,8 +85,10 @@ into its owned staging directory, verifies the copies, and uses only explicit
 local wheels with `--no-index --no-deps`. It never provisions GStreamer, even for
 a fresh installation: an already reviewed runtime must be available where the
 existing preflight expects it. Absence or mismatch fails staged preflight.
-The legacy online path is unchanged when none of the offline arguments is used;
-its open-ended pip/build inputs are not qualified by this offline contract.
+The legacy online command flow is unchanged when none of the offline arguments
+is used; its open-ended pip/build inputs are not qualified by this offline contract.
+The requirements now explicitly pin the observed Windows-only `pyreadline3`
+dependency as described below.
 
 ### Manifest contract
 
@@ -113,14 +115,31 @@ manifest, binding the source revisions to those exact payload/artifact records.
 A source-revision string alone is never sufficient provenance.
 
 This initial contract admits only base CPython 3.12 on Windows x64 and its exact
-executable and bundled ensurepip wheel identity. It requires precisely the 27
-versions in the unchanged, hash-bound `runtime-requirements.txt`, K5 `0.1.0`, and
-the identical pip wheel bundled with that admitted Python. The wheelhouse must
-contain exactly those 29 wheels and no other entry. Metadata, filename versions,
+executable and bundled ensurepip wheel identity. It requires precisely the 28
+Windows versions in the hash-bound `runtime-requirements.txt`, K5 `0.1.0`, and
+the identical pip wheel bundled with that admitted Python. The original 27 pins
+are unchanged; `pyreadline3==3.5.6; sys_platform == "win32"` adds the one explicitly
+reviewed Windows dependency. The wheelhouse must contain exactly those 30 wheels
+and no other entry. Metadata, filename versions,
 compatible Windows/pure-Python tags, paths, archive bounds and source payload
 bytes are checked; links, reparse points, duplicate names and unexpected files
 are refused. Keep wheelhouse, manifest and installer source outside the install
 root. They must remain unchanged while installation runs.
+
+The requirements readers recognize only this literal Windows marker, in addition
+to unmarked exact pins; they do not resolve arbitrary transitive packages or
+interpret general marker expressions. Offline admission selects the fixed Windows
+target even when a portable source test runs on Linux. The callable
+`install_transaction.runtime_versions(path, target_platform="win32")` reads the
+same hash-bound inventory. An explicit Linux or macOS target omits that pin; such
+targets do not extend the installer beyond its existing Windows x64 contract.
+
+The clean Windows runtime install recorded on 2026-10-04 collected
+`pyreadline3>=3.5.4` from `onvif-python==0.3.1` and installed `pyreadline3==3.5.6`.
+Its successful install list contains the original 27 runtime versions plus that
+single addition. The separately reviewed native analytics witness already pins
+this version (and `colorama==0.4.6`), so its 33-version inventory is unchanged.
+That witness's broader inventory is not the offline installer's wheel inventory.
 
 The wheel inventory is closed before any install state is created. Wheel and
 script bytes are checked again when staged and before activation. Dependency
@@ -142,6 +161,13 @@ to select a newer version or bypass admission.
 Portable source tests use generated wheel metadata and mocked commands. They
 exercise refusal, copy verification, command isolation and transaction recovery;
 they do not execute supplied packages or establish native installer acceptance.
+The platform regression models the observed onvif dependency with generated
+metadata: the former 29-wheel inventory fails Windows closure, the Linux marker
+is inactive, and the repaired 30-wheel inventory passes that modeled edge.
+The install log is inventory evidence, not a complete audit of actual wheel
+metadata, dependency closure, artifact hashes, licenses or redistribution rights.
+Actual wheel archives were not available for that audit. Adding the existing
+witness pin does not qualify or authorize retrieval or installation of artifacts.
 Actual admitted Windows wheel inputs, native process/file/COM behavior and the
 full installed upgrade boundary still require independent qualification.
 
@@ -151,3 +177,49 @@ require, so it fails current staged preflight. Use an explicitly qualified exact
 runtime for this source-only qualification route. The root one-file bootstrap
 still does not deliver this helper or its offline parameters; changing its
 payload/runtime selection remains a separate reviewed delivery change.
+
+## Capturing already-qualified wheel inputs
+
+The existing installed-analytics qualification workflow has an explicit route
+for the transactional-upgrade branch. Publishing on that route can queue its
+existing physical job: coordinate the shared runner first. Admission still
+requires the exact trusted repository/branch head and its three applicable
+hosted checks, followed by the existing fresh host/port checks. The older route's
+additional gates and the single non-cancelling job are preserved.
+
+After both installed receipts validate, and before the existing temporary-input
+cleanup, `capture_installer_wheel_provenance.py` reads the original 33 dependency
+wheels, K5 and Analytics wheels, and admitted Python's bundled pip wheel. It
+cross-checks receipt/source identities, exact archive hashes and metadata, then
+checks the full 36-input dependency graph and the separate 30-wheel Windows
+installer subset. The runtime package payload is pinned independently to the
+132 tracked files at `eccd0cb88c31e75c98d328ebb5fb7f0407ea5cd1`; another source
+payload requires a separate reviewed binding change. A compatible version label
+or a locally rebuilt wheel is not a substitute for the qualified archive bytes.
+
+The collector never runs pip, ensurepip bootstrap, a resolver, a source build,
+package payload or media process. Dependency parsing is a bounded, documented
+subset of the packaging specifications and refuses unsupported syntax. Raw
+requirement marker strings are not published; source-free output contains exact
+metadata hashes, normalized closure results and the bounded target environment.
+
+Exact original wheels stay under a newly owned per-run namespace outside the
+checkout and temporary cleanup roots:
+
+`<verified runner work root>/k5-qualification-artifacts/K5-Vision/<run>-<attempt>-<revision>`
+
+The directory is derived from live runner paths, with local-volume, path,
+ownership, ACL, capacity and collision checks. No access settings change. Only
+source-free JSON is uploaded; wheels, source trees, models, media, credentials
+and account identifiers are not uploaded. Copies are verified before atomic
+publication. A failure conservatively retains partial or uncertain state and
+reports that cleanup is pending instead of deleting a possibly replaced path.
+Do not adopt or delete an older or unrecognized bundle.
+
+A local COMPLETE record certifies captured bytes only. Consumption still needs
+successful outer workflow/cleanup evidence and fresh verification of every
+selected archive. The recorded 30-wheel subset is an allowlist of the retained
+originals, not an additional resolved or installed environment. Complete real
+artifact provenance and availability remain prerequisites for native installer
+qualification. JSON alone, generated test fixtures and hosted source tests do
+not establish that the real installation or upgrade has passed.

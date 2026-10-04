@@ -12,13 +12,14 @@ WORKFLOW = ROOT / ".github/workflows/installed-analytics-candidate.yml"
 BASELINE = ROOT / ".github/workflows/stage-one-operator-physical.yml"
 BRANCH = "feat/installed-analytics-operator-20261003"
 LAUNCHER_BRANCH = "feat/alpha-analytics-preflight-20261004"
+UPGRADE_BRANCH = "fix/transactional-alpha-upgrade-20261003"
 
 
-def test_candidate_route_is_one_job_on_only_two_exact_trusted_feature_branches():
+def test_candidate_route_is_one_job_on_only_three_exact_trusted_branches():
     text = WORKFLOW.read_text()
     events = text.split("on:\n", 1)[1].split("concurrency:", 1)[0]
     branches = events.split("    branches:\n", 1)[1].split("    paths:\n", 1)[0]
-    assert branches == f"      - {BRANCH}\n      - {LAUNCHER_BRANCH}\n"
+    assert branches == f"      - {BRANCH}\n      - {LAUNCHER_BRANCH}\n      - {UPGRADE_BRANCH}\n"
     assert "pull_request" not in events
     assert "workflow_dispatch" not in text
     assert "workflow_call" not in text
@@ -26,19 +27,23 @@ def test_candidate_route_is_one_job_on_only_two_exact_trusted_feature_branches()
     assert "github.repository == 'mkurtgerald/K5-Vision'" in text
     assert f"github.ref == 'refs/heads/{BRANCH}'" in text
     assert f"github.ref == 'refs/heads/{LAUNCHER_BRANCH}'" in text
+    assert f"github.ref == 'refs/heads/{UPGRADE_BRANCH}'" in text
     assert text.count("runs-on:") == 1
     assert "runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]" in text
     assert "timeout-minutes: 35" in text
 
 
-def test_launcher_branch_requires_only_its_three_applicable_hosted_gates():
+def test_launcher_and_upgrade_branches_require_their_three_applicable_hosted_gates():
     text = WORKFLOW.read_text()
     gate = text.split("- name: Require exact trusted head", 1)[1].split(
         "- name: Admit existing Git", 1
     )[0]
     assert f'$legacyBranch = "{BRANCH}"' in gate
     assert f'$launcherBranch = "{LAUNCHER_BRANCH}"' in gate
-    assert "$env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch)" in gate
+    assert f'$upgradeBranch = "{UPGRADE_BRANCH}"' in gate
+    assert (
+        "$env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $upgradeBranch)" in gate
+    )
     base = gate.split("$required = @{", 1)[1].split("\n          }", 1)[0]
     assert set(re.findall(r'"([0-9]+)" = ', base)) == {"355859781", "369354936", "361865932"}
     assert "$env:K5_CANDIDATE_BRANCH -ceq $legacyBranch" in gate
@@ -55,6 +60,17 @@ def test_native_probe_regression_dependency_is_exact_and_hosted_qualified():
         "scripts/installed_analytics_witness.py",
         "scripts/installed_alpha_launcher_witness.py",
         "scripts/windows_owned_preflight.py",
+        "scripts/capture_installer_wheel_provenance.py",
+        "scripts/installer_wheel_requirements.py",
+        "scripts/installer_wheel_storage.py",
+        "scripts/windows-alpha/Install-K5VisionAlpha.ps1",
+        "scripts/windows-alpha/install_transaction.py",
+        "tests/test_capture_installer_wheel_provenance.py",
+        "tests/test_installer_wheel_requirements.py",
+        "tests/test_installer_wheel_storage.py",
+        "tests/test_installer_runtime_platform_dependencies.py",
+        "tests/test_windows_alpha_upgrade.py",
+        "tests/test_windows_alpha_bootstrap.py",
         "scripts/build_analytics_runtime_wheel.py",
         "scripts/windows-alpha/Invoke-K5InstalledAnalyticsWitness.ps1",
         "scripts/windows-alpha/Start-K5VisionAlpha.ps1",
