@@ -1802,10 +1802,94 @@ public static class K5OwnedExitFixture {
     }
 }
 """
+ELEMENT_CHILD_PREFIX = b"K5_ELEMENT_CHILD_FAILURE="
+ELEMENT_CHILD_PHASES = {
+    "compile",
+    "source_select",
+    "command_admission",
+    "probe_invoke",
+    "probe_record",
+    "reference_start",
+    "reference_wait",
+    "reference_exit",
+    "reference_cleanup",
+}
+ELEMENT_CHILD_ERRORS = {
+    "unknown",
+    "compiler_error",
+    "command_missing",
+    "variable_undefined",
+    "property_missing",
+    "parameter_binding",
+    "method_binding",
+    "permission_denied",
+    "file_missing",
+    "io_error",
+    "native_stderr",
+    "timeout",
+}
+ELEMENT_CHILD_DIAGNOSTICS = r"""
+function Write-K5ElementChildFailure([object]$Failure, [string]$Phase, [string]$Boundary) {
+    $category = 'unknown'
+    $code = $null
+    if ($Failure -is [Management.Automation.ErrorRecord]) {
+        $id = $Failure.FullyQualifiedErrorId.Split(',')[0]
+        if ($id -cin @(
+            'COMPILER_ERRORS','SOURCE_CODE_ERROR','CompilerErrors','AddTypeCompilerError')) {
+            $category = 'compiler_error'
+        } elseif ($id -ceq 'CommandNotFoundException') { $category = 'command_missing' }
+        elseif ($id -ceq 'VariableIsUndefined') { $category = 'variable_undefined' }
+        elseif ($id -cin @('PropertyNotFoundStrict','PropertyNotFound')) {
+            $category = 'property_missing'
+        }
+        elseif ($id -cin @('NativeCommandError','NativeCommandErrorMessage')) {
+            $category = 'native_stderr'
+        }
+        elseif ($Failure.Exception -is [Management.Automation.ParameterBindingException]) {
+            $category = 'parameter_binding'
+        } elseif ($Failure.Exception -is [Management.Automation.MethodInvocationException]) {
+            $category = 'method_binding'
+        }
+        $exception = $Failure.Exception
+        for ($depth = 0; $null -ne $exception -and $depth -lt 4; $depth++) {
+            if ($exception -is [UnauthorizedAccessException]) { $category = 'permission_denied' }
+            elseif ($exception -is [IO.FileNotFoundException]) { $category = 'file_missing' }
+            elseif ($exception -is [TimeoutException]) { $category = 'timeout' }
+            elseif ($exception -is [IO.IOException] -and $category -ceq 'unknown') {
+                $category = 'io_error'
+            }
+            if ($depth -eq 0) { $code = [int]$exception.HResult }
+            $exception = $exception.InnerException
+        }
+    }
+    $record = [ordered]@{
+        schema_version = 'element-child-failure-v1'
+        phase = $Phase
+        boundary = $Boundary
+        error = $category
+        hresult = $code
+    }
+    Write-Output ('K5_ELEMENT_CHILD_FAILURE=' + ($record | ConvertTo-Json -Compress))
+}
+"""
+ELEMENT_COMPILE_SCRIPT = (
+    "param([string]$Root, [string]$Kind)\n$ErrorActionPreference='Stop'\n"
+    + ELEMENT_CHILD_DIAGNOSTICS
+    + "try {\n$code = @'\n"
+    + ELEMENT_PROBE_NATIVE_SOURCE
+    + "\n'@\n"
+    + "if ($Kind -cnotin @('ConsoleApplication','WindowsApplication')) { throw 'invalid' }\n"
+    + "Add-Type -TypeDefinition $code -OutputType $Kind "
+    + "-OutputAssembly (Join-Path $Root ($Kind + '.exe'))\n"
+    + "Write-Output 'K5_NATIVE_COMPILE=passed'; exit 0\n"
+    + "} catch { Write-K5ElementChildFailure $_ 'compile' 'primary'; exit 1 }\n"
+)
 ELEMENT_PROBE_SCRIPT = r"""
 param([string]$Start, [string]$Executable, [string]$Name, [string]$Variant, [string]$Initial)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+__ELEMENT_CHILD_DIAGNOSTICS__
+$fixturePhase = 'source_select'
 try {
     if ($Variant -cnotin @('original','pipeline') -or
         $Initial -cnotin @('absent','stale_zero','stale_nonzero')) { throw 'fixture_invalid' }
@@ -1833,6 +1917,7 @@ try {
     . ([scriptblock]::Create($selected))
     function K5FixtureNoNative { param($Name) }
     Set-Alias -Name K5FixtureAlias -Value K5FixtureNoNative
+    $fixturePhase = 'command_admission'
     $gstInspect = $Executable
     $kind = 'missing'
     $bound = $false
@@ -1853,6 +1938,7 @@ try {
     # Deliberately stale inputs are negative fixtures, never a proposed repair.
     if ($Initial -ceq 'stale_zero') { $global:LASTEXITCODE = 0 }
     elseif ($Initial -ceq 'stale_nonzero') { $global:LASTEXITCODE = 9 }
+    $fixturePhase = 'probe_invoke'
     $outcome = 'unexpected'
     $watch = [Diagnostics.Stopwatch]::StartNew()
     try {
@@ -1866,6 +1952,7 @@ try {
         } elseif ($id -ceq 'CommandNotFoundException') { $outcome = 'command_missing' }
     }
     $watch.Stop()
+    $fixturePhase = 'probe_record'
     $last = Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
     $value = $null
     if ($null -ne $last) {
@@ -1885,15 +1972,19 @@ try {
     }
     Write-Output ('K5_ELEMENT_PROBE=' + ($record | ConvertTo-Json -Compress))
     exit 0
-} catch { Write-Output 'K5_ELEMENT_FIXTURE=failed'; exit 1 }
-"""
+} catch { Write-K5ElementChildFailure $_ $fixturePhase 'primary'; exit 1 }
+""".replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS)
 ELEMENT_REFERENCE_SCRIPT = r"""
 param([string]$Executable, [string]$Name)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$process = [Diagnostics.Process]::new()
+__ELEMENT_CHILD_DIAGNOSTICS__
+$process = $null
 $started = $false
+$failed = $false
+$fixturePhase = 'reference_start'
 try {
+    $process = [Diagnostics.Process]::new()
     $process.StartInfo.FileName = $Executable
     $process.StartInfo.Arguments = $Name
     $process.StartInfo.UseShellExecute = $false
@@ -1905,18 +1996,38 @@ try {
     $handle = $process.Handle
     $out = $process.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null)
     $err = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+    $fixturePhase = 'reference_wait'
     if (-not $process.WaitForExit(5000) -or
-        -not [Threading.Tasks.Task]::WaitAll(@($out,$err), 5000)) { throw 'fixture_invalid' }
+        -not [Threading.Tasks.Task]::WaitAll(@($out,$err), 5000)) {
+        throw [TimeoutException]::new('fixture_timeout')
+    }
+    $fixturePhase = 'reference_exit'
     if ($process.ExitCode -notin @(0,7)) { throw 'fixture_invalid' }
     Write-Output ('K5_NATIVE_REFERENCE=' + $process.ExitCode)
+} catch {
+    $failed = $true
+    Write-K5ElementChildFailure $_ $fixturePhase 'primary'
 } finally {
-    if ($started -and -not $process.HasExited) {
-        $process.Kill()
-        if (-not $process.WaitForExit(5000)) { throw 'fixture_cleanup' }
+    try {
+        if ($started -and -not $process.HasExited) {
+            $process.Kill()
+            if (-not $process.WaitForExit(5000)) {
+                throw [TimeoutException]::new('fixture_cleanup')
+            }
+        }
+    } catch {
+        $failed = $true
+        Write-K5ElementChildFailure $_ 'reference_cleanup' 'cleanup'
+    } finally {
+        try { if ($null -ne $process) { $process.Dispose() } }
+        catch {
+            $failed = $true
+            Write-K5ElementChildFailure $_ 'reference_cleanup' 'cleanup'
+        }
     }
-    $process.Dispose()
 }
-"""
+if ($failed) { exit 1 }
+""".replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS)
 
 
 def _pe_fixture_subsystem(path: Path) -> int:
@@ -1974,15 +2085,264 @@ def _parse_element_probe(raw: bytes) -> dict:
     return value
 
 
+ELEMENT_FIXTURE_PREFIX = "K5_ELEMENT_FIXTURE_DIAGNOSTIC="
+ELEMENT_FIXTURE_PHASES = {
+    "module_load",
+    "runtime_admission",
+    "environment",
+    "compiler_script",
+    "compile",
+    "pe_admission",
+    "fixture_scripts",
+    "reference",
+    "probe",
+    "negative",
+    "matrix",
+}
+ELEMENT_FIXTURE_ERRORS = {
+    "none",
+    "unexpected",
+    "contract",
+    "permission_denied",
+    "file_missing",
+    "os_error",
+    "admission_failed",
+    "identity_mismatch",
+    "child_failed",
+    "child_timeout",
+    "output_invalid",
+    "cleanup_incomplete",
+}
+
+
+def _element_context(phase, kind="none", case="none", variant="none", initial="none"):
+    return dict(phase=phase, kind=kind, case=case, variant=variant, initial=initial)
+
+
+def _validate_element_diagnostic(value):
+    allowed = {
+        "schema_version": {"element-fixture-diagnostic-v1"},
+        "phase": ELEMENT_FIXTURE_PHASES,
+        "kind": {"none", "ConsoleApplication", "WindowsApplication", "missing", "alias"},
+        "case": {"none", "zero", "nonzero", "stderr_zero", "stderr_nonzero"},
+        "variant": {"none", "original", "pipeline"},
+        "initial": {"none", "absent", "stale_zero", "stale_nonzero"},
+        "boundary": {"primary", "owned_cleanup", "child_primary", "child_cleanup"},
+        "status": {"started", "passed", "failed"},
+        "error": ELEMENT_FIXTURE_ERRORS,
+        "child_phase": {"none"} | ELEMENT_CHILD_PHASES,
+        "child_error": {"none"} | ELEMENT_CHILD_ERRORS,
+        "gate_state": {
+            "none",
+            "not_used",
+            "waiting",
+            "opened",
+            "started",
+            "exited",
+            "launch_failed",
+            "refused",
+        },
+    }
+    if type(value) is not dict or value.keys() != allowed.keys() | {
+        "child_exit",
+        "relay_exit",
+        "timed_out",
+        "hresult",
+    }:
+        raise ValueError("Invalid element diagnostic")
+    for key, choices in allowed.items():
+        if type(value[key]) is not str or value[key] not in choices:
+            raise ValueError("Invalid element diagnostic")
+    if type(value["timed_out"]) is not bool:
+        raise ValueError("Invalid element diagnostic")
+    for key in ("child_exit", "relay_exit", "hresult"):
+        if value[key] is not None and (
+            type(value[key]) is not int or not -(2**31) <= value[key] < 2**32
+        ):
+            raise ValueError("Invalid element diagnostic")
+
+
+def _element_diagnostic(
+    context, status, error=None, *, common=None, boundary="primary", child=None
+):
+    record = dict(
+        schema_version="element-fixture-diagnostic-v1",
+        **context,
+        boundary=boundary,
+        status=status,
+        error="none",
+        child_phase="none",
+        child_error="none",
+        hresult=None,
+        child_exit=None,
+        relay_exit=None,
+        timed_out=False,
+        gate_state="none",
+    )
+    if error is not None:
+        record["error"] = (
+            "permission_denied"
+            if isinstance(error, PermissionError)
+            else "file_missing"
+            if isinstance(error, FileNotFoundError)
+            else "os_error"
+            if isinstance(error, OSError)
+            else "contract"
+            if isinstance(error, ValueError)
+            else "unexpected"
+        )
+        if common is not None and type(error) is common.WitnessError:
+            if len(error.args) == 1 and error.args[0] in ELEMENT_FIXTURE_ERRORS:
+                record["error"] = error.args[0]
+            if error.diagnostic is not None:
+                common.validate_diagnostic(error.diagnostic)
+                record.update(
+                    child_exit=error.diagnostic["child_exit_code"],
+                    relay_exit=error.diagnostic["relay_exit_code"],
+                    timed_out=error.diagnostic["timed_out"],
+                    gate_state=error.diagnostic["gate_state"],
+                )
+    if child is not None:
+        record.update(
+            child_phase=child["phase"], child_error=child["error"], hresult=child["hresult"]
+        )
+    _validate_element_diagnostic(record)
+    print(ELEMENT_FIXTURE_PREFIX + json.dumps(record, separators=(",", ":")))
+    return record
+
+
+def _element_child_records(raw):
+    if len(raw) > 4096:
+        raise ValueError("Invalid child diagnostics")
+    records = []
+    for line in raw.splitlines():
+        if not line.startswith(ELEMENT_CHILD_PREFIX):
+            continue  # Never echo unrecognized child output, including compiler diagnostics.
+        pairs = json.loads(line[len(ELEMENT_CHILD_PREFIX) :], object_pairs_hook=list)
+        if type(pairs) is not list or any(
+            type(pair) is not tuple or len(pair) != 2 for pair in pairs
+        ):
+            raise ValueError("Invalid child diagnostics")
+        value = dict(pairs)
+        if len(value) != len(pairs) or value.keys() != {
+            "schema_version",
+            "phase",
+            "boundary",
+            "error",
+            "hresult",
+        }:
+            raise ValueError("Invalid child diagnostics")
+        for field, allowed in (
+            ("schema_version", {"element-child-failure-v1"}),
+            ("phase", ELEMENT_CHILD_PHASES),
+            ("boundary", {"primary", "cleanup"}),
+            ("error", ELEMENT_CHILD_ERRORS),
+        ):
+            if type(value[field]) is not str or value[field] not in allowed:
+                raise ValueError("Invalid child diagnostics")
+        if value["hresult"] is not None and (
+            type(value["hresult"]) is not int or not -(2**31) <= value["hresult"] < 2**31
+        ):
+            raise ValueError("Invalid child diagnostics")
+        records.append(value)
+        if len(records) > 3 or sum(r["boundary"] == "primary" for r in records) > 1:
+            raise ValueError("Invalid child diagnostics")
+    return records
+
+
+class _ElementCaptureFailure(Exception):
+    """All underlying failures have already been projected into fixed records."""
+
+
+def _capture_element_child(common, arguments, *, cwd, env, context):
+    # Reuse the reviewed relay/Job, with the same bounded stdout and wait limits
+    # as common.capture. Keep primary and cleanup errors separately observable.
+    import threading
+
+    owned = reader = stream = None
+    reader_started = False
+    result = []
+    failed = False
+
+    def emit(status, error=None, **kwargs):
+        nonlocal failed
+        try:
+            _element_diagnostic(context, status, error, common=common, **kwargs)
+        except Exception:
+            failed = True  # Reporting cannot bypass ownership cleanup or yield success.
+
+    emit("started")
+    if failed:
+        raise _ElementCaptureFailure from None
+    try:
+        owned = common.OwnedProcess(
+            arguments,
+            cwd=cwd,
+            env=env,
+            operation="probe_admission",
+            stdout=subprocess.PIPE,
+        )
+        stream = owned.process.stdout
+
+        def read():
+            try:
+                result.append(stream.read(4097))
+            except Exception:
+                result.append(None)
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        reader_started = True
+        reader.join(15)
+        if reader.is_alive():
+            raise owned.failure("child_timeout", timed_out=True)
+        if len(result) != 1 or type(result[0]) is not bytes or len(result[0]) > 4096:
+            raise common.WitnessError("output_invalid")
+        for child in _element_child_records(result[0]):
+            failed = True
+            emit("failed", boundary="child_" + child["boundary"], child=child)
+        owned.wait(5)
+    except Exception as error:
+        failed = True
+        emit("failed", error)
+    finally:
+        cleanup_failed = False
+        if owned is not None:
+            try:
+                owned.close()
+            except Exception as error:
+                failed = cleanup_failed = True
+                emit("failed", error, boundary="owned_cleanup")
+        if reader_started:
+            reader.join(5)
+            if reader.is_alive():
+                failed = cleanup_failed = True
+                emit("failed", common.WitnessError("cleanup_incomplete"), boundary="owned_cleanup")
+        if stream is not None and (not reader_started or not reader.is_alive()):
+            try:
+                stream.close()
+            except Exception as error:
+                failed = cleanup_failed = True
+                emit("failed", error, boundary="owned_cleanup")
+        if owned is not None and not cleanup_failed:
+            emit("passed", boundary="owned_cleanup")
+    if failed:
+        raise _ElementCaptureFailure from None
+    return result[0]
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows GUI/CUI process semantics")
 def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Path):
     import os
 
-    module = _startup_witness()
-    common = module.common
+    common = None
+    context = _element_context("module_load")
     complete = False
     original_misses = pipeline_misses = missing_refusals = 0
     try:
+        module = _startup_witness()
+        common = module.common
+        context = _element_context("runtime_admission")
         base = common.local_path(Path(sys._base_executable))
         base_hash = common.file_hash(base)
         supplied = {key: os.environ.get(key) for key in common.GATE_RUNTIME_KEYS}
@@ -1991,6 +2351,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
             "K5_WITNESS_BASE_PYTHON_SHA256": base_hash,
         }:
             raise ValueError("Invalid fixture base binding")
+        context = _element_context("environment")
         env = module.clean_environment(dict(os.environ), tmp_path)
         env.update(K5_WITNESS_BASE_PYTHON=str(base), K5_WITNESS_BASE_PYTHON_SHA256=base_hash)
         for name in ("TEMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
@@ -1999,22 +2360,13 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
         powershell = common.local_path(
             Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
         )
+        context = _element_context("compiler_script")
         compile_script = tmp_path / "compile.ps1"
-        compile_script.write_text(
-            "param([string]$Root, [string]$Kind)\n$ErrorActionPreference='Stop'\ntry {\n"
-            + "$code = @'\n"
-            + ELEMENT_PROBE_NATIVE_SOURCE
-            + "\n'@\n"
-            + "if ($Kind -cnotin @('ConsoleApplication','WindowsApplication')) "
-            "{ throw 'invalid' }\n" + "Add-Type -TypeDefinition $code -OutputType $Kind "
-            "-OutputAssembly (Join-Path $Root ($Kind + '.exe'))\n"
-            + "Write-Output 'K5_NATIVE_COMPILE=passed'; exit 0\n} catch { exit 1 }\n",
-            encoding="ascii",
-            newline="\n",
-        )
+        compile_script.write_text(ELEMENT_COMPILE_SCRIPT, encoding="ascii", newline="\n")
 
         def capture(script, *arguments):
-            return common.capture(
+            return _capture_element_child(
+                common,
                 [
                     str(powershell),
                     "-NoLogo",
@@ -2026,11 +2378,11 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                 ],
                 cwd=tmp_path,
                 env=env,
-                operation="probe_admission",
-                limit=4096,
+                context=context,
             )
 
         for kind in ("ConsoleApplication", "WindowsApplication"):
+            context = _element_context("compile", kind)
             if (
                 capture(compile_script, "-Root", tmp_path, "-Kind", kind).strip()
                 != b"K5_NATIVE_COMPILE=passed"
@@ -2038,10 +2390,12 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                 raise ValueError("Invalid compiler result")
         binaries = {}
         for kind, expected_subsystem in (("ConsoleApplication", 3), ("WindowsApplication", 2)):
+            context = _element_context("pe_admission", kind)
             executable = tmp_path / (kind + ".exe")
             if _pe_fixture_subsystem(executable) != expected_subsystem:
                 raise ValueError("Invalid compiler subsystem")
             binaries[kind] = (executable, common.file_hash(executable))
+        context = _element_context("fixture_scripts")
         reference = tmp_path / "reference.ps1"
         reference.write_text(ELEMENT_REFERENCE_SCRIPT, encoding="ascii", newline="\n")
         probe = tmp_path / "probe.ps1"
@@ -2049,6 +2403,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
         for kind, (executable, identity) in binaries.items():
             for name in ("zero", "nonzero", "stderr_zero", "stderr_nonzero"):
                 expected_exit = 0 if name.endswith("zero") and not name.endswith("nonzero") else 7
+                context = _element_context("reference", kind, name)
                 actual = capture(reference, "-Executable", executable, "-Name", name).strip()
                 if actual != b"K5_NATIVE_REFERENCE=" + str(expected_exit).encode():
                     raise ValueError("Actual reference exit mismatch")
@@ -2061,6 +2416,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                 for initial in states:
                     results = {}
                     for variant in ("original", "pipeline"):
+                        context = _element_context("probe", kind, name, variant, initial)
                         if common.file_hash(executable) != identity:
                             raise ValueError("Owned executable changed")
                         result = _parse_element_probe(
@@ -2110,6 +2466,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
         ):
             for initial in ("absent", "stale_zero", "stale_nonzero"):
                 for variant in ("original", "pipeline"):
+                    context = _element_context("negative", expected_kind, "zero", variant, initial)
                     result = _parse_element_probe(
                         capture(
                             probe,
@@ -2133,13 +2490,27 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
                     print("K5_ELEMENT_CASE=" + expected_kind + ":zero:" + initial)
                     print(ELEMENT_PROBE_PREFIX.decode() + json.dumps(result, separators=(",", ":")))
         complete = True
-    except Exception:
-        pass  # All children are bounded by their own Job; no raw error/paths escape.
+    except _ElementCaptureFailure:
+        pass  # Primary and cleanup diagnostics were both emitted before reaching here.
+    except Exception as error:
+        try:
+            _element_diagnostic(context, "failed", error, common=common)
+        except Exception:
+            pass  # Fixed pytest failure below; never expose a chained setup/printing error.
     if not complete:
         pytest.fail("Owned native element-probe fixture failed", pytrace=False)
-    print("K5_ELEMENT_ORIGINAL_MISSES=" + str(original_misses))
-    print("K5_ELEMENT_PIPELINE_MISSES=" + str(pipeline_misses))
-    print("K5_ELEMENT_MISSING_REFUSALS=" + str(missing_refusals))
+    try:
+        print("K5_ELEMENT_ORIGINAL_MISSES=" + str(original_misses))
+        print("K5_ELEMENT_PIPELINE_MISSES=" + str(pipeline_misses))
+        print("K5_ELEMENT_MISSING_REFUSALS=" + str(missing_refusals))
+        matrix_failed = bool(original_misses or pipeline_misses or missing_refusals != 2)
+        _element_diagnostic(
+            _element_context("matrix"),
+            "failed" if matrix_failed else "passed",
+            ValueError() if matrix_failed else None,
+        )
+    except Exception:
+        pytest.fail("Owned native element-probe reporting failed", pytrace=False)
     if missing_refusals != 2:
         pytest.fail("Missing executable did not refuse under stale-zero state", pytrace=False)
     if original_misses:
@@ -2222,3 +2593,328 @@ def test_element_probe_comparison_changes_only_downstream_pipeline():
     assert "$process.Kill()" in ELEMENT_REFERENCE_SCRIPT
     assert "CopyToAsync([IO.Stream]::Null)" in ELEMENT_REFERENCE_SCRIPT
     test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
+
+
+def test_element_fixture_setup_failure_reports_phase_without_raw_error(
+    tmp_path, monkeypatch, capsys
+):
+    from types import SimpleNamespace
+
+    def fail(_path):
+        raise RuntimeError("PRIVATE_SETUP_PATH_OR_ERROR")
+
+    monkeypatch.setitem(
+        test_windows_exact_element_probe_uses_fresh_actual_native_exit.__globals__,
+        "_startup_witness",
+        lambda: SimpleNamespace(
+            common=SimpleNamespace(
+                local_path=fail, WitnessError=type("FixedFailure", (Exception,), {})
+            )
+        ),
+    )
+    with pytest.raises(pytest.fail.Exception, match="Owned native element-probe fixture failed"):
+        test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path)
+    output = capsys.readouterr()
+    assert "PRIVATE_SETUP" not in output.out + output.err
+    lines = output.out.splitlines()
+    assert lines
+    record = json.loads(lines[-1].removeprefix("K5_ELEMENT_FIXTURE_DIAGNOSTIC="))
+    assert record["phase"] == "runtime_admission"
+    assert record["status"] == "failed"
+    assert record["error"] == "unexpected"
+
+
+def _fixture_records(output):
+    records = [
+        json.loads(line[len(ELEMENT_FIXTURE_PREFIX) :])
+        for line in output.splitlines()
+        if line.startswith(ELEMENT_FIXTURE_PREFIX)
+    ]
+    for record in records:
+        _validate_element_diagnostic(record)
+    return records
+
+
+def test_element_fixture_diagnostic_contract_rejects_raw_and_coerced_values(capsys):
+    value = _element_diagnostic(_element_context("compile", "WindowsApplication"), "started")
+    assert _fixture_records(capsys.readouterr().out) == [value]
+    for patch in (
+        {"path": "PRIVATE_PATH"},
+        {"phase": "PRIVATE_PHASE"},
+        {"kind": []},
+        {"error": "PRIVATE_ERROR"},
+        {"child_phase": "PRIVATE_SOURCE"},
+        {"hresult": True},
+        {"child_exit": 2**32},
+        {"relay_exit": -(2**31) - 1},
+        {"timed_out": 1},
+        {"child_error": {"message": "PRIVATE_MESSAGE"}},
+    ):
+        with pytest.raises(ValueError):
+            _validate_element_diagnostic({**value, **patch})
+
+
+def test_element_child_failure_parser_is_strict_and_source_free():
+    value = dict(
+        schema_version="element-child-failure-v1",
+        phase="compile",
+        boundary="primary",
+        error="compiler_error",
+        hresult=-2146233087,
+    )
+    raw = ELEMENT_CHILD_PREFIX + json.dumps(value).encode() + b"\n"
+    assert _element_child_records(b"PRIVATE_RAW_COMPILER_OUTPUT\n" + raw) == [value]
+    for patch in (
+        {"message": "PRIVATE"},
+        {"phase": "PRIVATE_PATH"},
+        {"boundary": "PRIVATE"},
+        {"error": "PRIVATE"},
+        {"hresult": True},
+        {"hresult": 2**31},
+        {"phase": []},
+    ):
+        with pytest.raises(ValueError):
+            _element_child_records(ELEMENT_CHILD_PREFIX + json.dumps({**value, **patch}).encode())
+    for bad in (
+        raw + raw,
+        b"x" * 4097,
+        ELEMENT_CHILD_PREFIX + b"[]",
+        raw.rstrip()[:-1] + b',"hresult":0}',
+    ):
+        with pytest.raises(ValueError):
+            _element_child_records(bad)
+
+
+@pytest.mark.parametrize(
+    "mode", ["nonzero", "timeout", "dual", "cleanup_only", "malformed", "oversize", "child_zero"]
+)
+def test_element_capture_preserves_primary_and_owned_cleanup(mode, monkeypatch, tmp_path, capsys):
+    import io
+    from types import SimpleNamespace
+
+    common = _startup_witness().common
+    closed = []
+    raw = b"PRIVATE_RAW_OUTPUT"
+    if mode in {"nonzero", "dual", "child_zero"}:
+        raw += (
+            b"\n"
+            + ELEMENT_CHILD_PREFIX
+            + json.dumps(
+                dict(
+                    schema_version="element-child-failure-v1",
+                    phase="compile",
+                    boundary="primary",
+                    error="compiler_error",
+                    hresult=-2146233087,
+                )
+            ).encode()
+        )
+    elif mode == "malformed":
+        raw = ELEMENT_CHILD_PREFIX + b'{"PRIVATE_PATH": true}'
+    elif mode == "oversize":
+        raw = b"PRIVATE" * 700
+
+    class Owned:
+        def __init__(self, *args, **kwargs):
+            self.process = SimpleNamespace(stdout=io.BytesIO(raw))
+
+        def wait(self, seconds):
+            assert seconds == 5
+            if mode in {"nonzero", "dual", "timeout"}:
+                timeout = mode == "timeout"
+                raise common.WitnessError(
+                    "child_timeout" if timeout else "child_failed",
+                    common.diagnostic(
+                        "probe_admission",
+                        child_exit_code=None if timeout else 1,
+                        relay_exit_code=None if timeout else 1,
+                        timed_out=timeout,
+                        gate_state="started" if timeout else "exited",
+                    ),
+                )
+
+        def close(self):
+            closed.append(True)
+            if mode in {"dual", "cleanup_only"}:
+                raise common.WitnessError("cleanup_incomplete")
+
+    monkeypatch.setattr(common, "OwnedProcess", Owned)
+    with pytest.raises(_ElementCaptureFailure):
+        _capture_element_child(
+            common,
+            ["PRIVATE_COMMAND"],
+            cwd=tmp_path,
+            env={},
+            context=_element_context("compile", "ConsoleApplication"),
+        )
+    output = capsys.readouterr()
+    assert "PRIVATE" not in output.out + output.err
+    assert closed == [True]
+    records = _fixture_records(output.out)
+    assert all(record["phase"] == "compile" for record in records)
+    failures = [record for record in records if record["status"] == "failed"]
+    assert failures
+    if mode in {"nonzero", "dual"}:
+        assert failures[0]["child_error"] == "compiler_error"
+        primary = next(record for record in failures if record["boundary"] == "primary")
+        assert primary["error"] == "child_failed"
+        assert primary["child_exit"] == primary["relay_exit"] == 1
+    if mode == "timeout":
+        assert failures[0]["timed_out"] and failures[0]["error"] == "child_timeout"
+    if mode == "dual":
+        assert failures[-1]["boundary"] == "owned_cleanup"
+        assert failures[-1]["error"] == "cleanup_incomplete"
+
+
+def test_element_fixture_child_contexts_and_reference_cleanup_are_fixed():
+    source = Path(__file__).read_text()
+    section = source.split("def test_windows_exact_element_probe_uses_fresh_actual_native_exit", 1)[
+        1
+    ]
+    section = section.split("def test_element_probe_parser", 1)[0]
+    for phase in ELEMENT_FIXTURE_PHASES:
+        assert f'_element_context("{phase}"' in section
+    assert "_capture_element_child(" in section and "common.capture(" not in section
+    assert "Write-K5ElementChildFailure $_ $fixturePhase 'primary'" in ELEMENT_REFERENCE_SCRIPT
+    assert (
+        "Write-K5ElementChildFailure $_ 'reference_cleanup' 'cleanup'" in ELEMENT_REFERENCE_SCRIPT
+    )
+    assert ELEMENT_REFERENCE_SCRIPT.index("'primary'") < ELEMENT_REFERENCE_SCRIPT.index("'cleanup'")
+    assert "if ($failed) { exit 1 }" in ELEMENT_REFERENCE_SCRIPT
+    assert "Write-K5ElementChildFailure $_ 'compile' 'primary'" in ELEMENT_COMPILE_SCRIPT
+
+
+def test_element_fixture_module_load_failure_is_fixed(tmp_path, monkeypatch, capsys):
+    def fail():
+        raise ImportError("PRIVATE_IMPORT_PATH")
+
+    monkeypatch.setitem(
+        test_windows_exact_element_probe_uses_fresh_actual_native_exit.__globals__,
+        "_startup_witness",
+        fail,
+    )
+    with pytest.raises(pytest.fail.Exception, match="Owned native element-probe fixture failed"):
+        test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path)
+    output = capsys.readouterr()
+    assert "PRIVATE" not in output.out + output.err
+    (record,) = _fixture_records(output.out)
+    assert record["phase"] == "module_load" and record["error"] == "unexpected"
+
+
+@pytest.mark.parametrize("primary", [True, False])
+def test_element_capture_emission_failure_cannot_skip_cleanup_or_pass(
+    primary,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import io
+    from types import SimpleNamespace
+
+    common = _startup_witness().common
+    closed = []
+    seen = []
+    real_emit = _element_diagnostic
+
+    class Owned:
+        def __init__(self, *args, **kwargs):
+            self.process = SimpleNamespace(stdout=io.BytesIO(b"K5_NATIVE_COMPILE=passed"))
+
+        def wait(self, _seconds):
+            if primary:
+                raise common.WitnessError("child_failed")
+
+        def close(self):
+            closed.append(True)
+
+    def emit(context, status, error=None, **kwargs):
+        seen.append((status, error.args[0] if error else None, kwargs.get("boundary", "primary")))
+        if status == "failed" or kwargs.get("boundary") == "owned_cleanup":
+            raise ValueError("PRIVATE_PROJECTION_ERROR")
+        return real_emit(context, status, error, **kwargs)
+
+    monkeypatch.setattr(common, "OwnedProcess", Owned)
+    monkeypatch.setitem(_capture_element_child.__globals__, "_element_diagnostic", emit)
+    with pytest.raises(_ElementCaptureFailure):
+        _capture_element_child(
+            common, [], cwd=tmp_path, env={}, context=_element_context("reference")
+        )
+    assert closed == [True]
+    assert ("passed", None, "owned_cleanup") in seen
+    if primary:
+        assert ("failed", "child_failed", "primary") in seen
+    output = capsys.readouterr()
+    assert "PRIVATE" not in output.out + output.err
+
+
+def test_element_top_level_emission_failure_never_exposes_setup_error(
+    tmp_path, monkeypatch, capsys
+):
+    def fail_load():
+        raise ImportError("PRIVATE_SETUP_PATH")
+
+    def fail_emit(*args, **kwargs):
+        raise RuntimeError("PRIVATE_PROJECTION_PATH")
+
+    scope = test_windows_exact_element_probe_uses_fresh_actual_native_exit.__globals__
+    monkeypatch.setitem(scope, "_startup_witness", fail_load)
+    monkeypatch.setitem(scope, "_element_diagnostic", fail_emit)
+    with pytest.raises(pytest.fail.Exception, match="Owned native element-probe fixture failed"):
+        test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path)
+    output = capsys.readouterr()
+    assert "PRIVATE" not in output.out + output.err
+
+
+def test_element_capture_stuck_collector_never_reports_cleanup_success(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import io
+    import threading
+    from types import SimpleNamespace
+
+    common = _startup_witness().common
+    closed = []
+
+    class Reader:
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def join(self, seconds):
+            assert seconds in (5, 15)
+
+        def is_alive(self):
+            return True
+
+    class Owned:
+        def __init__(self, *args, **kwargs):
+            self.process = SimpleNamespace(stdout=io.BytesIO())
+
+        def failure(self, code, *, timed_out):
+            return common.WitnessError(
+                code,
+                common.diagnostic(
+                    "probe_admission",
+                    gate_state="started",
+                    timed_out=timed_out,
+                ),
+            )
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(common, "OwnedProcess", Owned)
+    monkeypatch.setattr(threading, "Thread", Reader)
+    with pytest.raises(_ElementCaptureFailure):
+        _capture_element_child(common, [], cwd=tmp_path, env={}, context=_element_context("probe"))
+    assert closed == [True]
+    records = _fixture_records(capsys.readouterr().out)
+    assert not any(r["boundary"] == "owned_cleanup" and r["status"] == "passed" for r in records)
+    assert [r["error"] for r in records if r["status"] == "failed"] == [
+        "child_timeout",
+        "cleanup_incomplete",
+    ]
