@@ -139,3 +139,24 @@ service-token rejection, bounded process ownership, execution gating, occupied
 ports, output bounds, failed admission and preservation of unrelated work.
 Windows Job behavior, plugin inventory, looping RTSP media, OpenVINO completions
 and visible presentations still require the exact native run.
+
+## Existing Git prerequisite
+
+Candidate run `37164394848` passed all five exact-source hosted gates and the
+initial host admission, then stopped before fixture preparation because Git was
+absent from the runner's inherited `PATH`. Both checkout actions had used their
+REST archive fallback, which cannot satisfy this witness's later `git archive`
+source boundaries. The owned controller cleanup passed; no media launch or
+installed-app acceptance was reached.
+
+Before either checkout, the candidate route now admits only the existing
+`C:\Program Files\Git\cmd\git.exe` under the installation root observed in that
+run. The file must be regular, all ancestors must be existing non-reparse
+directories, and its bounded version check must report Git for Windows 2.18 or
+newer. Exact version and executable SHA-256 are recorded in the job log. Only
+its directory is added to this job's `GITHUB_PATH`. Missing or invalid Git fails
+closed; there is no download, install, alternate-location search, registry edit
+or persistent PATH change. Both resulting local `.git` directories and exact
+HEAD revisions are checked before runtime provisioning. The hosted source gates,
+authentication, installed payload verification and two 225-frame launches stay
+required.

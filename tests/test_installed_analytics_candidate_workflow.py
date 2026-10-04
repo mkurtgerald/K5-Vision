@@ -157,3 +157,63 @@ def test_required_hosted_gates_match_audited_runtime_pr_paths_and_exact_sha():
     assert "$deadline = [DateTime]::UtcNow.AddMinutes(6)" in text
     assert "timeout-minutes: 7" in text
     assert text.index("if (-not $qualified") < text.index("Checkout immutable candidate")
+
+
+def test_existing_git_is_admitted_after_hosted_gate_before_either_checkout():
+    text = WORKFLOW.read_text()
+    admission = text.split("- name: Admit existing Git before immutable checkouts", 1)[1]
+    admission = admission.split("- name: Checkout immutable candidate", 1)[0]
+    assert text.index("if (-not $qualified") < text.index("Admit existing Git")
+    assert text.index("Admit existing Git") < text.index("Checkout immutable candidate")
+    assert text.index("Admit existing Git") < text.index("Checkout immutable Analytics source")
+    assert "timeout-minutes: 1" in admission
+    assert "$git = 'C:\\Program Files\\Git\\cmd\\git.exe'" in admission
+    assert "[IO.File]::GetAttributes($git)" in admission
+    assert "[IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint" in admission
+    assert "while ($null -ne $parent)" in admission
+    assert "-not $parent.Exists" in admission
+    assert "$parent.Attributes -band [IO.FileAttributes]::ReparsePoint" in admission
+    assert "$output = @(& $git --version)" in admission
+    assert "$exitCode -ne 0 -or $output.Count -ne 1" in admission
+    assert r"\.windows\.[0-9]+\z" in admission
+    assert "$version -lt [Version]'2.18.0'" in admission
+    assert "Get-FileHash -LiteralPath $git -Algorithm SHA256" in admission
+    assert 'Write-Host "K5_CHECKOUT_GIT_VERSION=$versionText"' in admission
+    assert 'Write-Host "K5_CHECKOUT_GIT_SHA256=$gitSha256"' in admission
+    path_export = "(Split-Path -Parent $git) | Out-File -FilePath $env:GITHUB_PATH"
+    assert admission.index("$version -lt") < admission.index(path_export)
+    for forbidden in (
+        "Invoke-WebRequest",
+        "Invoke-RestMethod",
+        "SetEnvironmentVariable",
+        "Set-ItemProperty",
+        "Set-ExecutionPolicy",
+        "New-Item",
+        "Remove-Item",
+        "Start-Process",
+    ):
+        assert forbidden not in admission
+
+
+def test_git_backed_exact_revisions_are_required_before_provisioning():
+    text = WORKFLOW.read_text()
+    verification = text.split("- name: Require exact Git-backed source checkouts", 1)[1]
+    verification = verification.split("- name: Provision existing reviewed GStreamer runtime", 1)[0]
+    assert text.index("Checkout immutable Analytics source") < text.index(
+        "Require exact Git-backed"
+    )
+    assert text.index("Require exact Git-backed") < text.index(
+        "Provision existing reviewed GStreamer"
+    )
+    assert "timeout-minutes: 1" in verification
+    assert "Get-Command git -CommandType Application -ErrorAction Stop" in verification
+    assert "-ine 'C:\\Program Files\\Git\\cmd\\git.exe'" in verification
+    assert "$env:GITHUB_WORKSPACE = $env:K5_STAGE_ONE_REVISION" in verification
+    assert "'analytics-lab') = $env:ANALYTICS_LAB_SHA" in verification
+    assert "Join-Path $source '.git'" in verification
+    assert "[IO.File]::GetAttributes($metadata)" in verification
+    assert "[IO.FileAttributes]::Directory" in verification
+    assert "[IO.FileAttributes]::ReparsePoint" in verification
+    assert "@(git -C $source rev-parse HEAD)" in verification
+    assert "$LASTEXITCODE -ne 0 -or $actual.Count -ne 1" in verification
+    assert "$actual[0] -cne $sources[$source]" in verification
