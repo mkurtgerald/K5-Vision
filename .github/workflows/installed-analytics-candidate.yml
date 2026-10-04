@@ -1,0 +1,239 @@
+name: Installed Analytics Candidate Qualification
+
+on:
+  push:
+    branches:
+      - feat/installed-analytics-operator-20261003
+    paths:
+      - .github/workflows/installed-analytics-candidate.yml
+      - scripts/installed_analytics_witness.py
+      - scripts/build_analytics_runtime_wheel.py
+      - scripts/windows-alpha/Invoke-K5InstalledAnalyticsWitness.ps1
+      - src/k5vision/**
+      - pyproject.toml
+      - scripts/windows-alpha/runtime-requirements.txt
+      - tests/test_installed_analytics_witness.py
+      - tests/test_installed_analytics_candidate_workflow.py
+
+# Shares the existing K5 physical lane; never cancel an already running owner.
+# Cross-repository launch coordination and fresh host admission remain required.
+concurrency:
+  group: stage-one-operator-physical
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  installed-analytics-candidate:
+    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/feat/installed-analytics-operator-20261003'
+    runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
+    timeout-minutes: 35
+    env:
+      PYTHONHOME: ""
+      PYTHONPYCACHEPREFIX: ""
+      ANALYTICS_LAB_SHA: c8b347ae538991a0c0ce38eabc2dc17b566531d3
+      K5_STAGE_ONE_REVISION: ${{ github.sha }}
+      K5_ALPHA_DIRECT_RTSP_OUTPUT: artifacts\alpha-direct-rtsp-candidate-baseline.json
+      K5_INSTALLED_ANALYTICS_OUTPUT: artifacts\installed-analytics-candidate.json
+      K5_INSTALLED_WORK_OWNED: ""
+      K5_INSTALLED_EVIDENCE_OWNED: ""
+      K5_INSTALLED_CONTROLLER_OWNED: ""
+
+    steps:
+      - name: Require exact trusted head and green hosted PR qualification
+        timeout-minutes: 7
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+          K5_EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:K5_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "Exact candidate SHA required." }
+          $branch = [uri]::EscapeDataString("feat/installed-analytics-operator-20261003")
+          $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+          # Audited PR318's aggregate diff includes operator_runtime.py, which
+          # triggers Alpha, viewport-editor and Analytics compatibility. CI and
+          # PR dedupe are unfiltered. No native workflow is in this allowlist.
+          $required = @{
+            "355859781" = "CI"
+            "369354936" = "Windows Alpha Script Smoke"
+            "362514400" = "Current Gate Viewport Editor Qualification"
+            "364801702" = "Stage One Analytics Compatibility"
+            "361865932" = "PR Run Dedupe"
+          }
+          $deadline = [DateTime]::UtcNow.AddMinutes(6)
+          $qualified = $false
+          while ([DateTime]::UtcNow -lt $deadline) {
+            $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+            if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch has advanced; no physical work admitted." }
+            $uri = "https://api.github.com/repos/mkurtgerald/K5-Vision/actions/runs?event=pull_request&head_sha=$env:K5_EXPECTED_SHA&per_page=100"
+            $response = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri $uri
+            $qualified = $true
+            foreach ($id in $required.Keys) {
+              $matching = @($response.workflow_runs | Where-Object {
+                [string]$_.workflow_id -ceq $id -and $_.head_sha -ceq $env:K5_EXPECTED_SHA -and
+                $_.event -ceq "pull_request" -and $_.head_branch -ceq "feat/installed-analytics-operator-20261003" -and
+                $_.name -ceq $required[$id]
+              } | Sort-Object -Property id -Descending)
+              if ($matching.Count -eq 0) { $qualified = $false; continue }
+              if (@($matching | Where-Object { $_.status -ceq "completed" -and $_.conclusion -cne "success" }).Count -ne 0) {
+                throw "An exact-candidate hosted qualification failed; native execution refused."
+              }
+              if ($matching[0].status -cne "completed" -or $matching[0].conclusion -cne "success") { $qualified = $false }
+            }
+            if ($qualified) { break }
+            Start-Sleep -Seconds 15
+          }
+          if (-not $qualified -or [DateTime]::UtcNow -ge $deadline) { throw "Exact hosted qualification did not pass within the admission budget." }
+
+      - name: Checkout immutable candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Require idle exact physical host before provisioning
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
+
+      - name: Checkout immutable Analytics source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: mkurtgerald/Analytics-lab
+          ref: ${{ env.ANALYTICS_LAB_SHA }}
+          path: analytics-lab
+          persist-credentials: false
+
+      - name: Provision existing reviewed GStreamer runtime
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+          K5_EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $branch = [uri]::EscapeDataString("feat/installed-analytics-operator-20261003")
+          $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+          $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+          if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; provisioning refused." }
+          .\scripts\provision-stage03-gstreamer.ps1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Create isolated witness controller
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $controller = Join-Path $env:RUNNER_TEMP ("k5-installed-controller-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $controller) { throw "Witness controller path already exists." }
+          New-Item -ItemType Directory -Path $controller -ErrorAction Stop | Out-Null
+          "K5_INSTALLED_CONTROLLER_OWNED=$controller" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          python -m venv $controller
+          if ($LASTEXITCODE -ne 0) { throw "Witness controller environment failed." }
+          $python = Join-Path $controller "Scripts\python.exe"
+          & $python -I -c "import site,sys; assert sys.prefix != sys.base_prefix; assert site.ENABLE_USER_SITE is False"
+          if ($LASTEXITCODE -ne 0) { throw "Witness controller isolation failed." }
+          (Split-Path -Parent $python) | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "VIRTUAL_ENV=$controller" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PIP_REQUIRE_VIRTUALENV=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Prepare existing bounded rights-reviewed fixture
+        shell: powershell
+        env:
+          PYTHONPATH: ${{ github.workspace }}\analytics-lab
+        run: |
+          $ErrorActionPreference = "Stop"
+          $actual = (git -C analytics-lab rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -cne $env:ANALYTICS_LAB_SHA) { throw "Analytics fixture revision mismatch." }
+          $evidence = Join-Path $env:RUNNER_TEMP ("k5-installed-evidence-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $evidence) { throw "Fixture evidence path already exists." }
+          New-Item -ItemType Directory -Path $evidence -ErrorAction Stop | Out-Null
+          "K5_INSTALLED_EVIDENCE_OWNED=$evidence" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          python -B -m analytics_lab.validation_seed --output-dir $evidence
+          if ($LASTEXITCODE -ne 0) { throw "Pinned fixture preparation failed." }
+          "K5_ANALYTICS_EVIDENCE_ROOT=$evidence" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Preserve installed Alpha baseline and pinned MediaMTX provisioning
+        timeout-minutes: 10
+        shell: powershell
+        run: .\scripts\windows-alpha\Invoke-K5VisionAlphaWitness.ps1 -Output $env:K5_ALPHA_DIRECT_RTSP_OUTPUT
+
+      - name: Recheck fresh exact candidate before installed media acceptance
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+          K5_EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $branch = [uri]::EscapeDataString("feat/installed-analytics-operator-20261003")
+          $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+          $head = Invoke-RestMethod -Method Get -Headers $headers -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+          if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; installed media acceptance refused." }
+
+      - name: Recheck idle host before installed normal-app witness
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
+
+      - name: Prove installed normal-app analytics and repeated presentation
+        id: installed_witness
+        timeout-minutes: 15
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $work = Join-Path $env:RUNNER_TEMP ("k5-installed-work-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $work) { throw "Installed witness work path already exists." }
+          New-Item -ItemType Directory -Path $work -ErrorAction Stop | Out-Null
+          "K5_INSTALLED_WORK_OWNED=$work" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          .\scripts\windows-alpha\Invoke-K5InstalledAnalyticsWitness.ps1 -Output $env:K5_INSTALLED_ANALYTICS_OUTPUT -Revision $env:K5_STAGE_ONE_REVISION -AnalyticsSource "$env:GITHUB_WORKSPACE\analytics-lab" -WorkRoot $work
+
+      - name: Verify owned media cleanup
+        if: always() && (steps.installed_witness.outcome == 'success' || steps.installed_witness.outcome == 'failure' || steps.installed_witness.outcome == 'cancelled')
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
+
+      - name: Validate exact source-free installed receipt
+        id: safe_evidence
+        if: steps.installed_witness.outcome == 'success'
+        timeout-minutes: 1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -I -B scripts\installed_analytics_witness.py --validate-receipt --output $env:K5_INSTALLED_ANALYTICS_OUTPUT --revision $env:K5_STAGE_ONE_REVISION
+          if ($LASTEXITCODE -ne 0) { throw "Installed receipt violated exact source-free contract." }
+
+      - name: Remove only this job's disposable fixture and controller
+        if: always()
+        timeout-minutes: 1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cleanupComplete = $true
+          $prefixes = @{ K5_INSTALLED_WORK_OWNED = "k5-installed-work-"; K5_INSTALLED_EVIDENCE_OWNED = "k5-installed-evidence-"; K5_INSTALLED_CONTROLLER_OWNED = "k5-installed-controller-" }
+          foreach ($name in @("K5_INSTALLED_WORK_OWNED", "K5_INSTALLED_EVIDENCE_OWNED", "K5_INSTALLED_CONTROLLER_OWNED")) {
+            $owned = [Environment]::GetEnvironmentVariable($name, "Process")
+            if ([string]::IsNullOrWhiteSpace($owned)) { continue }
+            try {
+              $expected = Join-Path $env:RUNNER_TEMP ($prefixes[$name] + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+              if ([IO.Path]::GetFullPath($owned) -cne [IO.Path]::GetFullPath($expected)) { throw "ownership" }
+              if (Test-Path -LiteralPath $owned) { Remove-Item -LiteralPath $owned -Recurse -Force -ErrorAction Stop }
+              if (Test-Path -LiteralPath $owned) { throw "cleanup" }
+            } catch { $cleanupComplete = $false }
+          }
+          if (-not $cleanupComplete) { throw "Owned installed-witness fixture cleanup was incomplete." }
+
+      - name: Upload only validated installed normal-app receipt
+        if: success() && steps.safe_evidence.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: installed-analytics-candidate-witness
+          path: artifacts/installed-analytics-candidate.json
+          if-no-files-found: error
+          retention-days: 14
