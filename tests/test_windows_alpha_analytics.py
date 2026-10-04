@@ -949,3 +949,633 @@ def test_windows_start_error_projection_checks_real_file_line_and_operation(tmp_
         pass
     if not valid:
         pytest.fail("Checked Start source line projection fixture failed", pytrace=False)
+
+
+ERROR_SHAPE_PREFIX = b"K5_ALPHA_ERROR_SHAPE="
+ERROR_SHAPE_BOOL_FIELDS = {
+    "present",
+    "invocation_present",
+    "script_name_present",
+    "script_name_matches",
+    "command_path_present",
+    "command_path_matches",
+    "line_in_start",
+    "runtime_exception",
+    "parent_exception",
+    "action_stop",
+    "method_exception",
+    "native_remote",
+    "nested_record",
+    "inner_exception",
+}
+ERROR_SHAPE_IDS = {
+    "absent",
+    "other",
+    "known_throw",
+    "variable_undefined",
+    "property_missing",
+    "null_method",
+    "method_missing",
+    "native_stderr",
+    "path_missing",
+    "command_missing",
+    "parameter_binding",
+    "element_missing",
+}
+ERROR_BOUNDARY_CASES = {
+    "direct_known": 'throw "Pinned MediaMTX executable failed its version probe."',
+    "nested_known": (
+        "function Invoke-K5FixtureFault { "
+        'throw "Pinned MediaMTX executable failed its version probe." }\nInvoke-K5FixtureFault'
+    ),
+    "nested_rethrow": (
+        "function Invoke-K5FixtureFault { try { "
+        'throw "Pinned MediaMTX executable failed its version probe." } '
+        "catch { throw } }\nInvoke-K5FixtureFault"
+    ),
+    "missing_variable": (
+        "function Invoke-K5FixtureFault { $null = $K5FixtureUndefinedVariable }\n"
+        "Invoke-K5FixtureFault"
+    ),
+    "missing_property": (
+        "function Invoke-K5FixtureFault { "
+        "$null = ([pscustomobject]@{}).K5FixtureAbsentProperty }\nInvoke-K5FixtureFault"
+    ),
+    "null_method": (
+        "function Invoke-K5FixtureFault { $value = $null; $null = $value.ToString() }\n"
+        "Invoke-K5FixtureFault"
+    ),
+    "missing_owned_file": (
+        "function Invoke-K5FixtureFault { "
+        'Get-Content -LiteralPath (Join-Path $PSScriptRoot "fixture-absent") }\n'
+        "Invoke-K5FixtureFault"
+    ),
+    "native_stderr": (
+        "$null = @(& $python -I -B -c "
+        "\"import sys;sys.stderr.write('PRIVATE_NATIVE_SENTINEL')\" 2>&1)"
+    ),
+    "native_all_streams": (
+        "function Invoke-K5FixtureElement([string]$Name) {\n"
+        "    & $gstInspect $Name *> $null\n"
+        "    return $LASTEXITCODE -eq 0\n"
+        "}\n"
+        "$gstInspect = $python\n"
+        'if (-not (Invoke-K5FixtureElement (Join-Path $PSScriptRoot "fixture-stderr.py"))) {\n'
+        '    throw "Reviewed GStreamer runtime is missing required synthetic test element: '
+        'videotestsrc"\n'
+        "}"
+    ),
+    "foreign_known": '& (Join-Path $PSScriptRoot "foreign.ps1")',
+}
+ERROR_BOUNDARY_EXPECTED_IDS = {
+    "direct_known": "known_throw",
+    "nested_known": "known_throw",
+    "nested_rethrow": "known_throw",
+    "missing_variable": "variable_undefined",
+    "missing_property": "property_missing",
+    "null_method": "null_method",
+    "missing_owned_file": "path_missing",
+    "native_stderr": "native_stderr",
+    "native_all_streams": "element_missing",
+    "foreign_known": "known_throw",
+}
+
+# Test-only, observational insertion after the original catch saves $fatal. All
+# original envelope bytes remain in order and the production projection runs next.
+# Inspect only typed ErrorRecord / Exception edges, never stringify a graph node.
+ERROR_SHAPE_OBSERVER = r"""
+    function Write-K5FixtureErrorShape {
+        param([System.Management.Automation.ErrorRecord]$Root)
+        $shape = [ordered]@{
+            schema_version = 'alpha-error-boundary-shape-v1'
+            observer_valid = $false
+            records = 0
+            nodes = 0
+            cycle = $false
+            truncated = $false
+            source_read_ok = $false
+            source_anchors_ok = $false
+        }
+        $fields = @('present','invocation_present','script_name_present','script_name_matches',
+                    'command_path_present','command_path_matches','line_in_start',
+                    'runtime_exception','parent_exception','action_stop','method_exception',
+                    'native_remote','nested_record','inner_exception')
+        for ($slot = 0; $slot -lt 4; $slot++) {
+            foreach ($field in $fields) { $shape["record_${slot}_${field}"] = $false }
+            $shape["record_${slot}_error_id"] = 'absent'
+        }
+        try {
+            $startPath = [IO.Path]::GetFullPath($Start)
+            $sourceLineCount = 0
+            try {
+                $stream = [IO.File]::OpenRead($startPath)
+                try {
+                    if ($stream.Length -gt 65536) { throw 'fixture_source_invalid' }
+                    $bytes = New-Object byte[] 65537
+                    $count = 0
+                    while ($count -lt $bytes.Length) {
+                        $read = $stream.Read($bytes, $count, $bytes.Length - $count)
+                        if ($read -eq 0) { break }
+                        $count += $read
+                    }
+                    if ($count -gt 65536) { throw 'fixture_source_invalid' }
+                } finally { $stream.Dispose() }
+                $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+                $lines = $utf8.GetString($bytes, 0, $count).Replace("`r`n", "`n").Split("`n")
+                if ($lines.Count -gt 4096) { throw 'fixture_source_invalid' }
+                $shape.source_read_ok = $true
+                $sourceLineCount = $lines.Count
+                $anchors = ConvertFrom-Json '__ANCHOR_JSON__'
+                $previous = 0
+                foreach ($anchor in $anchors) {
+                    $positions = @(for ($line = 0; $line -lt $lines.Count; $line++) {
+                        if ($lines[$line].Trim() -ceq $anchor[0]) { $line + 1 }
+                    })
+                    if ($positions.Count -ne 1 -or $positions[0] -le $previous) {
+                        throw 'fixture_source_invalid'
+                    }
+                    $previous = $positions[0]
+                }
+                $shape.source_anchors_ok = $true
+            } catch { $shape.source_anchors_ok = $false }
+            $queue = [Collections.Generic.Queue[object]]::new()
+            $seen = [Collections.Generic.List[object]]::new()
+            $queue.Enqueue([pscustomobject]@{ Value = $Root; Depth = 0 })
+            while ($queue.Count -gt 0 -and $shape.nodes -lt 8) {
+                $entry = $queue.Dequeue()
+                $node = $entry.Value
+                $revisited = $false
+                foreach ($prior in $seen) {
+                    if ([object]::ReferenceEquals($node, $prior)) { $revisited = $true; break }
+                }
+                if ($revisited) { $shape.cycle = $true; continue }
+                if ($entry.Depth -gt 4) { $shape.truncated = $true; continue }
+                $seen.Add($node)
+                $shape.nodes++
+                if ($node -is [System.Management.Automation.ErrorRecord]) {
+                    if ($shape.records -ge 4) { $shape.truncated = $true; continue }
+                    $slot = $shape.records
+                    $shape.records++
+                    $shape["record_${slot}_present"] = $true
+                    $shape["record_${slot}_error_id"] = 'other'
+                    $id = $node.FullyQualifiedErrorId
+                    if ($null -ne $id -and $id.Length -le 512) {
+                        $token = $id.Split(',')[0]
+                        $elementId = 'Reviewed GStreamer runtime is missing required '
+                        $elementId += 'synthetic test element: videotestsrc'
+                        switch -CaseSensitive ($token) {
+                            'Pinned MediaMTX executable failed its version probe.' {
+                                $shape["record_${slot}_error_id"] = 'known_throw'
+                            }
+                            { $_ -ceq $elementId } {
+                                $shape["record_${slot}_error_id"] = 'element_missing'
+                            }
+                            'VariableIsUndefined' {
+                                $shape["record_${slot}_error_id"] = 'variable_undefined'
+                            }
+                            'PropertyNotFoundStrict' {
+                                $shape["record_${slot}_error_id"] = 'property_missing'
+                            }
+                            'InvokeMethodOnNull' {
+                                $shape["record_${slot}_error_id"] = 'null_method'
+                            }
+                            'MethodNotFound' {
+                                $shape["record_${slot}_error_id"] = 'method_missing'
+                            }
+                            'NativeCommandError' {
+                                $shape["record_${slot}_error_id"] = 'native_stderr'
+                            }
+                            'NativeCommandErrorMessage' {
+                                $shape["record_${slot}_error_id"] = 'native_stderr'
+                            }
+                            'PathNotFound' {
+                                $shape["record_${slot}_error_id"] = 'path_missing'
+                            }
+                            'CommandNotFoundException' {
+                                $shape["record_${slot}_error_id"] = 'command_missing'
+                            }
+                            'NamedParameterNotFound' {
+                                $shape["record_${slot}_error_id"] = 'parameter_binding'
+                            }
+                        }
+                    }
+                    $info = $node.InvocationInfo
+                    $shape["record_${slot}_invocation_present"] = $null -ne $info
+                    if ($null -ne $info) {
+                        $name = $info.ScriptName
+                        $shape["record_${slot}_script_name_present"] =
+                            -not [string]::IsNullOrEmpty($name)
+                        if (-not [string]::IsNullOrEmpty($name)) {
+                            $shape["record_${slot}_script_name_matches"] = [string]::Equals(
+                                [IO.Path]::GetFullPath($name), $startPath,
+                                [StringComparison]::OrdinalIgnoreCase)
+                        }
+                        $property = $info.PSObject.Properties['PSCommandPath']
+                        if ($null -ne $property) {
+                            $path = $property.Value
+                            $shape["record_${slot}_command_path_present"] =
+                                -not [string]::IsNullOrEmpty($path)
+                            if (-not [string]::IsNullOrEmpty($path)) {
+                                $shape["record_${slot}_command_path_matches"] = [string]::Equals(
+                                    [IO.Path]::GetFullPath($path), $startPath,
+                                    [StringComparison]::OrdinalIgnoreCase)
+                            }
+                        }
+                        $shape["record_${slot}_line_in_start"] =
+                            $shape["record_${slot}_script_name_matches"] -and
+                            $info.ScriptLineNumber -ge 1 -and
+                            $info.ScriptLineNumber -le $sourceLineCount
+                    }
+                    $exception = $node.Exception
+                    $shape["record_${slot}_runtime_exception"] =
+                        $exception -is [System.Management.Automation.RuntimeException]
+                    $shape["record_${slot}_parent_exception"] =
+                        $exception -is
+                            [System.Management.Automation.ParentContainsErrorRecordException]
+                    $shape["record_${slot}_action_stop"] =
+                        $exception -is [System.Management.Automation.ActionPreferenceStopException]
+                    $shape["record_${slot}_method_exception"] =
+                        $exception -is [System.Management.Automation.MethodException] -or
+                        $exception -is [System.Management.Automation.MethodInvocationException]
+                    $shape["record_${slot}_native_remote"] =
+                        $exception -is [System.Management.Automation.RemoteException]
+                    $shape["record_${slot}_inner_exception"] = $null -ne $exception.InnerException
+                    if ($exception -is [System.Management.Automation.RuntimeException]) {
+                        $shape["record_${slot}_nested_record"] =
+                            $exception.ErrorRecord -is [System.Management.Automation.ErrorRecord]
+                    }
+                    $queue.Enqueue([pscustomobject]@{
+                        Value = $exception; Depth = $entry.Depth + 1
+                    })
+                } elseif ($node -is [Exception]) {
+                    if ($node -is [System.Management.Automation.RuntimeException] -and
+                        $node.ErrorRecord -is [System.Management.Automation.ErrorRecord]) {
+                        $queue.Enqueue([pscustomobject]@{
+                            Value = $node.ErrorRecord; Depth = $entry.Depth + 1
+                        })
+                    }
+                    if ($null -ne $node.InnerException) {
+                        $queue.Enqueue([pscustomobject]@{
+                            Value = $node.InnerException; Depth = $entry.Depth + 1
+                        })
+                    }
+                } else { throw 'fixture_invalid' }
+            }
+            if ($queue.Count -gt 0) { $shape.truncated = $true }
+            $shape.observer_valid = $true
+        } catch { $shape.observer_valid = $false }
+        Write-Output ('K5_ALPHA_ERROR_SHAPE=' + ($shape | ConvertTo-Json -Compress))
+    }
+    Write-K5FixtureErrorShape -Root $fatal
+"""
+
+
+def _error_shape_observer(anchors) -> str:
+    return ERROR_SHAPE_OBSERVER.replace("__ANCHOR_JSON__", json.dumps(anchors).replace("'", "''"))
+
+
+def _observed_envelope(envelope: str, anchors) -> str:
+    marker = "    $fatal = $_\n"
+    if envelope.count(marker) != 1:
+        raise ValueError("Invalid fixture envelope")
+    insertion = _error_shape_observer(anchors)
+    observed = envelope.replace(marker, marker + insertion, 1)
+    if observed.replace(insertion, "", 1) != envelope:
+        raise ValueError("Invalid fixture envelope")
+    return observed
+
+
+def _validate_error_shape(value: object) -> None:
+    fields = {
+        f"record_{slot}_{field}"
+        for slot in range(4)
+        for field in ERROR_SHAPE_BOOL_FIELDS | {"error_id"}
+    }
+    if type(value) is not dict or value.keys() != fields | {
+        "schema_version",
+        "observer_valid",
+        "records",
+        "nodes",
+        "cycle",
+        "truncated",
+        "source_read_ok",
+        "source_anchors_ok",
+    }:
+        raise ValueError("Invalid error shape")
+    if (
+        type(value["schema_version"]) is not str
+        or value["schema_version"] != "alpha-error-boundary-shape-v1"
+    ):
+        raise ValueError("Invalid error shape")
+    for field, maximum in (("records", 4), ("nodes", 8)):
+        if type(value[field]) is not int or not 0 <= value[field] <= maximum:
+            raise ValueError("Invalid error shape")
+    for field in ("observer_valid", "cycle", "truncated", "source_read_ok", "source_anchors_ok"):
+        if type(value[field]) is not bool:
+            raise ValueError("Invalid error shape")
+    for slot in range(4):
+        for field in ERROR_SHAPE_BOOL_FIELDS:
+            if type(value[f"record_{slot}_{field}"]) is not bool:
+                raise ValueError("Invalid error shape")
+        identity = value[f"record_{slot}_error_id"]
+        if type(identity) is not str or identity not in ERROR_SHAPE_IDS:
+            raise ValueError("Invalid error shape")
+        if value[f"record_{slot}_present"] != (slot < value["records"]):
+            raise ValueError("Invalid error shape")
+        if slot >= value["records"] and (
+            identity != "absent"
+            or any(value[f"record_{slot}_{field}"] for field in ERROR_SHAPE_BOOL_FIELDS)
+        ):
+            raise ValueError("Invalid error shape")
+
+
+def _parse_error_boundary_output(module, result, *, observed):
+    if result.returncode != 24 or result.stderr or len(result.stdout) > 12_288:
+        raise ValueError("Invalid error boundary output")
+    projections, shapes = [], []
+    admitted = failed = 0
+    for line in result.stdout.splitlines():
+        if line.startswith(module.START_ERROR_PREFIX):
+            projections.append(module.parse_start_error(line[len(module.START_ERROR_PREFIX) :]))
+        elif line.startswith(ERROR_SHAPE_PREFIX):
+            raw = line[len(ERROR_SHAPE_PREFIX) :]
+            if len(raw) > 8192:
+                raise ValueError("Invalid error shape")
+            pairs = json.loads(raw, object_pairs_hook=list)
+            if type(pairs) is not list or any(
+                type(pair) is not tuple or len(pair) != 2 for pair in pairs
+            ):
+                raise ValueError("Invalid error shape")
+            shape = dict(pairs)
+            if len(shape) != len(pairs):
+                raise ValueError("Invalid error shape")
+            _validate_error_shape(shape)
+            shapes.append(shape)
+        elif line == b"K5 analytics configuration admitted; live provider acceptance is pending.":
+            admitted += 1
+        elif line == b"K5_ALPHA_START_FAILED":
+            failed += 1
+        else:
+            raise ValueError("Invalid error boundary output")
+    if admitted != 1 or failed != 1 or len(projections) != 1 or len(shapes) != int(observed):
+        raise ValueError("Invalid error boundary output")
+    return projections[0], shapes[0] if shapes else None
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="Requires hosted Windows ErrorRecord propagation"
+)
+def test_windows_post_admission_error_boundary_preserves_useful_projection(tmp_path: Path):
+    import os
+
+    module = _startup_witness()
+    completed = False
+    regressions = []
+    try:
+        installed = tmp_path / "installed"
+        venv = installed / ".venv"
+        subprocess.run(
+            [sys._base_executable, "-I", "-B", "-m", "venv", "--without-pip", str(venv)],
+            capture_output=True,
+            timeout=60,
+            check=True,
+        )
+        package = venv / "Lib/site-packages/k5vision"
+        package.mkdir()
+        (package / "__init__.py").write_bytes(b"")
+        (package / "cli.py").write_text(
+            "import sys\nassert sys.flags.isolated and sys.flags.dont_write_bytecode\n"
+            'assert sys.argv[1:] == ["analytics-preflight"]\n'
+            'print(\'{"schema_version":"1","analytics_enabled":true,"status":"ready"}\')\n',
+            encoding="ascii",
+            newline="\n",
+        )
+        sessions = tmp_path / "temporary"
+        sessions.mkdir()
+        target = installed / "Start-K5VisionAlpha.ps1"
+        source = START.read_text()
+        marker = "if ($AnalyticsPreflightOnly) { return }\n"
+        if source.count(marker) != 1:
+            raise ValueError("Invalid fixture source")
+        (installed / "foreign.ps1").write_text(
+            'throw "Pinned MediaMTX executable failed its version probe."\n', encoding="ascii"
+        )
+        (installed / "fixture-stderr.py").write_text(
+            "import sys\nsys.stderr.write('PRIVATE_ALL_STREAMS_SENTINEL')\nsys.exit(1)\n",
+            encoding="ascii",
+            newline="\n",
+        )
+        control = tmp_path / "control.ps1"
+        control.write_bytes(module.ENVELOPE.encode("ascii"))
+        observer = tmp_path / "observer.ps1"
+        observer.write_bytes(
+            _observed_envelope(module.ENVELOPE, module.START_OPERATION_ANCHORS).encode("ascii")
+        )
+        if control.read_bytes() != module.ENVELOPE.encode("ascii"):
+            raise ValueError("Invalid fixture envelope")
+        environment = {**os.environ, "TEMP": str(sessions), "TMP": str(sessions)}
+        for case, fault in ERROR_BOUNDARY_CASES.items():
+            injection = fault + '\nthrow "fixture_fault_did_not_terminate"\n'
+            fixture = source.replace(marker, marker + injection, 1)
+            if fixture.replace(injection, "", 1) != source or len(fixture.splitlines()) > 4096:
+                raise ValueError("Invalid fixture source")
+            target.write_text(fixture, encoding="ascii", newline="\n")
+            outcomes = []
+            for envelope, observed in ((control, False), (observer, True)):
+                result = subprocess.run(
+                    [
+                        "powershell.exe",
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-File",
+                        str(envelope),
+                        "-Start",
+                        str(target),
+                        "-Port",
+                        "8011",
+                    ],
+                    capture_output=True,
+                    timeout=20,
+                    check=False,
+                    env=environment,
+                )
+                outcomes.append(_parse_error_boundary_output(module, result, observed=observed))
+            projection, _ = outcomes[0]
+            observed_projection, shape = outcomes[1]
+            if (
+                projection != observed_projection
+                or not shape["observer_valid"]
+                or shape["truncated"]
+                or shape["records"] == 0
+            ):
+                raise ValueError("Observer changed projection or failed")
+            if target.read_bytes() != fixture.encode("ascii"):
+                raise ValueError("Fixture identity changed")
+            if any(sessions.glob("K5VisionAlpha-*")):
+                raise ValueError("Fixture crossed session boundary")
+            # Emit only validated scalar records; no raw process output is shown.
+            print("K5_ALPHA_ERROR_CASE=" + case)
+            print(
+                module.START_ERROR_PREFIX.decode() + json.dumps(projection, separators=(",", ":"))
+            )
+            print(ERROR_SHAPE_PREFIX.decode() + json.dumps(shape, separators=(",", ":")))
+            expected_ids = {ERROR_BOUNDARY_EXPECTED_IDS[case]}
+            if case == "native_all_streams":
+                # Windows PowerShell may stop on redirected stderr before the
+                # exact helper returns; otherwise exit 1 must become element refusal.
+                expected_ids.add("native_stderr")
+            if not expected_ids.intersection(
+                {shape[f"record_{slot}_error_id"] for slot in range(4)}
+            ):
+                raise ValueError("Unexpected error boundary shape")
+            recoverable = any(shape[f"record_{slot}_line_in_start"] for slot in range(4))
+            if case == "foreign_known":
+                if projection["origin"] != "unknown":
+                    regressions.append(case)
+            elif (
+                not recoverable
+                or projection["origin"] != "start"
+                or projection["operation"] == "unknown"
+                or projection["error_class"] == "unknown"
+            ):
+                regressions.append(case)
+        completed = True
+    except Exception:
+        pass  # Never include raw exception, source, child output or arguments.
+    if not completed:
+        pytest.fail("Post-admission ErrorRecord boundary fixture failed", pytrace=False)
+    if regressions:
+        print("K5_ALPHA_ERROR_PROJECTION_MISSES=" + str(len(regressions)))
+        pytest.fail(
+            "Post-admission ErrorRecord projection lost useful classification", pytrace=False
+        )
+
+
+def test_error_boundary_observer_preserves_all_original_envelope_bytes():
+    module = _startup_witness()
+    observed = _observed_envelope(module.ENVELOPE, module.START_OPERATION_ANCHORS)
+    assert (
+        observed.replace(_error_shape_observer(module.START_OPERATION_ANCHORS), "", 1)
+        == module.ENVELOPE
+    )
+    assert observed.count("& $Start -Port $Port -ExitAfterPublicTest") == 1
+    assert observed.count("    $fatal = $_\n") == 1
+    assert (
+        "ReferenceEquals" in ERROR_SHAPE_OBSERVER and "$shape.nodes -lt 8" in ERROR_SHAPE_OBSERVER
+    )
+    assert "$entry.Depth -gt 4" in ERROR_SHAPE_OBSERVER
+    assert "$shape.records -ge 4" in ERROR_SHAPE_OBSERVER
+    assert "Format-List" not in ERROR_SHAPE_OBSERVER and "ToString()" not in ERROR_SHAPE_OBSERVER
+    test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
+
+
+def test_error_boundary_shape_rejects_raw_duplicate_unbounded_or_coerced_values():
+    value = {
+        "schema_version": "alpha-error-boundary-shape-v1",
+        "observer_valid": True,
+        "records": 0,
+        "nodes": 0,
+        "cycle": False,
+        "truncated": False,
+        "source_read_ok": False,
+        "source_anchors_ok": False,
+        **{
+            f"record_{slot}_{field}": False
+            for slot in range(4)
+            for field in ERROR_SHAPE_BOOL_FIELDS
+        },
+        **{f"record_{slot}_error_id": "absent" for slot in range(4)},
+    }
+    _validate_error_shape(value)
+    for change in (
+        {"private": "path"},
+        {"nodes": True},
+        {"nodes": 9},
+        {"records": 5},
+        {"record_0_error_id": "PRIVATE_NATIVE_SENTINEL"},
+        {"record_0_invocation_present": 1},
+        {"record_0_error_id": []},
+        {"record_0_script_name_matches": True},
+        {"schema_version": []},
+    ):
+        with pytest.raises(ValueError):
+            _validate_error_shape({**value, **change})
+
+
+def test_error_boundary_parser_rejects_raw_repeated_or_malformed_output():
+    from types import SimpleNamespace
+
+    module = _startup_witness()
+    shape = {
+        "schema_version": "alpha-error-boundary-shape-v1",
+        "observer_valid": True,
+        "records": 0,
+        "nodes": 0,
+        "cycle": False,
+        "truncated": False,
+        "source_read_ok": False,
+        "source_anchors_ok": False,
+        **{
+            f"record_{slot}_{field}": False
+            for slot in range(4)
+            for field in ERROR_SHAPE_BOOL_FIELDS
+        },
+        **{f"record_{slot}_error_id": "absent" for slot in range(4)},
+    }
+    projection = {
+        "schema_version": "alpha-start-error-v1",
+        "phase": "primary",
+        "origin": "unknown",
+        "source_line": None,
+        "operation": "unknown",
+        "error_class": "unknown",
+        "failure": "unknown",
+    }
+    admitted = b"K5 analytics configuration admitted; live provider acceptance is pending.\n"
+    error = module.START_ERROR_PREFIX + json.dumps(projection).encode() + b"\n"
+    metadata = ERROR_SHAPE_PREFIX + json.dumps(shape).encode() + b"\n"
+    failed = b"K5_ALPHA_START_FAILED\n"
+    raw = admitted + error + metadata + failed
+    assert _parse_error_boundary_output(
+        module, SimpleNamespace(returncode=24, stdout=raw, stderr=b""), observed=True
+    ) == (projection, shape)
+    duplicate_key = metadata.rstrip()[:-1] + b',"records":0}\n'
+    bad_values = [
+        (raw, b"PRIVATE_STDERR", 24),
+        (raw, b"", 0),
+        (raw + b"PRIVATE_STDOUT\n", b"", 24),
+        (raw + error, b"", 24),
+        (raw + metadata, b"", 24),
+        (raw + admitted, b"", 24),
+        (raw.replace(admitted, b""), b"", 24),
+        (raw.replace(metadata, duplicate_key), b"", 24),
+        (raw.replace(metadata, ERROR_SHAPE_PREFIX + b"[]\n"), b"", 24),
+        (b"x" * 12_289, b"", 24),
+    ]
+    for stdout, stderr, code in bad_values:
+        with pytest.raises((ValueError, TypeError)):
+            _parse_error_boundary_output(
+                module,
+                SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr),
+                observed=True,
+            )
+    with pytest.raises(ValueError):
+        _parse_error_boundary_output(
+            module, SimpleNamespace(returncode=24, stdout=raw, stderr=b""), observed=False
+        )
+
+
+def test_all_streams_fixture_keeps_exact_gstreamer_probe_body():
+    source = START.read_text()
+    signature = "function Test-K5GStreamerElement([string]$Name) {\n"
+    assert source.count(signature) == 1
+    body = source.split(signature, 1)[1].split("\n}", 1)[0]
+    assert body == "    & $gstInspect $Name *> $null\n    return $LASTEXITCODE -eq 0"
+    fixture = ERROR_BOUNDARY_CASES["native_all_streams"]
+    assert body in fixture
+    assert signature not in fixture  # Existing source anchor remains unique.
+    assert (
+        'throw "Reviewed GStreamer runtime is missing required synthetic test element: ' in fixture
+    )
+    assert ERROR_BOUNDARY_EXPECTED_IDS["native_all_streams"] == "element_missing"
