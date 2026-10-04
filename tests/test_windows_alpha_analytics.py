@@ -2995,8 +2995,6 @@ def _capture_element_child(common, arguments, *, cwd, env, context):
                     RUN_FACADE_MANAGEMENT_PREFIX.decode()
                     + json.dumps(binding, separators=(",", ":"))
                 )
-            for inner in _test_native_inner_records(complete):
-                print(TEST_NATIVE_INNER_PREFIX.decode() + json.dumps(inner, separators=(",", ":")))
             for checkpoint in checkpoints:
                 print(ELEMENT_CHECKPOINT_PREFIX.decode() + checkpoint)
             for argument in arguments:
@@ -6570,7 +6568,7 @@ TEST_STATUS_BLOCKS = {
     "gst_version": (
         "$output = @(& $gstLaunch --version 2>$null)\n"
         "$gstLaunchSucceeded = $?\n"
-        'if (-not $gstLaunchSucceeded -or -not (($output -join "\`n").Contains("GStreamer $gstreamerVersion"))) {\n'
+        'if (-not $gstLaunchSucceeded -or -not (($output -join "`n").Contains("GStreamer $gstreamerVersion"))) {\n'
         '    throw "Reviewed GStreamer runtime version verification failed."\n'
         "}"
     ),
