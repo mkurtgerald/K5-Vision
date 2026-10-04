@@ -134,6 +134,7 @@ OPERATIONS = {
     "build_analytics_wheel",
     "rebuild_analytics_wheel",
     "install_dependencies",
+    "download_dependencies",
     "install_local_wheels",
     "check_dependencies",
     "probe_before",
@@ -524,6 +525,50 @@ def validate_receipt(
             )
 
 
+class JobAccountingInformation(ctypes.Structure):
+    """Win32 JOBOBJECT_BASIC_ACCOUNTING_INFORMATION (fixed-width ABI)."""
+
+    _fields_ = [
+        ("total_user_time", ctypes.c_int64),
+        ("total_kernel_time", ctypes.c_int64),
+        ("period_user_time", ctypes.c_int64),
+        ("period_kernel_time", ctypes.c_int64),
+        ("total_page_faults", ctypes.c_uint32),
+        ("total_processes", ctypes.c_uint32),
+        ("active_processes", ctypes.c_uint32),
+        ("total_terminated_processes", ctypes.c_uint32),
+    ]
+
+
+GATE_RUNTIME_KEYS = {"K5_WITNESS_BASE_PYTHON", "K5_WITNESS_BASE_PYTHON_SHA256"}
+
+
+def admitted_gate_python(environment: dict[str, str]) -> Path:
+    """Bind the relay to the caller's independently admitted base runtime.
+
+    A Windows venv python.exe is a redirector. Starting it before Job assignment
+    can leave its real interpreter outside the Job. Never use that redirector,
+    a PATH lookup, or an unverified _base_executable for the gated relay.
+    """
+    path = environment.get("K5_WITNESS_BASE_PYTHON")
+    identity = environment.get("K5_WITNESS_BASE_PYTHON_SHA256")
+    require(type(path) is str and bool(path), "admission_failed")
+    require(
+        type(identity) is str and re.fullmatch(r"[0-9a-f]{64}", identity) is not None,
+        "admission_failed",
+    )
+    admitted = local_path(Path(path))
+    actual = getattr(sys, "_base_executable", None)
+    require(type(actual) is str and bool(actual), "admission_failed")
+    require(
+        admitted == local_path(Path(actual))
+        and admitted == local_path(Path(sys.base_prefix) / "python.exe")
+        and file_hash(admitted) == identity,
+        "identity_mismatch",
+    )
+    return admitted
+
+
 class WindowsJob:
     """A new kill-on-close Job containing only processes launched by this witness.
 
@@ -592,24 +637,25 @@ class WindowsJob:
             "cleanup_incomplete",
         )
 
+    def accounting(self) -> JobAccountingInformation:
+        counters = JobAccountingInformation()
+        require(
+            bool(
+                self.api.QueryInformationJobObject(
+                    self.handle, 1, ctypes.byref(counters), ctypes.sizeof(counters), None
+                )
+            ),
+            "cleanup_incomplete",
+        )
+        return counters
+
     def close(self) -> None:
-        # Basic accounting has four LARGE_INTEGER values followed by four DWORDs;
-        # ActiveProcesses is the third DWORD. Wait for descendants, not just root.
-        counters = (ctypes.c_uint64 * 6)()
+        # Wait for owned descendants, not just the root process.
         deadline = time.monotonic() + 5
         try:
             require(bool(self.api.TerminateJobObject(self.handle, 1)), "cleanup_incomplete")
             while time.monotonic() < deadline:
-                require(
-                    bool(
-                        self.api.QueryInformationJobObject(
-                            self.handle, 1, ctypes.byref(counters), ctypes.sizeof(counters), None
-                        )
-                    ),
-                    "cleanup_incomplete",
-                )
-                active = ctypes.cast(ctypes.byref(counters, 40), ctypes.POINTER(ctypes.c_uint32))[0]
-                if active == 0:
+                if self.accounting().active_processes == 0:
                     return
                 time.sleep(0.05)
             raise WitnessError("cleanup_incomplete")
@@ -626,21 +672,35 @@ class OwnedProcess:
         env: dict[str, str],
         operation: str,
         stdout: object = subprocess.DEVNULL,
+        job_factory=None,
     ) -> None:
         require(operation in OPERATIONS, "admission_failed")
         self.operation = operation
         self.stderr_summary = None
         self.gated = os.name == "nt"
+        require(job_factory is None or self.gated and callable(job_factory), "admission_failed")
         self.gate_nonce = secrets.token_hex(16) if self.gated else ""
         self.job = None
         self.process: subprocess.Popen[bytes] | None = None
         try:
-            self.job = WindowsJob() if self.gated else None
+            relay_python = admitted_gate_python(env) if self.gated else None
+            self.job = (
+                (WindowsJob if job_factory is None else job_factory)() if self.gated else None
+            )
+            if self.gated and job_factory is not None:
+                require(
+                    self.job is not None
+                    and all(
+                        callable(getattr(self.job, name, None)) for name in ("assign", "close")
+                    ),
+                    "admission_failed",
+                )
             command = (
                 [
-                    sys.executable,
+                    str(relay_python),
                     "-I",
                     "-B",
+                    "-S",  # No site/.pth hooks before Job assignment opens the gate.
                     str(Path(__file__).resolve()),
                     "--gate",
                     self.gate_nonce,
@@ -889,6 +949,9 @@ def clean_environment(base: dict[str, str]) -> dict[str, str]:
         PIP_DISABLE_PIP_VERSION_CHECK="1",
         PIP_CONFIG_FILE=os.devnull,
     )
+    # Non-secret, independently admitted relay binding needed by the installed
+    # publisher's nested Job. Every Windows launch revalidates path and bytes.
+    env.update({key: base[key] for key in GATE_RUNTIME_KEYS if key in base})
     return env
 
 

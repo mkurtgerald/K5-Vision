@@ -4,16 +4,25 @@ on:
   push:
     branches:
       - feat/installed-analytics-operator-20261003
+      - feat/alpha-analytics-preflight-20261004
     paths:
       - .github/workflows/installed-analytics-candidate.yml
       - scripts/installed_analytics_witness.py
+      - scripts/installed_alpha_launcher_witness.py
+      - scripts/windows_owned_preflight.py
       - scripts/build_analytics_runtime_wheel.py
       - scripts/windows-alpha/Invoke-K5InstalledAnalyticsWitness.ps1
+      - scripts/windows-alpha/Start-K5VisionAlpha.ps1
+      - scripts/windows-alpha/Test-K5VisionAlpha.ps1
+      - scripts/windows-alpha/Run-K5VisionAlpha.ps1
+      - scripts/windows-alpha/Invoke-K5VisionAlphaWitness.ps1
       - src/k5vision/**
       - pyproject.toml
       - scripts/windows-alpha/runtime-requirements.txt
       - tests/test_installed_analytics_witness.py
+      - tests/test_installed_alpha_launcher_witness.py
       - tests/test_installed_analytics_candidate_workflow.py
+      - tests/test_windows_alpha_analytics.py
 
 # Shares the existing K5 physical lane; never cancel an already running owner.
 # Cross-repository launch coordination and fresh host admission remain required.
@@ -27,7 +36,7 @@ permissions:
 
 jobs:
   installed-analytics-candidate:
-    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/feat/installed-analytics-operator-20261003'
+    if: github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004')
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 35
     env:
@@ -35,11 +44,14 @@ jobs:
       PYTHONPYCACHEPREFIX: ""
       ANALYTICS_LAB_SHA: c8b347ae538991a0c0ce38eabc2dc17b566531d3
       K5_STAGE_ONE_REVISION: ${{ github.sha }}
+      K5_CANDIDATE_BRANCH: ${{ github.ref_name }}
       K5_ALPHA_DIRECT_RTSP_OUTPUT: artifacts\alpha-direct-rtsp-candidate-baseline.json
       K5_INSTALLED_ANALYTICS_OUTPUT: artifacts\installed-analytics-candidate.json
       K5_INSTALLED_WORK_OWNED: ""
       K5_INSTALLED_EVIDENCE_OWNED: ""
       K5_INSTALLED_CONTROLLER_OWNED: ""
+      K5_ALPHA_LAUNCHER_OWNED: ""
+      K5_ALPHA_LAUNCHER_OUTPUT: artifacts\installed-alpha-start-script-witness.json
 
     steps:
       - name: Require exact trusted head and green hosted PR qualification
@@ -51,17 +63,23 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           if ($env:K5_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "Exact candidate SHA required." }
-          $branch = [uri]::EscapeDataString("feat/installed-analytics-operator-20261003")
+          $legacyBranch = "feat/installed-analytics-operator-20261003"
+          $launcherBranch = "feat/alpha-analytics-preflight-20261004"
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch)) { throw "Unreviewed candidate branch refused." }
+          $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
-          # Audited PR318's aggregate diff includes operator_runtime.py, which
-          # triggers Alpha, viewport-editor and Analytics compatibility. CI and
-          # PR dedupe are unfiltered. No native workflow is in this allowlist.
+          # PR321's launcher/CLI paths trigger Alpha smoke; CI and PR dedupe are
+          # unfiltered. PR318 also changes operator_runtime.py, so its original
+          # viewport and Analytics compatibility requirements remain in force.
+          # No native workflow or intentionally untriggered gate is counted.
           $required = @{
             "355859781" = "CI"
             "369354936" = "Windows Alpha Script Smoke"
-            "362514400" = "Current Gate Viewport Editor Qualification"
-            "364801702" = "Stage One Analytics Compatibility"
             "361865932" = "PR Run Dedupe"
+          }
+          if ($env:K5_CANDIDATE_BRANCH -ceq $legacyBranch) {
+            $required["362514400"] = "Current Gate Viewport Editor Qualification"
+            $required["364801702"] = "Stage One Analytics Compatibility"
           }
           $deadline = [DateTime]::UtcNow.AddMinutes(6)
           $qualified = $false
@@ -74,7 +92,7 @@ jobs:
             foreach ($id in $required.Keys) {
               $matching = @($response.workflow_runs | Where-Object {
                 [string]$_.workflow_id -ceq $id -and $_.head_sha -ceq $env:K5_EXPECTED_SHA -and
-                $_.event -ceq "pull_request" -and $_.head_branch -ceq "feat/installed-analytics-operator-20261003" -and
+                $_.event -ceq "pull_request" -and $_.head_branch -ceq $env:K5_CANDIDATE_BRANCH -and
                 $_.name -ceq $required[$id]
               } | Sort-Object -Property id -Descending)
               if ($matching.Count -eq 0) { $qualified = $false; continue }
@@ -160,13 +178,15 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          $branch = [uri]::EscapeDataString("feat/installed-analytics-operator-20261003")
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004")) { throw "Unreviewed candidate branch refused." }
+          $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
           if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; provisioning refused." }
           .\scripts\provision-stage03-gstreamer.ps1
 
       - name: Set up Python
+        id: runtime_python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
@@ -174,8 +194,18 @@ jobs:
 
       - name: Create isolated witness controller
         shell: powershell
+        env:
+          K5_SETUP_PYTHON: ${{ steps.runtime_python.outputs.python-path }}
         run: |
           $ErrorActionPreference = "Stop"
+          $base = [IO.Path]::GetFullPath($env:K5_SETUP_PYTHON)
+          $attributes = [IO.File]::GetAttributes($base)
+          if ($attributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint)) { throw "Admitted base Python must be a regular executable." }
+          & $base -I -B -S -c "import sys; assert sys.prefix == sys.base_prefix and sys.version_info[:2] == (3, 12)"
+          if ($LASTEXITCODE -ne 0) { throw "Admitted base Python identity failed." }
+          $baseHash = (Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant()
+          "K5_WITNESS_BASE_PYTHON=$base" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "K5_WITNESS_BASE_PYTHON_SHA256=$baseHash" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $controller = Join-Path $env:RUNNER_TEMP ("k5-installed-controller-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
           if (Test-Path -LiteralPath $controller) { throw "Witness controller path already exists." }
           New-Item -ItemType Directory -Path $controller -ErrorAction Stop | Out-Null
@@ -205,10 +235,36 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Pinned fixture preparation failed." }
           "K5_ANALYTICS_EVIDENCE_ROOT=$evidence" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Recheck fresh exact candidate before installed Alpha baseline
+        timeout-minutes: 1
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+          K5_EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004")) { throw "Unreviewed candidate branch refused." }
+          $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
+          $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+          $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+          if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; installed baseline refused." }
+
+      - name: Recheck idle host before installed Alpha baseline
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
+
       - name: Preserve installed Alpha baseline and pinned MediaMTX provisioning
+        id: baseline_witness
         timeout-minutes: 10
         shell: powershell
         run: .\scripts\windows-alpha\Invoke-K5VisionAlphaWitness.ps1 -Output $env:K5_ALPHA_DIRECT_RTSP_OUTPUT
+
+      - name: Verify installed Alpha baseline owned media cleanup
+        if: always() && (steps.baseline_witness.outcome == 'success' || steps.baseline_witness.outcome == 'failure' || steps.baseline_witness.outcome == 'cancelled')
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
 
       - name: Recheck fresh exact candidate before installed media acceptance
         shell: powershell
@@ -217,9 +273,10 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          $branch = [uri]::EscapeDataString("feat/installed-analytics-operator-20261003")
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004")) { throw "Unreviewed candidate branch refused." }
+          $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
-          $head = Invoke-RestMethod -Method Get -Headers $headers -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+          $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
           if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; installed media acceptance refused." }
 
       - name: Recheck idle host before installed normal-app witness
@@ -255,6 +312,145 @@ jobs:
           python -I -B scripts\installed_analytics_witness.py --validate-receipt --output $env:K5_INSTALLED_ANALYTICS_OUTPUT --revision $env:K5_STAGE_ONE_REVISION
           if ($LASTEXITCODE -ne 0) { throw "Installed receipt violated exact source-free contract." }
 
+      - name: Prepare independently bound offline Start-script inputs
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'
+        timeout-minutes: 6
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+          K5_EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:K5_CANDIDATE_BRANCH -cne "feat/alpha-analytics-preflight-20261004") { throw "Unreviewed launcher branch refused." }
+          $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
+          $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+          $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+          if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; Start-script preparation refused." }
+          $root = Join-Path $env:RUNNER_TEMP ("k5-alpha-launcher-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $root) { throw "Launcher input path already exists." }
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          "K5_ALPHA_LAUNCHER_OWNED=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $git = 'C:\Program Files\Git\cmd\git.exe'
+          & $git -c core.autocrlf=false -c core.eol=lf -C $env:GITHUB_WORKSPACE archive --format=zip --output="$root\source.zip" $env:K5_STAGE_ONE_REVISION
+          if ($LASTEXITCODE -ne 0) { throw "Exact launcher source archive failed." }
+          & $git -c core.autocrlf=false -c core.eol=lf -C "$env:GITHUB_WORKSPACE\analytics-lab" archive --format=zip --output="$root\analytics.zip" $env:ANALYTICS_LAB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Exact Analytics source archive failed." }
+          Expand-Archive -LiteralPath "$root\source.zip" -DestinationPath "$root\source"
+          Expand-Archive -LiteralPath "$root\analytics.zip" -DestinationPath "$root\analytics-source"
+          $base = $env:K5_WITNESS_BASE_PYTHON
+          if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_WITNESS_BASE_PYTHON_SHA256) { throw "Admitted base Python changed." }
+          # Provisioning is explicit and precedes the offline installed witness.
+          # No raw process output, credentials, source paths or media are retained.
+          @'
+          try:
+              import importlib.util, os, sys, uuid
+              from pathlib import Path
+              root = Path(sys.argv[1])
+              source = root / "source"
+              spec = importlib.util.spec_from_file_location("launcher", source / "scripts/installed_alpha_launcher_witness.py")
+              launcher = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(launcher)
+              common = launcher.common
+              env = common.clean_environment(dict(os.environ))
+              controller = str(Path(os.environ["K5_INSTALLED_CONTROLLER_OWNED"]) / "Scripts/python.exe")
+              wheels, wheelhouse = root / "wheels", root / "wheelhouse"
+              common.run([controller, "-I", "-B", "-m", "pip", "wheel", "--no-deps", "--wheel-dir", str(wheels), str(source)], cwd=root, env=env, seconds=180, operation="build_k5_wheel")
+              versions = {**common.requirements(source / "scripts/windows-alpha/runtime-requirements.txt"), **common.RUNTIME_VERSIONS, **common.WINDOWS_RUNTIME_VERSIONS}
+              common.run([controller, "-I", "-B", "-m", "pip", "download", "--no-deps", "--only-binary=:all:", "--dest", str(wheelhouse), *[f"{name}=={version}" for name, version in sorted(versions.items())]], cwd=root, env=env, seconds=180, operation="download_dependencies")
+              common.run([controller, "-I", "-B", str(source / "scripts/build_analytics_runtime_wheel.py"), "--source-root", str(root / "analytics-source"), "--output-dir", str(wheels)], cwd=root, env=env, operation="build_analytics_wheel")
+              k5, analytics = list(wheels.glob("k5_vision-*.whl")), list(wheels.glob("k5_analytics_runtime-*.whl"))
+              common.require(len(k5) == len(analytics) == 1)
+              # Read-only independent model/seed verification uses the pinned LF donor.
+              sys.path.insert(0, str(root / "analytics-source"))
+              from analytics_lab.artifacts import OPENVINO_OMZ_2023_FP16, verify_artifact_set
+              from analytics_lab.validation_seed import GMDCSA24_SEED, _manifest, verify_seed_media
+              evidence = common.local_path(Path(os.environ["K5_ANALYTICS_EVIDENCE_ROOT"]), directory=True)
+              models = verify_artifact_set(evidence / "artifacts", OPENVINO_OMZ_2023_FP16)
+              common.require(len(models) == 4)
+              identities = {}
+              for sample in GMDCSA24_SEED:
+                  clip = common.local_path(evidence / "media/gmdcsa24" / sample.relative_path)
+                  common.require(clip.is_relative_to(evidence))
+                  identities[sample.sample_id] = verify_seed_media(clip, sample)
+              common.require(common.read_json(evidence / "validation-manifest.json") == _manifest(identities))
+              expected = {
+                  "revision": os.environ["K5_STAGE_ONE_REVISION"], "run_nonce": uuid.uuid4().hex,
+                  "source_tree_sha256": common.digest(launcher.tree_manifest(source)),
+                  "k5_payload_sha256": common.digest(launcher.source_payload(source)),
+                  "k5_wheel_sha256": common.file_hash(k5[0]),
+                  "analytics_manifest_sha256": common.file_hash(source / "src/k5vision/data/analytics-runtime-manifest.json"),
+                  "analytics_wheel_sha256": common.file_hash(analytics[0]),
+                  "model_identity_sha256": common.digest([{"relative_path": item.spec.relative_path, "size_bytes": item.spec.size_bytes, "sha384": item.spec.sha384} for item in models]),
+                  "seed_identity_sha256": common.digest(identities),
+                  "native_cache_sha256": common.digest(launcher.native_manifest(Path(os.environ["LOCALAPPDATA"]))),
+                  "wheelhouse_sha256": common.digest(launcher.tree_manifest(wheelhouse, maximum_files=256)),
+                  **{name + "_script_sha256": common.file_hash(source / "scripts/windows-alpha" / (name.title() + "-K5VisionAlpha.ps1")) for name in ("start", "test", "run")},
+              }
+              launcher.validate_expectations(expected, installed=False)
+              (root / "inputs.json").write_bytes(common.canonical(expected))
+              (root / "work").mkdir()
+          except BaseException as error:
+              if "common" in globals() and isinstance(error, common.WitnessError) and error.diagnostic:
+                  common.emit_diagnostic(error.diagnostic)
+              else:
+                  print("K5_ALPHA_INPUT_PREPARATION_FAILED")
+              raise SystemExit(1)
+          '@ | & $base -I -B -S - $root
+          if ($LASTEXITCODE -ne 0) { throw "Independent launcher input admission failed." }
+
+      - name: Recheck fresh exact candidate before installed Start-script acceptance
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'
+        timeout-minutes: 1
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+          K5_EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:K5_CANDIDATE_BRANCH -cne "feat/alpha-analytics-preflight-20261004") { throw "Unreviewed launcher branch refused." }
+          $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
+          $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+          $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+          if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; Start-script acceptance refused." }
+
+      - name: Recheck idle host before installed Start-script witness
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
+
+      - name: Prove installed Start-script refusal and two analytics launches
+        id: alpha_launcher_witness
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'
+        timeout-minutes: 10
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:K5_ALPHA_LAUNCHER_OWNED
+          $base = $env:K5_WITNESS_BASE_PYTHON
+          if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_WITNESS_BASE_PYTHON_SHA256) { throw "Admitted base Python changed." }
+          $wheels = @(Get-ChildItem -LiteralPath "$root\wheels" -Filter 'k5_vision-*.whl' -File)
+          if ($wheels.Count -ne 1) { throw "Exactly one admitted K5 wheel required." }
+          & $base -I -B -S "$root\source\scripts\installed_alpha_launcher_witness.py" --expectations "$root\inputs.json" --admitted-expectations "$root\installed-alpha-start-script-expectations.json" --output $env:K5_ALPHA_LAUNCHER_OUTPUT --repo $env:GITHUB_WORKSPACE --analytics-source "$env:GITHUB_WORKSPACE\analytics-lab" --k5-wheel $wheels[0].FullName --wheelhouse "$root\wheelhouse" --evidence-root $env:K5_ANALYTICS_EVIDENCE_ROOT --local-appdata $env:LOCALAPPDATA --git 'C:\Program Files\Git\cmd\git.exe' --temp-root $root --work-root "$root\work"
+          if ($LASTEXITCODE -ne 0) { throw "Installed Start-script witness failed." }
+
+      - name: Verify installed Start-script owned media cleanup
+        if: always() && (steps.alpha_launcher_witness.outcome == 'success' || steps.alpha_launcher_witness.outcome == 'failure' || steps.alpha_launcher_witness.outcome == 'cancelled')
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
+
+      - name: Validate exact source-free installed Start-script receipt
+        id: safe_alpha_evidence
+        if: steps.alpha_launcher_witness.outcome == 'success'
+        timeout-minutes: 1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:K5_ALPHA_LAUNCHER_OWNED
+          & $env:K5_WITNESS_BASE_PYTHON -I -B -S "$root\source\scripts\installed_alpha_launcher_witness.py" --validate-receipt --expectations "$root\installed-alpha-start-script-expectations.json" --output $env:K5_ALPHA_LAUNCHER_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw "Installed Start-script receipt violated independent source-free contract." }
+
       - name: Remove only this job's disposable fixture and controller
         if: always()
         timeout-minutes: 1
@@ -262,8 +458,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $cleanupComplete = $true
-          $prefixes = @{ K5_INSTALLED_WORK_OWNED = "k5-installed-work-"; K5_INSTALLED_EVIDENCE_OWNED = "k5-installed-evidence-"; K5_INSTALLED_CONTROLLER_OWNED = "k5-installed-controller-" }
-          foreach ($name in @("K5_INSTALLED_WORK_OWNED", "K5_INSTALLED_EVIDENCE_OWNED", "K5_INSTALLED_CONTROLLER_OWNED")) {
+          $prefixes = @{ K5_INSTALLED_WORK_OWNED = "k5-installed-work-"; K5_INSTALLED_EVIDENCE_OWNED = "k5-installed-evidence-"; K5_INSTALLED_CONTROLLER_OWNED = "k5-installed-controller-"; K5_ALPHA_LAUNCHER_OWNED = "k5-alpha-launcher-" }
+          foreach ($name in @("K5_INSTALLED_WORK_OWNED", "K5_INSTALLED_EVIDENCE_OWNED", "K5_INSTALLED_CONTROLLER_OWNED", "K5_ALPHA_LAUNCHER_OWNED")) {
             $owned = [Environment]::GetEnvironmentVariable($name, "Process")
             if ([string]::IsNullOrWhiteSpace($owned)) { continue }
             try {
@@ -281,5 +477,14 @@ jobs:
         with:
           name: installed-analytics-candidate-witness
           path: artifacts/installed-analytics-candidate.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload only validated installed Start-script receipt
+        if: success() && steps.safe_alpha_evidence.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: installed-alpha-start-script-witness
+          path: artifacts/installed-alpha-start-script-witness.json
           if-no-files-found: error
           retention-days: 14

@@ -25,13 +25,17 @@ $gstCoreReady = (Test-Path -LiteralPath (Join-Path $gstreamerRoot "bin\gstreamer
     (Test-Path -LiteralPath (Join-Path $gstreamerRoot "bin\libgstreamer-1.0-0.dll"))
 if (-not $gstCoreReady -or -not (Test-Path -LiteralPath $gstLaunch)) { throw "Reviewed GStreamer runtime is incomplete." }
 
+# Reuse the installed launcher's source-isolated, bounded config admission.
+# Refusal happens before any native runtime probe or alpha session creation.
+& $launcher -AnalyticsPreflightOnly
+
 $output = @(& $gstLaunch --version 2>$null)
 if ($LASTEXITCODE -ne 0 -or -not (($output -join "`n").Contains("GStreamer $gstreamerVersion"))) {
     throw "Reviewed GStreamer runtime version verification failed."
 }
-& $python -m k5vision.cli --version
+& $python -I -B -m k5vision.cli --version
 if ($LASTEXITCODE -ne 0) { throw "Installed K5 CLI verification failed." }
-& $python -m k5vision.cli --help *> $null
+& $python -I -B -m k5vision.cli --help *> $null
 if ($LASTEXITCODE -ne 0) { throw "Installed K5 CLI smoke test failed." }
 
 Write-Host "K5 Vision Alpha preflight PASS"

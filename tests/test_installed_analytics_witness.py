@@ -22,6 +22,20 @@ SPEC.loader.exec_module(witness)
 REVISION = "a" * 40
 
 
+@pytest.fixture(autouse=True)
+def admit_test_base_python(monkeypatch, request):
+    # The real hosted Job proof must preserve the workflow's independent runtime
+    # binding. Its admission check must fail if those inputs are absent or wrong.
+    if request.node.name == "test_windows_real_venv_child_is_owned_by_admitted_base_job":
+        return
+    # Portable tests using real Windows Jobs explicitly admit their current base
+    # interpreter, just as the qualification caller does from setup-python.
+    if os.name == "nt":
+        base = Path(sys._base_executable)
+        monkeypatch.setenv("K5_WITNESS_BASE_PYTHON", str(base))
+        monkeypatch.setenv("K5_WITNESS_BASE_PYTHON_SHA256", witness.file_hash(base))
+
+
 def live() -> dict[str, object]:
     return {
         "schema_version": "2",
@@ -391,6 +405,7 @@ def test_owned_job_assignment_precedes_child_execution(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(witness, "WindowsJob", FakeJob)
     monkeypatch.setattr(witness, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(witness, "admitted_gate_python", lambda _env: Path(sys._base_executable))
     env = dict(os.environ)
     process = witness.OwnedProcess(
         [
@@ -423,6 +438,7 @@ def test_assignment_failure_never_runs_requested_command(tmp_path: Path, monkeyp
 
     monkeypatch.setattr(witness, "WindowsJob", RefusingJob)
     monkeypatch.setattr(witness, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(witness, "admitted_gate_python", lambda _env: Path(sys._base_executable))
     with pytest.raises(witness.WitnessError, match="cleanup_incomplete"):
         witness.OwnedProcess(
             [
@@ -819,3 +835,303 @@ def test_helper_modes_preserve_known_failure_codes_without_raw_output(
     output = capsys.readouterr()
     assert output.err == f"K5_CHILD_CATEGORY={code}\n"
     assert output.out == "Installed analytics witness failed closed\n"
+
+
+def test_typed_job_accounting_matches_windows_abi() -> None:
+    import ctypes
+
+    layout = witness.JobAccountingInformation
+    assert ctypes.sizeof(layout) == 48
+    assert layout.total_page_faults.offset == 32
+    assert layout.total_processes.offset == 36
+    assert layout.active_processes.offset == 40
+    assert layout.total_terminated_processes.offset == 44
+    calls = []
+
+    def query(handle, information_class, address, size, returned):
+        calls.append((handle, information_class, size, returned))
+        data = ctypes.cast(address, ctypes.POINTER(layout)).contents
+        data.total_page_faults = 900
+        data.total_processes = 4
+        data.active_processes = 0
+        return True
+
+    job = object.__new__(witness.WindowsJob)
+    job.handle = 123
+    job.api = SimpleNamespace(QueryInformationJobObject=query)
+    info = job.accounting()
+    assert (info.total_processes, info.active_processes) == (4, 0)
+    assert calls == [(123, 1, 48, None)]
+    job.api.QueryInformationJobObject = lambda *_: False
+    with pytest.raises(witness.WitnessError, match="cleanup_incomplete"):
+        job.accounting()
+
+
+def base_admission_fixture(tmp_path, monkeypatch):
+    base = tmp_path / "base"
+    base.mkdir()
+    executable = base / "python.exe"
+    executable.write_bytes(b"independently admitted base runtime")
+    venv = tmp_path / "venv/Scripts"
+    venv.mkdir(parents=True)
+    redirector = venv / "python.exe"
+    redirector.write_bytes(b"redirector, not relay runtime")
+    monkeypatch.setattr(
+        witness,
+        "sys",
+        SimpleNamespace(
+            executable=str(redirector), _base_executable=str(executable), base_prefix=str(base)
+        ),
+    )
+    environment = {
+        "K5_WITNESS_BASE_PYTHON": str(executable),
+        "K5_WITNESS_BASE_PYTHON_SHA256": witness.file_hash(executable),
+    }
+    return executable, redirector, environment
+
+
+def test_gate_uses_independently_admitted_base_not_venv_redirector(tmp_path, monkeypatch) -> None:
+    base, redirector, environment = base_admission_fixture(tmp_path, monkeypatch)
+    assert witness.admitted_gate_python(environment) == base
+    seen = []
+
+    class Job:
+        def close(self):
+            pass
+
+    def inspect_command(command, **kwargs):
+        seen.append((command, kwargs))
+        raise OSError("sentinel launch failure")
+
+    monkeypatch.setattr(witness, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(witness, "WindowsJob", Job)
+    monkeypatch.setattr(witness.subprocess, "Popen", inspect_command)
+    requested = [str(redirector), "-I", "-B", "-m", "k5vision.cli", "serve", "--operator"]
+    with pytest.raises(witness.WitnessError, match="child_failed"):
+        witness.OwnedProcess(
+            requested, cwd=tmp_path, env=environment, operation="start_application"
+        )
+    command, options = seen[0]
+    assert command[:4] == [str(base), "-I", "-B", "-S"]
+    assert command[-len(requested) :] == requested
+    assert options["env"] is environment
+    assert options["cwd"] == tmp_path
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing",
+        "wrong_hash",
+        "redirector",
+        "runtime_mismatch",
+        "prefix_mismatch",
+        "changed_bytes",
+        "alias",
+    ],
+)
+def test_gate_base_admission_fails_closed(tmp_path, monkeypatch, failure) -> None:
+    base, redirector, environment = base_admission_fixture(tmp_path, monkeypatch)
+    if failure == "missing":
+        environment.pop("K5_WITNESS_BASE_PYTHON")
+    elif failure == "wrong_hash":
+        environment["K5_WITNESS_BASE_PYTHON_SHA256"] = "a" * 64
+    elif failure == "redirector":
+        environment["K5_WITNESS_BASE_PYTHON"] = str(redirector)
+        environment["K5_WITNESS_BASE_PYTHON_SHA256"] = witness.file_hash(redirector)
+    elif failure == "runtime_mismatch":
+        witness.sys._base_executable = str(redirector)
+    elif failure == "prefix_mismatch":
+        witness.sys.base_prefix = str(redirector.parent)
+    elif failure == "changed_bytes":
+        base.write_bytes(b"modified since admission")
+    else:
+        alias = tmp_path / "alias.exe"
+        try:
+            alias.symlink_to(base)
+        except OSError:
+            pytest.skip("Symbolic-link fixture is unavailable on this host")
+        environment["K5_WITNESS_BASE_PYTHON"] = str(alias)
+    with pytest.raises(witness.WitnessError):
+        witness.admitted_gate_python(environment)
+
+
+def test_environment_preserves_only_explicit_gate_binding_from_k5_state() -> None:
+    bound = {"K5_WITNESS_BASE_PYTHON": "admitted-base", "K5_WITNESS_BASE_PYTHON_SHA256": "a" * 64}
+    cleaned = witness.clean_environment(
+        {**bound, "K5_USER_DB_PATH": "real", "K5_CONTROL_PLANE_TOKEN": "secret"}
+    )
+    assert {key: value for key, value in cleaned.items() if key.startswith("K5_")} == bound
+
+
+def test_dependency_download_has_fixed_diagnostic_operation() -> None:
+    witness.validate_diagnostic(
+        witness.diagnostic("download_dependencies", category="network_failed")
+    )
+
+
+@pytest.mark.parametrize("binding", ["missing", "mismatched"])
+def test_real_windows_job_fixture_never_replaces_external_binding(
+    tmp_path, monkeypatch, binding
+) -> None:
+    base, _redirector, _expected = base_admission_fixture(tmp_path, monkeypatch)
+    for key in witness.GATE_RUNTIME_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    if binding == "mismatched":
+        monkeypatch.setenv("K5_WITNESS_BASE_PYTHON", str(base))
+        monkeypatch.setenv("K5_WITNESS_BASE_PYTHON_SHA256", "a" * 64)
+    before = {key: os.environ.get(key) for key in witness.GATE_RUNTIME_KEYS}
+    # Simulate the fixture's Windows branch without altering global os/pathlib.
+    monkeypatch.setitem(globals(), "os", SimpleNamespace(name="nt", environ=os.environ))
+    request = SimpleNamespace(
+        node=SimpleNamespace(name="test_windows_real_venv_child_is_owned_by_admitted_base_job")
+    )
+    admit_test_base_python.__wrapped__(monkeypatch, request)
+    assert {key: os.environ.get(key) for key in witness.GATE_RUNTIME_KEYS} == before
+    with pytest.raises(witness.WitnessError):
+        witness.admitted_gate_python(dict(os.environ))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Requires real Windows Job and CPython venv redirector")
+def test_windows_real_venv_child_is_owned_by_admitted_base_job(tmp_path, monkeypatch) -> None:
+    """Non-media Windows proof of the redirector/Job ownership contract."""
+    import shutil
+
+    environment = witness.clean_environment(dict(os.environ))
+    base = witness.admitted_gate_python(environment)
+    venv = tmp_path / "owned-venv"
+    assigned, executed = tmp_path / "assigned", tmp_path / "executed"
+    owned = None
+    try:
+        witness.run(
+            [str(base), "-I", "-B", "-m", "venv", "--without-pip", str(venv)],
+            cwd=tmp_path,
+            env=environment,
+            operation="create_venv",
+            seconds=60,
+        )
+        original_assign = witness.WindowsJob.assign
+
+        def assign_before_execution(job, process):
+            assert not executed.exists()
+            original_assign(job, process)
+            assigned.write_text("assigned")
+
+        monkeypatch.setattr(witness.WindowsJob, "assign", assign_before_execution)
+        target = venv / "Scripts/python.exe"
+        code = (
+            "import ctypes; from ctypes import wintypes; from pathlib import Path; "
+            "api=ctypes.WinDLL('kernel32',use_last_error=True); "
+            "api.GetCurrentProcess.restype=wintypes.HANDLE; "
+            "api.IsProcessInJob.argtypes=[wintypes.HANDLE,wintypes.HANDLE,"
+            "ctypes.POINTER(wintypes.BOOL)]; "
+            "owned=wintypes.BOOL(); "
+            "assert api.IsProcessInJob(api.GetCurrentProcess(),None,ctypes.byref(owned)); "
+            "assert owned.value; "
+            f"assert Path({str(assigned)!r}).read_text()=='assigned'; "
+            f"Path({str(executed)!r}).write_text('executed-in-job')"
+        )
+        owned = witness.OwnedProcess(
+            [str(target), "-I", "-B", "-c", code],
+            cwd=tmp_path,
+            env=environment,
+            operation="probe_admission",
+        )
+        assert owned.job is not None
+        assert owned.process.args[:4] == [str(base), "-I", "-B", "-S"]
+        owned.wait(30)
+        accounting = owned.job.accounting()
+        # One base relay, one venv redirector, one actual requested interpreter.
+        assert accounting.total_processes == 3
+        assert accounting.active_processes == 0
+        assert executed.read_text() == "executed-in-job"
+    finally:
+        try:
+            if owned is not None:
+                owned.close()
+        finally:
+            if venv.exists():
+                shutil.rmtree(venv)
+            assigned.unlink(missing_ok=True)
+            executed.unlink(missing_ok=True)
+    assert not venv.exists()
+
+
+@pytest.mark.parametrize("provided", [False, True])
+def test_optional_job_factory_preserves_default_and_assignment_before_gate(
+    tmp_path, monkeypatch, provided
+):
+    base, redirector, environment = base_admission_fixture(tmp_path, monkeypatch)
+    calls = []
+
+    class Job:
+        def __init__(self):
+            calls.append("default_factory")
+
+        def assign(self, _process):
+            calls.append("assign")
+
+        def close(self):
+            calls.append("job_close")
+
+    def factory():
+        calls.append("injected_factory")
+        return object.__new__(Job)
+
+    process = SimpleNamespace(
+        stdin=SimpleNamespace(
+            write=lambda value: calls.append(("gate", value)),
+            flush=lambda: None,
+            close=lambda: None,
+        ),
+        stderr=None,
+        wait=lambda **_: 0,
+        poll=lambda: 0,
+    )
+    requested = [str(redirector), "-I", "-B", "-m", "k5vision.cli", "analytics-preflight"]
+
+    def popen(command, **kwargs):
+        calls.append("popen")
+        assert command[:4] == [str(base), "-I", "-B", "-S"]
+        assert command[-len(requested) :] == requested and kwargs["env"] is environment
+        return process
+
+    monkeypatch.setattr(witness, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(witness, "WindowsJob", Job)
+    monkeypatch.setattr(witness.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        witness, "StderrSummary", lambda *_args, **_kwargs: SimpleNamespace(finish=lambda: True)
+    )
+    extra = {"job_factory": factory} if provided else {}
+    owned = witness.OwnedProcess(
+        requested, cwd=tmp_path, env=environment, operation="probe_admission", **extra
+    )
+    owned.close()
+    assert calls == [
+        "injected_factory" if provided else "default_factory",
+        "popen",
+        "assign",
+        ("gate", b"1"),
+        "job_close",
+    ]
+
+
+@pytest.mark.parametrize(
+    "result", [None, object(), SimpleNamespace(assign=None, close=lambda: None)]
+)
+def test_explicit_job_factory_cannot_bypass_gate_with_invalid_result(tmp_path, monkeypatch, result):
+    _base, redirector, environment = base_admission_fixture(tmp_path, monkeypatch)
+    launches = []
+    monkeypatch.setattr(witness, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        witness.subprocess, "Popen", lambda *_args, **_kwargs: launches.append(True)
+    )
+    with pytest.raises(witness.WitnessError):
+        witness.OwnedProcess(
+            [str(redirector)],
+            cwd=tmp_path,
+            env=environment,
+            operation="probe_admission",
+            job_factory=lambda: result,
+        )
+    assert launches == []

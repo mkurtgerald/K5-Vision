@@ -48,6 +48,42 @@ The existing Alpha bootstrap still installs its pinned donor revision, and its
 ball-pattern launcher is not a positive person-detection acceptance fixture.
 This change does not claim that the Alpha shortcut already ships this candidate.
 
+## Camera-free installed preflight
+
+Run the installed interpreter's command before starting test media or the
+operator application:
+
+```powershell
+& $Python -I -B -m k5vision.cli analytics-preflight
+```
+
+The command reuses the operator application's existing
+`load_analytics_configuration(os.environ)` admission. It checks the selected
+configuration, installed package identity, dependency versions and local model
+bytes without creating an application, database, detector or tracker, opening a
+camera, or downloading/installing anything. An unset `K5_ANALYTICS_CONFIG` does
+not require the optional Analytics package or native dependencies. The command
+does not enable analytics for later commands; they must inherit the same explicit
+configuration and still perform their own admission.
+
+Standard output contains exactly one compact JSON object and a newline. All
+three fields are always present, and `schema_version` is the string `"1"`:
+
+- Unset configuration: `{"schema_version":"1","analytics_enabled":false,"status":"disabled"}`,
+  exit code 0
+- Fully admitted configuration: `{"schema_version":"1","analytics_enabled":true,"status":"ready"}`,
+  exit code 0
+- Invalid, missing or refused explicitly selected configuration/runtime:
+  `{"schema_version":"1","analytics_enabled":false,"status":"refused"}`,
+  exit code 1
+
+Refusal never prints local paths, configuration contents or raw exception text.
+Callers must check both the exit code and the exact versioned outcome; a refused
+selection must stop startup before media side effects. A disabled outcome is
+valid for a video-only run and cannot establish positive analytics acceptance.
+Likewise, `ready` establishes read-only admission only; it does not prove native
+inference, rendered boxes or physical presentation.
+
 ## Runtime and authority boundary
 
 Normal human-session authentication, role/device admission, source resolution and

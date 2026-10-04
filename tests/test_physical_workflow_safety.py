@@ -117,8 +117,9 @@ def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
     if path.name == _INSTALLED_CANDIDATE:
         assert (
             "  push:\n    branches:\n      - feat/installed-analytics-operator-20261003\n"
-            in triggers
+            "      - feat/alpha-analytics-preflight-20261004\n    paths:\n" in triggers
         )
+        assert "github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'" in admission
         assert "pull_request:" not in triggers and "workflow_dispatch:" not in triggers
         assert "github.repository == 'mkurtgerald/K5-Vision'" in admission
         assert "github.ref == 'refs/heads/feat/installed-analytics-operator-20261003'" in admission
@@ -210,6 +211,20 @@ def test_qualification_upload_requires_its_validation_outcome(path: Path) -> Non
         assert "source-free" in validation.split("\n", maxsplit=1)[0]
         assert "throw " in validation
         for upload in uploads:
+            if (
+                path.name == _INSTALLED_CANDIDATE
+                and "name: installed-alpha-start-script-witness" in upload
+            ):
+                alpha = [step for step in steps if "        id: safe_alpha_evidence\n" in step]
+                assert len(alpha) == 1
+                assert "if: steps.alpha_launcher_witness.outcome == 'success'" in alpha[0]
+                assert "--validate-receipt --expectations" in alpha[0]
+                assert "installed-alpha-start-script-expectations.json" in alpha[0]
+                assert steps.index(alpha[0]) < steps.index(upload)
+                header = upload.split("        uses:", maxsplit=1)[0]
+                assert "if: success() && steps.safe_alpha_evidence.outcome == 'success'" in header
+                assert "if: always()" not in header
+                continue
             assert steps.index(validation) < steps.index(upload)
             header = upload.split("        uses:", maxsplit=1)[0]
             assert "        if: success() && steps.safe_evidence.outcome == 'success'\n" in header

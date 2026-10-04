@@ -2,7 +2,8 @@
 param(
     [ValidateRange(1024,65535)][int]$Port = 8000,
     [string]$PublicRtspSource = "",
-    [switch]$ExitAfterPublicTest
+    [switch]$ExitAfterPublicTest,
+    [switch]$AnalyticsPreflightOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,9 +14,141 @@ $MediaMtxVersion = "1.21.1"
 $MediaMtxArchiveSha256 = "faa97974861eb75a68b5aa326c78e7e7a6f670b5ef191bace78e715130381f23"
 $MediaMtxArchiveUri = "https://github.com/bluenviron/mediamtx/releases/download/v$MediaMtxVersion/mediamtx_v$MediaMtxVersion" + "_windows_amd64.zip"
 
+# Keep admission in the installed launcher so Test and Start cannot drift. This
+# child never receives a source URI or credential and cannot import the checkout.
+# No temporary directory, output log, session database, or media process is made.
+function Invoke-K5AnalyticsPreflight {
+    param(
+        [Parameter(Mandatory=$true)][string]$Python,
+        [ValidateRange(1,60)][int]$TimeoutSeconds = 30
+    )
+    $maximumOutputBytes = 4096
+    $failureMessage = "K5 analytics preflight failed. No alpha session was started."
+    $child = $null
+    $stdout = $null
+    $started = $false
+    try {
+        $info = New-Object System.Diagnostics.ProcessStartInfo
+        $info.FileName = $Python
+        $info.Arguments = "-I -B -m k5vision.cli analytics-preflight"
+        $info.WorkingDirectory = Split-Path -Parent $Python
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        # Inherit only Windows runtime/location variables and the explicit
+        # selection. Never pass unrelated source, credential, or database state.
+        # The CLI owns all package/model/config admission; the parent is unchanged.
+        $allowedEnvironment = @(
+            "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "PATH", "TEMP", "TMP",
+            "USERPROFILE", "LOCALAPPDATA", "APPDATA", "PROGRAMDATA", "K5_ANALYTICS_CONFIG"
+        )
+        foreach ($name in @($info.EnvironmentVariables.Keys)) {
+            if ($name -notin $allowedEnvironment) { $info.EnvironmentVariables.Remove($name) }
+        }
+        $child = New-Object System.Diagnostics.Process
+        $child.StartInfo = $info
+        $started = $child.Start()
+        if (-not $started) { throw $failureMessage }
+        $childHandle = $child.Handle
+        $stdout = New-Object System.IO.MemoryStream
+        $outBuffer = New-Object byte[] 1024
+        $errBuffer = New-Object byte[] 1
+        $outRead = $child.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+        $errRead = $child.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+        $outDone = $false
+        $errDone = $false
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        while ($true) {
+            if ($watch.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw $failureMessage }
+            if (-not $outDone -and $outRead.IsCompleted) {
+                $count = $outRead.GetAwaiter().GetResult()
+                if ($count -eq 0) { $outDone = $true }
+                else {
+                    if ($stdout.Length + $count -gt $maximumOutputBytes) { throw $failureMessage }
+                    $stdout.Write($outBuffer, 0, $count)
+                    $outRead = $child.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+                }
+            }
+            if (-not $errDone -and $errRead.IsCompleted) {
+                # Successful admission has no stderr. Reject immediately rather
+                # than buffering an exception, path, credential, or output flood.
+                if ($errRead.GetAwaiter().GetResult() -ne 0) { throw $failureMessage }
+                $errDone = $true
+            }
+            if ($child.HasExited -and $outDone -and $errDone) { break }
+            Start-Sleep -Milliseconds 10
+        }
+        if ($child.ExitCode -ne 0) { throw $failureMessage }
+        $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $json = $utf8.GetString($stdout.ToArray()).Trim()
+        # Match the CLI's canonical success records, never permissive JSON
+        # coercion (arrays, duplicate/escaped keys, and extra fields must fail).
+        if ($json -ceq '{"schema_version":"1","analytics_enabled":true,"status":"ready"}') {
+            return $true
+        }
+        if ($json -ceq '{"schema_version":"1","analytics_enabled":false,"status":"disabled"}') {
+            return $false
+        }
+        throw $failureMessage
+    } catch {
+        # Do not expose child output or raw Process/JSON/config exceptions.
+        throw $failureMessage
+    } finally {
+        try {
+            if ($started -and -not $child.HasExited) {
+                $child.Kill()
+                if (-not $child.WaitForExit(5000)) { throw $failureMessage }
+            }
+        } catch {
+            throw $failureMessage
+        } finally {
+            if ($null -ne $child) { $child.Dispose() }
+            if ($null -ne $stdout) { $stdout.Dispose() }
+        }
+    }
+}
+
+function Test-K5AlphaOperatorReceipt([object]$Receipt, [bool]$AnalyticsRequired) {
+    if ($null -eq $Receipt) { return $false }
+    $fields = @($Receipt.PSObject.Properties.Name)
+    foreach ($name in @("completed", "delivered_frames", "presentations")) {
+        if ($name -cnotin $fields) { return $false }
+    }
+    if ($Receipt.completed -isnot [bool] -or -not $Receipt.completed) { return $false }
+    $counterNames = @("delivered_frames", "presentations")
+    if ($AnalyticsRequired) {
+        foreach ($name in @("analytics_enabled", "analytics_provider_submissions",
+                            "analytics_provider_completions", "analytics_failures")) {
+            if ($name -cnotin $fields) { return $false }
+        }
+        if ($Receipt.analytics_enabled -isnot [bool] -or -not $Receipt.analytics_enabled) {
+            return $false
+        }
+        $counterNames += @("analytics_provider_submissions", "analytics_provider_completions",
+                           "analytics_failures")
+    }
+    foreach ($name in $counterNames) {
+        $counter = $Receipt.$name
+        if (($counter -isnot [int] -and $counter -isnot [long]) -or $counter -lt 0) {
+            return $false
+        }
+        if ($name -cne "analytics_failures" -and $counter -lt 1) { return $false }
+    }
+    if ($AnalyticsRequired -and ($Receipt.analytics_failures -ne 0 -or
+        $Receipt.analytics_provider_completions -gt $Receipt.analytics_provider_submissions)) {
+        return $false
+    }
+    return $true
+}
+
 $python = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 $versionRecord = Join-Path $PSScriptRoot "gstreamer-version.txt"
 if (-not (Test-Path -LiteralPath $python)) { throw "Run Install-K5VisionAlpha.ps1 first." }
+$analyticsRequired = Invoke-K5AnalyticsPreflight -Python $python
+if ($analyticsRequired) { Write-Host "K5 analytics configuration admitted; live provider acceptance is pending." }
+else { Write-Host "K5 analytics disabled; video-only alpha acceptance selected." }
+if ($AnalyticsPreflightOnly) { return }
 if (-not (Test-Path -LiteralPath $versionRecord)) { throw "Installed GStreamer version record is missing." }
 
 $gstreamerVersion = (Get-Content -LiteralPath $versionRecord -Raw).Trim()
@@ -59,8 +192,171 @@ function Test-K5TcpListener([string]$HostName, [int]$TargetPort) {
 }
 
 function Test-K5GStreamerElement([string]$Name) {
-    & $gstInspect $Name *> $null
-    return $LASTEXITCODE -eq 0
+    if ($Name.Length -eq 0 -or $Name.Length -gt 8192 -or
+        $Name -match '[^\x21-\x7e]|["\\]') {
+        throw [Management.Automation.CommandNotFoundException]::new(
+            'K5 native application required.')
+    }
+    $result = Invoke-K5NativeProbe -Executable $gstInspect -Arguments @($Name)
+    return $result.ExitCode -eq 0
+}
+
+function Invoke-K5NativeProbe {
+    param([string]$Executable, [string[]]$Arguments,
+          [switch]$CaptureOutput, [switch]$DiscardStderr)
+    $child = $null
+    $primaryFailure = $null
+    $started = $false
+    $childHandle = [IntPtr]::Zero
+    $outRead = $null; $errRead = $null
+    $stdoutStream = $null; $stderrStream = $null
+    $capturedStdout = $null
+    try {
+        if (-not [IO.Path]::IsPathRooted($Executable)) {
+            throw [Management.Automation.CommandNotFoundException]::new(
+                'K5 native application required.')
+        }
+        if ($null -eq $Arguments -or $Arguments.Count -lt 1 -or $Arguments.Count -gt 16) {
+            throw [ArgumentException]::new('K5 native arguments invalid.')
+        }
+        # Encode one bounded Windows argv vector without a shell. Double every
+        # backslash before a quote and every trailing backslash inside quotes.
+        $quotedArguments = [Collections.Generic.List[string]]::new()
+        foreach ($argument in $Arguments) {
+            if ($null -eq $argument -or $argument.Length -gt 8192 -or
+                $argument.IndexOf([char]0) -ge 0) {
+                throw [ArgumentException]::new('K5 native arguments invalid.')
+            }
+            $encoded = [Text.StringBuilder]::new()
+            [void]$encoded.Append([char]34)
+            $slashes = 0
+            foreach ($character in $argument.ToCharArray()) {
+                if ($character -eq [char]92) { $slashes++; continue }
+                if ($character -eq [char]34) {
+                    [void]$encoded.Append([char]92, (2 * $slashes + 1))
+                } else { [void]$encoded.Append([char]92, $slashes) }
+                [void]$encoded.Append($character)
+                $slashes = 0
+            }
+            [void]$encoded.Append([char]92, (2 * $slashes))
+            [void]$encoded.Append([char]34)
+            $quotedArguments.Add($encoded.ToString())
+        }
+        $command = Get-Command -Name $Executable -ErrorAction Stop
+        if ($command -isnot [Management.Automation.ApplicationInfo] -or
+            -not [string]::Equals([IO.Path]::GetFullPath($command.Path),
+                [IO.Path]::GetFullPath($Executable), [StringComparison]::OrdinalIgnoreCase)) {
+            throw [Management.Automation.CommandNotFoundException]::new(
+                'K5 native application required.')
+        }
+        $info = [Diagnostics.ProcessStartInfo]::new()
+        $info.FileName = $command.Path
+        $info.Arguments = [string]::Join(' ', $quotedArguments.ToArray())
+        if ($info.Arguments.Length -gt 16384) {
+            throw [ArgumentException]::new('K5 native arguments invalid.')
+        }
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardInput = $true
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        if ($CaptureOutput) { $capturedStdout = [IO.MemoryStream]::new() }
+        $child = [Diagnostics.Process]::new()
+        $child.StartInfo = $info
+        $started = $child.Start()
+        if (-not $started) { throw [InvalidOperationException]::new('K5 native start failed.') }
+        $childHandle = $child.Handle
+        $child.StandardInput.Close()
+        $stdoutStream = $child.StandardOutput.BaseStream
+        $stderrStream = $child.StandardError.BaseStream
+        $outBuffer = [byte[]]::new(4096)
+        $errBuffer = [byte[]]::new(4096)
+        $outRead = $stdoutStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+        $errRead = $stderrStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+        $outDone = $false; $errDone = $false
+        $outCount = 0; $errCount = 0
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        while ($true) {
+            if ($watch.Elapsed.TotalSeconds -ge 5) {
+                throw [TimeoutException]::new('K5 native timeout.')
+            }
+            if (-not $outDone -and $outRead.IsCompleted) {
+                $count = $outRead.GetAwaiter().GetResult()
+                if ($count -eq 0) { $outDone = $true }
+                else {
+                    $outCount += $count
+                    if ($outCount + $errCount -gt 131072) {
+                        throw [IO.InvalidDataException]::new('K5 native output limit.')
+                    }
+                    if ($CaptureOutput) { $capturedStdout.Write($outBuffer, 0, $count) }
+                    $outRead = $stdoutStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+                }
+            }
+            if (-not $errDone -and $errRead.IsCompleted) {
+                $count = $errRead.GetAwaiter().GetResult()
+                if ($count -eq 0) { $errDone = $true }
+                else {
+                    $errCount += $count
+                    if ($outCount + $errCount -gt 131072) {
+                        throw [IO.InvalidDataException]::new('K5 native output limit.')
+                    }
+                    $errRead = $stderrStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+                }
+            }
+            if ($child.HasExited -and $outDone -and $errDone) { break }
+            [Threading.Thread]::Sleep(10)
+        }
+        $exitCode = $child.ExitCode
+        if ($errCount -ne 0 -and -not $DiscardStderr) {
+            throw [IO.InvalidDataException]::new('K5 native stderr refused.')
+        }
+        $outputText = ''
+        if ($CaptureOutput) {
+            $outputText = [Text.UTF8Encoding]::new($false, $true).GetString($capturedStdout.ToArray())
+        }
+        return [pscustomobject]@{ ExitCode = $exitCode; Stdout = $outputText }
+    } catch {
+        $primaryFailure = $_
+        throw
+    } finally {
+        $cleanupWatch = [Diagnostics.Stopwatch]::StartNew()
+        $cleanupFailed = $false
+        try {
+            if ($started) {
+                if ($childHandle -eq [IntPtr]::Zero -or $child.Handle -ne $childHandle) {
+                    throw [InvalidOperationException]::new('K5 native cleanup failed.')
+                }
+                if (-not $child.HasExited) {
+                    $child.Kill()
+                    if (-not $child.WaitForExit(5000)) {
+                        throw [InvalidOperationException]::new('K5 native cleanup failed.')
+                    }
+                }
+            }
+        } catch { $cleanupFailed = $true }
+        foreach ($ownedStream in @($stdoutStream, $stderrStream, $capturedStdout)) {
+            try { if ($null -ne $ownedStream) { $ownedStream.Close() } }
+            catch { $cleanupFailed = $true }
+        }
+        try { if ($null -ne $child) { $child.Dispose() } }
+        catch { $cleanupFailed = $true }
+        while (($null -ne $outRead -and -not $outRead.IsCompleted) -or
+               ($null -ne $errRead -and -not $errRead.IsCompleted)) {
+            if ($cleanupWatch.Elapsed.TotalSeconds -ge 5) {
+                $cleanupFailed = $true
+                break
+            }
+            [Threading.Thread]::Sleep(10)
+        }
+        if ($cleanupFailed) {
+            $cleanupError = [InvalidOperationException]::new('K5 native cleanup failed.')
+            if ($primaryFailure -is [Management.Automation.ErrorRecord]) {
+                $cleanupError.Data['K5ElementPrimaryErrorRecord'] = $primaryFailure
+            }
+            throw $cleanupError
+        }
+        # The exact started Process and its streams are now closed.
+    }
 }
 
 function Get-K5MediaMtx {
@@ -137,22 +433,21 @@ paths:
 "@
     [IO.File]::WriteAllText($configPath, $config)
 
-    $mediaMtxVersion = @(& $mediaMtx --version 2>&1)
-    if ($LASTEXITCODE -ne 0 -or -not (($mediaMtxVersion -join " ").Contains($MediaMtxVersion))) {
-        foreach ($line in $mediaMtxVersion) { Write-Host ("mediamtx-version: " + $line) }
+    $mediaMtxVersionOutput = Invoke-K5NativeProbe -Executable $mediaMtx -Arguments @("--version") -CaptureOutput
+    if ($mediaMtxVersionOutput.ExitCode -ne 0 -or
+        $mediaMtxVersionOutput.Stdout -isnot [string] -or
+        $mediaMtxVersionOutput.Stdout -cnotin @(
+            ("v" + $MediaMtxVersion), ("v" + $MediaMtxVersion + "`n"),
+            ("v" + $MediaMtxVersion + "`r`n"))) {
         throw "Pinned MediaMTX executable failed its version probe."
     }
 
-    $validation = @(& $mediaMtx --validate-conf $configPath 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-        foreach ($line in $validation) { Write-Host ("mediamtx-validate: " + $line) }
+    $validation = Invoke-K5NativeProbe -Executable $mediaMtx -Arguments @("--validate-conf", $configPath)
+    if ($validation.ExitCode -ne 0) {
         throw "Local synthetic RTSP MediaMTX configuration is invalid."
     }
-    foreach ($line in $validation) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$line)) {
-            Write-Host ("mediamtx-validate: " + $line)
-        }
-    }
+    # Validation output contains a local path and is never echoed or persisted.
+    $validation = $null
 
     if (Test-K5TcpListener "127.0.0.1" 8554) {
         throw "Local synthetic RTSP port 8554 is already in use."
@@ -234,7 +529,13 @@ paths:
             }
         }
         if (-not $cleanupComplete) {
-            throw "Local synthetic RTSP startup failed and owned process cleanup was incomplete."
+            $cleanupFailure = [InvalidOperationException]::new(
+                "Local synthetic RTSP startup failed and owned process cleanup was incomplete."
+            )
+            # Keep the original typed error only in memory for bounded diagnostic
+            # projection. Cleanup remains fatal; never serialize this private link.
+            $cleanupFailure.Data["K5.StartupErrorRecord"] = $startupFailure
+            throw $cleanupFailure
         }
         throw $startupFailure
     }
@@ -297,11 +598,20 @@ try {
         Write-Host "Starting K5 Vision Alpha local synthetic operator test on http://127.0.0.1:$Port"
     } else {
         $resolveCode = "from k5vision.operator_runtime import resolve_public_test_source_ip; import sys; print(resolve_public_test_source_ip(sys.argv[1]))"
-        $resolved = @(& $python -c $resolveCode $PublicRtspSource 2>$null)
-        if ($LASTEXITCODE -ne 0 -or $resolved.Count -ne 1) {
+        $resolved = Invoke-K5NativeProbe -Executable $python -Arguments @("-I", "-B", "-c", $resolveCode, $PublicRtspSource) -CaptureOutput -DiscardStderr
+        if ($resolved.ExitCode -ne 0) {
             throw "Public RTSP alpha source failed validation."
         }
-        $publicSourceIp = ([string]$resolved[0]).Trim()
+        $resolvedLines = @($resolved.Stdout -split "\r\n|\r|\n")
+        if ($resolved.Stdout.EndsWith("`r") -or $resolved.Stdout.EndsWith("`n")) {
+            $resolvedLines = @($resolvedLines[0..($resolvedLines.Count - 2)])
+        }
+        if ($resolvedLines.Count -ne 1) {
+            throw "Public RTSP alpha source failed validation."
+        }
+        $publicSourceIp = ([string]$resolvedLines[0]).Trim()
+        $resolved = $null
+        $resolvedLines = $null
         if ([string]::IsNullOrWhiteSpace($publicSourceIp)) {
             throw "Public RTSP alpha source failed validation."
         }
@@ -338,7 +648,8 @@ try {
 
     Write-Host "Recording is disabled. Test media and temporary K5 state are not retained."
     $arguments = @("-m","k5vision.cli","serve","--operator","--host","127.0.0.1","--port",$Port)
-    $process = Start-Process -FilePath $python -ArgumentList $arguments -PassThru -NoNewWindow
+    $arguments = @("-I","-B") + $arguments
+    $process = Start-Process -FilePath $python -ArgumentList $arguments -PassThru -NoNewWindow -WorkingDirectory (Split-Path -Parent $python)
 
     $baseUri = "http://127.0.0.1:$Port"
     $ready = $false
@@ -402,8 +713,11 @@ try {
             height = 720
         }
     )
-    if (-not $receipt.completed -or $receipt.delivered_frames -lt 1 -or $receipt.presentations -lt 1) {
-        throw "K5 Windows operator alpha test did not complete cleanly."
+    if (-not (Test-K5AlphaOperatorReceipt -Receipt $receipt -AnalyticsRequired $analyticsRequired)) {
+        throw "K5 Windows operator alpha test did not complete the selected acceptance checks."
+    }
+    if ($analyticsRequired) {
+        Write-Host ("K5 analytics PASS: submissions={0}, completions={1}, failures=0" -f $receipt.analytics_provider_submissions, $receipt.analytics_provider_completions)
     }
 
     Write-Host ("K5 operator PASS: frames={0}, presentations={1}" -f $receipt.delivered_frames, $receipt.presentations)
