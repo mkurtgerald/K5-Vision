@@ -535,7 +535,7 @@ def test_windows_synthetic_version_guard_rejects_wrong_executable(tmp_path: Path
         pytest.fail("MediaMTX version guard did not reject the wrong executable", pytrace=False)
 
 
-def test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection() -> None:
+def test_native_probe_dependency_is_exact_and_keeps_existing_smoke_selection() -> None:
     from fnmatch import fnmatchcase
 
     native = (ROOT / ".github/workflows/installed-analytics-candidate.yml").read_text()
@@ -545,9 +545,8 @@ def test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
         for line in push.split("    paths:\n", 1)[1].splitlines()
         if line.strip().startswith("- ")
     ]
-    assert patterns and all(
-        not fnmatchcase("tests/test_windows_alpha_analytics.py", pattern) for pattern in patterns
-    )
+    dependency = "tests/test_windows_alpha_analytics.py"
+    assert [pattern for pattern in patterns if fnmatchcase(dependency, pattern)] == [dependency]
     test_windows_smoke_selects_analytics_and_preserves_lifetime_coverage()
 
 
@@ -1510,7 +1509,7 @@ def test_error_boundary_observer_preserves_all_original_envelope_bytes():
     assert "$entry.Depth -gt 4" in ERROR_SHAPE_OBSERVER
     assert "$shape.records -ge 4" in ERROR_SHAPE_OBSERVER
     assert "Format-List" not in ERROR_SHAPE_OBSERVER and "ToString()" not in ERROR_SHAPE_OBSERVER
-    test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
+    test_native_probe_dependency_is_exact_and_keeps_existing_smoke_selection()
 
 
 def test_error_boundary_shape_rejects_raw_duplicate_unbounded_or_coerced_values():
@@ -3463,7 +3462,7 @@ def test_element_probe_comparison_preserves_original_and_selects_process_prototy
     assert "child.kill()" in ELEMENT_REFERENCE_SCRIPT
     assert "stream.read(65)" in ELEMENT_REFERENCE_SCRIPT
     assert "outputs != [b'', expected]" in ELEMENT_REFERENCE_SCRIPT
-    test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
+    test_native_probe_dependency_is_exact_and_keeps_existing_smoke_selection()
 
 
 def test_element_fixture_setup_failure_reports_phase_without_raw_error(
@@ -3838,7 +3837,7 @@ def test_element_runtime_pair_replaces_compiler_without_widening_probe_or_budget
     assert "stream.read(65)" in ELEMENT_REFERENCE_SCRIPT
     assert "time.monotonic() + 10" in ELEMENT_REFERENCE_SCRIPT
     assert "reference_wait" in ELEMENT_REFERENCE_SCRIPT
-    test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
+    test_native_probe_dependency_is_exact_and_keeps_existing_smoke_selection()
 
 
 def test_element_timeout_recovers_only_complete_checkpoints_after_cleanup(
@@ -4047,7 +4046,7 @@ def test_element_utility_route_is_exact_scoped_and_keeps_native_acceptance():
         '_element_context("python_control")'
     )
     assert "_element_bind_utility(ELEMENT_PROBE_SCRIPT" in main
-    test_version_guard_probe_is_hosted_only_and_keeps_existing_smoke_selection()
+    test_native_probe_dependency_is_exact_and_keeps_existing_smoke_selection()
 
 
 def test_element_imported_probe_requires_complete_exact_prefix_and_existing_schema():

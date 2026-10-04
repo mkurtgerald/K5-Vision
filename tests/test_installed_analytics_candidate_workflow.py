@@ -47,6 +47,39 @@ def test_launcher_branch_requires_only_its_three_applicable_hosted_gates():
     assert "$_.head_branch -ceq $env:K5_CANDIDATE_BRANCH" in gate
 
 
+def test_native_probe_regression_dependency_is_exact_and_hosted_qualified():
+    dependency = "tests/test_windows_alpha_analytics.py"
+    paths = WORKFLOW.read_text().split("    paths:\n", 1)[1].split("\n# Shares", 1)[0]
+    expected = {
+        ".github/workflows/installed-analytics-candidate.yml",
+        "scripts/installed_analytics_witness.py",
+        "scripts/installed_alpha_launcher_witness.py",
+        "scripts/windows_owned_preflight.py",
+        "scripts/build_analytics_runtime_wheel.py",
+        "scripts/windows-alpha/Invoke-K5InstalledAnalyticsWitness.ps1",
+        "scripts/windows-alpha/Start-K5VisionAlpha.ps1",
+        "scripts/windows-alpha/Test-K5VisionAlpha.ps1",
+        "scripts/windows-alpha/Run-K5VisionAlpha.ps1",
+        "scripts/windows-alpha/Invoke-K5VisionAlphaWitness.ps1",
+        "src/k5vision/**",
+        "pyproject.toml",
+        "scripts/windows-alpha/runtime-requirements.txt",
+        "tests/test_installed_analytics_witness.py",
+        "tests/test_installed_alpha_launcher_witness.py",
+        "tests/test_installed_analytics_candidate_workflow.py",
+        dependency,
+    }
+    assert set(paths.splitlines()) == {"      - " + path for path in expected}
+    assert len(paths.splitlines()) == len(expected)
+    hosted = (
+        (ROOT / ".github/workflows/windows-alpha-script-smoke.yml")
+        .read_text()
+        .split("  pull_request:\n", 1)[1]
+        .split("  push:\n", 1)[0]
+    )
+    assert hosted.count('      - "' + dependency + '"\n') == 1
+
+
 def test_candidate_and_main_share_non_cancelling_lane_without_new_main_trigger():
     candidate, baseline = WORKFLOW.read_text(), BASELINE.read_text()
     for text in (candidate, baseline):
