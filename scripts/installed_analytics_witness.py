@@ -124,11 +124,257 @@ RECEIPT_FIELDS = (
 )
 
 
+# A separate diagnostic line never extends the retained success-receipt schema.
+OPERATIONS = {
+    "driver_admission",
+    "archive_candidate",
+    "archive_analytics",
+    "create_venv",
+    "build_k5_wheel",
+    "build_analytics_wheel",
+    "rebuild_analytics_wheel",
+    "install_dependencies",
+    "install_local_wheels",
+    "check_dependencies",
+    "probe_before",
+    "probe_after",
+    "probe_admission",
+    "inspect_gstreamer_version",
+    "inspect_mediamtx_version",
+    "start_rtsp_server",
+    "start_publisher",
+    "publish_gstreamer",
+    "start_application",
+    "wait_rtsp_server",
+    "wait_rtsp_publication",
+    "wait_application",
+    "authenticate",
+    "launch_1",
+    "launch_2",
+    "verify_identity",
+    "cleanup_owned",
+    "receipt_validate",
+    "publish_fixture",
+} | {f"inspect_{element}" for element in GSTREAMER_ELEMENTS}
+OUTCOMES = {"child_failed", "gate_failed", "launch_failed", "timeout", "failed", "cleanup_failed"}
+GATE_STATES = {"not_used", "waiting", "opened", "started", "exited", "launch_failed", "refused"}
+# Ordered: a network retry followed by pip's misleading final 'No matching
+# distribution' must retain the useful network classification.
+ERROR_PATTERNS = (
+    (
+        "dns_failed",
+        rb"getaddrinfo failed|temporary failure in name resolution|"
+        rb"name or service not known|failed to resolve|nodename nor servname",
+    ),
+    ("tls_failed", rb"certificate_verify_failed|certificate verify failed|sslerror"),
+    (
+        "network_failed",
+        rb"newconnectionerror|connection refused|network is unreachable|"
+        rb"connecttimeouterror|readtimeouterror|read timed out|broken pipe|connectionreseterror",
+    ),
+    ("analytics_manifest_invalid", rb"analytics package admission manifest is invalid"),
+    (
+        "analytics_source_mismatch",
+        rb"analytics source inventory|analytics source git blob|"
+        rb"analytics package payload (?:hash|size|is missing)",
+    ),
+    (
+        "analytics_configuration_invalid",
+        rb"configured analytics (?:input is invalid|runtime admission failed)",
+    ),
+    ("model_identity_mismatch", rb"artifact checksum mismatch|artifact size mismatch"),
+    ("seed_identity_mismatch", rb"seed media.*(?:mismatch|identity)|seed paths may not"),
+    ("git_unsafe_repository", rb"detected dubious ownership|unsafe repository"),
+    ("git_repository_missing", rb"not a git repository"),
+    (
+        "git_revision_missing",
+        rb"not a valid object name|bad object|unknown revision|"
+        rb"invalid object name|not a valid commit name",
+    ),
+    ("pip_missing", rb"no module named pip"),
+    (
+        "venv_bootstrap_failed",
+        rb"ensurepip.*(?:non-zero exit|failed)|"
+        rb"ensurepip is not available",
+    ),
+    (
+        "dependency_conflict",
+        rb"resolutionimpossible|conflicting dependencies|"
+        rb"has requirement .* but you have",
+    ),
+    ("dependency_unavailable", rb"no matching distribution|could not find a version"),
+    (
+        "build_backend_failed",
+        rb"metadata-generation-failed|failed building wheel|"
+        rb"backendunavailable|subprocess-exited-with-error",
+    ),
+    (
+        "python_runtime_failed",
+        rb"fatal python error|failed to load.*python|"
+        rb"failed to get the python codec|no python at",
+    ),
+    ("native_library_missing", rb"dll load failed|specified module could not be found"),
+    ("module_missing", rb"no module named"),
+    ("gst_element_unavailable", rb"no element |no such element|no property .* in element"),
+    (
+        "publication_connect_failed",
+        rb"could not connect to|failed to connect to|"
+        rb"could not open resource for writing",
+    ),
+    ("permission_denied", rb"permission denied|access is denied|winerror 5"),
+    ("executable_missing", rb"winerror 2|no such file or directory|cannot find the file"),
+)
+CATEGORIES = (
+    {item[0] for item in ERROR_PATTERNS}
+    | FAILURES
+    | {
+        "unclassified",
+        "readiness_timeout",
+        "gate_protocol_invalid",
+        "output_limit",
+        "collector_incomplete",
+        "http_rejected",
+    }
+)
+DIAGNOSTIC_FIELDS = {
+    "operation",
+    "outcome",
+    "gate_state",
+    "child_exit_code",
+    "relay_exit_code",
+    "timed_out",
+    "category",
+}
+_MAX_STDERR_CLASSIFIED = 65_536
+
+
+def validate_diagnostic(value: object) -> None:
+    if type(value) is not dict or value.keys() != DIAGNOSTIC_FIELDS:
+        raise ValueError("invalid diagnostic")
+    for key, allowed in (
+        ("operation", OPERATIONS),
+        ("outcome", OUTCOMES),
+        ("gate_state", GATE_STATES),
+        ("category", CATEGORIES),
+    ):
+        if type(value[key]) is not str or value[key] not in allowed:
+            raise ValueError("invalid diagnostic")
+    if type(value["timed_out"]) is not bool:
+        raise ValueError("invalid diagnostic")
+    for key in ("child_exit_code", "relay_exit_code"):
+        code = value[key]
+        if code is not None and (type(code) is not int or not -(2**31) <= code < 2**32):
+            raise ValueError("invalid diagnostic")
+
+
+def diagnostic(
+    operation: str,
+    *,
+    outcome: str = "failed",
+    gate_state: str = "not_used",
+    child_exit_code: int | None = None,
+    relay_exit_code: int | None = None,
+    timed_out: bool = False,
+    category: str = "unclassified",
+) -> dict[str, object]:
+    value = dict(
+        operation=operation,
+        outcome=outcome,
+        gate_state=gate_state,
+        child_exit_code=child_exit_code,
+        relay_exit_code=relay_exit_code,
+        timed_out=timed_out,
+        category=category,
+    )
+    validate_diagnostic(value)
+    return value
+
+
+def emit_diagnostic(value: dict[str, object]) -> None:
+    validate_diagnostic(value)
+    print("K5_INSTALLED_DIAGNOSTIC=" + canonical(value).decode("ascii"))
+
+
+def classify_error(raw: bytes) -> str:
+    for category, pattern in ERROR_PATTERNS:
+        if re.search(pattern, raw, re.IGNORECASE):
+            return category
+    return "unclassified"
+
+
+class StderrSummary:
+    """Drain stderr without logging/storing it; retain only enums and exit integers.
+
+    Raw memory is one 4096-byte chunk plus a bounded rolling overlap. Classification
+    stops after 64KiB. Drain/discard continues so verbose native failures cannot block
+    the child; final relay markers are still read after the classification budget.
+    """
+
+    def __init__(self, stream, *, gated: bool, nonce: str = "") -> None:
+        self.category = "unclassified"
+        self.gate_state = "waiting" if gated else "not_used"
+        self.child_exit_code = None
+        self.marker = rb"K5_GATE_" + re.escape(nonce.encode("ascii")) + rb"_"
+        self.bytes_classified = 0
+        self.read_failed = False
+        self.thread = threading.Thread(target=self._read, args=(stream,), daemon=True)
+        self.thread.start()
+
+    def _promote(self, category: str) -> None:
+        order = [item[0] for item in ERROR_PATTERNS]
+        if category in CATEGORIES and (
+            self.category == "unclassified"
+            or category in order
+            and (self.category not in order or order.index(category) < order.index(self.category))
+        ):
+            self.category = category
+
+    def _read(self, stream) -> None:
+        overlap = b""
+        try:
+            while block := stream.read1(4096):
+                window = overlap + block
+                if self.bytes_classified < _MAX_STDERR_CLASSIFIED:
+                    remaining = _MAX_STDERR_CLASSIFIED - self.bytes_classified
+                    self._promote(classify_error(overlap + block[:remaining]))
+                    self.bytes_classified += min(len(block), remaining)
+                for match in re.finditer(
+                    rb"(?:^|\n)"
+                    + self.marker
+                    + rb"STATE=(opened|started|launch_failed|refused)\r?\n",
+                    window,
+                ):
+                    self.gate_state = match[1].decode("ascii")
+                for match in re.finditer(
+                    rb"(?:^|\n)" + self.marker + rb"EXIT=(-?[0-9]{1,10})\r?\n", window
+                ):
+                    code = int(match[1])
+                    if -(2**31) <= code < 2**32:
+                        self.child_exit_code, self.gate_state = code, "exited"
+                for match in re.finditer(rb"(?:^|\n)K5_CHILD_CATEGORY=([a-z_]{1,64})\r?\n", window):
+                    self._promote(match[1].decode("ascii"))
+                overlap = window[-256:]
+        except (OSError, ValueError):
+            self.read_failed = True
+        finally:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                self.read_failed = True
+
+    def finish(self, seconds: float = 5) -> bool:
+        self.thread.join(seconds)
+        return not self.thread.is_alive() and not self.read_failed
+
+
 class WitnessError(RuntimeError):
     """A fixed project-owned code, never an exception from native code or a URL."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, detail: dict[str, object] | None = None) -> None:
         super().__init__(code if code in FAILURES else "unexpected")
+        if detail is not None:
+            validate_diagnostic(detail)
+        self.diagnostic = detail
 
 
 def require(condition: bool, code: str = "identity_mismatch") -> None:
@@ -378,13 +624,28 @@ class OwnedProcess:
         *,
         cwd: Path,
         env: dict[str, str],
+        operation: str,
         stdout: object = subprocess.DEVNULL,
     ) -> None:
-        self.job = WindowsJob() if os.name == "nt" else None
+        require(operation in OPERATIONS, "admission_failed")
+        self.operation = operation
+        self.stderr_summary = None
+        self.gated = os.name == "nt"
+        self.gate_nonce = secrets.token_hex(16) if self.gated else ""
+        self.job = None
         self.process: subprocess.Popen[bytes] | None = None
         try:
+            self.job = WindowsJob() if self.gated else None
             command = (
-                [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--gate", *arguments]
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(Path(__file__).resolve()),
+                    "--gate",
+                    self.gate_nonce,
+                    *arguments,
+                ]
                 if self.job is not None
                 else arguments
             )
@@ -394,16 +655,67 @@ class OwnedProcess:
                 env=env,
                 stdin=subprocess.PIPE if self.job is not None else subprocess.DEVNULL,
                 stdout=stdout,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            self.stderr_summary = StderrSummary(
+                self.process.stderr, gated=self.gated, nonce=self.gate_nonce
             )
             if self.job is not None:
                 self.job.assign(self.process)
                 self.process.stdin.write(b"1")
                 self.process.stdin.flush()
                 self.process.stdin.close()
-        except BaseException:
+        except BaseException as error:
             self.close()
-            raise
+            detail = diagnostic(
+                operation,
+                outcome="launch_failed",
+                gate_state="waiting" if self.gated else "not_used",
+                category=classify_error(str(error)[:_MAX_STDERR_CLASSIFIED].encode()),
+            )
+            raise WitnessError(
+                str(error) if isinstance(error, WitnessError) else "child_failed", detail
+            ) from None
+
+    def failure(self, code: str = "child_failed", *, timed_out: bool = False) -> WitnessError:
+        relay_code = None if self.process is None else self.process.poll()
+        summary = self.stderr_summary
+        if relay_code is not None and summary is not None:
+            summary.finish()
+        state = ("waiting" if self.gated else "not_used") if summary is None else summary.gate_state
+        child_code = (
+            (None if summary is None else summary.child_exit_code) if self.gated else relay_code
+        )
+        category = "unclassified" if summary is None else summary.category
+        if category == "unclassified" and code != "child_failed":
+            category = code
+        outcome = (
+            "timeout"
+            if timed_out
+            else (
+                "launch_failed"
+                if state == "launch_failed"
+                else "gate_failed"
+                if self.gated and state != "exited"
+                else "child_failed"
+            )
+        )
+        return WitnessError(
+            code,
+            diagnostic(
+                self.operation,
+                outcome=outcome,
+                gate_state=state,
+                child_exit_code=child_code,
+                relay_exit_code=relay_code if self.gated else None,
+                timed_out=timed_out,
+                category=category,
+            ),
+        )
+
+    def ensure_running(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            raise self.failure()
 
     def close(self) -> None:
         process, self.process = self.process, None
@@ -413,6 +725,11 @@ class OwnedProcess:
                 job.close()
             elif process is not None and process.poll() is None:
                 process.terminate()
+        except BaseException:
+            raise WitnessError(
+                "cleanup_incomplete",
+                diagnostic(self.operation, outcome="cleanup_failed", category="cleanup_incomplete"),
+            ) from None
         finally:
             if process is not None:
                 try:
@@ -422,15 +739,51 @@ class OwnedProcess:
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        raise WitnessError("cleanup_incomplete") from None
+                        raise WitnessError(
+                            "cleanup_incomplete",
+                            diagnostic(
+                                self.operation,
+                                outcome="cleanup_failed",
+                                category="cleanup_incomplete",
+                            ),
+                        ) from None
+            if self.stderr_summary is not None and not self.stderr_summary.finish():
+                raise WitnessError(
+                    "cleanup_incomplete",
+                    diagnostic(
+                        self.operation, outcome="cleanup_failed", category="collector_incomplete"
+                    ),
+                )
 
     def wait(self, seconds: float) -> None:
         require(self.process is not None, "child_failed")
         try:
             code = self.process.wait(timeout=seconds)
         except subprocess.TimeoutExpired:
-            raise WitnessError("child_timeout") from None
-        require(code == 0, "child_failed")
+            raise self.failure("child_timeout", timed_out=True) from None
+        if code != 0:
+            raise self.failure()
+        if self.stderr_summary is not None and not self.stderr_summary.finish():
+            raise WitnessError(
+                "cleanup_incomplete",
+                diagnostic(
+                    self.operation, outcome="cleanup_failed", category="collector_incomplete"
+                ),
+            )
+
+
+def close_after_failure(owned: OwnedProcess, original: BaseException | None) -> None:
+    try:
+        owned.close()
+    except BaseException as cleanup_error:
+        if isinstance(original, WitnessError) and original.diagnostic is not None:
+            emit_diagnostic(original.diagnostic)
+        detail = cleanup_error.diagnostic if isinstance(cleanup_error, WitnessError) else None
+        raise WitnessError(
+            "cleanup_incomplete",
+            detail
+            or diagnostic(owned.operation, outcome="cleanup_failed", category="cleanup_incomplete"),
+        ) from None
 
 
 def run(
@@ -438,19 +791,26 @@ def run(
     *,
     cwd: Path,
     env: dict[str, str],
+    operation: str,
     seconds: float = 90,
     stdout: object = subprocess.DEVNULL,
 ) -> None:
-    owned = OwnedProcess(arguments, cwd=cwd, env=env, stdout=stdout)
+    owned = OwnedProcess(arguments, cwd=cwd, env=env, operation=operation, stdout=stdout)
+    original = None
     try:
         owned.wait(seconds)
+    except BaseException as error:
+        original = error
+        raise
     finally:
-        owned.close()
+        close_after_failure(owned, original)
 
 
-def capture(arguments: list[str], *, cwd: Path, env: dict[str, str], limit: int = 131_072) -> bytes:
+def capture(
+    arguments: list[str], *, cwd: Path, env: dict[str, str], operation: str, limit: int = 131_072
+) -> bytes:
     """Bounded in-memory diagnostics, never persisted or printed."""
-    owned = OwnedProcess(arguments, cwd=cwd, env=env, stdout=subprocess.PIPE)
+    owned = OwnedProcess(arguments, cwd=cwd, env=env, operation=operation, stdout=subprocess.PIPE)
     result: list[bytes] = []
 
     def read() -> None:
@@ -458,16 +818,30 @@ def capture(arguments: list[str], *, cwd: Path, env: dict[str, str], limit: int 
 
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
+    original = None
     try:
         reader.join(15)
-        require(not reader.is_alive(), "child_timeout")
-        require(len(result) == 1 and len(result[0]) <= limit, "output_invalid")
+        if reader.is_alive():
+            raise owned.failure("child_timeout", timed_out=True)
+        if len(result) != 1 or len(result[0]) > limit:
+            raise WitnessError("output_invalid", diagnostic(operation, category="output_limit"))
         owned.wait(5)
         return result[0]
+    except BaseException as error:
+        original = error
+        raise
     finally:
-        owned.close()
-        reader.join(5)
-        require(not reader.is_alive(), "cleanup_incomplete")
+        try:
+            close_after_failure(owned, original)
+        finally:
+            reader.join(5)
+            if reader.is_alive():
+                raise WitnessError(
+                    "cleanup_incomplete",
+                    diagnostic(
+                        operation, outcome="cleanup_failed", category="collector_incomplete"
+                    ),
+                )
 
 
 def inspect_plugin(raw: bytes, expected: tuple[str, str, str], gst: Path) -> str:
@@ -790,19 +1164,28 @@ def publish(inputs: Path) -> None:
         ]
         # This child inherits the controller-owned Windows Job; it cannot outlive
         # the publisher fixture. No command shell or detached grandchildren.
-        child = subprocess.Popen(
-            arguments,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        child = OwnedProcess(
+            arguments, cwd=Path.cwd(), env=dict(os.environ), operation="publish_gstreamer"
         )
-        peer, address = listener.accept()
+        try:
+            peer, address = listener.accept()
+        except OSError:
+            child.ensure_running()
+            raise WitnessError(
+                "readiness_failed",
+                diagnostic(
+                    "publish_gstreamer",
+                    outcome="timeout",
+                    timed_out=True,
+                    category="readiness_timeout",
+                ),
+            ) from None
         require(address[0] == "127.0.0.1", "admission_failed")
         peer.settimeout(10)
         listener.close()
         deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
-            require(child.poll() is None, "child_failed")
+            child.ensure_running()
             require(frame.shape == (height, width, 3), "admission_failed")
             peer.sendall(frame.tobytes())
             ok, frame = capture.read()
@@ -816,13 +1199,7 @@ def publish(inputs: Path) -> None:
             peer.close()
         capture.release()
         if child is not None:
-            if child.poll() is None:
-                child.terminate()
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait(timeout=5)
+            child.close()
 
 
 def rtsp_listener_ready(port: int) -> bool:
@@ -881,21 +1258,48 @@ def rtsp_ready(port: int) -> bool:
         return True
 
 
-def wait_ready(check: object, processes: list[OwnedProcess], seconds: float = 20) -> None:
+def wait_ready(
+    check: object, processes: list[OwnedProcess], seconds: float = 20, *, operation: str
+) -> None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        require(
-            all(p.process is not None and p.process.poll() is None for p in processes),
-            "readiness_failed",
-        )
+        for process in processes:
+            process.ensure_running()
         try:
             if check():
                 require(time.monotonic() < deadline, "readiness_failed")
                 return
         except (OSError, urllib.error.URLError):
             pass
+        except Exception as error:
+            if isinstance(error, WitnessError) and error.diagnostic is not None:
+                raise
+            raise WitnessError(
+                "readiness_failed", diagnostic(operation, category="readiness_failed")
+            ) from None
         time.sleep(0.1)
-    raise WitnessError("readiness_failed")
+    raise WitnessError(
+        "readiness_failed",
+        diagnostic(operation, outcome="timeout", timed_out=True, category="readiness_timeout"),
+    )
+
+
+def archive_command(repository: Path, output: Path, revision: str) -> list[str]:
+    # Git archive performs checkout conversion unless overridden. Preserve exact
+    # pinned LF bytes without changing the repository, user or system Git config.
+    return [
+        "git",
+        "-c",
+        "core.autocrlf=false",
+        "-c",
+        "core.eol=lf",
+        "-C",
+        str(repository),
+        "archive",
+        "--format=zip",
+        f"--output={output}",
+        revision,
+    ]
 
 
 def extract_archive(path: Path, target: Path) -> None:
@@ -970,6 +1374,8 @@ def execute(args: argparse.Namespace) -> int:
                 False if key in {"completed", "analytics_enabled"} else 0
             )
     owned: list[OwnedProcess] = []
+    failure_detail = None
+    operation = "driver_admission"
     work: Path | None = None
     output = args.output.absolute()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1001,39 +1407,29 @@ def execute(args: argparse.Namespace) -> int:
         # The archive binds all built K5 bytes to the requested immutable candidate,
         # unaffected by dirty/untracked checkout files, editable installs or cwd.
         document["stage"] = "build"
+        operation = "archive_candidate"
+        operation = "archive_candidate"
         run(
-            [
-                "git",
-                "-C",
-                str(repo),
-                "archive",
-                "--format=zip",
-                f"--output={archive}",
-                args.revision,
-            ],
+            archive_command(repo, archive, args.revision),
             cwd=work,
             env=env,
+            operation="archive_candidate",
         )
         extract_archive(archive, source)
         # A preceding seed-preparation step may have produced __pycache__ in the
         # donor checkout. Export exact tracked bytes, never delete another step's
         # work or smuggle those caches into the reproducible wrapper.
         donor_archive, donor_source = work / "analytics.zip", work / "analytics-source"
+        operation = "archive_analytics"
         run(
-            [
-                "git",
-                "-C",
-                str(analytics),
-                "archive",
-                "--format=zip",
-                f"--output={donor_archive}",
-                ANALYTICS_REVISION,
-            ],
+            archive_command(analytics, donor_archive, ANALYTICS_REVISION),
             cwd=work,
             env=env,
+            operation="archive_analytics",
         )
         extract_archive(donor_archive, donor_source)
         analytics = donor_source
+        operation = "verify_identity"
         driver = work / "installed_analytics_witness.py"
         shutil.copyfile(source / "scripts" / "installed_analytics_witness.py", driver)
         require(
@@ -1041,9 +1437,16 @@ def execute(args: argparse.Namespace) -> int:
             == Path(__file__).read_bytes().replace(b"\r\n", b"\n")
         )
         python = work / "venv" / "Scripts" / "python.exe"
-        run([sys.executable, "-I", "-B", "-m", "venv", str(work / "venv")], cwd=work, env=env)
+        operation = "create_venv"
+        run(
+            [sys.executable, "-I", "-B", "-m", "venv", str(work / "venv")],
+            cwd=work,
+            env=env,
+            operation="create_venv",
+        )
         wheels = work / "wheels"
         wheels.mkdir()
+        operation = "build_k5_wheel"
         run(
             [
                 str(python),
@@ -1060,9 +1463,11 @@ def execute(args: argparse.Namespace) -> int:
             cwd=work,
             env=env,
             seconds=180,
+            operation="build_k5_wheel",
         )
         k5_wheels = list(wheels.glob("k5_vision-*.whl"))
         require(len(k5_wheels) == 1)
+        operation = "build_analytics_wheel"
         run(
             [
                 str(python),
@@ -1076,11 +1481,13 @@ def execute(args: argparse.Namespace) -> int:
             ],
             cwd=work,
             env=env,
+            operation="build_analytics_wheel",
         )
         analytics_wheels = list(wheels.glob("k5_analytics_runtime-*.whl"))
         require(len(analytics_wheels) == 1)
         # Independently rebuild to establish wrapper determinism on this host.
         repeat = work / "repeat"
+        operation = "rebuild_analytics_wheel"
         run(
             [
                 str(python),
@@ -1094,6 +1501,7 @@ def execute(args: argparse.Namespace) -> int:
             ],
             cwd=work,
             env=env,
+            operation="rebuild_analytics_wheel",
         )
         require(file_hash(analytics_wheels[0]) == file_hash(repeat / analytics_wheels[0].name))
         payload = wheel_payload(k5_wheels[0])
@@ -1106,12 +1514,14 @@ def execute(args: argparse.Namespace) -> int:
             ),
         )
         document["stage"] = "install"
+        operation = "install_dependencies"
         base = source / "scripts/windows-alpha/runtime-requirements.txt"
         versions = {**requirements(base), **RUNTIME_VERSIONS, **WINDOWS_RUNTIME_VERSIONS}
         constraints = work / "constraints.txt"
         constraints.write_text(
             "\n".join(f"{name}=={version}" for name, version in versions.items())
         )
+        operation = "install_dependencies"
         run(
             [
                 str(python),
@@ -1133,7 +1543,9 @@ def execute(args: argparse.Namespace) -> int:
             cwd=work,
             env=env,
             seconds=300,
+            operation="install_dependencies",
         )
+        operation = "install_local_wheels"
         run(
             [
                 str(python),
@@ -1150,8 +1562,15 @@ def execute(args: argparse.Namespace) -> int:
             ],
             cwd=work,
             env=env,
+            operation="install_local_wheels",
         )
-        run([str(python), "-I", "-B", "-m", "pip", "check"], cwd=work, env=env)
+        operation = "check_dependencies"
+        run(
+            [str(python), "-I", "-B", "-m", "pip", "check"],
+            cwd=work,
+            env=env,
+            operation="check_dependencies",
+        )
         config = work / "analytics.json"
         config.write_bytes(
             canonical(
@@ -1171,6 +1590,8 @@ def execute(args: argparse.Namespace) -> int:
             )
         )
         document["stage"] = "probe"
+        operation = "probe_before"
+        operation = "probe_before"
         run(
             [
                 str(python),
@@ -1186,6 +1607,7 @@ def execute(args: argparse.Namespace) -> int:
             cwd=work,
             env=env,
             seconds=120,
+            operation="probe_before",
         )
         checked = read_json(probe_output)
         require(
@@ -1220,10 +1642,26 @@ def execute(args: argparse.Namespace) -> int:
             ([str(native_files[1]), "--version"], "1.28.7"),
             ([str(mediamtx), "--version"], "1.21.1"),
         ):
-            version = capture(arguments, cwd=work, env=env, limit=4096).decode()
+            operation = (
+                "inspect_gstreamer_version" if expected == "1.28.7" else "inspect_mediamtx_version"
+            )
+            version = capture(
+                arguments,
+                cwd=work,
+                env=env,
+                limit=4096,
+                operation=(
+                    "inspect_gstreamer_version"
+                    if expected == "1.28.7"
+                    else "inspect_mediamtx_version"
+                ),
+            ).decode()
             require(re.search(r"(?<![0-9.])" + re.escape(expected) + r"(?![0-9.])", version))
         for element, expected in GSTREAMER_ELEMENTS.items():
-            raw = capture([str(native_files[1]), element], cwd=work, env=env)
+            operation = f"inspect_{element}"
+            raw = capture(
+                [str(native_files[1]), element], cwd=work, env=env, operation=f"inspect_{element}"
+            )
             native_hashes[element] = inspect_plugin(raw, expected, gst)
         libraries = sorted((gst / "bin").glob("*.dll"))
         require(bool(libraries))
@@ -1231,6 +1669,7 @@ def execute(args: argparse.Namespace) -> int:
             native_hashes["bin/" + library.name] = file_hash(local_path(library))
         identities["native_identity_sha256"] = digest(native_hashes)
         document["stage"] = "fixture"
+        operation = "wait_rtsp_publication"
         port, rtsp_port = free_port(), free_port()
         require(port != rtsp_port, "port_occupied")
         require_free_port(port)
@@ -1259,9 +1698,13 @@ def execute(args: argparse.Namespace) -> int:
                 ]
             )
         )
-        server = OwnedProcess([str(mediamtx), str(server_config)], cwd=work, env=env)
+        server = OwnedProcess(
+            [str(mediamtx), str(server_config)], cwd=work, env=env, operation="start_rtsp_server"
+        )
         owned.append(server)
-        wait_ready(lambda: rtsp_listener_ready(rtsp_port), [server], 10)
+        wait_ready(
+            lambda: rtsp_listener_ready(rtsp_port), [server], 10, operation="wait_rtsp_server"
+        )
         publication = work / "publication.json"
         publication.write_bytes(
             canonical(
@@ -1276,10 +1719,12 @@ def execute(args: argparse.Namespace) -> int:
             [str(python), "-I", "-B", str(driver), "--publish", "--inputs", str(publication)],
             cwd=work,
             env=env,
+            operation="start_publisher",
         )
         owned.append(publisher)
-        wait_ready(lambda: rtsp_ready(rtsp_port), owned, 20)
+        wait_ready(lambda: rtsp_ready(rtsp_port), owned, 20, operation="wait_rtsp_publication")
         document["stage"] = "app"
+        operation = "wait_application"
         admin, service = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         env.update(
             K5_CONTROL_PLANE_SITE_ID="witness-" + secrets.token_hex(16),
@@ -1309,14 +1754,17 @@ def execute(args: argparse.Namespace) -> int:
             ],
             cwd=work,
             env=env,
+            operation="start_application",
         )
         owned.append(app)
-        wait_ready(lambda: health_ready(port), owned, 30)
+        wait_ready(lambda: health_ready(port), owned, 30, operation="wait_application")
         document["stage"] = "auth"
+        operation = "authenticate"
         session, body = authenticate(port, admin, service, rtsp_port)
         document["service_token_rejected"] = True
         for attempt in (1, 2):
             document["stage"] = f"live_{attempt}"
+            operation = f"launch_{attempt}"
             code, live = api(port, "/api/v1/operator/live", body=body, token=session, timeout=75)
             require(code == 200, "receipt_invalid")
             metrics = validate_live_receipt(live)
@@ -1326,10 +1774,13 @@ def execute(args: argparse.Namespace) -> int:
                 "receipt_invalid",
             )
             document.update({f"run_{attempt}_{key}": value for key, value in metrics.items()})
-            require(all(item.process.poll() is None for item in owned), "child_failed")
+            for item in owned:
+                item.ensure_running()
         document["stage"] = "verify"
+        operation = "verify_identity"
         # Re-admit installed payload/models/dependencies after both launches.
         after = work / "probe-after.json"
+        operation = "probe_after"
         run(
             [
                 str(python),
@@ -1345,18 +1796,42 @@ def execute(args: argparse.Namespace) -> int:
             cwd=work,
             env=env,
             seconds=120,
+            operation="probe_after",
         )
         require(read_json(after) == checked)
         document["completed"] = True
     except BaseException as error:
         document["failure_code"] = str(error) if isinstance(error, WitnessError) else "unexpected"
+        failure_detail = error.diagnostic if isinstance(error, WitnessError) else None
+        if failure_detail is None:
+            category = (
+                str(error)
+                if isinstance(error, WitnessError)
+                else classify_error(str(error)[:_MAX_STDERR_CLASSIFIED].encode())
+            )
+            timed_out = isinstance(error, TimeoutError) or (
+                isinstance(error, urllib.error.URLError) and isinstance(error.reason, TimeoutError)
+            )
+            failure_detail = diagnostic(
+                operation,
+                category=category,
+                timed_out=timed_out,
+                outcome="timeout" if timed_out else "failed",
+            )
     finally:
         cleanup = True
+        cleanup_detail = None
         for process in reversed(owned):
             try:
                 process.close()
-            except BaseException:
+            except BaseException as error:
                 cleanup = False
+                if cleanup_detail is None:
+                    cleanup_detail = (
+                        error.diagnostic if isinstance(error, WitnessError) else None
+                    ) or diagnostic(
+                        process.operation, outcome="cleanup_failed", category="cleanup_incomplete"
+                    )
         if work is not None:
             try:
                 shutil.rmtree(work)
@@ -1367,8 +1842,15 @@ def execute(args: argparse.Namespace) -> int:
         document["cleanup_complete"] = cleanup
         if not cleanup:
             document.update(completed=False, failure_code="cleanup_incomplete")
+            if failure_detail is not None:
+                emit_diagnostic(failure_detail)
+            failure_detail = cleanup_detail or diagnostic(
+                "cleanup_owned", outcome="cleanup_failed", category="cleanup_incomplete"
+            )
         if document["completed"]:
             document["stage"] = "complete"
+        elif failure_detail is not None:
+            emit_diagnostic(failure_detail)
         validate_receipt(
             document, revision=args.revision, identities=identities, success=document["completed"]
         )
@@ -1384,9 +1866,27 @@ def execute(args: argparse.Namespace) -> int:
 def gated_child(arguments: list[str]) -> int:
     # No requested executable can start before its stdlib-only parent belongs
     # to the freshly-created Job. EOF/failed assignment never opens the gate.
-    if not arguments or sys.stdin.buffer.read(1) != b"1":
+    if len(arguments) < 2 or re.fullmatch(r"[0-9a-f]{32}", arguments[0]) is None:
         return 1
-    return subprocess.call(arguments, stdin=subprocess.DEVNULL)
+    marker = "K5_GATE_" + arguments[0] + "_"
+    arguments = arguments[1:]
+    if sys.stdin.buffer.read(1) != b"1":
+        print("\n" + marker + "STATE=refused", file=sys.stderr, flush=True)
+        return 1
+    print("\n" + marker + "STATE=opened", file=sys.stderr, flush=True)
+    try:
+        child = subprocess.Popen(arguments, stdin=subprocess.DEVNULL)
+    except OSError as error:
+        print("\n" + marker + "STATE=launch_failed", file=sys.stderr, flush=True)
+        category = classify_error(str(error)[:_MAX_STDERR_CLASSIFIED].encode())
+        print("K5_CHILD_CATEGORY=" + category, file=sys.stderr, flush=True)
+        return 1
+    print("\n" + marker + "STATE=started", file=sys.stderr, flush=True)
+    code = child.wait()
+    if not -(2**31) <= code < 2**32:
+        return 1
+    print("\n" + marker + f"EXIT={code}", file=sys.stderr, flush=True)
+    return code
 
 
 def main() -> int:
@@ -1437,7 +1937,25 @@ def main() -> int:
             "admission_failed",
         )
         return execute(args)
-    except BaseException:
+    except BaseException as error:
+        detail = error.diagnostic if isinstance(error, WitnessError) else None
+        category = (
+            detail["category"]
+            if detail is not None
+            else str(error)
+            if isinstance(error, WitnessError)
+            else classify_error(str(error)[:_MAX_STDERR_CLASSIFIED].encode())
+        )
+        if args.probe or args.publish:
+            print("K5_CHILD_CATEGORY=" + category, file=sys.stderr, flush=True)
+        else:
+            emit_diagnostic(
+                detail
+                or diagnostic(
+                    "receipt_validate" if args.validate_receipt else "driver_admission",
+                    category=category,
+                )
+            )
         print("Installed analytics witness failed closed")
         return 1
 

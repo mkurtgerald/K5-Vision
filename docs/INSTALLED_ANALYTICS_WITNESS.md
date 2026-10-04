@@ -160,3 +160,45 @@ or persistent PATH change. Both resulting local `.git` directories and exact
 HEAD revisions are checked before runtime provisioning. The hosted source gates,
 authentication, installed payload verification and two 225-frame launches stay
 required.
+
+## Exact archive bytes and bounded failure diagnostics
+
+Both source exports use command-scoped `core.autocrlf=false` and `core.eol=lf`.
+Git archive otherwise honors checkout conversion, so a Windows CRLF setting can
+change the pinned manifest and donor source bytes before wheel building. A
+portable regression reproduces that corruption and checks exact restoration.
+No repository, user or machine Git configuration is changed. This demonstrated
+portability defect is not proof of the cause of an earlier opaque native failure.
+
+Each bounded subprocess, native inventory query and readiness wait has a fixed
+operation label, including both archives, venv creation, K5 wheel building, both
+Analytics wrapper builds, dependency/wheel installation, pip check, before/after
+admission, publisher and app startup. Non-child build postconditions retain the
+operation that produced their input.
+
+Failures emit a separate `K5_INSTALLED_DIAGNOSTIC=` line with exactly seven scalar
+fields: `operation`, `outcome`, `gate_state`, `child_exit_code`, `relay_exit_code`,
+`timed_out`, and `category`. Operations/outcomes/categories are source-owned
+allowlists; exit codes are bounded integers or null. The Windows gate reports
+whether execution was admitted, target launch failed, or the target actually
+exited. A per-child nonce and leading-newline framing distinguish those markers
+from unrelated stderr, including a target's last line without a newline. The
+nonce and child output are never included in the diagnostic. These markers do
+not decide acceptance; actual subprocess exit status and the existing receipt
+and identity gates remain authoritative.
+
+Stderr is drained in memory without writing or echoing raw output. Classification
+examines at most 64 KiB, with a 4096-byte read buffer and 256-byte overlap; remaining
+bytes are discarded while fixed control markers can still be consumed. Only an
+allowlisted category survives. DNS/TLS/network errors take priority over pip's
+secondary final “No matching distribution” message. Unclassified output remains
+`unclassified`; it is never substituted into a message. Missing executable,
+manifest/source mismatch, dependency, native-library and GStreamer element errors
+therefore become bounded clues without exposing URLs, paths, tokens or exception
+text. A classified child failure followed by cleanup failure produces both safe
+diagnostics so cleanup cannot erase the original cause.
+
+The strict 35-field success receipt, all existing time budgets, clean environment,
+package/model hash requirements and physical acceptance thresholds are unchanged.
+Diagnostic labels identify the failing boundary; they do not establish native
+success, authorize another run or relax a failed prerequisite.

@@ -53,8 +53,9 @@ python scripts/build_analytics_runtime_wheel.py \
 
 The stdlib-only builder rejects missing, changed, additional or symlinked package
 source and mismatched notices before producing an artifact. Use a clean source
-directory without Python caches or automatic newline conversion (a Git archive
-export preserves the exact bytes on Windows too). It writes a sorted, uncompressed ZIP wheel
+directory without Python caches or automatic newline conversion. Export with
+`git -c core.autocrlf=false -c core.eol=lf archive` so Windows Git configuration
+cannot rewrite the pinned LF bytes. It writes a sorted, uncompressed ZIP wheel
 with fixed timestamps, fixed file permissions and a complete hashed `RECORD`.
 No environment timestamps, source paths, build backend or network state enter
 the bytes. Rebuilding from the same admitted inputs yields an identical wheel.
