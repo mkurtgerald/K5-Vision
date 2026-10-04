@@ -23,6 +23,7 @@ on:
       - "tests/test_public_test_operator_runtime.py"
       - "tests/test_windows_alpha_direct_witness.py"
       - "tests/test_windows_alpha_analytics.py"
+      - "tests/test_windows_alpha_preflight_boundary.py"
       - "scripts/installed_analytics_witness.py"
       - "scripts/installed_alpha_launcher_witness.py"
       - "tests/test_installed_analytics_witness.py"
@@ -52,6 +53,7 @@ on:
       - "tests/test_public_test_operator_runtime.py"
       - "tests/test_windows_alpha_direct_witness.py"
       - "tests/test_windows_alpha_analytics.py"
+      - "tests/test_windows_alpha_preflight_boundary.py"
       - "scripts/installed_analytics_witness.py"
       - "scripts/installed_alpha_launcher_witness.py"
       - "tests/test_installed_analytics_witness.py"
@@ -178,3 +180,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Owned Windows relay boundary qualification failed." }
           python -m pytest tests/test_installed_alpha_launcher_witness.py::test_windows_real_directory_guard_remembers_created_then_deleted_session --no-cov -q -rP
           if ($LASTEXITCODE -ne 0) { throw "Owned Windows directory observation qualification failed." }
+          $env:K5_PREFLIGHT_PROBE_PYTHON = Join-Path $env:RUNNER_TEMP "k5-alpha-runtime-probe\Scripts\python.exe"
+          python -m pytest tests/test_windows_alpha_preflight_boundary.py --no-cov -q -s
+          if ($LASTEXITCODE -ne 0) { throw "Owned Start preflight boundary observation failed." }
