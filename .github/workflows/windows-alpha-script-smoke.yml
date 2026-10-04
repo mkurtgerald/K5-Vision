@@ -6,7 +6,11 @@ on:
       - "Install-K5VisionAlpha.ps1"
       - "scripts/windows-alpha/**"
       - "src/k5vision/operator_runtime.py"
+      - "src/k5vision/main.py"
+      - "src/k5vision/stage_one_app.py"
+      - "tests/test_app_resource_lifetime.py"
       - "src/k5vision/cli.py"
+      - "tests/test_cli.py"
       - "src/k5vision/identity_state.py"
       - "src/k5vision/windows_identity_security.py"
       - "src/k5vision/recovery_admin.py"
@@ -19,13 +23,26 @@ on:
       - "tests/test_windows_alpha_upgrade.py"
       - "tests/test_public_test_operator_runtime.py"
       - "tests/test_windows_alpha_direct_witness.py"
+      - "tests/test_windows_alpha_analytics.py"
+      - "tests/test_windows_alpha_preflight_boundary.py"
+      - "scripts/windows_owned_preflight.py"
+      - "scripts/installed_analytics_witness.py"
+      - "scripts/installed_alpha_launcher_witness.py"
+      - "tests/test_installed_analytics_witness.py"
+      - "tests/test_installed_alpha_launcher_witness.py"
+      - "tests/test_installed_analytics_candidate_workflow.py"
+      - ".github/workflows/installed-analytics-candidate.yml"
       - ".github/workflows/windows-alpha-script-smoke.yml"
   push:
     branches: [main]
     paths:
       - "scripts/windows-alpha/**"
       - "src/k5vision/operator_runtime.py"
+      - "src/k5vision/main.py"
+      - "src/k5vision/stage_one_app.py"
+      - "tests/test_app_resource_lifetime.py"
       - "src/k5vision/cli.py"
+      - "tests/test_cli.py"
       - "src/k5vision/identity_state.py"
       - "src/k5vision/windows_identity_security.py"
       - "src/k5vision/recovery_admin.py"
@@ -38,6 +55,15 @@ on:
       - "tests/test_windows_alpha_upgrade.py"
       - "tests/test_public_test_operator_runtime.py"
       - "tests/test_windows_alpha_direct_witness.py"
+      - "tests/test_windows_alpha_analytics.py"
+      - "tests/test_windows_alpha_preflight_boundary.py"
+      - "scripts/windows_owned_preflight.py"
+      - "scripts/installed_analytics_witness.py"
+      - "scripts/installed_alpha_launcher_witness.py"
+      - "tests/test_installed_analytics_witness.py"
+      - "tests/test_installed_alpha_launcher_witness.py"
+      - "tests/test_installed_analytics_candidate_workflow.py"
+      - ".github/workflows/installed-analytics-candidate.yml"
       - ".github/workflows/windows-alpha-script-smoke.yml"
 
 permissions:
@@ -75,6 +101,7 @@ jobs:
           if ($failed) { throw "Windows alpha PowerShell parse failed." }
 
       - name: Set up Python
+        id: runtime_python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
@@ -102,7 +129,7 @@ jobs:
       - name: Run Windows alpha boundary regressions
         shell: powershell
         run: |
-          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_windows_alpha_upgrade.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py -q --no-cov
+          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_windows_alpha_upgrade.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py tests/test_app_resource_lifetime.py tests/test_windows_alpha_analytics.py tests/test_cli.py -q --no-cov
 
       - name: Qualify Windows local recovery identity
         shell: powershell
@@ -142,3 +169,21 @@ jobs:
           '@
           $qualification | python -
           if ($LASTEXITCODE -ne 0) { throw "Windows local recovery identity qualification failed." }
+
+      - name: Verify exact candidate workflow and owned Windows relay boundary
+        shell: powershell
+        env:
+          K5_SETUP_PYTHON: ${{ steps.runtime_python.outputs.python-path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:K5_WITNESS_BASE_PYTHON = [IO.Path]::GetFullPath($env:K5_SETUP_PYTHON)
+          $env:K5_WITNESS_BASE_PYTHON_SHA256 = (Get-FileHash -LiteralPath $env:K5_WITNESS_BASE_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant()
+          python -m pytest tests/test_installed_analytics_candidate_workflow.py --no-cov -q
+          if ($LASTEXITCODE -ne 0) { throw "Candidate workflow boundary qualification failed." }
+          python -m pytest tests/test_installed_analytics_witness.py -k "typed_job_accounting or gate_uses_independently or gate_base_admission or environment_preserves_only_explicit_gate or dependency_download_has_fixed or windows_real_venv_child_is_owned or real_windows_job_fixture" --no-cov -q -rP
+          if ($LASTEXITCODE -ne 0) { throw "Owned Windows relay boundary qualification failed." }
+          python -m pytest tests/test_installed_alpha_launcher_witness.py::test_windows_real_directory_guard_remembers_created_then_deleted_session --no-cov -q -rP
+          if ($LASTEXITCODE -ne 0) { throw "Owned Windows directory observation qualification failed." }
+          $env:K5_PREFLIGHT_PROBE_PYTHON = Join-Path $env:RUNNER_TEMP "k5-alpha-runtime-probe\Scripts\python.exe"
+          python -m pytest tests/test_windows_alpha_preflight_boundary.py --no-cov -q -s
+          if ($LASTEXITCODE -ne 0) { throw "Owned Start preflight boundary observation failed." }

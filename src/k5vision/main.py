@@ -8,6 +8,7 @@ from hmac import compare_digest
 from math import ceil
 from os import environ
 from pathlib import Path
+from threading import Lock
 from time import monotonic
 from typing import Annotated
 from uuid import UUID
@@ -491,4 +492,25 @@ def create_app(
     return application
 
 
-app = create_app()
+# Importing a factory must not open a second, unowned registry pair. Uvicorn's
+# supported ``k5vision.main:app`` entry point requests this attribute explicitly.
+# Keep an already-created app and its lock across importlib.reload; its original
+# lifespan remains the owner of the registries and closes them normally.
+if "_default_app_lock" not in globals():
+    _default_app_lock = Lock()
+    _default_app: FastAPI | None = globals().get("app")
+
+
+def __getattr__(name: str) -> FastAPI:
+    if name != "app":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    global _default_app
+    with _default_app_lock:
+        if _default_app is None:
+            _default_app = create_app()
+        globals()["app"] = _default_app
+        return _default_app
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | {"app"})

@@ -16,6 +16,7 @@ from socket import SOCK_STREAM, getaddrinfo
 from typing import Protocol
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
+from k5vision.analytics_runtime import OwnedAnalyticsProvider
 from k5vision.domain.devices import Device
 from k5vision.media.analytics_overlay_delivery import (
     AnalyticsObservationProvider,
@@ -80,6 +81,7 @@ class _WindowsOperatorBoundary(Protocol):
 
 LiveDeliveryFactory = Callable[[int], _LiveDeliveryBoundary]
 WindowsOperatorFactory = Callable[[ViewportLayout], _WindowsOperatorBoundary]
+AnalyticsProviderFactory = Callable[[], Awaitable[OwnedAnalyticsProvider]]
 
 
 def _sanitize_stream_token(value: str) -> str:
@@ -490,6 +492,7 @@ class WindowsSingleLiveOperatorLauncher(OperatorLauncher):
         delivery_factory: LiveDeliveryFactory = _default_delivery_factory,
         runtime_factory: WindowsOperatorFactory = _default_windows_operator_factory,
         detection_provider: AnalyticsObservationProvider | None = None,
+        detection_provider_factory: AnalyticsProviderFactory | None = None,
     ) -> None:
         if not callable(delivery_factory):
             raise TypeError("delivery_factory must be callable")
@@ -497,6 +500,11 @@ class WindowsSingleLiveOperatorLauncher(OperatorLauncher):
             raise TypeError("runtime_factory must be callable")
         if detection_provider is not None and not callable(detection_provider):
             raise TypeError("detection_provider must be callable")
+        if detection_provider_factory is not None and not callable(detection_provider_factory):
+            raise TypeError("detection_provider_factory must be callable")
+        if detection_provider is not None and detection_provider_factory is not None:
+            raise ValueError("analytics provider and factory are mutually exclusive")
+        self._detection_provider_factory = detection_provider_factory
         self._delivery_factory = delivery_factory
         self._runtime_factory = runtime_factory
         self._detection_provider = detection_provider
@@ -513,6 +521,50 @@ class WindowsSingleLiveOperatorLauncher(OperatorLauncher):
                 OperatorLaunchErrorCode.LAUNCH_FAILURE,
                 "live operator runtime failed",
             )
+        owned: OwnedAnalyticsProvider | None = None
+        primary_error: BaseException | None = None
+        try:
+            if self._detection_provider_factory is not None:
+                try:
+                    owned = await self._detection_provider_factory()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    raise OperatorLaunchError(
+                        OperatorLaunchErrorCode.LAUNCH_FAILURE,
+                        "configured analytics could not start",
+                    ) from None
+            return await self._run(
+                source,
+                width=width,
+                height=height,
+                detection_provider=owned if owned is not None else self._detection_provider,
+            )
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if owned is not None:
+                try:
+                    await owned.aclose()
+                except asyncio.CancelledError:
+                    if primary_error is None:
+                        raise
+                except Exception:
+                    if primary_error is None:
+                        raise OperatorLaunchError(
+                            OperatorLaunchErrorCode.LAUNCH_FAILURE,
+                            "configured analytics cleanup failed",
+                        ) from None
+
+    async def _run(
+        self,
+        source: ResolvedLiveSource,
+        *,
+        width: int,
+        height: int,
+        detection_provider: AnalyticsObservationProvider | None,
+    ) -> OperatorLaunchMetrics:
         analytics_delivery: BoundedAnalyticsOverlayDelivery | None = None
         try:
             layout = ViewportLayout(
@@ -524,10 +576,10 @@ class WindowsSingleLiveOperatorLauncher(OperatorLauncher):
                 )
             )
             delivery = self._delivery_factory(source.payload_type)
-            if self._detection_provider is not None:
+            if detection_provider is not None:
                 analytics_delivery = BoundedAnalyticsOverlayDelivery(
                     delivery,
-                    self._detection_provider,
+                    detection_provider,
                 )
                 delivery = analytics_delivery
             runtime = self._runtime_factory(layout)
@@ -604,6 +656,7 @@ def build_environment_operator_runtime(
     credential_probe: CredentialProbe = resolve_credential_index,
     payload_probe: PayloadTypeProbe = _probe_dynamic_payload_type,
     detection_provider: AnalyticsObservationProvider | None = None,
+    detection_provider_factory: AnalyticsProviderFactory | None = None,
 ) -> tuple[OperatorSourceResolver | None, OperatorLauncher | None]:
     """Build the physical Stage-One bridge only when private configuration is complete."""
     source_uri = environment.get(STAGE_ONE_SOURCE_ENV, "").strip()
@@ -630,6 +683,7 @@ def build_environment_operator_runtime(
             launcher = WindowsSingleLiveOperatorLauncher(
                 delivery_factory=_local_direct_rtsp_test_delivery_factory,
                 detection_provider=detection_provider,
+                detection_provider_factory=detection_provider_factory,
             )
         except (TypeError, ValueError):
             return None, None
@@ -655,6 +709,7 @@ def build_environment_operator_runtime(
             launcher = WindowsSingleLiveOperatorLauncher(
                 delivery_factory=_public_direct_rtsp_test_delivery_factory,
                 detection_provider=detection_provider,
+                detection_provider_factory=detection_provider_factory,
             )
         except (TypeError, ValueError):
             return None, None
@@ -674,7 +729,10 @@ def build_environment_operator_runtime(
             credential_probe=credential_probe,
             payload_probe=payload_probe,
         )
-        launcher = WindowsSingleLiveOperatorLauncher(detection_provider=detection_provider)
+        launcher = WindowsSingleLiveOperatorLauncher(
+            detection_provider=detection_provider,
+            detection_provider_factory=detection_provider_factory,
+        )
     except (TypeError, ValueError):
         return None, None
 

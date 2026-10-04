@@ -20,7 +20,7 @@ def test_rtsp_wiring_preserves_existing_triggers_pins_and_dependency_isolation()
     assert "on:\n  push:\n    branches:\n      - main\n  workflow_dispatch:\n" in text
     assert "if: github.ref == 'refs/heads/main'" in text
     assert "runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]" in text
-    assert "group: stage-one-operator-physical\n  cancel-in-progress: true" in text
+    assert "group: stage-one-operator-physical\n  cancel-in-progress: false" in text
     assert "ANALYTICS_LAB_SHA: c8b347ae538991a0c0ce38eabc2dc17b566531d3" in text
     assert "K5_STAGE_ONE_REVISION: ${{ github.sha }}" in text
     assert '"openvino==2026.3.1" "opencv-python-headless==4.12.0.88"' in text

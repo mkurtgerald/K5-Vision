@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from collections.abc import Sequence
 from contextlib import nullcontext
@@ -51,7 +52,32 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     setup.add_argument("--identity-dir", required=True, help="new private absolute directory")
     setup.add_argument("--username", default=DEFAULT_RECOVERY_USERNAME)
+    subparsers.add_parser(
+        "analytics-preflight", help="check selected analytics without starting the application"
+    )
     return parser
+
+
+def _analytics_preflight() -> int:
+    """Expose only the fixed, camera-free configuration-admission outcome."""
+    try:
+        # Keep optional admission out of ordinary serving and administrator setup.
+        # The loader checks installed package/model bytes without native creation.
+        from k5vision.analytics_config import load_analytics_configuration
+
+        enabled = load_analytics_configuration(os.environ) is not None
+        status = "ready" if enabled else "disabled"
+    except Exception:
+        # Never disclose configuration values, paths, or dependency exceptions.
+        enabled = False
+        status = "refused"
+    print(
+        json.dumps(
+            {"schema_version": "1", "analytics_enabled": enabled, "status": status},
+            separators=(",", ":"),
+        )
+    )
+    return 1 if status == "refused" else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -61,6 +87,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+    if args.command == "analytics-preflight":
+        return _analytics_preflight()
     if args.command == "setup-admin":
         try:
             setup_administrator(args.identity_dir, username=args.username)

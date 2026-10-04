@@ -267,7 +267,20 @@ $script:ownedServer = $null
 $script:publisherAttempted = $false
 function Test-K5GStreamerElement { return $true }
 function Get-K5MediaMtx { return 'Test-K5MediaMtxExecutable' }
-function Test-K5MediaMtxExecutable { $global:LASTEXITCODE = 0; return '1.21.1' }
+function Invoke-K5NativeProbe {
+    param($Executable, [string[]]$Arguments, [switch]$CaptureOutput, [switch]$DiscardStderr)
+    if ($Executable -ne 'Test-K5MediaMtxExecutable' -or $DiscardStderr) {
+        throw 'Unexpected probe boundary.'
+    }
+    if ($CaptureOutput -and $Arguments.Count -eq 1 -and $Arguments[0] -ceq '--version') {
+        return [pscustomobject]@{ ExitCode = 0; Stdout = 'v1.21.1' }
+    }
+    if ($CaptureOutput -or $Arguments.Count -ne 2 -or $Arguments[0] -cne '--validate-conf' -or
+        $Arguments[1] -cne (Join-Path $sessionRoot 'mediamtx.yml')) {
+        throw 'Unexpected probe arguments.'
+    }
+    return [pscustomobject]@{ ExitCode = 0; Stdout = '' }
+}
 function Test-K5TcpListener { return $null -ne $script:ownedServer }
 function Start-Process {
     param($FilePath, $ArgumentList, [switch]$PassThru, [switch]$NoNewWindow,

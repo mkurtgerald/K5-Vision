@@ -6,7 +6,8 @@ This file is the distribution-facing notice registry. Detailed source provenance
 
 ## Incorporated donor source
 
-No incorporated donor source is currently recorded.
+K5 does not vendor Analytics Lab business logic. Its separately built engineering
+runtime package is described below; all upstream rights remain effective.
 
 ## Runtime and development dependencies
 
@@ -25,3 +26,28 @@ K5 Vision depends on psutil for cross-platform process resource observation and 
 When third-party material requiring attribution or reproduction of license text is incorporated or distributed with K5 Vision, add the required notice here or include the complete upstream notice in a clearly identified file under a third-party notices directory before release.
 
 Do not remove or replace an upstream copyright, patent, attribution, or license notice.
+
+## Analytics Lab engineering runtime
+
+The optional `k5-analytics-runtime` engineering wheel packages unchanged
+`analytics_lab` sources from `mkurtgerald/Analytics-lab` revision
+`c8b347ae538991a0c0ce38eabc2dc17b566531d3`. Original Analytics project material is
+copyright (c) 2026 Kurt Gerald and governed by the **K5 Analytics Lab
+Source-Available License v1.0**, not an open-source license or the K5 Vision
+license. The wrapper does not transfer ownership or grant commercial, production
+or redistribution rights.
+
+The wheel preserves the complete upstream `LICENSE` and `THIRD_PARTY.md`, plus
+the ByteTrack MIT license (copyright (c) 2021 Yifu Zhang). Analytics' adapted
+Open Model Zoo decoder reference retains its copyright (C) 2020-2024 Intel
+Corporation and Apache-2.0 attribution; the full Apache license from the exact
+Open Model Zoo revision is included. These complete notices are installed in
+`k5_analytics_runtime-<version>.dist-info/licenses/` as `Analytics-Lab-LICENSE`,
+`THIRD_PARTY.md`, `ByteTrack-MIT.txt`, and `Apache-2.0.txt`. The supplemental Apache
+license is also preserved under `src/k5vision/data/analytics-runtime-Apache-2.0.txt`.
+
+This is engineering qualification only. No model, media, dataset, OpenVINO,
+OpenCV or other native runtime binary is bundled. Exact native/transitive wheel
+notices and redistribution review, separate model/data rights, and commercial
+project authority remain release gates. See `docs/ANALYTICS_RUNTIME_PACKAGING.md`
+and `docs/DONOR_LEDGER.md`; the upstream register's pending reviews remain pending.
