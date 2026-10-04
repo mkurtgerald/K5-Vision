@@ -1055,3 +1055,83 @@ def test_windows_real_venv_child_is_owned_by_admitted_base_job(tmp_path, monkeyp
             assigned.unlink(missing_ok=True)
             executed.unlink(missing_ok=True)
     assert not venv.exists()
+
+
+@pytest.mark.parametrize("provided", [False, True])
+def test_optional_job_factory_preserves_default_and_assignment_before_gate(
+    tmp_path, monkeypatch, provided
+):
+    base, redirector, environment = base_admission_fixture(tmp_path, monkeypatch)
+    calls = []
+
+    class Job:
+        def __init__(self):
+            calls.append("default_factory")
+
+        def assign(self, _process):
+            calls.append("assign")
+
+        def close(self):
+            calls.append("job_close")
+
+    def factory():
+        calls.append("injected_factory")
+        return object.__new__(Job)
+
+    process = SimpleNamespace(
+        stdin=SimpleNamespace(
+            write=lambda value: calls.append(("gate", value)),
+            flush=lambda: None,
+            close=lambda: None,
+        ),
+        stderr=None,
+        wait=lambda **_: 0,
+        poll=lambda: 0,
+    )
+    requested = [str(redirector), "-I", "-B", "-m", "k5vision.cli", "analytics-preflight"]
+
+    def popen(command, **kwargs):
+        calls.append("popen")
+        assert command[:4] == [str(base), "-I", "-B", "-S"]
+        assert command[-len(requested) :] == requested and kwargs["env"] is environment
+        return process
+
+    monkeypatch.setattr(witness, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(witness, "WindowsJob", Job)
+    monkeypatch.setattr(witness.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        witness, "StderrSummary", lambda *_args, **_kwargs: SimpleNamespace(finish=lambda: True)
+    )
+    extra = {"job_factory": factory} if provided else {}
+    owned = witness.OwnedProcess(
+        requested, cwd=tmp_path, env=environment, operation="probe_admission", **extra
+    )
+    owned.close()
+    assert calls == [
+        "injected_factory" if provided else "default_factory",
+        "popen",
+        "assign",
+        ("gate", b"1"),
+        "job_close",
+    ]
+
+
+@pytest.mark.parametrize(
+    "result", [None, object(), SimpleNamespace(assign=None, close=lambda: None)]
+)
+def test_explicit_job_factory_cannot_bypass_gate_with_invalid_result(tmp_path, monkeypatch, result):
+    _base, redirector, environment = base_admission_fixture(tmp_path, monkeypatch)
+    launches = []
+    monkeypatch.setattr(witness, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        witness.subprocess, "Popen", lambda *_args, **_kwargs: launches.append(True)
+    )
+    with pytest.raises(witness.WitnessError):
+        witness.OwnedProcess(
+            [str(redirector)],
+            cwd=tmp_path,
+            env=environment,
+            operation="probe_admission",
+            job_factory=lambda: result,
+        )
+    assert launches == []

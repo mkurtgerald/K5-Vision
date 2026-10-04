@@ -26,6 +26,13 @@ assert _SPEC is not None and _SPEC.loader is not None
 common = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(common)
 
+_BOUNDARY_SPEC = importlib.util.spec_from_file_location(
+    "_installed_alpha_boundary", Path(__file__).with_name("windows_owned_preflight.py")
+)
+assert _BOUNDARY_SPEC is not None and _BOUNDARY_SPEC.loader is not None
+boundary = importlib.util.module_from_spec(_BOUNDARY_SPEC)
+_BOUNDARY_SPEC.loader.exec_module(boundary)
+
 RECEIPT_NAME = "installed-alpha-start-script-witness.json"
 EXPECTATIONS_NAME = "installed-alpha-start-script-expectations.json"
 SCHEMA = "installed-alpha-start-script-v1"
@@ -116,7 +123,11 @@ DIAGNOSTIC_CONTRACTS = {
     "invalid_output_limit",
     "invalid_markers",
     "invalid_exit",
-    "invalid_job_total",
+    "invalid_job_total",  # Historical coarse-gate diagnostics remain interpretable.
+    "invalid_observation_setup",
+    "invalid_initialization",
+    "invalid_observation_cleanup",
+    "invalid_milestones",
     "invalid_session_change",
     "valid_output_limit",
     "valid_markers",
@@ -592,7 +603,7 @@ class LaunchSummary:
 
     def _line(self, line: bytes) -> None:
         line = line.rstrip(b"\r")
-        # Positive diagnostic observations only; never change the marker gates.
+        # Diagnostic milestones for media runs; invalid preflight refuses either observation.
         if line == b"K5 Vision Alpha health check PASS.":
             self.health_confirmed = True
         if line == b"Launching the authenticated K5 Windows operator path...":
@@ -738,13 +749,46 @@ def job_accounting(owned) -> tuple[int, int]:
     return counters.total_processes, counters.active_processes
 
 
+def emit_observation_failure(error, phase: str):
+    # These are helper-owned enum values, never text from an OS/child exception.
+    code = str(error) if isinstance(error, boundary.ObservationFailure) else "native_error"
+    value = {
+        "schema_version": "owned-preflight-failure-v1",
+        "stage": "invalid_config",
+        "phase": phase,
+        "error": code,
+    }
+    validate_observation_failure(value)
+    print("K5_OWNED_PREFLIGHT_FAILURE=" + common.canonical(value).decode("ascii"))
+
+
+def validate_observation_failure(value):
+    common.require(
+        type(value) is dict and value.keys() == {"schema_version", "stage", "phase", "error"}
+    )
+    for key, allowed in (
+        ("schema_version", {"owned-preflight-failure-v1"}),
+        ("stage", {"invalid_config"}),
+        ("phase", {"setup", "finish", "validate", "cleanup"}),
+        ("error", boundary.ERRORS - {"none"}),
+    ):
+        common.require(type(value[key]) is str and value[key] in allowed)
+
+
 def invoke_start(
-    command: list[str], *, work: Path, env: dict[str, str], operation: str, invalid: bool = False
+    command: list[str],
+    *,
+    work: Path,
+    env: dict[str, str],
+    operation: str,
+    invalid: bool = False,
+    admitted_images=None,
+    owned_observations=None,
 ) -> dict[str, object]:
     stage = "invalid_config" if invalid else operation
     sessions = Path(env["TEMP"])
     state = {
-        "expected_job_total": 4 if invalid else None,
+        "expected_job_total": 5 if invalid else None,
         "launcher_requested": False,
         "launcher_returned": False,
     }
@@ -755,7 +799,7 @@ def invoke_start(
         observations={**state, "sessions_empty": False},
         code="cleanup_incomplete",
     )
-    guard = None
+    observation, initialization = None, None
     owned, summary, original, child_detail = None, None, None, None
 
     def snapshot():
@@ -784,12 +828,30 @@ def invoke_start(
     try:
         if invalid:
             try:
-                guard = DirectoryChangeGuard(sessions)
+                common.require(
+                    type(admitted_images) is dict and type(owned_observations) is list,
+                    "admission_failed",
+                )
+                observation = boundary.PreflightObservation(
+                    common, temp_root=sessions, admitted_images=admitted_images
+                )
+                # Register before start: even a partially initialized observer must
+                # prevent outer file cleanup until all its readers have stopped.
+                owned_observations.append(observation)
+                observation.start()
             except BaseException as error:
-                raise contextual_error(error, stage, "directory_guard_setup", snapshot()) from None
+                emit_observation_failure(error, "setup")
+                raise contextual_error(
+                    error, stage, "invalid_observation_setup", snapshot()
+                ) from None
         state["launcher_requested"] = True
         owned = common.OwnedProcess(
-            command, cwd=work, env=env, operation=operation, stdout=subprocess.PIPE
+            command,
+            cwd=work,
+            env=env,
+            operation=operation,
+            stdout=subprocess.PIPE,
+            **({"job_factory": observation.job_factory} if invalid else {}),
         )
         summary = LaunchSummary(owned.process.stdout)
         try:
@@ -819,7 +881,6 @@ def invoke_start(
             code="cleanup_incomplete",
         )
         if invalid:
-            state["session_unchanged"] = guard.unchanged()
             contract_require(
                 not summary.invalid, stage, "invalid_output_limit", observations=snapshot()
             )
@@ -840,17 +901,25 @@ def invoke_start(
             contract_require(
                 owned.process.returncode == 23, stage, "invalid_exit", observations=snapshot()
             )
-            # Base relay, PowerShell, preflight venv redirector and interpreter.
-            contract_require(total == 4, stage, "invalid_job_total", observations=snapshot())
             contract_require(
-                state["session_unchanged"], stage, "invalid_session_change", observations=snapshot()
+                child_detail.get("child_exit_code") == 23
+                and child_detail.get("relay_exit_code") == 23
+                and child_detail.get("gate_state") == "exited"
+                and child_detail.get("timed_out") is False,
+                stage,
+                "invalid_exit",
+                observations=snapshot(),
             )
-            return {
-                "invalid_config_refused": True,
-                "invalid_config_no_session": True,
-                "invalid_config_no_media": True,
-            }
-        return summary.result(stage=stage)
+            contract_require(
+                not summary.health_confirmed and not summary.operator_request_observed,
+                stage,
+                "invalid_milestones",
+                observations=snapshot(),
+            )
+            # Success is deferred until the owned Job closes and the complete
+            # qualified process/TEMP observation drains and validates below.
+        else:
+            return summary.result(stage=stage)
     except BaseException as error:
         original = contextual_error(error, stage, "child_process", snapshot())
         raise original from None
@@ -870,13 +939,41 @@ def invoke_start(
                 cleanup_errors.append(
                     contextual_error(error, "cleanup", "collector_cleanup", snapshot())
                 )
-        if guard is not None:
+        if observation is not None:
             try:
-                guard.close()
+                if (
+                    observation.started
+                    and len(observation.jobs) == 1
+                    and not observation.jobs[0].observation_open
+                ):
+                    initialization = observation.finish()
+                    boundary.validate_summary(initialization)
+                    print(
+                        "K5_OWNED_PREFLIGHT_INITIALIZATION="
+                        + common.canonical(initialization).decode("ascii")
+                    )
             except BaseException as error:
+                emit_observation_failure(error, "finish")
                 cleanup_errors.append(
-                    contextual_error(error, "cleanup", "directory_guard_cleanup", snapshot())
+                    AlphaWitnessError(
+                        alpha_diagnostic(stage, "invalid_initialization", observations=snapshot())
+                    )
                 )
+            finally:
+                try:
+                    observation.close()
+                except BaseException as error:
+                    emit_observation_failure(error, "cleanup")
+                    cleanup_errors.append(
+                        AlphaWitnessError(
+                            alpha_diagnostic(
+                                "cleanup",
+                                "invalid_observation_cleanup",
+                                failure_code="cleanup_incomplete",
+                                observations=snapshot(),
+                            )
+                        )
+                    )
         if cleanup_errors:
             # Report each fixed failure once; cleanup never overwrites the cause.
             if original is not None:
@@ -884,6 +981,32 @@ def invoke_start(
             for error in cleanup_errors[:-1]:
                 emit_alpha_diagnostic(error.alpha_diagnostic)
             raise cleanup_errors[-1] from None
+
+    try:
+        boundary.validate_invalid_initialization(initialization)
+    except BaseException as error:
+        emit_observation_failure(error, "validate")
+        raise AlphaWitnessError(
+            alpha_diagnostic(stage, "invalid_initialization", observations=snapshot())
+        ) from None
+    return {
+        "invalid_config_refused": True,
+        "invalid_config_no_session": True,
+        "invalid_config_no_media": True,
+    }
+
+
+def admitted_preflight_images(env: dict[str, str], installed: Path, powershell: Path):
+    paths = {
+        "base_python": common.admitted_gate_python(env),
+        "venv_python": installed / ".venv/Scripts/python.exe",
+        "powershell": powershell,
+        "console_host": Path(env["SYSTEMROOT"]) / "System32/conhost.exe",
+    }
+    return {
+        kind: (common.local_path(path), common.file_hash(common.local_path(path)))
+        for kind, path in paths.items()
+    }
 
 
 def require_ports_free(port: int) -> None:
@@ -905,6 +1028,7 @@ def launch_sequence(
     powershell: Path,
     expected: dict[str, str],
     document: dict[str, object],
+    owned_observations: list,
 ) -> None:
     envelope = work / "invoke-start.ps1"
     envelope.write_text(ENVELOPE, encoding="ascii", newline="\n")
@@ -921,6 +1045,8 @@ def launch_sequence(
             env={**env, "K5_ANALYTICS_CONFIG": str(invalid_config)},
             operation="probe_admission",
             invalid=True,
+            admitted_images=admitted_preflight_images(env, installed, powershell),
+            owned_observations=owned_observations,
         )
     )
     for attempt in (1, 2):
@@ -986,7 +1112,11 @@ def prepare(args, work: Path, expected: dict[str, str], document: dict[str, obje
         common.extract_archive(archive, target)
     common.require(common.digest(tree_manifest(source)) == expected["source_tree_sha256"])
     # Controller and reused helper must themselves be exact candidate bytes.
-    for name in (Path(__file__).name, "installed_analytics_witness.py"):
+    for name in (
+        Path(__file__).name,
+        "installed_analytics_witness.py",
+        "windows_owned_preflight.py",
+    ):
         common.require(
             (source / "scripts" / name).read_bytes() == Path(__file__).with_name(name).read_bytes()
         )
@@ -1209,6 +1339,7 @@ def execute(args) -> int:
     work = None
     detail = None
     alpha_detail = None
+    owned_observations = []
     try:
         admit_platform()
         repo = common.local_path(args.repo.absolute(), directory=True)
@@ -1233,6 +1364,7 @@ def execute(args) -> int:
             powershell=powershell,
             expected=expected,
             document=document,
+            owned_observations=owned_observations,
         )
         document["stage"] = "verify"
         probe(command, work, env, expected, after=True)
@@ -1258,9 +1390,12 @@ def execute(args) -> int:
         cleanup = True
         if work is not None:
             try:
-                shutil.rmtree(work)
-                cleanup = not work.exists()
-            except OSError:
+                if all(observation.quiescent() for observation in owned_observations):
+                    shutil.rmtree(work)
+                    cleanup = not work.exists()
+                else:
+                    cleanup = False
+            except (OSError, boundary.ObservationFailure):
                 cleanup = False
         document["cleanup_complete"] = cleanup
         if not cleanup:

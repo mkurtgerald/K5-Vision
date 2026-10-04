@@ -672,17 +672,29 @@ class OwnedProcess:
         env: dict[str, str],
         operation: str,
         stdout: object = subprocess.DEVNULL,
+        job_factory=None,
     ) -> None:
         require(operation in OPERATIONS, "admission_failed")
         self.operation = operation
         self.stderr_summary = None
         self.gated = os.name == "nt"
+        require(job_factory is None or self.gated and callable(job_factory), "admission_failed")
         self.gate_nonce = secrets.token_hex(16) if self.gated else ""
         self.job = None
         self.process: subprocess.Popen[bytes] | None = None
         try:
             relay_python = admitted_gate_python(env) if self.gated else None
-            self.job = WindowsJob() if self.gated else None
+            self.job = (
+                (WindowsJob if job_factory is None else job_factory)() if self.gated else None
+            )
+            if self.gated and job_factory is not None:
+                require(
+                    self.job is not None
+                    and all(
+                        callable(getattr(self.job, name, None)) for name in ("assign", "close")
+                    ),
+                    "admission_failed",
+                )
             command = (
                 [
                     str(relay_python),

@@ -330,11 +330,14 @@ def test_invalid_then_two_successful_installed_launches(monkeypatch, tmp_path: P
     monkeypatch.setattr(witness, "native_manifest", lambda *_: {"cache": "admitted"})
     monkeypatch.setattr(witness, "require_ports_free", lambda port: calls.append(("ports", port)))
     monkeypatch.setattr(witness.common, "free_port", lambda: 8011)
+    monkeypatch.setattr(witness, "admitted_preflight_images", lambda *_: {"explicit": "images"})
 
     def invoke(command, **kwargs):
         assert "Start-K5VisionAlpha.ps1" in " ".join(command)
         calls.append(("start", kwargs.get("invalid", False)))
         if kwargs.get("invalid"):
+            assert kwargs["admitted_images"] == {"explicit": "images"}
+            assert type(kwargs["owned_observations"]) is list
             assert (
                 Path(kwargs["env"]["K5_ANALYTICS_CONFIG"]).read_bytes().find(b"invalid-selected")
                 >= 0
@@ -343,6 +346,7 @@ def test_invalid_then_two_successful_installed_launches(monkeypatch, tmp_path: P
                 ("invalid_config_refused", "invalid_config_no_session", "invalid_config_no_media"),
                 True,
             )
+        assert "admitted_images" not in kwargs and "owned_observations" not in kwargs
         assert kwargs["env"]["K5_ANALYTICS_CONFIG"] == "validated-config"
         return {
             name: receipt()[f"run_1_{name}"] for name in witness.COUNTERS | witness.RUN_BOOLEANS
@@ -356,6 +360,7 @@ def test_invalid_then_two_successful_installed_launches(monkeypatch, tmp_path: P
         powershell=tmp_path / "powershell.exe",
         expected=expected_identities,
         document=document,
+        owned_observations=[],
     )
     assert [call for call in calls if call[0] == "start"] == [
         ("start", True),
@@ -372,17 +377,19 @@ def invoke_fixture(
     tmp_path,
     *,
     invalid=False,
-    total=4,
+    total=5,
     active=0,
     unchanged=True,
     exit_code=None,
     output=None,
     leave_session=False,
     cleanup_failure=False,
+    detail_override=None,
+    profile_overrides=None,
 ):
     from types import SimpleNamespace
 
-    state = {"closed": False, "guard_closed": False}
+    state = {"closed": False, "observation_closed": False}
     sessions = tmp_path / "sessions"
     sessions.mkdir()
     code = 23 if invalid else 0
@@ -392,6 +399,8 @@ def invoke_fixture(
     class Owned:
         def __init__(self, *_args, **_kwargs):
             self.operation = "launch_1"
+            if invalid:
+                self.job = _kwargs["job_factory"]()
             self.process = SimpleNamespace(
                 stdout=io.BytesIO(
                     output
@@ -408,34 +417,74 @@ def invoke_fixture(
             if leave_session:
                 (sessions / "K5VisionAlpha-leftover").mkdir()
             if code:
-                raise witness.common.WitnessError(
-                    "child_failed",
-                    witness.common.diagnostic(
-                        "probe_admission",
-                        outcome="child_failed",
-                        gate_state="exited",
-                        child_exit_code=code,
-                        relay_exit_code=code,
-                    ),
+                detail = witness.common.diagnostic(
+                    "probe_admission",
+                    outcome="child_failed",
+                    gate_state="exited",
+                    child_exit_code=code,
+                    relay_exit_code=code,
                 )
+                detail.update(detail_override or {})
+                raise witness.common.WitnessError("child_failed", detail)
 
         def close(self):
             state["closed"] = True
+            if invalid:
+                self.job.observation_open = False
             if cleanup_failure:
                 raise witness.common.WitnessError("cleanup_incomplete")
 
-    class Guard:
-        def __init__(self, path):
-            assert path == sessions
+    class Observation:
+        def __init__(self, _common, *, temp_root, admitted_images):
+            assert temp_root == sessions and admitted_images == {}
+            self.started = False
+            self.jobs = []
+            self.resources = []
 
-        def unchanged(self):
-            return unchanged
+        def start(self):
+            self.started = True
+
+        def job_factory(self):
+            job = SimpleNamespace(observation_open=True)
+            self.jobs.append(job)
+            return job
+
+        def finish(self):
+            assert state["closed"] and not self.jobs[0].observation_open
+            value = witness.boundary.empty_summary()
+            kinds = ["base_python", "powershell", "venv_python", "console_host", "base_python"]
+            kinds = (kinds + ["base_python"] * total)[:total]
+            value.update(
+                job_total=total,
+                job_active=active,
+                distinct_births=total,
+                process_coverage_complete=active == 0,
+                cleanup_complete=True,
+                temporary_root_empty=not any(sessions.iterdir()),
+                policy_lifecycles_complete=unchanged,
+                temp_drain_complete=True,
+                policy_ps1_files=2,
+                policy_psm1_files=2,
+                temp_events=12,
+            )
+            for index, kind in enumerate(kinds, 1):
+                value[f"birth_{index}_class"] = kind
+            for kind in witness.boundary.PROCESS_KINDS:
+                value["process_" + kind] = kinds.count(kind)
+            for action in ("added", "modified", "removed"):
+                value["temp_policy_probe_" + action] = 4
+            value.update(profile_overrides or {})
+            self.summary = value
+            return value
 
         def close(self):
-            state["guard_closed"] = True
+            state["observation_closed"] = True
+
+        def quiescent(self):
+            return state["observation_closed"]
 
     monkeypatch.setattr(witness.common, "OwnedProcess", Owned)
-    monkeypatch.setattr(witness, "DirectoryChangeGuard", Guard)
+    monkeypatch.setattr(witness.boundary, "PreflightObservation", Observation)
     monkeypatch.setattr(witness, "job_accounting", lambda _: (total, active))
     return state, sessions
 
@@ -453,17 +502,19 @@ def test_invalid_config_proves_no_transient_session_or_native_child(
         env={"TEMP": str(sessions)},
         operation="probe_admission",
         invalid=True,
+        admitted_images={},
+        owned_observations=[],
     )
     assert result == dict.fromkeys(
         ("invalid_config_refused", "invalid_config_no_session", "invalid_config_no_media"), True
     )
-    assert state == {"closed": True, "guard_closed": True}
+    assert state == {"closed": True, "observation_closed": True}
 
 
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"total": 5},
+        {"total": 6},
         {"active": 1},
         {"unchanged": False},
         {"exit_code": 0},
@@ -485,8 +536,10 @@ def test_invalid_config_failure_closes_every_owned_resource(
             env={"TEMP": str(sessions)},
             operation="probe_admission",
             invalid=True,
+            admitted_images={},
+            owned_observations=[],
         )
-    assert state["closed"] and state["guard_closed"]
+    assert state["closed"] and state["observation_closed"]
 
 
 @pytest.mark.parametrize(
@@ -630,7 +683,11 @@ def prepare_fixture(monkeypatch, tmp_path):
     candidate = tmp_path / "candidate"
     (candidate / "scripts/windows-alpha").mkdir(parents=True)
     (candidate / "src/k5vision/data").mkdir(parents=True)
-    for name in ("installed_alpha_launcher_witness.py", "installed_analytics_witness.py"):
+    for name in (
+        "installed_alpha_launcher_witness.py",
+        "installed_analytics_witness.py",
+        "windows_owned_preflight.py",
+    ):
         shutil.copyfile(ROOT / "scripts" / name, candidate / "scripts" / name)
     for name in witness.SCRIPT_NAMES:
         shutil.copyfile(
@@ -934,7 +991,7 @@ def test_windows_real_directory_guard_remembers_created_then_deleted_session(tmp
 
 
 def test_invalid_job_count_has_precise_source_free_diagnostic(monkeypatch, tmp_path) -> None:
-    _state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True, total=5)
+    _state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True, total=6)
     with pytest.raises(witness.common.WitnessError) as caught:
         witness.invoke_start(
             ["real Start"],
@@ -942,12 +999,14 @@ def test_invalid_job_count_has_precise_source_free_diagnostic(monkeypatch, tmp_p
             env={"TEMP": str(sessions)},
             operation="probe_admission",
             invalid=True,
+            admitted_images={},
+            owned_observations=[],
         )
     record = caught.value.alpha_diagnostic
     assert record["stage"] == "invalid_config"
-    assert record["contract"] == "invalid_job_total"
-    assert record["job_total"] == 5 and record["expected_job_total"] == 4
-    assert record["job_active"] == 0 and record["session_unchanged"] is True
+    assert record["contract"] == "invalid_initialization"
+    assert record["job_total"] == 6 and record["expected_job_total"] == 5
+    assert record["job_active"] == 0 and record["session_unchanged"] is None
     assert record["marker_refusal"] == 1 and record["child_exit_code"] == 23
     assert record["relay_exit_code"] == 23
     assert record["health_confirmed"] is False
@@ -1061,8 +1120,8 @@ def test_untrusted_counter_observation_is_omitted(value) -> None:
         ({"output": REFUSAL_OUTPUT + b"x" * 65537}, "invalid_output_limit"),
         ({"output": b""}, "invalid_markers"),
         ({"exit_code": 0}, "invalid_exit"),
-        ({"total": 5}, "invalid_job_total"),
-        ({"unchanged": False}, "invalid_session_change"),
+        ({"total": 6}, "invalid_initialization"),
+        ({"unchanged": False}, "invalid_initialization"),
         ({"active": 1}, "job_active"),
         ({"leave_session": True}, "sessions_empty"),
         ({"exit_code": 24}, "child_process"),
@@ -1079,6 +1138,8 @@ def test_invalid_boundaries_remain_closed_and_are_distinguishable(
             env={"TEMP": str(sessions)},
             operation="probe_admission",
             invalid=True,
+            admitted_images={},
+            owned_observations=[],
         )
     value = caught.value.alpha_diagnostic
     assert value["stage"] == "invalid_config" and value["contract"] == contract
@@ -1139,7 +1200,7 @@ def test_primary_receipt_and_process_cleanup_failures_both_survive(
     monkeypatch, tmp_path, capsys
 ) -> None:
     _state, sessions = invoke_fixture(
-        monkeypatch, tmp_path, invalid=True, total=5, cleanup_failure=True
+        monkeypatch, tmp_path, invalid=True, output=b"", cleanup_failure=True
     )
     with pytest.raises(witness.common.WitnessError) as caught:
         witness.invoke_start(
@@ -1148,9 +1209,11 @@ def test_primary_receipt_and_process_cleanup_failures_both_survive(
             env={"TEMP": str(sessions)},
             operation="probe_admission",
             invalid=True,
+            admitted_images={},
+            owned_observations=[],
         )
     primary = alpha_records(capsys.readouterr().out)
-    assert len(primary) == 1 and primary[0]["contract"] == "invalid_job_total"
+    assert len(primary) == 1 and primary[0]["contract"] == "invalid_markers"
     assert caught.value.alpha_diagnostic["stage"] == "cleanup"
     assert caught.value.alpha_diagnostic["contract"] == "owned_process_cleanup"
 
@@ -1240,6 +1303,8 @@ def test_existing_session_refuses_before_launcher_request(monkeypatch, tmp_path)
             env={"TEMP": str(sessions)},
             operation="probe_admission",
             invalid=True,
+            admitted_images={},
+            owned_observations=[],
         )
     value = caught.value.alpha_diagnostic
     assert value["stage"] == "invalid_config" and value["contract"] == "sessions_empty"
@@ -1306,7 +1371,7 @@ def test_primary_and_multiple_cleanup_failures_each_reported_once(
     monkeypatch, tmp_path, capsys
 ) -> None:
     _state, sessions = invoke_fixture(
-        monkeypatch, tmp_path, invalid=True, total=5, cleanup_failure=True
+        monkeypatch, tmp_path, invalid=True, output=b"", cleanup_failure=True
     )
     original_finish = witness.LaunchSummary.finish
     calls = []
@@ -1321,7 +1386,7 @@ def test_primary_and_multiple_cleanup_failures_each_reported_once(
         raise witness.common.WitnessError("cleanup_incomplete")
 
     monkeypatch.setattr(witness.LaunchSummary, "finish", finish)
-    monkeypatch.setattr(witness.DirectoryChangeGuard, "close", close)
+    monkeypatch.setattr(witness.boundary.PreflightObservation, "close", close)
     with pytest.raises(witness.common.WitnessError) as caught:
         witness.invoke_start(
             ["actual Start"],
@@ -1329,14 +1394,16 @@ def test_primary_and_multiple_cleanup_failures_each_reported_once(
             env={"TEMP": str(sessions)},
             operation="probe_admission",
             invalid=True,
+            admitted_images={},
+            owned_observations=[],
         )
     records = alpha_records(capsys.readouterr().out)
     records.append(caught.value.alpha_diagnostic)
     assert [record["contract"] for record in records] == [
-        "invalid_job_total",
+        "invalid_markers",
         "owned_process_cleanup",
         "collector_cleanup",
-        "directory_guard_cleanup",
+        "invalid_observation_cleanup",
     ]
     assert all(record["relay_exit_code"] == 23 for record in records)
 
@@ -1361,13 +1428,13 @@ def test_final_validator_error_in_execute_finally_reaches_outer_catch(
     assert not args.output.exists() and not args.work_root.exists()
 
 
-def test_directory_guard_setup_failure_is_before_requested_launcher(monkeypatch, tmp_path) -> None:
+def test_observation_setup_failure_is_before_requested_launcher(monkeypatch, tmp_path) -> None:
     _state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True)
 
-    def fail(_path):
+    def fail(*_args, **_kwargs):
         raise OSError("private source path")
 
-    monkeypatch.setattr(witness, "DirectoryChangeGuard", fail)
+    monkeypatch.setattr(witness.boundary, "PreflightObservation", fail)
     with pytest.raises(witness.common.WitnessError) as caught:
         witness.invoke_start(
             ["actual Start"],
@@ -1375,9 +1442,11 @@ def test_directory_guard_setup_failure_is_before_requested_launcher(monkeypatch,
             env={"TEMP": str(sessions)},
             operation="probe_admission",
             invalid=True,
+            admitted_images={},
+            owned_observations=[],
         )
     value = caught.value.alpha_diagnostic
-    assert value["stage"] == "invalid_config" and value["contract"] == "directory_guard_setup"
+    assert value["stage"] == "invalid_config" and value["contract"] == "invalid_observation_setup"
     assert value["launcher_requested"] is False and value["launcher_returned"] is False
     assert value["health_confirmed"] is None
 
@@ -1432,3 +1501,305 @@ def test_prelaunch_child_exit_is_not_a_launcher_return(
     assert records[0]["launcher_requested"] is None
     assert records[0]["launcher_returned"] is None
     assert records[0]["health_confirmed"] is None
+
+
+def test_prepare_binds_observer_raw_bytes_even_with_admitted_tree_hash(monkeypatch, tmp_path):
+    args, expectations, calls = prepare_fixture(monkeypatch, tmp_path)
+    (args.repo / "scripts/windows_owned_preflight.py").write_bytes(b"# substituted observer\n")
+    expectations["source_tree_sha256"] = witness.common.digest(witness.tree_manifest(args.repo))
+    work = tmp_path / "owned"
+    work.mkdir()
+    with pytest.raises(witness.common.WitnessError):
+        witness.prepare(args, work, expectations, witness.new_receipt(expectations))
+    assert not any(meta["operation"] == "create_venv" for _, meta in calls)
+
+
+def test_execution_refuses_to_delete_layout_with_live_observer(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    args, _identities, _state = execute_fixture(monkeypatch, tmp_path)
+
+    def launch(**kwargs):
+        kwargs["owned_observations"].append(SimpleNamespace(quiescent=lambda: False))
+        raise witness.common.WitnessError("cleanup_incomplete")
+
+    monkeypatch.setattr(witness, "launch_sequence", launch)
+    assert witness.execute(args) == 1
+    assert args.work_root.exists() and not args.output.exists()
+
+
+def test_invalid_success_uses_one_registered_observer_and_real_profile_validator(
+    monkeypatch, tmp_path
+):
+    state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True)
+    tracked = []
+    observation_class = witness.boundary.PreflightObservation
+    original_start = observation_class.start
+
+    def start(observation):
+        assert tracked == [observation]
+        original_start(observation)
+
+    monkeypatch.setattr(observation_class, "start", start)
+    result = witness.invoke_start(
+        ["actual Start"],
+        work=tmp_path,
+        env={"TEMP": str(sessions)},
+        operation="probe_admission",
+        invalid=True,
+        admitted_images={},
+        owned_observations=tracked,
+    )
+    assert len(tracked) == 1 and tracked[0].quiescent()
+    witness.boundary.validate_invalid_initialization(tracked[0].summary)
+    assert all(result.values()) and state["closed"] and state["observation_closed"]
+
+
+@pytest.mark.parametrize(
+    "output,contract",
+    [
+        (b"", "invalid_markers"),
+        (REFUSAL_OUTPUT + b"K5 Vision Alpha health check PASS.\n", "invalid_milestones"),
+        (
+            REFUSAL_OUTPUT + b"Launching the authenticated K5 Windows operator path...\n",
+            "invalid_milestones",
+        ),
+    ],
+)
+def test_valid_os_profile_cannot_hide_wrong_refusal_or_milestones(
+    monkeypatch, tmp_path, output, contract
+):
+    _state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True, output=output)
+    tracked = []
+    with pytest.raises(witness.AlphaWitnessError) as caught:
+        witness.invoke_start(
+            ["actual Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+            admitted_images={},
+            owned_observations=tracked,
+        )
+    assert caught.value.alpha_diagnostic["contract"] == contract
+    assert len(tracked) == 1
+    witness.boundary.validate_invalid_initialization(tracked[0].summary)
+
+
+def test_observer_setup_denial_keeps_registered_owner_and_fixed_evidence(
+    monkeypatch, tmp_path, capsys
+):
+    state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True)
+    tracked = []
+
+    def denied(observation):
+        assert tracked == [observation]
+        raise witness.boundary.ObservationFailure("access_denied")
+
+    monkeypatch.setattr(witness.boundary.PreflightObservation, "start", denied)
+    with pytest.raises(witness.AlphaWitnessError) as caught:
+        witness.invoke_start(
+            ["actual Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+            admitted_images={},
+            owned_observations=tracked,
+        )
+    assert len(tracked) == 1 and state["observation_closed"] and not state["closed"]
+    assert caught.value.alpha_diagnostic["contract"] == "invalid_observation_setup"
+    assert caught.value.alpha_diagnostic["launcher_requested"] is False
+    text = capsys.readouterr().out
+    assert '"error":"access_denied"' in text and '"phase":"setup"' in text
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"path": "private"},
+        {"error": "private exception"},
+        {"error": {"nested": "value"}},
+        {"stage": "launch_1"},
+        {"phase": "unknown"},
+        {"schema_version": True},
+        {"error": "none"},
+    ],
+)
+def test_observation_failure_record_rejects_raw_or_forged_fields(change):
+    value = {
+        "schema_version": "owned-preflight-failure-v1",
+        "stage": "invalid_config",
+        "phase": "validate",
+        "error": "incomplete",
+    }
+    value.update(change)
+    with pytest.raises(witness.common.WitnessError):
+        witness.validate_observation_failure(value)
+
+
+def test_observation_external_exception_text_is_never_emitted(capsys):
+    witness.emit_observation_failure(OSError("private path and token"), "finish")
+    text = capsys.readouterr().out
+    assert '"error":"native_error"' in text
+    assert "private" not in text and "token" not in text
+
+
+def test_profile_failure_preserves_fixed_process_and_temp_evidence(monkeypatch, tmp_path, capsys):
+    _state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True, unchanged=False)
+    with pytest.raises(witness.AlphaWitnessError) as caught:
+        witness.invoke_start(
+            ["actual Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+            admitted_images={},
+            owned_observations=[],
+        )
+    text = capsys.readouterr().out
+    assert "K5_OWNED_PREFLIGHT_INITIALIZATION=" in text
+    assert '"policy_lifecycles_complete":false' in text
+    assert '"process_console_host":1' in text
+    assert '"phase":"validate"' in text
+    assert caught.value.alpha_diagnostic["contract"] == "invalid_initialization"
+
+
+def test_explicit_image_admission_ignores_mutable_path(monkeypatch, tmp_path):
+    system = tmp_path / "Windows"
+    installed = tmp_path / "installed"
+    base = tmp_path / "base/python.exe"
+    shell = system / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    python = installed / ".venv/Scripts/python.exe"
+    console = system / "System32/conhost.exe"
+    for path in (base, shell, python, console):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(path.name.encode())
+    env = {"SYSTEMROOT": str(system), "PATH": "untrusted search directory"}
+    monkeypatch.setattr(
+        witness.common, "admitted_gate_python", lambda value: base if value is env else None
+    )
+    values = witness.admitted_preflight_images(env, installed, shell)
+    assert values == {
+        kind: (path, witness.common.file_hash(path))
+        for kind, path in (
+            ("base_python", base),
+            ("powershell", shell),
+            ("venv_python", python),
+            ("console_host", console),
+        )
+    }
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"error": "access_denied"},
+        {
+            "process_console_host": 0,
+            "process_unknown": 1,
+            "birth_4_class": "unknown",
+            "process_coverage_complete": False,
+            "error": "unexpected_process",
+        },
+        {"policy_lifecycles_complete": False, "temp_policy_probe_removed": 3, "temp_events": 11},
+        {
+            "policy_lifecycles_complete": False,
+            "temp_other_owned_temp_added": 1,
+            "temp_events": 13,
+            "error": "unexpected_temp",
+        },
+        {"temp_drain_complete": False, "error": "incomplete"},
+    ],
+)
+def test_refusal_cannot_hide_unknown_incomplete_or_extra_initialization(
+    monkeypatch, tmp_path, capsys, changes
+):
+    _state, sessions = invoke_fixture(
+        monkeypatch, tmp_path, invalid=True, profile_overrides=changes
+    )
+    with pytest.raises(witness.AlphaWitnessError) as caught:
+        witness.invoke_start(
+            ["actual Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+            admitted_images={},
+            owned_observations=[],
+        )
+    assert caught.value.alpha_diagnostic["contract"] == "invalid_initialization"
+    text = capsys.readouterr().out
+    assert "K5_OWNED_PREFLIGHT_INITIALIZATION=" in text
+    assert "K5_OWNED_PREFLIGHT_FAILURE=" in text
+    assert "private" not in text
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        {"child_exit_code": 0},
+        {"relay_exit_code": 24},
+        {"gate_state": "waiting"},
+        {"timed_out": True},
+    ],
+)
+def test_valid_initialization_cannot_hide_refusal_gate_exit_mismatch(monkeypatch, tmp_path, detail):
+    _state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True, detail_override=detail)
+    tracked = []
+    with pytest.raises(witness.AlphaWitnessError):
+        witness.invoke_start(
+            ["actual Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+            admitted_images={},
+            owned_observations=tracked,
+        )
+    witness.boundary.validate_invalid_initialization(tracked[0].summary)
+
+
+def test_failed_observer_start_and_close_keep_outer_layout_owned(monkeypatch, tmp_path, capsys):
+    from types import SimpleNamespace
+
+    args, _identities, _state = execute_fixture(monkeypatch, tmp_path)
+    tracked = []
+
+    def launch(**kwargs):
+        _state, sessions = invoke_fixture(monkeypatch, kwargs["work"], invalid=True)
+        fake = witness.boundary.PreflightObservation
+
+        class BrokenObservation(fake):
+            def start(self):
+                assert kwargs["owned_observations"] == [self]
+                self.resources.append(
+                    SimpleNamespace(thread=SimpleNamespace(is_alive=lambda: True))
+                )
+                tracked.append(self)
+                raise witness.boundary.ObservationFailure("access_denied")
+
+            def close(self):
+                raise witness.boundary.ObservationFailure("cleanup_incomplete")
+
+            def quiescent(self):
+                return False
+
+        monkeypatch.setattr(witness.boundary, "PreflightObservation", BrokenObservation)
+        witness.invoke_start(
+            ["actual Start"],
+            work=kwargs["work"],
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+            admitted_images={},
+            owned_observations=kwargs["owned_observations"],
+        )
+
+    monkeypatch.setattr(witness, "launch_sequence", launch)
+    assert witness.execute(args) == 1
+    assert len(tracked) == 1 and args.work_root.exists() and not args.output.exists()
+    text = capsys.readouterr().out
+    assert '"phase":"setup"' in text and '"error":"access_denied"' in text
+    assert '"phase":"cleanup"' in text and '"error":"cleanup_incomplete"' in text
+    assert "owned_layout_cleanup" in text

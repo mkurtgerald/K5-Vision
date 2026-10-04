@@ -26,12 +26,7 @@ assert SPEC is not None and SPEC.loader is not None
 alpha = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(alpha)
 common = alpha.common
-HELPER_SPEC = importlib.util.spec_from_file_location(
-    "_windows_owned_preflight", ROOT / "scripts/windows_owned_preflight.py"
-)
-assert HELPER_SPEC is not None and HELPER_SPEC.loader is not None
-boundary = importlib.util.module_from_spec(HELPER_SPEC)
-HELPER_SPEC.loader.exec_module(boundary)
+boundary = alpha.boundary
 MAX_PROCESSES, MAX_EVENTS = boundary.MAX_PROCESSES, boundary.MAX_EVENTS
 PROCESS_KINDS, TEMP_KINDS, ACTIONS, ERRORS = (
     boundary.PROCESS_KINDS,
@@ -254,32 +249,41 @@ def run_reproduction(tmp_path: Path, monkeypatch, record, resources):
     envelope = owned / "invoke-start.ps1"
     envelope.write_text(alpha.ENVELOPE, encoding="ascii", newline="\n")
     need(not (installed / "gstreamer-version.txt").exists())
-    observation = boundary.PreflightObservation(
-        common, temp_root=Path(env["TEMP"]), admitted_images=admitted
-    )
-    old_error = None
-    summary = None
+    captured, owned_observations = [], []
+    actual_observation = boundary.PreflightObservation
+
+    class CapturedObservation(actual_observation):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured.append(self)
+
+    # Capture construction only. The actual production negative path creates its
+    # own single observer and performs every refusal/initialization acceptance gate.
+    monkeypatch.setattr(boundary, "PreflightObservation", CapturedObservation)
     try:
-        observation.start()
-        resources.extend(observation.resources)
-        monkeypatch.setattr(common, "WindowsJob", observation.job_factory)
-        try:
-            alpha.invoke_start(
-                alpha.start_command(shell, envelope, installed, 8011),
-                work=owned,
-                env=env,
-                operation="probe_admission",
-                invalid=True,
-            )
-        except common.WitnessError as error:
-            old_error = error
-            record["old_gate_rejected"] = True
-            if isinstance(error, alpha.AlphaWitnessError):
-                record["old_contract"] = error.alpha_diagnostic["contract"]
-                alpha.emit_alpha_diagnostic(error.alpha_diagnostic)
-        finally:
-            resources[:] = observation.resources
-        summary = observation.finish()
+        result = alpha.invoke_start(
+            alpha.start_command(shell, envelope, installed, 8011),
+            work=owned,
+            env=env,
+            operation="probe_admission",
+            invalid=True,
+            admitted_images=admitted,
+            owned_observations=owned_observations,
+        )
+        need(
+            result
+            == {
+                "invalid_config_refused": True,
+                "invalid_config_no_session": True,
+                "invalid_config_no_media": True,
+            },
+            "launcher_rejected",
+        )
+        need(len(captured) == 1 and owned_observations == captured, "incomplete")
+        observation = captured[0]
+        need(observation.finished and observation.quiescent(), "incomplete")
+        summary = observation.summary
+        boundary.validate_invalid_initialization(summary)
         record.update(
             {
                 key: value
@@ -287,13 +291,9 @@ def run_reproduction(tmp_path: Path, monkeypatch, record, resources):
                 if key in COUNT_FIELDS | BOOL_FIELDS or key.startswith("birth_") or key == "error"
             }
         )
-        validate_expected_legacy_refusal(old_error)
-        boundary.validate_invalid_initialization(summary)
         record["initialization_contract_verified"] = True
     finally:
-        close_observation(observation, resources)
-        if summary is not None:
-            print("K5_OWNED_PREFLIGHT_INITIALIZATION=" + common.canonical(summary).decode("ascii"))
+        resources[:] = [resource for observation in captured for resource in observation.resources]
 
 
 def close_observation(observation, resources):
@@ -418,11 +418,11 @@ def test_hosted_reproduction_paths_cannot_trigger_native_candidate_job():
     changed = (
         "tests/test_windows_alpha_preflight_boundary.py",
         ".github/workflows/windows-alpha-script-smoke.yml",
-        "scripts/windows_owned_preflight.py",
     )
     assert patterns and all(
         not fnmatchcase(path, pattern) for path in changed for pattern in patterns
     )
+    assert "scripts/windows_owned_preflight.py" in patterns
     smoke = (ROOT / changed[1]).read_text()
     assert "K5_PREFLIGHT_PROBE_PYTHON" in smoke
     assert "tests/test_windows_alpha_preflight_boundary.py --no-cov -q -s" in smoke
@@ -1314,3 +1314,24 @@ def test_late_abort_after_emergency_timeout_cannot_certify_drain(monkeypatch):
     assert calls == ["cancel"]
     assert watcher.drained.is_set() and watcher.error == "incomplete"
     assert watcher.drain_complete is False
+
+
+def test_hosted_capture_overrides_construction_only_and_keeps_real_validation():
+    import ast
+
+    tree = ast.parse(Path(__file__).read_text())
+    capture = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "CapturedObservation"
+    )
+    assert [node.name for node in capture.body if isinstance(node, ast.FunctionDef)] == ["__init__"]
+    reproduction = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_reproduction"
+    )
+    text = ast.unparse(reproduction)
+    assert "alpha.invoke_start(" in text and "boundary.validate_invalid_initialization(" in text
+    assert "monkeypatch.setattr(common, 'WindowsJob'" not in text
+    assert "owned_observations=owned_observations" in text and "admitted_images=admitted" in text

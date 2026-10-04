@@ -162,12 +162,22 @@ No `PublicRtspSource` or `AnalyticsPreflightOnly` override is passed.
 
 1. Run actual installed Start with an explicit invalid selected Analytics config
 2. Require the launcher's exact fixed refusal and exit 23 from the envelope
-3. A Windows directory-change notification must prove no transient session/file
-   creation, including create-then-delete, under the owned session TEMP root
-4. Kernel Job accounting must show exactly four total processes and zero active
-   processes: base relay Python, PowerShell, the installed preflight venv
-   redirector and its base interpreter. This deliberately CPython-3.12-specific
-   negative-path contract excludes native probes, media and application children
+3. The independently hosted-qualified observer must account for every TEMP
+   notification, including create-then-delete. Its narrow policy-probe-shaped
+   profile requires exactly four distinct top-level
+   `__PSScriptPolicyTest_<8dot3>.ps1/.psm1` names, two of each extension, each with
+   exactly one add, modification and removal in that order. Every other name,
+   session, event, duplicate, rename, incomplete lifecycle or excess fails.
+   Names establish only a documented shape; they do not identify the writer
+4. Exactly five distinct owned births must reconcile with kernel Job accounting:
+   two admitted base-Python processes, one installed venv redirector, one admitted
+   PowerShell and one admitted System32 console host. All image paths/hashes are
+   checked, unknown identities or class-quota excess abort the owned Job, and
+   active processes must be zero. The watcher then drains queued and
+   cancellation-racing batches until a fresh empty request is confirmed aborted.
+   An incomplete queue, access denial, missing drain, or nonempty final TEMP fails.
+   This is a qualified CPython-3.12/Windows initialization profile, not an arbitrary
+   total-process allowance or a generic policy-filename exemption
 5. Run the same actual installed Start twice with the explicit admitted config,
    generated ball and bounded exit. Pre-admit TCP control/8554 and UDP
    18000/18001; never stop another owner's listener or process
@@ -183,6 +193,32 @@ classified using the existing bounded diagnostic collector, never printed or
 stored. Child deadlines are finite. The shared Job helper assigns a base-Python
 relay before opening its execution gate and owns all descendants. Cleanup is by
 owned handles and owned directories, never process-name/path/port searches.
+The execution retains its observer before setup starts and refuses to remove its
+layout while any observer reader remains live. The optional Job factory is used
+only for this negative boundary; its default retains the original shared relay
+path. The observer source is raw-byte-bound to the exact Git export alongside
+both controller scripts before any Start invocation.
+
+The former four-process/no-TEMP-change gate is historical evidence. Hosted
+candidate `f8894c1ca92fef2d5897ccd96bdef1b534bcc7c0` intentionally rejected its
+complete five-process observation. The additional process relative to the
+four-process model was the admitted console host, and only policy-probe-shaped
+TEMP events were observed. Candidate
+`1adcb117fed1a12fc07210f66a03396465f7cf52` independently qualified the strict
+per-file lifecycle and process profile on hosted Windows. This does not by itself
+qualify the installed media launches on the coordinated native runner.
+
+The documented name shape comes from [Microsoft's PowerShell application-control
+reference](https://learn.microsoft.com/en-us/powershell/scripting/security/app-control/application-control).
+CPython's [3.12.10 venv launcher](https://github.com/python/cpython/blob/v3.12.10/PC/launcher.c)
+starts its redirected interpreter with creation flags zero. The exact profile is
+retained conservatively; a differing platform trace fails rather than broadening
+these requirements automatically.
+
+Failure logs retain validated `K5_OWNED_PREFLIGHT_INITIALIZATION` scalar summaries
+and fixed `K5_OWNED_PREFLIGHT_FAILURE` records (schema, stage, phase, helper error),
+alongside the existing Alpha diagnostic. They never contain names, paths, PIDs,
+child output or exception text. The installed success receipt is unchanged.
 
 ## Receipt scope and testing
 

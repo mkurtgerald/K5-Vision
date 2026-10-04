@@ -9,6 +9,7 @@ on:
       - .github/workflows/installed-analytics-candidate.yml
       - scripts/installed_analytics_witness.py
       - scripts/installed_alpha_launcher_witness.py
+      - scripts/windows_owned_preflight.py
       - scripts/build_analytics_runtime_wheel.py
       - scripts/windows-alpha/Invoke-K5InstalledAnalyticsWitness.ps1
       - scripts/windows-alpha/Start-K5VisionAlpha.ps1

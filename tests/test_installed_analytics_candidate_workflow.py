@@ -425,3 +425,17 @@ def test_input_preparation_exception_boundary_never_echoes_raw_error():
     assert "raise SystemExit(1)" in handler
     for forbidden in ("traceback", "print(error)", "str(error)", "repr(error)"):
         assert forbidden not in handler
+
+
+def test_qualified_preflight_helper_changes_require_future_native_qualification():
+    text = WORKFLOW.read_text()
+    paths = text.split("    paths:\n", 1)[1].split("\n# Shares", 1)[0]
+    assert "      - scripts/windows_owned_preflight.py\n" in paths
+    witness = (ROOT / "scripts/installed_alpha_launcher_witness.py").read_text()
+    # The controller must bind the imported helper's exact bytes before Start.
+    preparation = witness.split("def prepare(", 1)[1].split("def probe(", 1)[0]
+    assert '"windows_owned_preflight.py"' in preparation
+    assert "Path(__file__).with_name(name).read_bytes()" in preparation
+    assert (ROOT / "scripts/windows_owned_preflight.py").is_file()
+    assert text.count("runs-on:") == 1
+    assert "group: stage-one-operator-physical\n  cancel-in-progress: false" in text
