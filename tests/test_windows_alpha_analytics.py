@@ -1837,6 +1837,7 @@ def _element_python_argument(script: Path, case: str) -> str:
 
 ELEMENT_CHILD_PREFIX = b"K5_ELEMENT_CHILD_FAILURE="
 ELEMENT_CHILD_PHASES = {
+    "utility_observation",
     "utility_manifest",
     "utility_import",
     "utility_binding",
@@ -1895,6 +1896,7 @@ function Write-K5ElementChildFailure([object]$Failure, [string]$Phase, [string]$
         }
     }
     if ($Phase -cnotin @('utility_manifest','utility_import','utility_binding','utility_cmdlet',
+        'utility_observation',
         'source_select','command_admission','probe_invoke','probe_record',
         'reference_start','reference_wait','reference_exit','reference_cleanup') -or
         $Boundary -cnotin @('primary','cleanup')) { throw 'fixture_diagnostic_invalid' }
@@ -1909,7 +1911,256 @@ function Write-K5ElementChildFailure([object]$Failure, [string]$Phase, [string]$
     [Console]::Out.Flush()
 }
 """
+ELEMENT_UTILITY_OBSERVATION = r"""
+function Write-K5UtilityBindingObservation {
+    $observed = [ordered]@{
+        schema_version = 'element-utility-binding-v1'
+        pshome_verified = $true; manifest_hash_verified = $true; manifest_reparse_clear = $true
+        module_count_ok = $false; module_type_ok = $false; module_name_ok = $false
+        module_base_ok = $false; module_path_ok = $false; cmdlet_type_ok = $false
+        implementation_type_ok = $false; assembly_name_ok = $false
+        utility_token_length_ok = $false; core_token_length_ok = $false; token_match = $false
+        metadata_complete = $true; declared_binary_path_match = $false
+        manifest_shape = 'unsupported'; root_module_kind = 'unavailable'
+        nested_modules_kind = 'unavailable'; module_base_kind = 'unavailable'
+        module_path_kind = 'unavailable'
+    }
+    try {
+        $observedMemory = [IO.MemoryStream]::new($manifestBytes, $false)
+        $observedReader = [IO.StreamReader]::new(
+            $observedMemory, [Text.UTF8Encoding]::new($false, $true), $true)
+        try { $observedText = $observedReader.ReadToEnd() }
+        finally { $observedReader.Dispose(); $observedMemory.Dispose() }
+        if ($observedText.IndexOf([char]0xfffd) -ge 0) { throw 'observation_unsupported' }
+        $observedTokens = $null; $observedErrors = $null
+        $observedAst = [Management.Automation.Language.Parser]::ParseInput($observedText,
+            [ref]$observedTokens, [ref]$observedErrors)
+        if ($observedErrors.Count -ne 0 -or $null -ne $observedAst.BeginBlock -or
+            $null -ne $observedAst.ProcessBlock -or $null -ne $observedAst.DynamicParamBlock -or
+            $null -ne $observedAst.ParamBlock -or $observedAst.UsingStatements.Count -ne 0 -or
+            $observedAst.EndBlock.Statements.Count -ne 1) {
+            throw 'observation_unsupported'
+        }
+        $observedStatement = $observedAst.EndBlock.Statements[0]
+        if ($observedStatement -isnot [Management.Automation.Language.PipelineAst] -or
+            $observedStatement.PipelineElements.Count -ne 1 -or
+            $observedStatement.PipelineElements[0] -isnot
+                [Management.Automation.Language.CommandExpressionAst]) {
+                throw 'observation_unsupported'
+            }
+        $observedTable = $observedStatement.PipelineElements[0].Expression
+        if ($observedTable -isnot [Management.Automation.Language.HashtableAst] -or
+            $observedTable.KeyValuePairs.Count -gt 64) { throw 'observation_unsupported' }
+        $observedDeclarations = @{}
+        foreach ($observedPair in $observedTable.KeyValuePairs) {
+            if ($observedPair.Item1 -isnot
+                    [Management.Automation.Language.StringConstantExpressionAst]) {
+                throw 'observation_unsupported'
+            }
+            $observedKey = $observedPair.Item1.Value
+            if ($observedKey -in @('RootModule','NestedModules')) {
+                if ($observedDeclarations.ContainsKey($observedKey) -or
+                    $observedPair.Item2.Statements.Count -ne 1) { throw 'observation_unsupported' }
+                $observedPipeline = $observedPair.Item2.Statements[0]
+                if ($observedPipeline -isnot [Management.Automation.Language.PipelineAst] -or
+                    $observedPipeline.PipelineElements.Count -ne 1 -or
+                    $observedPipeline.PipelineElements[0] -isnot
+                        [Management.Automation.Language.CommandExpressionAst]) {
+                    throw 'observation_unsupported'
+                }
+                $observedValue = $observedPipeline.PipelineElements[0].Expression
+                if ($observedValue -is [Management.Automation.Language.ArrayExpressionAst] -and
+                    $observedValue.SubExpression.Statements.Count -eq 0) {
+                    $observedValue = $null
+                } elseif ($observedValue -is [Management.Automation.Language.ArrayExpressionAst]) {
+                    if ($observedValue.SubExpression.Statements.Count -ne 1) {
+                        throw 'observation_unsupported'
+                    }
+                    $observedPipeline = $observedValue.SubExpression.Statements[0]
+                    if ($observedPipeline -isnot [Management.Automation.Language.PipelineAst] -or
+                        $observedPipeline.PipelineElements.Count -ne 1 -or
+                        $observedPipeline.PipelineElements[0] -isnot
+                            [Management.Automation.Language.CommandExpressionAst]) {
+                        throw 'observation_unsupported'
+                    }
+                    $observedValue = $observedPipeline.PipelineElements[0].Expression
+                }
+                $observedValues = @()
+                if ($null -ne $observedValue) { $observedValues = @($observedValue) }
+                if ($observedValue -is [Management.Automation.Language.ArrayLiteralAst]) {
+                    $observedValues = @($observedValue.Elements)
+                }
+                if ($observedValues.Count -gt 4 -or
+                    ($observedKey -eq 'RootModule' -and $observedValues.Count -ne 1)) {
+                    throw 'observation_unsupported'
+                }
+                $observedStrings = @()
+                foreach ($observedValue in $observedValues) {
+                    if ($observedValue -isnot
+                            [Management.Automation.Language.StringConstantExpressionAst] -or
+                        $observedValue.Value.Length -gt 128) { throw 'observation_unsupported' }
+                    $observedStrings += $observedValue.Value
+                }
+                $observedDeclarations[$observedKey] = $observedStrings
+            }
+        }
+        $observed.root_module_kind = 'absent'
+        if ($observedDeclarations.ContainsKey('RootModule')) {
+            $observed.root_module_kind = 'other_literal'
+            if ($observedDeclarations['RootModule'][0] -ieq
+                    'Microsoft.PowerShell.Commands.Utility.dll') {
+                $observed.root_module_kind = 'utility_dll'
+            }
+        }
+        $observed.nested_modules_kind = 'absent'
+        if ($observedDeclarations.ContainsKey('NestedModules')) {
+            $observed.nested_modules_kind = 'other_literals'
+            $observedNested = $observedDeclarations['NestedModules']
+            if ($observedNested.Count -eq 0) {
+                $observed.nested_modules_kind = 'empty_literal'
+            } elseif ($observedNested.Count -eq 1 -and
+                $observedNested[0] -ieq 'Microsoft.PowerShell.Commands.Utility.dll') {
+                $observed.nested_modules_kind = 'utility_dll_only'
+            } elseif ($observedNested.Count -eq 2 -and
+                $observedNested -icontains 'Microsoft.PowerShell.Commands.Utility.dll' -and
+                $observedNested -icontains 'Microsoft.PowerShell.Utility.psm1') {
+                $observed.nested_modules_kind = 'utility_dll_and_psm1'
+            }
+        }
+        $observed.manifest_shape = 'supported'
+    } catch { $observed.manifest_shape = 'unsupported' }
+    $observedModule = $null; $observedCmdlet = $null; $observedType = $null
+    $observedAssembly = $null; $observedToken = $null; $observedCoreToken = $null
+    $observedBase = $null; $observedPath = $null; $observedAssemblyPath = $null
+    $observed.module_count_ok = $utilityModules.Count -eq 1
+    if ($observed.module_count_ok) {
+        $observed.module_type_ok = $utilityModules[0] -is [Management.Automation.PSModuleInfo]
+        if ($observed.module_type_ok) { $observedModule = $utilityModules[0] }
+    }
+    if ($null -ne $observedModule) {
+        try { $observed.module_name_ok = $observedModule.Name -ceq 'Microsoft.PowerShell.Utility' }
+        catch { $observed.metadata_complete = $false }
+        try {
+            $observedBase = [IO.Path]::GetFullPath($observedModule.ModuleBase)
+            $observed.module_base_ok = [string]::Equals($observedBase, $utilityBase,
+                [StringComparison]::OrdinalIgnoreCase)
+            $observed.module_base_kind = 'other'
+            if ($observed.module_base_ok) {
+                $observed.module_base_kind = 'admitted_module_directory'
+            }
+            elseif ([string]::Equals($observedBase, $expectedHome,
+                [StringComparison]::OrdinalIgnoreCase)) {
+                $observed.module_base_kind = 'exact_pshome'
+            }
+        } catch { $observed.metadata_complete = $false }
+        try {
+            $observedPath = [IO.Path]::GetFullPath($observedModule.Path)
+            $observed.module_path_ok = [string]::Equals($observedPath, $utilityManifest,
+                [StringComparison]::OrdinalIgnoreCase)
+            $observed.module_path_kind = 'other'
+            if ($observed.module_path_ok) { $observed.module_path_kind = 'admitted_manifest' }
+            elseif ([string]::Equals($observedPath,
+                [IO.Path]::Combine($expectedHome, 'Microsoft.PowerShell.Commands.Utility.dll'),
+                [StringComparison]::OrdinalIgnoreCase)) {
+                $observed.module_path_kind = 'exact_pshome_utility_dll'
+            }
+        } catch { $observed.metadata_complete = $false }
+        try {
+            $observedCmdlet = $observedModule.ExportedCmdlets['Write-Output']
+            $observed.cmdlet_type_ok = $observedCmdlet -is [Management.Automation.CmdletInfo]
+        } catch { $observed.metadata_complete = $false }
+    } else { $observed.metadata_complete = $false }
+    if ($observed.cmdlet_type_ok) {
+        try {
+            $observedType = $observedCmdlet.ImplementingType
+            if ($observedType -isnot [type]) { throw 'observation_unavailable' }
+            $observed.implementation_type_ok = $observedType.FullName -ceq
+                'Microsoft.PowerShell.Commands.WriteOutputCommand'
+        } catch { $observed.metadata_complete = $false }
+    } else { $observed.metadata_complete = $false }
+    if ($observedType -is [type]) {
+        try {
+            $observedAssembly = $observedType.Assembly.GetName()
+            $observed.assembly_name_ok = $observedAssembly.Name -ceq
+                'Microsoft.PowerShell.Commands.Utility'
+        } catch { $observed.metadata_complete = $false }
+    }
+    if ($null -ne $observedAssembly) {
+        try {
+            $observedToken = $observedAssembly.GetPublicKeyToken()
+            $observed.utility_token_length_ok = $observedToken.Length -eq 8
+        } catch { $observed.metadata_complete = $false }
+    }
+    try {
+        $observedCoreToken = [Management.Automation.PSObject].Assembly.GetName().GetPublicKeyToken()
+        $observed.core_token_length_ok = $observedCoreToken.Length -eq 8
+    } catch { $observed.metadata_complete = $false }
+    if ($null -ne $observedToken -and $null -ne $observedCoreToken) {
+        try {
+            $observed.token_match = [BitConverter]::ToString($observedToken) -ceq
+                [BitConverter]::ToString($observedCoreToken)
+        } catch { $observed.metadata_complete = $false }
+    }
+    if ($observed.cmdlet_type_ok -and $observed.implementation_type_ok -and
+        $observed.assembly_name_ok -and $observed.utility_token_length_ok -and
+        $observed.core_token_length_ok -and $observed.token_match) {
+        try {
+            $observedAssemblyPath = [IO.Path]::GetFullPath($observedType.Assembly.Location)
+            if ($observed.module_path_kind -eq 'other' -and
+                [string]::Equals($observedPath, $observedAssemblyPath,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                $observed.module_path_kind = 'exact_verified_export_assembly'
+            }
+            if ($observed.module_base_kind -eq 'other' -and
+                [string]::Equals($observedBase, [IO.Path]::GetDirectoryName($observedAssemblyPath),
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                $observed.module_base_kind = 'exact_verified_export_directory'
+            }
+        } catch { $observed.metadata_complete = $false }
+    }
+    $observed.declared_binary_path_match = (
+        ($observed.root_module_kind -eq 'utility_dll' -or
+         $observed.nested_modules_kind -in @('utility_dll_only','utility_dll_and_psm1')) -and
+        $observed.module_path_kind -in
+            @('exact_pshome_utility_dll','exact_verified_export_assembly'))
+    $observedJson = ('{{"schema_version":"element-utility-binding-v1","pshome_verified":{0}' +
+        ',"manifest_hash_verified":{1},"manifest_reparse_clear":{2},"module_count_ok":{3}' +
+        ',"module_type_ok":{4},"module_name_ok":{5},"module_base_ok":{6},"module_path_ok":{7}' +
+        ',"cmdlet_type_ok":{8},"implementation_type_ok":{9},"assembly_name_ok":{10}' +
+        ',"utility_token_length_ok":{11},"core_token_length_ok":{12},"token_match":{13}' +
+        ',"metadata_complete":{14},"declared_binary_path_match":{15},"manifest_shape":"{16}"' +
+        ',"root_module_kind":"{17}","nested_modules_kind":"{18}","module_base_kind":"{19}"' +
+        ',"module_path_kind":"{20}"}}') -f
+        $observed.pshome_verified.ToString().ToLowerInvariant(),
+        $observed.manifest_hash_verified.ToString().ToLowerInvariant(),
+        $observed.manifest_reparse_clear.ToString().ToLowerInvariant(),
+        $observed.module_count_ok.ToString().ToLowerInvariant(),
+        $observed.module_type_ok.ToString().ToLowerInvariant(),
+        $observed.module_name_ok.ToString().ToLowerInvariant(),
+        $observed.module_base_ok.ToString().ToLowerInvariant(),
+        $observed.module_path_ok.ToString().ToLowerInvariant(),
+        $observed.cmdlet_type_ok.ToString().ToLowerInvariant(),
+        $observed.implementation_type_ok.ToString().ToLowerInvariant(),
+        $observed.assembly_name_ok.ToString().ToLowerInvariant(),
+        $observed.utility_token_length_ok.ToString().ToLowerInvariant(),
+        $observed.core_token_length_ok.ToString().ToLowerInvariant(),
+        $observed.token_match.ToString().ToLowerInvariant(),
+        $observed.metadata_complete.ToString().ToLowerInvariant(),
+        $observed.declared_binary_path_match.ToString().ToLowerInvariant(),
+        $observed.manifest_shape,
+        $observed.root_module_kind,
+        $observed.nested_modules_kind,
+        $observed.module_base_kind,
+        $observed.module_path_kind
+    [Console]::Out.WriteLine('K5_ELEMENT_UTILITY_BINDING=' + $observedJson)
+    [Console]::Out.Flush()
+    if ($observed.manifest_shape -cne 'supported' -or -not $observed.metadata_complete) {
+        throw 'fixture_identity'
+    }
+}
+"""
 ELEMENT_UTILITY_IMPORT = r"""
+__UTILITY_OBSERVATION__
 $fixturePhase = 'utility_manifest'
 [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_manifest_requested')
 [Console]::Out.Flush()
@@ -1930,9 +2181,18 @@ try {
     if ($manifestStream.Length -le 0 -or $manifestStream.Length -gt 65536) {
         throw 'fixture_identity'
     }
+    $manifestBytes = [Array]::CreateInstance([byte], [int]$manifestStream.Length)
+    $manifestOffset = 0
+    while ($manifestOffset -lt $manifestBytes.Length) {
+        $manifestRead = $manifestStream.Read($manifestBytes, $manifestOffset,
+            $manifestBytes.Length - $manifestOffset)
+        if ($manifestRead -le 0) { throw 'fixture_identity' }
+        $manifestOffset += $manifestRead
+    }
+    if ($manifestStream.ReadByte() -ne -1) { throw 'fixture_identity' }
     $manifestHasher = [Security.Cryptography.SHA256]::Create()
-    $manifestBytes = $manifestHasher.ComputeHash($manifestStream)
-    $manifestHash = [BitConverter]::ToString($manifestBytes).Replace('-', '').ToLowerInvariant()
+    $manifestDigest = $manifestHasher.ComputeHash($manifestBytes)
+    $manifestHash = [BitConverter]::ToString($manifestDigest).Replace('-', '').ToLowerInvariant()
     if ($manifestHash -cne '__UTILITY_SHA256__') { throw 'fixture_identity' }
 } finally {
     if ($null -ne $manifestHasher) { $manifestHasher.Dispose() }
@@ -1946,6 +2206,8 @@ $utilityModules = @(
 )
 [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_import_returned')
 [Console]::Out.Flush()
+$fixturePhase = 'utility_observation'
+Write-K5UtilityBindingObservation
 $fixturePhase = 'utility_binding'
 if ($utilityModules.Count -ne 1 -or
     $utilityModules[0] -isnot [Management.Automation.PSModuleInfo]) {
@@ -1973,7 +2235,7 @@ if ($utilityAssembly.Name -cne 'Microsoft.PowerShell.Commands.Utility' -or
 }
 [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_binding_verified')
 [Console]::Out.Flush()
-"""
+""".replace("__UTILITY_OBSERVATION__", ELEMENT_UTILITY_OBSERVATION)
 ELEMENT_PROBE_SCRIPT = r"""
 param([string]$Start, [string]$Executable, [string]$Name, [string]$Variant, [string]$Initial)
 $ErrorActionPreference = 'Stop'
@@ -2345,29 +2607,145 @@ def _parse_element_probe(raw: bytes) -> dict:
     return value
 
 
+ELEMENT_UTILITY_BINDING_PREFIX = b"K5_ELEMENT_UTILITY_BINDING="
+ELEMENT_UTILITY_PREDICATES = {
+    "pshome_verified",
+    "manifest_hash_verified",
+    "manifest_reparse_clear",
+    "module_count_ok",
+    "module_type_ok",
+    "module_name_ok",
+    "module_base_ok",
+    "module_path_ok",
+    "cmdlet_type_ok",
+    "implementation_type_ok",
+    "assembly_name_ok",
+    "utility_token_length_ok",
+    "core_token_length_ok",
+    "token_match",
+    "metadata_complete",
+}
+ELEMENT_UTILITY_CATEGORIES = {
+    "schema_version": {"element-utility-binding-v1"},
+    "manifest_shape": {"supported", "unsupported"},
+    "root_module_kind": {"absent", "utility_dll", "other_literal", "unavailable"},
+    "nested_modules_kind": {
+        "absent",
+        "utility_dll_only",
+        "utility_dll_and_psm1",
+        "empty_literal",
+        "other_literals",
+        "unavailable",
+    },
+    "module_base_kind": {
+        "admitted_module_directory",
+        "exact_pshome",
+        "exact_verified_export_directory",
+        "other",
+        "unavailable",
+    },
+    "module_path_kind": {
+        "admitted_manifest",
+        "exact_pshome_utility_dll",
+        "exact_verified_export_assembly",
+        "other",
+        "unavailable",
+    },
+}
+
+
+def _element_utility_binding_records(raw):
+    if len(raw) > 4096:
+        raise ValueError("Invalid utility observation")
+    records = []
+    for line in raw.splitlines():
+        if not line.startswith(ELEMENT_UTILITY_BINDING_PREFIX):
+            continue
+        pairs = json.loads(line[len(ELEMENT_UTILITY_BINDING_PREFIX) :], object_pairs_hook=list)
+        if type(pairs) is not list or any(
+            type(pair) is not tuple or len(pair) != 2 for pair in pairs
+        ):
+            raise ValueError("Invalid utility observation")
+        value = dict(pairs)
+        bools = ELEMENT_UTILITY_PREDICATES | {"declared_binary_path_match"}
+        if len(value) != len(pairs) or value.keys() != bools | ELEMENT_UTILITY_CATEGORIES.keys():
+            raise ValueError("Invalid utility observation")
+        if any(type(value[key]) is not bool for key in bools):
+            raise ValueError("Invalid utility observation")
+        for key, allowed in ELEMENT_UTILITY_CATEGORIES.items():
+            if type(value[key]) is not str or value[key] not in allowed:
+                raise ValueError("Invalid utility observation")
+        if value["module_base_ok"] != (
+            value["module_base_kind"] == "admitted_module_directory"
+        ) or value["module_path_ok"] != (value["module_path_kind"] == "admitted_manifest"):
+            raise ValueError("Inconsistent utility observation")
+        signed = all(
+            value[key]
+            for key in (
+                "cmdlet_type_ok",
+                "implementation_type_ok",
+                "assembly_name_ok",
+                "utility_token_length_ok",
+                "core_token_length_ok",
+                "token_match",
+            )
+        )
+        if (
+            value["module_path_kind"] == "exact_verified_export_assembly"
+            or value["module_base_kind"] == "exact_verified_export_directory"
+        ) and not signed:
+            raise ValueError("Inconsistent signed observation")
+        declared = value["root_module_kind"] == "utility_dll" or value["nested_modules_kind"] in {
+            "utility_dll_only",
+            "utility_dll_and_psm1",
+        }
+        binary = value["module_path_kind"] in {
+            "exact_pshome_utility_dll",
+            "exact_verified_export_assembly",
+        }
+        if value["declared_binary_path_match"] != (declared and binary):
+            raise ValueError("Inconsistent manifest observation")
+        records.append(value)
+    if len(records) > 1:
+        raise ValueError("Duplicate utility observation")
+    return records
+
+
+def _element_require_utility_observation(line):
+    records = _element_utility_binding_records(line)
+    if (
+        len(records) != 1
+        or records[0]["manifest_shape"] != "supported"
+        or not all(records[0][key] for key in ELEMENT_UTILITY_PREDICATES)
+    ):
+        raise ValueError("Incomplete utility observation")
+
+
 def _parse_imported_element_probe(raw):
     lines = raw.splitlines()
     if (
         len(raw) > 4096
         or not raw.endswith(b"\n")
-        or len(lines) != 5
-        or lines[:4]
+        or len(lines) != 6
+        or lines[:3]
         != [
             ELEMENT_CHECKPOINT_PREFIX + name.encode("ascii")
             for name in (
                 "utility_manifest_requested",
                 "utility_import_requested",
                 "utility_import_returned",
-                "utility_binding_verified",
             )
         ]
+        or lines[4] != ELEMENT_CHECKPOINT_PREFIX + b"utility_binding_verified"
     ):
         raise ValueError("Invalid official import observation")
-    return _parse_element_probe(lines[4] + b"\n")
+    _element_require_utility_observation(lines[3])
+    return _parse_element_probe(lines[5] + b"\n")
 
 
 ELEMENT_FIXTURE_PREFIX = "K5_ELEMENT_FIXTURE_DIAGNOSTIC="
 ELEMENT_FIXTURE_PHASES = {
+    "utility_ast",
     "shell_direct_control",
     "shell_utility_control",
     "utility_admission",
@@ -2621,6 +2999,11 @@ def _capture_element_child(common, arguments, *, cwd, env, context):
             for child in _element_child_records(complete):
                 failed = True
                 emit("failed", boundary="child_" + child["boundary"], child=child)
+            for binding in _element_utility_binding_records(complete):
+                print(
+                    ELEMENT_UTILITY_BINDING_PREFIX.decode()
+                    + json.dumps(binding, separators=(",", ":"))
+                )
             for checkpoint in checkpoints:
                 print(ELEMENT_CHECKPOINT_PREFIX.decode() + checkpoint)
             for argument in arguments:
@@ -2650,19 +3033,31 @@ def _element_utility_controls(common, direct_command, utility_command, *, cwd, e
         _element_diagnostic(context, "passed")
         context = _element_context("shell_utility_control")
         output = _capture_element_child(common, utility_command, cwd=cwd, env=env, context=context)
-        if output.splitlines() != [
-            ELEMENT_CHECKPOINT_PREFIX + name.encode("ascii")
-            for name in (
-                "utility_manifest_requested",
-                "utility_import_requested",
-                "utility_import_returned",
-                "utility_binding_verified",
-                "utility_cmdlet_requested",
-                "utility_cmdlet_result",
-                "utility_cmdlet_returned",
-            )
-        ]:
+        lines = output.splitlines()
+        if (
+            len(lines) != 8
+            or lines[:3]
+            != [
+                ELEMENT_CHECKPOINT_PREFIX + name.encode()
+                for name in (
+                    "utility_manifest_requested",
+                    "utility_import_requested",
+                    "utility_import_returned",
+                )
+            ]
+            or lines[4:]
+            != [
+                ELEMENT_CHECKPOINT_PREFIX + name.encode()
+                for name in (
+                    "utility_binding_verified",
+                    "utility_cmdlet_requested",
+                    "utility_cmdlet_result",
+                    "utility_cmdlet_returned",
+                )
+            ]
+        ):
             raise ValueError("Invalid official module control")
+        _element_require_utility_observation(lines[3])
         _element_diagnostic(context, "passed")
     except _ElementCaptureFailure:
         raise
@@ -3196,6 +3591,7 @@ def test_element_fixture_child_contexts_and_reference_cleanup_are_fixed():
     ]
     section = section.split("def test_element_probe_parser", 1)[0]
     for phase in ELEMENT_FIXTURE_PHASES - {
+        "utility_ast",
         "shell_direct_control",
         "shell_utility_control",
     }:
@@ -3618,6 +4014,8 @@ def test_element_imported_probe_requires_complete_exact_prefix_and_existing_sche
         )
     )
     payload = ELEMENT_PROBE_PREFIX + json.dumps(record).encode() + b"\n"
+    parts = prefix.splitlines(keepends=True)
+    prefix = b"".join(parts[:3]) + _utility_observation_bytes() + parts[3]
     raw = prefix + payload
     assert _parse_imported_element_probe(raw) == _parse_element_probe(payload) == record
     lines = raw.splitlines(keepends=True)
@@ -3832,6 +4230,8 @@ def test_element_utility_controls_require_both_routes_before_matrix(
                 "utility_cmdlet_returned",
             )
         )
+        parts = raw.splitlines(keepends=True)
+        raw = b"".join(parts[:3]) + _utility_observation_bytes() + b"".join(parts[3:])
         return b"" if failure == "utility_missing" else raw
 
     monkeypatch.setitem(_element_utility_controls.__globals__, "_capture_element_child", capture)
@@ -3847,3 +4247,316 @@ def test_element_utility_controls_require_both_routes_before_matrix(
     )
     output = capsys.readouterr()
     assert "PRIVATE" not in output.out + output.err
+
+
+def test_element_utility_binding_observation_preserves_admission_conjunction():
+    import hashlib
+
+    assert ELEMENT_UTILITY_BINDING_PREFIX == b"K5_ELEMENT_UTILITY_BINDING="
+    start = ELEMENT_UTILITY_IMPORT.index("$fixturePhase = 'utility_binding'\n")
+    end = ELEMENT_UTILITY_IMPORT.index(
+        "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_binding_verified')", start
+    )
+    assert (
+        hashlib.sha256(ELEMENT_UTILITY_IMPORT[start:end].encode()).hexdigest()
+        == "04c584d32785502b86e82295c0e3f87bb8d894a12b3d0294e53ca975954db0f3"
+    )
+    assert ELEMENT_UTILITY_IMPORT.index("Write-K5UtilityBindingObservation") < start
+    assert "SafeGetValue" not in ELEMENT_UTILITY_OBSERVATION
+    assert "Invoke-Expression" not in ELEMENT_UTILITY_OBSERVATION
+    assert "::ParseInput($observedText" in ELEMENT_UTILITY_OBSERVATION
+    assert "[IO.MemoryStream]::new($manifestBytes, $false)" in ELEMENT_UTILITY_OBSERVATION
+
+
+def _utility_observation_bytes(**changes):
+    value = {key: True for key in ELEMENT_UTILITY_PREDICATES}
+    value.update(
+        schema_version="element-utility-binding-v1",
+        declared_binary_path_match=False,
+        manifest_shape="supported",
+        root_module_kind="absent",
+        nested_modules_kind="utility_dll_and_psm1",
+        module_base_kind="admitted_module_directory",
+        module_path_kind="admitted_manifest",
+    )
+    value.update(changes)
+    return (
+        ELEMENT_UTILITY_BINDING_PREFIX + json.dumps(value, separators=(",", ":")).encode() + b"\n"
+    )
+
+
+def test_element_utility_binding_record_rejects_raw_forged_and_inconsistent_fields():
+    valid = _utility_observation_bytes()
+    assert len(_element_utility_binding_records(valid)) == 1
+    _element_require_utility_observation(valid)
+    for field in ELEMENT_UTILITY_PREDICATES | {"declared_binary_path_match"}:
+        for forged in (None, 1, "PRIVATE", [], {}, 2**65):
+            with pytest.raises(ValueError):
+                _element_utility_binding_records(_utility_observation_bytes(**{field: forged}))
+    for field in ELEMENT_UTILITY_CATEGORIES:
+        for forged in (None, 1, True, "PRIVATE_PATH", [], {}):
+            with pytest.raises(ValueError):
+                _element_utility_binding_records(_utility_observation_bytes(**{field: forged}))
+    for forged in (
+        valid + valid,
+        b"x" * 4097,
+        ELEMENT_UTILITY_BINDING_PREFIX + b"[]",
+        _utility_observation_bytes(raw="PRIVATE_PATH"),
+        valid.rstrip()[:-1] + b',"token_match":true}\n',
+        _utility_observation_bytes(module_base_kind="exact_pshome"),
+        _utility_observation_bytes(module_base_ok=False),
+        _utility_observation_bytes(module_path_ok=False),
+        _utility_observation_bytes(module_path_kind="exact_pshome_utility_dll"),
+        _utility_observation_bytes(declared_binary_path_match=True),
+        _utility_observation_bytes(
+            module_path_ok=False,
+            module_path_kind="exact_verified_export_assembly",
+            declared_binary_path_match=True,
+            token_match=False,
+        ),
+    ):
+        with pytest.raises(ValueError):
+            _element_utility_binding_records(forged)
+    # Diagnostics may report a complete mismatch; they cannot permit execution.
+    mismatch = _utility_observation_bytes(module_base_ok=False, module_base_kind="exact_pshome")
+    assert not _element_utility_binding_records(mismatch)[0]["module_base_ok"]
+    for rejected in (
+        mismatch,
+        _utility_observation_bytes(manifest_shape="unsupported"),
+        _utility_observation_bytes(metadata_complete=False),
+    ):
+        with pytest.raises(ValueError):
+            _element_require_utility_observation(rejected)
+
+
+def test_element_utility_observation_has_complete_fixed_template_and_guarded_getters():
+    expression = ELEMENT_UTILITY_OBSERVATION.split("$observedJson = (", 1)[1].split(") -f", 1)[0]
+    template = "".join(re.findall(r"'([^']*)'", expression))
+    args = ELEMENT_UTILITY_OBSERVATION.split(") -f\n", 1)[1].split("[Console]::Out.WriteLine", 1)[0]
+    names = re.findall(r"\$observed\.([a-z_]+)", args)
+    valid = _element_utility_binding_records(_utility_observation_bytes())[0]
+    assert set(names) == valid.keys() - {"schema_version"} and len(set(names)) == len(names)
+    rendered = template.format(
+        *(str(valid[name]).lower() if type(valid[name]) is bool else valid[name] for name in names)
+    )
+    assert json.loads(rendered) == valid
+    assert "StringConstantExpressionAst" in ELEMENT_UTILITY_OBSERVATION
+    assert "ArrayLiteralAst" in ELEMENT_UTILITY_OBSERVATION
+    assert "SafeGetValue" not in ELEMENT_UTILITY_OBSERVATION
+    assert "ReadAll" not in ELEMENT_UTILITY_OBSERVATION
+    assert "GetFullPath($observedType.Assembly.Location)" in ELEMENT_UTILITY_OBSERVATION
+    assert "GetAttributes" not in ELEMENT_UTILITY_OBSERVATION  # No extra assembly path reads.
+    assert ELEMENT_UTILITY_IMPORT.index(
+        "ComputeHash($manifestBytes)"
+    ) < ELEMENT_UTILITY_IMPORT.index("\nWrite-K5UtilityBindingObservation\n")
+    for predicate in ELEMENT_UTILITY_PREDICATES:
+        assert predicate in ELEMENT_UTILITY_OBSERVATION
+    assert "$observedModule = $null" in ELEMENT_UTILITY_OBSERVATION
+    assert "if ($observed.cmdlet_type_ok)" in ELEMENT_UTILITY_OBSERVATION
+    assert "if ($observedType -is [type])" in ELEMENT_UTILITY_OBSERVATION
+    assert "if ($null -ne $observedAssembly)" in ELEMENT_UTILITY_OBSERVATION
+    assert "$observed.metadata_complete = $false" in ELEMENT_UTILITY_OBSERVATION
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_element_utility_observation_survives_failure_without_raw_output_or_success(
+    malformed, tmp_path, monkeypatch, capsys
+):
+    import io
+    from types import SimpleNamespace
+
+    common = _startup_witness().common
+    closed = []
+    raw = (
+        _utility_observation_bytes(raw="PRIVATE")
+        if malformed
+        else _utility_observation_bytes(
+            module_path_ok=False,
+            module_path_kind="exact_pshome_utility_dll",
+            declared_binary_path_match=True,
+        )
+    )
+
+    class Owned:
+        def __init__(self, *args, **kwargs):
+            self.process = SimpleNamespace(stdout=io.BytesIO(raw))
+
+        def wait(self, seconds):
+            raise common.WitnessError(
+                "child_failed",
+                common.diagnostic(
+                    "probe_admission", child_exit_code=1, relay_exit_code=1, gate_state="exited"
+                ),
+            )
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(common, "OwnedProcess", Owned)
+    with pytest.raises(_ElementCaptureFailure):
+        _capture_element_child(
+            common, [], cwd=tmp_path, env={}, context=_element_context("shell_utility_control")
+        )
+    output = capsys.readouterr()
+    assert closed == [True] and "PRIVATE" not in output.out + output.err
+    diagnostics = _fixture_records(output.out)
+    assert diagnostics[1]["error"] == "child_failed"
+    assert diagnostics[1]["child_exit"] == diagnostics[1]["relay_exit"] == 1
+    observations = _element_utility_binding_records(output.out.encode())
+    assert len(observations) == (0 if malformed else 1)
+    if observations:
+        assert not observations[0]["module_path_ok"]
+
+
+def test_element_unsupported_binding_observation_refuses_before_native_invocation():
+    emitted = ELEMENT_UTILITY_OBSERVATION.index(
+        "[Console]::Out.WriteLine('K5_ELEMENT_UTILITY_BINDING='"
+    )
+    refusal = ELEMENT_UTILITY_OBSERVATION.index("if ($observed.manifest_shape -cne 'supported'")
+    assert (
+        emitted < refusal < ELEMENT_UTILITY_OBSERVATION.index("throw 'fixture_identity'", refusal)
+    )
+    assert "'utility_observation'" in ELEMENT_CHILD_DIAGNOSTICS
+    assert ELEMENT_PROBE_SCRIPT.index(
+        "\nWrite-K5UtilityBindingObservation\n"
+    ) < ELEMENT_PROBE_SCRIPT.index("$answer = Test-K5GStreamerElement")
+
+
+UTILITY_AST_CASES = (
+    ("absent", b"@{}", "supported", "absent", "absent"),
+    ("empty", b"@{NestedModules=@()}", "supported", "absent", "empty_literal"),
+    (
+        "scalar",
+        b"@{NestedModules='Microsoft.PowerShell.Commands.Utility.dll'}",
+        "supported",
+        "absent",
+        "utility_dll_only",
+    ),
+    (
+        "array",
+        b"@{NestedModules=@('Microsoft.PowerShell.Commands.Utility.dll','Microsoft.PowerShell.Utility.psm1')}",
+        "supported",
+        "absent",
+        "utility_dll_and_psm1",
+    ),
+    (
+        "root",
+        b"@{RootModule='Microsoft.PowerShell.Commands.Utility.dll'}",
+        "supported",
+        "utility_dll",
+        "absent",
+    ),
+    ("bom", "@{NestedModules=@()}".encode("utf-16"), "supported", "absent", "empty_literal"),
+    ("expression", b"@{NestedModules=(1+1)}", "unsupported", "unavailable", "unavailable"),
+    ("interpolation", b'@{RootModule="$env:TEMP"}', "unsupported", "unavailable", "unavailable"),
+    ("encoding", b"\xff@{}", "unsupported", "unavailable", "unavailable"),
+    ("begin", b"begin {} end {@{}}", "unsupported", "unavailable", "unavailable"),
+    ("parameters", b"param() @{}", "unsupported", "unavailable", "unavailable"),
+)
+
+ELEMENT_CHECKPOINTS.update(
+    "utility_ast_" + case + "_" + state
+    for case, *_ in UTILITY_AST_CASES
+    for state in ("requested", "passed")
+)
+
+
+def _utility_ast_fixture_script():
+    import base64
+
+    start = ELEMENT_UTILITY_OBSERVATION.index("    try {\n        $observedMemory")
+    end = ELEMENT_UTILITY_OBSERVATION.index("    $observedModule = $null", start)
+    block = ELEMENT_UTILITY_OBSERVATION[start:end]
+    script = (
+        "$ErrorActionPreference = 'Stop'\nfunction Read-K5ManifestShape([byte[]]$manifestBytes) {\n"
+        "$observed = @{manifest_shape='unsupported';root_module_kind='unavailable';"
+        "nested_modules_kind='unavailable'}\n" + block + "return $observed\n}\n"
+    )
+    for case, raw, shape, root, nested in UTILITY_AST_CASES:
+        encoded = base64.b64encode(raw).decode()
+        script += (
+            "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_ast_" + case + "_requested')\n"
+            "[Console]::Out.Flush()\n"
+            "$result = Read-K5ManifestShape ([Convert]::FromBase64String('" + encoded + "'))\n"
+            "if ($result.manifest_shape -cne '"
+            + shape
+            + "' -or $result.root_module_kind -cne '"
+            + root
+            + "' -or $result.nested_modules_kind -cne '"
+            + nested
+            + "') { exit 1 }\n"
+            "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_ast_" + case + "_passed')\n"
+            "[Console]::Out.Flush()\n"
+        )
+    return script + "exit 0\n"
+
+
+def test_element_manifest_ast_fixture_uses_exact_bounded_block_without_execution():
+    script = _utility_ast_fixture_script()
+    start = ELEMENT_UTILITY_OBSERVATION.index("    try {\n        $observedMemory")
+    end = ELEMENT_UTILITY_OBSERVATION.index("    $observedModule = $null", start)
+    assert script.count(ELEMENT_UTILITY_OBSERVATION[start:end]) == 1
+    assert "Import-Module" not in script and "SafeGetValue" not in script
+    assert "Invoke-Expression" not in script and "ScriptBlock]::Create" not in script
+    assert len(UTILITY_AST_CASES) == 11 and len(script.encode()) < 16384
+    for case, *_ in UTILITY_AST_CASES:
+        for state in ("requested", "passed"):
+            assert "utility_ast_" + case + "_" + state in ELEMENT_CHECKPOINTS
+            assert script.count("K5_ELEMENT_CHECKPOINT=utility_ast_" + case + "_" + state) == 1
+    assert "K5_UTILITY_AST_CASE" not in script
+    assert "StringConstantExpressionAst" in script and "ArrayLiteralAst" in script
+    for name in (
+        "BeginBlock",
+        "ProcessBlock",
+        "DynamicParamBlock",
+        "ParamBlock",
+        "UsingStatements",
+    ):
+        assert "$observedAst." + name in script
+    assert "ReadToEnd" in script and "MemoryStream" in script
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows PowerShell manifest AST")
+def test_windows_utility_manifest_ast_literals_and_unsupported_forms(tmp_path):
+    import os
+
+    common = None
+    context = _element_context("utility_ast")
+    try:
+        module = _startup_witness()
+        common = module.common
+        base = common.local_path(Path(sys._base_executable))
+        binding = dict(
+            K5_WITNESS_BASE_PYTHON=str(base), K5_WITNESS_BASE_PYTHON_SHA256=common.file_hash(base)
+        )
+        supplied = {key: os.environ.get(key) for key in common.GATE_RUNTIME_KEYS}
+        if any(value is not None for value in supplied.values()) and supplied != binding:
+            raise ValueError("Invalid fixture runtime")
+        env = module.clean_environment(dict(os.environ), tmp_path)
+        env.update(binding)
+        for key in ("TEMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            Path(env[key]).mkdir(parents=True, exist_ok=True)
+        shell = common.local_path(
+            Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        script = tmp_path / "manifest-ast.ps1"
+        script.write_text(_utility_ast_fixture_script(), encoding="ascii", newline="\n")
+        raw = _capture_element_child(
+            common,
+            [str(shell), "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)],
+            cwd=tmp_path,
+            env=env,
+            context=context,
+        )
+        if raw.splitlines() != [
+            ELEMENT_CHECKPOINT_PREFIX + ("utility_ast_" + case + "_" + state).encode()
+            for case, *_ in UTILITY_AST_CASES
+            for state in ("requested", "passed")
+        ]:
+            raise ValueError("Invalid fixed AST fixture result")
+    except Exception as error:
+        try:
+            _element_diagnostic(context, "failed", error, common=common)
+        except Exception:
+            pass
+        pytest.fail("Owned manifest AST fixture failed", pytrace=False)
