@@ -6562,3 +6562,401 @@ def test_run_facade_matrix_covers_equal_nonzero_success_and_failure_without_synt
     )[0]
     assert "[IO.Path]::Combine($InstallRoot, 'Start-K5VisionAlpha.ps1')" in preparation
     assert "Join-Path" not in preparation
+
+
+TEST_NATIVE_CALLS = {
+    "gst_version": (
+        "$output = @(& $gstLaunch --version 2>$null)",
+        '    throw "Reviewed GStreamer runtime version verification failed."\n}',
+        "$gstLaunch",
+        ["--version"],
+        b"GStreamer 1.28.7\n",
+        "Reviewed GStreamer runtime version verification failed.",
+    ),
+    "cli_version": (
+        "& $python -I -B -m k5vision.cli --version",
+        'if ($LASTEXITCODE -ne 0) { throw "Installed K5 CLI verification failed." }',
+        "$python",
+        ["-I", "-B", "-m", "k5vision.cli", "--version"],
+        b"k5-vision 0.1.0\n",
+        "Installed K5 CLI verification failed.",
+    ),
+    "cli_help": (
+        "& $python -I -B -m k5vision.cli --help *> $null",
+        'if ($LASTEXITCODE -ne 0) { throw "Installed K5 CLI smoke test failed." }',
+        "$python",
+        ["-I", "-B", "-m", "k5vision.cli", "--help"],
+        b"owned help\n",
+        "Installed K5 CLI smoke test failed.",
+    ),
+}
+
+
+def _test_native_call_source(boundary):
+    if boundary not in TEST_NATIVE_CALLS:
+        raise ValueError("Invalid fixed Test call")
+    raw = TEST.read_bytes()
+    normalized = raw.replace(b"\r\n", b"\n")
+    if (
+        raw not in (normalized, normalized.replace(b"\n", b"\r\n"))
+        or hashlib.sha256(normalized).hexdigest()
+        != "eb820f15f30e8433d51bf012131456a0e00c71501fbe03db8dbeb5b51bf01341"
+    ):
+        raise ValueError("Unqualified Test invocation source")
+    source = normalized.decode("ascii")
+    first, last, executable, *_ = TEST_NATIVE_CALLS[boundary]
+    if source.count(first) != 1 or source.count(last) != 1:
+        raise ValueError("Invalid Test call anchors")
+    start = source.index(first)
+    stop = source.index(last, start) + len(last)
+    block = source[start:stop]
+    anchor = "& " + executable + " "
+    if block.count(anchor) != 1 or len(block) > 1024:
+        raise ValueError("Invalid Test call extent")
+    # Only the executable and owned oracle prefix are substituted. Original argv,
+    # redirection, assignment and following validator remain byte-for-byte intact.
+    return block, block.replace(anchor, "& $Executable $Name ", 1)
+
+
+def _test_native_probe_script(boundary):
+    _, block = _test_native_call_source(boundary)
+    caller = (
+        "[CmdletBinding()]\nparam([string]$Executable,[string]$Name)\n"
+        "$ErrorActionPreference = 'Stop'\nSet-StrictMode -Version Latest\n"
+        "$gstreamerVersion = '1.28.7'\n" + block + "\n"
+    )
+    replacements = (
+        ("$Variant -cnotin @('original','process')", "$Variant -cne 'original'"),
+        (ELEMENT_HISTORICAL_HELPER, caller),
+        (
+            "    . ([scriptblock]::Create($selected))",
+            "    $caller = [IO.Path]::Combine($PSScriptRoot,'test-native-caller.ps1')\n"
+            "    [IO.File]::WriteAllText($caller,$selected,[Text.UTF8Encoding]::new($false))",
+        ),
+        (
+            "        $answer = Test-K5GStreamerElement -Name $Name\n"
+            "        if ($answer -is [bool]) { $outcome = "
+            "if ($answer) { 'true' } else { 'false' } }",
+            "        & $caller -Executable $Executable -Name $Name\n        $outcome = 'true'",
+        ),
+        (
+            "        if ($_.Exception -is [TimeoutException]) { $outcome = 'timeout' }",
+            "        if ($_.Exception.Message -ceq '"
+            + TEST_NATIVE_CALLS[boundary][5]
+            + "') { $outcome = 'false' }\n"
+            "        elseif ($_.Exception -is [TimeoutException]) { $outcome = 'timeout' }",
+        ),
+        (
+            "# Frozen historical error/exit baseline; never the current product source.",
+            "# Exact Test call/validator projection; never full installed Test acceptance.",
+        ),
+        (ELEMENT_UTILITY_IMPORT, ELEMENT_UTILITY_IMPORT + RUN_FACADE_MANAGEMENT_IMPORT),
+    )
+    script = ELEMENT_PROBE_SCRIPT
+    for before, after in replacements:
+        if script.count(before) != 1:
+            raise ValueError("Invalid qualified Test probe adaptation")
+        script = script.replace(before, after, 1)
+    return script
+
+
+def _test_native_argument(fixture, boundary, case):
+    import base64
+
+    if boundary not in TEST_NATIVE_CALLS or case not in {"zero", "nonzero"}:
+        raise ValueError("Invalid fixed Test oracle")
+    argument = _element_python_argument(fixture, case)
+    prefix, suffix = "-IBScexec(__import__('base64').b64decode('", "'))"
+    if not argument.startswith(prefix) or not argument.endswith(suffix):
+        raise ValueError("Unqualified oracle loader")
+    loader = base64.b64decode(argument[len(prefix) : -len(suffix)], validate=True).decode("utf8")
+    anchor = "exec(compile(data, '<owned-element-fixture>', 'exec'))\n"
+    if loader.count(anchor) != 1 or ELEMENT_PROBE_PYTHON_SOURCE.count("    time.sleep(0.5)") != 1:
+        raise ValueError("Invalid qualified oracle anchors")
+    argv, output = TEST_NATIVE_CALLS[boundary][3:5]
+    # The qualified oracle's isolation, sleep, actual exit and failure cleanup stay
+    # intact. A fixed argv check/output is inserted inside its existing try block.
+    addition = (
+        "    if sys.argv[1:] != " + repr(argv) + ":\n        os._exit(44)\n"
+        "    os.write(1," + repr(output) + ")\n    time.sleep(0.5)"
+    )
+    rewrite = "data=data.replace(b'    time.sleep(0.5)'," + repr(addition.encode("ascii")) + ",1)\n"
+    loader = loader.replace(anchor, rewrite + anchor, 1)
+    return prefix + base64.b64encode(loader.encode("utf8")).decode("ascii") + suffix
+
+
+def _test_native_reference_script(boundary):
+    argv, output = TEST_NATIVE_CALLS[boundary][3:5]
+    script = ELEMENT_REFERENCE_SCRIPT
+    for before, after in (
+        (
+            "subprocess.Popen([executable, argument],",
+            "subprocess.Popen([executable, argument] + " + repr(argv) + ",",
+        ),
+        ("outputs != [b'', expected]", "outputs != [" + repr(output) + ", expected]"),
+    ):
+        if script.count(before) != 1:
+            raise ValueError("Invalid qualified reference adaptation")
+        script = script.replace(before, after, 1)
+    return script
+
+
+def _parse_test_native_probe(raw, boundary):
+    lines = raw.splitlines()
+    # Only the exact source-free oracle literal may be forwarded by the original
+    # command shape. Suppression/capture is not rewritten to simplify this probe.
+    literal = TEST_NATIVE_CALLS[boundary][4].rstrip(b"\n")
+    if lines.count(literal) > 1:
+        raise ValueError("Invalid fixed Test output")
+    lines = [line for line in lines if line != literal]
+    if len(lines) != 11 or not raw.endswith(b"\n") or len(raw) > 4096:
+        raise ValueError("Invalid Test native observation")
+    expected = [
+        ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in RUN_FACADE_MANAGEMENT_CHECKPOINTS
+    ]
+    if lines[5:8] != expected[:3] or lines[9] != expected[3]:
+        raise ValueError("Unqualified Management prefix")
+    _element_require_utility_observation(_run_facade_management_as_utility(lines[8]))
+    return _parse_imported_element_probe(b"\n".join([*lines[:5], lines[10]]) + b"\n")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires actual GUI/CUI Test native semantics")
+@pytest.mark.parametrize("boundary", sorted(TEST_NATIVE_CALLS))
+def test_windows_test_facade_native_calls_observe_real_exit(tmp_path, boundary):
+    import os
+
+    common = None
+    context = _element_context("runtime_admission")
+    complete = False
+    misses = []
+    try:
+        module = _startup_witness()
+        common = module.common
+        common.StderrSummary, common.OwnedProcess = _run_facade_capture_classes(common)
+        base = common.local_path(Path(sys._base_executable))
+        binding = dict(
+            K5_WITNESS_BASE_PYTHON=str(base), K5_WITNESS_BASE_PYTHON_SHA256=common.file_hash(base)
+        )
+        supplied = {key: os.environ.get(key) for key in common.GATE_RUNTIME_KEYS}
+        if any(item is not None for item in supplied.values()) and supplied != binding:
+            raise ValueError("Invalid Test oracle runtime")
+        env = module.clean_environment(dict(os.environ), tmp_path)
+        env.update(binding)
+        for key in ("TEMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            Path(env[key]).mkdir(parents=True, exist_ok=True)
+        shell = common.local_path(
+            Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        fixture = tmp_path / "owned-test-oracle.py"
+        fixture.write_bytes(ELEMENT_PROBE_PYTHON_SOURCE.encode("ascii"))
+        reference = tmp_path / "test-reference.py"
+        reference.write_text(
+            _test_native_reference_script(boundary), encoding="ascii", newline="\n"
+        )
+        probe = tmp_path / "test-probe.ps1"
+        probe.write_text(
+            _run_facade_bind_modules(_test_native_probe_script(boundary), shell, common),
+            encoding="ascii",
+            newline="\n",
+        )
+        test_identity = common.file_hash(TEST)
+        for kind, executable, subsystem in (
+            ("ConsoleApplication", base, 3),
+            ("WindowsApplication", base.with_name("pythonw.exe"), 2),
+        ):
+            executable = common.local_path(executable)
+            if executable.parent != base.parent or _pe_fixture_subsystem(executable) != subsystem:
+                raise ValueError("Invalid Test oracle PE identity")
+            identity = common.file_hash(executable)
+            for case, actual_exit in (("zero", 0), ("nonzero", 7)):
+                context = _element_context("reference", kind, case)
+                argument = _test_native_argument(fixture, boundary, case)
+                output = _capture_element_child(
+                    common,
+                    [str(base), "-I", "-B", "-S", str(reference), str(executable), argument, case],
+                    cwd=tmp_path,
+                    env=env,
+                    context=context,
+                )
+                full, checkpoints, argv_records = _element_complete_records(output)
+                if (
+                    checkpoints
+                    != [
+                        "reference_entered",
+                        "reference_start_requested",
+                        "reference_started",
+                        "reference_waited",
+                        "reference_stdio_verified",
+                        "reference_cleanup_complete",
+                    ]
+                    or argv_records
+                ):
+                    raise ValueError("Incomplete actual-exit oracle")
+                result = [
+                    line
+                    for line in full.splitlines()
+                    if not line.startswith(ELEMENT_CHECKPOINT_PREFIX)
+                ]
+                if result != [b"K5_NATIVE_REFERENCE=" + str(actual_exit).encode()]:
+                    raise ValueError("Actual Test oracle exit mismatch")
+                print(
+                    "K5_TEST_NATIVE_REFERENCE="
+                    + boundary
+                    + ":"
+                    + kind
+                    + ":"
+                    + case
+                    + ":"
+                    + str(actual_exit)
+                )
+                for initial in ("absent", "stale_zero", "stale_nonzero"):
+                    context = _element_context("probe", kind, case, "original", initial)
+                    if (
+                        common.file_hash(executable) != identity
+                        or common.file_hash(TEST) != test_identity
+                    ):
+                        raise ValueError("Test source/oracle changed")
+                    output = _capture_element_child(
+                        common,
+                        [
+                            str(shell),
+                            "-NoLogo",
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-File",
+                            str(probe),
+                            "-Start",
+                            str(START),
+                            "-Executable",
+                            str(executable),
+                            "-Name:",
+                            argument,
+                            "-Variant",
+                            "original",
+                            "-Initial",
+                            initial,
+                        ],
+                        cwd=tmp_path,
+                        env=env,
+                        context=context,
+                    )
+                    record = _parse_test_native_probe(output, boundary)
+                    valid = (
+                        record["fresh_session"]
+                        and record["application_bound"]
+                        and record["command_kind"] == "application"
+                        and record["variant"] == "original"
+                        and record["initial"] == initial
+                        and record["waited_floor"]
+                        and record["last_exit"] == actual_exit
+                        and record["outcome"] == ("true" if actual_exit == 0 else "false")
+                    )
+                    print(
+                        "K5_TEST_NATIVE_CALL=" + boundary + ":" + kind + ":" + case + ":" + initial
+                    )
+                    print(ELEMENT_PROBE_PREFIX.decode() + json.dumps(record, separators=(",", ":")))
+                    if not valid:
+                        misses.append((kind, case, initial))
+        complete = True
+    except _ElementCaptureFailure:
+        pass
+    except Exception as error:
+        try:
+            _element_diagnostic(context, "failed", error, common=common)
+        except Exception:
+            pass
+    if not complete:
+        pytest.fail("Source-bound Test native caller observation failed", pytrace=False)
+    if misses:
+        print("K5_TEST_NATIVE_MISSES=" + boundary + ":" + str(len(misses)))
+        pytest.fail("Test native caller violated actual-exit contract", pytrace=False)
+
+
+@pytest.mark.parametrize("boundary", sorted(TEST_NATIVE_CALLS))
+def test_test_native_projection_preserves_actual_argv_redirect_and_validator(boundary):
+    source, projected = _test_native_call_source(boundary)
+    executable = TEST_NATIVE_CALLS[boundary][2]
+    assert projected.replace("& $Executable $Name ", "& " + executable + " ", 1) == source
+    script = _test_native_probe_script(boundary)
+    assert projected in script and RUN_FACADE_MANAGEMENT_IMPORT in script
+    assert "& $caller -Executable $Executable -Name $Name" in script
+    assert "$answer = Test-K5GStreamerElement" not in script
+    assert "[IO.File]::WriteAllText($caller" in script
+    assert "& $launcher" not in script and "Read-Host" not in script
+    reference = _test_native_reference_script(boundary)
+    assert "child.wait(timeout=5)" in reference and "stream.read(65)" in reference
+    assert "child.kill()" in reference and "reference_cleanup_complete" in reference
+    assert repr(TEST_NATIVE_CALLS[boundary][3]) in reference
+    compile(reference, "qualified-test-reference", "exec")
+
+
+def test_test_native_oracle_reuses_exact_qualified_fixture_and_adds_only_fixed_inputs(tmp_path):
+    import base64
+
+    path = tmp_path / "owned oracle.py"
+    path.write_bytes(ELEMENT_PROBE_PYTHON_SOURCE.encode("ascii"))
+    for boundary in TEST_NATIVE_CALLS:
+        for case in ("zero", "nonzero"):
+            argument = _test_native_argument(path, boundary, case)
+            assert " " not in argument and '"' not in argument
+            encoded = argument.split("b64decode('", 1)[1].split("'", 1)[0]
+            code = base64.b64decode(encoded).decode("utf8")
+            compile(code, "qualified-test-loader", "exec")
+            assert hashlib.sha256(path.read_bytes()).hexdigest() in code
+            assert "os._exit(44)" in code and "time.sleep(0.5)" in code
+    path.write_bytes(b"PRIVATE_CHANGED_SOURCE")
+    with pytest.raises(ValueError):
+        _test_native_argument(path, "gst_version", "zero")
+
+
+def test_test_native_record_retains_only_complete_qualified_scalar_evidence():
+    utility = [
+        ELEMENT_CHECKPOINT_PREFIX + name.encode()
+        for name in (
+            "utility_manifest_requested",
+            "utility_import_requested",
+            "utility_import_returned",
+        )
+    ]
+    utility += [_utility_observation_bytes().rstrip(b"\n")]
+    utility += [ELEMENT_CHECKPOINT_PREFIX + b"utility_binding_verified"]
+    management = [
+        ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in RUN_FACADE_MANAGEMENT_CHECKPOINTS[:3]
+    ]
+    management += [
+        _utility_observation_bytes()
+        .rstrip(b"\n")
+        .replace(b"UTILITY", b"MANAGEMENT")
+        .replace(b"utility", b"management")
+    ]
+    management += [ELEMENT_CHECKPOINT_PREFIX + RUN_FACADE_MANAGEMENT_CHECKPOINTS[3].encode()]
+    record = dict(
+        schema_version=ELEMENT_PROBE_SCHEMA,
+        variant="original",
+        initial="absent",
+        fresh_session=True,
+        command_kind="application",
+        application_bound=True,
+        outcome="true",
+        last_exit=0,
+        waited_floor=True,
+        actual_exit=None,
+        process_cleaned=False,
+    )
+    value = ELEMENT_PROBE_PREFIX + json.dumps(record).encode()
+    wire = b"\n".join([*utility, *management, value]) + b"\n"
+    assert _parse_test_native_probe(wire, "gst_version") == record
+    for boundary, case in TEST_NATIVE_CALLS.items():
+        assert _parse_test_native_probe(wire + case[4], boundary) == record
+        with pytest.raises(ValueError):
+            _parse_test_native_probe(wire + case[4] * 2, boundary)
+    for malformed in (
+        wire + b"PRIVATE_PATH\n",
+        wire * 2,
+        wire[:-1],
+        b"x" * 4097,
+        wire.replace(b"management_binding_verified", b"management_import_returned"),
+        wire.replace(b'"last_exit": 0', b'"last_exit": true'),
+    ):
+        with pytest.raises(ValueError):
+            _parse_test_native_probe(malformed, "gst_version")
