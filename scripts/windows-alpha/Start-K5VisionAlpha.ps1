@@ -270,9 +270,11 @@ paths:
 "@
     [IO.File]::WriteAllText($configPath, $config)
 
-    $mediaMtxVersion = @(& $mediaMtx --version 2>&1)
-    if ($LASTEXITCODE -ne 0 -or -not (($mediaMtxVersion -join " ").Contains($MediaMtxVersion))) {
-        foreach ($line in $mediaMtxVersion) { Write-Host ("mediamtx-version: " + $line) }
+    $mediaMtxVersionOutput = @(& $mediaMtx --version 2>&1)
+    if ($LASTEXITCODE -ne 0 -or $mediaMtxVersionOutput.Count -ne 1 -or
+        $mediaMtxVersionOutput[0] -isnot [string] -or
+        $mediaMtxVersionOutput[0] -cne ("v" + $MediaMtxVersion)) {
+        foreach ($line in $mediaMtxVersionOutput) { Write-Host ("mediamtx-version: " + $line) }
         throw "Pinned MediaMTX executable failed its version probe."
     }
 
@@ -367,7 +369,13 @@ paths:
             }
         }
         if (-not $cleanupComplete) {
-            throw "Local synthetic RTSP startup failed and owned process cleanup was incomplete."
+            $cleanupFailure = [InvalidOperationException]::new(
+                "Local synthetic RTSP startup failed and owned process cleanup was incomplete."
+            )
+            # Keep the original typed error only in memory for bounded diagnostic
+            # projection. Cleanup remains fatal; never serialize this private link.
+            $cleanupFailure.Data["K5.StartupErrorRecord"] = $startupFailure
+            throw $cleanupFailure
         }
         throw $startupFailure
     }

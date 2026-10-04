@@ -1871,3 +1871,222 @@ def test_single_pair_cannot_bypass_refusal_activity_or_cleanup(monkeypatch, tmp_
             owned_observations=[],
         )
     assert state["closed"] and state["observation_closed"]
+
+
+def test_start_diagnostics_are_separate_from_success_evidence() -> None:
+    summary = witness.LaunchSummary(io.BytesIO(success_output()))
+    summary.finish()
+    assert summary.start_errors == []
+    assert summary.start_diagnostic_invalid is False
+    assert set(summary.start_milestones) == set(witness.START_MILESTONES)
+    assert summary.result()["delivered_frames"] == 225
+
+
+def start_error(**changes):
+    return {
+        "schema_version": "alpha-start-error-v1",
+        "phase": "primary",
+        "origin": "unknown",
+        "source_line": None,
+        "operation": "unknown",
+        "error_class": "unknown",
+        "failure": "unknown",
+        **changes,
+    }
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"path": "private"},
+        {"failure": "private message"},
+        {"operation": []},
+        {"source_line": 123},
+        {"origin": "private path"},
+        {"error_class": {}},
+        {"origin": "start", "source_line": True},
+        {"origin": "start", "source_line": 4097},
+        {"origin": "start", "source_line": 0},
+        {"schema_version": "unknown"},
+        {"phase": "private"},
+        {"failure": "mediamtx_version"},
+        {"operation": "mediamtx_version"},
+        {"error_class": "known_throw"},
+    ],
+)
+def test_start_error_rejects_raw_unbounded_or_inconsistent_values(changes):
+    with pytest.raises(ValueError):
+        witness.validate_start_error(start_error(**changes))
+
+
+def test_start_error_parser_and_collector_reject_forged_records_without_raw_output(capsys):
+    raw = witness.common.canonical(start_error())
+    for bad in (
+        b"[]",
+        b"{}",
+        raw[:-1] + b',"phase":"cleanup"}',
+        b"x" * 1025,
+        b'{"failure":{"secret":"private"}}',
+    ):
+        with pytest.raises((ValueError, TypeError)):
+            witness.parse_start_error(bad)
+    stream = (witness.START_ERROR_PREFIX + raw + b"\n") * 3
+    stream += witness.START_ERROR_PREFIX + b'{"secret":"private"}\n'
+    summary = witness.LaunchSummary(io.BytesIO(stream))
+    summary.finish()
+    assert summary.start_errors == [start_error()]
+    assert summary.start_diagnostic_invalid
+    summary.emit_start_diagnostics("launch_1")
+    assert "private" not in capsys.readouterr().out
+
+
+def test_start_operation_anchors_are_unique_ordered_in_actual_admitted_source():
+    lines = (ROOT / "scripts/windows-alpha/Start-K5VisionAlpha.ps1").read_text().splitlines()
+    previous = 0
+    for anchor, operation in witness.START_OPERATION_ANCHORS:
+        matches = [i + 1 for i, line in enumerate(lines) if line.strip() == anchor]
+        assert len(matches) == 1, (anchor, matches)
+        assert matches[0] > previous
+        previous = matches[0]
+        assert operation in witness.START_OPERATIONS
+    assert len(lines) <= 4096
+    assert "GetFullPath($info.ScriptName)" in witness.ENVELOPE
+    assert "$info.ScriptLineNumber -gt $lines.Count" in witness.ENVELOPE
+    assert "$matchesAt.Count -ne 1" in witness.ENVELOPE
+    assert "$depth -lt 4" in witness.ENVELOPE
+    assert "-is [System.Management.Automation.ErrorRecord]" in " ".join(witness.ENVELOPE.split())
+
+
+def test_start_milestones_are_capped_observations_without_acceptance_effect(capsys):
+    noisy = b"\n".join(witness.START_MILESTONES.values()) + b"\n"
+    stream = success_output() + noisy * 3 + b"publisher: private token path\n"
+    summary = witness.LaunchSummary(io.BytesIO(stream))
+    summary.finish()
+    assert summary.result()["delivered_frames"] == 225
+    assert all(value >= 3 for value in summary.start_milestones.values())
+    for _ in range(300):
+        summary._line(b"publisher: discarded private details")
+    assert summary.start_milestones["publisher_output"] == 255
+    summary.emit_start_diagnostics("launch_2")
+    output = capsys.readouterr().out
+    assert "private" not in output and "alpha-start-observation-v1" in output
+    assert witness.MARKERS == {"admitted", "synthetic", "analytics", "operator", "exit", "refusal"}
+
+
+def test_start_error_records_survive_primary_and_owned_cleanup_failures(
+    monkeypatch, tmp_path, capsys
+):
+    primary = start_error(
+        origin="start",
+        source_line=276,
+        operation="mediamtx_version",
+        error_class="known_throw",
+        failure="mediamtx_version",
+    )
+    cleanup = start_error(phase="cleanup", error_class="known_throw", failure="synthetic_cleanup")
+    output = (
+        b"\n".join(
+            witness.START_ERROR_PREFIX + witness.common.canonical(item)
+            for item in (primary, cleanup)
+        )
+        + b"\n"
+    )
+    state, sessions = invoke_fixture(
+        monkeypatch, tmp_path, exit_code=24, output=output, cleanup_failure=True
+    )
+    with pytest.raises(witness.AlphaWitnessError) as caught:
+        witness.invoke_start(
+            ["real Start"], work=tmp_path, env={"TEMP": str(sessions)}, operation="launch_1"
+        )
+    assert state["closed"]
+    printed = capsys.readouterr().out
+    assert '"phase":"primary"' in printed and '"phase":"cleanup"' in printed
+    assert '"stage":"launch_1"' in printed
+    assert caught.value.alpha_diagnostic["stage"] == "cleanup"
+
+
+def test_start_diagnostic_emission_failure_cannot_skip_observer_cleanup(
+    monkeypatch, tmp_path, capsys
+):
+    state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True, exit_code=24)
+
+    def fail(*_):
+        raise ValueError("private projection details")
+
+    monkeypatch.setattr(witness.LaunchSummary, "emit_start_diagnostics", fail)
+    with pytest.raises(witness.AlphaWitnessError) as caught:
+        witness.invoke_start(
+            ["real Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+            admitted_images={},
+            owned_observations=[],
+        )
+    assert state["closed"] and state["observation_closed"]
+    assert caught.value.alpha_diagnostic["contract"] == "startup_diagnostic_projection"
+    output = capsys.readouterr().out
+    assert '"stage":"invalid_config"' in output
+    assert '"child_exit_code":24' in output
+    assert '"contract":"child_process"' in output
+    assert '"failure_code":"child_failed"' in output
+    assert "private" not in output
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"schema_version": "private"},
+        {"schema_version": []},
+        {"stage": "private"},
+        {"stage": []},
+        {"diagnostic_valid": 1},
+        {"collector_finished": "yes"},
+        {"error_records": 3},
+        {"error_records": True},
+        {"server_requested": -1},
+        {"publisher_output": 256},
+        {"version_output": "private"},
+        {"private": "path"},
+    ],
+)
+def test_start_observation_rejects_unknown_or_unbounded_values(change):
+    value = {
+        "schema_version": "alpha-start-observation-v1",
+        "stage": "launch_1",
+        "diagnostic_valid": True,
+        "collector_finished": True,
+        "error_records": 0,
+        **dict.fromkeys(witness.START_MILESTONES, 0),
+        **change,
+    }
+    with pytest.raises(ValueError):
+        witness.validate_start_observation(value)
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_projection_failure_without_primary_remains_fatal_and_cleans(
+    monkeypatch, tmp_path, invalid
+):
+    state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=invalid)
+
+    def fail(*_):
+        raise ValueError("private")
+
+    monkeypatch.setattr(witness.LaunchSummary, "emit_start_diagnostics", fail)
+    with pytest.raises(witness.AlphaWitnessError) as caught:
+        witness.invoke_start(
+            ["real Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission" if invalid else "launch_1",
+            invalid=invalid,
+            admitted_images={},
+            owned_observations=[],
+        )
+    assert state["closed"]
+    if invalid:
+        assert state["observation_closed"]
+    assert caught.value.alpha_diagnostic["contract"] == "startup_diagnostic_projection"
+    assert caught.value.alpha_diagnostic["stage"] == "cleanup"

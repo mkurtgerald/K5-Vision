@@ -2,7 +2,7 @@
 """Owned installed-layout/Start-script engineering witness, not installer acceptance.
 
 The generated ball establishes launcher/provider continuity, never person boxes.
-The original person-clip app command/acceptance gates and production scripts stay unchanged.
+The original person-clip app command and acceptance gates remain separate.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -136,6 +137,7 @@ DIAGNOSTIC_CONTRACTS = {
     "child_process",
     "owned_process_cleanup",
     "collector_cleanup",
+    "startup_diagnostic_projection",
     "directory_guard_cleanup",
     "directory_guard_setup",
     "driver_contract",
@@ -289,22 +291,344 @@ def observed_integer(value: object, *, signed=False) -> int | None:
     return value if type(value) is int and lower <= value < 2**32 else None
 
 
-# This envelope does not replace, dot-source, patch, or intercept Start's work.
-# It only maps the reviewed fixed refusal to a bounded scalar exit/marker.
-ENVELOPE = """param([string]$Start, [int]$Port)
+# Source-line projection is derived from unique anchors in the admitted Start
+# bytes, not absolute line numbers that could silently drift after a repair.
+START_OPERATION_ANCHORS = (
+    ("[CmdletBinding()]", "launcher_setup"),
+    ("function Invoke-K5AnalyticsPreflight {", "analytics_preflight"),
+    (
+        "function Test-K5AlphaOperatorReceipt([object]$Receipt, [bool]$AnalyticsRequired) {",
+        "receipt_check",
+    ),
+    ('$python = Join-Path $PSScriptRoot ".venv\\Scripts\\python.exe"', "runtime_admission"),
+    (
+        '$sessionRoot = Join-Path $env:TEMP ("K5VisionAlpha-" + [Guid]::NewGuid().ToString("N"))',
+        "session_create",
+    ),
+    ("function New-K5Token {", "token_create"),
+    ("function ConvertTo-K5Json([hashtable]$Value) {", "json_encode"),
+    ("function Test-K5TcpListener([string]$HostName, [int]$TargetPort) {", "listener_probe"),
+    ("function Test-K5GStreamerElement([string]$Name) {", "element_probe"),
+    ("function Get-K5MediaMtx {", "mediamtx_cache"),
+    ("function Start-K5SyntheticSource {", "element_probe"),
+    ("$mediaMtx = Get-K5MediaMtx", "mediamtx_cache"),
+    ('$configPath = Join-Path $sessionRoot "mediamtx.yml"', "mediamtx_config_write"),
+    ("$mediaMtxVersionOutput = @(& $mediaMtx --version 2>&1)", "mediamtx_version"),
+    ("$validation = @(& $mediaMtx --validate-conf $configPath 2>&1)", "mediamtx_config_validate"),
+    ('throw "Local synthetic RTSP port 8554 is already in use."', "rtsp_port_admission"),
+    ('Write-Host "Starting local MediaMTX RTSP server..."', "server_start"),
+    ("$serverReady = $false", "server_readiness"),
+    ('$source = "rtsp://127.0.0.1:8554/k5synthetic"', "publisher_start"),
+    (
+        'Write-Host "Synthetic RTSP publisher started; deferring media readback '
+        'to the K5 native live-source probe."',
+        "publisher_readiness",
+    ),
+    (
+        'Write-Host "Local synthetic RTSP publisher PASS; K5 native media probe pending."',
+        "synthetic_return",
+    ),
+    ("$startupFailure = $_", "synthetic_cleanup"),
+    ("$writeToken = New-K5Token", "token_create"),
+    ("$priorPath = [string]$env:PATH", "environment_setup"),
+    ('if (Test-K5TcpListener "127.0.0.1" $Port) {', "control_port_admission"),
+    ("$sourceUri = $null", "source_selection"),
+    ("$synthetic = Start-K5SyntheticSource", "synthetic_result"),
+    (
+        '$env:K5_CONTROL_PLANE_SITE_ID = "alpha-" + [Guid]::NewGuid().ToString("N")',
+        "application_environment",
+    ),
+    (
+        'Write-Host "Recording is disabled. Test media and temporary K5 state are not retained."',
+        "application_start",
+    ),
+    ('$baseUri = "http://127.0.0.1:$Port"', "application_health"),
+    ('$adminHeaders = @{ Authorization = "Bearer $adminToken" }', "operator_authentication"),
+    ('$writeHeaders = @{ Authorization = "Bearer $writeToken" }', "device_enrollment"),
+    ('Write-Host "Launching the authenticated K5 Windows operator path..."', "operator_request"),
+    (
+        "if (-not (Test-K5AlphaOperatorReceipt -Receipt $receipt "
+        "-AnalyticsRequired $analyticsRequired)) {",
+        "receipt_check",
+    ),
+    ("finally {", "session_cleanup"),
+)
+START_FAILURE_MESSAGES = {
+    "Windows is required.": "platform",
+    "K5 analytics preflight failed. No alpha session was started.": "analytics_refusal",
+    "Run Install-K5VisionAlpha.ps1 first.": "python_missing",
+    "Installed GStreamer version record is missing.": "gst_record_missing",
+    "Installed GStreamer version record is invalid.": "gst_record_invalid",
+    "Reviewed GStreamer runtime is unavailable. Run Test-K5VisionAlpha.ps1.": "gst_unavailable",
+    "MediaMTX archive failed pinned SHA-256 verification.": "archive_identity",
+    "Pinned MediaMTX archive did not contain the Windows executable.": "archive_executable",
+    "Pinned MediaMTX executable failed its version probe.": "mediamtx_version",
+    "Local synthetic RTSP MediaMTX configuration is invalid.": "mediamtx_config",
+    "Local synthetic RTSP port 8554 is already in use.": "rtsp_port_occupied",
+    "Local synthetic RTSP server failed to start.": "server_unavailable",
+    "Local synthetic RTSP source failed to remain available for K5 probing.": (
+        "publisher_unavailable"
+    ),
+    "Local synthetic RTSP startup failed and owned process cleanup was incomplete.": (
+        "synthetic_cleanup"
+    ),
+    "Public RTSP alpha source failed validation.": "public_source",
+    "Public RTSP alpha source is invalid.": "public_source",
+    "K5 Vision Alpha failed its local health check.": "application_health",
+    "K5 alpha operator login failed.": "operator_login",
+    "K5 alpha test device enrollment failed.": "device_enrollment",
+    "K5 Windows operator alpha test did not complete the selected acceptance checks.": (
+        "operator_receipt"
+    ),
+}
+START_ERROR_PREFIX = b"K5_ALPHA_START_ERROR="
+START_ERROR_FIELDS = {
+    "schema_version",
+    "phase",
+    "origin",
+    "source_line",
+    "operation",
+    "error_class",
+    "failure",
+}
+START_ERROR_CLASSES = {
+    "known_throw",
+    "method_binding",
+    "native_stderr",
+    "access_denied",
+    "missing_resource",
+    "win32",
+    "unknown",
+}
+START_FAILURES = set(START_FAILURE_MESSAGES.values()) | {
+    "element_missing",
+    "control_port_occupied",
+    "unknown",
+}
+START_OPERATIONS = {operation for _, operation in START_OPERATION_ANCHORS} | {"unknown"}
+START_MILESTONES = {
+    "provisioning": b"Provisioning pinned local RTSP test server...",
+    "version_output": b"mediamtx-version: ",
+    "config_output": b"mediamtx-validate: ",
+    "server_requested": b"Starting local MediaMTX RTSP server...",
+    "server_diagnostics": b"Synthetic RTSP server diagnostics: ",
+    "publisher_started": (
+        b"Synthetic RTSP publisher started; deferring media readback "
+        b"to the K5 native live-source probe."
+    ),
+    "publisher_diagnostics": b"Synthetic RTSP diagnostics: ",
+    "publisher_output": b"publisher: ",
+    "publisher_ready": b"Local synthetic RTSP publisher PASS; K5 native media probe pending.",
+}
+START_PREFIX_MILESTONES = {
+    "version_output",
+    "config_output",
+    "server_diagnostics",
+    "publisher_diagnostics",
+    "publisher_output",
+}
+
+
+def validate_start_error(value: object) -> None:
+    if type(value) is not dict or value.keys() != START_ERROR_FIELDS:
+        raise ValueError("invalid Start diagnostic")
+    for key, allowed in (
+        ("schema_version", {"alpha-start-error-v1"}),
+        ("phase", {"primary", "cleanup"}),
+        ("origin", {"start", "unknown"}),
+        ("operation", START_OPERATIONS),
+        ("error_class", START_ERROR_CLASSES),
+        ("failure", START_FAILURES),
+    ):
+        if type(value[key]) is not str or value[key] not in allowed:
+            raise ValueError("invalid Start diagnostic")
+    line = value["source_line"]
+    if value["origin"] == "start":
+        if type(line) is not int or not 1 <= line <= 4096:
+            raise ValueError("invalid Start diagnostic")
+    elif line is not None or value["operation"] != "unknown":
+        raise ValueError("invalid Start diagnostic")
+    if (value["failure"] == "unknown") != (value["error_class"] != "known_throw"):
+        raise ValueError("invalid Start diagnostic")
+
+
+def parse_start_error(raw: bytes) -> dict:
+    if len(raw) > 1024:
+        raise ValueError("invalid Start diagnostic")
+    pairs = json.loads(raw, object_pairs_hook=list)
+    if type(pairs) is not list or any(type(pair) is not tuple or len(pair) != 2 for pair in pairs):
+        raise ValueError("invalid Start diagnostic")
+    value = dict(pairs)
+    if len(pairs) != len(value):
+        raise ValueError("invalid Start diagnostic")
+    validate_start_error(value)
+    return value
+
+
+def validate_start_observation(value: object) -> None:
+    if type(value) is not dict or value.keys() != set(START_MILESTONES) | {
+        "schema_version",
+        "stage",
+        "diagnostic_valid",
+        "error_records",
+        "collector_finished",
+    }:
+        raise ValueError("invalid Start observation")
+    if (
+        type(value["schema_version"]) is not str
+        or value["schema_version"] != "alpha-start-observation-v1"
+        or type(value["stage"]) is not str
+        or value["stage"] not in {"invalid_config", "launch_1", "launch_2"}
+    ):
+        raise ValueError("invalid Start observation")
+    for name in ("diagnostic_valid", "collector_finished"):
+        if type(value[name]) is not bool:
+            raise ValueError("invalid Start observation")
+    for name in set(START_MILESTONES) | {"error_records"}:
+        if type(value[name]) is not int or not 0 <= value[name] <= (
+            2 if name == "error_records" else 255
+        ):
+            raise ValueError("invalid Start observation")
+
+
+# This envelope invokes exactly the admitted Start command. Error projection is
+# observational: no raw message, path, stack, exception Data or child output leaves
+# it. Missing/unrecognized metadata stays unknown; it never changes an exit gate.
+ENVELOPE = r"""param([string]$Start, [int]$Port)
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+function Write-K5StartError {
+    param([System.Management.Automation.ErrorRecord]$Failure, [string]$Phase)
+    $record = [ordered]@{
+        schema_version = 'alpha-start-error-v1'
+        phase = $Phase
+        origin = 'unknown'
+        source_line = $null
+        operation = 'unknown'
+        error_class = 'unknown'
+        failure = 'unknown'
+    }
+    try {
+        $message = $Failure.Exception.Message
+        $known = ConvertFrom-Json '__KNOWN_MESSAGES__'
+        foreach ($item in $known) {
+            if ($message -ceq $item[0]) { $record.failure = $item[1]; break }
+        }
+        $elementPattern = '^Reviewed GStreamer runtime is missing required synthetic test element: '
+        $elementPattern += '(videotestsrc|videoconvert|x264enc|h264parse|rtspclientsink|'
+        $elementPattern += 'rtspsrc|queue|identity|fakesink)$'
+        if ($message -cmatch $elementPattern) {
+            $record.failure = 'element_missing'
+        }
+        $portPattern = '^K5 Vision Alpha control-plane port [0-9]{4,5} is already in use\. '
+        $portPattern += 'Close any previous K5 Vision Alpha window or reinstall '
+        $portPattern += 'to clean the stale runtime\.$'
+        if ($message -cmatch $portPattern) {
+            $record.failure = 'control_port_occupied'
+        }
+        if ($record.failure -cne 'unknown') { $record.error_class = 'known_throw' }
+        elseif ($Failure.FullyQualifiedErrorId -cin
+                @('NativeCommandError', 'NativeCommandErrorMessage')) {
+            $record.error_class = 'native_stderr'
+        } else {
+            $exception = $Failure.Exception
+            for ($depth = 0; $depth -lt 4 -and $null -ne $exception; $depth++) {
+                if ($exception -is [System.Management.Automation.MethodException] -or
+                    $exception -is [System.Management.Automation.MethodInvocationException]) {
+                    $record.error_class = 'method_binding'
+                } elseif ($exception -is [UnauthorizedAccessException]) {
+                    $record.error_class = 'access_denied'; break
+                } elseif ($exception -is [IO.FileNotFoundException] -or
+                          $exception -is [IO.DirectoryNotFoundException] -or
+                          $exception -is [System.Management.Automation.ItemNotFoundException]) {
+                    $record.error_class = 'missing_resource'; break
+                } elseif ($exception -is [ComponentModel.Win32Exception]) {
+                    $record.error_class = 'win32'; break
+                }
+                $exception = $exception.InnerException
+            }
+        }
+    } catch { $record.error_class = 'unknown'; $record.failure = 'unknown' }
+    try {
+        $info = $Failure.InvocationInfo
+        if ($null -ne $info -and $info.ScriptLineNumber -ge 1 -and
+            [string]::Equals([IO.Path]::GetFullPath($info.ScriptName),
+                             [IO.Path]::GetFullPath($Start),
+                             [StringComparison]::OrdinalIgnoreCase)) {
+            # Bound the read itself, including a replacement/growth race.
+            $stream = [IO.File]::OpenRead($Start)
+            try {
+                if ($stream.Length -gt 65536) { throw 'unknown' }
+                $buffer = New-Object byte[] 65537
+                $count = 0
+                while ($count -lt $buffer.Length) {
+                    $read = $stream.Read($buffer, $count, $buffer.Length - $count)
+                    if ($read -eq 0) { break }
+                    $count += $read
+                }
+                if ($count -gt 65536) { throw 'unknown' }
+            } finally { $stream.Dispose() }
+            $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+            $lines = $utf8.GetString($buffer, 0, $count).Replace("`r`n", "`n").Split("`n")
+            if ($lines.Count -gt 4096 -or $info.ScriptLineNumber -gt $lines.Count) {
+                throw 'unknown'
+            }
+            $record.origin = 'start'
+            $record.source_line = $info.ScriptLineNumber
+            $anchors = ConvertFrom-Json '__OPERATION_ANCHORS__'
+            $previous = 0
+            $operation = 'unknown'
+            foreach ($anchor in $anchors) {
+                $matchesAt = @(for ($index = 0; $index -lt $lines.Count; $index++) {
+                    if ($lines[$index].Trim() -ceq $anchor[0]) { $index + 1 }
+                })
+                if ($matchesAt.Count -ne 1 -or $matchesAt[0] -le $previous) { throw 'unknown' }
+                $previous = $matchesAt[0]
+                if ($previous -le $record.source_line) { $operation = $anchor[1] }
+            }
+            $record.operation = $operation
+        }
+    } catch {
+        $record.origin = 'unknown'; $record.source_line = $null; $record.operation = 'unknown'
+    }
+    Write-Output ('K5_ALPHA_START_ERROR=' + ($record | ConvertTo-Json -Compress))
+}
 try {
     & $Start -Port $Port -ExitAfterPublicTest
     exit 0
 } catch {
-    if ($_.Exception.Message -ceq "K5 analytics preflight failed. No alpha session was started.") {
+    $fatal = $_
+    $refusal = 'K5 analytics preflight failed. No alpha session was started.'
+    if ($fatal.Exception.Message -ceq $refusal) {
         Write-Output "K5_ALPHA_EXPECTED_CONFIG_REFUSAL"
         exit 23
+    }
+    $primary = $null
+    $exception = $fatal.Exception
+    $cleanupMessage = 'Local synthetic RTSP startup failed and owned process cleanup '
+    $cleanupMessage += 'was incomplete.'
+    for ($depth = 0; $depth -lt 4 -and $null -ne $exception; $depth++) {
+        if ($exception.Message -ceq $cleanupMessage -and
+            $exception.Data.Contains('K5.StartupErrorRecord') -and
+            $exception.Data['K5.StartupErrorRecord'] -is
+                [System.Management.Automation.ErrorRecord]) {
+            $primary = $exception.Data['K5.StartupErrorRecord']
+            break
+        }
+        $exception = $exception.InnerException
+    }
+    if ($null -ne $primary) {
+        Write-K5StartError -Failure $primary -Phase 'primary'
+        Write-K5StartError -Failure $fatal -Phase 'cleanup'
+    } else {
+        Write-K5StartError -Failure $fatal -Phase 'primary'
     }
     Write-Output "K5_ALPHA_START_FAILED"
     exit 24
 }
-"""
+""".replace(
+    "__KNOWN_MESSAGES__", json.dumps(list(START_FAILURE_MESSAGES.items())).replace("'", "''")
+).replace("__OPERATION_ANCHORS__", json.dumps(START_OPERATION_ANCHORS).replace("'", "''"))
 
 
 def validate_expectations(
@@ -596,6 +920,9 @@ class LaunchSummary:
         )
         self.scalars: dict[str, int] = {}
         self.invalid = False
+        self.start_errors: list[dict] = []
+        self.start_diagnostic_invalid = False
+        self.start_milestones = dict.fromkeys(START_MILESTONES, 0)
         self.health_confirmed = False
         self.operator_request_observed = False
         self.thread = threading.Thread(target=self._read, args=(stream,), daemon=True)
@@ -603,6 +930,19 @@ class LaunchSummary:
 
     def _line(self, line: bytes) -> None:
         line = line.rstrip(b"\r")
+        if line.startswith(START_ERROR_PREFIX):
+            try:
+                value = parse_start_error(line[len(START_ERROR_PREFIX) :])
+                if len(self.start_errors) >= 2 or value["phase"] != (
+                    "cleanup" if self.start_errors else "primary"
+                ):
+                    raise ValueError("invalid Start diagnostic")
+                self.start_errors.append(value)
+            except (ValueError, TypeError, RecursionError):
+                self.start_diagnostic_invalid = True
+        for key, pattern in START_MILESTONES.items():
+            if line.startswith(pattern) if key in START_PREFIX_MILESTONES else line == pattern:
+                self.start_milestones[key] = min(255, self.start_milestones[key] + 1)
         # Diagnostic milestones for media runs; invalid preflight refuses either observation.
         if line == b"K5 Vision Alpha health check PASS.":
             self.health_confirmed = True
@@ -688,6 +1028,21 @@ class LaunchSummary:
             **{f"expected_marker_{key}": number for key, number in expected.items()},
             **run_observations(self.scalars),
         }
+
+    def emit_start_diagnostics(self, stage: str) -> None:
+        for value in self.start_errors:
+            validate_start_error(value)
+            print(START_ERROR_PREFIX.decode("ascii") + common.canonical(value).decode("ascii"))
+        value = {
+            "schema_version": "alpha-start-observation-v1",
+            "stage": stage,
+            "diagnostic_valid": not self.start_diagnostic_invalid,
+            "error_records": len(self.start_errors),
+            "collector_finished": not self.thread.is_alive(),
+            **self.start_milestones,
+        }
+        validate_start_observation(value)
+        print("K5_ALPHA_START_OBSERVATION=" + common.canonical(value).decode("ascii"))
 
     def result(self, *, stage="launch_1") -> dict[str, object]:
         observations = self.observations()
@@ -938,6 +1293,13 @@ def invoke_start(
             except BaseException as error:
                 cleanup_errors.append(
                     contextual_error(error, "cleanup", "collector_cleanup", snapshot())
+                )
+        if summary is not None and not summary.thread.is_alive():
+            try:
+                summary.emit_start_diagnostics(stage)
+            except BaseException as error:
+                cleanup_errors.append(
+                    contextual_error(error, "cleanup", "startup_diagnostic_projection", snapshot())
                 )
         if observation is not None:
             try:

@@ -248,3 +248,43 @@ and orchestration tests establish harness contracts only. Real Windows x64,
 PowerShell, CPython redirector accounting, native cache/plugin admission and both
 225-frame launches still require coordinated native execution at the exact final
 candidate. Linux test success is not Windows acceptance.
+
+## Startup failure diagnostics
+
+The hosted guard-only proof on `8ea38531` established that PowerShell's
+case-insensitive local `$mediaMtxVersion` output variable shadowed the independent
+`$MediaMtxVersion` pin and admitted a zero-exit Python version string. The repaired
+Start uses a distinct output variable and requires zero exit, exactly one string
+line, and the exact official MediaMTX release token `v1.21.1`. This defect is not
+established as the cause of the earlier installed launch's exit 24.
+
+The invocation envelope retains its exact Start arguments and exit codes. For an
+unexpected failure, it projects `K5_ALPHA_START_ERROR=` records with schema
+`alpha-start-error-v1`: primary/cleanup phase, checked Start origin and line,
+allowlisted operation, error class and known-failure enum. Source origin requires
+an exact canonical path match to the admitted installed Start; the read is capped
+at 65,536 bytes and 4,096 lines. Unique, ordered source anchors define the operation
+intervals. Unknown or malformed metadata stays unknown. No source line, raw
+message, path, stack, exception Data or output value is printed or retained.
+
+If synthetic startup and its owned-process cleanup both fail, Start keeps the
+original typed ErrorRecord only in the fatal cleanup exception's in-memory
+`K5.StartupErrorRecord` link. The envelope follows only that fixed typed link,
+through at most four exception levels, and emits separate fixed primary and
+cleanup projections. Cleanup remains fatal. Controller cleanup errors also remain
+separate, and a diagnostic emission failure cannot bypass observer cleanup.
+
+`K5_ALPHA_START_OBSERVATION=` uses separate schema `alpha-start-observation-v1`.
+It records the launch stage, collector/diagnostic validity, at most two projected
+errors, and counts capped at 255 for existing provisioning, version/config output,
+server request/diagnostic and publisher started/diagnostic/ready messages. Prefix
+suffixes are discarded. These observations do not alter the six acceptance
+markers, media counters, invalid-preflight profile or success receipt schema.
+A missing milestone does not establish that an application or media process never
+ran; it establishes only that this collector did not observe that milestone.
+
+Windows-only non-media tests exercise the exact source guard against the official
+token and wrong/empty/decorated/multiline/nonzero responses, plus genuine typed
+startup-and-cleanup failures and foreign/malformed metadata. Portable tests check
+strict scalar schemas, source-anchor uniqueness, bounded parsing, milestone caps,
+raw-value rejection and preservation of ownership cleanup on projection failure.

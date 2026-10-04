@@ -605,3 +605,347 @@ def test_version_guard_record_rejects_duplicate_fields_and_nested_values() -> No
     ):
         with pytest.raises(ValueError):
             _version_guard_record(VERSION_GUARD_PREFIX + suffix, b"", 0)
+
+
+def test_media_mtx_version_guard_has_distinct_output_and_exact_official_token() -> None:
+    source = START.read_text()
+    assert "$mediaMtxVersionOutput = @(& $mediaMtx --version 2>&1)" in source
+    guard = source.split("$mediaMtxVersionOutput =", 1)[1].split("$validation =", 1)[0]
+    assert "$LASTEXITCODE -ne 0" in guard
+    assert "$mediaMtxVersionOutput.Count -ne 1" in guard
+    assert "$mediaMtxVersionOutput[0] -isnot [string]" in guard
+    assert '$mediaMtxVersionOutput[0] -cne ("v" + $MediaMtxVersion)' in guard
+    assert ".Contains(" not in guard and "-join" not in guard
+
+
+def test_synthetic_cleanup_preserves_typed_primary_error_in_memory_only() -> None:
+    source = START.read_text()
+    assert '$cleanupFailure.Data["K5.StartupErrorRecord"] = $startupFailure' in source
+    assert "throw $cleanupFailure" in source
+    assert "throw $startupFailure" in source
+    assert source.count("K5.StartupErrorRecord") == 1
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows PowerShell version predicate")
+def test_windows_version_guard_exact_official_token_matrix(tmp_path: Path) -> None:
+    # Reuse the independently pinned, exact AST selection from the baseline.
+    selection = VERSION_GUARD_SCRIPT.split("    $mediaMtx = $Python", 1)[0]
+    cases = [
+        (["v1.21.1"], 0, True),
+        (["1.21.1"], 0, False),
+        (["v1.21.10"], 0, False),
+        (["prefix v1.21.1"], 0, False),
+        (["v1.21.1 suffix"], 0, False),
+        (["v1.21.1 "], 0, False),
+        ([], 0, False),
+        ([""], 0, False),
+        (["v1.21.1", "v1.21.1"], 0, False),
+        (["v1.21.1\nextra"], 0, False),
+        (["v1.21.1"], 1, False),
+        ([123], 0, False),
+    ]
+    data = json.dumps(
+        [dict(lines=lines, exit=exit_code, accept=accept) for lines, exit_code, accept in cases]
+    )
+    script = (
+        selection
+        + r"""
+    $code = @(
+        'function Invoke-K5ControlledVersionGuard { param($case)',
+        ('Set-Variable -Name ' + $outputName + ' -Value @($case.lines)'),
+        '$LASTEXITCODE = $case.exit',
+        $guard.Extent.Text,
+        '}'
+    ) -join "`n"
+    . ([scriptblock]::Create($code))
+    $cases = ConvertFrom-Json '__CASES__'
+    foreach ($case in $cases) {
+        $accepted = $true
+        try { Invoke-K5ControlledVersionGuard $case *> $null }
+        catch {
+            if ($_.Exception.Message -cne 'Pinned MediaMTX executable failed its version probe.') {
+                throw 'fixture_invalid'
+            }
+            $accepted = $false
+        }
+        if ($accepted -ne $case.accept -or $MediaMtxVersion -cne '1.21.1') {
+            throw 'fixture_invalid'
+        }
+    }
+    Write-Output 'K5_MEDIA_MTX_VERSION_MATRIX=passed'
+    exit 0
+} catch { exit 1 }
+""".replace("__CASES__", data.replace("'", "''"))
+    )
+    valid = False
+    try:
+        target = tmp_path / "version-matrix.ps1"
+        target.write_text(script, encoding="ascii", newline="\n")
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(target),
+                "-Start",
+                str(START),
+            ],
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        valid = (
+            result.returncode == 0
+            and not result.stderr
+            and result.stdout.strip() == b"K5_MEDIA_MTX_VERSION_MATRIX=passed"
+        )
+    except Exception:
+        pass
+    if not valid:
+        pytest.fail("MediaMTX exact version predicate fixture failed", pytrace=False)
+
+
+def _startup_witness():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "startup_diagnostic_fixture", ROOT / "scripts/installed_alpha_launcher_witness.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows PowerShell ErrorRecord")
+def test_windows_synthetic_primary_and_cleanup_errors_stay_typed_and_source_free(tmp_path: Path):
+    # No media/port/child seams execute. The exact candidate function still owns
+    # its genuine startup catch and cleanup logic; fake objects fail both paths.
+    module = _startup_witness()
+    fixture = r"""
+param([int]$Port, [switch]$ExitAfterPublicTest)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    '__SOURCE__', [ref]$tokens, [ref]$parseErrors
+)
+$functions = @($ast.FindAll({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'Start-K5SyntheticSource'
+}, $true))
+if ($parseErrors.Count -ne 0 -or $functions.Count -ne 1) { throw 'fixture_invalid' }
+. ([scriptblock]::Create($functions[0].Extent.Text))
+$sessionRoot = $PSScriptRoot
+$MediaMtxVersion = '1.21.1'
+$gstLaunch = 'fixture_publisher'
+$script:server = $null
+function Test-K5GStreamerElement { return $true }
+function Get-K5MediaMtx { return 'Test-K5FixtureMediaMtx' }
+function Test-K5FixtureMediaMtx {
+    $global:LASTEXITCODE = 0
+    if ($args[0] -ceq '--version') { return 'v1.21.1' }
+}
+function Test-K5TcpListener { return $null -ne $script:server }
+function Start-Sleep { }
+function Start-Process {
+    param($FilePath, $ArgumentList, [switch]$PassThru, [switch]$NoNewWindow,
+          $WindowStyle, $RedirectStandardOutput, $RedirectStandardError)
+    if ($FilePath -ceq 'fixture_publisher') { throw 'PRIVATE_STARTUP_SENTINEL' }
+    $script:server = [pscustomobject]@{ HasExited = $false; Handle = [IntPtr]1 }
+    $script:server | Add-Member ScriptMethod Kill { throw 'PRIVATE_CLEANUP_SENTINEL' }
+    $script:server | Add-Member ScriptMethod WaitForExit { param($milliseconds) return $false }
+    return $script:server
+}
+try { $null = Start-K5SyntheticSource; throw 'fixture_invalid' }
+catch {
+    $message = 'Local synthetic RTSP startup failed and owned process cleanup was incomplete.'
+    $linked = $_.Exception.Data['K5.StartupErrorRecord']
+    if ($_.Exception.Message -cne $message -or
+        $linked -isnot [System.Management.Automation.ErrorRecord] -or
+        $linked.Exception.Message -cne 'PRIVATE_STARTUP_SENTINEL') {
+        throw 'fixture_invalid'
+    }
+    throw
+}
+""".replace("__SOURCE__", _quote(START))
+    records = None
+    try:
+        target = tmp_path / "start-fixture.ps1"
+        target.write_text(fixture, encoding="ascii", newline="\n")
+        envelope = tmp_path / "envelope.ps1"
+        envelope.write_text(module.ENVELOPE, encoding="ascii", newline="\n")
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(envelope),
+                "-Start",
+                str(target),
+                "-Port",
+                "8011",
+            ],
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        if (
+            result.returncode != 24
+            or result.stderr
+            or len(result.stdout) > 4096
+            or b"PRIVATE_" in result.stdout
+        ):
+            raise ValueError("Invalid fixture result")
+        records = [
+            module.parse_start_error(line[len(module.START_ERROR_PREFIX) :])
+            for line in result.stdout.splitlines()
+            if line.startswith(module.START_ERROR_PREFIX)
+        ]
+        if (
+            len(records) != 2
+            or [r["phase"] for r in records] != ["primary", "cleanup"]
+            or records[0]["failure"] != "unknown"
+            or records[1]["failure"] != "synthetic_cleanup"
+        ):
+            records = None
+    except Exception:
+        records = None
+    if records is None:
+        pytest.fail("Typed startup and cleanup projection fixture failed", pytrace=False)
+    for record in records:
+        print(module.START_ERROR_PREFIX.decode() + json.dumps(record, separators=(",", ":")))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows PowerShell error projection")
+def test_windows_start_error_projection_bounds_foreign_and_malformed_metadata(tmp_path: Path):
+    module = _startup_witness()
+    valid = False
+    try:
+        # Run the exact envelope, with a tiny owned Start fixture and no media.
+        # A real foreign-origin ErrorRecord is linked in memory; malformed Data
+        # must be ignored, and both invocations must still fail with exit 24.
+        foreign = tmp_path / "foreign.ps1"
+        foreign.write_text("throw 'PRIVATE_FOREIGN_SENTINEL'\n", encoding="ascii")
+        envelope = tmp_path / "envelope.ps1"
+        envelope.write_text(module.ENVELOPE, encoding="ascii", newline="\n")
+        for linked in ("$saved", "'PRIVATE_MALFORMED_SENTINEL'"):
+            target = tmp_path / "start.ps1"
+            target.write_text(
+                "param([int]$Port, [switch]$ExitAfterPublicTest)\n"
+                f"try {{ & '{_quote(foreign)}' }} catch {{ $saved = $_ }}\n"
+                "$fatal = [InvalidOperationException]::new("
+                "'Local synthetic RTSP startup failed and owned process cleanup was incomplete.')\n"
+                f"$fatal.Data['K5.StartupErrorRecord'] = {linked}\n"
+                "throw $fatal\n",
+                encoding="ascii",
+                newline="\n",
+            )
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-File",
+                    str(envelope),
+                    "-Start",
+                    str(target),
+                    "-Port",
+                    "8011",
+                ],
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+            if result.returncode != 24 or result.stderr or b"PRIVATE_" in result.stdout:
+                raise ValueError("Invalid projection")
+            if len(result.stdout) > 4096:
+                raise ValueError("Invalid projection")
+            records = [
+                module.parse_start_error(line[len(module.START_ERROR_PREFIX) :])
+                for line in result.stdout.splitlines()
+                if line.startswith(module.START_ERROR_PREFIX)
+            ]
+            if linked == "$saved":
+                if (
+                    len(records) != 2
+                    or records[0]["origin"] != "unknown"
+                    or records[0]["source_line"] is not None
+                ):
+                    raise ValueError("Invalid projection")
+            elif len(records) != 1 or records[0]["phase"] != "primary":
+                raise ValueError("Invalid projection")
+        valid = True
+    except Exception:
+        pass
+    if not valid:
+        pytest.fail("Bounded Start error metadata fixture failed", pytrace=False)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows PowerShell source origin")
+def test_windows_start_error_projection_checks_real_file_line_and_operation(tmp_path: Path):
+    module = _startup_witness()
+    valid = False
+    try:
+        # This fixture is explicitly modified test source. Stop immediately after
+        # StrictMode, before any admission, native work, session or child creation.
+        source = START.read_text()
+        stop = 'throw "Pinned MediaMTX executable failed its version probe."'
+        marker = "Set-StrictMode -Version Latest\n"
+        if source.count(marker) != 1:
+            raise ValueError("Invalid fixture source")
+        fixture = source.replace(marker, marker + stop + "\n", 1)
+        expected_line = fixture.splitlines().index(stop) + 1
+        target = tmp_path / "source-fixture.ps1"
+        envelope = tmp_path / "envelope.ps1"
+        envelope.write_text(module.ENVELOPE, encoding="ascii", newline="\n")
+        for extra, expected_origin in (("", "start"), ("\n#" + "x" * 65536, "unknown")):
+            target.write_text(fixture + extra, encoding="ascii", newline="\n")
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-File",
+                    str(envelope),
+                    "-Start",
+                    str(target),
+                    "-Port",
+                    "8011",
+                ],
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+            if result.returncode != 24 or result.stderr or len(result.stdout) > 2048:
+                raise ValueError("Invalid fixture result")
+            records = [
+                module.parse_start_error(line[len(module.START_ERROR_PREFIX) :])
+                for line in result.stdout.splitlines()
+                if line.startswith(module.START_ERROR_PREFIX)
+            ]
+            if len(records) != 1:
+                raise ValueError("Invalid fixture result")
+            record = records[0]
+            if record["origin"] != expected_origin or record["failure"] != "mediamtx_version":
+                raise ValueError("Invalid fixture projection")
+            if expected_origin == "start":
+                if (
+                    record["source_line"] != expected_line
+                    or record["operation"] != "launcher_setup"
+                ):
+                    raise ValueError("Invalid fixture projection")
+            elif record["source_line"] is not None or record["operation"] != "unknown":
+                raise ValueError("Invalid fixture projection")
+        valid = True
+    except Exception:
+        pass
+    if not valid:
+        pytest.fail("Checked Start source line projection fixture failed", pytrace=False)

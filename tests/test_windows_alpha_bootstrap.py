@@ -260,7 +260,7 @@ $script:ownedServer = $null
 $script:publisherAttempted = $false
 function Test-K5GStreamerElement { return $true }
 function Get-K5MediaMtx { return 'Test-K5MediaMtxExecutable' }
-function Test-K5MediaMtxExecutable { $global:LASTEXITCODE = 0; return '1.21.1' }
+function Test-K5MediaMtxExecutable { $global:LASTEXITCODE = 0; return 'v1.21.1' }
 function Test-K5TcpListener { return $null -ne $script:ownedServer }
 function Start-Process {
     param($FilePath, $ArgumentList, [switch]$PassThru, [switch]$NoNewWindow,
