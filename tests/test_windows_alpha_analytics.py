@@ -1027,6 +1027,7 @@ ERROR_BOUNDARY_CASES = {
         "$null = @(& $python -I -B -c "
         "\"import sys;sys.stderr.write('PRIVATE_NATIVE_SENTINEL')\" 2>&1)"
     ),
+    # Frozen old-helper error-chain evidence, independent of current product behavior.
     "native_all_streams": (
         "function Invoke-K5FixtureElement([string]$Name) {\n"
         "    & $gstInspect $Name *> $null\n"
@@ -1444,7 +1445,7 @@ def test_windows_post_admission_error_boundary_preserves_useful_projection(tmp_p
             expected_ids = {ERROR_BOUNDARY_EXPECTED_IDS[case]}
             if case == "native_all_streams":
                 # Windows PowerShell may stop on redirected stderr before the
-                # exact helper returns; otherwise exit 1 must become element refusal.
+                # historical helper returns; otherwise exit 1 becomes element refusal.
                 expected_ids.add("native_stderr")
             if not expected_ids.intersection(
                 {shape[f"record_{slot}_error_id"] for slot in range(4)}
@@ -1591,8 +1592,8 @@ def test_error_boundary_parser_rejects_raw_repeated_or_malformed_output():
         )
 
 
-def test_all_streams_fixture_keeps_exact_gstreamer_probe_body():
-    source = START.read_text()
+def test_all_streams_fixture_keeps_frozen_historical_error_boundary():
+    source = ELEMENT_HISTORICAL_HELPER
     signature = "function Test-K5GStreamerElement([string]$Name) {\n"
     assert source.count(signature) == 1
     body = source.split(signature, 1)[1].split("\n}", 1)[0]
@@ -2116,139 +2117,42 @@ if ($utilityAssembly.Name -cne 'Microsoft.PowerShell.Commands.Utility' -or
 [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=utility_binding_verified')
 [Console]::Out.Flush()
 """.replace("__UTILITY_OBSERVATION__", ELEMENT_UTILITY_OBSERVATION)
-ELEMENT_PROCESS_PROTOTYPE = r"""
-function Test-K5GStreamerElement([string]$Name) {
-    $child = $null
-    $primaryFailure = $null
-    $started = $false
-    $childHandle = [IntPtr]::Zero
-    $outRead = $null; $errRead = $null
-    $stdoutStream = $null; $stderrStream = $null
-    try {
-        # Only one bounded token reaches the native argv parser. This includes
-        # actual element names and the admitted one-argument native probe.
-        if ($Name.Length -eq 0 -or $Name.Length -gt 8192 -or
-            $Name -match '[^\x21-\x7e]|["\\]' -or -not [IO.Path]::IsPathRooted($gstInspect)) {
-            throw [Management.Automation.CommandNotFoundException]::new(
-                'K5 native application required.')
-        }
-        $command = Get-Command -Name $gstInspect -ErrorAction Stop
-        if ($command -isnot [Management.Automation.ApplicationInfo] -or
-            -not [string]::Equals([IO.Path]::GetFullPath($command.Path),
-                [IO.Path]::GetFullPath($gstInspect), [StringComparison]::OrdinalIgnoreCase)) {
-            throw [Management.Automation.CommandNotFoundException]::new(
-                'K5 native application required.')
-        }
-        $info = [Diagnostics.ProcessStartInfo]::new()
-        $info.FileName = $command.Path
-        $info.Arguments = $Name
-        $info.UseShellExecute = $false
-        $info.CreateNoWindow = $true
-        $info.RedirectStandardInput = $true
-        $info.RedirectStandardOutput = $true
-        $info.RedirectStandardError = $true
-        $child = [Diagnostics.Process]::new()
-        $child.StartInfo = $info
-        $started = $child.Start()
-        if (-not $started) { throw [InvalidOperationException]::new('K5 native start failed.') }
-        $childHandle = $child.Handle
-        $child.StandardInput.Close()
-        $stdoutStream = $child.StandardOutput.BaseStream
-        $stderrStream = $child.StandardError.BaseStream
-        $outBuffer = [byte[]]::new(4096)
-        $errBuffer = [byte[]]::new(4096)
-        $outRead = $stdoutStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
-        $errRead = $stderrStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
-        $outDone = $false; $errDone = $false
-        $outCount = 0; $errCount = 0
-        $watch = [Diagnostics.Stopwatch]::StartNew()
-        while ($true) {
-            if ($watch.Elapsed.TotalSeconds -ge 5) {
-                throw [TimeoutException]::new('K5 native timeout.')
-            }
-            if (-not $outDone -and $outRead.IsCompleted) {
-                $count = $outRead.GetAwaiter().GetResult()
-                if ($count -eq 0) { $outDone = $true }
-                else {
-                    $outCount += $count
-                    if ($outCount + $errCount -gt 131072) {
-                        throw [IO.InvalidDataException]::new('K5 native output limit.')
-                    }
-                    $outRead = $stdoutStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
-                }
-            }
-            if (-not $errDone -and $errRead.IsCompleted) {
-                $count = $errRead.GetAwaiter().GetResult()
-                if ($count -eq 0) { $errDone = $true }
-                else {
-                    $errCount += $count
-                    if ($outCount + $errCount -gt 131072) {
-                        throw [IO.InvalidDataException]::new('K5 native output limit.')
-                    }
-                    $errRead = $stderrStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
-                }
-            }
-            if ($child.HasExited -and $outDone -and $errDone) { break }
-            [Threading.Thread]::Sleep(10)
-        }
-        $exitCode = $child.ExitCode
-        if ($errCount -ne 0) { throw [IO.InvalidDataException]::new('K5 native stderr refused.') }
-        return $exitCode -eq 0
-    } catch {
-        $primaryFailure = $_
-        throw
-    } finally {
-        $cleanupWatch = [Diagnostics.Stopwatch]::StartNew()
-        $cleanupFailed = $false
-        try {
-            if ($started) {
-                if ($childHandle -eq [IntPtr]::Zero -or $child.Handle -ne $childHandle) {
-                    throw [InvalidOperationException]::new('K5 native cleanup failed.')
-                }
-                if (-not $child.HasExited) {
-                    $child.Kill()
-                    if (-not $child.WaitForExit(5000)) {
-                        throw [InvalidOperationException]::new('K5 native cleanup failed.')
-                    }
-                }
-            }
-        } catch { $cleanupFailed = $true }
-        foreach ($ownedStream in @($stdoutStream, $stderrStream)) {
-            try { if ($null -ne $ownedStream) { $ownedStream.Close() } }
-            catch { $cleanupFailed = $true }
-        }
-        try { if ($null -ne $child) { $child.Dispose() } }
-        catch { $cleanupFailed = $true }
-        while (($null -ne $outRead -and -not $outRead.IsCompleted) -or
-               ($null -ne $errRead -and -not $errRead.IsCompleted)) {
-            if ($cleanupWatch.Elapsed.TotalSeconds -ge 5) {
-                $cleanupFailed = $true
-                break
-            }
-            [Threading.Thread]::Sleep(10)
-        }
-        if ($cleanupFailed) {
-            $cleanupError = [InvalidOperationException]::new('K5 native cleanup failed.')
-            if ($primaryFailure -is [Management.Automation.ErrorRecord]) {
-                $cleanupError.Data['K5ElementPrimaryErrorRecord'] = $primaryFailure
-            }
-            throw $cleanupError
-        }
-        # The exact started Process and its streams are now closed.
-    }
-}
-"""
+# The exact helper qualified on Windows at 32008ac4, in the only two checkout
+# representations admitted here. Application packaging retains its raw hashes.
+ELEMENT_PRODUCT_HASHES = (
+    "363c93f0825c19d18c946598ab5020c7354483965f51666bc7eca90f7016c54f",
+    "623ca9b0321684af25f9f0e47bfc6ec58fe1401d4815f70ae807e48831e34dcd",
+)
+ELEMENT_HISTORICAL_HELPER = r"""function Test-K5GStreamerElement([string]$Name) {
+    & $gstInspect $Name *> $null
+    return $LASTEXITCODE -eq 0
+}"""
+
+
+def _element_product_helper(source):
+    if type(source) is not bytes or len(source) > 262144:
+        raise ValueError("Invalid product helper source")
+    matches = re.findall(
+        rb"(?ms)^function Test-K5GStreamerElement\(\[string\]\$Name\) \{\r?\n.*?^\}", source
+    )
+    if len(matches) != 1 or hashlib.sha256(matches[0]).hexdigest() not in ELEMENT_PRODUCT_HASHES:
+        raise ValueError("Unqualified product helper source")
+    # Conversion occurs only after an exact admitted raw-byte digest matches.
+    return "\n" + matches[0].replace(b"\r\n", b"\n").decode("ascii") + "\n"
+
+
+ELEMENT_PRODUCT_HELPER = _element_product_helper(START.read_bytes())
 ELEMENT_PROCESS_INSERTIONS = {
     "        $exitCode = $child.ExitCode\n": "        $script:fixtureActualExit = $exitCode\n",
     "        # The exact started Process and its streams are now closed.\n": (
         "        $script:fixtureProcessCleaned = $true\n"
     ),
 }
-ELEMENT_PROCESS_OBSERVED = ELEMENT_PROCESS_PROTOTYPE
+ELEMENT_PRODUCT_OBSERVED = ELEMENT_PRODUCT_HELPER
 for _anchor, _insertion in ELEMENT_PROCESS_INSERTIONS.items():
-    if ELEMENT_PROCESS_OBSERVED.count(_anchor) != 1:
+    if ELEMENT_PRODUCT_OBSERVED.count(_anchor) != 1:
         raise ValueError("Invalid process fixture anchor")
-    ELEMENT_PROCESS_OBSERVED = ELEMENT_PROCESS_OBSERVED.replace(_anchor, _anchor + _insertion, 1)
+    ELEMENT_PRODUCT_OBSERVED = ELEMENT_PRODUCT_OBSERVED.replace(_anchor, _anchor + _insertion, 1)
 
 ELEMENT_PROBE_SCRIPT = (
     r"""
@@ -2274,15 +2178,23 @@ __ELEMENT_UTILITY_IMPORT__
         $node.Name -ceq 'Test-K5GStreamerElement'
     }, $true))
     if ($errors.Count -ne 0 -or $functions.Count -ne 1) { throw 'fixture_invalid' }
-    $original = $functions[0].Extent.Text
-    $needle = '& $gstInspect $Name *> $null'
-    if (($original.Split(@($needle), [StringSplitOptions]::None)).Count -ne 2) {
-        throw 'fixture_invalid'
-    }
-    $selected = $original
+    $actual = $functions[0].Extent.Text
+    $helperHasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $helperBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($actual)
+        $helperHash = [BitConverter]::ToString(
+            $helperHasher.ComputeHash($helperBytes)).Replace('-', '').ToLowerInvariant()
+        if ($helperHash -cnotin @(
+            '__QUALIFIED_ELEMENT_LF__',
+            '__QUALIFIED_ELEMENT_CRLF__')) { throw 'fixture_identity' }
+    } finally { $helperHasher.Dispose() }
     if ($Variant -ceq 'process') {
+        $selected = $actual.Replace("`r`n", "`n") + "`n"
+__ELEMENT_PROCESS_SCALAR_INSERTIONS__
+    } else {
+        # Frozen historical error/exit baseline; never the current product source.
         $selected = @'
-__ELEMENT_PROCESS_OBSERVED__
+__ELEMENT_HISTORICAL_HELPER__
 '@
     }
     . ([scriptblock]::Create($selected))
@@ -2384,7 +2296,21 @@ __ELEMENT_PROCESS_OBSERVED__
 } catch { Write-K5ElementChildFailure $_ $fixturePhase 'primary'; exit 1 }
 """.replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS)
     .replace("__ELEMENT_UTILITY_IMPORT__", ELEMENT_UTILITY_IMPORT)
-    .replace("__ELEMENT_PROCESS_OBSERVED__", ELEMENT_PROCESS_OBSERVED)
+    .replace("__QUALIFIED_ELEMENT_LF__", ELEMENT_PRODUCT_HASHES[0])
+    .replace("__QUALIFIED_ELEMENT_CRLF__", ELEMENT_PRODUCT_HASHES[1])
+    .replace("__ELEMENT_HISTORICAL_HELPER__", ELEMENT_HISTORICAL_HELPER)
+    .replace(
+        "__ELEMENT_PROCESS_SCALAR_INSERTIONS__",
+        "\n".join(
+            "        $anchor = '" + anchor.rstrip("\n").replace("'", "''") + '\' + "`n"\n'
+            "        if (($selected.Split(@($anchor), [StringSplitOptions]::None)).Count -ne 2) {\n"
+            "            throw 'fixture_identity'\n        }\n"
+            "        $selected = $selected.Replace($anchor, $anchor + '"
+            + insertion.rstrip("\n").replace("'", "''")
+            + '\' + "`n")'
+            for anchor, insertion in ELEMENT_PROCESS_INSERTIONS.items()
+        ),
+    )
 )
 ELEMENT_UTILITY_CONTROL = (
     "$ErrorActionPreference = 'Stop'\n"
@@ -3405,7 +3331,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
         print("K5_ELEMENT_PROCESS_MISSES=" + str(process_misses))
         print("K5_ELEMENT_MISSING_REFUSALS=" + str(missing_refusals))
         # Original counters preserve the demonstrated baseline. Qualification
-        # below is exclusively for the hosted Process prototype, not Start.
+        # below covers the actual product helper, not full installed Start acceptance.
         matrix_failed = bool(process_misses or missing_refusals != 2)
         print("K5_ELEMENT_PROCESS_QUALIFIED=" + str(not matrix_failed).lower())
         _element_diagnostic(
@@ -3418,9 +3344,7 @@ def test_windows_exact_element_probe_uses_fresh_actual_native_exit(tmp_path: Pat
     if missing_refusals != 2:
         pytest.fail("Missing executable did not refuse under stale-zero state", pytrace=False)
     if process_misses:
-        pytest.fail(
-            "Process prototype did not preserve actual exit/stderr semantics", pytrace=False
-        )
+        pytest.fail("Product helper did not preserve actual exit/stderr semantics", pytrace=False)
 
 
 def test_element_probe_parser_rejects_raw_duplicate_and_coerced_evidence():
@@ -3486,7 +3410,8 @@ def test_owned_fixture_pe_reader_checks_subsystem_and_bounds(tmp_path: Path):
 def test_element_probe_comparison_preserves_original_and_selects_process_prototype():
     assert "$functions.Count -ne 1" in ELEMENT_PROBE_SCRIPT
     assert "$node.Name -ceq 'Test-K5GStreamerElement'" in ELEMENT_PROBE_SCRIPT
-    assert ELEMENT_PROCESS_OBSERVED in ELEMENT_PROBE_SCRIPT
+    assert ELEMENT_PRODUCT_OBSERVED not in ELEMENT_PROBE_SCRIPT
+    assert "$actual = $functions[0].Extent.Text" in ELEMENT_PROBE_SCRIPT
     assert " | Out-Null" not in ELEMENT_PROBE_SCRIPT
     assert "Get-Variable LASTEXITCODE -Scope Global" in ELEMENT_PROBE_SCRIPT
     assert "$global:LASTEXITCODE = 0" in ELEMENT_PROBE_SCRIPT  # Explicit stale-input case only.
@@ -3864,7 +3789,8 @@ def test_element_runtime_pair_replaces_compiler_without_widening_probe_or_budget
     assert '("WindowsApplication", base.with_name("pythonw.exe"), 2)' in section
     assert "executable.parent != base.parent" in section
     assert section.count("common.file_hash(executable) != identity") == 3
-    assert ELEMENT_PROCESS_OBSERVED in ELEMENT_PROBE_SCRIPT
+    assert ELEMENT_PRODUCT_OBSERVED not in ELEMENT_PROBE_SCRIPT
+    assert "$actual = $functions[0].Extent.Text" in ELEMENT_PROBE_SCRIPT
     assert " | Out-Null" not in ELEMENT_PROBE_SCRIPT
     assert "Popen([executable, argument]" in ELEMENT_REFERENCE_SCRIPT
     assert "code = child.wait(timeout=5)" in ELEMENT_REFERENCE_SCRIPT
@@ -4068,7 +3994,8 @@ def test_element_utility_route_is_exact_scoped_and_keeps_native_acceptance():
     )
     assert "Get-Variable LASTEXITCODE -Scope Global" in ELEMENT_PROBE_SCRIPT
     assert "Set-Alias -Name K5FixtureAlias" in ELEMENT_PROBE_SCRIPT
-    assert ELEMENT_PROCESS_OBSERVED in ELEMENT_PROBE_SCRIPT
+    assert ELEMENT_PRODUCT_OBSERVED not in ELEMENT_PROBE_SCRIPT
+    assert "$actual = $functions[0].Extent.Text" in ELEMENT_PROBE_SCRIPT
     assert " | Out-Null" not in ELEMENT_PROBE_SCRIPT
     assert "Get-Command -Name $gstInspect -ErrorAction Stop" in ELEMENT_PROBE_SCRIPT
     assert "ConvertTo-Json" not in ELEMENT_PROBE_SCRIPT
@@ -4578,7 +4505,7 @@ def test_element_utility_each_retained_predicate_is_required(predicate):
 
 
 def test_element_process_candidate_binds_actual_exit_without_ambient_writes():
-    prototype = globals().get("ELEMENT_PROCESS_PROTOTYPE", "")
+    prototype = globals().get("ELEMENT_PRODUCT_HELPER", "")
     assert "$exitCode = $child.ExitCode" in prototype
     assert "LASTEXITCODE" not in prototype
     assert "$info.FileName = $command.Path" in prototype
@@ -4593,8 +4520,8 @@ def test_element_process_probe_has_distinct_actual_exit_schema():
     assert " | Out-Null" not in ELEMENT_PROBE_SCRIPT
 
 
-def test_element_process_scalar_observations_strip_to_exact_prototype():
-    stripped = ELEMENT_PROCESS_OBSERVED
+def test_element_process_scalar_observations_strip_to_exact_product_helper():
+    stripped = ELEMENT_PRODUCT_OBSERVED
     assert set(ELEMENT_PROCESS_INSERTIONS.values()) == {
         "        $script:fixtureActualExit = $exitCode\n",
         "        $script:fixtureProcessCleaned = $true\n",
@@ -4602,13 +4529,14 @@ def test_element_process_scalar_observations_strip_to_exact_prototype():
     for anchor, insertion in ELEMENT_PROCESS_INSERTIONS.items():
         assert stripped.count(anchor + insertion) == 1
         stripped = stripped.replace(anchor + insertion, anchor, 1)
-    assert stripped.encode() == ELEMENT_PROCESS_PROTOTYPE.encode()
-    assert "fixture" not in ELEMENT_PROCESS_PROTOTYPE
-    assert ELEMENT_PROCESS_OBSERVED in ELEMENT_PROBE_SCRIPT
+    assert stripped.encode() == ELEMENT_PRODUCT_HELPER.encode()
+    assert "fixture" not in ELEMENT_PRODUCT_HELPER
+    assert ELEMENT_PRODUCT_OBSERVED not in ELEMENT_PROBE_SCRIPT
+    assert "$actual = $functions[0].Extent.Text" in ELEMENT_PROBE_SCRIPT
 
 
 def test_element_process_drains_concurrently_and_cleanup_is_owned_bounded():
-    source = ELEMENT_PROCESS_PROTOTYPE
+    source = ELEMENT_PRODUCT_HELPER
     first_read = source.index("$outRead = $stdoutStream.ReadAsync")
     second_read = source.index("$errRead = $stderrStream.ReadAsync")
     loop = source.index("while ($true)")
@@ -4636,7 +4564,7 @@ def test_element_process_drains_concurrently_and_cleanup_is_owned_bounded():
 
 
 def test_element_process_name_guard_preserves_one_exact_bounded_native_argument(tmp_path):
-    expression = re.search(r"\$Name -match '([^']+)'", ELEMENT_PROCESS_PROTOTYPE).group(1)
+    expression = re.search(r"\$Name -match '([^']+)'", ELEMENT_PRODUCT_HELPER).group(1)
     script = tmp_path / "owned fixture 'one'.py"
     script.write_bytes(ELEMENT_PROBE_PYTHON_SOURCE.encode("ascii"))
     for name in ("rtspsrc", "d3d11h264dec", _element_python_argument(script, "zero")):
@@ -4644,8 +4572,8 @@ def test_element_process_name_guard_preserves_one_exact_bounded_native_argument(
         assert subprocess.list2cmdline([name]) == name
     for name in ("two names", "line\nfeed", "tab\tvalue", 'a"b', "a\\b", "a\x00b", "é"):
         assert re.search(expression, name) is not None
-    assert "$Name.Length -eq 0 -or $Name.Length -gt 8192" in ELEMENT_PROCESS_PROTOTYPE
-    assert "$info.Arguments = $Name" in ELEMENT_PROCESS_PROTOTYPE
+    assert "$Name.Length -eq 0 -or $Name.Length -gt 8192" in ELEMENT_PRODUCT_HELPER
+    assert "$info.Arguments = $Name" in ELEMENT_PRODUCT_HELPER
 
 
 @pytest.mark.parametrize("case,size", [("stdout_bound", 131072), ("stdout_overflow", 131073)])
@@ -4710,9 +4638,9 @@ def test_element_process_matrix_requires_real_exit_stale_independence_and_cleanu
 
 
 def _element_process_cleanup_fixture():
-    start = ELEMENT_PROCESS_PROTOTYPE.index("        $cleanupWatch = ")
-    end = ELEMENT_PROCESS_PROTOTYPE.index("        # The exact started Process", start)
-    cleanup = ELEMENT_PROCESS_PROTOTYPE[start:end]
+    start = ELEMENT_PRODUCT_HELPER.index("        $cleanupWatch = ")
+    end = ELEMENT_PRODUCT_HELPER.index("        # The exact started Process", start)
+    cleanup = ELEMENT_PRODUCT_HELPER[start:end]
     return (
         "$ErrorActionPreference='Stop'\nSet-StrictMode -Version Latest\n"
         "function Invoke-OwnedCleanup {\n"
@@ -4777,9 +4705,9 @@ ELEMENT_CHECKPOINTS.update(
 
 def test_element_process_cleanup_failure_fixture_uses_exact_owned_finally():
     script = _element_process_cleanup_fixture()
-    start = ELEMENT_PROCESS_PROTOTYPE.index("        $cleanupWatch = ")
-    end = ELEMENT_PROCESS_PROTOTYPE.index("        # The exact started Process", start)
-    assert script.count(ELEMENT_PROCESS_PROTOTYPE[start:end]) == 1
+    start = ELEMENT_PRODUCT_HELPER.index("        $cleanupWatch = ")
+    end = ELEMENT_PRODUCT_HELPER.index("        # The exact started Process", start)
+    assert script.count(ELEMENT_PRODUCT_HELPER[start:end]) == 1
     assert "Process]::new" not in script and "Get-Command" not in script
     assert "ReferenceEquals" in script and "-not $script:secondClosed" in script
     assert len(script.encode()) < 8192
@@ -4953,3 +4881,80 @@ def test_element_process_late_alias_failure_cannot_qualify(tmp_path, monkeypatch
     assert calls[-1]["kind"] == "alias"
     assert sum(c["kind"] == "missing" for c in calls) == 6
     assert "K5_ELEMENT_PROCESS_QUALIFIED=true" not in capsys.readouterr().out
+
+
+def test_actual_start_element_helper_matches_hosted_qualified_hash():
+    source = START.read_bytes()
+    matches = re.findall(
+        rb"(?ms)^function Test-K5GStreamerElement\(\[string\]\$Name\) \{\r?\n.*?^\}", source
+    )
+    assert len(matches) == 1
+    assert hashlib.sha256(matches[0]).hexdigest() in {
+        "363c93f0825c19d18c946598ab5020c7354483965f51666bc7eca90f7016c54f",
+        "623ca9b0321684af25f9f0e47bfc6ec58fe1401d4815f70ae807e48831e34dcd",
+    }
+
+
+def test_element_matrix_selects_and_instruments_actual_admitted_start_extent():
+    assert "$actual = $functions[0].Extent.Text" in ELEMENT_PROBE_SCRIPT
+    assert '$selected = $actual.Replace("`r`n", "`n") + "`n"' in ELEMENT_PROBE_SCRIPT
+    assert "[Diagnostics.ProcessStartInfo]::new()" not in ELEMENT_PROBE_SCRIPT
+    assert "$helperHasher.ComputeHash" in ELEMENT_PROBE_SCRIPT
+
+
+def test_element_product_extraction_accepts_only_qualified_raw_representations():
+    canonical = ELEMENT_PRODUCT_HELPER.strip("\n").encode("ascii")
+    assert hashlib.sha256(ELEMENT_PRODUCT_HELPER.encode()).hexdigest() == (
+        "ad703dbc3478618eb39a9fcbc22b67f1579372e722f31fe2210d51953b3d2a13"
+    )
+    for source in (canonical, canonical.replace(b"\n", b"\r\n")):
+        assert _element_product_helper(source) == ELEMENT_PRODUCT_HELPER
+    for source in (
+        canonical.replace(b"\n", b"\r\n", 1),
+        canonical.replace(b"$exitCode = $child.ExitCode", b"$exitCode = 0"),
+        canonical + b"\n" + canonical,
+        ELEMENT_HISTORICAL_HELPER.encode(),
+        b"x" * 262145,
+        b"",
+        canonical.decode(),
+    ):
+        with pytest.raises(ValueError):
+            _element_product_helper(source)
+
+
+def test_element_product_transfer_preserves_all_surrounding_start_bytes():
+    source = START.read_bytes()
+    canonical = ELEMENT_PRODUCT_HELPER.strip("\n").encode("ascii")
+    variants = (canonical, canonical.replace(b"\n", b"\r\n"))
+    actual = next(body for body in variants if source.count(body) == 1)
+    historical = ELEMENT_HISTORICAL_HELPER.encode("ascii")
+    if b"\r\n" in actual:
+        historical = historical.replace(b"\n", b"\r\n")
+    restored = source.replace(actual, historical, 1)
+    assert hashlib.sha256(restored).hexdigest() in {
+        "0239575c75c9131ea62097d7e984446d91e27c6d3f95b05b2187d791f8403cb4",
+        "683793019ace6e36f21d31ba095732232e6023bb76d01da5e8ca2046103feec8",
+    }
+    assert hashlib.sha256(ELEMENT_HISTORICAL_HELPER.encode()).hexdigest() == (
+        "a05ca4a8b4d90291ea4c8b2191a0a7dead7b400f0d7455c7fc08a81b9dfbb171"
+    )
+
+
+def test_element_actual_ast_selection_checks_raw_identity_before_scalar_insertions():
+    source = ELEMENT_PROBE_SCRIPT
+    extent = source.index("$actual = $functions[0].Extent.Text")
+    admission = source.index("if ($helperHash -cnotin @(", extent)
+    selected = source.index('$selected = $actual.Replace("`r`n", "`n")', admission)
+    instrumented = source.index("$selected = $selected.Replace($anchor", selected)
+    invoked = source.index(". ([scriptblock]::Create($selected))", instrumented)
+    assert extent < admission < selected < instrumented < invoked
+    for digest in ELEMENT_PRODUCT_HASHES:
+        assert source.count(digest) == 1
+    assert source.count("if (($selected.Split(@($anchor)") == 2
+    assert "$helperHasher.Dispose()" in source
+    assert ELEMENT_PRODUCT_HELPER.strip() not in source
+    assert ELEMENT_HISTORICAL_HELPER in source
+    assert "ELEMENT_PROCESS_PROTOTYPE" not in globals()
+    for anchor, insertion in ELEMENT_PROCESS_INSERTIONS.items():
+        assert ("$anchor = '" + anchor.rstrip("\n") + "'") in source
+        assert ("$anchor + '" + insertion.rstrip("\n") + "'") in source

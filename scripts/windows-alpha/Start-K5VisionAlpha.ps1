@@ -192,8 +192,124 @@ function Test-K5TcpListener([string]$HostName, [int]$TargetPort) {
 }
 
 function Test-K5GStreamerElement([string]$Name) {
-    & $gstInspect $Name *> $null
-    return $LASTEXITCODE -eq 0
+    $child = $null
+    $primaryFailure = $null
+    $started = $false
+    $childHandle = [IntPtr]::Zero
+    $outRead = $null; $errRead = $null
+    $stdoutStream = $null; $stderrStream = $null
+    try {
+        # Only one bounded token reaches the native argv parser. This includes
+        # actual element names and the admitted one-argument native probe.
+        if ($Name.Length -eq 0 -or $Name.Length -gt 8192 -or
+            $Name -match '[^\x21-\x7e]|["\\]' -or -not [IO.Path]::IsPathRooted($gstInspect)) {
+            throw [Management.Automation.CommandNotFoundException]::new(
+                'K5 native application required.')
+        }
+        $command = Get-Command -Name $gstInspect -ErrorAction Stop
+        if ($command -isnot [Management.Automation.ApplicationInfo] -or
+            -not [string]::Equals([IO.Path]::GetFullPath($command.Path),
+                [IO.Path]::GetFullPath($gstInspect), [StringComparison]::OrdinalIgnoreCase)) {
+            throw [Management.Automation.CommandNotFoundException]::new(
+                'K5 native application required.')
+        }
+        $info = [Diagnostics.ProcessStartInfo]::new()
+        $info.FileName = $command.Path
+        $info.Arguments = $Name
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardInput = $true
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        $child = [Diagnostics.Process]::new()
+        $child.StartInfo = $info
+        $started = $child.Start()
+        if (-not $started) { throw [InvalidOperationException]::new('K5 native start failed.') }
+        $childHandle = $child.Handle
+        $child.StandardInput.Close()
+        $stdoutStream = $child.StandardOutput.BaseStream
+        $stderrStream = $child.StandardError.BaseStream
+        $outBuffer = [byte[]]::new(4096)
+        $errBuffer = [byte[]]::new(4096)
+        $outRead = $stdoutStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+        $errRead = $stderrStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+        $outDone = $false; $errDone = $false
+        $outCount = 0; $errCount = 0
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        while ($true) {
+            if ($watch.Elapsed.TotalSeconds -ge 5) {
+                throw [TimeoutException]::new('K5 native timeout.')
+            }
+            if (-not $outDone -and $outRead.IsCompleted) {
+                $count = $outRead.GetAwaiter().GetResult()
+                if ($count -eq 0) { $outDone = $true }
+                else {
+                    $outCount += $count
+                    if ($outCount + $errCount -gt 131072) {
+                        throw [IO.InvalidDataException]::new('K5 native output limit.')
+                    }
+                    $outRead = $stdoutStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+                }
+            }
+            if (-not $errDone -and $errRead.IsCompleted) {
+                $count = $errRead.GetAwaiter().GetResult()
+                if ($count -eq 0) { $errDone = $true }
+                else {
+                    $errCount += $count
+                    if ($outCount + $errCount -gt 131072) {
+                        throw [IO.InvalidDataException]::new('K5 native output limit.')
+                    }
+                    $errRead = $stderrStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+                }
+            }
+            if ($child.HasExited -and $outDone -and $errDone) { break }
+            [Threading.Thread]::Sleep(10)
+        }
+        $exitCode = $child.ExitCode
+        if ($errCount -ne 0) { throw [IO.InvalidDataException]::new('K5 native stderr refused.') }
+        return $exitCode -eq 0
+    } catch {
+        $primaryFailure = $_
+        throw
+    } finally {
+        $cleanupWatch = [Diagnostics.Stopwatch]::StartNew()
+        $cleanupFailed = $false
+        try {
+            if ($started) {
+                if ($childHandle -eq [IntPtr]::Zero -or $child.Handle -ne $childHandle) {
+                    throw [InvalidOperationException]::new('K5 native cleanup failed.')
+                }
+                if (-not $child.HasExited) {
+                    $child.Kill()
+                    if (-not $child.WaitForExit(5000)) {
+                        throw [InvalidOperationException]::new('K5 native cleanup failed.')
+                    }
+                }
+            }
+        } catch { $cleanupFailed = $true }
+        foreach ($ownedStream in @($stdoutStream, $stderrStream)) {
+            try { if ($null -ne $ownedStream) { $ownedStream.Close() } }
+            catch { $cleanupFailed = $true }
+        }
+        try { if ($null -ne $child) { $child.Dispose() } }
+        catch { $cleanupFailed = $true }
+        while (($null -ne $outRead -and -not $outRead.IsCompleted) -or
+               ($null -ne $errRead -and -not $errRead.IsCompleted)) {
+            if ($cleanupWatch.Elapsed.TotalSeconds -ge 5) {
+                $cleanupFailed = $true
+                break
+            }
+            [Threading.Thread]::Sleep(10)
+        }
+        if ($cleanupFailed) {
+            $cleanupError = [InvalidOperationException]::new('K5 native cleanup failed.')
+            if ($primaryFailure -is [Management.Automation.ErrorRecord]) {
+                $cleanupError.Data['K5ElementPrimaryErrorRecord'] = $primaryFailure
+            }
+            throw $cleanupError
+        }
+        # The exact started Process and its streams are now closed.
+    }
 }
 
 function Get-K5MediaMtx {
