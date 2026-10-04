@@ -96,6 +96,188 @@ FIELDS = (
     | {f"run_{attempt}_{name}" for attempt in (1, 2) for name in COUNTERS | RUN_BOOLEANS}
 )
 REFUSAL = b"K5_ALPHA_EXPECTED_CONFIG_REFUSAL"
+MARKERS = {"admitted", "synthetic", "analytics", "operator", "exit", "refusal"}
+DIAGNOSTIC_STAGES = STAGES | {"final_receipt"}
+DIAGNOSTIC_CONTRACTS = {
+    "input_schema",
+    "input_identity",
+    "receipt_schema",
+    "receipt_write",
+    "receipt_identity",
+    "receipt_scalar",
+    "receipt_state",
+    "run_schema",
+    "run_boolean",
+    "run_counter",
+    "frame_count",
+    "presentation_count",
+    "analytics_activity",
+    "analytics_failures",
+    "invalid_output_limit",
+    "invalid_markers",
+    "invalid_exit",
+    "invalid_job_total",
+    "invalid_session_change",
+    "valid_output_limit",
+    "valid_markers",
+    "job_active",
+    "sessions_empty",
+    "child_process",
+    "owned_process_cleanup",
+    "collector_cleanup",
+    "directory_guard_cleanup",
+    "directory_guard_setup",
+    "driver_contract",
+    "owned_layout_cleanup",
+}
+DIAGNOSTIC_BOOLEANS = {
+    "collector_finished",
+    "output_invalid",
+    "sessions_empty",
+    "session_unchanged",
+    "health_confirmed",
+    "operator_request_observed",
+    "timed_out",
+    "launcher_requested",
+    "launcher_returned",
+}
+DIAGNOSTIC_COUNTERS = (
+    {
+        "job_total",
+        "job_active",
+        "expected_job_total",
+        "expected_frames",
+        "minimum_presentations",
+        "minimum_submissions",
+        "minimum_completions",
+        "expected_failures",
+    }
+    | {f"marker_{key}" for key in MARKERS}
+    | {f"expected_marker_{key}" for key in MARKERS}
+    | {f"counter_{key}" for key in COUNTERS}
+)
+DIAGNOSTIC_EXITS = {"child_exit_code", "relay_exit_code"}
+DIAGNOSTIC_OBSERVATIONS = (
+    DIAGNOSTIC_BOOLEANS | DIAGNOSTIC_COUNTERS | DIAGNOSTIC_EXITS | {"gate_state"}
+)
+ALPHA_DIAGNOSTIC_FIELDS = DIAGNOSTIC_OBSERVATIONS | {
+    "schema_version",
+    "stage",
+    "contract",
+    "field",
+    "failure_code",
+}
+
+
+def validate_alpha_diagnostic(value: object) -> None:
+    if type(value) is not dict or value.keys() != ALPHA_DIAGNOSTIC_FIELDS:
+        raise ValueError("invalid Alpha diagnostic")
+    if (
+        type(value["schema_version"]) is not str
+        or value["schema_version"] != "alpha-launcher-diagnostic-v1"
+    ):
+        raise ValueError("invalid Alpha diagnostic")
+    if value["gate_state"] is not None and (
+        type(value["gate_state"]) is not str or value["gate_state"] not in common.GATE_STATES
+    ):
+        raise ValueError("invalid Alpha diagnostic")
+    for key, allowed in (
+        ("stage", DIAGNOSTIC_STAGES),
+        ("contract", DIAGNOSTIC_CONTRACTS),
+        ("field", FIELDS | COUNTERS | RUN_BOOLEANS | {"none"}),
+        ("failure_code", common.FAILURES - {"none"}),
+    ):
+        if type(value[key]) is not str or value[key] not in allowed:
+            raise ValueError("invalid Alpha diagnostic")
+    for key in DIAGNOSTIC_BOOLEANS:
+        if value[key] is not None and type(value[key]) is not bool:
+            raise ValueError("invalid Alpha diagnostic")
+    for key in DIAGNOSTIC_COUNTERS | DIAGNOSTIC_EXITS:
+        number = value[key]
+        lower = -(2**31) if key in DIAGNOSTIC_EXITS else 0
+        if number is not None and (type(number) is not int or not lower <= number < 2**32):
+            raise ValueError("invalid Alpha diagnostic")
+
+
+def alpha_diagnostic(
+    stage: str,
+    contract: str,
+    *,
+    field: str = "none",
+    failure_code: str = "receipt_invalid",
+    observations=None,
+) -> dict[str, object]:
+    observations = {} if observations is None else observations
+    if type(observations) is not dict or observations.keys() - DIAGNOSTIC_OBSERVATIONS:
+        raise ValueError("invalid Alpha diagnostic")
+    result = {
+        **dict.fromkeys(DIAGNOSTIC_OBSERVATIONS),
+        "schema_version": "alpha-launcher-diagnostic-v1",
+        "stage": stage,
+        "contract": contract,
+        "field": field,
+        "failure_code": failure_code,
+        **observations,
+    }
+    validate_alpha_diagnostic(result)
+    return result
+
+
+def emit_alpha_diagnostic(value: dict[str, object]) -> None:
+    validate_alpha_diagnostic(value)
+    print("K5_ALPHA_LAUNCHER_DIAGNOSTIC=" + common.canonical(value).decode("ascii"))
+
+
+class AlphaWitnessError(common.WitnessError):
+    def __init__(self, record: dict[str, object], detail=None) -> None:
+        validate_alpha_diagnostic(record)
+        super().__init__(record["failure_code"], detail)
+        self.alpha_diagnostic = record
+
+
+def contract_require(
+    condition: bool,
+    stage: str,
+    contract: str,
+    *,
+    field="none",
+    observations=None,
+    code="receipt_invalid",
+) -> None:
+    if not condition:
+        raise AlphaWitnessError(
+            alpha_diagnostic(
+                stage, contract, field=field, observations=observations, failure_code=code
+            )
+        )
+
+
+def contextual_error(error: BaseException, stage: str, contract: str, observations=None):
+    """Merge only allowlisted observations; never stringify an external exception."""
+    if isinstance(error, AlphaWitnessError):
+        record = {**error.alpha_diagnostic, **({} if observations is None else observations)}
+    else:
+        record = alpha_diagnostic(
+            stage,
+            contract,
+            failure_code=str(error) if isinstance(error, common.WitnessError) else "unexpected",
+            observations=observations,
+        )
+    detail = error.diagnostic if isinstance(error, common.WitnessError) else None
+    if detail is not None:
+        for key in ("gate_state", "child_exit_code", "relay_exit_code", "timed_out"):
+            if record[key] is None:
+                record[key] = detail[key]
+        if detail["gate_state"] == "exited" and record["launcher_requested"] is True:
+            record["launcher_returned"] = True
+    return AlphaWitnessError(record, detail)
+
+
+def observed_integer(value: object, *, signed=False) -> int | None:
+    lower = -(2**31) if signed else 0
+    return value if type(value) is int and lower <= value < 2**32 else None
+
+
 # This envelope does not replace, dot-source, patch, or intercept Start's work.
 # It only maps the reviewed fixed refusal to a bounded scalar exit/marker.
 ENVELOPE = """param([string]$Start, [int]$Port)
@@ -114,17 +296,23 @@ try {
 """
 
 
-def validate_expectations(value: object, *, installed: bool = True) -> dict[str, str]:
+def validate_expectations(
+    value: object, *, installed: bool = True, stage: str = "admission"
+) -> dict[str, str]:
     names = IDENTITIES if installed else INPUT_IDENTITIES
-    common.require(
-        type(value) is dict and value.keys() == names | {"revision", "run_nonce"}, "receipt_invalid"
+    contract_require(
+        type(value) is dict and value.keys() == names | {"revision", "run_nonce"},
+        stage,
+        "input_schema",
     )
     for name, length in [("revision", 40), ("run_nonce", 32), *[(key, 64) for key in names]]:
-        common.require(
+        contract_require(
             type(value[name]) is str
             and re.fullmatch(r"[0-9a-f]{" + str(length) + "}", value[name]) is not None
             and value[name] != "0" * length,
-            "receipt_invalid",
+            stage,
+            "input_identity",
+            field=name,
         )
     return value
 
@@ -151,26 +339,53 @@ def new_receipt(expected: dict[str, str]) -> dict[str, object]:
     }
 
 
-def validate_run(value: dict[str, object]) -> None:
-    common.require(value.keys() == COUNTERS | RUN_BOOLEANS, "receipt_invalid")
+def run_observations(value: dict[str, object]) -> dict[str, object]:
+    return {
+        "expected_frames": 225,
+        "minimum_presentations": 225,
+        "minimum_submissions": 1,
+        "minimum_completions": 1,
+        "expected_failures": 0,
+        **{f"counter_{key}": observed_integer(value.get(key)) for key in COUNTERS},
+    }
+
+
+def validate_run(value: dict[str, object], *, stage="final_receipt") -> None:
+    contract_require(value.keys() == COUNTERS | RUN_BOOLEANS, stage, "run_schema")
+    observations = run_observations(value)
     for name in RUN_BOOLEANS:
-        common.require(value[name] is True, "receipt_invalid")
-    for name in COUNTERS:
-        common.require(
-            type(value[name]) is int and 0 <= value[name] <= common.MAX_COUNTER, "receipt_invalid"
+        contract_require(
+            value[name] is True, stage, "run_boolean", field=name, observations=observations
         )
-    common.require(
-        value["delivered_frames"] == 225
-        and value["presentations"] >= 225
-        and 0 < value["analytics_provider_completions"] <= value["analytics_provider_submissions"]
-        and value["analytics_failures"] == 0,
-        "receipt_invalid",
+    for name in COUNTERS:
+        contract_require(
+            type(value[name]) is int and 0 <= value[name] <= common.MAX_COUNTER,
+            stage,
+            "run_counter",
+            field=name,
+            observations=observations,
+        )
+    contract_require(
+        value["delivered_frames"] == 225, stage, "frame_count", observations=observations
+    )
+    contract_require(
+        value["presentations"] >= 225, stage, "presentation_count", observations=observations
+    )
+    contract_require(
+        0 < value["analytics_provider_completions"] <= value["analytics_provider_submissions"],
+        stage,
+        "analytics_activity",
+        observations=observations,
+    )
+    contract_require(
+        value["analytics_failures"] == 0, stage, "analytics_failures", observations=observations
     )
 
 
 def validate_receipt(value: object, expected: dict[str, str], *, success: bool = True) -> None:
-    validate_expectations(expected)
-    common.require(type(value) is dict and value.keys() == FIELDS, "receipt_invalid")
+    stage = "final_receipt"
+    validate_expectations(expected, stage=stage)
+    contract_require(type(value) is dict and value.keys() == FIELDS, stage, "receipt_schema")
     for name, exact in {
         "schema_version": SCHEMA,
         "analytics_revision": common.ANALYTICS_REVISION,
@@ -179,37 +394,52 @@ def validate_receipt(value: object, expected: dict[str, str], *, success: bool =
         "execution_context": "owned-installed-start-script-windows-x64",
         **expected,
     }.items():
-        common.require(type(value[name]) is str and value[name] == exact, "receipt_invalid")
-    common.require(
+        contract_require(
+            type(value[name]) is str and value[name] == exact, stage, "receipt_identity", field=name
+        )
+    contract_require(
         type(value["stage"]) is str
         and value["stage"] in STAGES
         and type(value["failure_code"]) is str
         and value["failure_code"] in common.FAILURES,
-        "receipt_invalid",
+        stage,
+        "receipt_state",
     )
     for name in BOOLEANS:
-        common.require(type(value[name]) is bool, "receipt_invalid")
-    common.require(value["person_box_acceptance"] is False, "receipt_invalid")
+        contract_require(type(value[name]) is bool, stage, "receipt_scalar", field=name)
+    contract_require(
+        value["person_box_acceptance"] is False,
+        stage,
+        "receipt_state",
+        field="person_box_acceptance",
+    )
     for attempt in (1, 2):
         run = {name: value[f"run_{attempt}_{name}"] for name in COUNTERS | RUN_BOOLEANS}
         for name in RUN_BOOLEANS:
-            common.require(type(run[name]) is bool, "receipt_invalid")
+            contract_require(
+                type(run[name]) is bool, stage, "receipt_scalar", field=f"run_{attempt}_{name}"
+            )
         for name in COUNTERS:
-            common.require(
-                type(run[name]) is int and 0 <= run[name] <= common.MAX_COUNTER, "receipt_invalid"
+            contract_require(
+                type(run[name]) is int and 0 <= run[name] <= common.MAX_COUNTER,
+                stage,
+                "receipt_scalar",
+                field=f"run_{attempt}_{name}",
+                observations=run_observations(run),
             )
         if success:
-            validate_run(run)
+            validate_run(run, stage=stage)
     if success:
-        common.require(
+        contract_require(
             all(value[key] is True for key in BOOLEANS - {"person_box_acceptance"})
             and value["stage"] == "complete"
             and value["failure_code"] == "none",
-            "receipt_invalid",
+            stage,
+            "receipt_state",
         )
     else:
-        common.require(
-            value["completed"] is False and value["failure_code"] != "none", "receipt_invalid"
+        contract_require(
+            value["completed"] is False and value["failure_code"] != "none", stage, "receipt_state"
         )
 
 
@@ -355,11 +585,18 @@ class LaunchSummary:
         )
         self.scalars: dict[str, int] = {}
         self.invalid = False
+        self.health_confirmed = False
+        self.operator_request_observed = False
         self.thread = threading.Thread(target=self._read, args=(stream,), daemon=True)
         self.thread.start()
 
     def _line(self, line: bytes) -> None:
         line = line.rstrip(b"\r")
+        # Positive diagnostic observations only; never change the marker gates.
+        if line == b"K5 Vision Alpha health check PASS.":
+            self.health_confirmed = True
+        if line == b"Launching the authenticated K5 Windows operator path...":
+            self.operator_request_observed = True
         markers = {
             "admitted": (
                 b"K5 analytics configuration admitted; live provider acceptance is pending."
@@ -429,10 +666,23 @@ class LaunchSummary:
         self.thread.join(5)
         common.require(not self.thread.is_alive(), "cleanup_incomplete")
 
-    def result(self) -> dict[str, object]:
-        common.require(
-            not self.invalid
-            and self.counts
+    def observations(self, *, invalid=False) -> dict[str, object]:
+        expected = {key: int(key == "refusal" if invalid else key != "refusal") for key in MARKERS}
+        return {
+            "collector_finished": not self.thread.is_alive(),
+            "output_invalid": self.invalid,
+            "health_confirmed": self.health_confirmed,
+            "operator_request_observed": self.operator_request_observed,
+            **{f"marker_{key}": observed_integer(self.counts[key]) for key in MARKERS},
+            **{f"expected_marker_{key}": number for key, number in expected.items()},
+            **run_observations(self.scalars),
+        }
+
+    def result(self, *, stage="launch_1") -> dict[str, object]:
+        observations = self.observations()
+        contract_require(not self.invalid, stage, "valid_output_limit", observations=observations)
+        contract_require(
+            self.counts
             == {
                 "admitted": 1,
                 "synthetic": 1,
@@ -441,10 +691,12 @@ class LaunchSummary:
                 "exit": 1,
                 "refusal": 0,
             },
-            "receipt_invalid",
+            stage,
+            "valid_markers",
+            observations=observations,
         )
         result = {**self.scalars, **dict.fromkeys(RUN_BOOLEANS, True)}
-        validate_run(result)
+        validate_run(result, stage=stage)
         return result
 
 
@@ -489,11 +741,53 @@ def job_accounting(owned) -> tuple[int, int]:
 def invoke_start(
     command: list[str], *, work: Path, env: dict[str, str], operation: str, invalid: bool = False
 ) -> dict[str, object]:
+    stage = "invalid_config" if invalid else operation
     sessions = Path(env["TEMP"])
-    common.require(not any(sessions.iterdir()), "cleanup_incomplete")
-    guard = DirectoryChangeGuard(sessions) if invalid else None
-    owned, summary, original = None, None, None
+    state = {
+        "expected_job_total": 4 if invalid else None,
+        "launcher_requested": False,
+        "launcher_returned": False,
+    }
+    contract_require(
+        not any(sessions.iterdir()),
+        stage,
+        "sessions_empty",
+        observations={**state, "sessions_empty": False},
+        code="cleanup_incomplete",
+    )
+    guard = None
+    owned, summary, original, child_detail = None, None, None, None
+
+    def snapshot():
+        result = {**({} if summary is None else summary.observations(invalid=invalid)), **state}
+        process = None if owned is None else owned.process
+        if process is not None:
+            result["relay_exit_code"] = observed_integer(process.returncode, signed=True)
+            if result["relay_exit_code"] is not None:
+                state["relay_exit_code"] = result["relay_exit_code"]
+        detail = child_detail
+        if detail is None and owned is not None:
+            stderr = getattr(owned, "stderr_summary", None)
+            if stderr is not None:
+                detail = {
+                    "gate_state": stderr.gate_state,
+                    "child_exit_code": stderr.child_exit_code,
+                }
+        if detail is not None:
+            result["gate_state"] = detail.get("gate_state")
+            result["child_exit_code"] = observed_integer(detail.get("child_exit_code"), signed=True)
+            result["timed_out"] = detail.get("timed_out", False)
+            if detail.get("gate_state") == "exited":
+                result["launcher_returned"] = True
+        return result
+
     try:
+        if invalid:
+            try:
+                guard = DirectoryChangeGuard(sessions)
+            except BaseException as error:
+                raise contextual_error(error, stage, "directory_guard_setup", snapshot()) from None
+        state["launcher_requested"] = True
         owned = common.OwnedProcess(
             command, cwd=work, env=env, operation=operation, stdout=subprocess.PIPE
         )
@@ -501,22 +795,36 @@ def invoke_start(
         try:
             owned.wait(60 if invalid else 150)
         except common.WitnessError as error:
-            detail = error.diagnostic or {}
+            child_detail = error.diagnostic or {}
             if not (
                 invalid
                 and str(error) == "child_failed"
-                and detail.get("child_exit_code") == 23
-                and detail.get("gate_state") == "exited"
+                and child_detail.get("child_exit_code") == 23
+                and child_detail.get("gate_state") == "exited"
             ):
                 raise
+        state["launcher_returned"] = True
         summary.finish()
         total, active = job_accounting(owned)
-        common.require(active == 0, "cleanup_incomplete")
-        common.require(not any(sessions.iterdir()), "cleanup_incomplete")
+        state.update(job_total=observed_integer(total), job_active=observed_integer(active))
+        contract_require(
+            active == 0, stage, "job_active", observations=snapshot(), code="cleanup_incomplete"
+        )
+        state["sessions_empty"] = not any(sessions.iterdir())
+        contract_require(
+            state["sessions_empty"],
+            stage,
+            "sessions_empty",
+            observations=snapshot(),
+            code="cleanup_incomplete",
+        )
         if invalid:
-            common.require(
-                not summary.invalid
-                and summary.counts
+            state["session_unchanged"] = guard.unchanged()
+            contract_require(
+                not summary.invalid, stage, "invalid_output_limit", observations=snapshot()
+            )
+            contract_require(
+                summary.counts
                 == {
                     "admitted": 0,
                     "synthetic": 0,
@@ -524,34 +832,58 @@ def invoke_start(
                     "operator": 0,
                     "exit": 0,
                     "refusal": 1,
-                }
-                and owned.process.returncode == 23,
-                "receipt_invalid",
+                },
+                stage,
+                "invalid_markers",
+                observations=snapshot(),
             )
-            # Base relay Python, PowerShell, installed venv redirector, and its
-            # base analytics-preflight interpreter (CPython 3.12 Windows).
-            # A native probe, app, or media process would increase this kernel counter.
-            common.require(total == 4 and guard.unchanged(), "receipt_invalid")
+            contract_require(
+                owned.process.returncode == 23, stage, "invalid_exit", observations=snapshot()
+            )
+            # Base relay, PowerShell, preflight venv redirector and interpreter.
+            contract_require(total == 4, stage, "invalid_job_total", observations=snapshot())
+            contract_require(
+                state["session_unchanged"], stage, "invalid_session_change", observations=snapshot()
+            )
             return {
                 "invalid_config_refused": True,
                 "invalid_config_no_session": True,
                 "invalid_config_no_media": True,
             }
-        return summary.result()
+        return summary.result(stage=stage)
     except BaseException as error:
-        original = error
-        raise
+        original = contextual_error(error, stage, "child_process", snapshot())
+        raise original from None
     finally:
-        try:
-            if owned is not None:
-                common.close_after_failure(owned, original)
-        finally:
+        cleanup_errors = []
+        if owned is not None:
             try:
-                if summary is not None:
-                    summary.finish()
-            finally:
-                if guard is not None:
-                    guard.close()
+                common.close_after_failure(owned, original)
+            except BaseException as error:
+                cleanup_errors.append(
+                    contextual_error(error, "cleanup", "owned_process_cleanup", snapshot())
+                )
+        if summary is not None:
+            try:
+                summary.finish()
+            except BaseException as error:
+                cleanup_errors.append(
+                    contextual_error(error, "cleanup", "collector_cleanup", snapshot())
+                )
+        if guard is not None:
+            try:
+                guard.close()
+            except BaseException as error:
+                cleanup_errors.append(
+                    contextual_error(error, "cleanup", "directory_guard_cleanup", snapshot())
+                )
+        if cleanup_errors:
+            # Report each fixed failure once; cleanup never overwrites the cause.
+            if original is not None:
+                emit_alpha_diagnostic(original.alpha_diagnostic)
+            for error in cleanup_errors[:-1]:
+                emit_alpha_diagnostic(error.alpha_diagnostic)
+            raise cleanup_errors[-1] from None
 
 
 def require_ports_free(port: int) -> None:
@@ -876,6 +1208,7 @@ def execute(args) -> int:
     document = new_receipt(expected)
     work = None
     detail = None
+    alpha_detail = None
     try:
         admit_platform()
         repo = common.local_path(args.repo.absolute(), directory=True)
@@ -914,6 +1247,8 @@ def execute(args) -> int:
         )
         document["completed"] = True
     except BaseException as error:
+        failure = contextual_error(error, document["stage"], "driver_contract")
+        alpha_detail = failure.alpha_diagnostic
         document["failure_code"] = (
             str(error) if isinstance(error, common.WitnessError) else "unexpected"
         )
@@ -929,18 +1264,28 @@ def execute(args) -> int:
                 cleanup = False
         document["cleanup_complete"] = cleanup
         if not cleanup:
+            if alpha_detail is not None:
+                emit_alpha_diagnostic(alpha_detail)
             document.update(completed=False, failure_code="cleanup_incomplete", stage="cleanup")
+            alpha_detail = alpha_diagnostic(
+                "cleanup", "owned_layout_cleanup", failure_code="cleanup_incomplete"
+            )
             detail = common.diagnostic(
                 "cleanup_owned", outcome="cleanup_failed", category="cleanup_incomplete"
             )
         if document["completed"]:
             document["stage"] = "complete"
             validate_receipt(document, expected)
-            with output.open("xb") as stream:
-                stream.write(common.canonical(document) + b"\n")
+            try:
+                with output.open("xb") as stream:
+                    stream.write(common.canonical(document) + b"\n")
+            except BaseException as error:
+                raise contextual_error(error, "final_receipt", "receipt_write") from None
         # Failure is a separate fixed diagnostic, never a partly populated success
         # file or an exception/path/native stream published as acceptance evidence.
         elif detail is not None:
+            if alpha_detail is not None:
+                emit_alpha_diagnostic(alpha_detail)
             common.emit_diagnostic(detail)
     print(
         "Installed Alpha Start-script witness passed"
@@ -971,7 +1316,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.validate_receipt:
-            common.require(args.output.name == RECEIPT_NAME, "receipt_invalid")
+            contract_require(args.output.name == RECEIPT_NAME, "final_receipt", "receipt_schema")
             validate_receipt(common.read_json(args.output), common.read_json(args.expectations))
             print("Installed Alpha Start-script receipt validation passed")
             return 0
@@ -998,6 +1343,10 @@ def main() -> int:
         )
         return execute(args)
     except BaseException as error:
+        failure = contextual_error(
+            error, "final_receipt" if args.validate_receipt else "admission", "driver_contract"
+        )
+        emit_alpha_diagnostic(failure.alpha_diagnostic)
         code = str(error) if isinstance(error, common.WitnessError) else "unexpected"
         common.emit_diagnostic(
             common.diagnostic(

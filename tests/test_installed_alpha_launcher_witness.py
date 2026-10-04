@@ -931,3 +931,504 @@ def test_windows_real_directory_guard_remembers_created_then_deleted_session(tmp
         guard.close()
         if session.exists():
             session.rmdir()
+
+
+def test_invalid_job_count_has_precise_source_free_diagnostic(monkeypatch, tmp_path) -> None:
+    _state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True, total=5)
+    with pytest.raises(witness.common.WitnessError) as caught:
+        witness.invoke_start(
+            ["real Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+        )
+    record = caught.value.alpha_diagnostic
+    assert record["stage"] == "invalid_config"
+    assert record["contract"] == "invalid_job_total"
+    assert record["job_total"] == 5 and record["expected_job_total"] == 4
+    assert record["job_active"] == 0 and record["session_unchanged"] is True
+    assert record["marker_refusal"] == 1 and record["child_exit_code"] == 23
+    assert record["relay_exit_code"] == 23
+    assert record["health_confirmed"] is False
+
+
+def test_valid_marker_failure_identifies_second_launch_and_health_milestone(
+    monkeypatch, tmp_path
+) -> None:
+    output = success_output().replace(b"K5 operator PASS: frames=225, presentations=226\n", b"")
+    output += (
+        b"K5 Vision Alpha health check PASS.\n"
+        b"Launching the authenticated K5 Windows operator path...\n"
+    )
+    _state, sessions = invoke_fixture(monkeypatch, tmp_path, output=output)
+    with pytest.raises(witness.common.WitnessError) as caught:
+        witness.invoke_start(
+            ["real Start"], work=tmp_path, env={"TEMP": str(sessions)}, operation="launch_2"
+        )
+    record = caught.value.alpha_diagnostic
+    assert record["stage"] == "launch_2" and record["contract"] == "valid_markers"
+    assert record["marker_operator"] == 0 and record["expected_marker_operator"] == 1
+    assert record["health_confirmed"] is True and record["operator_request_observed"] is True
+
+
+def test_final_schema_failure_identifies_exact_boundary() -> None:
+    result = receipt()
+    result["raw_private_path"] = "sensitive content"
+    with pytest.raises(witness.common.WitnessError) as caught:
+        witness.validate_receipt(result, expected())
+    record = caught.value.alpha_diagnostic
+    assert record["stage"] == "final_receipt" and record["contract"] == "receipt_schema"
+    assert b"sensitive" not in witness.common.canonical(record)
+    assert b"raw_private_path" not in witness.common.canonical(record)
+
+
+def alpha_records(text):
+    prefix = "K5_ALPHA_LAUNCHER_DIAGNOSTIC="
+    records = [
+        witness.common.parse_json(line[len(prefix) :].encode())
+        for line in text.splitlines()
+        if line.startswith(prefix)
+    ]
+    for record in records:
+        witness.validate_alpha_diagnostic(record)
+    return records
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"extra": "private"},
+        {"stage": "private path"},
+        {"contract": "raw exception"},
+        {"field": "unknown private field"},
+        {"failure_code": "private error"},
+        {"schema_version": 1},
+        {"job_total": True},
+        {"job_active": -1},
+        {"marker_operator": 2**32},
+        {"counter_presentations": "225"},
+        {"health_confirmed": 1},
+        {"session_unchanged": []},
+        {"gate_state": "private host"},
+        {"child_exit_code": 2**32},
+        {"relay_exit_code": -(2**31) - 1},
+    ],
+)
+def test_diagnostic_schema_rejects_forged_raw_or_unbounded_values(change) -> None:
+    value = witness.alpha_diagnostic("invalid_config", "invalid_job_total")
+    value.update(change)
+    with pytest.raises(ValueError, match="invalid Alpha diagnostic"):
+        witness.validate_alpha_diagnostic(value)
+    with pytest.raises(ValueError):
+        witness.emit_alpha_diagnostic(value)
+
+
+def test_diagnostic_is_bounded_fixed_scalar_and_exception_text_free(capsys) -> None:
+    value = witness.alpha_diagnostic(
+        "invalid_config",
+        "invalid_job_total",
+        observations={
+            "job_total": 5,
+            "expected_job_total": 4,
+            "job_active": 0,
+            "marker_refusal": 1,
+            "session_unchanged": False,
+            "child_exit_code": 23,
+            "gate_state": "exited",
+        },
+    )
+    witness.emit_alpha_diagnostic(value)
+    assert len(witness.common.canonical(value)) < witness.common.MAX_BYTES
+    error = witness.contextual_error(
+        RuntimeError("secret path or token"), "build", "driver_contract"
+    )
+    witness.emit_alpha_diagnostic(error.alpha_diagnostic)
+    output = capsys.readouterr().out
+    assert len(alpha_records(output)) == 2
+    assert "secret" not in output and "token" not in output
+    assert all(value is None or type(value) in (str, bool, int) for value in value.values())
+
+
+@pytest.mark.parametrize("value", [True, "225", {"raw": "secret"}, -1, 2**32, 1.0])
+def test_untrusted_counter_observation_is_omitted(value) -> None:
+    assert witness.observed_integer(value) is None
+
+
+@pytest.mark.parametrize(
+    "overrides,contract",
+    [
+        ({"output": REFUSAL_OUTPUT + b"x" * 65537}, "invalid_output_limit"),
+        ({"output": b""}, "invalid_markers"),
+        ({"exit_code": 0}, "invalid_exit"),
+        ({"total": 5}, "invalid_job_total"),
+        ({"unchanged": False}, "invalid_session_change"),
+        ({"active": 1}, "job_active"),
+        ({"leave_session": True}, "sessions_empty"),
+        ({"exit_code": 24}, "child_process"),
+    ],
+)
+def test_invalid_boundaries_remain_closed_and_are_distinguishable(
+    monkeypatch, tmp_path, overrides, contract
+) -> None:
+    _state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True, **overrides)
+    with pytest.raises(witness.common.WitnessError) as caught:
+        witness.invoke_start(
+            ["actual Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+        )
+    value = caught.value.alpha_diagnostic
+    assert value["stage"] == "invalid_config" and value["contract"] == contract
+    assert value["launcher_requested"] is True
+    assert value["launcher_returned"] is True
+    assert value["health_confirmed"] is False
+    assert value["expected_marker_refusal"] == 1
+    assert value["expected_marker_operator"] == 0
+
+
+@pytest.mark.parametrize(
+    "before,after,contract",
+    [
+        (b"frames=225", b"frames=226", "frame_count"),
+        (b"presentations=226", b"presentations=224", "presentation_count"),
+        (b"completions=39", b"completions=0", "analytics_activity"),
+        (b"failures=0", b"failures=1", "analytics_failures"),
+        (b"frames=225", b"frames=1000001", "run_counter"),
+    ],
+)
+def test_first_launch_counter_failures_expose_observation_not_raw_output(
+    monkeypatch, tmp_path, before, after, contract
+) -> None:
+    _state, sessions = invoke_fixture(
+        monkeypatch, tmp_path, output=success_output().replace(before, after)
+    )
+    with pytest.raises(witness.common.WitnessError) as caught:
+        witness.invoke_start(
+            ["actual Start"], work=tmp_path, env={"TEMP": str(sessions)}, operation="launch_1"
+        )
+    value = caught.value.alpha_diagnostic
+    assert value["stage"] == "launch_1" and value["contract"] == contract
+    assert value["expected_frames"] == 225 and value["minimum_presentations"] == 225
+    assert value["minimum_completions"] == 1 and value["expected_failures"] == 0
+    assert value["health_confirmed"] is False  # No observed marker is not proof of no app.
+    assert str(tmp_path).encode() not in witness.common.canonical(value)
+
+
+def test_milestones_are_observational_and_leave_success_gate_identical() -> None:
+    raw = success_output()
+    plain = witness.LaunchSummary(io.BytesIO(raw))
+    observed = witness.LaunchSummary(
+        io.BytesIO(
+            raw + b"K5 Vision Alpha health check PASS.\n"
+            b"Launching the authenticated K5 Windows operator path...\n"
+        )
+    )
+    plain.finish()
+    observed.finish()
+    assert plain.result() == observed.result()
+    assert plain.counts == observed.counts
+    assert plain.observations()["health_confirmed"] is False
+    assert observed.observations()["health_confirmed"] is True
+    assert set(observed.result()) == witness.COUNTERS | witness.RUN_BOOLEANS
+
+
+def test_primary_receipt_and_process_cleanup_failures_both_survive(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    _state, sessions = invoke_fixture(
+        monkeypatch, tmp_path, invalid=True, total=5, cleanup_failure=True
+    )
+    with pytest.raises(witness.common.WitnessError) as caught:
+        witness.invoke_start(
+            ["actual Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+        )
+    primary = alpha_records(capsys.readouterr().out)
+    assert len(primary) == 1 and primary[0]["contract"] == "invalid_job_total"
+    assert caught.value.alpha_diagnostic["stage"] == "cleanup"
+    assert caught.value.alpha_diagnostic["contract"] == "owned_process_cleanup"
+
+
+def test_primary_and_layout_cleanup_failure_both_logged(monkeypatch, tmp_path, capsys) -> None:
+    args, _identities, _state = execute_fixture(
+        monkeypatch, tmp_path, launch_error=True, cleanup_error=True
+    )
+    assert witness.execute(args) == 1
+    values = alpha_records(capsys.readouterr().out)
+    assert len(values) == 2
+    assert values[0]["contract"] == "driver_contract"
+    assert values[1]["stage"] == "cleanup" and values[1]["contract"] == "owned_layout_cleanup"
+    assert not args.output.exists()
+
+
+@pytest.mark.parametrize("stage", ["build", "install", "probe"])
+def test_prelaunch_stage_survives_fixed_driver_failure(
+    monkeypatch, tmp_path, capsys, stage
+) -> None:
+    args, _identities, _state = execute_fixture(monkeypatch, tmp_path)
+
+    def fail_before_launch(_args, _work, _expected, document):
+        document["stage"] = stage
+        raise witness.common.WitnessError("identity_mismatch")
+
+    monkeypatch.setattr(witness, "prepare", fail_before_launch)
+    assert witness.execute(args) == 1
+    values = alpha_records(capsys.readouterr().out)
+    assert len(values) == 1 and values[0]["stage"] == stage
+    assert values[0]["launcher_requested"] is None and values[0]["health_confirmed"] is None
+    assert not args.output.exists()
+
+
+@pytest.mark.parametrize("validation", [False, True])
+def test_outer_cli_catch_emits_input_or_final_boundary(tmp_path, validation) -> None:
+    output = tmp_path / witness.RECEIPT_NAME
+    expectations = tmp_path / "input.json"
+    expectations.write_bytes(
+        witness.common.canonical(expected() if validation else {"unknown": "secret"})
+    )
+    args = [
+        sys.executable,
+        "-I",
+        "-B",
+        str(SPEC.origin),
+        "--expectations",
+        str(expectations),
+        "--output",
+        str(output),
+    ]
+    if validation:
+        data = receipt()
+        data["unknown"] = "private raw output"
+        output.write_bytes(witness.common.canonical(data))
+        args.append("--validate-receipt")
+    else:
+        for flag in (
+            "repo",
+            "analytics-source",
+            "k5-wheel",
+            "wheelhouse",
+            "evidence-root",
+            "local-appdata",
+            "git",
+            "temp-root",
+            "work-root",
+        ):
+            args += ["--" + flag, str(tmp_path)]
+        args += ["--admitted-expectations", str(tmp_path / witness.EXPECTATIONS_NAME)]
+    result = subprocess.run(args, capture_output=True, timeout=10)
+    assert result.returncode == 1
+    records = alpha_records(result.stdout.decode())
+    assert len(records) == 1
+    assert records[0]["stage"] == ("final_receipt" if validation else "admission")
+    assert records[0]["contract"] == ("receipt_schema" if validation else "input_schema")
+    assert b"secret" not in result.stdout and b"private" not in result.stdout
+
+
+def test_existing_session_refuses_before_launcher_request(monkeypatch, tmp_path) -> None:
+    _state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True)
+    (sessions / "existing-state").write_bytes(b"preserve")
+    with pytest.raises(witness.common.WitnessError) as caught:
+        witness.invoke_start(
+            ["actual Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+        )
+    value = caught.value.alpha_diagnostic
+    assert value["stage"] == "invalid_config" and value["contract"] == "sessions_empty"
+    assert value["launcher_requested"] is False and value["launcher_returned"] is False
+    assert value["health_confirmed"] is None
+    assert (sessions / "existing-state").read_bytes() == b"preserve"
+
+
+def test_timeout_preserves_known_gate_state_without_claiming_return(monkeypatch, tmp_path) -> None:
+    _state, sessions = invoke_fixture(monkeypatch, tmp_path)
+    original = witness.common.OwnedProcess
+
+    class TimedOut(original):
+        def wait(self, _seconds):
+            self.process.returncode = None
+            raise witness.common.WitnessError(
+                "child_timeout",
+                witness.common.diagnostic(
+                    "launch_1",
+                    outcome="timeout",
+                    gate_state="started",
+                    timed_out=True,
+                    category="child_timeout",
+                ),
+            )
+
+    monkeypatch.setattr(witness.common, "OwnedProcess", TimedOut)
+    with pytest.raises(witness.common.WitnessError) as caught:
+        witness.invoke_start(
+            ["actual Start"], work=tmp_path, env={"TEMP": str(sessions)}, operation="launch_1"
+        )
+    value = caught.value.alpha_diagnostic
+    assert value["timed_out"] is True and value["gate_state"] == "started"
+    assert value["launcher_requested"] is True and value["launcher_returned"] is False
+    assert value["child_exit_code"] is None and value["relay_exit_code"] is None
+
+
+def test_launch_failure_retains_fixed_gate_details(monkeypatch, tmp_path) -> None:
+    _state, sessions = invoke_fixture(monkeypatch, tmp_path)
+
+    def failed(*_args, **_kwargs):
+        raise witness.common.WitnessError(
+            "child_failed",
+            witness.common.diagnostic(
+                "launch_1",
+                outcome="launch_failed",
+                gate_state="waiting",
+                category="executable_missing",
+            ),
+        )
+
+    monkeypatch.setattr(witness.common, "OwnedProcess", failed)
+    with pytest.raises(witness.common.WitnessError) as caught:
+        witness.invoke_start(
+            ["actual Start"], work=tmp_path, env={"TEMP": str(sessions)}, operation="launch_1"
+        )
+    value = caught.value.alpha_diagnostic
+    assert value["gate_state"] == "waiting"
+    assert value["launcher_requested"] is True and value["launcher_returned"] is False
+    assert value["health_confirmed"] is None
+
+
+def test_primary_and_multiple_cleanup_failures_each_reported_once(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    _state, sessions = invoke_fixture(
+        monkeypatch, tmp_path, invalid=True, total=5, cleanup_failure=True
+    )
+    original_finish = witness.LaunchSummary.finish
+    calls = []
+
+    def finish(summary):
+        calls.append(1)
+        original_finish(summary)
+        if len(calls) > 1:
+            raise witness.common.WitnessError("cleanup_incomplete")
+
+    def close(_guard):
+        raise witness.common.WitnessError("cleanup_incomplete")
+
+    monkeypatch.setattr(witness.LaunchSummary, "finish", finish)
+    monkeypatch.setattr(witness.DirectoryChangeGuard, "close", close)
+    with pytest.raises(witness.common.WitnessError) as caught:
+        witness.invoke_start(
+            ["actual Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+        )
+    records = alpha_records(capsys.readouterr().out)
+    records.append(caught.value.alpha_diagnostic)
+    assert [record["contract"] for record in records] == [
+        "invalid_job_total",
+        "owned_process_cleanup",
+        "collector_cleanup",
+        "directory_guard_cleanup",
+    ]
+    assert all(record["relay_exit_code"] == 23 for record in records)
+
+
+def test_final_validator_error_in_execute_finally_reaches_outer_catch(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    args, _identities, _state = execute_fixture(monkeypatch, tmp_path)
+
+    def reject(*_args, **_kwargs):
+        witness.contract_require(False, "final_receipt", "receipt_state")
+
+    monkeypatch.setattr(witness, "validate_receipt", reject)
+    monkeypatch.setattr(witness.argparse.ArgumentParser, "parse_args", lambda _self: args)
+    args.validate_receipt = False
+    for name in ("analytics_source", "k5_wheel", "evidence_root", "local_appdata", "git"):
+        setattr(args, name, tmp_path)
+    assert witness.main() == 1
+    records = alpha_records(capsys.readouterr().out)
+    assert len(records) == 1
+    assert records[0]["stage"] == "final_receipt" and records[0]["contract"] == "receipt_state"
+    assert not args.output.exists() and not args.work_root.exists()
+
+
+def test_directory_guard_setup_failure_is_before_requested_launcher(monkeypatch, tmp_path) -> None:
+    _state, sessions = invoke_fixture(monkeypatch, tmp_path, invalid=True)
+
+    def fail(_path):
+        raise OSError("private source path")
+
+    monkeypatch.setattr(witness, "DirectoryChangeGuard", fail)
+    with pytest.raises(witness.common.WitnessError) as caught:
+        witness.invoke_start(
+            ["actual Start"],
+            work=tmp_path,
+            env={"TEMP": str(sessions)},
+            operation="probe_admission",
+            invalid=True,
+        )
+    value = caught.value.alpha_diagnostic
+    assert value["stage"] == "invalid_config" and value["contract"] == "directory_guard_setup"
+    assert value["launcher_requested"] is False and value["launcher_returned"] is False
+    assert value["health_confirmed"] is None
+
+
+def test_final_receipt_write_failure_keeps_final_boundary(monkeypatch, tmp_path, capsys) -> None:
+    args, _identities, _state = execute_fixture(monkeypatch, tmp_path)
+    original_open = Path.open
+
+    def fail_output(path, *positional, **kwargs):
+        if path == args.output and positional == ("xb",):
+            raise OSError("private receipt path")
+        return original_open(path, *positional, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_output)
+    monkeypatch.setattr(witness.argparse.ArgumentParser, "parse_args", lambda _self: args)
+    args.validate_receipt = False
+    for name in ("analytics_source", "k5_wheel", "evidence_root", "local_appdata", "git"):
+        setattr(args, name, tmp_path)
+    assert witness.main() == 1
+    records = alpha_records(capsys.readouterr().out)
+    assert len(records) == 1
+    assert records[0]["stage"] == "final_receipt" and records[0]["contract"] == "receipt_write"
+    assert not args.output.exists() and not args.work_root.exists()
+
+
+@pytest.mark.parametrize(
+    "stage,operation", [("build", "build_k5_wheel"), ("probe", "probe_before")]
+)
+def test_prelaunch_child_exit_is_not_a_launcher_return(
+    monkeypatch, tmp_path, capsys, stage, operation
+) -> None:
+    args, _identities, _state = execute_fixture(monkeypatch, tmp_path)
+
+    def fail_before_launch(_args, _work, _expected, document):
+        document["stage"] = stage
+        raise witness.common.WitnessError(
+            "child_failed",
+            witness.common.diagnostic(
+                operation,
+                outcome="child_failed",
+                gate_state="exited",
+                child_exit_code=1,
+                relay_exit_code=1,
+            ),
+        )
+
+    monkeypatch.setattr(witness, "prepare", fail_before_launch)
+    assert witness.execute(args) == 1
+    records = alpha_records(capsys.readouterr().out)
+    assert len(records) == 1 and records[0]["stage"] == stage
+    assert records[0]["gate_state"] == "exited" and records[0]["child_exit_code"] == 1
+    assert records[0]["launcher_requested"] is None
+    assert records[0]["launcher_returned"] is None
+    assert records[0]["health_confirmed"] is None
