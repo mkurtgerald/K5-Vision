@@ -27,8 +27,11 @@ on:
       - "scripts/windows_owned_preflight.py"
       - "scripts/installed_analytics_witness.py"
       - "scripts/installed_alpha_launcher_witness.py"
+      - "scripts/installed_alpha_facade_witness.py"
       - "tests/test_installed_analytics_witness.py"
       - "tests/test_installed_alpha_launcher_witness.py"
+      - "tests/test_installed_alpha_facade_witness.py"
+      - "tests/test_windows_alpha_facade_witness.py"
       - "tests/test_installed_analytics_candidate_workflow.py"
       - ".github/workflows/installed-analytics-candidate.yml"
       - ".github/workflows/windows-alpha-script-smoke.yml"
@@ -58,8 +61,11 @@ on:
       - "scripts/windows_owned_preflight.py"
       - "scripts/installed_analytics_witness.py"
       - "scripts/installed_alpha_launcher_witness.py"
+      - "scripts/installed_alpha_facade_witness.py"
       - "tests/test_installed_analytics_witness.py"
       - "tests/test_installed_alpha_launcher_witness.py"
+      - "tests/test_installed_alpha_facade_witness.py"
+      - "tests/test_windows_alpha_facade_witness.py"
       - "tests/test_installed_analytics_candidate_workflow.py"
       - ".github/workflows/installed-analytics-candidate.yml"
       - ".github/workflows/windows-alpha-script-smoke.yml"
@@ -127,7 +133,7 @@ jobs:
       - name: Run Windows alpha boundary regressions
         shell: powershell
         run: |
-          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py tests/test_app_resource_lifetime.py tests/test_windows_alpha_analytics.py tests/test_cli.py -q --no-cov
+          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py tests/test_app_resource_lifetime.py tests/test_windows_alpha_analytics.py tests/test_cli.py tests/test_installed_alpha_facade_witness.py -q --no-cov
 
       - name: Qualify Windows local recovery identity
         shell: powershell
@@ -185,3 +191,5 @@ jobs:
           $env:K5_PREFLIGHT_PROBE_PYTHON = Join-Path $env:RUNNER_TEMP "k5-alpha-runtime-probe\Scripts\python.exe"
           python -m pytest tests/test_windows_alpha_preflight_boundary.py --no-cov -q -s
           if ($LASTEXITCODE -ne 0) { throw "Owned Start preflight boundary observation failed." }
+          python -m pytest tests/test_windows_alpha_facade_witness.py::test_windows_facade_process_observer_real_owned_births --no-cov -q -rP
+          if ($LASTEXITCODE -ne 0) { throw "Owned facade process observation qualification failed." }

@@ -5,10 +5,12 @@ on:
     branches:
       - feat/installed-analytics-operator-20261003
       - feat/alpha-analytics-preflight-20261004
+      - feat/installed-alpha-facade-witness-20261005
     paths:
       - .github/workflows/installed-analytics-candidate.yml
       - scripts/installed_analytics_witness.py
       - scripts/installed_alpha_launcher_witness.py
+      - scripts/installed_alpha_facade_witness.py
       - scripts/windows_owned_preflight.py
       - scripts/build_analytics_runtime_wheel.py
       - scripts/windows-alpha/Invoke-K5InstalledAnalyticsWitness.ps1
@@ -21,24 +23,96 @@ on:
       - scripts/windows-alpha/runtime-requirements.txt
       - tests/test_installed_analytics_witness.py
       - tests/test_installed_alpha_launcher_witness.py
+      - tests/test_installed_alpha_facade_witness.py
+      - tests/test_windows_alpha_facade_witness.py
       - tests/test_installed_analytics_candidate_workflow.py
       - tests/test_windows_alpha_analytics.py
 
-# Shares the existing K5 physical lane; never cancel an already running owner.
+# Shares the existing K5 physical lane only after hosted admission succeeds.
 # Cross-repository launch coordination and fresh host admission remain required.
-concurrency:
-  group: stage-one-operator-physical
-  cancel-in-progress: false
-
 permissions:
   contents: read
   actions: read
 
 jobs:
+  hosted_admission:
+    name: hosted-candidate-admission
+    if: github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005')
+    runs-on: windows-latest
+    timeout-minutes: 10
+    outputs:
+      qualified_sha: ${{ steps.qualify.outputs.qualified_sha }}
+    env:
+      K5_CANDIDATE_BRANCH: ${{ github.ref_name }}
+      K5_EXPECTED_SHA: ${{ github.sha }}
+    steps:
+      - name: Require exact trusted head and green hosted PR qualification
+        id: qualify
+        timeout-minutes: 9
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Test-K5CandidateHostedGates {
+            if ($env:GITHUB_REPOSITORY -cne "mkurtgerald/K5-Vision") { throw "Untrusted candidate repository refused." }
+            if ($env:K5_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "Exact candidate SHA required." }
+            $legacyBranch = "feat/installed-analytics-operator-20261003"
+            $launcherBranch = "feat/alpha-analytics-preflight-20261004"
+            $facadeBranch = "feat/installed-alpha-facade-witness-20261005"
+            if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $facadeBranch)) { throw "Unreviewed candidate branch refused." }
+            $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
+            $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+            # Launcher/facade branches require three applicable gates; legacy retains all five.
+            $required = @{
+              "355859781" = "CI"
+              "369354936" = "Windows Alpha Script Smoke"
+              "361865932" = "PR Run Dedupe"
+            }
+            if ($env:K5_CANDIDATE_BRANCH -ceq $legacyBranch) {
+              $required["362514400"] = "Current Gate Viewport Editor Qualification"
+              $required["364801702"] = "Stage One Analytics Compatibility"
+            }
+            $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+            if ($head.name -cne $env:K5_CANDIDATE_BRANCH) { throw "Candidate branch identity mismatch." }
+            if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch has advanced; no physical work admitted." }
+            $uri = "https://api.github.com/repos/mkurtgerald/K5-Vision/actions/runs?event=pull_request&head_sha=$env:K5_EXPECTED_SHA&per_page=100"
+            $response = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri $uri
+            if ($null -eq $response -or $response.workflow_runs -isnot [System.Array]) { throw "Malformed hosted qualification response." }
+            $qualified = $true
+            foreach ($id in $required.Keys) {
+              $matching = @($response.workflow_runs | Where-Object {
+                [string]$_.workflow_id -ceq $id -and $_.head_sha -ceq $env:K5_EXPECTED_SHA -and
+                $_.event -ceq "pull_request" -and $_.head_branch -ceq $env:K5_CANDIDATE_BRANCH -and
+                $_.name -ceq $required[$id] -and
+                $_.repository.full_name -ceq "mkurtgerald/K5-Vision" -and
+                $_.head_repository.full_name -ceq "mkurtgerald/K5-Vision"
+              } | Sort-Object -Property id -Descending)
+              if ($matching.Count -eq 0) { $qualified = $false; continue }
+              if (@($matching | Where-Object { $_.status -ceq "completed" -and $_.conclusion -cne "success" }).Count -ne 0) {
+                throw "An exact-candidate hosted qualification failed; native execution refused."
+              }
+              if ($matching[0].status -cne "completed" -or $matching[0].conclusion -cne "success") { $qualified = $false }
+            }
+            return $qualified
+          }
+          $deadline = [DateTime]::UtcNow.AddMinutes(8)
+          $qualified = $false
+          while ([DateTime]::UtcNow -lt $deadline) {
+            if (Test-K5CandidateHostedGates) { $qualified = $true; break }
+            Start-Sleep -Seconds 15
+          }
+          if (-not $qualified -or [DateTime]::UtcNow -ge $deadline) { throw "Exact hosted qualification did not pass within the admission budget." }
+          "qualified_sha=$env:K5_EXPECTED_SHA" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
   installed-analytics-candidate:
-    if: github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004')
+    needs: hosted_admission
+    if: needs.hosted_admission.result == 'success' && needs.hosted_admission.outputs.qualified_sha == github.sha && (github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'))
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
-    timeout-minutes: 35
+    timeout-minutes: 25
+    concurrency:
+      group: stage-one-operator-physical
+      cancel-in-progress: false
     env:
       PYTHONHOME: ""
       PYTHONPYCACHEPREFIX: ""
@@ -52,48 +126,55 @@ jobs:
       K5_INSTALLED_CONTROLLER_OWNED: ""
       K5_ALPHA_LAUNCHER_OWNED: ""
       K5_ALPHA_LAUNCHER_OUTPUT: artifacts\installed-alpha-start-script-witness.json
+      K5_ALPHA_FACADE_OWNED: ""
+      K5_ALPHA_FACADE_INPUTS: artifacts\installed-alpha-facades-inputs.json
+      K5_ALPHA_FACADE_EXPECTATIONS: artifacts\installed-alpha-facades-expectations.json
+      K5_ALPHA_FACADE_OUTPUT: artifacts\installed-alpha-facades-witness.json
 
     steps:
-      - name: Require exact trusted head and green hosted PR qualification
-        timeout-minutes: 7
+      - name: Revalidate exact admitted candidate before native work
+        timeout-minutes: 1
         shell: powershell
         env:
           K5_GITHUB_TOKEN: ${{ github.token }}
           K5_EXPECTED_SHA: ${{ github.sha }}
+          K5_ADMITTED_SHA: ${{ needs.hosted_admission.outputs.qualified_sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "Exact candidate SHA required." }
-          $legacyBranch = "feat/installed-analytics-operator-20261003"
-          $launcherBranch = "feat/alpha-analytics-preflight-20261004"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch)) { throw "Unreviewed candidate branch refused." }
-          $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
-          $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
-          # PR321's launcher/CLI paths trigger Alpha smoke; CI and PR dedupe are
-          # unfiltered. PR318 also changes operator_runtime.py, so its original
-          # viewport and Analytics compatibility requirements remain in force.
-          # No native workflow or intentionally untriggered gate is counted.
-          $required = @{
-            "355859781" = "CI"
-            "369354936" = "Windows Alpha Script Smoke"
-            "361865932" = "PR Run Dedupe"
-          }
-          if ($env:K5_CANDIDATE_BRANCH -ceq $legacyBranch) {
-            $required["362514400"] = "Current Gate Viewport Editor Qualification"
-            $required["364801702"] = "Stage One Analytics Compatibility"
-          }
-          $deadline = [DateTime]::UtcNow.AddMinutes(6)
-          $qualified = $false
-          while ([DateTime]::UtcNow -lt $deadline) {
+          if ($env:K5_ADMITTED_SHA -cne $env:K5_EXPECTED_SHA) { throw "Hosted admission does not bind this exact candidate." }
+          function Test-K5CandidateHostedGates {
+            if ($env:GITHUB_REPOSITORY -cne "mkurtgerald/K5-Vision") { throw "Untrusted candidate repository refused." }
+            if ($env:K5_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "Exact candidate SHA required." }
+            $legacyBranch = "feat/installed-analytics-operator-20261003"
+            $launcherBranch = "feat/alpha-analytics-preflight-20261004"
+            $facadeBranch = "feat/installed-alpha-facade-witness-20261005"
+            if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $facadeBranch)) { throw "Unreviewed candidate branch refused." }
+            $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
+            $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+            # Launcher/facade branches require three applicable gates; legacy retains all five.
+            $required = @{
+              "355859781" = "CI"
+              "369354936" = "Windows Alpha Script Smoke"
+              "361865932" = "PR Run Dedupe"
+            }
+            if ($env:K5_CANDIDATE_BRANCH -ceq $legacyBranch) {
+              $required["362514400"] = "Current Gate Viewport Editor Qualification"
+              $required["364801702"] = "Stage One Analytics Compatibility"
+            }
             $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+            if ($head.name -cne $env:K5_CANDIDATE_BRANCH) { throw "Candidate branch identity mismatch." }
             if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch has advanced; no physical work admitted." }
             $uri = "https://api.github.com/repos/mkurtgerald/K5-Vision/actions/runs?event=pull_request&head_sha=$env:K5_EXPECTED_SHA&per_page=100"
             $response = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri $uri
+            if ($null -eq $response -or $response.workflow_runs -isnot [System.Array]) { throw "Malformed hosted qualification response." }
             $qualified = $true
             foreach ($id in $required.Keys) {
               $matching = @($response.workflow_runs | Where-Object {
                 [string]$_.workflow_id -ceq $id -and $_.head_sha -ceq $env:K5_EXPECTED_SHA -and
                 $_.event -ceq "pull_request" -and $_.head_branch -ceq $env:K5_CANDIDATE_BRANCH -and
-                $_.name -ceq $required[$id]
+                $_.name -ceq $required[$id] -and
+                $_.repository.full_name -ceq "mkurtgerald/K5-Vision" -and
+                $_.head_repository.full_name -ceq "mkurtgerald/K5-Vision"
               } | Sort-Object -Property id -Descending)
               if ($matching.Count -eq 0) { $qualified = $false; continue }
               if (@($matching | Where-Object { $_.status -ceq "completed" -and $_.conclusion -cne "success" }).Count -ne 0) {
@@ -101,10 +182,9 @@ jobs:
               }
               if ($matching[0].status -cne "completed" -or $matching[0].conclusion -cne "success") { $qualified = $false }
             }
-            if ($qualified) { break }
-            Start-Sleep -Seconds 15
+            return $qualified
           }
-          if (-not $qualified -or [DateTime]::UtcNow -ge $deadline) { throw "Exact hosted qualification did not pass within the admission budget." }
+          if (-not (Test-K5CandidateHostedGates)) { throw "Exact hosted qualification is no longer green; no physical work admitted." }
 
       - name: Admit existing Git before immutable checkouts
         timeout-minutes: 1
@@ -178,7 +258,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004")) { throw "Unreviewed candidate branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -243,7 +323,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004")) { throw "Unreviewed candidate branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -273,7 +353,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004")) { throw "Unreviewed candidate branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -313,7 +393,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Installed receipt violated exact source-free contract." }
 
       - name: Prepare independently bound offline Start-script inputs
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
         timeout-minutes: 6
         shell: powershell
         env:
@@ -321,7 +401,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cne "feat/alpha-analytics-preflight-20261004") { throw "Unreviewed launcher branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/alpha-analytics-preflight-20261004", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed launcher branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -399,7 +479,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Independent launcher input admission failed." }
 
       - name: Recheck fresh exact candidate before installed Start-script acceptance
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
         timeout-minutes: 1
         shell: powershell
         env:
@@ -407,21 +487,21 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cne "feat/alpha-analytics-preflight-20261004") { throw "Unreviewed launcher branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/alpha-analytics-preflight-20261004", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed launcher branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
           if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; Start-script acceptance refused." }
 
       - name: Recheck idle host before installed Start-script witness
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
         timeout-minutes: 1
         shell: powershell
         run: .\scripts\assert-stage-one-physical-admission.ps1
 
       - name: Prove installed Start-script refusal and two analytics launches
         id: alpha_launcher_witness
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
         timeout-minutes: 10
         shell: powershell
         run: |
@@ -451,15 +531,166 @@ jobs:
           & $env:K5_WITNESS_BASE_PYTHON -I -B -S "$root\source\scripts\installed_alpha_launcher_witness.py" --validate-receipt --expectations "$root\installed-alpha-start-script-expectations.json" --output $env:K5_ALPHA_LAUNCHER_OUTPUT
           if ($LASTEXITCODE -ne 0) { throw "Installed Start-script receipt violated independent source-free contract." }
 
+      - name: Prepare independently bound offline facade inputs
+        if: github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
+        timeout-minutes: 1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:K5_ALPHA_LAUNCHER_OWNED
+          $base = $env:K5_WITNESS_BASE_PYTHON
+          if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_WITNESS_BASE_PYTHON_SHA256) { throw "Admitted base Python changed." }
+          $facade = Join-Path $env:RUNNER_TEMP ("k5-alpha-facades-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $facade) { throw "Facade input path already exists." }
+          New-Item -ItemType Directory -Path $facade -ErrorAction Stop | Out-Null
+          "K5_ALPHA_FACADE_OWNED=$facade" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Reuse independently admitted raw-source/wheel/model/seed/cache inputs.
+          # The new installed runtime will be independently probed by this controller.
+          @'
+          try:
+              import importlib.util, os, sys, uuid
+              from pathlib import Path
+              root, facade_root = Path(sys.argv[1]), Path(sys.argv[2])
+              source = root / "source"
+              controller = source / "scripts/installed_alpha_facade_witness.py"
+              spec = importlib.util.spec_from_file_location("facade", controller)
+              facade = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(facade)
+              launcher, common = facade.alpha, facade.common
+              initial = common.read_json(root / "inputs.json")
+              launcher.validate_expectations(initial, installed=False)
+              common.require(initial["revision"] == os.environ["K5_STAGE_ONE_REVISION"])
+              common.require(common.digest(launcher.tree_manifest(source)) == initial["source_tree_sha256"])
+              expected = {
+                  **initial, "run_nonce": uuid.uuid4().hex,
+                  "facade_controller_sha256": common.file_hash(controller),
+              }
+              common.require(expected["run_nonce"] != initial["run_nonce"])
+              facade.validate_expectations(expected, installed=False)
+              output = Path(os.environ["K5_ALPHA_FACADE_INPUTS"])
+              common.local_path(output.parent.absolute(), directory=True)
+              with output.open("xb") as stream:
+                  stream.write(common.canonical(expected) + b"\n")
+              (facade_root / "work").mkdir()
+          except BaseException:
+              print("K5_ALPHA_FACADE_INPUT_PREPARATION_FAILED")
+              raise SystemExit(1)
+          '@ | & $base -I -B -S - $root $facade
+          if ($LASTEXITCODE -ne 0) { throw "Independent facade input admission failed." }
+
+      - name: Recheck fresh exact candidate before installed facade acceptance
+        if: github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
+        timeout-minutes: 1
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+          K5_EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:K5_CANDIDATE_BRANCH -cne "feat/installed-alpha-facade-witness-20261005") { throw "Unreviewed facade branch refused." }
+          $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
+          $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+          $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+          if ($head.name -cne $env:K5_CANDIDATE_BRANCH) { throw "Candidate branch identity mismatch." }
+          if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; installed facade acceptance refused." }
+
+      - name: Recheck idle host before installed facade witness
+        if: github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
+
+      - name: Prove actual installed Test and two Run facades
+        id: alpha_facade_witness
+        if: github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
+        timeout-minutes: 10
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:K5_ALPHA_LAUNCHER_OWNED
+          $facade = $env:K5_ALPHA_FACADE_OWNED
+          $base = $env:K5_WITNESS_BASE_PYTHON
+          if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_WITNESS_BASE_PYTHON_SHA256) { throw "Admitted base Python changed." }
+          $wheels = @(Get-ChildItem -LiteralPath "$root\wheels" -Filter 'k5_vision-*.whl' -File)
+          if ($wheels.Count -ne 1) { throw "Exactly one admitted K5 wheel required." }
+          & $base -I -B -S "$root\source\scripts\installed_alpha_facade_witness.py" --expectations $env:K5_ALPHA_FACADE_INPUTS --admitted-expectations $env:K5_ALPHA_FACADE_EXPECTATIONS --output $env:K5_ALPHA_FACADE_OUTPUT --repo $env:GITHUB_WORKSPACE --analytics-source "$env:GITHUB_WORKSPACE\analytics-lab" --k5-wheel $wheels[0].FullName --wheelhouse "$root\wheelhouse" --evidence-root $env:K5_ANALYTICS_EVIDENCE_ROOT --local-appdata $env:LOCALAPPDATA --git 'C:\Program Files\Git\cmd\git.exe' --temp-root $facade --work-root "$facade\work"
+          if ($LASTEXITCODE -ne 0) { throw "Installed facade witness failed." }
+
+      - name: Verify installed facade owned media cleanup
+        if: always() && (steps.alpha_facade_witness.outcome == 'success' || steps.alpha_facade_witness.outcome == 'failure' || steps.alpha_facade_witness.outcome == 'cancelled')
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
+
+      - name: Validate exact source-free installed facade receipt
+        id: safe_facade_evidence
+        if: success() && steps.alpha_facade_witness.outcome == 'success'
+        timeout-minutes: 1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:K5_ALPHA_LAUNCHER_OWNED
+          $facade = $env:K5_ALPHA_FACADE_OWNED
+          $base = $env:K5_WITNESS_BASE_PYTHON
+          if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_WITNESS_BASE_PYTHON_SHA256) { throw "Admitted base Python changed." }
+          # Caller-held source-free inputs bind the admitted expectations before
+          # the distinct read-only receipt validator; no authority comes from output.
+          @'
+          try:
+              import importlib.util, os, sys
+              from pathlib import Path
+              root, facade_root = Path(sys.argv[1]), Path(sys.argv[2])
+              controller = root / "source/scripts/installed_alpha_facade_witness.py"
+              spec = importlib.util.spec_from_file_location("facade", controller)
+              facade = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(facade)
+              common = facade.common
+              initial = common.read_json(Path(os.environ["K5_ALPHA_FACADE_INPUTS"]))
+              admitted = common.read_json(Path(os.environ["K5_ALPHA_FACADE_EXPECTATIONS"]))
+              facade.validate_expectations(initial, installed=False)
+              facade.validate_expectations(admitted)
+              common.require(initial["revision"] == os.environ["K5_STAGE_ONE_REVISION"])
+              common.require(common.file_hash(controller) == initial["facade_controller_sha256"])
+              common.require(all(admitted[key] == value for key, value in initial.items()))
+              common.require(not (facade_root / "work").exists())
+          except BaseException:
+              print("K5_ALPHA_FACADE_AUTHORITY_VALIDATION_FAILED")
+              raise SystemExit(1)
+          '@ | & $base -I -B -S - $root $facade
+          if ($LASTEXITCODE -ne 0) { throw "Independent facade authority validation failed." }
+          & $base -I -B -S "$root\source\scripts\installed_alpha_facade_witness.py" --validate-receipt --expectations $env:K5_ALPHA_FACADE_EXPECTATIONS --output $env:K5_ALPHA_FACADE_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw "Installed facade receipt violated independent source-free contract." }
+
       - name: Remove only this job's disposable fixture and controller
         if: always()
         timeout-minutes: 1
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+          # The controllers alone know whether their collectors/Jobs are quiescent.
+          # Any remaining work root, missing ownership proof or denied read preserves
+          # ALL shared input/controller roots. Never override their deletion guard.
+          $preserveOwnedRoots = $false
+          $guardedRoots = @{ K5_ALPHA_LAUNCHER_OWNED = "k5-alpha-launcher-"; K5_ALPHA_FACADE_OWNED = "k5-alpha-facades-" }
+          foreach ($name in $guardedRoots.Keys) {
+            $owned = [Environment]::GetEnvironmentVariable($name, "Process")
+            if ([string]::IsNullOrWhiteSpace($owned)) { continue }
+            try {
+              $expected = Join-Path $env:RUNNER_TEMP ($guardedRoots[$name] + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+              if ([IO.Path]::GetFullPath($owned) -cne [IO.Path]::GetFullPath($expected)) { throw "ownership" }
+              try {
+                $null = [IO.File]::GetAttributes((Join-Path $owned "work"))
+                $preserveOwnedRoots = $true
+              } catch [IO.FileNotFoundException] {
+                # Only positively absent controller work authorizes outer cleanup.
+              } catch [IO.DirectoryNotFoundException] {
+              } catch { $preserveOwnedRoots = $true }
+            } catch { $preserveOwnedRoots = $true }
+          }
+          if ($preserveOwnedRoots) { throw "Controller work retained or unavailable; preserving all owned roots for diagnosis." }
           $cleanupComplete = $true
-          $prefixes = @{ K5_INSTALLED_WORK_OWNED = "k5-installed-work-"; K5_INSTALLED_EVIDENCE_OWNED = "k5-installed-evidence-"; K5_INSTALLED_CONTROLLER_OWNED = "k5-installed-controller-"; K5_ALPHA_LAUNCHER_OWNED = "k5-alpha-launcher-" }
-          foreach ($name in @("K5_INSTALLED_WORK_OWNED", "K5_INSTALLED_EVIDENCE_OWNED", "K5_INSTALLED_CONTROLLER_OWNED", "K5_ALPHA_LAUNCHER_OWNED")) {
+          $prefixes = @{ K5_INSTALLED_WORK_OWNED = "k5-installed-work-"; K5_INSTALLED_EVIDENCE_OWNED = "k5-installed-evidence-"; K5_INSTALLED_CONTROLLER_OWNED = "k5-installed-controller-"; K5_ALPHA_LAUNCHER_OWNED = "k5-alpha-launcher-"; K5_ALPHA_FACADE_OWNED = "k5-alpha-facades-" }
+          foreach ($name in @("K5_INSTALLED_WORK_OWNED", "K5_INSTALLED_EVIDENCE_OWNED", "K5_INSTALLED_CONTROLLER_OWNED", "K5_ALPHA_LAUNCHER_OWNED", "K5_ALPHA_FACADE_OWNED")) {
             $owned = [Environment]::GetEnvironmentVariable($name, "Process")
             if ([string]::IsNullOrWhiteSpace($owned)) { continue }
             try {
@@ -486,5 +717,23 @@ jobs:
         with:
           name: installed-alpha-start-script-witness
           path: artifacts/installed-alpha-start-script-witness.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload only validated installed facade receipt
+        if: success() && steps.safe_facade_evidence.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: installed-alpha-facades-witness
+          path: artifacts/installed-alpha-facades-witness.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Retain only validated source-free facade expectations
+        if: success() && steps.safe_facade_evidence.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: installed-alpha-facades-expectations
+          path: artifacts/installed-alpha-facades-expectations.json
           if-no-files-found: error
           retention-days: 14
