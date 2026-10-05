@@ -12,6 +12,10 @@ from collections.abc import Callable, Sequence
 from pydantic import BaseModel, ConfigDict, Field
 
 from k5vision.media.mixed_presentation import MixedPresentationStream
+from k5vision.media.viewport_client_projection import (
+    ViewportClientProjection,
+    project_viewport_layout,
+)
 from k5vision.media.viewport_geometry import ViewportLayout
 from k5vision.media.windows_operator_host import (
     BoundedWindowsOperatorHost,
@@ -92,6 +96,7 @@ class _NativeShellFailure(enum.StrEnum):
     LOAD = "load"
     CREATE = "create"
     PUMP = "pump"
+    GEOMETRY = "geometry"
     DESTROY = "destroy"
 
 
@@ -99,6 +104,10 @@ class _NativeShellError(RuntimeError):
     def __init__(self, failure: _NativeShellFailure) -> None:
         super().__init__(failure.value)
         self.failure = failure
+
+
+class _ShellRect(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_int32) for name in ("left", "top", "right", "bottom")]
 
 
 class _Win32Point(ctypes.Structure):
@@ -155,6 +164,13 @@ class _NativeShellBoundary(typing.Protocol):
     def destroy_shell(self, shell: int) -> None: ...
 
 
+@typing.runtime_checkable
+class _NativeShellGeometryBoundary(typing.Protocol):
+    def client_size(self, shell: int) -> tuple[int, int]: ...
+
+    def ensure_client_size(self, shell: int, width: int, height: int) -> tuple[int, int]: ...
+
+
 OperatorHostFactory = Callable[[int], _OperatorHostBoundary]
 
 
@@ -164,6 +180,7 @@ class _Win32OperatorShellApi:
     def __init__(self) -> None:
         if sys.platform != "win32":
             raise _NativeShellError(_NativeShellFailure.UNSUPPORTED_PLATFORM)
+        self._geometry_change_pending = False
         try:
             loader = ctypes.WinDLL
             self._user32 = loader("user32", use_last_error=True)
@@ -208,6 +225,24 @@ class _Win32OperatorShellApi:
             self._dispatch_message.argtypes = [ctypes.POINTER(_Win32Message)]
             self._dispatch_message.restype = ctypes.c_ssize_t
 
+            self._get_client_rect = self._user32.GetClientRect
+            self._get_client_rect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ShellRect)]
+            self._get_client_rect.restype = ctypes.c_int
+            self._get_window_rect = self._user32.GetWindowRect
+            self._get_window_rect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ShellRect)]
+            self._get_window_rect.restype = ctypes.c_int
+            self._is_iconic = self._user32.IsIconic
+            self._is_iconic.argtypes = [ctypes.c_void_p]
+            self._is_iconic.restype = ctypes.c_int
+            self._set_window_pos = self._user32.SetWindowPos
+            self._set_window_pos.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                *([ctypes.c_int] * 4),
+                ctypes.c_uint32,
+            ]
+            self._set_window_pos.restype = ctypes.c_int
+
             self._destroy_window = self._user32.DestroyWindow
             self._destroy_window.argtypes = [ctypes.c_void_p]
             self._destroy_window.restype = ctypes.c_int
@@ -240,6 +275,79 @@ class _Win32OperatorShellApi:
             raise _NativeShellError(_NativeShellFailure.CREATE)
         return shell
 
+    def client_size(self, shell: int) -> tuple[int, int]:
+        """Observe actual client pixels on the HWND-creating thread."""
+        rect = _ShellRect()
+        try:
+            if self._is_iconic(ctypes.c_void_p(shell)):
+                return 0, 0
+            if not self._get_client_rect(ctypes.c_void_p(shell), ctypes.byref(rect)):
+                raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+            result = rect.right - rect.left, rect.bottom - rect.top
+            if any(not 0 <= value <= _MAX_DIMENSION for value in result):
+                raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+            return result
+        except Exception:
+            raise _NativeShellError(_NativeShellFailure.GEOMETRY) from None
+
+    def ensure_client_size(self, shell: int, width: int, height: int) -> tuple[int, int]:
+        """Clamp a positive settled client once; never restore a minimized shell."""
+        try:
+            if any(
+                type(value) is not int or not 1 <= value <= _MAX_DIMENSION
+                for value in (width, height)
+            ):
+                raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+            current = self.client_size(shell)
+            if 0 in current or (current[0] >= width and current[1] >= height):
+                return current
+            outer = _ShellRect()
+            if not self._get_window_rect(ctypes.c_void_p(shell), ctypes.byref(outer)):
+                raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+            outer_width, outer_height = outer.right - outer.left, outer.bottom - outer.top
+            if outer_width < current[0] or outer_height < current[1]:
+                raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+            requested_width = outer_width + max(0, width - current[0])
+            requested_height = outer_height + max(0, height - current[1])
+            if not all(
+                1 <= value <= 2 * _MAX_DIMENSION for value in (requested_width, requested_height)
+            ):
+                raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+            if not self._set_window_pos(
+                ctypes.c_void_p(shell),
+                None,
+                0,
+                0,
+                requested_width,
+                requested_height,
+                0x0002 | 0x0004 | 0x0010,  # NOMOVE | NOZORDER | NOACTIVATE
+            ):
+                raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+            result = self.client_size(shell)
+            if 0 not in result and (result[0] < width or result[1] < height):
+                raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+            return result
+        except Exception:
+            raise _NativeShellError(_NativeShellFailure.GEOMETRY) from None
+
+    def _note_geometry_message(self, shell: int, message: _Win32Message) -> None:
+        if int(message.hwnd or 0) != shell:
+            return
+        kind, command = int(message.message), int(message.wParam)
+        if (
+            kind in {0x0005, 0x0047}  # SIZE, WINDOWPOSCHANGED when queued.
+            or (kind in {0x00A1, 0x00A3} and command in {2, *range(10, 18)})
+            or (kind == 0x0112 and command & 0xFFF0 in {0xF000, 0xF010, 0xF020, 0xF030, 0xF120})
+        ):
+            # Record intent before DispatchMessage may enter the native modal loop.
+            # A drag that returns to the same size still invalidates old input.
+            self._geometry_change_pending = True
+
+    def take_geometry_change(self) -> bool:
+        pending = getattr(self, "_geometry_change_pending", False)
+        self._geometry_change_pending = False
+        return pending
+
     def pump_messages(self, shell: int, max_messages: int) -> tuple[int, bool]:
         count = 0
         close_requested = False
@@ -254,6 +362,7 @@ class _Win32OperatorShellApi:
             ):
                 count += 1
                 hwnd = int(message.hwnd or 0)
+                self._note_geometry_message(shell, message)
                 if message.message == _WM_QUIT or (message.message == _WM_CLOSE and hwnd == shell):
                     close_requested = True
                     continue
@@ -294,6 +403,10 @@ def _default_host_factory(parent_handle: int) -> BoundedWindowsOperatorHost:
 class BoundedWindowsOperatorApplication:
     """Own one visible shell and an accepted re-entrant operator host beneath it."""
 
+    _minimum_client_width = 192
+    _minimum_client_height = 192
+    _content_top = 0
+
     def __init__(
         self,
         *,
@@ -328,7 +441,139 @@ class BoundedWindowsOperatorApplication:
         self._host_snapshot: WindowsOperatorHostSnapshot | None = None
         self._pump_cycles = 0
         self._pumped_messages = 0
+        self._reference_size = (1, 1)
+        self._logical_layout: ViewportLayout | None = None
+        self._projection: ViewportClientProjection | None = None
+        self._observed_client: tuple[int, int] | None = None
+        self._last_positive_client: tuple[int, int] | None = None
+        self._pointer_projection_suspended = False
+        self._projection_change_in_progress = False
         self._lock = asyncio.Lock()
+
+    def _observe_client(self) -> tuple[int, int] | None:
+        native, shell = self._native_api, self._shell
+        if shell is None or not isinstance(native, _NativeShellGeometryBoundary):
+            return None
+        extent = native.client_size(shell)
+        if (
+            not isinstance(extent, tuple)
+            or len(extent) != 2
+            or any(type(value) is not int or not 0 <= value <= _MAX_DIMENSION for value in extent)
+        ):
+            raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+        if 0 not in extent and (
+            extent[0] < self._minimum_client_width or extent[1] < self._minimum_client_height
+        ):
+            extent = native.ensure_client_size(
+                shell, self._minimum_client_width, self._minimum_client_height
+            )
+            if (
+                not isinstance(extent, tuple)
+                or len(extent) != 2
+                or any(
+                    type(value) is not int or not 0 <= value <= _MAX_DIMENSION for value in extent
+                )
+                or (
+                    0 not in extent
+                    and (
+                        extent[0] < self._minimum_client_width
+                        or extent[1] < self._minimum_client_height
+                    )
+                )
+            ):
+                raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+        return extent
+
+    def _projection_for(
+        self, layout: ViewportLayout, extent: tuple[int, int] | None
+    ) -> ViewportClientProjection | None:
+        if extent is None:
+            return None  # Existing injected host-only boundaries remain compatible.
+        selected = (
+            extent
+            if 0 not in extent
+            else (
+                self._last_positive_client
+                or (self._minimum_client_width, self._minimum_client_height)
+            )
+        )
+        return project_viewport_layout(
+            layout,
+            reference_width=self._reference_size[0],
+            reference_height=self._reference_size[1],
+            client_width=selected[0],
+            client_height=selected[1],
+            content_top=self._content_top,
+        )
+
+    def _invalidate_projected_pointer_input(self) -> None:
+        """Interactive variants discard stale raw input and deliver CANCEL here."""
+
+    def _begin_projection_change(
+        self,
+        projection: ViewportClientProjection | None,
+        extent: tuple[int, int] | None,
+        *,
+        force: bool = False,
+    ) -> None:
+        if force or projection != self._projection or extent != self._observed_client:
+            # Fence raw pointer input before awaiting target replacement. A separate
+            # input consumer must never reinterpret an old batch during that await.
+            self._projection_change_in_progress = True
+            self._pointer_projection_suspended = True
+            self._invalidate_projected_pointer_input()
+
+    def _accept_projection(
+        self,
+        layout: ViewportLayout,
+        projection: ViewportClientProjection | None,
+        extent: tuple[int, int] | None,
+    ) -> None:
+        changed = projection != self._projection or extent != self._observed_client
+        self._logical_layout, self._projection, self._observed_client = layout, projection, extent
+        self._pointer_projection_suspended = extent is not None and 0 in extent
+        if extent is not None and 0 not in extent:
+            self._last_positive_client = extent
+        if changed and not self._projection_change_in_progress:
+            self._invalidate_projected_pointer_input()
+        self._projection_change_in_progress = False
+
+    def _refresh_native_chrome(self) -> None:
+        refresh = getattr(self._native_api, "after_viewport_layout", None)
+        if callable(refresh):
+            refresh()
+
+    async def _refresh_client_projection(self, *, force: bool = False) -> None:
+        extent = self._observe_client()
+        if (extent == self._observed_client and not force) or self._logical_layout is None:
+            return
+        if extent is not None and 0 in extent:
+            self._begin_projection_change(self._projection, extent, force=force)
+            self._accept_projection(self._logical_layout, self._projection, extent)
+            return
+        projection = self._projection_for(self._logical_layout, extent)
+        self._begin_projection_change(projection, extent, force=force)
+        host = self._host
+        if projection != self._projection:
+            if not (
+                host is not None
+                and self._state == WindowsOperatorApplicationState.RUNNING
+                and host.snapshot.state == WindowsOperatorHostState.RUNNING
+            ):
+                # No live targets were relaid out. Keep their accepted projection,
+                # but invalidate input; a later start/replace observes the new size.
+                self._accept_projection(self._logical_layout, self._projection, extent)
+                return
+            if not isinstance(host, _RelayoutOperatorHostBoundary):
+                raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+            child = await host.relayout(
+                self._logical_layout if projection is None else projection.physical_layout
+            )
+            if child.state != WindowsOperatorHostState.RUNNING:
+                raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+            self._host_snapshot = child
+            self._refresh_native_chrome()
+        self._accept_projection(self._logical_layout, projection, extent)
 
     @property
     def snapshot(self) -> WindowsOperatorApplicationSnapshot:
@@ -446,6 +691,17 @@ class BoundedWindowsOperatorApplication:
                     WindowsOperatorApplicationErrorCode.SHELL_CREATE_FAILURE,
                     "operator application shell creation failed",
                 ) from None
+            self._reference_size = (width, height)
+            try:
+                self._observed_client = self._observe_client()
+                if self._observed_client is not None and 0 not in self._observed_client:
+                    self._last_positive_client = self._observed_client
+            except Exception:
+                await self._fail_closed()
+                raise WindowsOperatorApplicationError(
+                    WindowsOperatorApplicationErrorCode.SHELL_CREATE_FAILURE,
+                    "operator application client geometry is unavailable",
+                ) from None
             self._state = WindowsOperatorApplicationState.OPEN
             return self.snapshot
 
@@ -468,7 +724,14 @@ class BoundedWindowsOperatorApplication:
                 raise
             self._host = host
             try:
-                self._host_snapshot = await host.start(layout, streams)
+                extent = self._observe_client()
+                projection = self._projection_for(layout, extent)
+                self._begin_projection_change(projection, extent)
+                self._host_snapshot = await host.start(
+                    layout if projection is None else projection.physical_layout, streams
+                )
+                self._accept_projection(layout, projection, extent)
+                self._refresh_native_chrome()
             except asyncio.CancelledError:
                 await self._fail_closed()
                 raise
@@ -502,7 +765,14 @@ class BoundedWindowsOperatorApplication:
                     "operator application cannot replace from current state",
                 )
             try:
-                self._host_snapshot = await self._host.replace(layout, streams)
+                extent = self._observe_client()
+                projection = self._projection_for(layout, extent)
+                self._begin_projection_change(projection, extent)
+                self._host_snapshot = await self._host.replace(
+                    layout if projection is None else projection.physical_layout, streams
+                )
+                self._accept_projection(layout, projection, extent)
+                self._refresh_native_chrome()
             except asyncio.CancelledError:
                 await self._fail_closed()
                 raise
@@ -531,7 +801,14 @@ class BoundedWindowsOperatorApplication:
                     "operator application relayout boundary is unavailable",
                 )
             try:
-                child = await host.relayout(layout)
+                extent = self._observe_client()
+                projection = self._projection_for(layout, extent)
+                self._begin_projection_change(projection, extent)
+                child = await host.relayout(
+                    layout if projection is None else projection.physical_layout
+                )
+                self._accept_projection(layout, projection, extent)
+                self._refresh_native_chrome()
             except asyncio.CancelledError:
                 await self._fail_closed()
                 raise
@@ -675,6 +952,24 @@ class BoundedWindowsOperatorApplication:
                 ) from None
             self._pump_cycles += 1
             self._pumped_messages += pumped
+            if not close_requested:
+                try:
+                    # Sample actual client dimensions once after this bounded batch;
+                    # WM_SIZE can also arrive synchronously inside native dispatch.
+                    changed = getattr(native, "take_geometry_change", None)
+                    force = changed() if callable(changed) else False
+                    if type(force) is not bool:
+                        raise _NativeShellError(_NativeShellFailure.GEOMETRY)
+                    await self._refresh_client_projection(force=force)
+                except asyncio.CancelledError:
+                    await self._fail_closed()
+                    raise
+                except Exception:
+                    await self._fail_closed()
+                    raise WindowsOperatorApplicationError(
+                        WindowsOperatorApplicationErrorCode.PUMP_FAILURE,
+                        "operator application client relayout failed",
+                    ) from None
             if close_requested:
                 cleanup_failed = await self._close_host()
                 cleanup_failed = self._destroy_shell() or cleanup_failed

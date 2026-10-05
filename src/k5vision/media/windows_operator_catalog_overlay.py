@@ -92,6 +92,10 @@ class _OverlayCatalogWin32OperatorShellApi(_CatalogWin32OperatorShellApi):
             raise
         return shell
 
+    def after_viewport_layout(self) -> None:
+        """Fresh child targets must not cover the fixed command chrome."""
+        self._raise_catalog_controls()
+
     def pump_messages(self, shell: int, max_messages: int) -> tuple[int, bool]:
         self._raise_catalog_controls()
         return super().pump_messages(shell, max_messages)

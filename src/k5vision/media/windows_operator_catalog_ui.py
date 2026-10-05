@@ -253,6 +253,7 @@ class _CatalogWin32OperatorShellApi(_InteractiveWin32OperatorShellApi):
             ):
                 count += 1
                 hwnd = int(message.hwnd or 0)
+                self._note_geometry_message(shell, message)
                 if message.message == _WM_QUIT or (message.message == _WM_CLOSE and hwnd == shell):
                     self._cancel_pointer_capture(shell)
                     close_requested = True
@@ -271,6 +272,16 @@ class _CatalogWin32OperatorShellApi(_InteractiveWin32OperatorShellApi):
                 if hwnd in self._ui_handles:
                     self._translate_message(ctypes.byref(message))
                     self._dispatch_message(ctypes.byref(message))
+                    continue
+                if message.message in {
+                    _WM_LBUTTONDOWN,
+                    _WM_MOUSEMOVE,
+                    _WM_LBUTTONUP,
+                } and not self._pointer_message_for_shell(shell, message):
+                    self._translate_message(ctypes.byref(message))
+                    self._dispatch_message(ctypes.byref(message))
+                    continue
+                if self._stale_pointer_message(message):
                     continue
                 if message.message == _WM_LBUTTONDOWN:
                     self._cancel_pointer_capture(shell)
@@ -331,6 +342,12 @@ class _CatalogWin32OperatorShellApi(_InteractiveWin32OperatorShellApi):
 
 class BoundedCatalogWindowsOperatorApplication(BoundedInteractiveWindowsOperatorApplication):
     """Interactive application exposing only bounded source-free reusable-view commands."""
+
+    # Full selector chrome ends at x=600/y=32. Keep an 8px edge margin
+    # and a separate 40px strip above the minimum 192px video content.
+    _minimum_client_width = 608
+    _minimum_client_height = 232
+    _content_top = 40
 
     def _ensure_native_api(self) -> _NativeShellBoundary:
         if self._native_api is not None:
