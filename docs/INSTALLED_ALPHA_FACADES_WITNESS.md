@@ -24,9 +24,11 @@ facade, product monkeypatch, public source URI, or real camera/storage input.
 **Native qualification is pending.** Portable synthetic regression records check
 validation logic only. The process inventories and event counts for successful
 actual Test and Run have not been established by those tests. The finite limits
-(32 process births, 256 TEMP events) are fail-closed resource ceilings, not claimed
-observed success profiles. If an allocated native run exceeds a limit, review its
-source-free failure at this boundary; do not silently expand acceptance.
+are fail-closed validation policy, not observed success profiles: Test retains 32
+process births; each fresh Run has the independently bounded class policy below,
+totaling 42; TEMP retains 256 events. The shared preflight limit is unchanged.
+If an allocated native run exceeds any limit, review its source-free failure at
+this boundary; do not silently expand acceptance.
 
 This is not installation, upgrade, desktop shortcut, beta, public-RTSP, or
 person-box acceptance. The generated ball proves provider/launcher continuity,
@@ -85,12 +87,15 @@ Every image is bound by exact path and raw SHA256, then checked again after
 execution. One fixed capture actor consumes the owned Job completion port. It
 performs exactly one `OpenProcess(0x1000, False, pid)` per birth notification,
 proves membership of the exact duplicated Job handle, reads positive creation
-time, deduplicates `(pid, creation_time)`, enforces the 32-reservation bound,
-and queries the image immediately through that same handle. Only then does it
-publish a private FIFO record for the one fixed ordered admission actor.
+time, deduplicates `(pid, creation_time)`, enforces the mode-selected reservation
+bound (32 Test, 42 Run), and queries the image immediately through that same
+handle. Only then does it publish a private FIFO record for the one fixed ordered admission actor.
 
 The admission actor performs the unchanged path/class check and full raw SHA256
 for **every distinct birth**, without a state/resource lock across hashing.
+Before admission it independently enforces that class's ceiling. A third scanner,
+a 22nd console host, or any other class-cap-plus-one fails even below the total,
+regardless of order. Receipt validation independently repeats every class cap.
 There is no digest cache, pre/post-only replacement, process reopen, alternate
 process API, PID/name scan, or guessed image. Capture can proceed while an older
 birth is being hashed. A captured birth enters the accepted inventory only after
@@ -99,8 +104,10 @@ denied read, overflow or incomplete coverage still aborts only this owned Job an
 refuses acceptance. An exited or missing birth is never inferred from totals.
 
 One registry owns all reserved process handles, including queued, validating and
-failed records. At most 32 distinct reservations can coexist across all those
-states and admitted births, plus one transient capture handle. A duplicate is
+failed records. Before any image classification, the mode fixes the finite total:
+at most 32 Test or 42 Run distinct reservations can coexist across all those
+states and admitted births, plus one transient capture handle. These count
+cumulative unique births: exit never releases a reservation for reuse. A duplicate is
 closed without another reservation or hash; PID reuse with a new creation time
 is distinct. Queue image strings are bounded by the existing 32,768-character
 query buffer. The 256-notification diagnostic ceiling saturates telemetry only;
@@ -123,6 +130,65 @@ Exact Job accounting detects incompleteness and cannot replace identity evidence
 Deferred path hashing retains the existing evidence model: it is not an atomic
 attestation of bytes loaded at birth, and can widen that observation-time gap.
 The per-birth and final raw hashes are both still required.
+
+### Run-only calibration policy
+
+Each independent `run_1` or `run_2` invocation gets fresh reservations and these
+strict class ceilings. No unused allowance can be transferred between classes:
+
+| Image class | Maximum unique births |
+| --- | ---: |
+| Base Python | 3 |
+| Installed venv Python | 2 |
+| PowerShell | 1 |
+| GStreamer inspect | 9 |
+| MediaMTX | 3 |
+| GStreamer launch | 1 |
+| GStreamer plugin scanner | 2 |
+| Windows console host | 21 |
+| Unknown | 0 |
+| Total | 42 |
+
+The fixed source-role subtotal is 19: one owned relay, two installed venv launches
+(analytics preflight and CLI server) and their base-interpreter children, one
+PowerShell envelope executing Run/Start in-process, nine synthetic-source element
+probes, three MediaMTX launches (version, config validation, server), and one
+GStreamer publisher. Readiness loops poll without relaunch. The generated local
+payload-96 path skips dynamic payload probing, selects in-process direct-frame
+delivery and does not reach the standalone decoder qualifier's six inspect
+probes. Analytics uses a thread pool/OpenVINO in-process, and Uvicorn uses one
+worker. The bounded exit returns before browser launch. These source constraints
+support strict ceilings, not a claim that every successful inventory must equal
+those counts. Source-regression tests retain this route distinction and reject
+extra fixed launch sites or relaunches in the readiness loops.
+
+The scanner allowance of 2 bounds the normal availability-probe-plus-worker
+budget in the pinned GStreamer Windows loader. Warm state may need none; a third
+born scanner, including a retry/recovery worker, fails this policy. It does not
+prove scanner protocol/handshake health or exclude pre-birth helper failures,
+retry attempts that never create a process, or in-process registry fallback.
+The pinned loader can terminate a failed-handshake worker with exit code 0, so
+adding exit queries would not establish that health. This controller adds no
+native queries, helper-health fields or helper-health success claims. Actual
+frame, presentation, analytics, error and cleanup acceptance remain mandatory.
+The loader behavior is in the pinned
+[GStreamer 1.28.7 Windows plugin loader](https://github.com/GStreamer/gstreamer/blob/1.28.7/subprojects/gstreamer/gst/gstpluginloader-win32.c)
+and [registry](https://github.com/GStreamer/gstreamer/blob/1.28.7/subprojects/gstreamer/gst/gstregistry.c).
+
+The console allowance of 21 is a deliberately conservative aggregate validation
+allowance for the 21 possible non-console role slots (19 fixed + 2 scanner).
+It is **not** a proven Windows topology, an observed inventory, or a guarantee
+of one console host per process. No parent graph is inferred. Together these
+allowances define a bounded calibration policy, not a proven complete native
+process census or all-internal-helper-health acceptance.
+
+The previous Run attempt captured and hash-admitted 32 births with no pending
+validation: base Python 3, venv Python 2, PowerShell 1, inspect 9, MediaMTX 3,
+launch 1, console hosts 13 and scanners 0. Job accounting reported 33; birth 33
+hit the old total before image query and remains **unknown**. That failed prefix
+neither identifies a scanner nor justifies a maximum console count. It produced
+no facade success receipt. The new policy does not reinterpret that attempt as
+accepted or authorize retrying it with changed limits.
 
 The receipt retains observed class counts rather than asserting a guessed exact
 success inventory. Valid Test genuinely runs analytics admission, GStreamer
@@ -270,23 +336,31 @@ outside this owned generated-fixture boundary and remain separate gates.
 
 ## Failure-only phase evidence
 
-`K5_FACADE_EVIDENCE` is a separate `installed-alpha-facade-evidence-v2` diagnostic,
+`K5_FACADE_EVIDENCE` is a separate `installed-alpha-facade-evidence-v3` diagnostic,
 never a success receipt or an alternative acceptance path. Its exact typed schema
 is bounded to 8 KiB and emitted only on failure after cleanup. A live collector
 produces `not_quiescent` with no partial snapshot; diagnostic collection failure
 produces `unavailable`. Neither changes the original primary/cleanup errors.
 
-The v2 process record distinguishes captured reservations, admitted births,
-unadmitted (`pending_count`) reservations, and an active validator. A quiescent
-snapshot has no active validator. Capture and admission each retain their own
+The v3 process record retains the two-actor evidence and distinguishes captured reservations, admitted births,
+unadmitted (`pending_count`) reservations, and an active validator. `pending_count`
+is captured reservations minus admitted births, so it includes rejected or
+canceled reserved births as well as queued work; it is not the FIFO length.
+A quiescent snapshot has no active validator. Capture and admission each retain their own
 ordinal, phase and error; the first published primary error additionally freezes
 its actor/phase/ordinal. This is detection order, not proof of which birth first
 failed. Lifecycle startup/finish failures carry ordinal zero. At completion-port
 waits capture has ordinal zero; a birth's ordinal is assigned from reservations,
-not the slower admitted count. Ordinal 33 identifies an over-limit attempt.
+not the slower admitted count. Ordinal 33 identifies a Test over-limit attempt;
+ordinal 43 identifies a Run over-limit attempt. The new `class_limit` phase
+separately identifies a per-class refusal after the unchanged raw hash.
 
 Admitted classes/counts are the checked FIFO prefix. Notification and duplicate
-counts saturate at 256; captured/admitted bounds remain 32. A missing birth gets
+counts saturate at 256; captured/admitted/pending bounds are 32 for Test and 42
+for Run, with ordinals allowed through the corresponding total plus one.
+Quiescent class counts must respect the same independent per-mode caps as live
+admission and receipt validation. The v2 schema is rejected rather than silently
+reinterpreted under the changed bounds. A missing birth gets
 no image class. Both capture and admission stopped facts replace the old single
 process-reader fact. A live actor or collector yields no partial snapshot.
 Only failure diagnostics are versioned; success receipts and expectations retain

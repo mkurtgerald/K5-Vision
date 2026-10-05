@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -391,7 +392,8 @@ class NativeFacadeHarness:
     retained with that handle so PID reuse cannot change an already captured birth.
     """
 
-    def __init__(self, monkeypatch, tmp_path, *, kind="gst_launch", start=True):
+    def __init__(self, monkeypatch, tmp_path, *, kind="gst_launch", mode="test_valid", start=True):
+        self.mode = mode
         self.path = tmp_path / "private-synthetic-child.exe"
         self.path.write_bytes(b"synthetic executable contents for real per-birth hashing")
         self.real_hash = boundary.file_hash
@@ -429,7 +431,9 @@ class NativeFacadeHarness:
             self.start()
 
     def start(self):
-        self.observer = witness.FacadeProcessObserver(self.job, self.admitted, self.resources)
+        self.observer = witness.FacadeProcessObserver(
+            self.job, self.admitted, self.resources, mode=self.mode
+        )
         return self.observer
 
     def duplicate(self, current, handle, target, output, access, inherit, options):
@@ -652,8 +656,11 @@ def test_source_derived_hash_barrier_allows_later_capture_and_post_exit_admissio
         "image-native",
     ],
 )
-def test_capture_refusal_never_infers_image_or_retries(native_facade, record, error, phase, steps):
-    harness = native_facade()
+@pytest.mark.parametrize("mode", ["test_valid", "run_1"])
+def test_capture_refusal_never_infers_image_or_retries(
+    mode, native_facade, record, error, phase, steps
+):
+    harness = native_facade(mode=mode)
     harness.notify(10, **record)
     assert harness.aborted.wait(5)
     harness.finish(1)
@@ -678,10 +685,11 @@ def test_capture_refusal_never_infers_image_or_retries(native_facade, record, er
         ("permission", "access_denied"),
     ],
 )
+@pytest.mark.parametrize("mode", ["test_valid", "run_1"])
 def test_admission_failure_uses_actor_local_phase_and_real_per_birth_hash(
-    native_facade, case, error
+    mode, native_facade, case, error
 ):
-    harness = native_facade()
+    harness = native_facade(mode=mode)
     entered, release = harness.block_hash(
         2, PermissionError("private-secret") if case == "permission" else None
     )
@@ -708,8 +716,9 @@ def test_admission_failure_uses_actor_local_phase_and_real_per_birth_hash(
     assert observer.release_complete
 
 
-def test_duplicates_pending_validating_admitted_and_pid_reuse_are_bounded(native_facade):
-    harness = native_facade()
+@pytest.mark.parametrize("mode", ["test_valid", "run_1"])
+def test_duplicates_pending_validating_admitted_and_pid_reuse_are_bounded(mode, native_facade):
+    harness = native_facade(mode=mode, kind="base_python")
     entered, release = harness.block_hash()
     harness.notify(10)
     assert entered.wait(5)
@@ -735,8 +744,11 @@ def test_duplicates_pending_validating_admitted_and_pid_reuse_are_bounded(native
     assert len(harness.closed) == len(harness.handles) + 2
 
 
-def test_foreign_replacement_of_duplicate_pid_is_never_deduplicated_before_ownership(native_facade):
-    harness = native_facade()
+@pytest.mark.parametrize("mode", ["test_valid", "run_1"])
+def test_foreign_replacement_of_duplicate_pid_is_never_deduplicated_before_ownership(
+    mode, native_facade
+):
+    harness = native_facade(mode=mode)
     entered, release = harness.block_hash()
     harness.notify(10)
     assert entered.wait(5)
@@ -750,8 +762,9 @@ def test_foreign_replacement_of_duplicate_pid_is_never_deduplicated_before_owner
     assert len([call for call in harness.trace if call[0] == "image"]) == 1
 
 
-def test_32_pending_reservations_allow_only_one_transient_overflow_handle(native_facade):
-    harness = native_facade()
+@pytest.mark.parametrize("mode", ["test_invalid", "test_valid"])
+def test_32_pending_reservations_allow_only_one_transient_overflow_handle(native_facade, mode):
+    harness = native_facade(mode=mode, kind="base_python")
     entered, release = harness.block_hash()
     for pid in range(1, witness.MAX_PROCESSES + 1):
         harness.notify(pid)
@@ -927,16 +940,17 @@ def test_startup_failures_account_for_all_allocated_handles(monkeypatch, tmp_pat
         harness.cleanup()
 
 
+@pytest.mark.parametrize("mode", ["test_valid", "run_1"])
 def test_timeout_is_sticky_preserves_live_resources_and_blocks_root_cleanup(
-    native_facade, monkeypatch, tmp_path
+    mode, native_facade, monkeypatch, tmp_path
 ):
-    harness = native_facade()
+    harness = native_facade(mode=mode)
     entered, release = harness.block_hash()
     harness.notify(10)
     assert entered.wait(5)
     harness.flush_capture()
     observer = harness.observer
-    actual = witness.FacadeObservation(temp_root=tmp_path, admitted_images={}, mode="test_valid")
+    actual = witness.FacadeObservation(temp_root=tmp_path, admitted_images={}, mode=mode)
     actual.resources = harness.resources
     assert not actual.quiescent()
     # Advance only the facade controller's budget clock. Real threads and Events
@@ -961,11 +975,16 @@ def test_timeout_is_sticky_preserves_live_resources_and_blocks_root_cleanup(
         observer.finish(1)
 
 
-@pytest.mark.parametrize("expected_total", [0, 2, 33], ids=["zero", "missing-birth", "over-limit"])
+@pytest.mark.parametrize(
+    "expected_total", [0, 2, None], ids=["zero", "missing-birth", "over-limit"]
+)
+@pytest.mark.parametrize("mode", ["test_valid", "run_1"])
 def test_stopped_actors_with_unreconciled_job_total_never_become_complete(
-    native_facade, expected_total
+    mode, native_facade, expected_total
 ):
-    harness = native_facade()
+    if expected_total is None:
+        expected_total = witness.process_limit(mode) + 1
+    harness = native_facade(mode=mode)
     harness.notify(10)
     harness.flush_capture()
     # End capture after the sole event. Admission drains its FIFO before exiting.
@@ -1035,10 +1054,11 @@ def test_completion_port_rejects_unowned_or_invalid_birth_before_open(native_fac
     assert not harness.handles and not harness.hashes
 
 
+@pytest.mark.parametrize("mode", ["test_valid", "run_1"])
 def test_live_admission_lifetime_alone_blocks_execute_work_root_removal(
-    native_facade, monkeypatch, tmp_path
+    mode, native_facade, monkeypatch, tmp_path
 ):
-    harness = native_facade()
+    harness = native_facade(mode=mode)
     entered, release = harness.block_hash()
     harness.notify(10)
     assert entered.wait(5)
@@ -1050,7 +1070,7 @@ def test_live_admission_lifetime_alone_blocks_execute_work_root_removal(
     work.mkdir()
     marker = work / "owned-input"
     marker.write_bytes(b"must remain while hashing is live")
-    actual = witness.FacadeObservation(temp_root=work, admitted_images={}, mode="test_valid")
+    actual = witness.FacadeObservation(temp_root=work, admitted_images={}, mode=mode)
     actual.resources = harness.resources
     inputs = tmp_path / "input-expectations.json"
     inputs.write_bytes(common.canonical(expected(False)))
@@ -1226,7 +1246,7 @@ def fake_observation(monkeypatch, tmp_path, *, active=0, mode="test_valid"):
             calls.append("job_closed")
 
     class Processes:
-        def __init__(self, job, admitted, resources):
+        def __init__(self, job, admitted, resources, *, mode):
             self.error = "none"
             self.births = {(index, index + 1): kind for index, kind in enumerate(sorted(admitted))}
             self.thread = SimpleNamespace(is_alive=lambda: False)
@@ -1286,8 +1306,9 @@ def test_single_job_observation_closes_before_final_temp_drain(monkeypatch, tmp_
     assert calls == ["assign", "terminate", ("process_finished", 5), "job_closed", "temp_finished"]
 
 
-def test_final_observation_refuses_live_admission_before_reading_maps(monkeypatch, tmp_path):
-    actual, _ = fake_observation(monkeypatch, tmp_path)
+@pytest.mark.parametrize("mode", ["test_valid", "run_1", "run_2"])
+def test_final_observation_refuses_live_admission_before_reading_maps(monkeypatch, tmp_path, mode):
+    actual, _ = fake_observation(monkeypatch, tmp_path, mode=mode)
     actual.start()
     job = actual.job_factory()
     job.close()
@@ -1304,8 +1325,9 @@ def test_final_observation_refuses_live_admission_before_reading_maps(monkeypatc
         actual.finish()
 
 
-def test_forced_cleanup_cannot_erase_active_survivor_evidence(monkeypatch, tmp_path):
-    actual, _ = fake_observation(monkeypatch, tmp_path, active=1)
+@pytest.mark.parametrize("mode", ["test_valid", "run_1", "run_2"])
+def test_forced_cleanup_cannot_erase_active_survivor_evidence(monkeypatch, tmp_path, mode):
+    actual, _ = fake_observation(monkeypatch, tmp_path, mode=mode, active=1)
     actual.start()
     job = actual.job_factory()
     job.close()
@@ -1315,8 +1337,9 @@ def test_forced_cleanup_cannot_erase_active_survivor_evidence(monkeypatch, tmp_p
     actual.close()
 
 
-def test_observation_rechecks_each_admitted_executable_after_execution(monkeypatch, tmp_path):
-    actual, _ = fake_observation(monkeypatch, tmp_path)
+@pytest.mark.parametrize("mode", ["test_valid", "run_1", "run_2"])
+def test_observation_rechecks_each_admitted_executable_after_execution(monkeypatch, tmp_path, mode):
+    actual, _ = fake_observation(monkeypatch, tmp_path, mode=mode)
     actual.start()
     job = actual.job_factory()
     job.close()
@@ -1581,7 +1604,7 @@ def diagnostic_observation(tmp_path):
     actual = witness.FacadeObservation(temp_root=tmp_path, admitted_images={}, mode="run_1")
     quiet = SimpleNamespace(is_alive=lambda: False)
     observer = object.__new__(witness.FacadeProcessObserver)
-    observer._initialize_evidence()
+    observer._initialize_evidence("run_1")
     observer.thread, observer.error, observer.release_complete = quiet, "process_unavailable", True
     observer.admission_thread = quiet
     observer.capture_done.set()
@@ -1636,7 +1659,7 @@ def test_failure_snapshot_is_distinct_source_free_prefix_and_cached_exits(tmp_pa
     assert value["snapshot_state"] == "quiescent"
     assert value["observer"]["admitted_classes"] == ["base_python", "powershell"]
     assert value["observer"]["admitted_counts"]["unknown"] == 0
-    assert value["schema_version"] == "installed-alpha-facade-evidence-v2"
+    assert value["schema_version"] == "installed-alpha-facade-evidence-v3"
     assert value["observer"]["capture_ordinal"] == value["observer"]["failure_ordinal"] == 3
     assert value["observer"]["admission_ordinal"] == 2
     assert value["observer"]["captured_count"] == value["observer"]["admitted_count"] == 2
@@ -1804,10 +1827,10 @@ def test_bounded_stdout_evidence_never_contains_raw_output(tmp_path, raw, mode):
         (None, "mode", True),
         (None, "snapshot_state", "complete"),
         ("observer", "capture_ordinal", True),
-        ("observer", "capture_ordinal", 34),
+        ("observer", "capture_ordinal", 44),
         ("observer", "admission_ordinal", True),
-        ("observer", "failure_ordinal", 34),
-        ("observer", "captured_count", 33),
+        ("observer", "failure_ordinal", 44),
+        ("observer", "captured_count", 43),
         ("observer", "pending_count", True),
         ("observer", "pending_count", 1),
         ("observer", "admitted_count", 1),
@@ -2100,3 +2123,328 @@ def test_final_exit_collector_must_match_quiescent_collection(tmp_path):
     value["exit"]["gate_state"] = None
     with pytest.raises(ValueError):
         witness.validate_failure_evidence(value)
+
+
+# These vectors exercise the explicit policy. They are not native inventories.
+RUN_CAPS = {
+    "base_python": 3,
+    "venv_python": 2,
+    "powershell": 1,
+    "gst_inspect": 9,
+    "mediamtx": 3,
+    "gst_launch": 1,
+    "gst_scanner": 2,
+    "console_host": 21,
+    "unknown": 0,
+}
+
+
+def policy_vector():
+    return [kind for kind, cap in RUN_CAPS.items() for _ in range(cap)]
+
+
+def policy_harness(native_facade, tmp_path, mode="run_1"):
+    harness = native_facade(mode=mode, start=False)
+    harness.admitted = {}
+    for kind in witness.allowed_images(mode):
+        path = tmp_path / (kind + ".exe")
+        path.write_bytes(kind.encode())
+        harness.admitted[kind] = (path, harness.real_hash(path))
+    harness.start()
+    return harness
+
+
+def notify_vector(harness, kinds):
+    for pid, kind in enumerate(kinds, 1):
+        image = harness.admitted[kind][0] if kind in harness.admitted else "private-unknown.exe"
+        harness.notify(pid, image=image)
+
+
+def wait_admitted(harness, total):
+    observer = harness.observer
+    with observer.condition:
+        assert observer.condition.wait_for(lambda: len(observer.births) == total, 5)
+
+
+@pytest.mark.parametrize("mode", ["run_1", "run_2"])
+def test_run_policy_accepts_full_42_mix_in_observer_and_receipt(native_facade, tmp_path, mode):
+    harness = policy_harness(native_facade, tmp_path, mode)
+    notify_vector(harness, policy_vector())
+    wait_admitted(harness, 42)
+    harness.finish(42)
+    observer = harness.observer
+    assert observer.process_limit == 42 and observer.class_caps == RUN_CAPS
+    assert observer.reconciled(42) and observer.release_complete
+    assert len(harness.hashes) == len(observer.reservations) == 42
+    assert len(harness.closed) == 44
+    value = receipt()
+    observed = value[mode + "_observation"]
+    observed.update({"process_" + kind: cap for kind, cap in RUN_CAPS.items()})
+    observed["job_total"] = observed["distinct_births"] = 42
+    witness.validate_receipt(value, expected())
+    assert value["schema_version"] == "installed-alpha-facades-v1"
+    assert observed["schema_version"] == "owned-facade-observation-v1"
+
+
+@pytest.mark.parametrize("kind", sorted(RUN_CAPS))
+@pytest.mark.parametrize("order", ["first", "last"])
+def test_run_each_class_cap_plus_one_fails_below_total_in_any_order(
+    native_facade, tmp_path, kind, order
+):
+    harness = policy_harness(native_facade, tmp_path)
+    excess = [kind] * (RUN_CAPS[kind] + 1)
+    others = sorted(witness.allowed_images("run_1") - {kind})
+    kinds = excess + others if order == "first" else others + excess
+    assert len(kinds) < 42
+    notify_vector(harness, kinds)
+    assert harness.aborted.wait(5)
+    harness.finish(len(kinds))
+    observer = harness.observer
+    assert observer.primary_error == ("unexpected_process" if kind == "unknown" else "limit")
+    assert observer.failure_actor == "admission"
+    assert observer.failure_phase == ("image_admission" if kind == "unknown" else "class_limit")
+    assert list(observer.births.values()).count(kind) == RUN_CAPS[kind]
+    assert len(harness.hashes) == len(observer.births) + int(kind != "unknown")
+    assert observer.release_complete and set(harness.closed) == {456, 789, *harness.handles}
+    # Forgery must fail independently, even with consistent total and no overflow.
+    value = receipt()
+    observed = value["run_1_observation"]
+    observed["process_" + kind] = RUN_CAPS[kind] + 1
+    observed["job_total"] = observed["distinct_births"] = sum(
+        observed["process_" + item] for item in witness.PROCESS_KINDS
+    )
+    assert observed["job_total"] < 42
+    with pytest.raises(boundary.ObservationFailure):
+        witness.validate_receipt(value, expected())
+
+
+@pytest.mark.parametrize("state", ["pending", "mixed", "admitted"])
+def test_run_43rd_birth_refuses_before_image_with_all_reservation_states(
+    native_facade, tmp_path, state
+):
+    harness = policy_harness(native_facade, tmp_path)
+    blocked = {"pending": 1, "mixed": 20}.get(state)
+    if blocked:
+        entered, release = harness.block_hash(blocked)
+    notify_vector(harness, policy_vector())
+    if blocked:
+        assert entered.wait(5)
+    else:
+        wait_admitted(harness, 42)
+    harness.flush_capture()
+    observer = harness.observer
+    assert len(observer.reservations) == len(observer.handles) == 42
+    assert len(observer.births) == (blocked - 1 if blocked else 42)
+    assert len(observer.pending) + int(observer.validating is not None) + len(observer.births) == 42
+    harness.notify(43)
+    assert harness.aborted.wait(5)
+    assert len(harness.handles) == 43 and len(observer.reservations) == 42
+    assert len([call for call in harness.trace if call[0] == "image"]) == 42
+    assert observer.primary_error == "limit" and observer.failure_ordinal == 43
+    assert observer.failure_phase == "birth_limit"
+    if blocked:
+        assert harness.closed == [1042]
+        release.set()
+    harness.finish(43)
+    assert observer.release_complete and len(harness.closed) == 45
+    assert not observer.reconciled(43)
+
+
+def test_each_run_gets_fresh_immutable_limits_without_mutating_shared_preflight(
+    native_facade, monkeypatch, tmp_path
+):
+    caps_before = dict(witness.RUN_PROCESS_CAPS)
+    raw_hash = boundary.file_hash
+    observers = []
+    for mode in ("run_1", "run_2"):
+        monkeypatch.setattr(boundary, "file_hash", raw_hash)
+        harness = policy_harness(native_facade, tmp_path, mode)
+        notify_vector(harness, policy_vector())
+        wait_admitted(harness, 42)
+        harness.finish(42)
+        assert len(harness.hashes) == 42
+        observers.append(harness.observer)
+    assert observers[0].reservations is not observers[1].reservations
+    assert all(observer.reconciled(42) for observer in observers)
+    assert boundary.MAX_PROCESSES == witness.MAX_PROCESSES == 32
+    assert dict(witness.RUN_PROCESS_CAPS) == caps_before == RUN_CAPS
+    for mode in witness.MODES:
+        with pytest.raises(TypeError):
+            witness.process_caps(mode)["base_python"] = 99
+        assert witness.process_limit(mode) == (42 if mode.startswith("run_") else 32)
+
+
+@pytest.mark.parametrize("mode", sorted(witness.MODES))
+def test_failure_evidence_mode_specific_total_and_ordinal_bounds(tmp_path, mode):
+    limit = witness.process_limit(mode)
+    actual = diagnostic_observation(tmp_path)
+    observer = actual.jobs[0].observer
+    observer.births.clear()
+    observer.reservations = {index: () for index in range(limit)}
+    observer.capture_ordinal = observer.failure_ordinal = limit + 1
+    observer.admission_ordinal = limit
+    value = witness.failure_evidence(actual, mode)
+    assert value["schema_version"] == "installed-alpha-facade-evidence-v3"
+    assert value["observer"]["captured_count"] == limit
+    assert value["observer"]["pending_count"] == limit
+    assert len(common.canonical(value)) <= 8192
+    for key in ("capture_ordinal", "admission_ordinal", "failure_ordinal"):
+        bad = json.loads(common.canonical(value))
+        bad["observer"][key] = limit + 2
+        with pytest.raises(ValueError):
+            witness.validate_failure_evidence(bad)
+    for key in ("captured_count", "pending_count", "admitted_count"):
+        bad = json.loads(common.canonical(value))
+        bad["observer"][key] = limit + 1
+        with pytest.raises(ValueError):
+            witness.validate_failure_evidence(bad)
+    value["schema_version"] = "installed-alpha-facade-evidence-v2"
+    with pytest.raises(ValueError):
+        witness.validate_failure_evidence(value)
+
+
+@pytest.mark.parametrize("kind", sorted(RUN_CAPS))
+def test_failure_evidence_run_class_cap_cannot_be_bypassed_by_consistent_counts(tmp_path, kind):
+    actual = diagnostic_observation(tmp_path)
+    observer = actual.jobs[0].observer
+    observer.births = dict(enumerate(policy_vector()))
+    observer.reservations = dict(observer.births)
+    value = witness.failure_evidence(actual, "run_1")
+    assert len(common.canonical(value)) <= 8192
+    classes = [kind] * (RUN_CAPS[kind] + 1)
+    record = value["observer"]
+    record["admitted_classes"] = classes
+    record["admitted_counts"] = {item: classes.count(item) for item in witness.PROCESS_KINDS}
+    record["captured_count"] = record["admitted_count"] = len(classes)
+    record["pending_count"] = 0
+    with pytest.raises(ValueError):
+        witness.validate_failure_evidence(value)
+
+
+def test_run_role_vector_tracks_source_without_unreachable_probes_or_retries():
+    start = (ROOT / "scripts/windows-alpha/Start-K5VisionAlpha.ps1").read_text(encoding="utf-8")
+    run = (ROOT / "scripts/windows-alpha/Run-K5VisionAlpha.ps1").read_text(encoding="utf-8")
+    elements = re.search(r"foreach \(\$element in @\(([^\n]+)\)\)", start).group(1)
+    assert re.findall(r'"([^"]+)"', elements) == [
+        "videotestsrc",
+        "videoconvert",
+        "x264enc",
+        "h264parse",
+        "rtspclientsink",
+        "rtspsrc",
+        "queue",
+        "identity",
+        "fakesink",
+    ]
+    assert start.count("Test-K5GStreamerElement $element") == 1
+    assert start.count("Invoke-K5NativeProbe -Executable $gstInspect") == 1
+    assert start.count("Invoke-K5NativeProbe -Executable $mediaMtx") == 2
+    for executable in ("$mediaMtx", "$gstLaunch", "$python"):
+        assert start.count("Start-Process -FilePath " + executable + " ") == 1
+    assert start.count("$started = $child.Start()") == 2  # One preflight, one native-probe helper.
+    assert start.count("Invoke-K5AnalyticsPreflight -Python $python") == 1
+    assert '$payloadType = "96"' in start
+    assert "& $launcher -Port $Port -ExitAfterPublicTest:$ExitAfterPublicTest" in run
+    assert "Start-Process" not in run  # Start executes in the same PowerShell envelope.
+    loops = re.findall(r"foreach \(\$attempt in 1\.\.40\) \{(.*?)\n    [ }]+", start, re.S)
+    assert len(loops) == 2
+    for loop in loops:
+        assert not any(launch in loop for launch in ("Start-Process", ".Start()", "NativeProbe"))
+    assert start.index("if ($ExitAfterPublicTest) {") < start.index('Start-Process "$baseUri/docs"')
+    operator = (ROOT / "src/k5vision/operator_runtime.py").read_text(encoding="utf-8")
+    assert "delivery_factory=_local_direct_rtsp_test_delivery_factory" in operator
+    assert (
+        "if payload_type is None:\n                payload_type = await self._payload_probe"
+        in operator
+    )
+    for path in (
+        "src/k5vision/operator_runtime.py",
+        "src/k5vision/media/gstreamer_direct_frame_delivery.py",
+        "src/k5vision/media/presentation_decoder.py",
+        "src/k5vision/analytics_runtime.py",
+    ):
+        source = (ROOT / path).read_text(encoding="utf-8")
+        assert "qualify_decoder_runtime" not in source
+        assert "subprocess." not in source and "ProcessPoolExecutor" not in source
+    decoder = (ROOT / "src/k5vision/media/decoder_runtime.py").read_text(encoding="utf-8")
+    assert (
+        "elements = tuple(_inspect_element(executable, item) for item in _REQUIREMENTS)" in decoder
+    )
+    assert decoder.count("ElementRequirement(") == 6  # Separate, unreachable standalone route.
+    assert "ThreadPoolExecutor(max_workers=1" in (
+        ROOT / "src/k5vision/analytics_runtime.py"
+    ).read_text(encoding="utf-8")
+    assert "workers=1" in (ROOT / "src/k5vision/cli.py").read_text(encoding="utf-8")
+    fixed = {
+        key: cap
+        for key, cap in RUN_CAPS.items()
+        if key not in {"console_host", "gst_scanner", "unknown"}
+    }
+    assert sum(fixed.values()) == 19  # Relay + 2 venv base children + PS + 2 venv + 9 + 3 + 1.
+    assert dict(witness.RUN_PROCESS_CAPS) == RUN_CAPS and sum(RUN_CAPS.values()) == 42
+
+
+@pytest.mark.parametrize("mode", ["test_invalid", "test_valid"])
+def test_test_receipt_still_accepts_32_and_refuses_consistent_33(mode):
+    value = receipt()
+    observed = value[mode + "_observation"]
+    observed["process_console_host"] += 32 - observed["job_total"]
+    observed["job_total"] = observed["distinct_births"] = 32
+    witness.validate_receipt(value, expected())
+    observed["process_console_host"] += 1
+    observed["job_total"] = observed["distinct_births"] = 33
+    with pytest.raises(boundary.ObservationFailure, match="incomplete"):
+        witness.validate_receipt(value, expected())
+
+
+@pytest.mark.parametrize("case", ["class", "hash", "denied", "unknown", "cancel"])
+def test_emitted_quiescent_failure_retains_rejected_reservation(
+    native_facade, tmp_path, capsys, case
+):
+    harness = native_facade(mode="run_1")
+    if case in {"hash", "denied", "cancel"}:
+        entered, release = harness.block_hash(
+            2, PermissionError("private-secret") if case == "denied" else None
+        )
+    harness.notify(1)
+    harness.notify(2, **({"image": "private-unknown.exe"} if case == "unknown" else {}))
+    if case in {"hash", "denied", "cancel"}:
+        assert entered.wait(5)
+        if case == "hash":
+            harness.path.write_bytes(b"changed identity")
+        elif case == "cancel":
+            harness.observer.cancel()
+        release.set()
+    if case != "cancel":
+        assert harness.aborted.wait(5)
+    harness.finish(2)
+    observer = harness.observer
+    assert len(observer.reservations) == 2 and len(observer.births) == 1
+    assert not observer.pending and observer.validating is None
+    actual = witness.FacadeObservation(temp_root=tmp_path, admitted_images={}, mode="run_1")
+    actual.resources = harness.resources
+    actual.jobs = [harness.job]
+    for key, value in {
+        "final_total": 2,
+        "final_active": 0,
+        "accounting_observed": True,
+        "aborted": bool(harness.aborts),
+        "observer_abort_requested": bool(harness.aborts),
+        "observation_open": False,
+        "resources_closed": True,
+    }.items():
+        setattr(harness.job, key, value)
+    witness.emit_failure_evidence(actual, "run_1")
+    line = capsys.readouterr().out.strip()
+    assert line.startswith("K5_FACADE_EVIDENCE=")
+    evidence = json.loads(line.split("=", 1)[1])
+    witness.validate_failure_evidence(evidence)
+    assert evidence["schema_version"] == "installed-alpha-facade-evidence-v3"
+    assert evidence["snapshot_state"] == "quiescent"
+    assert evidence["observer"]["pending_count"] == 1  # Rejected record is no longer queued.
+    assert evidence["observer"]["primary_error"] == observer.primary_error != "none"
+    assert evidence["observer"]["failure_phase"] == observer.failure_phase
+    assert evidence["observer"]["failure_ordinal"] == observer.failure_ordinal
+    assert len(line.encode("ascii")) <= 8192
+    assert "private" not in line and "changed identity" not in line
+    assert not observer.reconciled(2)

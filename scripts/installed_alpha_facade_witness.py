@@ -19,7 +19,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 _SPEC = importlib.util.spec_from_file_location(
     "_facade_alpha", Path(__file__).with_name("installed_alpha_launcher_witness.py")
@@ -43,6 +43,21 @@ PROCESS_KINDS = BASE_IMAGES | RUN_IMAGES | {"unknown"}
 # Resource ceilings, never assertions about a native success inventory.
 MAX_PROCESSES = boundary.MAX_PROCESSES
 MAX_EVENTS = boundary.MAX_EVENTS
+# Run-only calibration policy, not a proven inventory or console-parent topology.
+# Fixed source roles total 19; scanner 2 + console 21 are conservative allowances.
+RUN_PROCESS_CAPS = MappingProxyType(
+    {
+        "base_python": 3,
+        "venv_python": 2,
+        "powershell": 1,
+        "gst_inspect": 9,
+        "mediamtx": 3,
+        "gst_launch": 1,
+        "gst_scanner": 2,
+        "console_host": 21,
+        "unknown": 0,
+    }
+)
 TEMP_COUNTS = {
     "temp_" + kind + "_" + action
     for kind in boundary.TEMP_KINDS
@@ -108,6 +123,7 @@ EVIDENCE_PHASES = {
     "job_membership",
     "process_times",
     "birth_limit",
+    "class_limit",
     "image_query",
     "image_admission",
     "duplicate_birth",
@@ -174,7 +190,7 @@ def validate_failure_evidence(value):
     evidence_fields(value, EVIDENCE_PARTS | {"schema_version", "mode", "snapshot_state"})
     evidence_need(
         type(value["schema_version"]) is str
-        and value["schema_version"] == "installed-alpha-facade-evidence-v2"
+        and value["schema_version"] == "installed-alpha-facade-evidence-v3"
     )
     evidence_need(type(value["mode"]) is str and value["mode"] in MODES)
     evidence_need(
@@ -184,6 +200,8 @@ def validate_failure_evidence(value):
     if value["snapshot_state"] != "quiescent":
         evidence_need(all(value[key] is None for key in EVIDENCE_PARTS))
         return
+    limit = process_limit(value["mode"])
+    caps = process_caps(value["mode"])
     observer = value["observer"]
     if observer is not None:
         evidence_fields(
@@ -212,9 +230,9 @@ def validate_failure_evidence(value):
             },
         )
         for key in ("capture_ordinal", "admission_ordinal", "failure_ordinal"):
-            evidence_integer(observer[key], MAX_PROCESSES + 1)
+            evidence_integer(observer[key], limit + 1)
         for key in ("captured_count", "pending_count", "admitted_count"):
-            evidence_integer(observer[key], MAX_PROCESSES)
+            evidence_integer(observer[key], limit)
         evidence_integer(observer["validating_count"], 1)
         evidence_need(observer["validating_count"] == 0)
         evidence_need(
@@ -228,7 +246,7 @@ def validate_failure_evidence(value):
         for key in ("error", "primary_error", "cleanup_error", "capture_error", "admission_error"):
             evidence_need(type(observer[key]) is str and observer[key] in boundary.ERRORS)
         classes = observer["admitted_classes"]
-        evidence_need(type(classes) is list and len(classes) <= MAX_PROCESSES)
+        evidence_need(type(classes) is list and len(classes) <= limit)
         evidence_need(observer["admitted_count"] == len(classes))
         evidence_need(
             observer["captured_count"] == observer["pending_count"] + observer["admitted_count"]
@@ -239,7 +257,7 @@ def validate_failure_evidence(value):
         evidence_fields(observer["admitted_counts"], PROCESS_KINDS)
         for kind in PROCESS_KINDS:
             count = observer["admitted_counts"][kind]
-            evidence_integer(count, MAX_PROCESSES)
+            evidence_integer(count, caps[kind])
             evidence_need(count == classes.count(kind))
     job = value["job"]
     if job is not None:
@@ -326,7 +344,7 @@ def exit_evidence(owned, relay_exit_code):
 
 def failure_evidence(observation, mode):
     value = {
-        "schema_version": "installed-alpha-facade-evidence-v2",
+        "schema_version": "installed-alpha-facade-evidence-v3",
         "mode": mode,
         "snapshot_state": "not_quiescent",
         **dict.fromkeys(EVIDENCE_PARTS),
@@ -415,7 +433,7 @@ def emit_failure_evidence(observation, mode):
         validate_failure_evidence(value)
     except BaseException:
         value = {
-            "schema_version": "installed-alpha-facade-evidence-v2",
+            "schema_version": "installed-alpha-facade-evidence-v3",
             "mode": mode,
             "snapshot_state": "unavailable",
             **dict.fromkeys(EVIDENCE_PARTS),
@@ -434,6 +452,20 @@ def allowed_images(mode: str) -> set[str]:
     if mode == "test_valid":
         return BASE_IMAGES | {"gst_launch"}
     return BASE_IMAGES | RUN_IMAGES
+
+
+def process_caps(mode: str):
+    allowed = allowed_images(mode)
+    if mode.startswith("run_"):
+        return RUN_PROCESS_CAPS
+    return MappingProxyType(
+        {kind: MAX_PROCESSES if kind in allowed else 0 for kind in PROCESS_KINDS}
+    )
+
+
+def process_limit(mode: str) -> int:
+    caps = process_caps(mode)
+    return sum(caps.values()) if mode.startswith("run_") else MAX_PROCESSES
 
 
 def validate_expectations(value: object, *, installed=True) -> dict[str, str]:
@@ -466,11 +498,15 @@ def validate_observation(value: object, mode: str) -> None:
     for key in OBS_BOOLEANS:
         need(value[key] is True, "incomplete")
     total = value["job_total"]
-    need(0 < total <= MAX_PROCESSES and value["distinct_births"] == total, "incomplete")
+    need(0 < total <= process_limit(mode) and value["distinct_births"] == total, "incomplete")
     need(value["job_active"] == 0, "cleanup_incomplete")
     need(sum(value["process_" + kind] for kind in PROCESS_KINDS) == total, "incomplete")
     need(
         all(value["process_" + kind] == 0 for kind in PROCESS_KINDS - allowed), "unexpected_process"
+    )
+    need(
+        all(value["process_" + kind] <= cap for kind, cap in process_caps(mode).items()),
+        "limit",
     )
     need(all(value["process_" + kind] > 0 for kind in BASE_IMAGES - {"console_host"}), "incomplete")
     if mode == "test_valid":
@@ -543,17 +579,17 @@ class FacadeProcessObserver:
     """One prompt capture actor and one ordered, per-birth hash admission actor.
 
     Every reserved handle stays in one registry until both actors stop using it.
-    The queue is private, bounded by the unchanged distinct-birth ceiling, and
+    The queue is private, bounded by the selected mode's finite distinct-birth ceiling, and
     never locked across hashing. Faster capture is not a native timing guarantee.
     """
 
-    def __init__(self, job, admitted, resources):
+    def __init__(self, job, admitted, resources, *, mode):
         from ctypes import wintypes as w
 
         class Association(ctypes.Structure):
             _fields_ = [("key", ctypes.c_void_p), ("port", w.HANDLE)]
 
-        self._initialize_evidence()
+        self._initialize_evidence(mode)
         self.job, self.admitted, self.api = job, admitted, boundary.api()
         self.thread = threading.Thread(target=self._read, daemon=True)
         self.admission_thread = threading.Thread(target=self._admit, daemon=True)
@@ -599,7 +635,10 @@ class FacadeProcessObserver:
             self._release()
             raise
 
-    def _initialize_evidence(self):
+    def _initialize_evidence(self, mode):
+        # Freeze the applicable limits before any capture/classification starts.
+        self.class_caps = process_caps(mode)
+        self.process_limit = process_limit(mode)
         self.notification_count = self.duplicate_count = 0
         self.capture_ordinal = self.admission_ordinal = self.failure_ordinal = 0
         self.capture_phase = self.admission_phase = self.failure_phase = "not_started"
@@ -670,7 +709,7 @@ class FacadeProcessObserver:
     def _observe(self, pid):
         with self.condition:
             self.notification_count = min(MAX_EVENTS, self.notification_count + 1)
-            self.capture_ordinal = min(MAX_PROCESSES + 1, len(self.reservations) + 1)
+            self.capture_ordinal = min(self.process_limit + 1, len(self.reservations) + 1)
         try:
             self._observe_birth(pid)
         except BaseException as error:
@@ -709,7 +748,7 @@ class FacadeProcessObserver:
                     self.capture_phase = "duplicate_birth"
                     return
                 self.capture_phase = "birth_limit"
-                need(len(self.reservations) < MAX_PROCESSES, "limit")
+                need(len(self.reservations) < self.process_limit, "limit")
             self.capture_phase = "image_query"
             buffer, count = ctypes.create_unicode_buffer(32768), w.DWORD(32768)
             boundary.native_need(
@@ -748,6 +787,11 @@ class FacadeProcessObserver:
         need(kind in self.admitted and kind != "unknown", "unexpected_process")
         with self.condition:
             if not self.stop.is_set():
+                self.admission_phase = "class_limit"
+                need(
+                    sum(item == kind for item in self.births.values()) < self.class_caps[kind],
+                    "limit",
+                )
                 self.births[key] = kind
                 self.admission_phase = "admitted_birth"
             self.condition.notify_all()
@@ -838,7 +882,7 @@ class FacadeProcessObserver:
     def reconciled(self, expected_total):
         return (
             self.error == "none"
-            and 0 < expected_total <= MAX_PROCESSES
+            and 0 < expected_total <= self.process_limit
             and len(self.reservations) == len(self.births) == expected_total
             and not self.pending
             and self.validating is None
@@ -958,7 +1002,7 @@ class FacadeObservation(boundary.PreflightObservation):
                 observation.jobs.append(self)
                 try:
                     self.observer = FacadeProcessObserver(
-                        self, observation.admitted, observation.resources
+                        self, observation.admitted, observation.resources, mode=observation.mode
                     )
                     need(observation.watcher.error == "none", observation.watcher.error)
                 except BaseException:

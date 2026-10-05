@@ -46,7 +46,10 @@ def test_windows_facade_process_observer_real_owned_births(tmp_path, monkeypatch
             jobs.append(self)
             try:
                 self.observer = witness.FacadeProcessObserver(
-                    self, {"base_python": (base, common.file_hash(base))}, resources
+                    self,
+                    {"base_python": (base, common.file_hash(base))},
+                    resources,
+                    mode="test_valid",
                 )
             except BaseException:
                 super().close()
@@ -88,6 +91,7 @@ def test_windows_facade_process_observer_real_owned_births(tmp_path, monkeypatch
         observed = owned.job.observer
         owned.close()
         owned = None
+        assert observed.process_limit == witness.MAX_PROCESSES == 32
         assert observed.error == "none"
         assert len(observed.births) == accounting.total_processes
         assert set(observed.births.values()) == {"base_python"}
