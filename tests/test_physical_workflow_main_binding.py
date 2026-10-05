@@ -18,16 +18,27 @@ def test_physical_qualifications_remain_main_bound_except_exact_installed_candid
         text = path.read_text(encoding="utf-8")
         admission = text.split("\njobs:\n", maxsplit=1)[1].split("    runs-on:", maxsplit=1)[0]
         if path == _INSTALLED_CANDIDATE:
+            admission = text.split("\n  installed-analytics-candidate:\n", 1)[1].split(
+                "    runs-on:", 1
+            )[0]
+            assert "needs: hosted_admission" in admission
+            assert "needs.hosted_admission.result == 'success'" in admission
+            assert "needs.hosted_admission.outputs.qualified_sha == github.sha" in admission
             assert "github.repository == 'mkurtgerald/K5-Vision'" in admission
             assert (
                 "github.ref == 'refs/heads/feat/installed-analytics-operator-20261003'" in admission
             )
-            events = text.split("\non:\n", maxsplit=1)[1].split("\nconcurrency:", maxsplit=1)[0]
+            events = text.split("\non:\n", maxsplit=1)[1].split("\npermissions:", maxsplit=1)[0]
             assert (
                 "  push:\n    branches:\n      - feat/installed-analytics-operator-20261003\n"
-                "      - feat/alpha-analytics-preflight-20261004\n    paths:\n" in events
+                "      - feat/alpha-analytics-preflight-20261004\n"
+                "      - feat/installed-alpha-facade-witness-20261005\n    paths:\n" in events
             )
             assert "github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'" in admission
+            assert (
+                "github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'"
+                in admission
+            )
             for forbidden in ("pull_request:", "workflow_dispatch:", "workflow_call:"):
                 assert forbidden not in events
             assert "$head.commit.sha -cne $env:K5_EXPECTED_SHA" in text

@@ -11,9 +11,11 @@ existing Start witness's admission/materialization helpers and executes:
 3. The unmodified installed `Run-K5VisionAlpha.ps1` twice, each invoking the actual
    installed Start script for one bounded generated-ball analytics launch
 
-The product scripts, Start-v1 controller/receipt, PR319 wheel-provenance consumer,
-and native workflows are unchanged. Hosted Windows Smoke adds only trigger paths,
-portable contracts and the owned-Python observer test after runtime admission.
+The product scripts, Start-v1 controller/receipt and PR319 wheel-provenance
+consumer are unchanged. The candidate native workflow adds a separate facade
+phase after existing normal-app and Start-v1 validation. Hosted Windows Smoke
+selects portable contracts and the owned-Python observer after runtime admission;
+it does not execute the installed Test/Run controller.
 Test retains its exact qualified local
 `Invoke-K5NativeProbe`; this controller introduces no product sibling dependency.
 There is no copied facade implementation, dot-sourced replacement, AST-extracted
@@ -124,7 +126,11 @@ identities/flags/counters and four strictly typed source-free observation record
 No process IDs, paths, TEMP names, native streams, URIs, credentials, frames,
 package listings or media are published. No success receipt is written on failure.
 The admitted expectations are a separate file named
-`installed-alpha-facades-expectations.json`.
+`installed-alpha-facades-expectations.json`. Their exact schema contains only
+nonzero lowercase hexadecimal hashes, the exact revision and run nonce. After
+independent validation and owned cleanup, the workflow retains this file in a
+separate source-free artifact so receipt consumers can validate against the
+caller-held authority rather than deriving expectations from the receipt.
 
 Use the same CLI input paths as `installed_alpha_launcher_witness.py`, a fresh
 separate nonce/work root/output, and the added independently generated controller
@@ -139,7 +145,7 @@ The expectation and receipt must be from the same exact reviewed candidate.
 A source-tree change requires regenerating all candidate expectations; no current
 Start-v1 expectation or receipt should be rewritten/reinterpreted as facade proof.
 
-## Tests and deferred workflow wiring
+## Tests and native workflow wiring
 
 - `tests/test_installed_alpha_facade_witness.py`: portable contract, negative,
   identity, forged receipt, event lifecycle, ownership, missing-birth, bound,
@@ -154,29 +160,67 @@ Start-v1 expectation or receipt should be rewritten/reinterpreted as facade proo
   `k5_wheel`, `wheelhouse`, `evidence_root`, `local_appdata`, `git`, `temp_root`,
   and `work_root`; values are the already admitted existing CLI input paths
 
-Both Windows cases remain unrun in the local Linux implementation environment.
-The full native test may perform the controller's offline installation inside its
-owned root; merely selecting hosted tests must never implicitly provision it.
+The hosted owned-Python check is a low-level observer qualification, not actual
+Test/Run evidence. The full native Test/Run witness remains pending. Neither
+Windows case was run in this local Linux workflow-wiring environment. The full
+native controller may perform its offline installation inside its owned root;
+merely selecting hosted tests must never implicitly provision that layout.
 
-Minimal native wiring, deliberately **not implemented here**:
+`.github/workflows/installed-analytics-candidate.yml` now has two jobs:
 
-1. Root reviews exact candidate, hosted selections and postmerge evidence, and
-   allocates the shared native runner without canceling another owner
-2. Preserve Start-v1 acceptance and PR319 provenance consumers unchanged
-3. After existing Start receipt validation, prepare separate facade expectations,
-   nonce and owned work root from the same independently admitted raw candidate
-4. Recheck exact head and idle host, invoke the facade controller, then recheck
-   owned-host cleanup and independently validate its distinct receipt
-5. Upload only the validated source-free facade receipt; clean only its owned
-   roots, preserving any roots blocked by live resources for bounded diagnosis
+1. A read-only `windows-latest` hosted admission job, bounded to 10 minutes with
+   an 8-minute polling budget inside its 9-minute step. It checks exact trusted
+   repository/branch/SHA and successful matching pull-request workflow runs
+2. The existing physical job, bounded to 25 minutes, requires that job's success
+   and exact `qualified_sha` output. Its first step revalidates the same hosted
+   gates and branch once, immediately before any native checkout/provisioning
 
-Current-main installed-candidate workflow does not include PR319's qualified
-hosted-before-native admission split. Reconciling that orchestration, branch/path
-admission, and runner allocation is separate root-reviewed work. Do not alter
-labels, permissions, concurrency, or infer native authorization from hosted
-selection. Facade success must not depend solely on the currently separate
-provenance storage-ACL blocker. The included hosted-only Smoke selection does not
-run the full installed facade witness or allocate the physical runner.
+Only the existing two trusted branches plus
+`feat/installed-alpha-facade-witness-20261005` are admitted. The legacy branch
+retains all five hosted gates; the launcher and facade branches require CI,
+Windows Alpha Script Smoke and PR Run Dedupe. The existing runner labels,
+contents/actions read permissions and `stage-one-operator-physical` concurrency
+identity with `cancel-in-progress: false` are unchanged. Concurrency now applies
+to the physical job so hosted waiting cannot occupy the native lane. This is not
+a cross-repository lock; publication still needs a fresh coordinated lane check.
+A matching push can automatically queue the native job once hosted checks pass.
+There is no new main, manual, reusable or pull-request native trigger.
+
+The facade branch runs the existing normal-app and Start-v1 phases first. After
+Start receipt validation, a separate preparation step takes the independently
+prepared initial Start input identities, verifies the raw-export tree again,
+adds the exact raw-export facade-controller hash and creates a new nonce. It
+never reads a success receipt for input authority. The new facade controller
+independently admits its own installed runtime identity through the unchanged
+source-isolated probe. Initial/admitted facade expectations and output have
+separate names and live outside its fresh owned work root.
+
+The workflow rechecks exact head and idle host immediately before the facade
+controller. It invokes the controller's full actual Test-invalid/Test-valid/Run-
+twice CLI, rechecks owned-host cleanup, binds every admitted identity to the
+caller-held initial expectations, and independently validates the distinct
+receipt. After successful cleanup it uploads only the validated facade receipt
+and, separately, its hash-only admitted expectations, with 14-day retention.
+No raw source, logs, paths, credentials or media are included in either artifact.
+Normal-app and Start-v1 receipts retain their separate existing validators.
+
+Outer cleanup never deletes a preserved Start or facade controller work root.
+A remaining work root, ownership mismatch or denied inspection fails closed and
+preserves all owned fixture/controller/input roots for diagnosis. Only the
+controller's own successful removal proves its collectors and Jobs drained;
+outer `Remove-Item` cannot bypass that guard. A canceled or failed prelaunch step
+can conservatively retain even an unused work root. No existing process is
+terminated or shared cache removed to force admission.
+
+Workflow regressions cover missing/failed/stale hosted outputs, trusted-branch
+admission, exact-head drift, independent hash-only preparation and validation,
+retained-work cleanup refusal, exact CLI/ordering and source-free artifact
+allowlists. Windows-only harnesses execute the actual inline PowerShell with
+mocked API responses and disposable directories, without running native media.
+They remain pending on the changed exact candidate until hosted Windows runs.
+All actual installed Test/Run qualification remains pending until a separately
+coordinated native run succeeds. No installer, upgrade, storage ACL or PR319
+provenance step/branch was imported; facade success has no storage-ACL dependency.
 
 ## Hardening applicability
 
