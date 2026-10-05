@@ -13,6 +13,7 @@ from k5vision.media.presentation_frame import PresentationVideoFrame
 from k5vision.media.viewport_dispatch import ViewportBinding
 from k5vision.media.viewport_geometry import ViewportLayout
 from k5vision.media.windows_presentation_surface import BoundedWindowsPresentationSurface
+from k5vision.media.windows_presentation_target import WindowsPresentationDeferred
 from k5vision.media.windows_viewport_layout import BoundedWindowsViewportLayout
 
 _MAX_VIEWPORTS = 64
@@ -305,6 +306,10 @@ class BoundedWindowsViewportRuntime:
             try:
                 await surface.present(frame)
                 await target_layout.present(logical_slot, surface)
+            except WindowsPresentationDeferred:
+                # The transient source frame was consumed, but no target pixels
+                # were painted. The next delivered frame checks current geometry.
+                return self.snapshot
             except asyncio.CancelledError:
                 await self._fail_closed()
                 raise

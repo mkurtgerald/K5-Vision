@@ -10,7 +10,10 @@ from collections.abc import Callable
 from pydantic import BaseModel, ConfigDict, Field
 
 from k5vision.media.viewport_geometry import ViewportLayout
-from k5vision.media.windows_presentation_target import BoundedWindowsPresentationTarget
+from k5vision.media.windows_presentation_target import (
+    BoundedWindowsPresentationTarget,
+    WindowsPresentationDeferred,
+)
 
 _MAX_TARGETS = 64
 _MAX_PRESENTATIONS = 1_000_000
@@ -248,6 +251,10 @@ class BoundedWindowsViewportLayout:
                 )
             try:
                 await target.present(surface)
+            except WindowsPresentationDeferred:
+                # Minimize/zero client extent is transient, not a failed target.
+                # Propagate to the frame-owning viewport without claiming a paint.
+                raise
             except asyncio.CancelledError:
                 await self._close_targets()
                 self._state = WindowsViewportLayoutState.FAILED
