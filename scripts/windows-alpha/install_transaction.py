@@ -38,6 +38,11 @@ WORKSPACE = ".k5-alpha-upgrade"
 LOCK = ".k5-alpha-install.lock"
 FORMAT = "k5-alpha-upgrade-v1"
 WHEELHOUSE_FORMAT = "k5-alpha-wheelhouse-v1"
+# Core METADATA includes a package's long description. The pinned Pydantic
+# 2.13.5 member is 110,178 bytes; WHEEL has no such description payload.
+# Both declared sizes and actual reads remain independently bounded.
+MAX_CORE_METADATA_BYTES = 128 * 1024
+MAX_WHEEL_METADATA_BYTES = 64 * 1024
 REQUIREMENTS_SHA256 = "1043752619f04dcfa6b58219936f1dd2c9be5497e52598ab9ff5fde026765efd"
 PAYLOAD_FILES = (
     "scripts/windows-alpha/Install-K5VisionAlpha.ps1",
@@ -542,7 +547,8 @@ class OfflineWheelhouse:
             _file_record(path, {key: record[key] for key in ("size", "sha256")})
             self.verify_metadata(path, record)
 
-    def verify_metadata(self, path: Path, record: dict) -> None:
+    def verify_metadata(self, path: Path, record: dict) -> tuple[bytes, bytes]:
+        """Admit the archive and return the exact bounded METADATA/WHEEL bytes."""
         parts = path.name[:-4].split("-")
         _admit(len(parts) in (5, 6), "wheel-filename-structure")
         _admit(bool(re.fullmatch(r"[A-Za-z0-9_]+", parts[0])), "wheel-filename-name")
@@ -621,17 +627,27 @@ class OfflineWheelhouse:
                         canonical.get("/".join(parts[:index]), True),
                         "archive-file-directory-collision",
                     )
-            metadata = []
-            for name, missing, limit in (
-                ("METADATA", "metadata-present", "metadata-size"),
-                ("WHEEL", "wheel-metadata-present", "wheel-metadata-size"),
+            metadata, raw_metadata = [], []
+            for name, missing, contract, limit in (
+                ("METADATA", "metadata-present", "metadata-size", MAX_CORE_METADATA_BYTES),
+                (
+                    "WHEEL",
+                    "wheel-metadata-present",
+                    "wheel-metadata-size",
+                    MAX_WHEEL_METADATA_BYTES,
+                ),
             ):
                 try:
                     info = archive.getinfo(prefix + name)
                 except KeyError:
                     raise OfflineAdmissionError(missing) from None
-                _admit(info.file_size <= 65536, limit, expected=65536, observed=info.file_size)
-                metadata.append(BytesParser().parsebytes(archive.read(info)))
+                _admit(info.file_size <= limit, contract, expected=limit, observed=info.file_size)
+                with archive.open(info) as stream:
+                    raw = stream.read(limit + 1)
+                _admit(len(raw) <= limit, contract, expected=limit, observed=len(raw))
+                _admit(len(raw) == info.file_size, "archive-read")
+                raw_metadata.append(raw)
+                metadata.append(BytesParser().parsebytes(raw))
             package, wheel = metadata
             names = package.get_all("Name", [])
             _admit(
@@ -683,6 +699,7 @@ class OfflineWheelhouse:
                         hashlib.sha256(content).hexdigest() == expected["sha256"],
                         "runtime-file-hash",
                     )
+            return raw_metadata[0], raw_metadata[1]
 
     def copy_to(self, destination: Path) -> None:
         self.verify_source()

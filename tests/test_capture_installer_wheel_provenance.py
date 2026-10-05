@@ -266,6 +266,54 @@ def test_generated_full_capture_retains_originals_and_independent_subset(bundle)
     assert "S-1-5-21" not in stored.read_text()
 
 
+@pytest.mark.parametrize("dependency_version", ["2.46.5", "2.46.6"])
+def test_full_capture_retains_pydantic_with_observed_metadata_size(
+    bundle, monkeypatch, dependency_version
+):
+    path = bundle.wheelhouse / "pydantic-2.13.5-py3-none-any.whl"
+    with zipfile.ZipFile(path) as archive:
+        files = {info.filename: archive.read(info) for info in archive.infolist()}
+    member = "pydantic-2.13.5.dist-info/METADATA"
+    raw = files[member] + f"Requires-Dist: pydantic-core=={dependency_version}\n\n".encode()
+    raw += b"x" * (110178 - len(raw))
+    files[member] = raw
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    bundle.expected["wheelhouse_sha256"] = bundle.tools.alpha.common.digest(
+        bundle.tools.alpha.tree_manifest(bundle.wheelhouse)
+    )
+    bundle.receipts()
+    read = zipfile.ZipFile.read
+
+    def no_metadata_reread(archive, member, *args, **kwargs):
+        name = member.filename if isinstance(member, zipfile.ZipInfo) else member
+        assert not name.endswith(("/METADATA", "/WHEEL"))
+        return read(archive, member, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", no_metadata_reread)
+    if dependency_version != "2.46.5":
+        with pytest.raises(bundle.tools.closure.ClosureError, match="dependency_version_mismatch"):
+            execute(bundle)
+        assert not bundle.storage.exists() and not bundle.args.output.exists()
+        return
+    result = execute(bundle)
+    provenance = json.loads(bundle.args.output.read_bytes())
+    record = next(record for record in provenance["wheels"] if record["name"] == "pydantic")
+    for name in ("qualified", "installer"):
+        closure = provenance["closure"][name]
+        edge = next(edge for edge in closure["dependency_edges"] if edge["source"] == "pydantic")
+        assert edge["target"] == "pydantic-core"
+        assert edge["specifier"] == "==2.46.5"
+        assert edge["active"] is True and edge["selected_version"] == "2.46.5"
+    assert record["metadata_sha256"] == capture.hashlib.sha256(raw).hexdigest()
+    retained = bundle.storage / result["bundle_key"] / record["relative_path"]
+    assert retained.read_bytes() == path.read_bytes()
+    assert provenance["closure"]["qualified"]["wheel_count"] == 36
+    assert provenance["closure"]["installer"]["wheel_count"] == 30
+    assert provenance["installer_accepted"] is False
+
+
 @pytest.mark.parametrize(
     "fault", ["source", "wheel", "missing", "extra", "revision", "receipt", "base", "pip"]
 )

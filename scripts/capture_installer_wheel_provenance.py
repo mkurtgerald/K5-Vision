@@ -400,11 +400,7 @@ def inspect_wheel(path: Path, name: str, version: str, role: str, tools, payload
     }
     inspector = object.__new__(tools.transaction.OfflineWheelhouse)
     inspector.data = {"runtime_payload": payload}
-    inspector.verify_metadata(path, record)
-    prefix = f"{parts[0]}-{parts[1]}.dist-info/"
-    with zipfile.ZipFile(path) as archive:
-        raw = archive.read(prefix + "METADATA")
-        wheel_raw = archive.read(prefix + "WHEEL")
+    raw, wheel_raw = inspector.verify_metadata(path, record)
     metadata = BytesParser().parsebytes(raw)
     requires_python = metadata.get_all("Requires-Python", [])
     require(len(requires_python) <= 1, "wheel_metadata")

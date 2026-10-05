@@ -1290,11 +1290,107 @@ def test_offline_unsupported_filename_tags_keep_admission_closed():
 
 
 @pytest.mark.parametrize(
+    "size",
+    [65537, 110178, 128 * 1024],
+    ids=["old-limit-plus-one", "observed-pydantic", "metadata-limit"],
+)
+def test_offline_core_metadata_description_has_separate_finite_budget(offline_bundle, size):
+    # Pydantic 2.13.5 has 110,178 bytes of METADATA, mostly its description.
+    # Generate the same size without incorporating third-party documentation.
+    raw = b"Metadata-Version: 2.1\nName: pydantic\nVersion: 2.13.5\n\n"
+    raw += b"x" * (size - len(raw))
+    offline_bundle.edit_wheel(
+        "pydantic", lambda files: files.update({"pydantic-2.13.5.dist-info/METADATA": raw})
+    )
+    run = Mock()
+    installer = offline_bundle.installer(run=run)
+    assert installer.offline.versions["pydantic"] == "2.13.5"
+    run.assert_not_called()
+    assert not offline_bundle.root.exists()
+
+
+def test_offline_wheel_metadata_limit_is_unchanged_and_returns_exact_bytes(offline_bundle):
+    raw = b"Wheel-Version: 1.0\nTag: py3-none-any\n\n"
+    raw += b"x" * (65536 - len(raw))
+    offline_bundle.edit_wheel(
+        "pydantic", lambda files: files.update({"pydantic-2.13.5.dist-info/WHEEL": raw})
+    )
+    wheelhouse = offline_bundle.installer().offline
+    record = next(
+        record for record in offline_bundle.data["wheels"] if record["name"] == "pydantic"
+    )
+    path = offline_bundle.wheels / record["filename"]
+    with transaction.zipfile.ZipFile(path) as archive:
+        metadata = archive.read("pydantic-2.13.5.dist-info/METADATA")
+    assert wheelhouse.verify_metadata(path, record) == (metadata, raw)
+
+
+@pytest.mark.parametrize(
+    ("member", "limit", "contract"),
+    [("METADATA", 131072, "metadata-size"), ("WHEEL", 65536, "wheel-metadata-size")],
+)
+def test_offline_metadata_rejects_actual_overflow_before_parsing(
+    offline_bundle, monkeypatch, member, limit, contract
+):
+    from io import BytesIO
+
+    record = next(
+        record for record in offline_bundle.data["wheels"] if record["name"] == "pydantic"
+    )
+    path = offline_bundle.wheels / record["filename"]
+    opened = transaction.zipfile.ZipFile.open
+    reads = []
+
+    class Overflow(BytesIO):
+        def read(self, size=-1):
+            reads.append(size)
+            assert size == limit + 1
+            return super().read(size)
+
+    def open_member(archive, info, *args, **kwargs):
+        if info.filename.endswith("/" + member):
+            # Central-directory size remains small; do not trust it to bound I/O.
+            assert info.file_size < limit
+            return Overflow(b"x" * (limit + 2))
+        return opened(archive, info, *args, **kwargs)
+
+    parser = Mock(wraps=transaction.BytesParser)
+    monkeypatch.setattr(transaction.zipfile.ZipFile, "open", open_member)
+    monkeypatch.setattr(transaction, "BytesParser", parser)
+    wheelhouse = object.__new__(transaction.OfflineWheelhouse)
+    assert_offline_contract(
+        lambda: wheelhouse.verify_metadata(path, record),
+        contract,
+        expected=limit,
+        observed=limit + 1,
+    )
+    assert reads == [limit + 1]
+    assert parser.call_count == (0 if member == "METADATA" else 1)
+
+
+def test_offline_metadata_rejects_short_read_before_parsing(offline_bundle, monkeypatch):
+    from io import BytesIO
+
+    record = next(
+        record for record in offline_bundle.data["wheels"] if record["name"] == "pydantic"
+    )
+    monkeypatch.setattr(transaction.zipfile.ZipFile, "open", lambda *args, **kwargs: BytesIO(b""))
+    parser = Mock()
+    monkeypatch.setattr(transaction, "BytesParser", parser)
+    wheelhouse = object.__new__(transaction.OfflineWheelhouse)
+    assert_offline_contract(
+        lambda: wheelhouse.verify_metadata(offline_bundle.wheels / record["filename"], record),
+        "archive-read",
+    )
+    parser.assert_not_called()
+
+
+@pytest.mark.parametrize(
     ("member", "content", "contract", "expected", "observed"),
     [
         ("METADATA", None, "metadata-present", None, None),
         ("WHEEL", None, "wheel-metadata-present", None, None),
-        ("METADATA", b"x" * 65537, "metadata-size", 65536, 65537),
+        ("METADATA", b"x" * 131073, "metadata-size", 131072, 131073),
         ("WHEEL", b"x" * 65537, "wheel-metadata-size", 65536, 65537),
         ("METADATA", b"malformed private metadata\n", "metadata-name-format", None, None),
         ("METADATA", b"Name: private-name\nVersion: 4.15.1\n", "metadata-name", None, None),
@@ -1456,11 +1552,12 @@ def test_offline_malformed_archive_has_a_fixed_refusal_without_raw_exception(off
 
 
 @pytest.mark.parametrize("error_class", [transaction.zipfile.BadZipFile, transaction.zlib.error])
+@pytest.mark.parametrize("method", ["read", "open"])
 def test_offline_archive_read_error_suppresses_external_exception_text(
-    offline_bundle, monkeypatch, error_class
+    offline_bundle, monkeypatch, error_class, method
 ):
     read = Mock(side_effect=error_class("private path and archive metadata"))
-    monkeypatch.setattr(transaction.zipfile.ZipFile, "read", read)
+    monkeypatch.setattr(transaction.zipfile.ZipFile, method, read)
     error = assert_offline_contract(offline_bundle.installer, "archive-read")
     assert error.__suppress_context__
 
@@ -1676,6 +1773,10 @@ def test_offline_metadata_ids_are_bounded_without_shrinking_payloads():
     assert all(isinstance(value, str) and 0 < len(value) <= 48 for value in ids)
     oversized = [case for case in cases if case[2] in {"metadata-size", "wheel-metadata-size"}]
     assert len(oversized) == 2
-    assert all(case[1] == b"x" * 65537 and case[3:] == (65536, 65537) for case in oversized)
+    assert [(case[0], case[3:]) for case in oversized] == [
+        ("METADATA", (131072, 131073)),
+        ("WHEEL", (65536, 65537)),
+    ]
+    assert all(case[1] == b"x" * case[4] for case in oversized)
     many_tags = next(case for case in cases if case[4] == 65)
     assert many_tags[1].count(b"Tag: py3-none-any\n") == 65
