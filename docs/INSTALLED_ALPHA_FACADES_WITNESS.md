@@ -232,3 +232,32 @@ regressions. The new native profile still needs actual Windows qualification.
 No new dependency, external source, dataset or model is introduced. Network,
 installer/upgrade/shortcut, public input, real camera and storage acceptance are
 outside this owned generated-fixture boundary and remain separate gates.
+
+## Failure-only phase evidence
+
+`K5_FACADE_EVIDENCE` is a separate `installed-alpha-facade-evidence-v1` diagnostic,
+never a success receipt or an alternative acceptance path. Its exact typed schema
+is bounded to 8 KiB and emitted only on failure after cleanup. A live collector
+produces `not_quiescent` with no partial snapshot; diagnostic collection failure
+produces `unavailable`. Neither changes the original primary/cleanup errors.
+
+The process record retains the next attempted distinct-birth ordinal, fixed
+native API/admission phase, admitted class prefix/counts, and fixed observer
+errors. Notification/duplicate counts saturate at 256; admitted births remain
+limited to 32, with ordinal 33 identifying an attempted over-limit candidate.
+An unobserved birth is not assigned any image class. Duplicate notifications do
+not add admitted births, and PID reuse still requires a distinct observed birth.
+OpenProcess remains one call with access mask 0x1000: error 87 still refuses and
+requests owned Job abort. There is no alternate lookup or new polling/retry.
+
+The diagnostic also retains pre-close Job total/active accounting when obtained,
+reader/handle-release facts, bounded existing stdout markers/milestones/counters,
+and cached relay exit plus stopped-stderr gate/child exit facts. A separately
+captured pre-observer-abort snapshot can establish that exit evidence was already
+observed before that observer's abort request only. An earlier TEMP abort or
+main cleanup termination may already have occurred; this is observation ordering,
+not independent product root cause. Missing, live or read-failed evidence cannot
+establish that a child had not previously failed; final exit after abort does not
+establish causality. An abort-request flag does not prove successful termination.
+No Popen or native handle is retained for these records, and no PID, timestamp,
+path, command line, token, username, raw stream or native exception is serialized.

@@ -407,6 +407,7 @@ def process_observer(monkeypatch, tmp_path, *, kind="gst_launch", belongs=True, 
         return True
 
     observer = object.__new__(witness.FacadeProcessObserver)
+    observer._initialize_evidence()
     observer.api = SimpleNamespace(
         OpenProcess=opened,
         IsProcessInJob=membership,
@@ -782,7 +783,11 @@ def test_primary_and_cleanup_failures_remain_distinct_source_free_diagnostics(
             images={},
             observations=registered,
         )
-    values = [json.loads(line.split("=", 1)[1]) for line in capsys.readouterr().out.splitlines()]
+    values = [
+        json.loads(line.split("=", 1)[1])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("K5_FACADE_FAILURE=")
+    ]
     assert [
         (value["stage"], value["failure_code"], value["observation_error"]) for value in values
     ] == [
@@ -875,3 +880,563 @@ def test_failed_process_construction_still_retains_stderr_collector(monkeypatch)
     with pytest.raises(common.WitnessError, match="cleanup_incomplete"):
         witness.FacadeOwnedProcess([], observation=observed)
     assert observed.collectors == [collector]
+
+
+def test_missing_birth_retains_attempt_and_native_phase(monkeypatch, tmp_path):
+    observer, calls, _, _ = process_observer(monkeypatch, tmp_path, denied=87)
+    # Production initializes before starting the inherited reader. This test's
+    # synthetic observer has no constructor/native thread.
+    initialize = getattr(observer, "_initialize_evidence", lambda: None)
+    initialize()
+    observer.births[(5, 50)] = "base_python"
+    with pytest.raises(boundary.ObservationFailure, match="process_unavailable"):
+        observer._observe(10)
+    assert observer.attempted_birth_ordinal == 2
+    assert observer.failure_phase == "open_process"
+    assert observer.primary_error == "process_unavailable"
+    assert list(observer.births.values()) == ["base_python"]
+    assert calls == [("open", 0x1000, False, 10)]
+
+
+def diagnostic_observation(tmp_path):
+    """Synthetic stopped collectors, never a native inventory qualification."""
+    actual = witness.FacadeObservation(temp_root=tmp_path, admitted_images={}, mode="run_1")
+    quiet = SimpleNamespace(is_alive=lambda: False)
+    observer = object.__new__(witness.FacadeProcessObserver)
+    observer._initialize_evidence()
+    observer.thread, observer.error, observer.release_complete = quiet, "process_unavailable", True
+    observer.attempted_birth_ordinal = 3
+    observer.notification_count = 3
+    observer.phase = observer.failure_phase = "open_process"
+    observer.primary_error = "process_unavailable"
+    observer.births = {(123456, 999999): "base_python", (234567, 888888): "powershell"}
+    actual.jobs = [
+        SimpleNamespace(
+            observer=observer,
+            final_total=3,
+            final_active=0,
+            accounting_observed=True,
+            aborted=True,
+            observer_abort_requested=True,
+            observation_open=False,
+            resources_closed=True,
+        )
+    ]
+    actual.watcher = SimpleNamespace(thread=quiet, closed=True, drain_complete=True)
+    actual.owned = SimpleNamespace(
+        stderr_summary=SimpleNamespace(
+            thread=quiet,
+            gate_state="started",
+            child_exit_code=None,
+            read_failed=False,
+        )
+    )
+    actual.relay_exit_code = 1
+    actual.stdout_summary = summary(b"K5_FACADE_FAILED\n", "run_1")
+    actual.resources = [observer, actual.watcher]
+    actual.collectors = [actual.stdout_summary, actual.owned.stderr_summary]
+    return actual
+
+
+def test_failure_snapshot_is_distinct_source_free_prefix_and_cached_exits(tmp_path):
+    actual = diagnostic_observation(tmp_path)
+    value = witness.failure_evidence(actual, "run_1")
+    witness.validate_failure_evidence(value)
+    assert value["snapshot_state"] == "quiescent"
+    assert value["observer"]["admitted_classes"] == ["base_python", "powershell"]
+    assert value["observer"]["admitted_counts"]["unknown"] == 0
+    assert value["observer"]["attempted_birth_ordinal"] == 3
+    assert value["job"]["observer_abort_requested"] is True
+    assert value["exit"]["relay_exit_code"] == 1
+    assert value["exit"]["child_exit_code"] is None
+    assert value["exit_before_observer_abort"] is None
+    assert value["stdout"]["failed"] == 1
+    assert all(item is True for item in value["collectors"].values())
+    raw = common.canonical(value)
+    assert all(secret not in raw for secret in (b"123456", b"234567", b"999999", b"888888"))
+    assert len(raw) < 8192
+    with pytest.raises((common.WitnessError, boundary.ObservationFailure)):
+        witness.validate_receipt(value, expected())
+
+
+@pytest.mark.parametrize("slot", ["process", "temp", "stdout", "stderr"])
+def test_live_reader_makes_entire_snapshot_unavailable_without_accessing_maps(tmp_path, slot):
+    actual = diagnostic_observation(tmp_path)
+    target = {
+        "process": actual.jobs[0].observer,
+        "temp": actual.watcher,
+        "stdout": actual.stdout_summary,
+        "stderr": actual.owned.stderr_summary,
+    }[slot]
+    target.thread = SimpleNamespace(is_alive=lambda: True)
+
+    # A racing map must not be touched even if other readers are already stopped.
+    class MutableBirths:
+        def values(self):
+            pytest.fail("live snapshot accessed mutable birth data")
+
+    actual.jobs[0].observer.births = MutableBirths()
+    value = witness.failure_evidence(actual, "run_1")
+    witness.validate_failure_evidence(value)
+    assert value["snapshot_state"] == "not_quiescent"
+    assert all(value[key] is None for key in witness.EVIDENCE_PARTS)
+
+
+def test_snapshot_does_not_invent_accounting_or_successful_release(tmp_path):
+    actual = diagnostic_observation(tmp_path)
+    job = actual.jobs[0]
+    job.accounting_observed = job.resources_closed = job.observer.release_complete = False
+    actual.watcher.closed = actual.watcher.drain_complete = False
+    value = witness.failure_evidence(actual, "run_1")
+    assert value["job"]["total"] is value["job"]["active_before_close"] is None
+    assert value["job"]["resources_closed"] is False
+    assert value["collectors"]["process_handles_released"] is False
+    assert value["collectors"]["temp_handles_released"] is False
+    assert value["collectors"]["temp_drain_complete"] is False
+
+
+@pytest.mark.parametrize("prior", ["none", "live", "exited", "read_failed"])
+def test_owned_abort_records_only_stopped_prior_exit_without_polling(monkeypatch, tmp_path, prior):
+    actual, calls = fake_observation(monkeypatch, tmp_path)
+    actual.start()
+    job = actual.job_factory()
+
+    class Relay:
+        returncode = 24
+
+        def poll(self):
+            pytest.fail("diagnostics must not query the process")
+
+    if prior != "none":
+        actual.owned = SimpleNamespace(
+            process=Relay(),
+            stderr_summary=SimpleNamespace(
+                thread=SimpleNamespace(is_alive=lambda: prior == "live"),
+                gate_state="exited",
+                child_exit_code=24,
+                read_failed=prior == "read_failed",
+            ),
+        )
+    job.observer.thread = threading.current_thread()
+    job.abort()
+    assert job.observer_abort_requested and job.aborted
+    assert calls == ["terminate"]
+    value = actual.exit_before_observer_abort
+    witness.validate_exit_evidence(value)
+    assert value["child_exit_code"] == (24 if prior in {"exited", "read_failed"} else None)
+    assert value["stderr_read_failed"] == (
+        prior == "read_failed" if prior in {"exited", "read_failed"} else None
+    )
+    assert value["relay_exit_code"] == (None if prior == "none" else 24)
+    # A stopped, read-failed collector is explicitly marked, never clean exit proof.
+    job.observer.thread = SimpleNamespace(is_alive=lambda: False)
+    job.close()
+    actual.close()
+
+
+def test_other_abort_source_is_not_mislabeled_as_process_observer(monkeypatch, tmp_path):
+    actual, _ = fake_observation(monkeypatch, tmp_path)
+    actual.start()
+    job = actual.job_factory()
+    job.abort()
+    assert job.aborted and not job.observer_abort_requested
+    assert actual.exit_before_observer_abort is None
+    job.close()
+    actual.close()
+
+
+@pytest.mark.parametrize("denied,error", [(5, "access_denied"), (87, "process_unavailable")])
+def test_reader_keeps_single_query_refusal_phase_and_abort(monkeypatch, tmp_path, denied, error):
+    observer, calls, _, _ = process_observer(monkeypatch, tmp_path, denied=denied)
+    aborted = []
+    observer.job = SimpleNamespace(abort=lambda: aborted.append(True))
+    observer.error, observer.stop, observer.port = "none", threading.Event(), 1
+    observer._release = lambda: None
+
+    def event(port, message, key, value, timeout):
+        assert timeout == 100
+        message._obj.value, key._obj.value, value._obj.value = 6, 1, 10
+        return True
+
+    observer.api.GetQueuedCompletionStatus = event
+    observer._read()
+    assert observer.error == observer.primary_error == error
+    assert observer.failure_phase == "open_process"
+    assert observer.attempted_birth_ordinal == observer.notification_count == 1
+    assert not observer.births and aborted == [True]
+    assert calls == [("open", 0x1000, False, 10)]
+
+
+@pytest.mark.parametrize(
+    "case,phase,error",
+    [
+        ("foreign", "job_membership", "ownership_unproven"),
+        ("unknown", "image_admission", "unexpected_process"),
+        ("overflow", "birth_limit", "limit"),
+        ("image-denied", "image_query", "access_denied"),
+        ("times-denied", "process_times", "access_denied"),
+    ],
+    ids=["foreign", "unknown", "overflow", "image-denied", "times-denied"],
+)
+def test_failed_birth_records_only_admitted_prefix(monkeypatch, tmp_path, case, phase, error):
+    observer, calls, _, _ = process_observer(
+        monkeypatch,
+        tmp_path,
+        kind="unknown" if case == "unknown" else "gst_launch",
+        belongs=case != "foreign",
+    )
+    if case == "overflow":
+        observer.births = {(i, i): "gst_launch" for i in range(witness.MAX_PROCESSES)}
+    if case in {"image-denied", "times-denied"}:
+        name = "QueryFullProcessImageNameW" if case == "image-denied" else "GetProcessTimes"
+        setattr(observer.api, name, lambda *args: False)
+        monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+    before = dict(observer.births)
+    with pytest.raises(boundary.ObservationFailure, match=error):
+        observer._observe(100)
+    assert observer.primary_error == error and observer.failure_phase == phase
+    assert observer.births == before
+    assert observer.attempted_birth_ordinal == len(before) + 1
+    assert len([call for call in calls if call[0] == "open"]) == 1
+
+
+def test_duplicate_notification_and_pid_reuse_keep_distinct_admitted_ordinals(
+    monkeypatch, tmp_path
+):
+    observer, calls, birth, _ = process_observer(monkeypatch, tmp_path)
+    observer._observe(10)
+    observer._observe(10)
+    assert observer.duplicate_count == 1 and observer.notification_count == 2
+    assert observer.attempted_birth_ordinal == 2 and len(observer.births) == 1
+    assert observer.phase == "duplicate_birth"
+    birth[0] += 1
+    observer._observe(10)
+    assert observer.attempted_birth_ordinal == 2 and len(observer.births) == 2
+    assert observer.phase == "admitted_birth"
+    assert len([call for call in calls if call[0] == "image"]) == 2
+    for _ in range(witness.MAX_EVENTS + 1):
+        observer._observe(10)
+    assert observer.duplicate_count == observer.notification_count == witness.MAX_EVENTS
+    assert len(observer.births) == 2  # Capping telemetry cannot change admission.
+
+
+def test_close_error_cannot_erase_primary_native_phase(monkeypatch, tmp_path):
+    observer, _, _, _ = process_observer(monkeypatch, tmp_path, belongs=False)
+    observer.api.CloseHandle = lambda handle: False
+    with pytest.raises(boundary.ObservationFailure, match="cleanup_incomplete"):
+        observer._observe(10)
+    assert observer.primary_error == "ownership_unproven"
+    assert observer.failure_phase == "job_membership"
+    assert observer.cleanup_error == "cleanup_incomplete"
+
+
+def test_diagnostic_state_initialized_before_inherited_reader_can_start(monkeypatch):
+    def constructor(self, *args):
+        assert self.phase == self.failure_phase == "not_started"
+        assert self.primary_error == self.cleanup_error == "none"
+        assert self.attempted_birth_ordinal == self.notification_count == self.duplicate_count == 0
+
+    monkeypatch.setattr(boundary.ProcessObserver, "__init__", constructor)
+    witness.FacadeProcessObserver(None, None, [])
+
+
+@pytest.mark.parametrize(
+    "raw,mode",
+    [
+        (b"private-token-user-name-path\n", "test_valid"),
+        (b"K5_FACADE_FAILED\n" * 4000 + b"private-secret", "run_1"),
+        (b"publisher: rtsp://private-secret@host/path\n", "run_1"),
+        (b"K5 analytics PASS: submissions=9999999, completions=1, failures=0\n", "run_1"),
+    ],
+    ids=["private-test-output", "output-flood", "private-prefix-milestone", "large-run-counter"],
+)
+def test_bounded_stdout_evidence_never_contains_raw_output(tmp_path, raw, mode):
+    actual = diagnostic_observation(tmp_path)
+    actual.stdout_summary = summary(raw, mode)
+    actual.collectors[0] = actual.stdout_summary
+    # Classes must match this mode; private output never supplies process authority.
+    value = witness.failure_evidence(actual, mode)
+    witness.validate_failure_evidence(value)
+    encoded = common.canonical(value)
+    assert b"private" not in encoded and b"secret" not in encoded and b"rtsp" not in encoded
+    assert len(encoded) < 8192
+    if mode == "test_valid" or len(raw) > 65536:
+        assert value["stdout"]["invalid"]
+    with pytest.raises(common.WitnessError):
+        actual.stdout_summary.result()
+
+
+@pytest.mark.parametrize(
+    "section,key,bad",
+    [
+        (None, "schema_version", "installed-alpha-facades-v1"),
+        (None, "mode", True),
+        (None, "snapshot_state", "complete"),
+        ("observer", "attempted_birth_ordinal", True),
+        ("observer", "attempted_birth_ordinal", 34),
+        ("observer", "notifications_capped", 257),
+        ("observer", "duplicates_capped", -1),
+        ("observer", "phase", "private-path"),
+        ("observer", "primary_error", "raw-native-error"),
+        ("observer", "admitted_classes", ["unknown"]),
+        ("job", "total", True),
+        ("job", "total", 2**32),
+        ("job", "observer_abort_requested", 1),
+        ("collectors", "stdout_stopped", 1),
+        ("stdout", "invalid", 0),
+        ("stdout", "returned", True),
+        ("stdout", "failed", 65537),
+        ("exit", "gate_state", "raw-child-error"),
+        ("exit", "child_exit_code", True),
+        ("exit", "relay_exit_code", 2**32),
+        ("exit", "stderr_read_failed", 0),
+    ],
+    ids=[
+        "schema",
+        "mode-bool",
+        "state",
+        "ordinal-bool",
+        "ordinal-overflow",
+        "count-overflow",
+        "negative-duplicate",
+        "raw-phase",
+        "raw-error",
+        "unknown-image",
+        "total-bool",
+        "total-overflow",
+        "abort-int",
+        "stopped-int",
+        "invalid-int",
+        "marker-bool",
+        "marker-overflow",
+        "raw-gate",
+        "exit-bool",
+        "exit-overflow",
+        "read-failed-int",
+    ],
+)
+def test_failure_evidence_strict_types_and_bounds(tmp_path, section, key, bad):
+    value = witness.failure_evidence(diagnostic_observation(tmp_path), "run_1")
+    target = value if section is None else value[section]
+    target[key] = bad
+    with pytest.raises(ValueError):
+        witness.validate_failure_evidence(value)
+
+
+@pytest.mark.parametrize("section", [None, "observer", "job", "collectors", "stdout", "exit"])
+@pytest.mark.parametrize("mutation", ["extra", "missing"])
+def test_failure_evidence_exact_field_sets(tmp_path, section, mutation):
+    value = witness.failure_evidence(diagnostic_observation(tmp_path), "run_1")
+    target = value if section is None else value[section]
+    if mutation == "extra":
+        target["private_path"] = "private-secret"
+    else:
+        target.pop(next(iter(target)))
+    with pytest.raises(ValueError):
+        witness.validate_failure_evidence(value)
+
+
+@pytest.mark.parametrize(
+    "section", ["admitted_counts", "test_counts", "run_markers", "start_milestones", "run_counters"]
+)
+@pytest.mark.parametrize("bad", [True, -1, "private-secret", 2**32])
+def test_nested_counter_schema_never_coerces(tmp_path, section, bad):
+    value = witness.failure_evidence(diagnostic_observation(tmp_path), "run_1")
+    owner = value["observer"] if section == "admitted_counts" else value["stdout"]
+    owner[section][next(iter(owner[section]))] = bad
+    with pytest.raises(ValueError):
+        witness.validate_failure_evidence(value)
+
+
+def test_unavailable_snapshot_never_attaches_partial_mutable_data(tmp_path):
+    value = witness.failure_evidence(diagnostic_observation(tmp_path), "run_1")
+    for state in ("not_quiescent", "unavailable"):
+        value["snapshot_state"] = state
+        with pytest.raises(ValueError):
+            witness.validate_failure_evidence(value)
+
+
+def test_diagnostic_failure_emits_fixed_unavailable_without_private_exception(
+    tmp_path, monkeypatch, capsys
+):
+    actual = diagnostic_observation(tmp_path)
+    monkeypatch.setattr(
+        witness,
+        "failure_evidence",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("private-token-user-name-path")),
+    )
+    witness.emit_failure_evidence(actual, "run_1")
+    raw = capsys.readouterr().out
+    assert "private" not in raw
+    value = json.loads(raw.split("=", 1)[1])
+    witness.validate_failure_evidence(value)
+    assert value["snapshot_state"] == "unavailable"
+    monkeypatch.setattr(
+        witness, "print", lambda *args: (_ for _ in ()).throw(OSError("private")), raising=False
+    )
+    witness.emit_failure_evidence(actual, "run_1")  # Output errors also cannot escape.
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_facade_close_retains_only_scalar_and_releases_process_lifetime(monkeypatch, failure):
+    import gc
+    import weakref
+
+    observed = SimpleNamespace(relay_exit_code=None)
+    released = []
+
+    class Process:
+        returncode = 24
+
+        def poll(self):
+            pytest.fail("diagnostic close must not query the process")
+
+        def __del__(self):
+            released.append(True)
+
+    process = Process()
+    reference = weakref.ref(process)
+    owned = object.__new__(witness.FacadeOwnedProcess)
+    owned.facade_observation, owned.process = observed, process
+    del process
+    error = common.WitnessError("cleanup_incomplete")
+
+    def close(self):
+        self.process = None
+        if failure:
+            raise error
+
+    monkeypatch.setattr(common.OwnedProcess, "close", close)
+    for _ in range(2):
+        if failure:
+            try:
+                owned.close()
+            except common.WitnessError as caught:
+                assert caught is error
+            else:
+                pytest.fail("cleanup failure was swallowed")
+        else:
+            owned.close()
+        # A caught exception's traceback can retain ordinary call locals while
+        # retained by the caller. Discard it to check persistent diagnostic state.
+        error.__traceback__ = None
+        gc.collect()
+        assert reference() is None and released == [True]
+        assert observed.relay_exit_code == 24
+        assert vars(observed) == {"relay_exit_code": 24}
+
+
+@pytest.mark.parametrize("original_code", ["child_failed", "child_timeout"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_invoke_diagnostic_error_never_changes_primary_or_cleanup_outcomes(
+    monkeypatch, tmp_path, capsys, original_code, cleanup_fails
+):
+    original = common.WitnessError(original_code)
+
+    class Observation:
+        def __init__(self, **kwargs):
+            self.started, self.jobs, self.resources = False, [], []
+
+        def start(self):
+            self.started = True
+
+        def job_factory(self):
+            return None
+
+        def close(self):
+            if cleanup_fails:
+                raise boundary.ObservationFailure("cleanup_incomplete")
+
+        def quiescent(self):
+            raise RuntimeError("private-user-token")
+
+    def launch(*args, **kwargs):
+        raise original
+
+    monkeypatch.setattr(witness, "FacadeObservation", Observation)
+    monkeypatch.setattr(witness, "FacadeOwnedProcess", launch)
+    with pytest.raises(common.WitnessError) as caught:
+        witness.invoke_facade(
+            [],
+            work=tmp_path,
+            env={"TEMP": str(tmp_path)},
+            mode="run_1",
+            expected=expected(),
+            images={},
+            observations=[],
+        )
+    assert str(caught.value) == ("cleanup_incomplete" if cleanup_fails else original_code)
+    if not cleanup_fails:
+        assert caught.value is original
+    raw = capsys.readouterr().out
+    assert "private" not in raw
+    values = [json.loads(line.split("=", 1)[1]) for line in raw.splitlines()]
+    assert values[0]["snapshot_state"] == "unavailable"
+    assert [value["stage"] for value in values[1:]] == (
+        ["run_1", "cleanup"] if cleanup_fails else []
+    )
+
+
+@pytest.mark.parametrize("mode", ["test_valid", "test_invalid"])
+def test_success_path_does_not_emit_diagnostics_or_change_receipt(monkeypatch, tmp_path, mode):
+    actual, _ = fake_observation(monkeypatch, tmp_path, mode=mode)
+    monkeypatch.setattr(witness, "FacadeObservation", lambda **kwargs: actual)
+    exit_code = 23 if mode == "test_invalid" else 0
+
+    class Owned:
+        def __init__(self, *args, **kwargs):
+            self.job = kwargs["job_factory"]()
+            self.process = SimpleNamespace(
+                stdout=io.BytesIO(test_stdout(mode)), returncode=exit_code
+            )
+            self.stderr_summary = SimpleNamespace(gate_state="exited", child_exit_code=exit_code)
+
+        def wait(self, timeout):
+            assert timeout == 60
+            if exit_code:
+                raise common.WitnessError(
+                    "child_failed",
+                    common.diagnostic(
+                        "probe_admission",
+                        gate_state="exited",
+                        child_exit_code=23,
+                        relay_exit_code=23,
+                    ),
+                )
+
+        def close(self):
+            self.job.close()
+
+    monkeypatch.setattr(witness, "FacadeOwnedProcess", Owned)
+    monkeypatch.setattr(
+        witness, "emit_failure_evidence", lambda *args: pytest.fail("success diagnostic")
+    )
+    result, record = witness.invoke_facade(
+        [],
+        work=tmp_path,
+        env={"TEMP": str(tmp_path)},
+        mode=mode,
+        expected=expected(),
+        images={},
+        observations=[],
+    )
+    assert result == {} and record == observation(mode)
+
+
+@pytest.mark.parametrize(
+    "key", ["process_stopped", "temp_stopped", "stdout_stopped", "stderr_stopped"]
+)
+def test_quiescent_schema_rejects_contradictory_live_reader(tmp_path, key):
+    value = witness.failure_evidence(diagnostic_observation(tmp_path), "run_1")
+    value["collectors"][key] = False
+    with pytest.raises(ValueError):
+        witness.validate_failure_evidence(value)
+
+
+def test_final_exit_collector_must_match_quiescent_collection(tmp_path):
+    value = witness.failure_evidence(diagnostic_observation(tmp_path), "run_1")
+    value["exit"]["stderr_stopped"] = None
+    value["exit"]["stderr_read_failed"] = None
+    value["exit"]["gate_state"] = None
+    with pytest.raises(ValueError):
+        witness.validate_failure_evidence(value)

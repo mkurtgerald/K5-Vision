@@ -98,6 +98,291 @@ FIELDS = (
 STAGES = {"admission", "build", "install", "probe", "verify", "cleanup", "complete"} | MODES
 
 
+# Failure-only evidence is separate from acceptance and contains no identities.
+EVIDENCE_PARTS = {"observer", "job", "collectors", "stdout", "exit", "exit_before_observer_abort"}
+EVIDENCE_PHASES = {
+    "not_started",
+    "open_process",
+    "job_membership",
+    "process_times",
+    "birth_limit",
+    "image_query",
+    "image_admission",
+    "duplicate_birth",
+    "admitted_birth",
+}
+TEST_MARKERS = {"admitted", "version", "pass", "revision", "gstreamer", "notice"}
+EVIDENCE_COLLECTORS = {
+    "process_stopped",
+    "process_handles_released",
+    "temp_stopped",
+    "temp_handles_released",
+    "temp_drain_complete",
+    "stdout_stopped",
+    "stderr_stopped",
+}
+
+
+def evidence_need(ok):
+    if not ok:
+        raise ValueError("invalid facade failure evidence")
+
+
+def evidence_fields(value, names):
+    evidence_need(type(value) is dict and value.keys() == names)
+
+
+def evidence_integer(value, maximum, *, nullable=False, minimum=0):
+    evidence_need(nullable and value is None or type(value) is int and minimum <= value <= maximum)
+
+
+def validate_exit_evidence(value):
+    evidence_fields(
+        value,
+        {
+            "stderr_stopped",
+            "stderr_read_failed",
+            "gate_state",
+            "child_exit_code",
+            "relay_exit_code",
+        },
+    )
+    evidence_need(value["stderr_stopped"] is None or type(value["stderr_stopped"]) is bool)
+    evidence_need(value["stderr_read_failed"] is None or type(value["stderr_read_failed"]) is bool)
+    gate = value["gate_state"]
+    evidence_need(gate is None or type(gate) is str and gate in common.GATE_STATES)
+    for key in ("child_exit_code", "relay_exit_code"):
+        evidence_integer(value[key], 2**32 - 1, nullable=True, minimum=-(2**31))
+    if value["stderr_stopped"] is not True:
+        evidence_need(
+            all(
+                value[key] is None
+                for key in ("stderr_read_failed", "gate_state", "child_exit_code")
+            )
+        )
+
+
+def validate_failure_evidence(value):
+    evidence_fields(value, EVIDENCE_PARTS | {"schema_version", "mode", "snapshot_state"})
+    evidence_need(
+        type(value["schema_version"]) is str
+        and value["schema_version"] == "installed-alpha-facade-evidence-v1"
+    )
+    evidence_need(type(value["mode"]) is str and value["mode"] in MODES)
+    evidence_need(
+        type(value["snapshot_state"]) is str
+        and value["snapshot_state"] in {"quiescent", "not_quiescent", "unavailable"}
+    )
+    if value["snapshot_state"] != "quiescent":
+        evidence_need(all(value[key] is None for key in EVIDENCE_PARTS))
+        return
+    observer = value["observer"]
+    if observer is not None:
+        evidence_fields(
+            observer,
+            {
+                "attempted_birth_ordinal",
+                "notifications_capped",
+                "duplicates_capped",
+                "phase",
+                "failure_phase",
+                "error",
+                "primary_error",
+                "cleanup_error",
+                "admitted_classes",
+                "admitted_counts",
+            },
+        )
+        evidence_integer(observer["attempted_birth_ordinal"], MAX_PROCESSES + 1)
+        for key in ("notifications_capped", "duplicates_capped"):
+            evidence_integer(observer[key], MAX_EVENTS)
+        for key in ("phase", "failure_phase"):
+            evidence_need(type(observer[key]) is str and observer[key] in EVIDENCE_PHASES)
+        for key in ("error", "primary_error", "cleanup_error"):
+            evidence_need(type(observer[key]) is str and observer[key] in boundary.ERRORS)
+        classes = observer["admitted_classes"]
+        evidence_need(type(classes) is list and len(classes) <= MAX_PROCESSES)
+        evidence_need(
+            all(type(kind) is str and kind in allowed_images(value["mode"]) for kind in classes)
+        )
+        evidence_fields(observer["admitted_counts"], PROCESS_KINDS)
+        for kind in PROCESS_KINDS:
+            count = observer["admitted_counts"][kind]
+            evidence_integer(count, MAX_PROCESSES)
+            evidence_need(count == classes.count(kind))
+    job = value["job"]
+    if job is not None:
+        evidence_fields(
+            job,
+            {
+                "total",
+                "active_before_close",
+                "aborted",
+                "observer_abort_requested",
+                "closed",
+                "resources_closed",
+            },
+        )
+        for key in ("total", "active_before_close"):
+            evidence_integer(job[key], 2**32 - 1, nullable=True)
+        for key in ("aborted", "observer_abort_requested", "closed", "resources_closed"):
+            evidence_need(type(job[key]) is bool)
+    evidence_fields(value["collectors"], EVIDENCE_COLLECTORS)
+    for key, item in value["collectors"].items():
+        evidence_need(item is None or type(item) is bool)
+        if key.endswith("_stopped"):
+            evidence_need(item is None or item is True)
+    stdout = value["stdout"]
+    if stdout is not None:
+        evidence_fields(
+            stdout,
+            {
+                "invalid",
+                "start_diagnostic_invalid",
+                "health_confirmed",
+                "operator_request_observed",
+                "returned",
+                "refused",
+                "failed",
+                "test_counts",
+                "run_markers",
+                "start_milestones",
+                "run_counters",
+            },
+        )
+        for key in (
+            "invalid",
+            "start_diagnostic_invalid",
+            "health_confirmed",
+            "operator_request_observed",
+        ):
+            evidence_need(type(stdout[key]) is bool)
+        for key in ("returned", "refused", "failed"):
+            evidence_integer(stdout[key], 65536)
+        for key, names, maximum in (
+            ("test_counts", TEST_MARKERS, 65536),
+            ("run_markers", alpha.MARKERS, 65536),
+            ("start_milestones", alpha.START_MILESTONES.keys(), 255),
+            ("run_counters", alpha.COUNTERS, 9_999_999),
+        ):
+            evidence_fields(stdout[key], names)
+            for item in stdout[key].values():
+                evidence_integer(item, maximum, nullable=key == "run_counters")
+    for key in ("exit", "exit_before_observer_abort"):
+        if value[key] is not None:
+            validate_exit_evidence(value[key])
+    if value["exit"] is not None:
+        evidence_need(value["exit"]["stderr_stopped"] is value["collectors"]["stderr_stopped"])
+    evidence_need(len(common.canonical(value)) <= 8192)
+
+
+def stopped(collector):
+    return None if collector is None else not collector.thread.is_alive()
+
+
+def exit_evidence(owned, relay_exit_code):
+    """Cached facts only; an unavailable collector never means no child failure."""
+    summary = getattr(owned, "stderr_summary", None)
+    quiet = stopped(summary)
+    return {
+        "stderr_stopped": quiet,
+        "stderr_read_failed": summary.read_failed if quiet else None,
+        "gate_state": summary.gate_state if quiet else None,
+        "child_exit_code": summary.child_exit_code if quiet else None,
+        "relay_exit_code": relay_exit_code,
+    }
+
+
+def failure_evidence(observation, mode):
+    value = {
+        "schema_version": "installed-alpha-facade-evidence-v1",
+        "mode": mode,
+        "snapshot_state": "not_quiescent",
+        **dict.fromkeys(EVIDENCE_PARTS),
+    }
+    # Never walk a live collector's mutable maps or stream state. They never restart.
+    if not observation.quiescent():
+        return value
+    value["snapshot_state"] = "quiescent"
+    job = observation.jobs[0] if len(observation.jobs) == 1 else None
+    observer = getattr(job, "observer", None)
+    watcher, stdout, owned = observation.watcher, observation.stdout_summary, observation.owned
+    if observer is not None:
+        classes = list(observer.births.values())
+        value["observer"] = {
+            "attempted_birth_ordinal": observer.attempted_birth_ordinal,
+            "notifications_capped": observer.notification_count,
+            "duplicates_capped": observer.duplicate_count,
+            "phase": observer.phase,
+            "failure_phase": observer.failure_phase,
+            "error": observer.error,
+            "primary_error": observer.primary_error,
+            "cleanup_error": observer.cleanup_error,
+            "admitted_classes": classes,
+            "admitted_counts": {kind: classes.count(kind) for kind in PROCESS_KINDS},
+        }
+    if job is not None:
+        value["job"] = {
+            "total": job.final_total if job.accounting_observed else None,
+            "active_before_close": job.final_active if job.accounting_observed else None,
+            "aborted": job.aborted,
+            "observer_abort_requested": job.observer_abort_requested,
+            "closed": not job.observation_open,
+            "resources_closed": job.resources_closed,
+        }
+    value["collectors"] = {
+        "process_stopped": stopped(observer),
+        "process_handles_released": getattr(observer, "release_complete", None),
+        "temp_stopped": stopped(watcher),
+        "temp_handles_released": getattr(watcher, "closed", None),
+        "temp_drain_complete": getattr(watcher, "drain_complete", None),
+        "stdout_stopped": stopped(stdout),
+        "stderr_stopped": stopped(getattr(owned, "stderr_summary", None)),
+    }
+    if stdout is not None:
+        value["stdout"] = {
+            **{
+                key: getattr(stdout, key)
+                for key in (
+                    "invalid",
+                    "start_diagnostic_invalid",
+                    "health_confirmed",
+                    "operator_request_observed",
+                    "returned",
+                    "refused",
+                    "failed",
+                )
+            },
+            "test_counts": dict(stdout.test_counts),
+            "run_markers": dict(stdout.counts),
+            "start_milestones": dict(stdout.start_milestones),
+            "run_counters": {key: stdout.scalars.get(key) for key in alpha.COUNTERS},
+        }
+    value["exit"] = exit_evidence(owned, observation.relay_exit_code)
+    value["exit_before_observer_abort"] = observation.exit_before_observer_abort
+    validate_failure_evidence(value)
+    return value
+
+
+def emit_failure_evidence(observation, mode):
+    # Diagnostic construction/output must not mask primary or cleanup failures.
+    try:
+        value = failure_evidence(observation, mode)
+        validate_failure_evidence(value)
+    except BaseException:
+        value = {
+            "schema_version": "installed-alpha-facade-evidence-v1",
+            "mode": mode,
+            "snapshot_state": "unavailable",
+            **dict.fromkeys(EVIDENCE_PARTS),
+        }
+    try:
+        validate_failure_evidence(value)
+        print("K5_FACADE_EVIDENCE=" + common.canonical(value).decode("ascii"))
+    except BaseException:
+        pass
+
+
 def allowed_images(mode: str) -> set[str]:
     need(type(mode) is str and mode in MODES)
     if mode == "test_invalid":
@@ -217,17 +502,49 @@ class FacadeProcessObserver(boundary.ProcessObserver):
     An unavailable short-lived birth fails closed, even if Job totals look right.
     """
 
+    def __init__(self, *args):
+        # The inherited constructor starts its reader: initialize before it does.
+        self._initialize_evidence()
+        super().__init__(*args)
+
+    def _initialize_evidence(self):
+        self.attempted_birth_ordinal = self.notification_count = self.duplicate_count = 0
+        self.phase = self.failure_phase = "not_started"
+        self.primary_error = self.cleanup_error = "none"
+
+    def _remember_primary(self, error):
+        if self.primary_error == "none":
+            self.failure_phase = self.phase
+            self.primary_error = (
+                str(error) if isinstance(error, boundary.ObservationFailure) else "native_error"
+            )
+
     def _observe(self, pid):
+        # Ordinal is the next distinct candidate, not an inferred image or PID.
+        # Repeated notifications retain the same candidate ordinal until admitted.
+        self.notification_count = min(MAX_EVENTS, self.notification_count + 1)
+        self.attempted_birth_ordinal = min(MAX_PROCESSES + 1, len(self.births) + 1)
+        try:
+            self._observe_birth(pid)
+        except BaseException as error:
+            if self.cleanup_error == "none":
+                self._remember_primary(error)
+            raise
+
+    def _observe_birth(self, pid):
         from ctypes import wintypes as w
 
+        self.phase = "open_process"
         handle = self.api.OpenProcess(0x1000, False, pid)
         boundary.native_need(handle, missing=True)
         try:
+            self.phase = "job_membership"
             belongs = w.BOOL()
             boundary.native_need(
                 self.api.IsProcessInJob(handle, self.job_query_handle, ctypes.byref(belongs))
             )
             need(bool(belongs.value), "ownership_unproven")
+            self.phase = "process_times"
             created, exited, kernel, user = (ctypes.c_uint64() for _ in range(4))
             boundary.native_need(
                 self.api.GetProcessTimes(
@@ -241,20 +558,33 @@ class FacadeProcessObserver(boundary.ProcessObserver):
             need(created.value > 0, "native_error")
             key = (pid, created.value)
             if key in self.births:
+                self.duplicate_count = min(MAX_EVENTS, self.duplicate_count + 1)
+                self.phase = "duplicate_birth"
                 return
+            self.phase = "birth_limit"
             need(len(self.births) < MAX_PROCESSES, "limit")
+            self.phase = "image_query"
             buffer, count = ctypes.create_unicode_buffer(32768), w.DWORD(32768)
             boundary.native_need(
                 self.api.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(count))
             )
+            self.phase = "image_admission"
             kind = boundary.process_class(buffer.value, self.admitted)
             need(kind in self.admitted and kind != "unknown", "unexpected_process")
             self.births[key] = kind
             self.handles.append(handle)
             handle = None
+            self.phase = "admitted_birth"
+        except BaseException as error:
+            self._remember_primary(error)
+            raise
         finally:
             if handle is not None:
-                need(bool(self.api.CloseHandle(handle)), "cleanup_incomplete")
+                try:
+                    need(bool(self.api.CloseHandle(handle)), "cleanup_incomplete")
+                except BaseException:
+                    self.cleanup_error = "cleanup_incomplete"
+                    raise
 
 
 class FacadeTempLifecycle:
@@ -305,6 +635,8 @@ class FacadeObservation(boundary.PreflightObservation):
         super().__init__(common, temp_root=temp_root, admitted_images=admitted_images)
         self.mode = mode
         self.collectors = []
+        self.owned = self.relay_exit_code = self.stdout_summary = None
+        self.exit_before_observer_abort = None
 
     def quiescent(self):
         return super().quiescent() and all(
@@ -340,6 +672,7 @@ class FacadeObservation(boundary.PreflightObservation):
                 self.resources_closed = False
                 self.observer = None
                 self.final_total = self.final_active = 0
+                self.accounting_observed = self.observer_abort_requested = False
                 observation.jobs.append(self)
                 try:
                     self.observer = FacadeProcessObserver(
@@ -353,6 +686,22 @@ class FacadeObservation(boundary.PreflightObservation):
             def abort(self):
                 with self.abort_lock:
                     self.aborted = True
+                    if (
+                        self.observer is not None
+                        and threading.current_thread() is self.observer.thread
+                    ):
+                        self.observer_abort_requested = True
+                        # Only cached exit facts; no new query, wait, or process lookup.
+                        # Failure to collect diagnostics must never prevent the abort.
+                        try:
+                            observation.exit_before_observer_abort = exit_evidence(
+                                observation.owned,
+                                getattr(
+                                    getattr(observation.owned, "process", None), "returncode", None
+                                ),
+                            )
+                        except BaseException:
+                            observation.exit_before_observer_abort = None
                     if self.observation_open:
                         self.api.TerminateJobObject(self.handle, 1)
 
@@ -377,6 +726,7 @@ class FacadeObservation(boundary.PreflightObservation):
                         state.total_processes,
                         state.active_processes,
                     )
+                    self.accounting_observed = True
                     boundary.native_need(self.api.TerminateJobObject(self.handle, 1))
                     deadline = time.monotonic() + 5
                     while self.accounting().active_processes:
@@ -556,12 +906,24 @@ class FacadeOwnedProcess(common.OwnedProcess):
     """Retain stderr collector even when base construction/assignment fails."""
 
     def __init__(self, *args, observation, **kwargs):
+        self.facade_observation = observation
+        observation.owned = self
         try:
             super().__init__(*args, **kwargs)
         finally:
             collector = getattr(self, "stderr_summary", None)
             if collector is not None:
                 observation.collectors.append(collector)
+
+    def close(self):
+        # Copy only the cached scalar after the original wait/kill/close. Do not
+        # retain Popen or extend its Windows process-handle lifetime for diagnostics.
+        process = getattr(self, "process", None)
+        try:
+            super().close()
+        finally:
+            if process is not None:
+                self.facade_observation.relay_exit_code = process.returncode
 
 
 def invoke_facade(command, *, work, env, mode, expected, images, observations):
@@ -585,6 +947,7 @@ def invoke_facade(command, *, work, env, mode, expected, images, observations):
         )
         summary = FacadeSummary(owned.process.stdout, mode, expected["revision"])
         observation.collectors.append(summary)
+        observation.stdout_summary = summary
         try:
             owned.wait(60 if mode.startswith("test_") else 150)
         except common.WitnessError as error:
@@ -637,6 +1000,12 @@ def invoke_facade(command, *, work, env, mode, expected, images, observations):
                 observation.close()
             except BaseException as error:
                 cleanup_errors.append(error)
+        if (
+            original is not None
+            or cleanup_errors
+            or any(resource.error != "none" for resource in observation.resources)
+        ):
+            emit_failure_evidence(observation, mode)
         for resource in observation.resources:
             if resource.error != "none":
                 emit_failure(mode, boundary.ObservationFailure(resource.error))

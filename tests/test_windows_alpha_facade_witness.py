@@ -70,6 +70,14 @@ def test_windows_facade_process_observer_real_owned_births(tmp_path):
         assert len(observed.births) == accounting.total_processes
         assert set(observed.births.values()) == {"base_python"}
         assert observed.release_complete
+        # Actual hosted owned-Python births qualify diagnostic initialization and
+        # collection only, never an installed facade success profile.
+        assert 0 < observed.attempted_birth_ordinal <= len(observed.births) + 1
+        assert len(observed.births) <= observed.notification_count <= witness.MAX_EVENTS
+        assert observed.primary_error == observed.cleanup_error == "none"
+        assert observed.failure_phase == "not_started"
+        assert observed.phase in {"admitted_birth", "duplicate_birth"}
+        assert observed.duplicate_count <= observed.notification_count
     finally:
         if owned is not None:
             owned.close()
