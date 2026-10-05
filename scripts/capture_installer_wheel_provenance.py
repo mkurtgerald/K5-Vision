@@ -173,6 +173,7 @@ def failure_diagnostic(error, diagnostic, tools=None):
     code, contract, error_class = "capture_refused", diagnostic.stage, "unexpected"
     expected, observed = diagnostic.expected, diagnostic.observed
     cleanup_pending, cleanup_known, field = False, False, None
+    storage_acl = None
     if isinstance(error, CaptureError):
         error_class = "capture_contract"
         if type(error.code) is str and error.code in CAPTURE_CODES:
@@ -216,6 +217,8 @@ def failure_diagnostic(error, diagnostic, tools=None):
             code = contract = error.code
         cleanup_pending = error.cleanup_pending is True
         cleanup_known = type(error.cleanup_pending) is bool
+        if code == "storage_acl":
+            storage_acl = tools.storage.bounded_acl_diagnostic(error.acl_diagnostic)
     else:
         for exception, category in (
             (FileNotFoundError, "missing_file"),
@@ -252,6 +255,7 @@ def failure_diagnostic(error, diagnostic, tools=None):
         "retention_state": diagnostic.retention_state,
         "cleanup_pending": cleanup_pending,
         "cleanup_known": cleanup_known,
+        "storage_acl": storage_acl,
         "errno": diagnostic_scalar(error.errno) if isinstance(error, OSError) else None,
         "winerror": diagnostic_scalar(getattr(error, "winerror", None))
         if isinstance(error, OSError)

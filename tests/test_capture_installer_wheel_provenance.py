@@ -623,6 +623,50 @@ def test_offline_and_storage_contract_details_are_bounded(bundle):
     assert record["code"] == "storage_identity" and record["retention_state"] == "in_progress"
 
 
+def test_storage_acl_discriminator_is_revalidated_without_claiming_retention(bundle, monkeypatch):
+    diagnostic = capture.CaptureDiagnostics()
+
+    def refuse(*args, **kwargs):
+        raise bundle.tools.storage.StorageError(
+            "storage_acl",
+            acl_diagnostic={
+                "path_role": "ancestor",
+                "path_context": "runner_workspace",
+                "ancestor_distance": 1,
+                "admission_mode": "ancestor",
+                "phase": "ace_policy",
+                "native_call": "GetNamedSecurityInfoW",
+                "native_error": "success",
+                "reason": "foreign_mutating_allow",
+                "path": "PRIVATE_CANARY",
+            },
+        )
+
+    monkeypatch.setattr(bundle.tools.storage, "derive_storage_root", refuse)
+    with pytest.raises(bundle.tools.storage.StorageError) as caught:
+        capture.capture(
+            bundle.args,
+            tools=bundle.tools,
+            storage_policy=bundle.policy,
+            identity_reader=lambda: bundle.identity,
+            diagnostics=diagnostic,
+        )
+    record = capture.failure_diagnostic(caught.value, diagnostic, bundle.tools)
+    assert record["stage"] == "storage_root" and record["retention_state"] == "not_started"
+    assert record["cleanup_known"] and not record["cleanup_pending"]
+    assert record["storage_acl"]["reason"] == "foreign_mutating_allow"
+    assert record["storage_acl"]["ancestor_distance"] == 1
+    assert not bundle.storage.exists() and not bundle.args.output.exists()
+    assert "PRIVATE_CANARY" not in json.dumps(record)
+    caught.value.acl_diagnostic.update(
+        reason="PRIVATE_CANARY", native_error="PRIVATE_CANARY", path="PRIVATE_CANARY"
+    )
+    record = capture.failure_diagnostic(caught.value, diagnostic, bundle.tools)
+    assert record["storage_acl"]["reason"] == "unknown"
+    assert record["storage_acl"]["native_error"] == "unknown"
+    assert "PRIVATE_CANARY" not in json.dumps(record)
+
+
 @pytest.mark.parametrize(
     ("exception", "category"),
     [

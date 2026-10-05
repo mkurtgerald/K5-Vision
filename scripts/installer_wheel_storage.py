@@ -71,16 +71,114 @@ _CODES = {
     "storage_interrupted",
     "storage_inventory",
 }
+_ACL_DIAGNOSTIC_ENUMS = {
+    "path_role": {
+        "runner_workspace",
+        "workspace",
+        "runner_temp",
+        "work_root",
+        "ancestor",
+        "unknown",
+    },
+    "path_context": {"runner_workspace", "workspace", "runner_temp", "work_root", "unknown"},
+    "admission_mode": {"ancestor", "owned", "existing", "unknown"},
+    "phase": {
+        "principal_query",
+        "token_owner_query",
+        "descriptor_query",
+        "trusted_installer_query",
+        "ownership_policy",
+        "ace_policy",
+        "unknown",
+    },
+    "native_call": {"GetNamedSecurityInfoW", "none", "unknown"},
+    "native_error": {
+        "success",
+        "access_denied",
+        "path_missing",
+        "invalid_parameter",
+        "insufficient_buffer",
+        "invalid_acl",
+        "invalid_security_descriptor",
+        "other_error",
+        "not_observed",
+        "unknown",
+    },
+    "reason": {
+        "foreign_mutating_allow",
+        "unsupported_ace",
+        "native_query",
+        "descriptor_parse",
+        "owner_sid_parse",
+        "descriptor_validation",
+        "unknown",
+    },
+}
+_ACL_PARSER_ERRORS = frozenset(
+    {
+        "invalid Windows identity ACL",
+        "unsupported Windows identity ACL",
+        "invalid Windows identity ACL entry",
+        "unsupported Windows identity ACL entry",
+        "unsupported Windows identity access mask",
+        "unsupported Windows security identifier",
+    }
+)
+_ACL_OWNER_ERRORS = frozenset(
+    {
+        "invalid native Windows security identifier",
+        "unsupported native Windows security identifier",
+    }
+)
+_ACL_DESCRIPTOR_ERRORS = frozenset(
+    {
+        "Windows identity ACL cannot be established",
+        "Windows identity ACL is invalid",
+    }
+)
+
+
+def bounded_acl_diagnostic(value):
+    """Project only fixed vocabulary; no paths, accounts, SIDs, ACEs or error text."""
+    if type(value) is not dict:
+        return None
+    result = {"schema_version": "storage-acl-admission-v1"}
+    for name, choices in _ACL_DIAGNOSTIC_ENUMS.items():
+        item = value.get(name)
+        result[name] = item if type(item) is str and item in choices else "unknown"
+    distance = value.get("ancestor_distance")
+    result["ancestor_distance"] = (
+        distance if type(distance) is int and 1 <= distance <= 64 else None
+    )
+    return result
+
+
+def _native_error_category(result):
+    if type(result) is not int:
+        return "unknown"
+    return {
+        0: "success",
+        2: "path_missing",
+        3: "path_missing",
+        5: "access_denied",
+        87: "invalid_parameter",
+        122: "insufficient_buffer",
+        1336: "invalid_acl",
+        1338: "invalid_security_descriptor",
+    }.get(result, "other_error")
 
 
 class StorageError(RuntimeError):
     """Only a fixed code and bounded, path-free cleanup state escape a failure."""
 
-    def __init__(self, code: str, *, cleanup_pending: bool = False) -> None:
+    def __init__(self, code: str, *, cleanup_pending: bool = False, acl_diagnostic=None) -> None:
         self.code = code if code in _CODES else "storage_io"
         self.reason_code = self.code
         self.cleanup_pending = cleanup_pending
         self.report = {"reason_code": self.code, "cleanup_pending": cleanup_pending}
+        self.acl_diagnostic = (
+            bounded_acl_diagnostic(acl_diagnostic) if self.code == "storage_acl" else None
+        )
         super().__init__(self.code)
 
 
@@ -136,16 +234,36 @@ def _path(value: Path) -> Path:
     return value
 
 
-def _checked(path: Path, policy, *, directory: bool = True, owned: bool = False):
+def _admit_path(path, policy, *, owned=False, ancestor=False, role="unknown", distance=None):
+    try:
+        policy.admit(path, owned=owned, ancestor=ancestor)
+    except StorageError as error:
+        if error.code == "storage_acl":
+            diagnostic = error.acl_diagnostic or {}
+            error.acl_diagnostic = bounded_acl_diagnostic(
+                {
+                    **diagnostic,
+                    "path_role": "ancestor" if ancestor else role,
+                    "path_context": role,
+                    "admission_mode": "ancestor" if ancestor else "owned" if owned else "existing",
+                    "ancestor_distance": distance if ancestor else None,
+                }
+            )
+        raise
+
+
+def _checked(path: Path, policy, *, directory: bool = True, owned: bool = False, role="unknown"):
     _path(path)
     policy.volume(path)
     for parent in reversed(path.parents):
         info = parent.lstat()
         _ordinary(info, directory=True)
-        policy.admit(parent, ancestor=True)
+        _admit_path(
+            parent, policy, ancestor=True, role=role, distance=len(path.parts) - len(parent.parts)
+        )
     info = path.lstat()
     _ordinary(info, directory=directory)
-    policy.admit(path, owned=owned)
+    _admit_path(path, policy, owned=owned, role=role)
     # resolve is only a comparison after refusing all links, never an admission
     # of their destinations. It also refuses Windows short-name/case aliases.
     _need(path.resolve(strict=True) == path, "storage_path")
@@ -307,26 +425,67 @@ class NativeStoragePolicy:
         except Exception:
             raise StorageError("storage_volume") from None
 
+    def _descriptor(self, path: Path, diagnostic):
+        # A per-call forwarding view observes the existing reader without changing
+        # any native/library attribute, even temporarily. Concurrent calls cannot
+        # nest observers or leave a wrapper behind. No additional query is made.
+        # GetNamedSecurityInfoW returns its error; GetLastError is not a substitute.
+        security = getattr(self._native, "security", None)
+        reader = getattr(self._native.descriptor, "__func__", None)
+        if security is None or reader is None:  # Inert injected adapters have no native method.
+            return self._native.descriptor(os.fspath(path))
+        original = security.GetNamedSecurityInfoW
+
+        def observe(*args):
+            diagnostic["native_call"] = "GetNamedSecurityInfoW"
+            result = original(*args)
+            diagnostic["native_error"] = _native_error_category(result)
+            return result
+
+        class View:
+            def __init__(self, target):
+                self.target = target
+
+            def __getattr__(self, name):
+                return getattr(self.target, name)
+
+        receiver = View(self._native)
+        receiver.security = View(security)
+        receiver.security.GetNamedSecurityInfoW = observe
+        return reader(receiver, os.fspath(path))
+
     def admit(self, path: Path, *, owned: bool = False, ancestor: bool = False) -> None:
+        diagnostic = {
+            "phase": "principal_query",
+            "native_call": "none",
+            "native_error": "not_observed",
+        }
         try:
             _need(self._native.current_user() == self.principal, "storage_ownership")
+            diagnostic["phase"] = "token_owner_query"
             _need(_token_owner(self._native) == self.default_owner, "storage_ownership")
-            owner, entries = self._native.descriptor(os.fspath(path))
+            diagnostic["phase"] = "descriptor_query"
+            owner, entries = self._descriptor(path, diagnostic)
             trusted = {self.principal, "S-1-5-18", "S-1-5-32-544"}
             if ancestor and (
                 owner == _TRUSTED_INSTALLER
                 or any(entry.sid == _TRUSTED_INSTALLER for entry in entries)
             ):
+                diagnostic["phase"] = "trusted_installer_query"
                 if self._native.trusted_installer():
                     trusted.add(_TRUSTED_INSTALLER)
+            diagnostic["phase"] = "ownership_policy"
             _need(
                 owner in {self.principal, self.default_owner} if owned else owner in trusted,
                 "storage_ownership",
             )
+            diagnostic["phase"] = "ace_policy"
             for entry in entries:
                 if entry.kind == 1:
                     continue  # A denial does not cancel an unsafe allow.
-                _need(entry.kind == 0, "storage_acl")
+                if entry.kind != 0:
+                    diagnostic["reason"] = "unsupported_ace"
+                    raise StorageError("storage_acl")
                 if ancestor and entry.flags & 0x08:
                     continue
                 sid = entry.sid
@@ -336,11 +495,29 @@ class NativeStoragePolicy:
                     sid = self.principal
                 mask = self._module._expanded_mask(entry.mask)
                 mutation = _ANCESTOR_MUTATION if ancestor else _MUTATION
-                _need(sid in trusted or not mask & mutation, "storage_acl")
-        except StorageError:
+                if sid not in trusted and mask & mutation:
+                    diagnostic["reason"] = "foreign_mutating_allow"
+                    raise StorageError("storage_acl")
+        except StorageError as error:
+            if error.code == "storage_acl":
+                error.acl_diagnostic = bounded_acl_diagnostic(diagnostic)
             raise
-        except Exception:
-            raise StorageError("storage_acl") from None
+        except Exception as error:
+            if diagnostic["phase"] == "descriptor_query":
+                if diagnostic["native_error"] not in {"success", "not_observed", "unknown"}:
+                    diagnostic["reason"] = "native_query"
+                elif isinstance(error, getattr(self._module, "WindowsIdentitySecurityError", ())):
+                    message = error.args[0] if len(error.args) == 1 else None
+                    if type(message) is str:
+                        for messages, reason in (
+                            (_ACL_PARSER_ERRORS, "descriptor_parse"),
+                            (_ACL_OWNER_ERRORS, "owner_sid_parse"),
+                            (_ACL_DESCRIPTOR_ERRORS, "descriptor_validation"),
+                        ):
+                            if message in messages:
+                                diagnostic["reason"] = reason
+                                break
+            raise StorageError("storage_acl", acl_diagnostic=diagnostic) from None
 
     def capacity(self, path: Path) -> tuple[int, int]:
         try:
@@ -426,8 +603,12 @@ class NativeStoragePolicy:
 def derive_storage_root(runner_workspace: Path, workspace: Path, runner_temp: Path, policy) -> Path:
     """Read-only derivation from the real runner layout; never guess a drive."""
     try:
-        for path in (runner_workspace, workspace, runner_temp):
-            _checked(path, policy)
+        for path, role in (
+            (runner_workspace, "runner_workspace"),
+            (workspace, "workspace"),
+            (runner_temp, "runner_temp"),
+        ):
+            _checked(path, policy, role=role)
         work_root = runner_workspace.parent
         _need(
             workspace.parent == runner_workspace
@@ -436,7 +617,7 @@ def derive_storage_root(runner_workspace: Path, workspace: Path, runner_temp: Pa
             and runner_temp.name == "_temp",
             "storage_layout",
         )
-        root_info = _checked(work_root, policy)
+        root_info = _checked(work_root, policy, role="work_root")
         _need(
             all(
                 path.lstat().st_dev == root_info.st_dev
@@ -889,4 +1070,8 @@ def retain_bundle(
                 else "storage_io"
             )
         )
-        raise StorageError(code, cleanup_pending=pending) from None
+        raise StorageError(
+            code,
+            cleanup_pending=pending,
+            acl_diagnostic=exc.acl_diagnostic if isinstance(exc, StorageError) else None,
+        ) from None

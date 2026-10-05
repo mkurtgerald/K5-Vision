@@ -11,10 +11,11 @@ import hashlib
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import types
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -176,6 +177,26 @@ class StorageTests(unittest.TestCase):
         self.policy.denied = None
         self.policy.volume_denied = True
         self.fails("storage_volume")
+
+    def test_storage_root_acl_path_context_is_fixed_and_read_only(self):
+        for path, role, context, distance in (
+            (self.runner, "runner_workspace", "runner_workspace", None),
+            (self.workspace, "workspace", "workspace", None),
+            (self.runner_temp, "runner_temp", "runner_temp", None),
+            (self.work, "ancestor", "runner_workspace", 1),
+        ):
+            with self.subTest(role=role):
+                self.policy.denied = path
+                with self.assertRaises(storage.StorageError) as caught:
+                    storage.derive_storage_root(
+                        self.runner, self.workspace, self.runner_temp, self.policy
+                    )
+                diagnostic = caught.exception.acl_diagnostic
+                self.assertEqual(role, diagnostic["path_role"])
+                self.assertEqual(context, diagnostic["path_context"])
+                self.assertEqual(distance, diagnostic["ancestor_distance"])
+                self.assertNotIn(str(self.base), json.dumps(diagnostic))
+                self.assertFalse(self.root.parent.exists())
 
     def test_retains_exact_36_once_and_subset_only_by_reference(self):
         self.records = self.make_records(36)
@@ -913,6 +934,16 @@ class NativePolicyModelTests(unittest.TestCase):
         with self.assertRaisesRegex(storage.StorageError, "storage_acl"):
             self.policy(entries=[self.ace(0x40)]).admit(Path("unused"), ancestor=True)
 
+    def test_acl_refusal_identifies_foreign_mutation_without_principal_or_path(self):
+        policy = self.policy(entries=[self.ace(2)])
+        with self.assertRaises(storage.StorageError) as caught:
+            policy.admit(Path("PRIVATE_CANARY"))
+        diagnostic = caught.exception.acl_diagnostic
+        self.assertEqual("ace_policy", diagnostic["phase"])
+        self.assertEqual("foreign_mutating_allow", diagnostic["reason"])
+        self.assertNotIn("PRIVATE_CANARY", json.dumps(diagnostic))
+        self.assertNotIn(PRINCIPAL, json.dumps(diagnostic))
+
     def test_changed_principal_and_unknown_native_error_are_sanitized(self):
         policy = self.policy()
         policy._native.current_user = lambda: "S-1-5-21-2000"
@@ -943,6 +974,238 @@ class NativePolicyModelTests(unittest.TestCase):
             policy.admit(Path("unused"), owned=True)
         with self.assertRaisesRegex(storage.StorageError, "storage_ownership"):
             policy.admit(Path("unused"), owned=True)
+
+
+class AclDiagnosticTests(unittest.TestCase):
+    """Run the pinned descriptor parser with inert native-call fixtures."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location(
+            "_acl_diagnostic_pinned_helper",
+            SOURCE.parent.parent / "src/k5vision/windows_identity_security.py",
+        )
+        self.helper = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = self.helper
+        self.addCleanup(sys.modules.pop, spec.name, None)
+        spec.loader.exec_module(self.helper)
+        owner_query = mock.patch.object(storage, "_token_owner", return_value=PRINCIPAL)
+        owner_query.start()
+        self.addCleanup(owner_query.stop)
+
+    def policy(self, *, result=0, acl=b"\x02\0\x08\0\0\0\0\0", valid_acl=True):
+        policy = object.__new__(storage.NativeStoragePolicy)
+        policy.principal = policy.default_owner = PRINCIPAL
+        policy._module = self.helper
+        native = object.__new__(self.helper._NativeSecurity)
+        buffer = ctypes.create_string_buffer(acl)
+        calls = []
+
+        def query(*args):
+            calls.append(args)
+            ctypes.cast(args[3], ctypes.POINTER(ctypes.c_void_p))[0] = 1
+            ctypes.cast(args[5], ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.addressof(buffer)
+            ctypes.cast(args[7], ctypes.POINTER(ctypes.c_void_p))[0] = 2
+            return result
+
+        native.security = types.SimpleNamespace(
+            GetNamedSecurityInfoW=query, IsValidAcl=lambda pointer: valid_acl
+        )
+        native.kernel = types.SimpleNamespace(LocalFree=mock.Mock())
+        native.current_user = lambda: PRINCIPAL
+        native.sid = lambda pointer: PRINCIPAL
+        native.trusted_installer = lambda: False
+        policy._native = native
+        return policy, query, calls
+
+    def refusal(self, policy):
+        with self.assertRaises(storage.StorageError) as caught:
+            policy.admit(Path("PRIVATE_CANARY"))
+        self.assertEqual("storage_acl", caught.exception.code)
+        self.assertNotIn("PRIVATE_CANARY", json.dumps(caught.exception.acl_diagnostic))
+        self.assertNotIn(PRINCIPAL, json.dumps(caught.exception.acl_diagnostic))
+        return caught.exception.acl_diagnostic
+
+    def test_success_observes_original_query_once_and_leaves_callable_unchanged(self):
+        policy, query, calls = self.policy()
+        policy.admit(Path("PRIVATE_CANARY"))
+        self.assertIs(query, policy._native.security.GetNamedSecurityInfoW)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(("PRIVATE_CANARY", 1, 5), calls[0][:3])
+        self.assertIsNone(calls[0][4])
+        self.assertIsNone(calls[0][6])
+        self.assertEqual(1, policy._native.kernel.LocalFree.call_count)
+
+    def test_interleaved_descriptor_calls_never_mutate_or_mix_native_observers(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+
+        policy, query, calls = self.policy()
+        barrier = Barrier(2)
+
+        def simultaneous(*args):
+            self.assertIs(simultaneous, policy._native.security.GetNamedSecurityInfoW)
+            query(*args)
+            barrier.wait(timeout=5)
+            return 5 if args[0] == "PRIVATE_CANARY_A" else 0
+
+        policy._native.security.GetNamedSecurityInfoW = simultaneous
+
+        def admit(name):
+            try:
+                policy.admit(Path(name))
+            except storage.StorageError as error:
+                return error.acl_diagnostic
+            return None
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            refused, allowed = workers.map(admit, ("PRIVATE_CANARY_A", "PRIVATE_CANARY_B"))
+        self.assertEqual("access_denied", refused["native_error"])
+        self.assertEqual("native_query", refused["reason"])
+        self.assertIsNone(allowed)
+        self.assertEqual(2, len(calls))
+        self.assertIs(simultaneous, policy._native.security.GetNamedSecurityInfoW)
+
+    def test_read_only_native_library_never_requires_attribute_mutation(self):
+        class ReadOnlySecurity:
+            def __init__(self, query):
+                object.__setattr__(self, "GetNamedSecurityInfoW", query)
+                object.__setattr__(self, "IsValidAcl", lambda pointer: True)
+
+            def __setattr__(self, name, value):
+                raise AssertionError("Native library must remain unchanged")
+
+        for outcome in ("success", "native_error", "parser_error", "os_error", "interrupt"):
+            with self.subTest(outcome=outcome):
+                policy, query, calls = self.policy(
+                    result=5 if outcome == "native_error" else 0,
+                    acl=b"\x03\0\x08\0\0\0\0\0"
+                    if outcome == "parser_error"
+                    else b"\x02\0\x08\0\0\0\0\0",
+                )
+                invoked = []
+
+                def api(*args, outcome=outcome, invoked=invoked, query=query):
+                    invoked.append(args)
+                    if outcome == "os_error":
+                        raise OSError("PRIVATE_CANARY")
+                    if outcome == "interrupt":
+                        raise KeyboardInterrupt
+                    return query(*args)
+
+                library = ReadOnlySecurity(api)
+                policy._native.security = library
+                if outcome == "success":
+                    policy.admit(Path("PRIVATE_CANARY"))
+                elif outcome == "interrupt":
+                    with self.assertRaises(KeyboardInterrupt):
+                        policy.admit(Path("PRIVATE_CANARY"))
+                else:
+                    self.refusal(policy)
+                self.assertEqual(1, len(invoked))
+                self.assertIs(library, policy._native.security)
+                self.assertIs(api, library.GetNamedSecurityInfoW)
+
+    def test_native_query_failure_categories_keep_original_failure_and_single_call(self):
+        for status, category in (
+            (2, "path_missing"),
+            (3, "path_missing"),
+            (5, "access_denied"),
+            (87, "invalid_parameter"),
+            (122, "insufficient_buffer"),
+            (1336, "invalid_acl"),
+            (1338, "invalid_security_descriptor"),
+            (99999, "other_error"),
+        ):
+            with self.subTest(category=category):
+                policy, query, calls = self.policy(result=status)
+                diagnostic = self.refusal(policy)
+                self.assertEqual("descriptor_query", diagnostic["phase"])
+                self.assertEqual("native_query", diagnostic["reason"])
+                self.assertEqual(category, diagnostic["native_error"])
+                self.assertEqual("GetNamedSecurityInfoW", diagnostic["native_call"])
+                self.assertEqual(1, len(calls))
+                self.assertEqual(("PRIVATE_CANARY", 1, 5), calls[0][:3])
+                self.assertIs(query, policy._native.security.GetNamedSecurityInfoW)
+
+    def test_real_parser_refusal_is_not_reported_as_unsafe_allow_or_query_failure(self):
+        policy, query, calls = self.policy(acl=b"\x03\0\x08\0\0\0\0\0")
+        diagnostic = self.refusal(policy)
+        self.assertEqual("descriptor_parse", diagnostic["reason"])
+        self.assertEqual("success", diagnostic["native_error"])
+        self.assertEqual(1, len(calls))
+        self.assertIs(query, policy._native.security.GetNamedSecurityInfoW)
+
+    def test_descriptor_validation_and_owner_sid_errors_have_distinct_fixed_reasons(self):
+        policy, query, calls = self.policy(valid_acl=False)
+        self.assertEqual("descriptor_validation", self.refusal(policy)["reason"])
+        self.assertIs(query, policy._native.security.GetNamedSecurityInfoW)
+        policy, query, calls = self.policy()
+        policy._native.sid = mock.Mock(
+            side_effect=self.helper.WindowsIdentitySecurityError(
+                "invalid native Windows security identifier"
+            )
+        )
+        self.assertEqual("owner_sid_parse", self.refusal(policy)["reason"])
+        self.assertIs(query, policy._native.security.GetNamedSecurityInfoW)
+
+    def test_unknown_and_spoofed_helper_messages_never_escape(self):
+        for error in (
+            self.helper.WindowsIdentitySecurityError("PRIVATE_CANARY"),
+            ValueError("unsupported Windows identity ACL"),
+        ):
+            policy, query, calls = self.policy()
+            policy._native.sid = mock.Mock(side_effect=error)
+            self.assertEqual("unknown", self.refusal(policy)["reason"])
+            self.assertIs(query, policy._native.security.GetNamedSecurityInfoW)
+
+    def test_native_api_exception_and_interruption_restore_without_retry(self):
+        for error in (OSError("PRIVATE_CANARY"), KeyboardInterrupt()):
+            policy, query, calls = self.policy()
+            original = mock.Mock(side_effect=error)
+            policy._native.security.GetNamedSecurityInfoW = original
+            if isinstance(error, KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    policy.admit(Path("PRIVATE_CANARY"))
+            else:
+                diagnostic = self.refusal(policy)
+                self.assertEqual("unknown", diagnostic["reason"])
+                self.assertEqual("not_observed", diagnostic["native_error"])
+            self.assertEqual(1, original.call_count)
+            self.assertIs(original, policy._native.security.GetNamedSecurityInfoW)
+
+    def test_principal_token_owner_and_trusted_installer_failures_keep_fixed_phase(self):
+        for phase in ("principal_query", "token_owner_query", "trusted_installer_query"):
+            policy, query, calls = self.policy()
+            if phase == "principal_query":
+                policy._native.current_user = mock.Mock(side_effect=OSError("PRIVATE_CANARY"))
+            elif phase == "trusted_installer_query":
+                policy._native.sid = lambda pointer: storage._TRUSTED_INSTALLER
+                policy._native.trusted_installer = mock.Mock(side_effect=OSError("PRIVATE_CANARY"))
+            token = (
+                mock.patch.object(storage, "_token_owner", side_effect=OSError("PRIVATE_CANARY"))
+                if phase == "token_owner_query"
+                else nullcontext()
+            )
+            with token:
+                with self.assertRaises(storage.StorageError) as caught:
+                    policy.admit(Path("PRIVATE_CANARY"), ancestor=True)
+            self.assertEqual(phase, caught.exception.acl_diagnostic["phase"])
+            self.assertEqual("unknown", caught.exception.acl_diagnostic["reason"])
+            self.assertIs(query, policy._native.security.GetNamedSecurityInfoW)
+
+    def test_diagnostic_projection_refuses_arbitrary_fields_types_and_values(self):
+        values = {key: "PRIVATE_CANARY" for key in storage._ACL_DIAGNOSTIC_ENUMS}
+        values.update(ancestor_distance=999, path="PRIVATE_CANARY", sid=PRINCIPAL)
+        diagnostic = storage.bounded_acl_diagnostic(values)
+        self.assertEqual(
+            set(storage._ACL_DIAGNOSTIC_ENUMS) | {"schema_version", "ancestor_distance"},
+            diagnostic.keys(),
+        )
+        self.assertNotIn("PRIVATE_CANARY", json.dumps(diagnostic))
+        self.assertNotIn(PRINCIPAL, json.dumps(diagnostic))
+        self.assertIsNone(diagnostic["ancestor_distance"])
+        for bad in (None, [], "PRIVATE_CANARY"):
+            self.assertIsNone(storage.bounded_acl_diagnostic(bad))
 
 
 class NativePublicationModelTests(unittest.TestCase):
