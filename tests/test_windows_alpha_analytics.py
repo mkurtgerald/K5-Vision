@@ -6646,9 +6646,25 @@ def test_test_facade_uses_exact_qualified_pump_without_ambient_native_status():
     assert source.count(b"function Invoke-K5NativeProbe {") == 1
     assert source.count(b"$exitCode = $child.ExitCode") == 1
     assert b"[Console]::Out.Write($cliVersion.Stdout)" in source
+    # Compare line positions only after the original helper bytes were admitted.
+    ordering_source = source.replace(b"\r\n", b"\n")
+    admission = ordering_source.index(b"& $launcher -AnalyticsPreflightOnly")
     for boundary in TEST_NATIVE_CALLS:
         block = _test_native_call_source(boundary)
-        assert source.index(b"& $launcher -AnalyticsPreflightOnly") < source.index(block.encode())
+        assert admission < ordering_source.index(block.encode())
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_test_facade_ordering_accepts_qualified_line_endings(tmp_path, monkeypatch, newline):
+    source = TEST.read_bytes().replace(b"\r\n", b"\n")
+    target = tmp_path / "Test-K5VisionAlpha.ps1"
+    target.write_bytes(source.replace(b"\n", newline))
+    monkeypatch.setitem(
+        test_test_facade_uses_exact_qualified_pump_without_ambient_native_status.__globals__,
+        "TEST",
+        target,
+    )
+    test_test_facade_uses_exact_qualified_pump_without_ambient_native_status()
 
 
 def test_test_native_helper_refuses_drift_duplicates_or_unbounded_sources():
