@@ -17,7 +17,9 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 
 _SPEC = importlib.util.spec_from_file_location(
     "_facade_alpha", Path(__file__).with_name("installed_alpha_launcher_witness.py")
@@ -110,10 +112,16 @@ EVIDENCE_PHASES = {
     "image_admission",
     "duplicate_birth",
     "admitted_birth",
+    "captured_birth",
+    "capture_publication",
+    "notification",
+    "startup",
+    "finish",
 }
 TEST_MARKERS = {"admitted", "version", "pass", "revision", "gstreamer", "notice"}
 EVIDENCE_COLLECTORS = {
-    "process_stopped",
+    "process_capture_stopped",
+    "process_admission_stopped",
     "process_handles_released",
     "temp_stopped",
     "temp_handles_released",
@@ -166,7 +174,7 @@ def validate_failure_evidence(value):
     evidence_fields(value, EVIDENCE_PARTS | {"schema_version", "mode", "snapshot_state"})
     evidence_need(
         type(value["schema_version"]) is str
-        and value["schema_version"] == "installed-alpha-facade-evidence-v1"
+        and value["schema_version"] == "installed-alpha-facade-evidence-v2"
     )
     evidence_need(type(value["mode"]) is str and value["mode"] in MODES)
     evidence_need(
@@ -181,10 +189,20 @@ def validate_failure_evidence(value):
         evidence_fields(
             observer,
             {
-                "attempted_birth_ordinal",
+                "capture_ordinal",
+                "admission_ordinal",
+                "failure_ordinal",
+                "captured_count",
+                "pending_count",
+                "admitted_count",
+                "validating_count",
+                "failure_actor",
+                "capture_error",
+                "admission_error",
                 "notifications_capped",
                 "duplicates_capped",
-                "phase",
+                "capture_phase",
+                "admission_phase",
                 "failure_phase",
                 "error",
                 "primary_error",
@@ -193,15 +211,28 @@ def validate_failure_evidence(value):
                 "admitted_counts",
             },
         )
-        evidence_integer(observer["attempted_birth_ordinal"], MAX_PROCESSES + 1)
+        for key in ("capture_ordinal", "admission_ordinal", "failure_ordinal"):
+            evidence_integer(observer[key], MAX_PROCESSES + 1)
+        for key in ("captured_count", "pending_count", "admitted_count"):
+            evidence_integer(observer[key], MAX_PROCESSES)
+        evidence_integer(observer["validating_count"], 1)
+        evidence_need(observer["validating_count"] == 0)
+        evidence_need(
+            type(observer["failure_actor"]) is str
+            and observer["failure_actor"] in {"none", "capture", "admission", "lifecycle"}
+        )
         for key in ("notifications_capped", "duplicates_capped"):
             evidence_integer(observer[key], MAX_EVENTS)
-        for key in ("phase", "failure_phase"):
+        for key in ("capture_phase", "admission_phase", "failure_phase"):
             evidence_need(type(observer[key]) is str and observer[key] in EVIDENCE_PHASES)
-        for key in ("error", "primary_error", "cleanup_error"):
+        for key in ("error", "primary_error", "cleanup_error", "capture_error", "admission_error"):
             evidence_need(type(observer[key]) is str and observer[key] in boundary.ERRORS)
         classes = observer["admitted_classes"]
         evidence_need(type(classes) is list and len(classes) <= MAX_PROCESSES)
+        evidence_need(observer["admitted_count"] == len(classes))
+        evidence_need(
+            observer["captured_count"] == observer["pending_count"] + observer["admitted_count"]
+        )
         evidence_need(
             all(type(kind) is str and kind in allowed_images(value["mode"]) for kind in classes)
         )
@@ -295,7 +326,7 @@ def exit_evidence(owned, relay_exit_code):
 
 def failure_evidence(observation, mode):
     value = {
-        "schema_version": "installed-alpha-facade-evidence-v1",
+        "schema_version": "installed-alpha-facade-evidence-v2",
         "mode": mode,
         "snapshot_state": "not_quiescent",
         **dict.fromkeys(EVIDENCE_PARTS),
@@ -310,10 +341,20 @@ def failure_evidence(observation, mode):
     if observer is not None:
         classes = list(observer.births.values())
         value["observer"] = {
-            "attempted_birth_ordinal": observer.attempted_birth_ordinal,
+            "capture_ordinal": observer.capture_ordinal,
+            "admission_ordinal": observer.admission_ordinal,
+            "failure_ordinal": observer.failure_ordinal,
+            "captured_count": len(observer.reservations),
+            "pending_count": len(observer.reservations) - len(observer.births),
+            "admitted_count": len(observer.births),
+            "validating_count": int(observer.validating is not None),
+            "failure_actor": observer.failure_actor,
+            "capture_error": observer.capture_error,
+            "admission_error": observer.admission_error,
             "notifications_capped": observer.notification_count,
             "duplicates_capped": observer.duplicate_count,
-            "phase": observer.phase,
+            "capture_phase": observer.capture_phase,
+            "admission_phase": observer.admission_phase,
             "failure_phase": observer.failure_phase,
             "error": observer.error,
             "primary_error": observer.primary_error,
@@ -331,7 +372,10 @@ def failure_evidence(observation, mode):
             "resources_closed": job.resources_closed,
         }
     value["collectors"] = {
-        "process_stopped": stopped(observer),
+        "process_capture_stopped": stopped(observer),
+        "process_admission_stopped": (
+            None if observer is None else not observer.admission_thread.is_alive()
+        ),
         "process_handles_released": getattr(observer, "release_complete", None),
         "temp_stopped": stopped(watcher),
         "temp_handles_released": getattr(watcher, "closed", None),
@@ -371,7 +415,7 @@ def emit_failure_evidence(observation, mode):
         validate_failure_evidence(value)
     except BaseException:
         value = {
-            "schema_version": "installed-alpha-facade-evidence-v1",
+            "schema_version": "installed-alpha-facade-evidence-v2",
             "mode": mode,
             "snapshot_state": "unavailable",
             **dict.fromkeys(EVIDENCE_PARTS),
@@ -495,56 +539,158 @@ def validate_receipt(value: object, expected: dict[str, str]) -> None:
         )
 
 
-class FacadeProcessObserver(boundary.ProcessObserver):
-    """Same owned completion-port reader; distinct bounded image admission.
+class FacadeProcessObserver:
+    """One prompt capture actor and one ordered, per-birth hash admission actor.
 
-    No global mutation and no reuse of the invalid-Start five-birth profile.
-    An unavailable short-lived birth fails closed, even if Job totals look right.
+    Every reserved handle stays in one registry until both actors stop using it.
+    The queue is private, bounded by the unchanged distinct-birth ceiling, and
+    never locked across hashing. Faster capture is not a native timing guarantee.
     """
 
-    def __init__(self, *args):
-        # The inherited constructor starts its reader: initialize before it does.
+    def __init__(self, job, admitted, resources):
+        from ctypes import wintypes as w
+
+        class Association(ctypes.Structure):
+            _fields_ = [("key", ctypes.c_void_p), ("port", w.HANDLE)]
+
         self._initialize_evidence()
-        super().__init__(*args)
+        self.job, self.admitted, self.api = job, admitted, boundary.api()
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.admission_thread = threading.Thread(target=self._admit, daemon=True)
+        # Both lifetimes are visible before allocating/starting anything. Shared
+        # quiescence sees the admission actor too, including constructor failure.
+        # The second entry exposes lifetime only; this observer owns all errors.
+        resources.extend([self, SimpleNamespace(thread=self.admission_thread, error="none")])
+        job.observer = self
+        try:
+            duplicate = w.HANDLE()
+            current = self.api.GetCurrentProcess()
+            boundary.native_need(
+                self.api.DuplicateHandle(
+                    current, job.handle, current, ctypes.byref(duplicate), 0, False, 2
+                )
+            )
+            self.job_query_handle = duplicate.value
+            self.port = self.api.CreateIoCompletionPort(ctypes.c_void_p(-1), None, 0, 1)
+            boundary.native_need(self.port)
+            association = Association(1, self.port)
+            boundary.native_need(
+                job.api.SetInformationJobObject(
+                    job.handle, 7, ctypes.byref(association), ctypes.sizeof(association)
+                )
+            )
+            # Startup gate prevents either actor working before both starts pass.
+            self.admission_thread.start()
+            self.thread.start()
+            self.begin.set()
+        except BaseException as error:
+            self._record_failure("lifecycle", error, phase="startup")
+            self.stop.set()
+            self.begin.set()
+            with self.condition:
+                self.condition.notify_all()
+            for actor, done in (
+                (self.thread, self.capture_done),
+                (self.admission_thread, self.admission_done),
+            ):
+                if actor.ident is None:
+                    done.set()
+            self._join_actors(time.monotonic() + 3)
+            self._release()
+            raise
 
     def _initialize_evidence(self):
-        self.attempted_birth_ordinal = self.notification_count = self.duplicate_count = 0
-        self.phase = self.failure_phase = "not_started"
-        self.primary_error = self.cleanup_error = "none"
+        self.notification_count = self.duplicate_count = 0
+        self.capture_ordinal = self.admission_ordinal = self.failure_ordinal = 0
+        self.capture_phase = self.admission_phase = self.failure_phase = "not_started"
+        self.capture_error = self.admission_error = "none"
+        self.failure_actor = "none"
+        self.error = self.primary_error = self.cleanup_error = "none"
+        self.condition = threading.Condition()
+        self.resource_lock = threading.Lock()
+        self.stop, self.begin = threading.Event(), threading.Event()
+        self.capture_done, self.admission_done = threading.Event(), threading.Event()
+        self.births, self.reservations, self.pending = {}, {}, deque()
+        self.validating = None
+        self.handles = []
+        self.port = self.job_query_handle = None
+        self.closed = self.release_complete = self.handle_release_failed = False
 
-    def _remember_primary(self, error):
-        if self.primary_error == "none":
-            self.failure_phase = self.phase
-            self.primary_error = (
-                str(error) if isinstance(error, boundary.ObservationFailure) else "native_error"
-            )
+    @staticmethod
+    def _error_code(error):
+        return str(error) if isinstance(error, boundary.ObservationFailure) else "native_error"
+
+    def _record_failure(self, actor, error, *, phase=None):
+        """Publish terminal state before abort, without holding locks on abort."""
+        code = self._error_code(error)
+        with self.condition:
+            if actor in {"capture", "admission"}:
+                if getattr(self, actor + "_error") == "none":
+                    setattr(self, actor + "_error", code)
+            if self.primary_error == "none":
+                self.primary_error = code
+                self.failure_actor = actor
+                self.failure_phase = phase or getattr(self, actor + "_phase")
+                self.failure_ordinal = (
+                    getattr(self, actor + "_ordinal") if actor != "lifecycle" else 0
+                )
+            if self.error == "none":
+                self.error = code
+            self.stop.set()
+            self.condition.notify_all()
+
+    def _cleanup_failed(self, *, handle=False):
+        with self.condition:
+            self.handle_release_failed |= handle
+            self.cleanup_error = "cleanup_incomplete"
+            self.error = "cleanup_incomplete"
+            self.stop.set()
+            self.condition.notify_all()
+
+    def _fail(self, actor, error):
+        self._record_failure(actor, error)
+        try:
+            self.job.abort()
+        except BaseException:
+            self._cleanup_failed()
+        self._wake()
+
+    def _wake(self):
+        # A late wake cannot touch a released completion port.
+        with self.resource_lock:
+            if self.port and not self.closed:
+                try:
+                    if not self.api.PostQueuedCompletionStatus(self.port, 0, 2, None):
+                        self._cleanup_failed()
+                except BaseException:
+                    self._cleanup_failed()
+        with self.condition:
+            self.condition.notify_all()
 
     def _observe(self, pid):
-        # Ordinal is the next distinct candidate, not an inferred image or PID.
-        # Repeated notifications retain the same candidate ordinal until admitted.
-        self.notification_count = min(MAX_EVENTS, self.notification_count + 1)
-        self.attempted_birth_ordinal = min(MAX_PROCESSES + 1, len(self.births) + 1)
+        with self.condition:
+            self.notification_count = min(MAX_EVENTS, self.notification_count + 1)
+            self.capture_ordinal = min(MAX_PROCESSES + 1, len(self.reservations) + 1)
         try:
             self._observe_birth(pid)
         except BaseException as error:
-            if self.cleanup_error == "none":
-                self._remember_primary(error)
+            self._record_failure("capture", error)
             raise
 
     def _observe_birth(self, pid):
         from ctypes import wintypes as w
 
-        self.phase = "open_process"
+        self.capture_phase = "open_process"
         handle = self.api.OpenProcess(0x1000, False, pid)
         boundary.native_need(handle, missing=True)
         try:
-            self.phase = "job_membership"
+            self.capture_phase = "job_membership"
             belongs = w.BOOL()
             boundary.native_need(
                 self.api.IsProcessInJob(handle, self.job_query_handle, ctypes.byref(belongs))
             )
             need(bool(belongs.value), "ownership_unproven")
-            self.phase = "process_times"
+            self.capture_phase = "process_times"
             created, exited, kernel, user = (ctypes.c_uint64() for _ in range(4))
             boundary.native_need(
                 self.api.GetProcessTimes(
@@ -557,34 +703,170 @@ class FacadeProcessObserver(boundary.ProcessObserver):
             )
             need(created.value > 0, "native_error")
             key = (pid, created.value)
-            if key in self.births:
-                self.duplicate_count = min(MAX_EVENTS, self.duplicate_count + 1)
-                self.phase = "duplicate_birth"
-                return
-            self.phase = "birth_limit"
-            need(len(self.births) < MAX_PROCESSES, "limit")
-            self.phase = "image_query"
+            with self.condition:
+                if key in self.reservations:
+                    self.duplicate_count = min(MAX_EVENTS, self.duplicate_count + 1)
+                    self.capture_phase = "duplicate_birth"
+                    return
+                self.capture_phase = "birth_limit"
+                need(len(self.reservations) < MAX_PROCESSES, "limit")
+            self.capture_phase = "image_query"
             buffer, count = ctypes.create_unicode_buffer(32768), w.DWORD(32768)
             boundary.native_need(
                 self.api.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(count))
             )
-            self.phase = "image_admission"
-            kind = boundary.process_class(buffer.value, self.admitted)
-            need(kind in self.admitted and kind != "unknown", "unexpected_process")
-            self.births[key] = kind
-            self.handles.append(handle)
-            handle = None
-            self.phase = "admitted_birth"
+            self.capture_phase = "capture_publication"
+            record = (key, buffer.value, self.capture_ordinal)
+            with self.condition:
+                if self.stop.is_set():
+                    return
+                # Transfer ownership to the sole registry before publishing work.
+                # If queue insertion fails, that registry still owns this handle.
+                self.handles.append(handle)
+                handle = None
+                self.reservations[key] = record
+                self.pending.append(record)
+                self.capture_phase = "captured_birth"
+                self.condition.notify_all()
         except BaseException as error:
-            self._remember_primary(error)
+            # Capture primary before transient CloseHandle can fail and mask it.
+            self._record_failure("capture", error)
             raise
         finally:
             if handle is not None:
                 try:
                     need(bool(self.api.CloseHandle(handle)), "cleanup_incomplete")
                 except BaseException:
-                    self.cleanup_error = "cleanup_incomplete"
+                    self._cleanup_failed(handle=True)
                     raise
+
+    def _admit_one(self, record):
+        key, image, ordinal = record
+        self.admission_ordinal, self.admission_phase = ordinal, "image_admission"
+        # Unchanged raw per-birth hash. No state/resource lock spans this call.
+        kind = boundary.process_class(image, self.admitted)
+        need(kind in self.admitted and kind != "unknown", "unexpected_process")
+        with self.condition:
+            if not self.stop.is_set():
+                self.births[key] = kind
+                self.admission_phase = "admitted_birth"
+            self.condition.notify_all()
+
+    def _admit(self):
+        self.begin.wait()
+        try:
+            while True:
+                with self.condition:
+                    while not self.pending and not self.stop.is_set():
+                        if self.capture_done.is_set():
+                            return
+                        self.condition.wait()
+                    if self.stop.is_set():
+                        return
+                    record = self.pending.popleft()
+                    self.validating = record
+                try:
+                    self._admit_one(record)
+                finally:
+                    with self.condition:
+                        self.validating = None
+                        self.condition.notify_all()
+        except BaseException as error:
+            self._fail("admission", error)
+        finally:
+            self.admission_done.set()
+            with self.condition:
+                self.condition.notify_all()
+            self._release()
+
+    def _read(self):
+        from ctypes import wintypes as w
+
+        self.begin.wait()
+        try:
+            while not self.stop.is_set():
+                self.capture_phase, self.capture_ordinal = "notification", 0
+                message, key, value = w.DWORD(), ctypes.c_size_t(), ctypes.c_void_p()
+                ready = self.api.GetQueuedCompletionStatus(
+                    self.port, ctypes.byref(message), ctypes.byref(key), ctypes.byref(value), 100
+                )
+                if not ready:
+                    if ctypes.get_last_error() == 258:
+                        continue
+                    boundary.native_need(False)
+                if key.value == 2:
+                    return
+                need(key.value == 1, "native_error")
+                if message.value == 6:
+                    need(value.value is not None and 0 < value.value < 2**32, "native_error")
+                    self._observe(value.value)
+        except BaseException as error:
+            self._fail("capture", error)
+        finally:
+            self.capture_done.set()
+            with self.condition:
+                self.condition.notify_all()
+            self._release()
+
+    def _release(self):
+        # Done means no further native access by that actor. The last actor may
+        # release in its own finalizer; external quiescence still requires joins.
+        with self.resource_lock:
+            if self.closed or not (self.capture_done.is_set() and self.admission_done.is_set()):
+                return
+            complete = not self.handle_release_failed
+            for handle in [*self.handles, self.port, self.job_query_handle]:
+                if handle is None:
+                    continue
+                try:
+                    complete = bool(self.api.CloseHandle(handle)) and complete
+                except BaseException:
+                    complete = False
+            self.handles.clear()
+            self.closed, self.release_complete = True, complete
+            if not complete:
+                self._cleanup_failed()
+
+    def _join_actors(self, deadline):
+        for actor in (self.thread, self.admission_thread):
+            if actor.ident is not None:
+                actor.join(max(0, deadline - time.monotonic()))
+        if self.thread.is_alive() or self.admission_thread.is_alive():
+            self._cleanup_failed()
+            raise boundary.ObservationFailure("cleanup_incomplete")
+
+    def reconciled(self, expected_total):
+        return (
+            self.error == "none"
+            and 0 < expected_total <= MAX_PROCESSES
+            and len(self.reservations) == len(self.births) == expected_total
+            and not self.pending
+            and self.validating is None
+        )
+
+    def cancel(self):
+        self._record_failure("lifecycle", boundary.ObservationFailure("incomplete"), phase="finish")
+        self._wake()
+
+    def finish(self, expected_total):
+        # Preserve the original 2s collection + 3s join budgets, shared by both.
+        deadline = time.monotonic() + 2
+        with self.condition:
+            while not self.reconciled(expected_total) and self.error == "none":
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self.capture_done.is_set() and self.admission_done.is_set():
+                    break
+                self.condition.wait(remaining)
+            if self.error == "none" and not self.reconciled(expected_total):
+                self._record_failure(
+                    "lifecycle", boundary.ObservationFailure("incomplete"), phase="finish"
+                )
+            self.stop.set()
+            self.condition.notify_all()
+        self._wake()
+        self._join_actors(time.monotonic() + 3)
+        self._release()
+        need(self.release_complete and self.cleanup_error == "none", "cleanup_incomplete")
 
 
 class FacadeTempLifecycle:
@@ -686,9 +968,9 @@ class FacadeObservation(boundary.PreflightObservation):
             def abort(self):
                 with self.abort_lock:
                     self.aborted = True
-                    if (
-                        self.observer is not None
-                        and threading.current_thread() is self.observer.thread
+                    if self.observer is not None and threading.current_thread() in (
+                        self.observer.thread,
+                        self.observer.admission_thread,
                     ):
                         self.observer_abort_requested = True
                         # Only cached exit facts; no new query, wait, or process lookup.
@@ -732,14 +1014,27 @@ class FacadeObservation(boundary.PreflightObservation):
                     while self.accounting().active_processes:
                         need(time.monotonic() < deadline, "cleanup_incomplete")
                         time.sleep(0.01)
-                    if self.observer is not None:
-                        self.observer.finish(self.final_total)
                 except BaseException as error:
                     failure = error
                 finally:
-                    with self.abort_lock:
-                        self.observation_open = False
-                        super().close()
+                    # Job accounting/termination failure must not strand either
+                    # actor. Stop independently, then spend the single observer
+                    # finish/join budget even when the main close already failed.
+                    if self.observer is not None:
+                        try:
+                            if failure is not None:
+                                self.observer.cancel()
+                            self.observer.finish(self.final_total)
+                        except BaseException as error:
+                            if failure is None:
+                                failure = error
+                    try:
+                        with self.abort_lock:
+                            self.observation_open = False
+                            super().close()
+                    except BaseException as error:
+                        if failure is None:
+                            failure = error
                     self.resources_closed = failure is None
                 if failure is not None:
                     raise boundary.ObservationFailure("cleanup_incomplete") from None
@@ -750,6 +1045,7 @@ class FacadeObservation(boundary.PreflightObservation):
         need(self.started and not self.finished)
         need(len(self.jobs) == 1 and not self.jobs[0].observation_open, "incomplete")
         self.watcher.finish()
+        need(self.quiescent(), "cleanup_incomplete")
         self.finished = True
         watcher, job = self.watcher, self.jobs[0]
         births = list(job.observer.births.values())
@@ -767,8 +1063,7 @@ class FacadeObservation(boundary.PreflightObservation):
                 "policy_" + key + "_files": count
                 for key, count in watcher.lifecycle.extensions.items()
             },
-            "process_coverage_complete": job.observer.error == "none"
-            and len(births) == job.final_total
+            "process_coverage_complete": job.observer.reconciled(job.final_total)
             and job.final_active == 0
             and "unknown" not in births,
             "temporary_root_empty": not any(self.temp_root.iterdir()),

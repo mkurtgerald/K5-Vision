@@ -6,6 +6,7 @@ import ctypes
 import importlib.util
 import io
 import json
+import queue
 import subprocess
 import sys
 import threading
@@ -138,7 +139,8 @@ def test_distinct_source_free_receipt_and_existing_route_unchanged():
         "dotnet_compiler": 0,
         "unknown": 0,
     }
-    assert witness.FacadeProcessObserver._read is boundary.ProcessObserver._read
+    assert witness.FacadeProcessObserver._read is not boundary.ProcessObserver._read
+    assert witness.FacadeProcessObserver.finish is not boundary.ProcessObserver.finish
     assert witness.FacadeTempObserver.finish is boundary.TempObserver.finish
     assert witness.FacadeObservation.close is boundary.PreflightObservation.close
 
@@ -381,104 +383,764 @@ def test_run_reuses_counter_contract_after_actual_facade_return_marker():
         summary(raw.replace(b"K5_FACADE_RETURNED", b""), "run_1").result()
 
 
-def process_observer(monkeypatch, tmp_path, *, kind="gst_launch", belongs=True, denied=0):
-    calls = []
-    path = tmp_path / "child.exe"
-    path.write_bytes(b"admitted")
-    birth = [100]
+class NativeFacadeHarness:
+    """Actual facade constructor, synthetic owned native APIs, and real raw hashes.
 
-    def opened(access, inherit, pid):
-        calls.append(("open", access, inherit, pid))
-        return None if denied else 123
+    Queue/event waits are deadlock guards, never claims about native scheduling.
+    Every synthetic notification gets one fresh handle; its immutable record is
+    retained with that handle so PID reuse cannot change an already captured birth.
+    """
 
-    def membership(handle, job, output):
-        calls.append(("membership", job))
-        output._obj.value = belongs
+    def __init__(self, monkeypatch, tmp_path, *, kind="gst_launch", start=True):
+        self.path = tmp_path / "private-synthetic-child.exe"
+        self.path.write_bytes(b"synthetic executable contents for real per-birth hashing")
+        self.real_hash = boundary.file_hash
+        self.admitted = {kind: (self.path, self.real_hash(self.path))}
+        self.queue = queue.Queue()
+        self.local = threading.local()
+        self.trace, self.handles, self.closed, self.resources = [], {}, [], []
+        self.hashes, self.blockers, self.aborts = [], [], []
+        self.aborted = threading.Event()
+        self.observer = None
+        self.startup_failure = None
+        self.close_failures = set()
+        self.abort_check = None
+        self.job = SimpleNamespace(handle=42, abort=self.abort)
+        self.api = SimpleNamespace(
+            GetCurrentProcess=lambda: 7,
+            DuplicateHandle=self.duplicate,
+            CreateIoCompletionPort=self.create_port,
+            SetInformationJobObject=self.associate,
+            GetQueuedCompletionStatus=self.dequeue,
+            PostQueuedCompletionStatus=self.post,
+            OpenProcess=self.open,
+            IsProcessInJob=self.membership,
+            GetProcessTimes=self.times,
+            QueryFullProcessImageNameW=self.image,
+            CloseHandle=self.close,
+        )
+        self.job.api = self.api
+        monkeypatch.setattr(boundary, "api", lambda: self.api)
+        monkeypatch.setattr(
+            ctypes, "get_last_error", lambda: getattr(self.local, "error", 0), raising=False
+        )
+        monkeypatch.setattr(boundary, "file_hash", self.hash)
+        if start:
+            self.start()
+
+    def start(self):
+        self.observer = witness.FacadeProcessObserver(self.job, self.admitted, self.resources)
+        return self.observer
+
+    def duplicate(self, current, handle, target, output, access, inherit, options):
+        assert (current, handle, target, access, inherit, options) == (7, 42, 7, 0, False, 2)
+        if self.startup_failure == "duplicate":
+            self.local.error = 5
+            return False
+        output._obj.value = 456
+        self.trace.append(("duplicate", 456))
         return True
 
-    def times(handle, created, *rest):
-        calls.append(("birth",))
-        created._obj.value = birth[0]
+    def create_port(self, source, existing, key, concurrency):
+        assert existing is None and (key, concurrency) == (0, 1)
+        if self.startup_failure == "port":
+            self.local.error = 5
+            return None
+        self.trace.append(("port", 789))
+        return 789
+
+    def associate(self, handle, kind, association, size):
+        assert handle == 42 and kind == 7
+        assert (association._obj.key, association._obj.port) == (1, 789)
+        self.trace.append(("associate",))
+        self.local.error = 5
+        return self.startup_failure != "associate"
+
+    def dequeue(self, port, message, key, value, timeout):
+        assert port == 789 and timeout == 100
+        try:
+            packet = self.queue.get(timeout=timeout / 1000)
+        except queue.Empty:
+            self.local.error = 258
+            return False
+        if "ack" in packet:
+            packet["ack"].set()
+        self.local.record = packet
+        message._obj.value = packet.get("message", 6)
+        key._obj.value = packet.get("key", 1)
+        value._obj.value = packet.get("pid")
+        self.trace.append(("dequeue", packet.get("pid")))
         return True
 
-    def image(handle, flags, buffer, size):
-        calls.append(("image",))
-        buffer.value = str(path)
+    def post(self, port, message, key, value):
+        assert port == 789
+        self.queue.put({"message": message, "key": key, "pid": value})
         return True
 
-    observer = object.__new__(witness.FacadeProcessObserver)
-    observer._initialize_evidence()
-    observer.api = SimpleNamespace(
-        OpenProcess=opened,
-        IsProcessInJob=membership,
-        GetProcessTimes=times,
-        QueryFullProcessImageNameW=image,
-        CloseHandle=lambda handle: calls.append(("close", handle)) or True,
+    def notify(self, pid=10, **record):
+        packet = {"pid": pid, "birth": (pid or 0) * 10, **record}
+        self.queue.put(packet)
+        return packet
+
+    def flush_capture(self):
+        event = threading.Event()
+        self.queue.put({"message": 0, "key": 1, "ack": event})
+        assert event.wait(5), "capture pump did not reach the ordered test barrier"
+
+    def open(self, access, inherit, pid):
+        assert (access, inherit) == (0x1000, False)
+        self.trace.append(("open", access, inherit, pid))
+        record = self.local.record
+        if record.get("open_error"):
+            self.local.error = record["open_error"]
+            return None
+        handle = 1000 + len(self.handles)
+        self.handles[handle] = dict(record)
+        self.trace.append(("opened", handle))
+        return handle
+
+    def native_step(self, name, handle):
+        record = self.handles[handle]
+        self.trace.append((name, handle))
+        if record.get("block_at") == name:
+            record["entered"].set()
+            assert record["release"].wait(5), "native-call test barrier was not released"
+        error = record.get(name + "_error", 0)
+        self.local.error = error
+        return record, not error
+
+    def membership(self, handle, job, output):
+        assert job == 456
+        record, result = self.native_step("membership", handle)
+        output._obj.value = record.get("belongs", True)
+        return result
+
+    def times(self, handle, created, *rest):
+        record, result = self.native_step("times", handle)
+        created._obj.value = record["birth"]
+        return result
+
+    def image(self, handle, flags, output, size):
+        assert flags == 0 and size._obj.value == 32768
+        record, result = self.native_step("image", handle)
+        output.value = str(record.get("image", self.path))
+        return result
+
+    def close(self, handle):
+        assert handle not in self.closed, "an owned native handle was closed twice"
+        self.trace.append(("close", handle))
+        self.closed.append(handle)
+        return handle not in self.close_failures
+
+    def hash(self, path):
+        self.hashes.append(path)
+        ordinal = len(self.hashes)
+        self.trace.append(("hash_enter", ordinal))
+        for selected, entered, release, failure in self.blockers:
+            if ordinal == selected:
+                entered.set()
+                assert release.wait(5), "hash test barrier was not released"
+                if failure:
+                    raise failure
+        result = self.real_hash(path)
+        self.trace.append(("hash_leave", ordinal))
+        return result
+
+    def block_hash(self, ordinal=1, failure=None):
+        entered, release = threading.Event(), threading.Event()
+        self.blockers.append((ordinal, entered, release, failure))
+        return entered, release
+
+    def abort(self):
+        self.aborts.append(threading.current_thread())
+        if self.abort_check:
+            self.abort_check()
+        self.aborted.set()
+
+    def finish(self, total):
+        self.observer.finish(total)
+        self.assert_stopped()
+
+    def assert_stopped(self):
+        observer = self.observer
+        assert observer.capture_done.is_set() and observer.admission_done.is_set()
+        assert not observer.thread.is_alive() and not observer.admission_thread.is_alive()
+
+    def cleanup(self):
+        for _, _, release, _ in self.blockers:
+            release.set()
+        for record in self.handles.values():
+            if "release" in record:
+                record["release"].set()
+        observer = self.observer or getattr(self.job, "observer", None)
+        if observer is None:
+            return
+        observer.stop.set()
+        self.post(789, 0, 2, None)
+        # Native wake also causes capture_done to notify a waiting validator.
+        for name in ("thread", "admission_thread"):
+            thread = getattr(observer, name, None)
+            if thread is not None and thread.ident is not None:
+                thread.join(5)
+                assert not thread.is_alive(), "test left an actor running"
+        observer._release()
+
+
+@pytest.fixture
+def native_facade(monkeypatch, tmp_path):
+    values = []
+
+    def make(*, start=True, **kwargs):
+        value = NativeFacadeHarness(monkeypatch, tmp_path, start=False, **kwargs)
+        values.append(value)
+        if start:
+            value.start()
+        return value
+
+    yield make
+    for value in values:
+        value.cleanup()
+
+
+def test_source_derived_hash_barrier_allows_later_capture_and_post_exit_admission(native_facade):
+    harness = native_facade(start=False)
+    entered, release = harness.block_hash()
+    harness.notify(10)
+    harness.notify(20)
+    harness.start()
+    assert entered.wait(5)
+    harness.flush_capture()
+    observer = harness.observer
+    assert [call[3] for call in harness.trace if call[0] == "open"] == [10, 20]
+    assert len(observer.reservations) == 2 and not observer.births
+    assert len(harness.hashes) == 1
+    assert ("image", 1001) in harness.trace and ("hash_leave", 1) not in harness.trace
+    # The second synthetic process now exits. The captured handle/image are the
+    # only evidence; reopening or querying after this point would fail this test.
+    harness.handles[1001]["image_error"] = 87
+    release.set()
+    harness.finish(2)
+    assert observer.error == "none" and len(observer.births) == len(harness.hashes) == 2
+    assert harness.trace.index(("image", 1001)) < harness.trace.index(("hash_leave", 1))
+    assert len([call for call in harness.trace if call[0] == "image"]) == 2
+    assert set(harness.closed) == {456, 789, 1000, 1001}
+    assert observer.release_complete and not observer.handles and not harness.aborts
+
+
+@pytest.mark.parametrize(
+    "record,error,phase,steps",
+    [
+        ({"open_error": 87}, "process_unavailable", "open_process", []),
+        ({"open_error": 5}, "access_denied", "open_process", []),
+        ({"open_error": 6}, "native_error", "open_process", []),
+        ({"belongs": False}, "ownership_unproven", "job_membership", ["membership"]),
+        ({"membership_error": 5}, "access_denied", "job_membership", ["membership"]),
+        ({"times_error": 5}, "access_denied", "process_times", ["membership", "times"]),
+        ({"birth": 0}, "native_error", "process_times", ["membership", "times"]),
+        ({"image_error": 5}, "access_denied", "image_query", ["membership", "times", "image"]),
+        ({"image_error": 87}, "native_error", "image_query", ["membership", "times", "image"]),
+    ],
+    ids=[
+        "unavailable",
+        "denied",
+        "native",
+        "foreign",
+        "membership",
+        "times",
+        "zero-birth",
+        "image-denied",
+        "image-native",
+    ],
+)
+def test_capture_refusal_never_infers_image_or_retries(native_facade, record, error, phase, steps):
+    harness = native_facade()
+    harness.notify(10, **record)
+    assert harness.aborted.wait(5)
+    harness.finish(1)
+    observer = harness.observer
+    assert observer.error == observer.primary_error == observer.capture_error == error
+    assert observer.failure_actor == "capture" and observer.failure_phase == phase
+    assert observer.failure_ordinal == observer.capture_ordinal == 1
+    assert not observer.births and not harness.hashes
+    assert [
+        call[0] for call in harness.trace if call[0] in {"membership", "times", "image"}
+    ] == steps
+    assert len([call for call in harness.trace if call[0] == "open"]) == 1
+    assert harness.aborts == [observer.thread]
+    assert set(harness.closed) == {456, 789, *harness.handles}
+
+
+@pytest.mark.parametrize(
+    "case,error",
+    [
+        ("unknown", "unexpected_process"),
+        ("mismatch", "fixture_admission"),
+        ("permission", "access_denied"),
+    ],
+)
+def test_admission_failure_uses_actor_local_phase_and_real_per_birth_hash(
+    native_facade, case, error
+):
+    harness = native_facade()
+    entered, release = harness.block_hash(
+        2, PermissionError("private-secret") if case == "permission" else None
     )
-    observer.job_query_handle = 456
-    observer.admitted = {kind: (path, common.file_hash(path))}
-    observer.births, observer.handles = {}, []
-    monkeypatch.setattr(ctypes, "get_last_error", lambda: denied, raising=False)
-    return observer, calls, birth, path
+    harness.notify(10)
+    harness.notify(20, **({"image": "private-unknown.exe"} if case == "unknown" else {}))
+    if case == "unknown":
+        assert harness.aborted.wait(5)
+    else:
+        assert entered.wait(5)
+        harness.notify(30)
+        harness.flush_capture()
+        assert len(harness.observer.reservations) == 3
+        if case == "mismatch":
+            harness.path.write_bytes(b"different raw file bytes")
+        release.set()
+        assert harness.aborted.wait(5)
+    harness.finish(2 if case == "unknown" else 3)
+    observer = harness.observer
+    assert observer.primary_error == observer.admission_error == error
+    assert observer.failure_actor == "admission" and observer.failure_phase == "image_admission"
+    assert observer.failure_ordinal == observer.admission_ordinal == 2
+    assert list(observer.births.values()) == ["gst_launch"]
+    assert len(harness.hashes) == (1 if case == "unknown" else 2)
+    assert observer.release_complete
 
 
-def test_owned_birth_must_match_exact_job_before_image_read(monkeypatch, tmp_path):
-    observer, calls, birth, path = process_observer(monkeypatch, tmp_path)
-    observer._observe(10)
-    assert [call[0] for call in calls[:4]] == ["open", "membership", "birth", "image"]
-    assert calls[0][1:3] == (0x1000, False)
-    observer._observe(10)
-    assert len(observer.births) == 1
-    birth[0] += 1
-    observer._observe(10)
-    assert len(observer.births) == 2
-    path.write_bytes(b"changed")
-    birth[0] += 1
-    with pytest.raises(boundary.ObservationFailure):
-        observer._observe(10)
+def test_duplicates_pending_validating_admitted_and_pid_reuse_are_bounded(native_facade):
+    harness = native_facade()
+    entered, release = harness.block_hash()
+    harness.notify(10)
+    assert entered.wait(5)
+    harness.notify(10)  # Original is validating.
+    harness.notify(20)
+    harness.notify(20)  # Original is pending behind the hash barrier.
+    harness.flush_capture()
+    assert len(harness.observer.reservations) == 2
+    assert harness.observer.duplicate_count == 2
+    release.set()
+    with harness.observer.condition:
+        assert harness.observer.condition.wait_for(lambda: len(harness.observer.births) == 2, 5)
+    harness.notify(10)  # Original is now admitted.
+    harness.notify(10, birth=101)  # Same PID, distinct creation time.
+    for _ in range(witness.MAX_EVENTS + 3):
+        harness.notify(10, birth=101)
+    harness.flush_capture()
+    harness.finish(3)
+    observer = harness.observer
+    assert observer.error == "none" and len(observer.births) == 3 and len(harness.hashes) == 3
+    assert observer.notification_count == observer.duplicate_count == witness.MAX_EVENTS
+    assert len([call for call in harness.trace if call[0] == "image"]) == 3
+    assert len(harness.closed) == len(harness.handles) + 2
 
 
-def test_foreign_pid_never_exposes_image_or_birth(monkeypatch, tmp_path):
-    observer, calls, _, _ = process_observer(monkeypatch, tmp_path, belongs=False)
-    with pytest.raises(boundary.ObservationFailure, match="ownership_unproven"):
-        observer._observe(10)
-    assert [call[0] for call in calls] == ["open", "membership", "close"]
+def test_foreign_replacement_of_duplicate_pid_is_never_deduplicated_before_ownership(native_facade):
+    harness = native_facade()
+    entered, release = harness.block_hash()
+    harness.notify(10)
+    assert entered.wait(5)
+    harness.notify(10, belongs=False)
+    assert harness.aborted.wait(5)
+    assert harness.observer.duplicate_count == 0
+    release.set()
+    harness.finish(1)
+    assert harness.observer.primary_error == "ownership_unproven"
+    assert len([call for call in harness.trace if call[0] == "times"]) == 1
+    assert len([call for call in harness.trace if call[0] == "image"]) == 1
 
 
-@pytest.mark.parametrize("denied,error", [(5, "access_denied"), (87, "process_unavailable")])
-def test_short_lived_or_denied_birth_cannot_be_inferred(monkeypatch, tmp_path, denied, error):
-    observer, calls, _, _ = process_observer(monkeypatch, tmp_path, denied=denied)
-    with pytest.raises(boundary.ObservationFailure, match=error):
-        observer._observe(10)
-    assert calls == [("open", 0x1000, False, 10)]
-    assert not observer.births
+def test_32_pending_reservations_allow_only_one_transient_overflow_handle(native_facade):
+    harness = native_facade()
+    entered, release = harness.block_hash()
+    for pid in range(1, witness.MAX_PROCESSES + 1):
+        harness.notify(pid)
+    assert entered.wait(5)
+    harness.flush_capture()
+    observer = harness.observer
+    assert len(observer.reservations) == len(observer.handles) == witness.MAX_PROCESSES
+    assert not observer.births and len(harness.hashes) == 1
+    harness.notify(33)
+    assert harness.aborted.wait(5)
+    assert len(harness.handles) == 33 and len(observer.reservations) == 32
+    assert len([call for call in harness.trace if call[0] == "image"]) == 32
+    assert observer.primary_error == "limit" and observer.failure_ordinal == 33
+    assert observer.failure_phase == "birth_limit"
+    assert harness.closed == [1032]  # Validator still owns the other 32 handles.
+    release.set()
+    harness.finish(33)
+    assert observer.release_complete and len(harness.closed) == 35
 
 
-def test_unknown_image_and_birth_limit_refuse_without_reclassification(monkeypatch, tmp_path):
-    observer, calls, birth, _ = process_observer(monkeypatch, tmp_path, kind="unknown")
-    with pytest.raises(boundary.ObservationFailure, match="unexpected_process"):
-        observer._observe(10)
-    assert not observer.births
-    observer, calls, birth, _ = process_observer(monkeypatch, tmp_path)
-    observer.births = {(index, index): "gst_launch" for index in range(witness.MAX_PROCESSES)}
-    with pytest.raises(boundary.ObservationFailure, match="limit"):
-        observer._observe(100)
+@pytest.mark.parametrize("block_at", ["membership", "times", "image"])
+def test_admission_abort_during_native_capture_never_enqueues_or_closes_under_validator(
+    native_facade, block_at
+):
+    harness = native_facade()
+    entered, release = harness.block_hash(failure=PermissionError("private"))
+    harness.notify(10)
+    assert entered.wait(5)
+    capturing, continue_capture = threading.Event(), threading.Event()
+    harness.notify(20, block_at=block_at, entered=capturing, release=continue_capture)
+    assert capturing.wait(5)
+    release.set()
+    assert harness.aborted.wait(5)
+    observer = harness.observer
+    assert observer.primary_error == "access_denied" and observer.failure_actor == "admission"
+    assert not harness.closed
+    continue_capture.set()
+    harness.finish(2)
+    assert not observer.births and len(harness.hashes) == 1
+    assert observer.release_complete and set(harness.closed) == {456, 789, 1000, 1001}
 
 
-def test_native_reader_aborts_owned_job_on_missing_birth(monkeypatch, tmp_path):
-    observer, calls, _, _ = process_observer(monkeypatch, tmp_path, denied=87)
-    aborted = []
-    observer.job = SimpleNamespace(abort=lambda: aborted.append(True))
-    observer.error, observer.stop, observer.port = "none", threading.Event(), 1
-    observer._release = lambda: None
+def test_capture_failure_during_hash_preserves_primary_and_actor_attribution(native_facade):
+    harness = native_facade()
+    entered, release = harness.block_hash(failure=PermissionError("private"))
+    harness.notify(10)
+    assert entered.wait(5)
+    harness.notify(20, open_error=87)
+    assert harness.aborted.wait(5)
+    observer = harness.observer
+    assert observer.primary_error == "process_unavailable" and not harness.closed
+    release.set()
+    harness.finish(2)
+    assert observer.failure_actor == "capture" and observer.failure_ordinal == 2
+    assert observer.failure_phase == "open_process" and observer.admission_error == "access_denied"
+    assert observer.cleanup_error == "none" and not observer.births
 
-    def event(port, message, key, value, timeout):
-        message._obj.value, key._obj.value, value._obj.value = 6, 1, 10
-        return True
 
-    observer.api.GetQueuedCompletionStatus = event
-    observer._read()
-    assert observer.error == "process_unavailable" and aborted == [True]
+def test_abort_runs_outside_state_and_resource_locks(native_facade):
+    harness = native_facade()
+    observer = harness.observer
+
+    def outside_locks():
+        acquired = []
+
+        def inspect_locks():
+            for lock in (observer.condition, observer.resource_lock):
+                success = lock.acquire(blocking=False)
+                acquired.append(success)
+                if success:
+                    lock.release()
+
+        other = threading.Thread(target=inspect_locks)
+        other.start()
+        other.join(5)
+        assert not other.is_alive() and acquired == [True, True]
+
+    harness.abort_check = outside_locks
+    harness.notify(10, open_error=87)
+    assert harness.aborted.wait(5)
+    harness.finish(1)
+
+
+@pytest.mark.parametrize("failed_handle", [1000, 789, 456])
+def test_close_failure_retains_primary_and_attempts_each_handle_exactly_once(
+    native_facade, failed_handle
+):
+    harness = native_facade()
+    harness.close_failures.add(failed_handle)
+    harness.notify(10, belongs=False)
+    assert harness.aborted.wait(5)
+    with pytest.raises(boundary.ObservationFailure, match="cleanup_incomplete"):
+        harness.finish(1)
+    observer = harness.observer
+    assert (
+        observer.primary_error == "ownership_unproven"
+        and observer.failure_phase == "job_membership"
+    )
+    assert observer.cleanup_error == "cleanup_incomplete" and not observer.release_complete
+    assert set(harness.closed) == {456, 789, 1000}
+    observer._release()
+    assert len(harness.closed) == 3
+
+
+def test_success_exact_totals_keep_capture_and_admission_counts_equal(native_facade):
+    harness = native_facade()
+    for pid in range(1, 33):
+        harness.notify(pid)
+    harness.finish(32)
+    observer = harness.observer
+    assert observer.error == "none" and observer.release_complete
+    assert len(observer.births) == len(observer.reservations) == len(harness.hashes) == 32
+    assert list(observer.births) == [(pid, pid * 10) for pid in range(1, 33)]
+    assert not observer.pending and observer.validating is None
+    assert len(harness.closed) == 34
+
+
+def test_actor_state_and_both_resources_are_published_before_first_start(monkeypatch, tmp_path):
+    harness = NativeFacadeHarness(monkeypatch, tmp_path, start=False)
+    real_start = threading.Thread.start
+    seen = []
+
+    def start(thread):
+        observer = harness.job.observer
+        assert observer.capture_phase == observer.admission_phase == "not_started"
+        assert observer.capture_ordinal == observer.admission_ordinal == 0
+        assert observer.primary_error == observer.cleanup_error == "none"
+        assert observer.thread is not observer.admission_thread
+        assert {resource.thread for resource in harness.resources} == {
+            observer.thread,
+            observer.admission_thread,
+        }
+        seen.append(thread)
+        return real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    try:
+        harness.start()
+        assert len(seen) == 2
+        harness.notify(10)
+        harness.finish(1)
+    finally:
+        harness.cleanup()
+
+
+@pytest.mark.parametrize(
+    "stage", ["duplicate", "port", "associate", "capture-start", "admission-start"]
+)
+def test_startup_failures_account_for_all_allocated_handles(monkeypatch, tmp_path, stage):
+    harness = NativeFacadeHarness(monkeypatch, tmp_path, start=False)
+    harness.startup_failure = stage
+    real_start = threading.Thread.start
+
+    def start(thread):
+        observer = harness.job.observer
+        if thread is getattr(
+            observer, "thread" if stage == "capture-start" else "admission_thread"
+        ):
+            raise RuntimeError("private-startup-error")
+        return real_start(thread)
+
+    if stage.endswith("-start"):
+        monkeypatch.setattr(threading.Thread, "start", start)
+    try:
+        with pytest.raises((boundary.ObservationFailure, RuntimeError)):
+            harness.start()
+        for resource in harness.resources:
+            assert not resource.thread.is_alive()
+        assert set(harness.closed) == (
+            set() if stage == "duplicate" else {456} if stage == "port" else {456, 789}
+        )
+    finally:
+        harness.cleanup()
+
+
+def test_timeout_is_sticky_preserves_live_resources_and_blocks_root_cleanup(
+    native_facade, monkeypatch, tmp_path
+):
+    harness = native_facade()
+    entered, release = harness.block_hash()
+    harness.notify(10)
+    assert entered.wait(5)
+    harness.flush_capture()
+    observer = harness.observer
+    actual = witness.FacadeObservation(temp_root=tmp_path, admitted_images={}, mode="test_valid")
+    actual.resources = harness.resources
+    assert not actual.quiescent()
+    # Advance only the facade controller's budget clock. Real threads and Events
+    # remain live; no arbitrary delay or five-second test timeout is needed.
+    ticks = iter(range(0, 1000, 10))
+    with monkeypatch.context() as patch:
+        patch.setattr(witness, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+        with pytest.raises(boundary.ObservationFailure, match="cleanup_incomplete"):
+            observer.finish(1)
+    assert observer.error == observer.cleanup_error == "cleanup_incomplete"
+    assert observer.admission_thread.is_alive() and not observer.release_complete
+    assert not actual.quiescent() and not harness.closed
+    assert tmp_path.exists()
+    release.set()
+    for thread in (observer.thread, observer.admission_thread):
+        thread.join(5)
+        assert not thread.is_alive()
+    observer._release()
+    assert observer.error == observer.cleanup_error == "cleanup_incomplete"
+    assert not observer.births and observer.release_complete
+    with pytest.raises(boundary.ObservationFailure, match="cleanup_incomplete"):
+        observer.finish(1)
+
+
+@pytest.mark.parametrize("expected_total", [0, 2, 33], ids=["zero", "missing-birth", "over-limit"])
+def test_stopped_actors_with_unreconciled_job_total_never_become_complete(
+    native_facade, expected_total
+):
+    harness = native_facade()
+    harness.notify(10)
+    harness.flush_capture()
+    # End capture after the sole event. Admission drains its FIFO before exiting.
+    harness.post(789, 0, 2, None)
+    for thread in (harness.observer.thread, harness.observer.admission_thread):
+        thread.join(5)
+        assert not thread.is_alive()
+    harness.finish(expected_total)
+    observer = harness.observer
+    assert observer.error == observer.primary_error == "incomplete"
+    assert observer.failure_actor == "lifecycle" and observer.failure_phase == "finish"
+    assert len(observer.births) == 1 and not observer.reconciled(expected_total)
+    assert observer.release_complete
+
+
+@pytest.mark.parametrize("slot", ["handles", "reservations", "pending"])
+def test_capture_publication_failure_keeps_exact_handle_ownership(native_facade, slot):
+    harness = native_facade()
+
+    class RefuseAppend(list):
+        def append(self, record):
+            raise RuntimeError("private-publication-error")
+
+    class RefuseInsert(dict):
+        def __setitem__(self, key, value):
+            raise RuntimeError("private-publication-error")
+
+    observer = harness.observer
+    with observer.condition:
+        setattr(observer, slot, RefuseInsert() if slot == "reservations" else RefuseAppend())
+    harness.notify(10)
+    assert harness.aborted.wait(5)
+    harness.finish(1)
+    assert observer.primary_error == "native_error" and observer.failure_actor == "capture"
+    assert observer.failure_phase == "capture_publication" and observer.failure_ordinal == 1
+    assert not observer.births and not harness.hashes
+    assert len(observer.reservations) == (1 if slot == "pending" else 0)
+    assert observer.release_complete and set(harness.closed) == {456, 789, 1000}
+
+
+def test_wake_failure_is_cleanup_failure_even_after_all_births_admitted(native_facade):
+    harness = native_facade()
+    harness.notify(10)
+    with harness.observer.condition:
+        assert harness.observer.condition.wait_for(lambda: len(harness.observer.births) == 1, 5)
+    harness.api.PostQueuedCompletionStatus = lambda *args: False
+    with pytest.raises(boundary.ObservationFailure, match="cleanup_incomplete"):
+        harness.finish(1)
+    harness.assert_stopped()
+    assert harness.observer.cleanup_error == harness.observer.error == "cleanup_incomplete"
+    assert harness.observer.release_complete and set(harness.closed) == {456, 789, 1000}
+
+
+@pytest.mark.parametrize(
+    "packet",
+    [{"key": 3}, {"pid": None}, {"pid": 0}, {"pid": 2**32}],
+    ids=["foreign-key", "null-pid", "zero-pid", "large-pid"],
+)
+def test_completion_port_rejects_unowned_or_invalid_birth_before_open(native_facade, packet):
+    harness = native_facade()
+    harness.notify(**packet)
+    assert harness.aborted.wait(5)
+    harness.finish(1)
+    assert harness.observer.primary_error == "native_error"
+    assert harness.observer.failure_actor == "capture"
+    assert harness.observer.failure_phase == "notification"
+    assert not harness.handles and not harness.hashes
+
+
+def test_live_admission_lifetime_alone_blocks_execute_work_root_removal(
+    native_facade, monkeypatch, tmp_path
+):
+    harness = native_facade()
+    entered, release = harness.block_hash()
+    harness.notify(10)
+    assert entered.wait(5)
+    harness.flush_capture()
+    harness.post(789, 0, 2, None)
+    harness.observer.thread.join(5)
+    assert not harness.observer.thread.is_alive() and harness.observer.admission_thread.is_alive()
+    work = tmp_path / "retained-work"
+    work.mkdir()
+    marker = work / "owned-input"
+    marker.write_bytes(b"must remain while hashing is live")
+    actual = witness.FacadeObservation(temp_root=work, admitted_images={}, mode="test_valid")
+    actual.resources = harness.resources
+    inputs = tmp_path / "input-expectations.json"
+    inputs.write_bytes(common.canonical(expected(False)))
+    args = SimpleNamespace(
+        output=tmp_path / witness.RECEIPT_NAME,
+        admitted_expectations=tmp_path / witness.EXPECTATIONS_NAME,
+        expectations=inputs,
+        repo=tmp_path,
+        work_root=work,
+        temp_root=tmp_path,
+    )
+    monkeypatch.setattr(witness.alpha, "admit_platform", lambda: None)
+    monkeypatch.setattr(common, "adopt_work_root", lambda *args: work)
+    monkeypatch.setattr(witness, "bind_controller", lambda *args: None)
+    monkeypatch.setattr(
+        witness.alpha,
+        "prepare",
+        lambda *args: (work, {"LOCALAPPDATA": str(work), "SYSTEMROOT": str(work)}, []),
+    )
+    monkeypatch.setattr(witness, "verify_inputs", lambda *args: None)
+    monkeypatch.setattr(witness, "generated_authorities", lambda *args: ({}, []))
+    monkeypatch.setattr(witness, "verify_generated", lambda *args: None)
+    monkeypatch.setattr(witness.alpha, "probe", lambda *args: {"runtime_identity_sha256": "d" * 64})
+    monkeypatch.setattr(witness.alpha, "verify_native", lambda *args: None)
+    monkeypatch.setattr(common, "local_path", lambda path, **kwargs: path)
+
+    def sequence(**kwargs):
+        kwargs["observations"].append(actual)
+        raise common.WitnessError("child_failed")
+
+    monkeypatch.setattr(witness, "facade_sequence", sequence)
+    assert witness.execute(args) == 1
+    assert marker.read_bytes() == b"must remain while hashing is live"
+    assert not args.output.exists()
+    assert not actual.quiescent() and not harness.closed
+    release.set()
+    harness.finish(1)
+    assert actual.quiescent()
+
+
+@pytest.mark.parametrize("stage", ["accounting", "terminate", "drain"])
+def test_job_close_native_failure_still_stops_both_observer_actors(monkeypatch, tmp_path, stage):
+    harness = NativeFacadeHarness(monkeypatch, tmp_path, start=False)
+    job_closed = []
+
+    class Job:
+        def __init__(self):
+            self.handle, self.api, self.accounting_calls = 42, harness.api, 0
+
+        def accounting(self):
+            self.accounting_calls += 1
+            if stage == "accounting" or stage == "drain" and self.accounting_calls > 1:
+                raise boundary.ObservationFailure("native_error")
+            return SimpleNamespace(total_processes=1, active_processes=0)
+
+        def assign(self, process):
+            pytest.fail("no process assignment in a native cleanup fixture")
+
+        def close(self):
+            job_closed.append(self.handle)
+
+    harness.api.TerminateJobObject = lambda *args: stage != "terminate"
+    monkeypatch.setattr(common, "WindowsJob", Job)
+    actual = witness.FacadeObservation(
+        temp_root=tmp_path, admitted_images=harness.admitted, mode="test_valid"
+    )
+    # Isolate the Job lifecycle while retaining its real constructor/observer.
+    # TEMP/product invocation is covered separately and is not synthetic proof.
+    actual.started = True
+    actual.watcher = SimpleNamespace(error="none")
+    try:
+        job = actual.job_factory()
+        harness.observer, harness.job, harness.resources = job.observer, job, actual.resources
+        harness.notify(10)
+        with job.observer.condition:
+            assert job.observer.condition.wait_for(lambda: len(job.observer.births) == 1, 5)
+        with pytest.raises(boundary.ObservationFailure, match="cleanup_incomplete"):
+            job.close()
+        harness.assert_stopped()
+        assert not job.observation_open and not job.resources_closed
+        assert job.observer.release_complete and actual.quiescent()
+        assert (
+            job.observer.primary_error == "incomplete" and job.observer.failure_actor == "lifecycle"
+        )
+        assert set(harness.closed) == {456, 789, 1000} and job_closed == [42]
+        with pytest.raises(boundary.ObservationFailure, match="cleanup_incomplete"):
+            job.close()
+        assert job_closed == [42]
+    finally:
+        harness.cleanup()
 
 
 def test_failure_diagnostics_never_include_raw_exceptions(capsys):
@@ -568,7 +1230,17 @@ def fake_observation(monkeypatch, tmp_path, *, active=0, mode="test_valid"):
             self.error = "none"
             self.births = {(index, index + 1): kind for index, kind in enumerate(sorted(admitted))}
             self.thread = SimpleNamespace(is_alive=lambda: False)
-            resources.append(self)
+            self.admission_thread = SimpleNamespace(is_alive=lambda: False)
+            self.reservations = dict(self.births)
+            self.pending, self.validating = [], None
+            self.release_complete = True
+            self.capture_done, self.admission_done = threading.Event(), threading.Event()
+            self.capture_done.set()
+            self.admission_done.set()
+            resources.extend([self, SimpleNamespace(thread=self.admission_thread, error="none")])
+
+        def reconciled(self, total):
+            return self.error == "none" and len(self.births) == len(self.reservations) == total
 
         def finish(self, total):
             calls.append(("process_finished", total))
@@ -614,6 +1286,24 @@ def test_single_job_observation_closes_before_final_temp_drain(monkeypatch, tmp_
     assert calls == ["assign", "terminate", ("process_finished", 5), "job_closed", "temp_finished"]
 
 
+def test_final_observation_refuses_live_admission_before_reading_maps(monkeypatch, tmp_path):
+    actual, _ = fake_observation(monkeypatch, tmp_path)
+    actual.start()
+    job = actual.job_factory()
+    job.close()
+    live = SimpleNamespace(is_alive=lambda: True)
+    job.observer.admission_thread = live
+    actual.resources[2].thread = live
+
+    class MutableBirths:
+        def values(self):
+            pytest.fail("final observation read births while admission was live")
+
+    job.observer.births = MutableBirths()
+    with pytest.raises(boundary.ObservationFailure, match="cleanup_incomplete"):
+        actual.finish()
+
+
 def test_forced_cleanup_cannot_erase_active_survivor_evidence(monkeypatch, tmp_path):
     actual, _ = fake_observation(monkeypatch, tmp_path, active=1)
     actual.start()
@@ -636,11 +1326,15 @@ def test_observation_rechecks_each_admitted_executable_after_execution(monkeypat
     actual.close()
 
 
-def test_aborted_observer_never_assigns_job_or_opens_gate(monkeypatch, tmp_path):
+@pytest.mark.parametrize("source", ["temp", "capture", "admission"])
+def test_aborted_observer_never_assigns_job_or_opens_gate(monkeypatch, tmp_path, source):
     actual, calls = fake_observation(monkeypatch, tmp_path)
     actual.start()
     job = actual.job_factory()
-    actual.watcher.error = "unexpected_temp"
+    if source == "temp":
+        actual.watcher.error = "unexpected_temp"
+    else:
+        job.observer.error = "process_unavailable" if source == "capture" else "access_denied"
     with pytest.raises(boundary.ObservationFailure):
         job.assign(object())
     assert "assign" not in calls
@@ -882,22 +1576,6 @@ def test_failed_process_construction_still_retains_stderr_collector(monkeypatch)
     assert observed.collectors == [collector]
 
 
-def test_missing_birth_retains_attempt_and_native_phase(monkeypatch, tmp_path):
-    observer, calls, _, _ = process_observer(monkeypatch, tmp_path, denied=87)
-    # Production initializes before starting the inherited reader. This test's
-    # synthetic observer has no constructor/native thread.
-    initialize = getattr(observer, "_initialize_evidence", lambda: None)
-    initialize()
-    observer.births[(5, 50)] = "base_python"
-    with pytest.raises(boundary.ObservationFailure, match="process_unavailable"):
-        observer._observe(10)
-    assert observer.attempted_birth_ordinal == 2
-    assert observer.failure_phase == "open_process"
-    assert observer.primary_error == "process_unavailable"
-    assert list(observer.births.values()) == ["base_python"]
-    assert calls == [("open", 0x1000, False, 10)]
-
-
 def diagnostic_observation(tmp_path):
     """Synthetic stopped collectors, never a native inventory qualification."""
     actual = witness.FacadeObservation(temp_root=tmp_path, admitted_images={}, mode="run_1")
@@ -905,11 +1583,20 @@ def diagnostic_observation(tmp_path):
     observer = object.__new__(witness.FacadeProcessObserver)
     observer._initialize_evidence()
     observer.thread, observer.error, observer.release_complete = quiet, "process_unavailable", True
-    observer.attempted_birth_ordinal = 3
+    observer.admission_thread = quiet
+    observer.capture_done.set()
+    observer.admission_done.set()
+    observer.capture_ordinal = observer.failure_ordinal = 3
+    observer.admission_ordinal = 2
     observer.notification_count = 3
-    observer.phase = observer.failure_phase = "open_process"
-    observer.primary_error = "process_unavailable"
+    observer.capture_phase = observer.failure_phase = "open_process"
+    observer.admission_phase = "admitted_birth"
+    observer.failure_actor = "capture"
+    observer.primary_error = observer.capture_error = "process_unavailable"
     observer.births = {(123456, 999999): "base_python", (234567, 888888): "powershell"}
+    observer.reservations = {
+        key: ("private-source-image.exe", index + 1) for index, key in enumerate(observer.births)
+    }
     actual.jobs = [
         SimpleNamespace(
             observer=observer,
@@ -933,7 +1620,11 @@ def diagnostic_observation(tmp_path):
     )
     actual.relay_exit_code = 1
     actual.stdout_summary = summary(b"K5_FACADE_FAILED\n", "run_1")
-    actual.resources = [observer, actual.watcher]
+    actual.resources = [
+        observer,
+        SimpleNamespace(thread=observer.admission_thread, error="none"),
+        actual.watcher,
+    ]
     actual.collectors = [actual.stdout_summary, actual.owned.stderr_summary]
     return actual
 
@@ -945,7 +1636,12 @@ def test_failure_snapshot_is_distinct_source_free_prefix_and_cached_exits(tmp_pa
     assert value["snapshot_state"] == "quiescent"
     assert value["observer"]["admitted_classes"] == ["base_python", "powershell"]
     assert value["observer"]["admitted_counts"]["unknown"] == 0
-    assert value["observer"]["attempted_birth_ordinal"] == 3
+    assert value["schema_version"] == "installed-alpha-facade-evidence-v2"
+    assert value["observer"]["capture_ordinal"] == value["observer"]["failure_ordinal"] == 3
+    assert value["observer"]["admission_ordinal"] == 2
+    assert value["observer"]["captured_count"] == value["observer"]["admitted_count"] == 2
+    assert value["observer"]["pending_count"] == value["observer"]["validating_count"] == 0
+    assert value["observer"]["failure_actor"] == "capture"
     assert value["job"]["observer_abort_requested"] is True
     assert value["exit"]["relay_exit_code"] == 1
     assert value["exit"]["child_exit_code"] is None
@@ -959,16 +1655,19 @@ def test_failure_snapshot_is_distinct_source_free_prefix_and_cached_exits(tmp_pa
         witness.validate_receipt(value, expected())
 
 
-@pytest.mark.parametrize("slot", ["process", "temp", "stdout", "stderr"])
+@pytest.mark.parametrize("slot", ["process", "admission", "temp", "stdout", "stderr"])
 def test_live_reader_makes_entire_snapshot_unavailable_without_accessing_maps(tmp_path, slot):
     actual = diagnostic_observation(tmp_path)
     target = {
         "process": actual.jobs[0].observer,
+        "admission": actual.resources[1],
         "temp": actual.watcher,
         "stdout": actual.stdout_summary,
         "stderr": actual.owned.stderr_summary,
     }[slot]
     target.thread = SimpleNamespace(is_alive=lambda: True)
+    if slot == "admission":
+        actual.jobs[0].observer.admission_thread = target.thread
 
     # A racing map must not be touched even if other readers are already stopped.
     class MutableBirths:
@@ -980,6 +1679,30 @@ def test_live_reader_makes_entire_snapshot_unavailable_without_accessing_maps(tm
     witness.validate_failure_evidence(value)
     assert value["snapshot_state"] == "not_quiescent"
     assert all(value[key] is None for key in witness.EVIDENCE_PARTS)
+
+
+def test_stopped_failure_snapshot_counts_all_unadmitted_reservations(tmp_path):
+    actual = diagnostic_observation(tmp_path)
+    observer = actual.jobs[0].observer
+    observer.births.pop((234567, 888888))
+    third = (345678, 777777)
+    observer.reservations[third] = (third, "private-image-path.exe", 3)
+    observer.pending.append(observer.reservations[third])
+    observer.capture_ordinal, observer.capture_phase = 0, "notification"
+    observer.admission_ordinal = observer.failure_ordinal = 2
+    observer.failure_actor = "admission"
+    observer.admission_phase = observer.failure_phase = "image_admission"
+    observer.capture_error = "none"
+    observer.error = observer.primary_error = observer.admission_error = "access_denied"
+    value = witness.failure_evidence(actual, "run_1")
+    witness.validate_failure_evidence(value)
+    evidence = value["observer"]
+    assert evidence["captured_count"] == 3 and evidence["admitted_count"] == 1
+    assert evidence["pending_count"] == 2 and evidence["validating_count"] == 0
+    assert evidence["failure_actor"] == "admission" and evidence["failure_ordinal"] == 2
+    assert evidence["capture_ordinal"] == 0 and evidence["admission_ordinal"] == 2
+    encoded = common.canonical(value)
+    assert b"private" not in encoded and b"345678" not in encoded and b"777777" not in encoded
 
 
 def test_snapshot_does_not_invent_accounting_or_successful_release(tmp_path):
@@ -996,7 +1719,10 @@ def test_snapshot_does_not_invent_accounting_or_successful_release(tmp_path):
 
 
 @pytest.mark.parametrize("prior", ["none", "live", "exited", "read_failed"])
-def test_owned_abort_records_only_stopped_prior_exit_without_polling(monkeypatch, tmp_path, prior):
+@pytest.mark.parametrize("actor", ["thread", "admission_thread"])
+def test_owned_abort_records_only_stopped_prior_exit_without_polling(
+    monkeypatch, tmp_path, prior, actor
+):
     actual, calls = fake_observation(monkeypatch, tmp_path)
     actual.start()
     job = actual.job_factory()
@@ -1017,7 +1743,7 @@ def test_owned_abort_records_only_stopped_prior_exit_without_polling(monkeypatch
                 read_failed=prior == "read_failed",
             ),
         )
-    job.observer.thread = threading.current_thread()
+    setattr(job.observer, actor, threading.current_thread())
     job.abort()
     assert job.observer_abort_requested and job.aborted
     assert calls == ["terminate"]
@@ -1029,7 +1755,7 @@ def test_owned_abort_records_only_stopped_prior_exit_without_polling(monkeypatch
     )
     assert value["relay_exit_code"] == (None if prior == "none" else 24)
     # A stopped, read-failed collector is explicitly marked, never clean exit proof.
-    job.observer.thread = SimpleNamespace(is_alive=lambda: False)
+    setattr(job.observer, actor, SimpleNamespace(is_alive=lambda: False))
     job.close()
     actual.close()
 
@@ -1043,101 +1769,6 @@ def test_other_abort_source_is_not_mislabeled_as_process_observer(monkeypatch, t
     assert actual.exit_before_observer_abort is None
     job.close()
     actual.close()
-
-
-@pytest.mark.parametrize("denied,error", [(5, "access_denied"), (87, "process_unavailable")])
-def test_reader_keeps_single_query_refusal_phase_and_abort(monkeypatch, tmp_path, denied, error):
-    observer, calls, _, _ = process_observer(monkeypatch, tmp_path, denied=denied)
-    aborted = []
-    observer.job = SimpleNamespace(abort=lambda: aborted.append(True))
-    observer.error, observer.stop, observer.port = "none", threading.Event(), 1
-    observer._release = lambda: None
-
-    def event(port, message, key, value, timeout):
-        assert timeout == 100
-        message._obj.value, key._obj.value, value._obj.value = 6, 1, 10
-        return True
-
-    observer.api.GetQueuedCompletionStatus = event
-    observer._read()
-    assert observer.error == observer.primary_error == error
-    assert observer.failure_phase == "open_process"
-    assert observer.attempted_birth_ordinal == observer.notification_count == 1
-    assert not observer.births and aborted == [True]
-    assert calls == [("open", 0x1000, False, 10)]
-
-
-@pytest.mark.parametrize(
-    "case,phase,error",
-    [
-        ("foreign", "job_membership", "ownership_unproven"),
-        ("unknown", "image_admission", "unexpected_process"),
-        ("overflow", "birth_limit", "limit"),
-        ("image-denied", "image_query", "access_denied"),
-        ("times-denied", "process_times", "access_denied"),
-    ],
-    ids=["foreign", "unknown", "overflow", "image-denied", "times-denied"],
-)
-def test_failed_birth_records_only_admitted_prefix(monkeypatch, tmp_path, case, phase, error):
-    observer, calls, _, _ = process_observer(
-        monkeypatch,
-        tmp_path,
-        kind="unknown" if case == "unknown" else "gst_launch",
-        belongs=case != "foreign",
-    )
-    if case == "overflow":
-        observer.births = {(i, i): "gst_launch" for i in range(witness.MAX_PROCESSES)}
-    if case in {"image-denied", "times-denied"}:
-        name = "QueryFullProcessImageNameW" if case == "image-denied" else "GetProcessTimes"
-        setattr(observer.api, name, lambda *args: False)
-        monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
-    before = dict(observer.births)
-    with pytest.raises(boundary.ObservationFailure, match=error):
-        observer._observe(100)
-    assert observer.primary_error == error and observer.failure_phase == phase
-    assert observer.births == before
-    assert observer.attempted_birth_ordinal == len(before) + 1
-    assert len([call for call in calls if call[0] == "open"]) == 1
-
-
-def test_duplicate_notification_and_pid_reuse_keep_distinct_admitted_ordinals(
-    monkeypatch, tmp_path
-):
-    observer, calls, birth, _ = process_observer(monkeypatch, tmp_path)
-    observer._observe(10)
-    observer._observe(10)
-    assert observer.duplicate_count == 1 and observer.notification_count == 2
-    assert observer.attempted_birth_ordinal == 2 and len(observer.births) == 1
-    assert observer.phase == "duplicate_birth"
-    birth[0] += 1
-    observer._observe(10)
-    assert observer.attempted_birth_ordinal == 2 and len(observer.births) == 2
-    assert observer.phase == "admitted_birth"
-    assert len([call for call in calls if call[0] == "image"]) == 2
-    for _ in range(witness.MAX_EVENTS + 1):
-        observer._observe(10)
-    assert observer.duplicate_count == observer.notification_count == witness.MAX_EVENTS
-    assert len(observer.births) == 2  # Capping telemetry cannot change admission.
-
-
-def test_close_error_cannot_erase_primary_native_phase(monkeypatch, tmp_path):
-    observer, _, _, _ = process_observer(monkeypatch, tmp_path, belongs=False)
-    observer.api.CloseHandle = lambda handle: False
-    with pytest.raises(boundary.ObservationFailure, match="cleanup_incomplete"):
-        observer._observe(10)
-    assert observer.primary_error == "ownership_unproven"
-    assert observer.failure_phase == "job_membership"
-    assert observer.cleanup_error == "cleanup_incomplete"
-
-
-def test_diagnostic_state_initialized_before_inherited_reader_can_start(monkeypatch):
-    def constructor(self, *args):
-        assert self.phase == self.failure_phase == "not_started"
-        assert self.primary_error == self.cleanup_error == "none"
-        assert self.attempted_birth_ordinal == self.notification_count == self.duplicate_count == 0
-
-    monkeypatch.setattr(boundary.ProcessObserver, "__init__", constructor)
-    witness.FacadeProcessObserver(None, None, [])
 
 
 @pytest.mark.parametrize(
@@ -1172,11 +1803,22 @@ def test_bounded_stdout_evidence_never_contains_raw_output(tmp_path, raw, mode):
         (None, "schema_version", "installed-alpha-facades-v1"),
         (None, "mode", True),
         (None, "snapshot_state", "complete"),
-        ("observer", "attempted_birth_ordinal", True),
-        ("observer", "attempted_birth_ordinal", 34),
+        ("observer", "capture_ordinal", True),
+        ("observer", "capture_ordinal", 34),
+        ("observer", "admission_ordinal", True),
+        ("observer", "failure_ordinal", 34),
+        ("observer", "captured_count", 33),
+        ("observer", "pending_count", True),
+        ("observer", "pending_count", 1),
+        ("observer", "admitted_count", 1),
+        ("observer", "validating_count", 1),
+        ("observer", "failure_actor", "private-actor"),
+        ("observer", "admission_phase", "private-phase"),
+        ("observer", "capture_error", "private-error"),
+        ("observer", "admission_error", "private-error"),
         ("observer", "notifications_capped", 257),
         ("observer", "duplicates_capped", -1),
-        ("observer", "phase", "private-path"),
+        ("observer", "capture_phase", "private-path"),
         ("observer", "primary_error", "raw-native-error"),
         ("observer", "admitted_classes", ["unknown"]),
         ("job", "total", True),
@@ -1197,6 +1839,17 @@ def test_bounded_stdout_evidence_never_contains_raw_output(tmp_path, raw, mode):
         "state",
         "ordinal-bool",
         "ordinal-overflow",
+        "admission-ordinal-bool",
+        "failure-ordinal-overflow",
+        "captured-overflow",
+        "pending-bool",
+        "pending-contradiction",
+        "admitted-contradiction",
+        "live-validation",
+        "raw-actor",
+        "raw-admission-phase",
+        "raw-capture-error",
+        "raw-admission-error",
         "count-overflow",
         "negative-duplicate",
         "raw-phase",
@@ -1424,7 +2077,14 @@ def test_success_path_does_not_emit_diagnostics_or_change_receipt(monkeypatch, t
 
 
 @pytest.mark.parametrize(
-    "key", ["process_stopped", "temp_stopped", "stdout_stopped", "stderr_stopped"]
+    "key",
+    [
+        "process_capture_stopped",
+        "process_admission_stopped",
+        "temp_stopped",
+        "stdout_stopped",
+        "stderr_stopped",
+    ],
 )
 def test_quiescent_schema_rejects_contradictory_live_reader(tmp_path, key):
     value = witness.failure_evidence(diagnostic_observation(tmp_path), "run_1")

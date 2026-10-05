@@ -73,21 +73,56 @@ TEMP/profile/cache are owned and independent of the exported source tree.
 ## Observations and refusal
 
 The accepted invalid-Start five-birth observer is unchanged. The new facade
-observer reuses its completion-port, least-privilege process-handle, TEMP I/O,
-cancellation-race draining, and guarded-assignment machinery with a separate
-image policy:
+observer retains its completion-port and least-privilege native API contract,
+TEMP I/O, cancellation-race draining, and guarded-assignment machinery, with a
+facade-local two-actor lifecycle and a separate image policy:
 
 - Invalid Test: admitted base/venv Python, PowerShell and console-host images
 - Valid Test: those images plus the admitted GStreamer launch/version executable
 - Run: those images plus GStreamer launch, inspect, plugin scanner and MediaMTX
 
 Every image is bound by exact path and raw SHA256, then checked again after
-execution. Every Job-reported birth must be observed and reconciled, including
-short-lived children. Image inspection follows proof that the exact process is
-owned by this Job; PID/name scans are never used. Unknown image, unavailable
-birth, denied read, count overflow, or incomplete coverage aborts only that owned
-Job and refuses acceptance. A process that exited before inspection is never
-inferred from totals or silently classified. No permission escalation occurs.
+execution. One fixed capture actor consumes the owned Job completion port. It
+performs exactly one `OpenProcess(0x1000, False, pid)` per birth notification,
+proves membership of the exact duplicated Job handle, reads positive creation
+time, deduplicates `(pid, creation_time)`, enforces the 32-reservation bound,
+and queries the image immediately through that same handle. Only then does it
+publish a private FIFO record for the one fixed ordered admission actor.
+
+The admission actor performs the unchanged path/class check and full raw SHA256
+for **every distinct birth**, without a state/resource lock across hashing.
+There is no digest cache, pre/post-only replacement, process reopen, alternate
+process API, PID/name scan, or guessed image. Capture can proceed while an older
+birth is being hashed. A captured birth enters the accepted inventory only after
+its own successful hash. Unknown image, unavailable birth (including error 87),
+denied read, overflow or incomplete coverage still aborts only this owned Job and
+refuses acceptance. An exited or missing birth is never inferred from totals.
+
+One registry owns all reserved process handles, including queued, validating and
+failed records. At most 32 distinct reservations can coexist across all those
+states and admitted births, plus one transient capture handle. A duplicate is
+closed without another reservation or hash; PID reuse with a new creation time
+is distinct. Queue image strings are bounded by the existing 32,768-character
+query buffer. The 256-notification diagnostic ceiling saturates telemetry only;
+it never becomes an extra duplicate-rejection limit.
+
+Both actors and their lifetimes are registered before Job assignment can admit
+children. Either actor publishes terminal failure before requesting owned abort.
+No resource closes while either actor can still use it. Finish shares the existing
+two-second reconciliation budget and three-second join budget across both actors;
+it requires captured and admitted totals to match exact Job accounting, no pending
+validation, both stopped, and complete handle release. A live validator preserves
+its resources and work root. Timeout remains a failure even if it later exits and
+safely releases those resources. Forced cleanup cannot erase pre-close survivors.
+
+This removes demonstrated synchronous hash-induced queue blocking. It does not
+prove native notification timing or identify notification 25 in the prior failed
+run. Windows may report an already-exited/reused PID or omit ordinary Job
+notifications; capture still contains native calls and is subject to scheduling.
+Exact Job accounting detects incompleteness and cannot replace identity evidence.
+Deferred path hashing retains the existing evidence model: it is not an atomic
+attestation of bytes loaded at birth, and can widen that observation-time gap.
+The per-birth and final raw hashes are both still required.
 
 The receipt retains observed class counts rather than asserting a guessed exact
 success inventory. Valid Test genuinely runs analytics admission, GStreamer
@@ -235,20 +270,28 @@ outside this owned generated-fixture boundary and remain separate gates.
 
 ## Failure-only phase evidence
 
-`K5_FACADE_EVIDENCE` is a separate `installed-alpha-facade-evidence-v1` diagnostic,
+`K5_FACADE_EVIDENCE` is a separate `installed-alpha-facade-evidence-v2` diagnostic,
 never a success receipt or an alternative acceptance path. Its exact typed schema
 is bounded to 8 KiB and emitted only on failure after cleanup. A live collector
 produces `not_quiescent` with no partial snapshot; diagnostic collection failure
 produces `unavailable`. Neither changes the original primary/cleanup errors.
 
-The process record retains the next attempted distinct-birth ordinal, fixed
-native API/admission phase, admitted class prefix/counts, and fixed observer
-errors. Notification/duplicate counts saturate at 256; admitted births remain
-limited to 32, with ordinal 33 identifying an attempted over-limit candidate.
-An unobserved birth is not assigned any image class. Duplicate notifications do
-not add admitted births, and PID reuse still requires a distinct observed birth.
-OpenProcess remains one call with access mask 0x1000: error 87 still refuses and
-requests owned Job abort. There is no alternate lookup or new polling/retry.
+The v2 process record distinguishes captured reservations, admitted births,
+unadmitted (`pending_count`) reservations, and an active validator. A quiescent
+snapshot has no active validator. Capture and admission each retain their own
+ordinal, phase and error; the first published primary error additionally freezes
+its actor/phase/ordinal. This is detection order, not proof of which birth first
+failed. Lifecycle startup/finish failures carry ordinal zero. At completion-port
+waits capture has ordinal zero; a birth's ordinal is assigned from reservations,
+not the slower admitted count. Ordinal 33 identifies an over-limit attempt.
+
+Admitted classes/counts are the checked FIFO prefix. Notification and duplicate
+counts saturate at 256; captured/admitted bounds remain 32. A missing birth gets
+no image class. Both capture and admission stopped facts replace the old single
+process-reader fact. A live actor or collector yields no partial snapshot.
+Only failure diagnostics are versioned; success receipts and expectations retain
+their exact prior schemas. Cached pre-abort exit attribution recognizes either
+observer actor and still never queries another process or performs a fresh poll.
 
 The diagnostic also retains pre-close Job total/active accounting when obtained,
 reader/handle-release facts, bounded existing stdout markers/milestones/counters,

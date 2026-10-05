@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -20,11 +21,23 @@ common = witness.common
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Requires Windows owned Job image observation")
-def test_windows_facade_process_observer_real_owned_births(tmp_path):
+def test_windows_facade_process_observer_real_owned_births(tmp_path, monkeypatch):
     """Low-level hosted test only. This does not execute or qualify Test/Run."""
     env = common.clean_environment(dict(os.environ))
     base = common.admitted_gate_python(env)
     resources, jobs = [], []
+    hash_entered, release_hash = threading.Event(), threading.Event()
+    hashes = []
+    raw_hash = witness.boundary.file_hash
+
+    def controlled_hash(path):
+        hashes.append(path)
+        if len(hashes) == 1:
+            hash_entered.set()
+            assert release_hash.wait(15), "Owned-Python hash barrier did not release"
+        return raw_hash(path)
+
+    monkeypatch.setattr(witness.boundary, "file_hash", controlled_hash)
 
     class ObservedJob(common.WindowsJob):
         def __init__(self):
@@ -60,6 +73,15 @@ def test_windows_facade_process_observer_real_owned_births(tmp_path):
             stdout=subprocess.DEVNULL,
             job_factory=ObservedJob,
         )
+        observed = owned.job.observer
+        assert hash_entered.wait(15)
+        with observed.condition:
+            assert observed.condition.wait_for(lambda: len(observed.reservations) >= 2, 15)
+            # The owned relay and its admitted Python child are already captured
+            # on their one limited handle, while the first raw hash remains held.
+            assert not observed.births and len(hashes) == 1
+            assert len(observed.handles) >= 2
+        release_hash.set()
         owned.wait(15)
         accounting = owned.job.accounting()
         assert accounting.active_processes == 0
@@ -69,16 +91,24 @@ def test_windows_facade_process_observer_real_owned_births(tmp_path):
         assert observed.error == "none"
         assert len(observed.births) == accounting.total_processes
         assert set(observed.births.values()) == {"base_python"}
-        assert observed.release_complete
+        assert observed.release_complete and not observed.handles
+        assert not observed.thread.is_alive() and not observed.admission_thread.is_alive()
+        assert observed.capture_done.is_set() and observed.admission_done.is_set()
+        assert not observed.pending and observed.validating is None
+        assert observed.reconciled(accounting.total_processes)
+        assert len(hashes) == len(observed.reservations) == len(observed.births)
         # Actual hosted owned-Python births qualify diagnostic initialization and
         # collection only, never an installed facade success profile.
-        assert 0 < observed.attempted_birth_ordinal <= len(observed.births) + 1
+        assert observed.admission_ordinal == len(observed.births)
         assert len(observed.births) <= observed.notification_count <= witness.MAX_EVENTS
         assert observed.primary_error == observed.cleanup_error == "none"
         assert observed.failure_phase == "not_started"
-        assert observed.phase in {"admitted_birth", "duplicate_birth"}
+        assert observed.admission_phase == "admitted_birth"
+        assert observed.capture_error == observed.admission_error == "none"
+        assert observed.failure_actor == "none"
         assert observed.duplicate_count <= observed.notification_count
     finally:
+        release_hash.set()
         if owned is not None:
             owned.close()
         assert witness.boundary.observers_quiescent(resources)
