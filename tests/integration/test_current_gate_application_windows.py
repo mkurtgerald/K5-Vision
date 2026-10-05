@@ -542,7 +542,10 @@ def test_real_shell_settled_resize_preserves_two_owned_camera_tiles(
             await settled("initial", (384, 240), (384, 240))
             await settled("shrink", (256, 192), (256, 192))
             await settled("grow", (480, 300), (480, 300))
-            await settled("minimum_clamp", (100, 80), (192, 192))
+            # Win32 enforces its own sizing-border minimum before our pump; the
+            # hosted runner clamps a 100-pixel request to 120. Use a reachable
+            # client below our 192-by-192 minimum, keeping exact pre/post checks.
+            await settled("minimum_clamp", (160, 120), (192, 192))
             assert shell.minimum_calls == 1
             prior = app.snapshot
             target_count = len(targets)
