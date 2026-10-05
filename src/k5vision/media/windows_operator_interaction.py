@@ -9,6 +9,7 @@ from collections import deque
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from k5vision.media.viewport_editor import _MAX_EDIT_DELTA
 from k5vision.media.windows_operator_application import (
     BoundedWindowsOperatorApplication,
     WindowsOperatorApplicationError,
@@ -50,6 +51,13 @@ class WindowsPointerEvent(BaseModel):
     y: int = Field(ge=-32_768, le=32_767)
 
 
+class _ProjectedWindowsPointerEvent(WindowsPointerEvent):
+    """Trusted inverse projection can span the canonical layout's wider bounds."""
+
+    x: int = Field(ge=0, le=2_000_000)
+    y: int = Field(ge=0, le=2_000_000)
+
+
 def _signed_word(value: int) -> int:
     return ctypes.c_short(value & 0xFFFF).value
 
@@ -61,7 +69,14 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
         super().__init__()
         self._pointer_events: deque[WindowsPointerEvent] = deque()
         self._capture_active = False
+        self._pointer_time_fence: int | None = None
         try:
+            self._get_tick_count = self._kernel32.GetTickCount
+            self._get_tick_count.argtypes = []
+            self._get_tick_count.restype = ctypes.c_uint32
+            self._is_child = self._user32.IsChild
+            self._is_child.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self._is_child.restype = ctypes.c_int
             self._map_window_points = self._user32.MapWindowPoints
             self._map_window_points.argtypes = [
                 ctypes.c_void_p,
@@ -165,6 +180,7 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
             ):
                 count += 1
                 hwnd = int(message.hwnd or 0)
+                self._note_geometry_message(shell, message)
                 if message.message == _WM_QUIT or (message.message == _WM_CLOSE and hwnd == shell):
                     self._cancel_pointer_capture(shell)
                     close_requested = True
@@ -174,6 +190,16 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
                     continue
                 if message.message == _WM_CAPTURECHANGED:
                     self._capture_was_lost(shell)
+                    continue
+                if message.message in {
+                    _WM_LBUTTONDOWN,
+                    _WM_MOUSEMOVE,
+                    _WM_LBUTTONUP,
+                } and not self._pointer_message_for_shell(shell, message):
+                    self._translate_message(ctypes.byref(message))
+                    self._dispatch_message(ctypes.byref(message))
+                    continue
+                if self._stale_pointer_message(message):
                     continue
                 if message.message == _WM_LBUTTONDOWN:
                     self._cancel_pointer_capture(shell)
@@ -207,6 +233,46 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
             raise _NativeShellError(_NativeShellFailure.PUMP) from None
         return count, close_requested
 
+    def _pointer_message_for_shell(self, shell: int, message: _Win32Message) -> bool:
+        hwnd = int(message.hwnd or 0)
+        if hwnd == shell:
+            return True
+        if not hwnd:
+            return False
+        try:
+            return bool(self._is_child(ctypes.c_void_p(shell), ctypes.c_void_p(hwnd)))
+        except Exception:
+            raise _NativeShellError(_NativeShellFailure.PUMP) from None
+
+    def _stale_pointer_message(self, message: _Win32Message) -> bool:
+        fence = getattr(self, "_pointer_time_fence", None)
+        if fence is None or message.message not in {_WM_LBUTTONDOWN, _WM_MOUSEMOVE, _WM_LBUTTONUP}:
+            return False
+        # MSG.time and GetTickCount use the same DWORD uptime clock. Equality is
+        # conservatively stale; subtraction is valid across the 49.7-day wrap.
+        elapsed = (int(message.time) - fence) & 0xFFFFFFFF
+        return not 0 < elapsed < 0x80000000
+
+    def discard_pointer_events(self, shell: int) -> None:
+        """Drop old-geometry input even if an UP already released capture."""
+        self._pointer_events.clear()
+        if self._capture_active:
+            try:
+                captured = int(self._get_capture() or 0)
+            except Exception:
+                raise _NativeShellError(_NativeShellFailure.PUMP) from None
+            if captured == shell:
+                self._release_pointer_capture()
+            else:
+                # Capture may already have moved to a command control or another
+                # window. Never release someone else's capture during resize.
+                self._capture_active = False
+        self._pointer_events.clear()
+        try:
+            self._pointer_time_fence = int(self._get_tick_count()) & 0xFFFFFFFF
+        except Exception:
+            raise _NativeShellError(_NativeShellFailure.PUMP) from None
+
     def drain_pointer_events(self, max_events: int) -> tuple[WindowsPointerEvent, ...]:
         if not 1 <= max_events <= _MAX_POINTER_EVENTS:
             raise _NativeShellError(_NativeShellFailure.PUMP)
@@ -218,6 +284,32 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
 
 class BoundedInteractiveWindowsOperatorApplication(BoundedWindowsOperatorApplication):
     """Visible operator application with bounded ephemeral pointer capture."""
+
+    def __init__(self, **kwargs: typing.Any) -> None:
+        super().__init__(**kwargs)
+        self._pointer_projection_cancel_pending = False
+        self._mapped_pointer_start: tuple[int, int] | None = None
+
+    def _discard_native_pointer_input(self) -> None:
+        native = self._native_api
+        try:
+            discard = getattr(native, "discard_pointer_events", None)
+            if callable(discard) and self._shell is not None:
+                discard(self._shell)
+                return
+            drain = getattr(native, "drain_pointer_events", None)
+            if callable(drain):
+                drain(_MAX_POINTER_EVENTS)
+        except Exception:
+            raise WindowsOperatorApplicationError(
+                WindowsOperatorApplicationErrorCode.PUMP_FAILURE,
+                "operator application pointer cancellation failed",
+            ) from None
+
+    def _invalidate_projected_pointer_input(self) -> None:
+        self._discard_native_pointer_input()
+        self._mapped_pointer_start = None
+        self._pointer_projection_cancel_pending = True
 
     def _ensure_native_api(self) -> _NativeShellBoundary:
         if self._native_api is not None:
@@ -251,6 +343,10 @@ class BoundedInteractiveWindowsOperatorApplication(BoundedWindowsOperatorApplica
         if not callable(drain):
             return ()
         try:
+            if self._pointer_projection_cancel_pending:
+                self._discard_native_pointer_input()
+                self._pointer_projection_cancel_pending = False
+                return (WindowsPointerEvent(kind=WindowsPointerEventKind.CANCEL, x=0, y=0),)
             events = drain(max_events)
         except _NativeShellError:
             raise WindowsOperatorApplicationError(
@@ -264,4 +360,37 @@ class BoundedInteractiveWindowsOperatorApplication(BoundedWindowsOperatorApplica
                 WindowsOperatorApplicationErrorCode.PUMP_FAILURE,
                 "operator application pointer input failed",
             )
-        return typing.cast(tuple[WindowsPointerEvent, ...], events)
+        if self._projection is None:
+            return typing.cast(tuple[WindowsPointerEvent, ...], events)
+        mapped: list[WindowsPointerEvent] = []
+        for event in events:
+            if event.kind == WindowsPointerEventKind.CANCEL:
+                self._mapped_pointer_start = None
+                mapped.append(event)
+                continue
+            point = (
+                None
+                if self._pointer_projection_suspended
+                else self._projection.logical_point(event.x, event.y)
+            )
+            start = self._mapped_pointer_start
+            invalid_delta = (
+                point is not None
+                and start is not None
+                and event.kind == WindowsPointerEventKind.UP
+                and any(
+                    abs(end - origin) > _MAX_EDIT_DELTA
+                    for end, origin in zip(point, start, strict=True)
+                )
+            )
+            if point is None or invalid_delta:
+                self._discard_native_pointer_input()
+                self._mapped_pointer_start = None
+                mapped.append(WindowsPointerEvent(kind=WindowsPointerEventKind.CANCEL, x=0, y=0))
+                break
+            if event.kind == WindowsPointerEventKind.DOWN:
+                self._mapped_pointer_start = point
+            elif event.kind == WindowsPointerEventKind.UP:
+                self._mapped_pointer_start = None
+            mapped.append(_ProjectedWindowsPointerEvent(kind=event.kind, x=point[0], y=point[1]))
+        return tuple(mapped)
