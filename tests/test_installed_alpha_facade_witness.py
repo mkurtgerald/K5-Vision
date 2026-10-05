@@ -24,6 +24,12 @@ SPEC.loader.exec_module(witness)
 common, boundary = witness.common, witness.boundary
 
 
+@pytest.fixture(autouse=True)
+def bounded_test_case_id(request):
+    # PYTEST_CURRENT_TEST includes this ID on Windows before each test phase.
+    assert len(request.node.nodeid) <= 512, "Use bounded semantic IDs for fixture payloads"
+
+
 def test_hosted_workflow_selects_facade_contracts_and_only_nonmedia_observer():
     workflow = (ROOT / ".github/workflows/windows-alpha-script-smoke.yml").read_text(
         encoding="utf8"
@@ -343,6 +349,13 @@ def test_complete_test_stdout_is_recognized_without_persisting_text(mode):
         b"K5_FACADE_EXPECTED_REFUSAL\n",
         b"K5_FACADE_FAILED\n",
         b"x" * 65537,
+    ],
+    ids=[
+        "unknown-output",
+        "duplicate-return",
+        "unexpected-refusal",
+        "failed-marker",
+        "output-flood",
     ],
 )
 @pytest.mark.parametrize("mode", ["test_valid", "test_invalid"])
