@@ -8,7 +8,11 @@ import typing
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from k5vision.media.viewport_editor import ViewportEditorError, apply_viewport_edit
+from k5vision.media.viewport_editor import (
+    ViewportEditorError,
+    ViewportEditorErrorCode,
+    apply_viewport_edit,
+)
 from k5vision.media.viewport_geometry import ViewportLayout
 from k5vision.media.viewport_history_control import (
     TransactionalViewportHistoryControl,
@@ -211,7 +215,12 @@ class BoundedHistoryWindowsOperatorControl(BoundedWindowsOperatorControl):
                     )
                 try:
                     apply_viewport_edit(self._active_layout, request.edit)
-                except ViewportEditorError:
+                except ViewportEditorError as exc:
+                    # Rejected pointer geometry is not an accepted history edit
+                    # and must not terminate the running media generation.
+                    if request.pointer_origin and exc.code == ViewportEditorErrorCode.INVALID_EDIT:
+                        self._cancelled_interactions += 1
+                        continue
                     raise WindowsOperatorControlError(
                         WindowsOperatorControlErrorCode.INVALID_EDIT,
                         "operator viewport edit is invalid",

@@ -285,7 +285,7 @@ def test_runtime_pin_matches_exact_tracked_git_blob_manifest():
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     assert len(manifest) == 136
-    assert capture.RUNTIME_REVISION == "044486401699634234843dfdf0fe02b938cc757f"
+    assert capture.RUNTIME_REVISION == "2017afdfefd80f81df610ead7461b41ad667c621"
     assert independent == capture.RUNTIME_PAYLOAD_SHA256
 
 
@@ -297,6 +297,8 @@ def test_runtime_pin_matches_exact_tracked_git_blob_manifest():
         "media/windows_operator_playback_ui.py",
         "media/windows_operator_window_procedure.py",
         "media/analytics_detection_adapter.py",
+        "media/windows_operator_control.py",
+        "media/windows_operator_history_control.py",
     ],
 )
 def test_runtime_mutation_cannot_be_admitted_by_rebinding_caller_expectations(bundle, relative):
@@ -316,6 +318,7 @@ def test_runtime_mutation_cannot_be_admitted_by_rebinding_caller_expectations(bu
         "c755ac54055c3d36ca12da20089f349b76477c7f1757c88b2cda9751160de92e",
         "f72765e7abf3c38a42285fd6cb26f46690e8b2321c600f2ddb5d5bc56eb2f3ec",
         "6b03a5168a55db435ab7b3b2272220b0bc0d7e53c2bca029760d3526d58da751",
+        "692e238ee1cd93cad319dc361b05acf0824638dab1cfa1ff2e0b24a6ce5de70f",
     ],
 )
 def test_old_runtime_expectation_is_refused_before_retention(bundle, previous_payload):

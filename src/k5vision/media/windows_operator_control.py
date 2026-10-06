@@ -14,6 +14,7 @@ from k5vision.media.mixed_presentation import MixedPresentationStream
 from k5vision.media.viewport_editor import (
     ViewportEdit,
     ViewportEditorError,
+    ViewportEditorErrorCode,
     ViewportMove,
     ViewportResize,
     apply_viewport_edit,
@@ -412,7 +413,12 @@ class BoundedWindowsOperatorControl(BoundedWindowsOperatorSession):
                     )
                 try:
                     candidate = apply_viewport_edit(self._active_layout, request.edit)
-                except ViewportEditorError:
+                except ViewportEditorError as exc:
+                    # An in-canvas drag can still move a tile past its origin or
+                    # shrink it to zero. Reject that gesture, preserving media.
+                    if request.pointer_origin and exc.code == ViewportEditorErrorCode.INVALID_EDIT:
+                        self._cancelled_interactions += 1
+                        continue
                     raise WindowsOperatorControlError(
                         WindowsOperatorControlErrorCode.INVALID_EDIT,
                         "operator viewport edit is invalid",
