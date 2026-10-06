@@ -99,6 +99,9 @@ def test_witness_uses_inert_queued_markers_without_global_input_or_capture() -> 
         "IsWindow",
         "IsChild",
         "GetParent",
+        "GetWindow",
+        "GetWindowLongPtrW",
+        "SetWindowLongPtrW",
         "GetWindowThreadProcessId",
         "GetCurrentThreadId",
         "ShowWindow",
@@ -527,3 +530,418 @@ def test_parent_interruption_during_either_join_requests_creator_cleanup(monkeyp
 
     scenario(1)
     scenario(2)
+
+
+def _native_fixture_function(name, bindings):
+    """Exercise actual nested helper bytes with pure fake Win32 dependencies."""
+    helper = _function(_tree(_WITNESS_NAME), _HELPER_NAME)
+    node = next(n for n in helper.body if isinstance(n, ast.FunctionDef) and n.name == name)
+    namespace = dict(bindings)
+    exec(
+        compile(ast.Module(body=[node], type_ignores=[]), "<native-fixture-source>", "exec"),
+        namespace,
+    )
+    return namespace[name]
+
+
+def test_sentinel_settle_is_bounded_and_revalidates_take_and_dispatch():
+    from types import SimpleNamespace
+
+    module = _diagnostic_module()
+    messages = [SimpleNamespace(message=0x031F), None]
+    events = []
+
+    def validate():
+        events.append("validate")
+
+    def take():
+        events.append("take")
+        return messages.pop(0)
+
+    def dispatch(message):
+        events.append(("dispatch", message.message))
+
+    assert module._settle_sentinel_queue(validate, take, dispatch, clock=lambda: 0) == (0x031F,)
+    assert events == [
+        "validate",
+        "take",
+        "validate",
+        ("dispatch", 0x031F),
+        "validate",
+        "validate",
+        "take",
+        "validate",
+    ]
+
+
+def test_sentinel_settle_refuses_message_count_deadline_and_callback_retirement():
+    from types import SimpleNamespace
+
+    import pytest
+
+    module = _diagnostic_module()
+    calls = []
+    message = SimpleNamespace(message=0x031F)
+    with pytest.raises(RuntimeError, match="message bound"):
+        module._settle_sentinel_queue(lambda: None, lambda: message, calls.append, clock=lambda: 0)
+    assert len(calls) == module._MAX_CYCLES == 32
+    for phase in ("validate", "take", "dispatch"):
+        now = [0]
+        events = []
+
+        def operation(name, phase=phase, now=now, events=events):
+            events.append(name)
+            if name == phase:
+                now[0] = 1.0
+            return message
+
+        with pytest.raises(RuntimeError, match="deadline"):
+            module._settle_sentinel_queue(
+                lambda: operation("validate"),
+                lambda: operation("take"),
+                lambda _: operation("dispatch"),
+                clock=lambda now=now: now[0],
+            )
+        assert events[-1] == ("validate" if phase != "validate" else phase)
+        assert events.count("take") <= 1 and events.count("dispatch") <= 1
+    for phase in ("take", "dispatch"):
+        valid = [True]
+        events = []
+
+        def validate(valid=valid):
+            if not valid[0]:
+                raise RuntimeError("generation retired")
+
+        def take(valid=valid, phase=phase):
+            if phase == "take":
+                valid[0] = False
+            return message
+
+        def dispatch(_, valid=valid, events=events):
+            events.append("dispatch")
+            valid[0] = False
+
+        with pytest.raises(RuntimeError, match="generation retired"):
+            module._settle_sentinel_queue(validate, take, dispatch, clock=lambda: 0)
+        assert events == ([] if phase == "take" else ["dispatch"])
+
+
+def _sentinel_take_fixture(queue, *, mutate=None, validate=None):
+    import ctypes
+
+    class Message(ctypes.Structure):
+        _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint32)]
+
+    calls, removed = [], []
+
+    def peek(pointer, hwnd, minimum, maximum, flags):
+        calls.append((hwnd.value, minimum, maximum, flags))
+        if mutate is not None:
+            mutate(flags)
+        for index, (target, kind) in enumerate(queue):
+            # HWND selectors include children; generated WM_QUIT bypasses filters.
+            if kind != 0x12 and (target not in (71, 72) or not minimum <= kind <= maximum):
+                continue
+            message = ctypes.cast(pointer, ctypes.POINTER(Message)).contents
+            message.hwnd, message.message = target, kind
+            if flags:
+                removed.append(queue.pop(index))
+            return 1
+        return 0
+
+    take = _native_fixture_function(
+        "take_sentinel_message",
+        {
+            "ctypes": ctypes,
+            "_Win32Message": Message,
+            "sentinel": 71,
+            "_SENTINEL_SYSTEM_MESSAGE": 0x031F,
+            "_PM_NOREMOVE": 0,
+            "_PM_REMOVE": 1,
+            "raw_peek": peek,
+            "validate_sentinel_phase": validate or (lambda: None),
+        },
+    )
+    return take, calls, removed
+
+
+def test_sentinel_exact_notification_is_settled_without_foreign_or_other_kind_removal():
+    queue = [(999, 0x031F), (0, 0x8001), (71, 0x8002), (71, 0x031F)]
+    take, calls, removed = _sentinel_take_fixture(queue)
+    message = take()
+    assert (message.hwnd, message.message) == (71, 0x031F)
+    assert removed == [(71, 0x031F)]
+    assert take() is None
+    assert queue == [(999, 0x031F), (0, 0x8001), (71, 0x8002)]
+    assert calls == [(71, 0x031F, 0x031F, 0), (71, 0x031F, 0x031F, 1), (71, 0x031F, 0x031F, 0)]
+
+
+def test_sentinel_noremove_rejects_child_and_quit_even_when_quit_bypasses_range_filter():
+    import pytest
+
+    for value in ((72, 0x031F), (71, 0x12), (0, 0x12)):
+        queue = [value]
+        take, calls, removed = _sentinel_take_fixture(queue)
+        with pytest.raises(RuntimeError, match="observation refused"):
+            take()
+        assert calls == [(71, 0x031F, 0x031F, 0)]
+        assert queue == [value] and removed == []
+
+
+def test_sentinel_generation_change_during_noremove_prevents_removal():
+    import pytest
+
+    valid = [True]
+
+    def mutate(flags):
+        valid[0] = False
+
+    def validate():
+        if not valid[0]:
+            raise RuntimeError("retired generation")
+
+    queue = [(71, 0x031F)]
+    take, calls, removed = _sentinel_take_fixture(queue, mutate=mutate, validate=validate)
+    with pytest.raises(RuntimeError, match="retired generation"):
+        take()
+    assert len(calls) == 1 and removed == [] and queue == [(71, 0x031F)]
+
+
+def test_second_peek_target_mutation_is_nonatomic_and_fails_before_dispatch():
+    import pytest
+
+    # A sent callback inside the second PeekMessage can replace the observed
+    # message. Win32 may already remove the replacement; rejection cannot undo it.
+    for replacement in ((72, 0x031F), (0, 0x12)):
+        queue = [(71, 0x031F)]
+
+        def mutate(flags, queue=queue, replacement=replacement):
+            if flags:
+                queue[:] = [replacement]
+
+        take, calls, removed = _sentinel_take_fixture(queue, mutate=mutate)
+        dispatched = []
+        with pytest.raises(RuntimeError, match="removal changed"):
+            _diagnostic_module()._settle_sentinel_queue(
+                lambda: None, take, dispatched.append, clock=lambda: 0
+            )
+        assert len(calls) == 2 and removed == [replacement] and queue == []
+        assert dispatched == []
+
+
+def test_sentinel_identity_requires_thread_live_standalone_and_full_width_generation():
+    import ctypes
+
+    import pytest
+
+    generation = object()
+    state = {"thread": True, "live": True, "parent": 0, "tag": id(generation)}
+
+    def same_thread():
+        if not state["thread"]:
+            raise RuntimeError("wrong thread")
+
+    def owned(hwnd):
+        if not state["live"] or hwnd != 71:
+            raise RuntimeError("not owned")
+
+    require = _native_fixture_function(
+        "require_sentinel",
+        {
+            "ctypes": ctypes,
+            "same_thread": same_thread,
+            "require_owned": owned,
+            "sentinel": 71,
+            "extra_windows": [71],
+            "sentinel_generation": generation,
+            "get_parent": lambda _: state["parent"],
+            "_GWLP_USERDATA": -21,
+            "get_user_data": lambda *_: state["tag"],
+        },
+    )
+    require()
+    for key, bad in (("thread", False), ("live", False), ("parent", 999), ("tag", 0), ("tag", 123)):
+        prior = state[key]
+        state[key] = bad
+        with pytest.raises(RuntimeError):
+            require()
+        state[key] = prior
+    assert id(generation) > 2**32
+
+
+def test_sentinel_cleanup_identity_is_independent_of_peer_routes_but_phase_is_not():
+    import pytest
+
+    local_calls = []
+
+    def local():
+        local_calls.append("verified local sentinel")
+
+    def peer():
+        raise RuntimeError("peer generation retired")
+
+    phase = _native_fixture_function(
+        "validate_sentinel_phase",
+        {
+            "validate_diagnostic_owners": peer,
+            "require_sentinel": local,
+        },
+    )
+    with pytest.raises(RuntimeError, match="peer generation retired"):
+        phase()
+    local()
+    assert local_calls == ["verified local sentinel"]
+    helper = _function(_tree(_WITNESS_NAME), _HELPER_NAME)
+    local_node = next(
+        n for n in helper.body if isinstance(n, ast.FunctionDef) and n.name == "require_sentinel"
+    )
+    assert "validate_diagnostic_owners" not in _calls(local_node)
+    cleanup = next(n for n in helper.body if isinstance(n, ast.Try)).finalbody
+    assert "require_sentinel" in set().union(*(_calls(n) for n in cleanup))
+    assert "validate_sentinel_phase" not in set().union(*(_calls(n) for n in cleanup))
+
+
+def test_sentinel_phase_rejects_children_and_rechecks_identity_after_child_query():
+    import ctypes
+
+    import pytest
+
+    for child in (0, 72):
+        events = []
+        phase = _native_fixture_function(
+            "validate_sentinel_phase",
+            {
+                "ctypes": ctypes,
+                "sentinel": 71,
+                "_GW_CHILD": 5,
+                "validate_diagnostic_owners": lambda events=events: events.append("peer"),
+                "require_sentinel": lambda events=events: events.append("sentinel"),
+                "get_window": lambda *_, child=child: child,
+            },
+        )
+        if child:
+            with pytest.raises(RuntimeError, match="unexpectedly has children"):
+                phase()
+            assert events == ["peer", "sentinel"]
+        else:
+            phase()
+            assert events == ["peer", "sentinel", "sentinel"]
+
+
+def test_sentinel_dispatch_validates_target_kind_and_identity_after_callback():
+    import ctypes
+    from types import SimpleNamespace
+
+    import pytest
+
+    events = []
+    valid = [True]
+
+    def validate():
+        if not valid[0]:
+            raise RuntimeError("retired after dispatch")
+
+    def raw_dispatch(_):
+        events.append("dispatch")
+        valid[0] = False
+
+    message = ctypes.c_int()
+    message.hwnd, message.message = 71, 0x031F
+    dispatch = _native_fixture_function(
+        "dispatch_sentinel_message",
+        {
+            "ctypes": ctypes,
+            "validate_sentinel_phase": validate,
+            "sentinel": 71,
+            "_SENTINEL_SYSTEM_MESSAGE": 0x031F,
+            "raw_dispatch": raw_dispatch,
+        },
+    )
+    for hwnd, kind in ((72, 0x031F), (71, 0x12)):
+        with pytest.raises(RuntimeError, match="dispatch refused"):
+            dispatch(SimpleNamespace(hwnd=hwnd, message=kind))
+    assert events == []
+    with pytest.raises(RuntimeError, match="retired after dispatch"):
+        dispatch(message)
+    assert events == ["dispatch"]
+
+
+def test_sentinel_settling_follows_preservation_proof_and_precedes_original_postquit():
+    helper = _function(_tree(_WITNESS_NAME), _HELPER_NAME)
+    resource_try = next(n for n in helper.body if isinstance(n, ast.Try))
+    sequence = [ast.unparse(n) for n in resource_try.body]
+    proof = next(i for i, text in enumerate(sequence) if "proof failed before settling" in text)
+    settled = next(
+        i for i, text in enumerate(sequence) if text.startswith("sentinel_settled_kinds =")
+    )
+    quit_post = next(i for i, text in enumerate(sequence) if text == "post_quit(0)")
+    assert proof < settled < quit_post
+    assert (
+        "sentinel_after_a == sentinel_after_b == sentinel_removed == sentinel_marker"
+        in sequence[proof]
+    )
+    take = next(
+        n
+        for n in helper.body
+        if isinstance(n, ast.FunctionDef) and n.name == "take_sentinel_message"
+    )
+    peeks = [
+        n
+        for n in ast.walk(take)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "raw_peek"
+    ]
+    assert len(peeks) == 2
+    assert all(ast.unparse(n.args[1]) == "ctypes.c_void_p(sentinel)" for n in peeks)
+    assert all(
+        [ast.unparse(a) for a in n.args[2:4]] == ["_SENTINEL_SYSTEM_MESSAGE"] * 2 for n in peeks
+    )
+    assert [ast.unparse(n.args[4]) for n in peeks] == ["_PM_NOREMOVE", "_PM_REMOVE"]
+    assert "validate_sentinel_phase()" in ast.unparse(take)
+
+
+def test_actual_sentinel_cleanup_survives_peer_failure_but_refuses_failed_or_reused_tag():
+    import ctypes
+
+    generation = object()
+    for tag in (id(generation), 0, 123):
+        destroyed, errors = [], []
+        namespace = {
+            "ctypes": ctypes,
+            "same_thread": lambda: None,
+            "require_owned": lambda _: None,
+            "sentinel": 71,
+            "extra_windows": [71],
+            "sentinel_generation": generation,
+            "get_parent": lambda _: 0,
+            "_GWLP_USERDATA": -21,
+            "get_user_data": lambda *_, tag=tag: tag,
+            "cleanup_errors": errors,
+            "is_window": lambda _: True,
+            "raw_destroy": lambda _, destroyed=destroyed: destroyed.append(71) or 1,
+        }
+
+        def retired_peer():
+            raise RuntimeError("peer registration retired")
+
+        namespace["validate_diagnostic_owners"] = retired_peer
+        namespace["require_sentinel"] = _native_fixture_function("require_sentinel", namespace)
+        helper = _function(_tree(_WITNESS_NAME), _HELPER_NAME)
+        resource_try = next(n for n in helper.body if isinstance(n, ast.Try))
+        destroy_loop = next(
+            n
+            for n in resource_try.finalbody
+            if isinstance(n, ast.For) and ast.unparse(n.iter) == "reversed(extra_windows)"
+        )
+        exec(
+            compile(
+                ast.Module(body=[destroy_loop], type_ignores=[]), "<native-cleanup-source>", "exec"
+            ),
+            namespace,
+        )
+        if tag == id(generation):
+            assert destroyed == [71] and errors == []
+        else:
+            # Failed SetWindowLongPtr (still zero) and reused/mismatched HWND
+            # cannot justify destroying an unverified generation. Qualification
+            # fails with cleanup errors; no successful cleanup receipt is possible.
+            assert destroyed == [] and errors == ["generated child or sentinel cleanup raised"]

@@ -24,6 +24,10 @@ _COOKIE = 1 << 40
 _SIGNED_COOKIE = -(1 << 40)
 _OWNER_JOIN_SECONDS = 10.0
 _OWNER_CLEANUP_SECONDS = 5.0
+_SENTINEL_SETTLE_SECONDS = 1.0
+_SENTINEL_SYSTEM_MESSAGE = 0x031F  # WM_DWMNCRENDERINGCHANGED, observed on exact 9769.
+_GWLP_USERDATA = -21
+_GW_CHILD = 5
 _QUEUE_STATUS_MASK = 0x1DFF  # Documented input, paint, timer, send and all-posted bits.
 _QUIT_DIAGNOSTIC_PROBES = (
     ("thread_quit", -1, _WM_QUIT, _WM_QUIT),
@@ -67,6 +71,32 @@ def _collect_quit_diagnostics(validate, queue_status, peek) -> dict[str, object]
         "queue_status_change_flags_may_be_cleared": True,
         "observations_are_sequential_not_atomic": True,
     }
+
+
+def _settle_sentinel_queue(validate, take, dispatch, *, clock=monotonic):
+    """Settle only the generated sentinel's observed notification, with hard bounds.
+
+    Bounds limit calls and elapsed observation, not the duration of native sent
+    callbacks. The outer owner-thread join remains a hard qualification deadline.
+    """
+    deadline = clock() + _SENTINEL_SETTLE_SECONDS
+    kinds = []
+    for _ in range(_MAX_CYCLES):
+        validate()
+        if clock() >= deadline:
+            raise RuntimeError("sentinel settling exceeded deadline")
+        message = take()
+        validate()
+        if clock() >= deadline:
+            raise RuntimeError("sentinel settling exceeded deadline")
+        if message is None:
+            return tuple(kinds)
+        dispatch(message)
+        validate()
+        if clock() >= deadline:
+            raise RuntimeError("sentinel settling exceeded deadline")
+        kinds.append(int(message.message))
+    raise RuntimeError("sentinel settling exceeded message bound")
 
 
 def _run_on_owner_thread(
@@ -227,6 +257,16 @@ def run_owned_queued_message_routing(
     is_window = bind(user32, "IsWindow", [ctypes.c_void_p], ctypes.c_int)
     is_child = bind(user32, "IsChild", [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int)
     get_parent = bind(user32, "GetParent", [ctypes.c_void_p], ctypes.c_void_p)
+    get_window = bind(user32, "GetWindow", [ctypes.c_void_p, ctypes.c_uint32], ctypes.c_void_p)
+    get_user_data = bind(
+        user32, "GetWindowLongPtrW", [ctypes.c_void_p, ctypes.c_int], ctypes.c_ssize_t
+    )
+    set_user_data = bind(
+        user32,
+        "SetWindowLongPtrW",
+        [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t],
+        ctypes.c_ssize_t,
+    )
     window_thread = bind(
         user32,
         "GetWindowThreadProcessId",
@@ -238,6 +278,7 @@ def run_owned_queued_message_routing(
     get_queue_status = bind(user32, "GetQueueStatus", [ctypes.c_uint32], ctypes.c_uint32)
     raw_peek = apis["a"]._peek_message
     raw_destroy = apis["a"]._destroy_window
+    raw_dispatch = apis["a"]._dispatch_message
     native_thread = int(get_thread())
     shells: dict[str, int] = {}
     extra_windows: list[int] = []
@@ -250,6 +291,8 @@ def run_owned_queued_message_routing(
     cleanup_markers: list[tuple[int, int, int, int]] = []
     quit_posted = False
     sentinel = 0
+    sentinel_generation = object()  # Retain the full-width opaque tag through cleanup.
+    sentinel_settled_kinds = ()
     registrations: dict[str, object] = {}
     quit_diagnostics = None
     post_quit_thread_matches = False
@@ -281,6 +324,76 @@ def run_owned_queued_message_routing(
         for name, shell in shells.items():
             apis[name]._message_route.require(shell, registration=registrations[name])
             require_owned(shell)
+
+    def require_sentinel() -> None:
+        # Cleanup depends only on this sentinel, never on peer route health.
+        same_thread()
+        require_owned(sentinel)
+        if (
+            sentinel not in extra_windows
+            or int(get_parent(ctypes.c_void_p(sentinel)) or 0) != 0
+            or ctypes.c_void_p(get_user_data(ctypes.c_void_p(sentinel), _GWLP_USERDATA)).value
+            != id(sentinel_generation)
+        ):
+            raise RuntimeError("sentinel identity or generation changed")
+        require_owned(sentinel)
+
+    def validate_sentinel_phase() -> None:
+        validate_diagnostic_owners()
+        require_sentinel()
+        # An HWND filter also selects children. This fixture creates none beneath
+        # its standalone STATIC sentinel and installs no subclass callback there.
+        if get_window(ctypes.c_void_p(sentinel), _GW_CHILD):
+            raise RuntimeError("sentinel unexpectedly has children")
+        require_sentinel()
+
+    def take_sentinel_message():
+        # Both PeekMessage calls may execute sent callbacks. Observation/removal
+        # is non-atomic: a second-call target mutation fails before dispatch but
+        # cannot undo native removal. Never claim universal queue preservation.
+        # Only the observed DWM notification is requested; WM_QUIT can bypass the
+        # range filter and must be rejected at the non-removing observation.
+        validate_sentinel_phase()
+        message = _Win32Message()
+        available = bool(
+            raw_peek(
+                ctypes.byref(message),
+                ctypes.c_void_p(sentinel),
+                _SENTINEL_SYSTEM_MESSAGE,
+                _SENTINEL_SYSTEM_MESSAGE,
+                _PM_NOREMOVE,
+            )
+        )
+        validate_sentinel_phase()
+        if not available:
+            return None
+        if int(message.hwnd or 0) != sentinel or message.message != _SENTINEL_SYSTEM_MESSAGE:
+            raise RuntimeError("sentinel observation refused unexpected message ownership or kind")
+        validate_sentinel_phase()
+        removed = bool(
+            raw_peek(
+                ctypes.byref(message),
+                ctypes.c_void_p(sentinel),
+                _SENTINEL_SYSTEM_MESSAGE,
+                _SENTINEL_SYSTEM_MESSAGE,
+                _PM_REMOVE,
+            )
+        )
+        validate_sentinel_phase()
+        if (
+            not removed
+            or int(message.hwnd or 0) != sentinel
+            or message.message != _SENTINEL_SYSTEM_MESSAGE
+        ):
+            raise RuntimeError("sentinel removal changed message ownership or kind")
+        return message
+
+    def dispatch_sentinel_message(message):
+        validate_sentinel_phase()
+        if int(message.hwnd or 0) != sentinel or message.message != _SENTINEL_SYSTEM_MESSAGE:
+            raise RuntimeError("sentinel dispatch refused unexpected message ownership or kind")
+        raw_dispatch(ctypes.byref(message))
+        validate_sentinel_phase()
 
     def diagnostic_queue_status():
         result = int(get_queue_status(_QUEUE_STATUS_MASK))
@@ -417,6 +530,17 @@ def run_owned_queued_message_routing(
         children = {name: create_extra(shell) for name, shell in shells.items()}
         grandchild = create_extra(children["a"])
         sentinel = create_extra()
+        require_owned(sentinel)
+        if get_user_data(ctypes.c_void_p(sentinel), _GWLP_USERDATA) != 0:
+            raise RuntimeError("new sentinel already has an identity tag")
+        previous_tag = set_user_data(
+            ctypes.c_void_p(sentinel), _GWLP_USERDATA, ctypes.c_ssize_t(id(sentinel_generation))
+        )
+        if previous_tag != 0:
+            raise RuntimeError("sentinel identity tag changed during creation")
+        # SetWindowLongPtr's zero result is ambiguous; verify installation itself.
+        # If it failed, cleanup refuses an unverified generation and this run fails.
+        require_sentinel()
         sentinel_marker = post(sentinel, 1)
         expected_b = [post(shells["b"], 11), post(children["b"], 12)]
         expected_a = [post(shells["a"], 21), post(children["a"], 22)]
@@ -470,6 +594,15 @@ def run_owned_queued_message_routing(
             else None
         )
 
+        if not (sentinel_after_a == sentinel_after_b == sentinel_removed == sentinel_marker):
+            raise RuntimeError("sentinel preservation proof failed before settling")
+        # Isolation removed the ambient thread's blocker but was insufficient:
+        # exact 9769 retained this owned sentinel's DWM notification. Settle only
+        # that kind after the original preservation proof, before generated quit.
+        sentinel_settled_kinds = _settle_sentinel_queue(
+            validate_sentinel_phase, take_sentinel_message, dispatch_sentinel_message
+        )
+
         # One generated thread quit must fan out to both live shell owners.
         same_thread()
         thread_before_post = int(get_thread())
@@ -495,6 +628,8 @@ def run_owned_queued_message_routing(
         )
         quit_diagnostics.update(
             {
+                "sentinel_settled_count": len(sentinel_settled_kinds),
+                "sentinel_settled_message_types": sorted(set(sentinel_settled_kinds)),
                 "post_quit_thread_matches": post_quit_thread_matches,
                 "post_quit_abi_verified": post_quit_abi_verified,
                 "thread_selector_is_pointer_width_all_ones": (
@@ -535,12 +670,18 @@ def run_owned_queued_message_routing(
                 same_thread()
                 if not is_window(ctypes.c_void_p(hwnd)):
                     continue
+                if hwnd == sentinel:
+                    require_sentinel()
                 for _ in range(_MAX_CYCLES):
+                    if hwnd == sentinel:
+                        require_sentinel()
                     message = _Win32Message()
                     if not raw_peek(
                         ctypes.byref(message), ctypes.c_void_p(hwnd), _MARKER, _MARKER, _PM_REMOVE
                     ):
                         break
+                    if hwnd == sentinel:
+                        require_sentinel()
                     cleanup_markers.append(event(message))
                 else:
                     cleanup_errors.append("generated marker cleanup exceeded bound")
@@ -549,6 +690,8 @@ def run_owned_queued_message_routing(
         for hwnd in reversed(extra_windows):
             try:
                 same_thread()
+                if hwnd == sentinel and is_window(ctypes.c_void_p(hwnd)):
+                    require_sentinel()
                 if is_window(ctypes.c_void_p(hwnd)) and not raw_destroy(ctypes.c_void_p(hwnd)):
                     cleanup_errors.append("generated child or sentinel cleanup failed")
             except Exception:
@@ -628,6 +771,9 @@ def run_owned_queued_message_routing(
         "generated_foreign_sentinels": 1,
         "shell_and_child_markers_per_owner": 4,
         "foreign_sentinel_preserved": True,
+        "sentinel_generation_verified": True,
+        "sentinel_settled_count": len(sentinel_settled_kinds),
+        "sentinel_settled_message_types": sorted(set(sentinel_settled_kinds)),
         "pump_message_bound": _PUMP_BOUND,
         "quit_message_bound": 1,
         "thread_quit_messages_consumed": 1,
