@@ -617,7 +617,7 @@ def test_real_owned_shell_queued_message_routing(
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    receipt = module.run_owned_queued_message_routing(shell_kind)
+    receipt = module.run_owned_queued_message_routing_on_owner_thread(shell_kind)
     with capsys.disabled():
         print("K5_NATIVE_QUEUED_MESSAGE_ROUTING_RECEIPT=" + json.dumps(receipt, sort_keys=True))
 

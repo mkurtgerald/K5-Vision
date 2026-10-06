@@ -51,7 +51,11 @@ def test_existing_windows_gate_selects_all_three_routing_variants() -> None:
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert _WITNESS_NAME in strings
-    assert {_HELPER_NAME, "spec_from_file_location", "exec_module"} <= _calls(wrapper)
+    assert {
+        "run_owned_queued_message_routing_on_owner_thread",
+        "spec_from_file_location",
+        "exec_module",
+    } <= _calls(wrapper)
     workflow = (_ROOT / ".github/workflows/current-gate-target-windows.yml").read_text()
     pytest_line = next(line for line in workflow.splitlines() if line.strip().startswith("pytest "))
     assert "tests/integration/test_current_gate_application_windows.py" in pytest_line.split()
@@ -335,3 +339,191 @@ def test_native_diagnostics_follow_frozen_product_results_and_never_remove_forei
     )
     assert "registration=registrations[name]" in ast.unparse(owner_check)
     assert {"same_thread", "require_owned", "require"} <= _calls(owner_check)
+
+
+def test_owned_thread_is_fresh_and_disposes_before_joined_result():
+    import threading
+
+    module = _diagnostic_module()
+    parent = threading.current_thread()
+    parent_queue = ["ambient foreign message"]
+    calls = []
+    owners = []
+
+    def work(stopped):
+        owner = threading.current_thread()
+        owners.append(owner)
+        assert owner is not parent and not stopped.is_set()
+        for operation in ("create", "post_quit", "pump", "dispose"):
+            calls.append((operation, owner))
+        return {"cleanup_complete": True}
+
+    assert module._run_on_owner_thread(work) == {"cleanup_complete": True}
+    assert all(owner is owners[0] for _, owner in calls)
+    assert [op for op, _ in calls] == ["create", "post_quit", "pump", "dispose"]
+    assert not owners[0].is_alive()
+    assert parent_queue == ["ambient foreign message"]
+
+
+def test_owned_thread_propagates_assertions_and_base_exceptions_after_join():
+    import threading
+
+    import pytest
+
+    module = _diagnostic_module()
+    for kind in (AssertionError, RuntimeError, SystemExit):
+        error = kind("synthetic witness failure")
+        owners = []
+
+        def work(stopped, error=error, owners=owners):
+            owners.append(threading.current_thread())
+            raise error
+
+        with pytest.raises(kind) as caught:
+            module._run_on_owner_thread(work)
+        assert caught.value is error
+        assert len(owners) == 1 and not owners[0].is_alive()
+
+
+def test_owned_thread_deadline_requests_same_thread_cleanup_and_remains_failure():
+    import threading
+
+    import pytest
+
+    module = _diagnostic_module()
+    owners, disposed = [], []
+
+    def work(stopped):
+        owner = threading.current_thread()
+        owners.append(owner)
+        try:
+            assert stopped.wait(2), "parent did not request cooperative stop"
+        finally:
+            disposed.append(threading.current_thread())
+        return {"cleanup_complete": True}
+
+    with pytest.raises(TimeoutError, match="owner thread joined after stop"):
+        module._run_on_owner_thread(work, join_seconds=0.01, cleanup_seconds=2)
+    assert disposed == owners
+    assert len(owners) == 1 and not owners[0].is_alive()
+
+
+def test_owned_thread_unresponsive_native_call_never_claims_cleanup(monkeypatch):
+    import pytest
+
+    module = _diagnostic_module()
+    observations = []
+
+    class UnresponsiveThread:
+        def __init__(self, **kwargs):
+            observations.append(("thread", kwargs["daemon"]))
+
+        def start(self):
+            observations.append("start")
+
+        def join(self, seconds):
+            observations.append(("join", seconds))
+
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr(module.threading, "Thread", UnresponsiveThread)
+    with pytest.raises(RuntimeError, match="still running; cleanup is unverified"):
+        module._run_on_owner_thread(lambda _: None, join_seconds=0.01, cleanup_seconds=0.02)
+    assert observations[:3] == [("thread", True), "start", ("join", 0.01)]
+    assert len(observations) == 4 and observations[3][0] == "join"
+    assert 0 < observations[3][1] <= 0.02
+
+
+def test_thread_isolation_wraps_entire_native_witness_and_cancellation_does_not_block_cleanup():
+    tree = _tree(_WITNESS_NAME)
+    wrapped = _function(tree, "run_owned_queued_message_routing_on_owner_thread")
+    assert {_HELPER_NAME, "_run_on_owner_thread"} <= _calls(wrapped)
+    assert "_stop_event=stopped" in ast.unparse(wrapped)
+    original = _function(tree, _HELPER_NAME)
+    resource_try = next(node for node in original.body if isinstance(node, ast.Try))
+    assert ast.unparse(resource_try.finalbody[0]) == "cleanup_started = True"
+    same_thread = next(
+        node
+        for node in original.body
+        if isinstance(node, ast.FunctionDef) and node.name == "same_thread"
+    )
+    checks = ast.unparse(same_thread)
+    assert "get_thread()" in checks
+    assert "not cleanup_started" in checks and "_stop_event.is_set()" in checks
+    assert "remaining_registrations == 0" in ast.unparse(original)
+    threaded = _function(tree, "_run_on_owner_thread")
+    assert _calls(threaded).isdisjoint(
+        {"PeekMessageW", "PostQuitMessage", "destroy_shell", "raw_destroy"}
+    )
+    assert "Queue(maxsize=1)" in ast.unparse(threaded)
+    assert "owner.join(join_seconds)" in ast.unparse(threaded)
+    assert "owner.join(remaining)" in ast.unparse(threaded)
+    assert "cleanup_deadline = monotonic() + cleanup_seconds" in ast.unparse(threaded)
+
+
+def test_parent_interruption_during_either_join_requests_creator_cleanup(monkeypatch):
+    import threading
+
+    import pytest
+
+    module = _diagnostic_module()
+    native_thread = threading.Thread
+
+    def scenario(interruption_call):
+        release_cleanup = threading.Event()
+        owners, stopped_events, disposed, threads = [], [], [], []
+        interrupted = KeyboardInterrupt("synthetic parent interruption")
+
+        class InterruptibleThread:
+            def __init__(self, **kwargs):
+                self.native = native_thread(**kwargs)
+                self.joins = []
+                threads.append(self)
+
+            def start(self):
+                self.native.start()
+
+            def is_alive(self):
+                return self.native.is_alive()
+
+            def join(self, seconds):
+                self.joins.append(seconds)
+                count = len(self.joins)
+                if count == interruption_call:
+                    raise interrupted
+                if interruption_call == 2 and count == 1:
+                    return  # Simulate initial observation deadline before stop.
+                release_cleanup.set()
+                self.native.join(seconds)
+
+        def work(stopped):
+            owner = threading.current_thread()
+            owners.append(owner)
+            stopped_events.append(stopped)
+            try:
+                assert stopped.wait(2)
+            finally:
+                assert release_cleanup.wait(2)
+                disposed.append(threading.current_thread())
+            return {"cleanup_complete": True}
+
+        monkeypatch.setattr(module.threading, "Thread", InterruptibleThread)
+        try:
+            with pytest.raises(KeyboardInterrupt) as caught:
+                module._run_on_owner_thread(work, join_seconds=0.01, cleanup_seconds=2)
+            assert caught.value is interrupted
+            assert len(stopped_events) == 1 and stopped_events[0].is_set()
+            assert disposed == owners and not threads[0].is_alive()
+            assert len(threads[0].joins) == interruption_call + 1
+            assert 0 < threads[0].joins[-1] <= 2
+            if interruption_call == 2:
+                assert threads[0].joins[-1] <= threads[0].joins[-2]
+        finally:
+            release_cleanup.set()
+            if threads:
+                threads[0].native.join(2)
+            monkeypatch.setattr(module.threading, "Thread", native_thread)
+
+    scenario(1)
+    scenario(2)

@@ -11,6 +11,8 @@ from __future__ import annotations
 import ctypes
 import sys
 import threading
+from queue import Empty, Queue
+from time import monotonic
 
 _MARKER = 0x8000 + 0x325
 _WM_QUIT = 0x0012
@@ -20,6 +22,8 @@ _PUMP_BOUND = 2
 _MAX_CYCLES = 32
 _COOKIE = 1 << 40
 _SIGNED_COOKIE = -(1 << 40)
+_OWNER_JOIN_SECONDS = 10.0
+_OWNER_CLEANUP_SECONDS = 5.0
 _QUEUE_STATUS_MASK = 0x1DFF  # Documented input, paint, timer, send and all-posted bits.
 _QUIT_DIAGNOSTIC_PROBES = (
     ("thread_quit", -1, _WM_QUIT, _WM_QUIT),
@@ -65,7 +69,94 @@ def _collect_quit_diagnostics(validate, queue_status, peek) -> dict[str, object]
     }
 
 
-def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
+def _run_on_owner_thread(
+    work, *, join_seconds=_OWNER_JOIN_SECONDS, cleanup_seconds=_OWNER_CLEANUP_SECONDS
+):
+    """Own a disposable test GUI queue without touching pytest's ambient queue.
+
+    Cooperative cancellation permits cleanup on the creator thread. A native call
+    that cannot return within both waits is a hard qualification failure; never
+    report cleanup or leak freedom for that path. No thread is forcibly stopped.
+    """
+    if not 0 < join_seconds <= 30 or not 0 < cleanup_seconds <= 30:
+        raise ValueError("owner-thread observation bounds are invalid")
+    caller = threading.current_thread()
+    stopped = threading.Event()
+    result = Queue(maxsize=1)
+
+    def execute():
+        try:
+            if threading.current_thread() is caller:
+                raise RuntimeError("native witness did not isolate its creator thread")
+            receipt = work(stopped)
+        except BaseException as error:
+            result.put_nowait((False, error))
+        else:
+            result.put_nowait((True, receipt))
+
+    owner = threading.Thread(target=execute, name="k5-owned-routing-witness", daemon=True)
+    cleanup_deadline = None
+    timed_out = False
+
+    def join_cleanup():
+        nonlocal cleanup_deadline
+        stopped.set()
+        if cleanup_deadline is None:
+            cleanup_deadline = monotonic() + cleanup_seconds
+        remaining = max(0.0, cleanup_deadline - monotonic())
+        if owner.is_alive() and remaining:
+            owner.join(remaining)
+
+    try:
+        owner.start()
+        owner.join(join_seconds)
+        if owner.is_alive():
+            timed_out = True
+            join_cleanup()
+    except BaseException:
+        # A parent interruption must request creator-thread cleanup too. If it
+        # interrupted cleanup, spend only the original grace's remaining time.
+        stopped.set()
+        try:
+            join_cleanup()
+        except BaseException:
+            pass  # Preserve the original interruption; never claim clean success.
+        raise
+    if timed_out:
+        if owner.is_alive():
+            raise RuntimeError(
+                "native witness owner thread is still running; cleanup is unverified"
+            )
+        raise TimeoutError("native witness exceeded its deadline; owner thread joined after stop")
+    try:
+        successful, value = result.get_nowait()
+    except Empty:
+        raise RuntimeError("native witness owner thread returned no result") from None
+    if not successful:
+        raise value
+    return value
+
+
+def run_owned_queued_message_routing_on_owner_thread(shell_kind: str) -> dict[str, object]:
+    """Run the complete unchanged native lifecycle on a fresh thread-local queue."""
+    if sys.platform != "win32":
+        raise RuntimeError("queued routing qualification requires Windows")
+    receipt = _run_on_owner_thread(
+        lambda stopped: run_owned_queued_message_routing(shell_kind, _stop_event=stopped)
+    )
+    return {
+        **receipt,
+        "isolated_owner_thread": True,
+        "owner_thread_joined": True,
+        "parent_thread_queue_polled": False,
+        "media_execution": False,
+        "python_window_callbacks_created": 0,
+    }
+
+
+def run_owned_queued_message_routing(
+    shell_kind: str, *, _stop_event: threading.Event | None = None
+) -> dict[str, object]:
     """Exercise real create/pump/destroy APIs; assert outcomes after owner cleanup."""
     if sys.platform != "win32":
         raise RuntimeError("queued routing qualification requires Windows")
@@ -162,6 +253,7 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
     registrations: dict[str, object] = {}
     quit_diagnostics = None
     post_quit_thread_matches = False
+    cleanup_started = False
     quit_cleanup_result = None
     post_quit_abi_verified = (
         isinstance(post_quit, ctypes._CFuncPtr)
@@ -172,6 +264,8 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
     def same_thread() -> None:
         if threading.get_ident() != owner_thread or int(get_thread()) != native_thread:
             raise RuntimeError("queued-routing witness changed owner thread")
+        if not cleanup_started and _stop_event is not None and _stop_event.is_set():
+            raise RuntimeError("queued-routing witness owner stop requested")
 
     def require_owned(hwnd: int) -> None:
         same_thread()
@@ -414,6 +508,7 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
             }
         )
     finally:
+        cleanup_started = True
         # Cleanup is owner-local, best-effort for *every* resource, and runs
         # before behavior assertions even when create/post/pump raises.
         if quit_posted and not any(
@@ -471,6 +566,9 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
                 except Exception:
                     cleanup_errors.append("owned shell fallback cleanup raised")
         remaining_windows = [hwnd for hwnd in all_windows if is_window(ctypes.c_void_p(hwnd))]
+        remaining_registrations = sum(
+            api._message_route._shell is not None for api in apis.values()
+        )
 
     if quit_diagnostics is not None:
         quit_diagnostics["existing_quit_cleanup_result"] = quit_cleanup_result
@@ -478,6 +576,7 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
         print("K5_NATIVE_QUIT_DIAGNOSTIC=" + json.dumps(quit_diagnostics, sort_keys=True))
     assert not cleanup_errors, cleanup_errors
     assert not remaining_windows, "queued-routing witness left an owned HWND alive"
+    assert remaining_registrations == 0, "queued-routing witness left an owned registration alive"
     assert not cleanup_markers
     assert a_after_a == tuple(expected_a)
     assert not b_after_a
@@ -534,5 +633,6 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
         "thread_quit_messages_consumed": 1,
         "owners_observing_quit": 2,
         "cleanup_complete": True,
+        "remaining_route_registrations": remaining_registrations,
         "scope": "queued messages only; no native callback or user activation claim",
     }
