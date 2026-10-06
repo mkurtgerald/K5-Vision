@@ -89,8 +89,12 @@ def test_launcher_upgrade_and_facade_branches_require_their_three_applicable_hos
     assert "$_.head_branch -ceq $env:K5_CANDIDATE_BRANCH" in gate
 
 
-def test_native_probe_regression_dependency_is_exact_and_hosted_qualified():
-    dependency = "tests/test_windows_alpha_analytics.py"
+def test_native_probe_and_host_admission_dependencies_are_exact_and_hosted_qualified():
+    dependencies = {
+        "tests/test_windows_alpha_analytics.py",
+        "scripts/assert-stage-one-physical-admission.ps1",
+        "tests/test_stage_one_physical_admission_diagnostics.py",
+    }
     paths = WORKFLOW.read_text().split("    paths:\n", 1)[1].split("\n\n", 1)[0] + "\n"
     expected = {
         ".github/workflows/installed-analytics-candidate.yml",
@@ -123,7 +127,7 @@ def test_native_probe_regression_dependency_is_exact_and_hosted_qualified():
         "tests/test_installed_alpha_facade_witness.py",
         "tests/test_windows_alpha_facade_witness.py",
         "tests/test_installed_analytics_candidate_workflow.py",
-        dependency,
+        *dependencies,
     }
     assert set(paths.splitlines()) == {"      - " + path for path in expected}
     assert len(paths.splitlines()) == len(expected)
@@ -133,7 +137,8 @@ def test_native_probe_regression_dependency_is_exact_and_hosted_qualified():
         .split("  pull_request:\n", 1)[1]
         .split("  push:\n", 1)[0]
     )
-    assert hosted.count('      - "' + dependency + '"\n') == 1
+    for dependency in dependencies:
+        assert hosted.count('      - "' + dependency + '"\n') == 1
 
 
 def test_candidate_and_main_share_non_cancelling_lane_without_new_main_trigger():

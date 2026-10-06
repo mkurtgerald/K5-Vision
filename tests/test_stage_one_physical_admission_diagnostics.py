@@ -192,32 +192,36 @@ switch ($Case) {
 }
 $results = @()
 foreach ($version in @('baseline', 'candidate')) {
-    $script:calls = 0; $script:names = 0; $script:properties = @()
+    # A called .ps1 has its own script scope. Mutate this shared object rather
+    # than script-scoped counters, which would target the guard's child scope.
+    $k5MockState = @{calls=0; names=0; properties=@(); tcpCalls=0; udpCalls=0}
+    # Keep every synthetic ID positive, bounded and disjoint from the real PID.
+    $fixtureBase = if ($PID -lt 100000) { 100000 } else { 1 }
     function Get-CimInstance {
-        param($ClassName, $OperationTimeoutSec, $ErrorAction, $Property)
-        $script:calls++; $script:properties = @($Property)
+        param($ClassName, $OperationTimeoutSec, $ErrorAction, $Property = @())
+        $k5MockState.calls++; $k5MockState.properties = @($Property)
         if ($Case -eq 'provider-error') { throw 'PRIVATE_CANARY provider' }
         $born = [DateTime]::UtcNow.AddMinutes(-10)
         $rows = @(
             [pscustomobject]@{Name='Runner.Worker.exe';
-            ProcessId=12345;
-            ParentProcessId=1;
+            ProcessId=$fixtureBase;
+            ParentProcessId=0;
             CreationDate=$born},
             [pscustomobject]@{Name='powershell.exe';
             ProcessId=$PID;
-            ParentProcessId=12345;
+            ParentProcessId=$fixtureBase;
             CreationDate=$born.AddSeconds(1)}
         )
         if ($Case -eq 'worker') { $rows = @($rows[1]) }
         if ($Case -in @('present','duplicate','positive-incomplete')) {
             $rows += [pscustomobject]@{Name='CRASHPAD_HANDLER.EXE';
-            ProcessId=23456;
-            ParentProcessId=1;
+            ProcessId=($fixtureBase+1);
+            ParentProcessId=0;
             CreationDate=$born}
         }
         if ($Case -eq 'duplicate') { $rows += [pscustomobject]@{Name='crashpad_handler.exe';
-            ProcessId=23457;
-            ParentProcessId=1;
+            ProcessId=($fixtureBase+2);
+            ParentProcessId=0;
             CreationDate=$born} }
         if ($Case -in @('null','positive-incomplete','path','newline','occupied')) {
             $name = switch ($Case) { 'path' { 'C:\PRIVATE_CANARY\thing.exe' }
@@ -225,22 +229,24 @@ foreach ($version in @('baseline', 'candidate')) {
                 'occupied' { 'python.exe' }
                 default { $null } }
             $rows += [pscustomobject]@{Name=$name;
-            ProcessId=23458;
-            ParentProcessId=1;
+            ProcessId=($fixtureBase+3);
+            ParentProcessId=0;
             CreationDate=$born}
         }
         if ($Case -eq 'overbound') {
             $rows += @(for ($i=0; $i -lt 32767; $i++) {
-                [pscustomobject]@{Name='idle.exe'; ProcessId=(30000+$i)
-                    ParentProcessId=1; CreationDate=$born}
+                [pscustomobject]@{Name='idle.exe'; ProcessId=($fixtureBase+5+$i)
+                    ParentProcessId=0; CreationDate=$born}
             })
         }
         if ($Case -in @('mutable','throwing')) {
-            $row = [pscustomobject]@{ProcessId=23459; ParentProcessId=1; CreationDate=$born}
+            $row = [pscustomobject]@{ProcessId=($fixtureBase+4);
+                ParentProcessId=0; CreationDate=$born}
             $row | Add-Member ScriptProperty Name {
-                $script:names++
-                if ($Case -eq 'throwing' -and $script:names -ge 3) { throw 'PRIVATE_CANARY getter' }
-                if ($script:names -ge 3) { return 'crashpad_handler.exe' }
+                $k5MockState.names++
+                if ($Case -eq 'throwing' -and $k5MockState.names -ge 3) {
+                    throw 'PRIVATE_CANARY getter' }
+                if ($k5MockState.names -ge 3) { return 'crashpad_handler.exe' }
                 return 'idle.exe'
             }
             $rows += $row
@@ -248,9 +254,10 @@ foreach ($version in @('baseline', 'candidate')) {
         return $rows
     }
     function Get-NetTCPConnection { param($State, $ErrorAction);
+            $k5MockState.tcpCalls++;
             if ($Case -eq 'port') { return [pscustomobject]@{LocalPort=8000} };
             return @() }
-    function Get-NetUDPEndpoint { param($ErrorAction); return @() }
+    function Get-NetUDPEndpoint { param($ErrorAction); $k5MockState.udpCalls++; return @() }
     $accepted = $true; $errorCode = $null
     try {
         if ($version -eq 'candidate') {
@@ -260,9 +267,11 @@ foreach ($version in @('baseline', 'candidate')) {
     $results += @{version=$version;
             accepted=$accepted;
             error=$errorCode;
-            queries=$script:calls;
-            properties=$script:properties;
-            names=$script:names}
+            queries=$k5MockState.calls;
+            properties=$k5MockState.properties;
+            names=$k5MockState.names;
+            tcp_queries=$k5MockState.tcpCalls;
+            udp_queries=$k5MockState.udpCalls}
 }
 Write-Output ('RESULT=' + ($results | ConvertTo-Json -Compress -Depth 4))"""
     (tmp_path / "harness.ps1").write_text(harness)
@@ -281,13 +290,32 @@ Write-Output ('RESULT=' + ($results | ConvertTo-Json -Compress -Depth 4))"""
         timeout=90,
         check=True,
     )
+    assert "PRIVATE_CANARY" not in result.stdout + result.stderr
     lines = result.stdout.splitlines()
-    baseline, candidate_result = json.loads(
-        next(line[7:] for line in lines if line.startswith("RESULT="))
+    result_lines = [line[7:] for line in lines if line.startswith("RESULT=")]
+    assert len(result_lines) == 1
+    baseline, candidate_result = json.loads(result_lines[0])
+    assert [baseline["version"], candidate_result["version"]] == ["baseline", "candidate"]
+    expected_failure = {
+        "provider-error": "inventory_unavailable",
+        "worker": "worker_ownership",
+        "occupied": "runtime_occupied",
+        "port": "endpoint_occupied",
+    }.get(case)
+    expected_error = (
+        f"Stage One physical admission refused: {expected_failure}. Existing owners were preserved."
+        if expected_failure is not None
+        else None
     )
-    assert baseline["accepted"] == candidate_result["accepted"]
-    assert baseline["error"] == candidate_result["error"]
+    # Parity alone also passes when both versions fail inside a broken mock.
+    for observed in (baseline, candidate_result):
+        assert observed["accepted"] is (expected_failure is None), observed
+        assert observed["error"] == expected_error, observed
     assert baseline["queries"] == candidate_result["queries"] == 1
+    expected_endpoint_queries = int(case not in {"provider-error", "worker", "occupied"})
+    for observed in (baseline, candidate_result):
+        assert observed["tcp_queries"] == observed["udp_queries"] == expected_endpoint_queries
+    assert baseline["properties"] == []
     assert candidate_result["properties"] == [
         "Name",
         "ProcessId",
@@ -303,14 +331,16 @@ Write-Output ('RESULT=' + ($results | ConvertTo-Json -Compress -Depth 4))"""
         "bad-producer",
         "clock-reversal",
     }:
-        assert "K5_HOST_NAME_OBSERVATION_UNAVAILABLE" in lines
+        assert lines.count("K5_HOST_NAME_OBSERVATION_UNAVAILABLE") == 1
         assert not any(line.startswith("K5_HOST_NAME_OBSERVATION=") for line in lines)
         return
-    record = json.loads(
-        next(
-            line.split("=", 1)[1] for line in lines if line.startswith("K5_HOST_NAME_OBSERVATION=")
-        )
-    )
+    record_lines = [
+        line.split("=", 1)[1] for line in lines if line.startswith("K5_HOST_NAME_OBSERVATION=")
+    ]
+    assert len(record_lines) == 1
+    assert "K5_HOST_NAME_OBSERVATION_UNAVAILABLE" not in lines
+    record = json.loads(record_lines[0])
+    assert record["provider_complete"] is (case != "provider-error")
     assert record["clock_domain"] == "runner_utc_unverified"
     assert record["retry_authority"] is False and record["edge_admission"] is False
     assert "PRIVATE_CANARY" not in json.dumps(record)
