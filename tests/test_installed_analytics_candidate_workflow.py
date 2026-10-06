@@ -1374,6 +1374,140 @@ def _early_reader_namespace():
     return namespace
 
 
+def test_storage_source_failure_codes_are_fixed_and_match_safe_reprojection():
+    namespace = _early_reader_namespace()
+    script = _run_script(_step("Observe read-only storage admission before provisioning"))
+    projected = re.search(r"source_binding = @\((.*?)\)", script, re.S).group(1)
+    codes = set(re.findall(r"'([^']+)'", projected))
+    assert codes == namespace["SOURCE_BINDING_CODES"] | {"source_cleanup_failed"}
+    assert all(re.fullmatch(r"source_[a-z_]{1,40}", code) for code in codes)
+    assert "error.code in SOURCE_BINDING_CODES" in script
+    assert "str(error)" not in script and "repr(error)" not in script
+    assert "record['stage'] == 'source_binding'" in script
+
+
+def test_storage_source_metadata_keeps_hardlink_refusal_with_a_fixed_reason(tmp_path):
+    namespace = _early_reader_namespace()
+    primary, alias = tmp_path / "git.exe", tmp_path / "git-lfs.exe"
+    primary.write_bytes(b"inert fixture; never executed")
+    namespace["ordinary"](primary, False)
+    os.link(primary, alias)
+    with pytest.raises(namespace["SourceBindingError"]) as error:
+        namespace["ordinary"](primary, False)
+    assert error.value.code == "source_file_links"
+    assert primary.stat().st_nlink == alias.stat().st_nlink == 2
+    assert primary.read_bytes() == alias.read_bytes() == b"inert fixture; never executed"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Installed Windows Git metadata required")
+def test_real_installed_git_metadata_preserves_admission_and_reports_bounded_count(capsys):
+    namespace = _early_reader_namespace()
+    git = Path(r"C:\Program Files\Git\cmd\git.exe")
+    record = {
+        "schema_version": "installed-git-metadata-v1",
+        "scope": "diagnostic-only-source-tool-metadata",
+        "classification": "metadata_unavailable",
+        "link_count": None,
+        "storage_admission": False,
+        "retry_authority": False,
+    }
+    try:
+        count = git.lstat().st_nlink
+        if type(count) is int and 1 <= count <= 32768:
+            record.update(
+                classification="single_link" if count == 1 else "multiple_links",
+                link_count=count,
+            )
+    finally:
+        # Only this fixed record is exposed, never paths, identities or exception text.
+        with capsys.disabled():
+            print("\nK5_INSTALLED_GIT_METADATA=" + json.dumps(record, separators=(",", ":")))
+    if record["classification"] == "single_link":
+        namespace["ordinary"](git, False)
+        assert namespace["file_digest"](git) == hashlib.sha256(git.read_bytes()).hexdigest()
+    elif record["classification"] == "multiple_links":
+        with pytest.raises(namespace["SourceBindingError"]) as error:
+            namespace["ordinary"](git, False)
+        assert error.value.code == "source_file_links"
+    else:
+        pytest.fail("Fixed installed Git metadata is unavailable or outside its reporting bound")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Installed Windows Git binary reader required")
+@pytest.mark.parametrize(
+    "case", ["lf", "crlf", "trailing", "binary", "module", "missing", "kind", "limit"]
+)
+def test_real_windows_python_git_reader_preserves_bytes_and_refusals(tmp_path, case):
+    # Exercise the reader layer only. This is not storage/ACL admission, and the
+    # separate metadata witness continues to require refusal of any hardlink.
+    namespace = _early_reader_namespace()
+    git = Path(r"C:\Program Files\Git\cmd\git.exe")
+    assert git.is_file()
+    environment = {
+        key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")
+    }
+    environment.update(
+        GIT_AUTHOR_NAME="source-fixture",
+        GIT_AUTHOR_EMAIL="source-fixture@example.invalid",
+        GIT_COMMITTER_NAME="source-fixture",
+        GIT_COMMITTER_EMAIL="source-fixture@example.invalid",
+        GIT_AUTHOR_DATE="2000-01-01T00:00:00+0000",
+        GIT_COMMITTER_DATE="2000-01-01T00:00:00+0000",
+        GIT_NO_REPLACE_OBJECTS="1",
+        GIT_NO_LAZY_FETCH="1",
+        GIT_ALLOW_PROTOCOL="",
+    )
+
+    def git_bytes(*arguments, data=None):
+        return subprocess.run(
+            [str(git), "-c", "protocol.allow=never", "-C", str(tmp_path), *arguments],
+            input=data,
+            capture_output=True,
+            env=environment,
+            timeout=10,
+            check=True,
+        ).stdout
+
+    git_bytes("-c", "init.templateDir=", "init", "--quiet", "--object-format=sha1")
+    body = {
+        "lf": b"value = 1\n",
+        "crlf": b"value = 1\r\n",
+        "trailing": b"value = 1\r\n\r\n",
+        "binary": b"\xef\xbb\xbf\x00\xff\n",
+    }.get(case, b"value = 1\n")
+    if case == "module":
+        body = (ROOT / "scripts/installer_wheel_storage.py").read_bytes()
+    blob = git_bytes("hash-object", "-w", "--stdin", data=body).decode().strip()
+    tree = git_bytes("mktree", data=f"100644 blob {blob}\tsource.py\n".encode()).decode().strip()
+    revision = git_bytes("commit-tree", tree, data=b"immutable reader witness\n").decode().strip()
+    commit_oid, commit = namespace["read_object"](git, tmp_path, revision, "commit", 65536)
+    assert commit_oid == revision
+    assert commit == git_bytes("cat-file", "commit", revision)
+    (tmp_path / "source.py").write_bytes(b"PRIVATE_CANARY mutable working source")
+    expression = "0" * 40 if case == "missing" else revision + ":source.py"
+    kind = "commit" if case == "kind" else "blob"
+    limit = 1 if case == "limit" else 131072
+    refused = {
+        "missing": "source_object_header",
+        "kind": "source_object_kind",
+        "limit": "source_object_size",
+    }
+    if case in refused:
+        with pytest.raises(namespace["SourceBindingError"]) as error:
+            namespace["read_object"](git, tmp_path, expression, kind, limit)
+        assert error.value.code == refused[case]
+    else:
+        oid, received = namespace["read_object"](git, tmp_path, expression, kind, limit)
+        assert oid == blob and received == body
+        if case == "module":
+            import types
+
+            module = types.ModuleType("_k5_early_storage_test")
+            module.__file__ = str(ROOT / "scripts/installer_wheel_storage.py")
+            exec(compile(received, "<verified-test-storage-source>", "exec"), module.__dict__)
+            assert callable(module.storage_preflight)  # Never query the real storage policy.
+
+
 def test_early_preflight_is_branch_only_before_provisioning_without_acceptance_reuse():
     text = WORKFLOW.read_text()
     step = _step("Observe read-only storage admission before provisioning")
@@ -1605,8 +1739,22 @@ def test_binary_storage_reader_refuses_malformed_bounded_source(monkeypatch, cas
     }
     process = _fake_git_process(payloads[case], 1 if case == "nonzero" else 0)
     monkeypatch.setattr(namespace["subprocess"], "Popen", lambda *args, **kwargs: process)
-    with pytest.raises(ValueError, match="binding"):
+    with pytest.raises(namespace["SourceBindingError"], match="binding") as error:
         namespace["read_object"]("FIXED_GIT", "CHECKOUT", "a" * 40, "blob", 131072)
+    assert (
+        error.value.code
+        == {
+            "bad-header": "source_object_header",
+            "long-header": "source_object_header",
+            "wrong-kind": "source_object_kind",
+            "oversize": "source_object_size",
+            "short": "source_object_truncated",
+            "long": "source_object_trailing",
+            "terminator": "source_object_terminator",
+            "hash": "source_object_hash",
+            "nonzero": "source_process_exit",
+        }[case]
+    )
     assert process.stdin.closed and process.stdout.closed
 
 
@@ -2042,6 +2190,10 @@ def test_real_git_powershell_immutable_binding_and_encoding_restoration(tmp_path
         "array-code",
         "valid-ace",
         "constructor-identity",
+        "source-links",
+        "source-object-hash",
+        "source-wrong-stage",
+        "source-unknown-code",
     ],
     ids=str,
 )
@@ -2058,6 +2210,14 @@ def test_actual_powershell_bootstrap_invocation_suppresses_startup_output(tmp_pa
     )
     if case == "constructor-identity":
         record.update(stage="storage_construction", code="storage_identity")
+    if case in {"source-links", "source-wrong-stage"}:
+        record["code"] = "source_file_links"
+        if case == "source-wrong-stage":
+            record["stage"] = "runtime_binding"
+    if case == "source-object-hash":
+        record["code"] = "source_object_hash"
+    if case == "source-unknown-code":
+        record["code"] = "PRIVATE_CANARY"
     if case == "identity-canary":
         record["storage_acl"] = {"owner": "PRIVATE_CANARY"}
     if case in {"mask-overflow", "distance-overflow", "valid-ace"}:
@@ -2131,9 +2291,18 @@ def test_actual_powershell_bootstrap_invocation_suppresses_startup_output(tmp_pa
         assert emitted["status"] == "refused" and "TERMINAL_REFUSAL" in result.stdout
         if case == "constructor-identity":
             assert emitted["code"] == "storage_identity"
+        if case in {"source-links", "source-object-hash"}:
+            assert emitted["code"] == record["code"] and emitted["stage"] == "source_binding"
         if case == "valid-ace":
             assert emitted["storage_acl"]["ace"]["access_mask"] == 0x40000000
-        elif case in {"mask-overflow", "distance-overflow", "bool-stage", "array-code"}:
+        elif case in {
+            "mask-overflow",
+            "distance-overflow",
+            "bool-stage",
+            "array-code",
+            "source-wrong-stage",
+            "source-unknown-code",
+        }:
             assert emitted["code"] == "bootstrap_unavailable"
 
 
@@ -2240,7 +2409,10 @@ def test_real_powershell_stdin_bootstrap_refuses_impossible_layout_before_native
     assert "Traceback" not in result.stdout + result.stderr
 
 
-def test_bootstrap_cleanup_failure_is_a_distinct_bounded_refusal(tmp_path, capsys):
+@pytest.mark.parametrize(
+    "fault", ["cleanup", "file-links", "runtime-links", "object-hash", "unknown-code", "exception"]
+)
+def test_bootstrap_source_failure_is_a_distinct_bounded_refusal(tmp_path, capsys, fault):
     from types import SimpleNamespace
 
     namespace = _early_reader_namespace()
@@ -2272,7 +2444,14 @@ def test_bootstrap_cleanup_failure_is_a_distinct_bounded_refusal(tmp_path, capsy
         dont_write_bytecode=True,
         executable=str(runtime),
     )
-    namespace["ordinary"] = lambda *args: None
+
+    def ordinary(path, directory):
+        if (fault == "file-links" and str(path) == r"C:\Program Files\Git\cmd\git.exe") or (
+            fault == "runtime-links" and path == runtime
+        ):
+            raise namespace["SourceBindingError"]("source_file_links")
+
+    namespace["ordinary"] = ordinary
     namespace["file_digest"] = lambda path: (
         "4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a"
         if path == runtime
@@ -2280,6 +2459,12 @@ def test_bootstrap_cleanup_failure_is_a_distinct_bounded_refusal(tmp_path, capsy
     )
 
     def fail(*args):
+        if fault == "object-hash":
+            raise namespace["SourceBindingError"]("source_object_hash")
+        if fault == "unknown-code":
+            raise namespace["SourceBindingError"]("PRIVATE_CANARY")
+        if fault == "exception":
+            raise OSError("PRIVATE_CANARY")
         raise namespace["SourceCleanupError"]("PRIVATE_CANARY")
 
     namespace["read_object"] = fail
@@ -2293,6 +2478,16 @@ def test_bootstrap_cleanup_failure_is_a_distinct_bounded_refusal(tmp_path, capsy
     output = capsys.readouterr()
     assert "PRIVATE_CANARY" not in output.out + output.err
     record = json.loads(output.out.strip().split("=", 1)[1])
-    assert record["stage"] == "source_binding"
-    assert record["code"] == "source_cleanup_failed"
+    assert record["stage"] == ("runtime_binding" if fault == "runtime-links" else "source_binding")
+    assert (
+        record["code"]
+        == {
+            "cleanup": "source_cleanup_failed",
+            "file-links": "source_file_links",
+            "runtime-links": "runtime_unavailable",
+            "object-hash": "source_object_hash",
+            "unknown-code": "source_commit_read",
+            "exception": "source_commit_read",
+        }[fault]
+    )
     assert record["status"] == "refused" and record["storage_acl"] is None

@@ -493,35 +493,55 @@ jobs:
           import hashlib, json, os, re, stat, subprocess, sys, threading, types
           from pathlib import Path
 
-          def require(value):
+          SOURCE_BINDING_CODES = frozenset((
+              'source_unavailable', 'source_environment', 'source_git_metadata',
+              'source_checkout_metadata', 'source_git_hash', 'source_path_shape',
+              'source_path_alias', 'source_path_type', 'source_file_links',
+              'source_path_identity', 'source_file_size', 'source_file_identity',
+              'source_commit_read', 'source_commit_identity', 'source_module_read',
+              'source_module_load', 'source_module_contract', 'source_process_start',
+              'source_request', 'source_object_header', 'source_object_kind',
+              'source_object_size', 'source_object_truncated', 'source_object_terminator',
+              'source_object_trailing', 'source_object_hash', 'source_read_unavailable',
+              'source_read_timeout', 'source_process_exit',
+          ))
+
+          class SourceBindingError(ValueError):
+              def __init__(self, code):
+                  super().__init__('binding')
+                  self.code = code
+
+          def require(value, code='source_unavailable'):
               if not value:
-                  raise ValueError('binding')
+                  raise SourceBindingError(code)
 
           def ordinary(path, directory):
-              require(path.is_absolute() and len(path.parts) <= 64 and not str(path).startswith(('\\\\', '//')))
+              require(path.is_absolute() and len(path.parts) <= 64 and not str(path).startswith(('\\\\', '//')), 'source_path_shape')
               for item in reversed((path, *path.parents)):
                   info = item.lstat()
-                  require(not stat.S_ISLNK(info.st_mode) and not getattr(info, 'st_file_attributes', 0) & 0x400)
+                  require(not stat.S_ISLNK(info.st_mode) and not getattr(info, 'st_file_attributes', 0) & 0x400, 'source_path_alias')
                   is_dir = item != path or directory
-                  require(stat.S_ISDIR(info.st_mode) if is_dir else stat.S_ISREG(info.st_mode) and info.st_nlink == 1)
-              require(path.resolve(strict=True) == path)
+                  require(stat.S_ISDIR(info.st_mode) if is_dir else stat.S_ISREG(info.st_mode), 'source_path_type')
+                  if not is_dir:
+                      require(info.st_nlink == 1, 'source_file_links')
+              require(path.resolve(strict=True) == path, 'source_path_identity')
 
           def file_digest(path):
               before = path.lstat()
-              require(0 < before.st_size <= 64 * 1024 * 1024)
+              require(0 < before.st_size <= 64 * 1024 * 1024, 'source_file_size')
               identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
               digest, count = hashlib.sha256(), 0
               with path.open('rb') as stream:
-                  require(identity(os.fstat(stream.fileno())) == identity(before))
+                  require(identity(os.fstat(stream.fileno())) == identity(before), 'source_file_identity')
                   while True:
                       chunk = stream.read(1024 * 1024)
                       if not chunk:
                           break
                       count += len(chunk)
-                      require(count <= before.st_size)
+                      require(count <= before.st_size, 'source_file_size')
                       digest.update(chunk)
-                  require(identity(os.fstat(stream.fileno())) == identity(before))
-              require(count == before.st_size and identity(path.lstat()) == identity(before))
+                  require(identity(os.fstat(stream.fileno())) == identity(before), 'source_file_identity')
+              require(count == before.st_size and identity(path.lstat()) == identity(before), 'source_file_identity')
               return digest.hexdigest()
 
           class SourceCleanupError(ValueError):
@@ -535,31 +555,39 @@ jobs:
               env['GIT_NO_LAZY_FETCH'] = '1'
               env['GIT_ALLOW_PROTOCOL'] = ''
               done, state = threading.Event(), {}
-              process = subprocess.Popen([str(git), '--no-replace-objects', '--no-lazy-fetch', '-c', 'protocol.allow=never', 'cat-file', '--batch'],
-                                         cwd=root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                         stderr=subprocess.DEVNULL, shell=False, bufsize=0)
+              try:
+                  process = subprocess.Popen([str(git), '--no-replace-objects', '--no-lazy-fetch', '-c', 'protocol.allow=never', 'cat-file', '--batch'],
+                                             cwd=root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                             stderr=subprocess.DEVNULL, shell=False, bufsize=0)
+              except OSError:
+                  raise SourceBindingError('source_process_start') from None
               reader = None
               def read_exact(count):
                   data = bytearray()
                   while len(data) < count:
                       chunk = process.stdout.read(count - len(data))
-                      require(bool(chunk))
+                      require(bool(chunk), 'source_object_truncated')
                       data.extend(chunk)
                   return bytes(data)
               def receive():
                   try:
                       request = expression.encode('ascii') + b'\n'
-                      require(process.stdin.write(request) == len(request))
+                      require(process.stdin.write(request) == len(request), 'source_request')
                       process.stdin.close()
                       header = process.stdout.readline(98)
                       match = re.fullmatch(rb'([0-9a-f]{40}) (blob|commit) ([1-9][0-9]{0,6})\n', header)
-                      require(match is not None)
+                      require(match is not None, 'source_object_header')
                       oid, actual_kind, size = match[1].decode('ascii'), match[2].decode('ascii'), int(match[3])
-                      require(actual_kind == kind and 0 < size <= limit)
+                      require(actual_kind == kind, 'source_object_kind')
+                      require(0 < size <= limit, 'source_object_size')
                       body = read_exact(size)
-                      require(read_exact(1) == b'\n' and process.stdout.read(1) == b'')
-                      require(hashlib.sha1(kind.encode('ascii') + b' ' + str(size).encode('ascii') + b'\0' + body).hexdigest() == oid)
+                      require(read_exact(1) == b'\n', 'source_object_terminator')
+                      require(process.stdout.read(1) == b'', 'source_object_trailing')
+                      require(hashlib.sha1(kind.encode('ascii') + b' ' + str(size).encode('ascii') + b'\0' + body).hexdigest() == oid, 'source_object_hash')
                       state['result'] = oid, body
+                  except SourceBindingError as error:
+                      state['failed'] = True
+                      state['code'] = error.code
                   except BaseException:
                       state['failed'] = True
                   finally:
@@ -567,8 +595,9 @@ jobs:
               try:
                   reader = threading.Thread(target=receive, daemon=True)
                   reader.start()
-                  require(done.wait(10) and 'result' in state and not state.get('failed'))
-                  require(process.wait(timeout=2) == 0)
+                  require(done.wait(10), 'source_read_timeout')
+                  require('result' in state and not state.get('failed'), state.get('code', 'source_read_unavailable'))
+                  require(process.wait(timeout=2) == 0, 'source_process_exit')
                   return state['result']
               finally:
                   quiet = True
@@ -610,6 +639,7 @@ jobs:
               ordinary(runtime, False)
               require(file_digest(runtime) == '4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a')
               record.update(stage='source_binding', code='source_unavailable')
+              record['code'] = 'source_environment'
               revision = os.environ['K5_STAGE_ONE_REVISION']
               require(re.fullmatch('[0-9a-f]{40}', revision) and revision == os.environ['GITHUB_SHA'])
               require(os.environ['GITHUB_REPOSITORY'] == 'mkurtgerald/K5-Vision')
@@ -617,19 +647,29 @@ jobs:
               for key in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'):
                   require(re.fullmatch('[1-9][0-9]{0,19}', os.environ[key]))
               git = Path(r'C:\Program Files\Git\cmd\git.exe')
+              record['code'] = 'source_git_metadata'
               ordinary(git, False)
+              record['code'] = 'source_checkout_metadata'
               ordinary(workspace / '.git', True)
+              record['code'] = 'source_git_hash'
               require(re.fullmatch('[0-9a-f]{64}', os.environ['K5_CHECKOUT_GIT_SHA256']))
               require(file_digest(git) == os.environ['K5_CHECKOUT_GIT_SHA256'])
+              record['code'] = 'source_commit_read'
               oid, commit = read_object(git, workspace, revision, 'commit', 65536)
-              require(oid == revision and re.match(rb'tree [0-9a-f]{40}\n', commit))
+              require(oid == revision and re.match(rb'tree [0-9a-f]{40}\n', commit), 'source_commit_identity')
+              record['code'] = 'source_module_read'
               oid, source = read_object(git, workspace, revision + ':scripts/installer_wheel_storage.py', 'blob', 131072)
+              record['code'] = 'source_module_load'
               module = types.ModuleType('_k5_early_storage')
               module.__file__ = str(workspace / 'scripts/installer_wheel_storage.py')
               exec(compile(source, '<k5-verified-storage-preflight>', 'exec'), module.__dict__)
+              record['code'] = 'source_module_contract'
               record = module.storage_preflight(runner, workspace, temporary)
           except SourceCleanupError:
               record['code'] = 'source_cleanup_failed'
+          except SourceBindingError as error:
+              if record['stage'] == 'source_binding' and error.code in SOURCE_BINDING_CODES and error.code != 'source_unavailable':
+                  record['code'] = error.code
           except BaseException:
               pass
           print('K5_STORAGE_PREFLIGHT=' + json.dumps(record, sort_keys=True, separators=(',', ':')))
@@ -660,7 +700,18 @@ jobs:
               Test-K5Enum $observed.stage @('runtime_binding', 'source_binding', 'storage_construction', 'storage_root')
               $stageCodes = @{
                   runtime_binding = @('runtime_unavailable')
-                  source_binding = @('source_unavailable', 'source_cleanup_failed')
+                  source_binding = @(
+                      'source_unavailable', 'source_cleanup_failed', 'source_environment',
+                      'source_git_metadata', 'source_checkout_metadata', 'source_git_hash',
+                      'source_path_shape', 'source_path_alias', 'source_path_type',
+                      'source_file_links', 'source_path_identity', 'source_file_size',
+                      'source_file_identity', 'source_commit_read', 'source_commit_identity',
+                      'source_module_read', 'source_module_load', 'source_module_contract',
+                      'source_process_start', 'source_request', 'source_object_header',
+                      'source_object_kind', 'source_object_size', 'source_object_truncated',
+                      'source_object_terminator', 'source_object_trailing', 'source_object_hash',
+                      'source_read_unavailable', 'source_read_timeout', 'source_process_exit'
+                  )
                   storage_construction = @('storage_path', 'storage_policy', 'storage_helper', 'storage_identity', 'storage_ownership', 'storage_interrupted')
                   storage_root = @('storage_path', 'storage_layout', 'storage_volume', 'storage_ownership', 'storage_acl', 'storage_helper', 'storage_interrupted', 'passed')
               }
