@@ -16,6 +16,7 @@ _MAX_PRESENTATIONS = 1_000_000
 _WS_CHILD = 0x40000000
 _WS_VISIBLE = 0x10000000
 _WS_POPUP = 0x80000000
+_GA_ROOT = 2
 
 
 class WindowsPresentationTargetState(enum.StrEnum):
@@ -35,6 +36,13 @@ class WindowsPresentationTargetErrorCode(enum.StrEnum):
     PRESENTATION_FAILURE = "presentation_failure"
     PRESENTATION_LIMIT = "presentation_limit"
     CLEANUP_FAILURE = "cleanup_failure"
+
+
+class WindowsPresentationDeferred(RuntimeError):
+    """A valid target is temporarily unpaintable; keep it open and do not count a paint."""
+
+    def __init__(self) -> None:
+        super().__init__("presentation target is temporarily unpaintable")
 
 
 class WindowsPresentationTargetError(RuntimeError):
@@ -65,6 +73,7 @@ class _NativeTargetFailure(enum.StrEnum):
     LOAD = "load"
     CREATE = "create"
     ACQUIRE_DC = "acquire_dc"
+    CLIENT_SIZE = "client_size"
     RELEASE_DC = "release_dc"
     DESTROY = "destroy"
 
@@ -77,18 +86,30 @@ class _NativeTargetError(RuntimeError):
 
 @typing.runtime_checkable
 class _SurfaceBoundary(typing.Protocol):
-    async def blit(self, target_dc: int) -> None: ...
+    async def blit(self, target_dc: int, *, target_width: int, target_height: int) -> None: ...
 
 
 @typing.runtime_checkable
 class _NativeTargetBoundary(typing.Protocol):
     def create_target(self, x: int, y: int, width: int, height: int) -> int: ...
 
+    def client_size(self, target: int) -> tuple[int, int]: ...
+
     def acquire_dc(self, target: int) -> int: ...
 
     def release_dc(self, target: int, target_dc: int) -> None: ...
 
     def destroy_target(self, target: int) -> None: ...
+
+
+class _ClientRect(ctypes.Structure):
+    # Win32 LONG is always 32 bits, including on 64-bit Windows.
+    _fields_ = [
+        ("left", ctypes.c_int32),
+        ("top", ctypes.c_int32),
+        ("right", ctypes.c_int32),
+        ("bottom", ctypes.c_int32),
+    ]
 
 
 class _Win32WindowTargetApi:
@@ -123,6 +144,16 @@ class _Win32WindowTargetApi:
                 ctypes.c_void_p,
             ]
             self._create_window.restype = ctypes.c_void_p
+
+            self._get_client_rect = self._user32.GetClientRect
+            self._get_client_rect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ClientRect)]
+            self._get_client_rect.restype = ctypes.c_int
+            self._get_ancestor = self._user32.GetAncestor
+            self._get_ancestor.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            self._get_ancestor.restype = ctypes.c_void_p
+            self._is_iconic = self._user32.IsIconic
+            self._is_iconic.argtypes = [ctypes.c_void_p]
+            self._is_iconic.restype = ctypes.c_int
 
             self._get_dc = self._user32.GetDC
             self._get_dc.argtypes = [ctypes.c_void_p]
@@ -172,6 +203,21 @@ class _Win32WindowTargetApi:
         if target == 0:
             raise _NativeTargetError(_NativeTargetFailure.CREATE)
         return target
+
+    def client_size(self, target: int) -> tuple[int, int]:
+        """Read current client pixels; a minimized top-level parent has no paintable view."""
+        rect = _ClientRect()
+        try:
+            root = int(self._get_ancestor(ctypes.c_void_p(target), _GA_ROOT) or 0)
+            if not root:
+                raise _NativeTargetError(_NativeTargetFailure.CLIENT_SIZE)
+            if self._is_iconic(ctypes.c_void_p(root)):
+                return 0, 0
+            if not self._get_client_rect(ctypes.c_void_p(target), ctypes.byref(rect)):
+                raise _NativeTargetError(_NativeTargetFailure.CLIENT_SIZE)
+            return rect.right - rect.left, rect.bottom - rect.top
+        except Exception:
+            raise _NativeTargetError(_NativeTargetFailure.CLIENT_SIZE) from None
 
     def acquire_dc(self, target: int) -> int:
         try:
@@ -369,6 +415,25 @@ class BoundedWindowsPresentationTarget:
                     "Windows presentation target native API is unavailable",
                 )
 
+            # Do not use creation/relayout geometry: client dimensions can change.
+            # A dedicated deferred signal keeps enclosing paint counters truthful.
+            try:
+                target_width, target_height = self._native_api.client_size(self._target)
+                if any(
+                    type(value) is not int or not 0 <= value <= _MAX_DIMENSION
+                    for value in (target_width, target_height)
+                ):
+                    raise ValueError
+            except Exception:
+                self._fail_and_destroy()
+                raise WindowsPresentationTargetError(
+                    WindowsPresentationTargetErrorCode.PRESENTATION_FAILURE,
+                    "presentation target client area is unavailable",
+                ) from None
+
+            if target_width == 0 or target_height == 0:
+                raise WindowsPresentationDeferred()
+
             try:
                 target_dc = self._native_api.acquire_dc(self._target)
             except _NativeTargetError:
@@ -380,7 +445,9 @@ class BoundedWindowsPresentationTarget:
 
             presentation_error: BaseException | None = None
             try:
-                await surface.blit(target_dc)
+                await surface.blit(
+                    target_dc, target_width=target_width, target_height=target_height
+                )
             except BaseException as exc:
                 presentation_error = exc
 

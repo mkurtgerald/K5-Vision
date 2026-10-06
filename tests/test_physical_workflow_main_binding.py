@@ -32,11 +32,16 @@ def test_physical_qualifications_remain_main_bound_except_exact_installed_candid
             assert (
                 "  push:\n    branches:\n      - feat/installed-analytics-operator-20261003\n"
                 "      - feat/alpha-analytics-preflight-20261004\n"
-                "      - fix/transactional-alpha-upgrade-20261003\n    paths:\n" in events
+                "      - fix/transactional-alpha-upgrade-20261003\n"
+                "      - feat/installed-alpha-facade-witness-20261005\n    paths:\n" in events
             )
             assert "github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'" in admission
             assert (
                 "github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'" in admission
+            )
+            assert (
+                "github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'"
+                in admission
             )
             for forbidden in ("pull_request:", "workflow_dispatch:", "workflow_call:"):
                 assert forbidden not in events

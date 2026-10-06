@@ -19,6 +19,7 @@ class FakeNativeApi:
         self.acquired: list[int] = []
         self.released: list[tuple[int, int]] = []
         self.destroyed: list[int] = []
+        self.client_dimensions = (1, 1)
         self.fail_create = False
         self.fail_acquire = False
         self.fail_release = False
@@ -28,7 +29,11 @@ class FakeNativeApi:
         if self.fail_create:
             raise target_module._NativeTargetError(target_module._NativeTargetFailure.CREATE)
         self.created.append((x, y, width, height))
+        self.client_dimensions = (width, height)
         return 101
+
+    def client_size(self, target: int) -> tuple[int, int]:
+        return self.client_dimensions
 
     def acquire_dc(self, target: int) -> int:
         if self.fail_acquire:
@@ -52,7 +57,7 @@ class FakeSurface:
         self.calls: list[int] = []
         self.fail = False
 
-    async def blit(self, target_dc: int) -> None:
+    async def blit(self, target_dc: int, *, target_width: int, target_height: int) -> None:
         self.calls.append(target_dc)
         if self.fail:
             raise RuntimeError("C:\\private\\target-secret")
@@ -260,3 +265,143 @@ def test_default_target_fails_closed_off_windows(monkeypatch: pytest.MonkeyPatch
 def test_presentation_bound_is_validated(limit: int) -> None:
     with pytest.raises(ValueError):
         BoundedWindowsPresentationTarget(max_presentations=limit)
+
+
+@pytest.mark.parametrize("dimensions", [(0, 0), (0, 64), (64, 0)])
+def test_zero_extent_is_deferred_without_acquiring_dc_and_can_resume(
+    dimensions: tuple[int, int],
+) -> None:
+    from k5vision.media.windows_presentation_target import WindowsPresentationDeferred
+
+    async def scenario() -> None:
+        native = FakeNativeApi()
+        target = BoundedWindowsPresentationTarget(native_api=native)
+        surface = FakeSurface()
+        await target.open(64, 64)
+        native.client_dimensions = dimensions
+        for _ in range(3):
+            with pytest.raises(WindowsPresentationDeferred):
+                await target.present(surface)
+        assert target.snapshot.state is WindowsPresentationTargetState.OPEN
+        assert target.snapshot.presentations == 0
+        assert not native.acquired and not native.destroyed and not surface.calls
+        native.client_dimensions = (80, 40)
+        await target.present(surface)
+        assert target.snapshot.presentations == 1
+        await target.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("dimensions", [(-1, 64), (64, -1), (True, 64), (64, 16_385), (None, 64)])
+def test_invalid_client_geometry_fails_closed_without_paint(
+    dimensions: tuple[object, object],
+) -> None:
+    async def scenario() -> None:
+        native = FakeNativeApi()
+        target = BoundedWindowsPresentationTarget(native_api=native)
+        await target.open(64, 64)
+        native.client_dimensions = dimensions
+        with pytest.raises(WindowsPresentationTargetError) as error:
+            await target.present(FakeSurface())
+        assert error.value.code is WindowsPresentationTargetErrorCode.PRESENTATION_FAILURE
+        assert target.snapshot.state is WindowsPresentationTargetState.FAILED
+        assert target.snapshot.presentations == 0
+        assert not native.acquired and native.destroyed == [101]
+
+    asyncio.run(scenario())
+
+
+def test_client_query_error_fails_closed_and_is_sanitized() -> None:
+    async def scenario() -> None:
+        native = FakeNativeApi()
+        target = BoundedWindowsPresentationTarget(native_api=native)
+        await target.open(64, 64)
+
+        def fail(_target: int) -> tuple[int, int]:
+            raise OSError("private target handle")
+
+        native.client_size = fail
+        with pytest.raises(WindowsPresentationTargetError) as error:
+            await target.present(FakeSurface())
+        assert "private" not in str(error.value)
+        assert target.snapshot.presentations == 0
+        assert not native.acquired and native.destroyed == [101]
+
+    asyncio.run(scenario())
+
+
+def test_native_client_query_uses_child_rectangle_and_top_level_minimize() -> None:
+    import ctypes
+
+    native = object.__new__(target_module._Win32WindowTargetApi)
+    roots: list[int] = []
+    clients: list[int] = []
+    minimized = False
+
+    def root(target: ctypes.c_void_p, flags: int) -> int:
+        assert target.value == 101 and flags == 2
+        return 909
+
+    def iconic(target: ctypes.c_void_p) -> int:
+        roots.append(target.value)
+        return int(minimized)
+
+    def client(target: ctypes.c_void_p, pointer: object) -> int:
+        clients.append(target.value)
+        rect = ctypes.cast(pointer, ctypes.POINTER(target_module._ClientRect)).contents
+        rect.left = rect.top = 0
+        rect.right, rect.bottom = 517, 293
+        return 1
+
+    native._get_ancestor, native._is_iconic, native._get_client_rect = root, iconic, client
+    assert ctypes.sizeof(target_module._ClientRect) == 16
+    assert native.client_size(101) == (517, 293)
+    minimized = True
+    assert native.client_size(101) == (0, 0)
+    assert roots == [909, 909] and clients == [101]
+
+
+@pytest.mark.parametrize("failure", ["ancestor", "iconic", "client"])
+def test_native_client_query_errors_are_not_misreported_as_minimize(failure: str) -> None:
+    native = object.__new__(target_module._Win32WindowTargetApi)
+    native._get_ancestor = lambda *_args: 101
+    native._is_iconic = lambda *_args: 0
+    native._get_client_rect = lambda *_args: 1
+
+    def fail(*_args: object) -> int:
+        raise OSError("private native detail")
+
+    setattr(
+        native,
+        {"ancestor": "_get_ancestor", "iconic": "_is_iconic", "client": "_get_client_rect"}[
+            failure
+        ],
+        fail,
+    )
+    with pytest.raises(target_module._NativeTargetError) as error:
+        native.client_size(101)
+    assert "private" not in str(error.value)
+    assert error.value.failure is target_module._NativeTargetFailure.CLIENT_SIZE
+
+
+def test_native_client_query_false_result_is_failure() -> None:
+    native = object.__new__(target_module._Win32WindowTargetApi)
+    native._get_ancestor = lambda *_args: 101
+    native._is_iconic = lambda *_args: 0
+    native._get_client_rect = lambda *_args: 0
+    with pytest.raises(target_module._NativeTargetError):
+        native.client_size(101)
+
+
+def test_missing_root_ancestor_is_failure_without_querying_client() -> None:
+    native = object.__new__(target_module._Win32WindowTargetApi)
+    native._get_ancestor = lambda *_args: 0
+
+    def unexpected(*_args: object) -> int:
+        raise AssertionError("unverified target must not be queried")
+
+    native._is_iconic = native._get_client_rect = unexpected
+    with pytest.raises(target_module._NativeTargetError) as error:
+        native.client_size(101)
+    assert error.value.failure is target_module._NativeTargetFailure.CLIENT_SIZE

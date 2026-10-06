@@ -66,7 +66,7 @@ def test_windows_alpha_preflight_verifies_installed_runtime_without_camera_conta
     assert "gst-launch-1.0.exe" in text
     assert "gstreamer-1.0-0.dll" in text
     assert "libgstreamer-1.0-0.dll" in text
-    assert "k5vision.cli --version" in text
+    assert '-Arguments @("-I", "-B", "-m", "k5vision.cli", "--version")' in text
     assert "No camera was contacted" in text
     assert "K5_STAGE03_SOURCE" not in text
 

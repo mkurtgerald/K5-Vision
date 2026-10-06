@@ -53,9 +53,9 @@ def test_test_script_reuses_installed_launcher_admission_before_native_probe() -
     text = TEST.read_text(encoding="utf-8")
     gate = "& $launcher -AnalyticsPreflightOnly"
     assert gate in text
-    assert text.index(gate) < text.index("& $gstLaunch --version")
-    assert "& $python -I -B -m k5vision.cli --version" in text
-    assert "& $python -I -B -m k5vision.cli --help" in text
+    assert text.index(gate) < text.index("$gstVersion = Invoke-K5NativeProbe")
+    assert '"-I", "-B", "-m", "k5vision.cli", "--version"' in text
+    assert '"-I", "-B", "-m", "k5vision.cli", "--help"' in text
 
 
 def test_preflight_is_bounded_memory_only_and_installed_source_isolated() -> None:
@@ -2773,7 +2773,7 @@ def _validate_element_diagnostic(value):
             "timeout",
         },
         "variant": {"none", "original", "process"},
-        "initial": {"none", "absent", "stale_zero", "stale_nonzero"},
+        "initial": {"none", "absent", "stale_zero", "stale_nonzero", "stale_seven"},
         "boundary": {"primary", "owned_cleanup", "child_primary", "child_cleanup"},
         "status": {"started", "passed", "failed"},
         "error": ELEMENT_FIXTURE_ERRORS,
@@ -2988,6 +2988,11 @@ def _capture_element_child(common, arguments, *, cwd, env, context):
             for binding in _element_utility_binding_records(complete):
                 print(
                     ELEMENT_UTILITY_BINDING_PREFIX.decode()
+                    + json.dumps(binding, separators=(",", ":"))
+                )
+            for binding in _run_facade_management_binding_records(complete):
+                print(
+                    RUN_FACADE_MANAGEMENT_PREFIX.decode()
                     + json.dumps(binding, separators=(",", ":"))
                 )
             for checkpoint in checkpoints:
@@ -5632,3 +5637,1376 @@ def test_public_native_line_parser_matches_cr_lf_crlf_and_one_terminal_delimiter
         if text.endswith(("\r", "\n")):
             lines = lines[:-1]
         assert (len(lines) == 1 and bool(lines[0].strip())) is accepted
+
+
+RUN_FACADE_PREFIX = b"K5_RUN_FACADE_RESULT="
+RUN_FACADE_CASES = {
+    "success": "returned",
+    "child_throw": "child_failure",
+    "cleanup_throw": "cleanup_failure",
+    "child_exit_nonzero": "wrapper_failure",
+}
+RUN_FACADE_INITIALS = {"absent": None, "stale_zero": 0, "stale_nonzero": 9, "stale_seven": 7}
+RUN_FACADE_SCENARIOS = [
+    (initial, case)
+    for case in sorted(RUN_FACADE_CASES)
+    for initial in ("absent", "stale_nonzero", "stale_zero")
+] + [("stale_seven", case) for case in ("success", "child_exit_nonzero")]
+# Exact comparison from b3ddecf414ed25ed6f6a36048771122c3505bb5c Run lines 29-32.
+# This is a policy projection, not a claim that the historical full Run completed.
+RUN_FACADE_HISTORICAL_COMPARISON = (
+    "    $nativeExitChanged = -not $nativeExitBeforePresent -or "
+    "$nativeExitAfterValue -ne $nativeExitBeforeValue\n"
+    "    if ($nativeExitChanged -and $nativeExitAfterValue -ne 0) {\n"
+    '        throw "K5 Vision Alpha launcher failed."\n'
+    "    }"
+)
+RUN_FACADE_CHECKPOINTS = (
+    "facade_source_requested",
+    "facade_source_selected",
+    "facade_invoke_requested",
+    "facade_invoke_returned",
+)
+RUN_FACADE_MANAGEMENT_CHECKPOINTS = (
+    "management_manifest_requested",
+    "management_import_requested",
+    "management_import_returned",
+    "management_binding_verified",
+)
+RUN_FACADE_MANAGEMENT_PREFIX = b"K5_ELEMENT_MANAGEMENT_BINDING="
+# Reuse the qualified, bounded manifest import/metadata observer without changing
+# it for existing probes. Only the exact PSHOME module and exported command differ.
+RUN_FACADE_MANAGEMENT_IMPORT = (
+    ELEMENT_UTILITY_IMPORT.replace("UTILITY", "MANAGEMENT")
+    .replace("Utility", "Management")
+    .replace("utility", "management")
+    .replace("Write-Output", "Join-Path")
+    .replace("WriteOutputCommand", "JoinPathCommand")
+    .replace("-Name $managementManifest -PassThru", "-Name $managementManifest -Global -PassThru")
+    # Keep the existing child-error phase vocabulary; checkpoints identify the module.
+    .replace("$fixturePhase = 'management_", "$fixturePhase = 'utility_")
+)
+RUN_FACADE_MANAGEMENT_TEST_PATH = r"""
+$managementTestPath = $managementModule.ExportedCmdlets['Test-Path']
+if ($managementTestPath -isnot [Management.Automation.CmdletInfo] -or
+    $managementTestPath.ImplementingType.FullName -cne
+        'Microsoft.PowerShell.Commands.TestPathCommand') { throw 'fixture_identity' }
+$managementTestAssembly = $managementTestPath.ImplementingType.Assembly.GetName()
+$managementTestToken = $managementTestAssembly.GetPublicKeyToken()
+if ($managementTestAssembly.Name -cne 'Microsoft.PowerShell.Commands.Management' -or
+    $managementTestToken.Length -ne 8 -or $coreToken.Length -ne 8 -or
+    [BitConverter]::ToString($managementTestToken) -cne [BitConverter]::ToString($coreToken)) {
+    throw 'fixture_identity'
+}
+"""
+_management_verified = (
+    "[Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=management_binding_verified')"
+)
+if RUN_FACADE_MANAGEMENT_IMPORT.count(_management_verified) != 1:
+    raise ValueError("Invalid scoped Management verification anchor")
+RUN_FACADE_MANAGEMENT_IMPORT = RUN_FACADE_MANAGEMENT_IMPORT.replace(
+    _management_verified, RUN_FACADE_MANAGEMENT_TEST_PATH + _management_verified, 1
+)
+ELEMENT_CHECKPOINTS.update((*RUN_FACADE_MANAGEMENT_CHECKPOINTS, *RUN_FACADE_CHECKPOINTS))
+RUN_FACADE_SCRIPT = (
+    r"""
+param([string]$Run, [string]$RunHash, [string]$StartSource, [string]$StartHash,
+      [string]$InstallRoot, [string]$Initial, [string]$Case, [string]$SourceKind)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+__ELEMENT_CHILD_DIAGNOSTICS__
+function Read-K5FacadeSource([string]$Path, [string]$Expected, [int]$Maximum) {
+    $stream = [IO.File]::OpenRead($Path)
+    $bytes = [byte[]]::new($Maximum + 1)
+    $total = 0
+    try {
+        while ($total -lt $bytes.Length) {
+            $count = $stream.Read($bytes, $total, $bytes.Length - $total)
+            if ($count -eq 0) { break }
+            $total += $count
+        }
+    } finally { $stream.Dispose() }
+    if ($total -gt $Maximum) { throw 'fixture_identity' }
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $actual = [BitConverter]::ToString(
+            $hasher.ComputeHash($bytes, 0, $total)).Replace('-', '').ToLowerInvariant()
+        if ($actual -cne $Expected) { throw 'fixture_identity' }
+    } finally { $hasher.Dispose() }
+    return [Text.UTF8Encoding]::new($false, $true).GetString($bytes, 0, $total)
+}
+$fixturePhase = 'utility_manifest'
+try {
+__ELEMENT_UTILITY_IMPORT__
+__FACADE_MANAGEMENT_IMPORT__
+    $fixturePhase = 'source_select'
+    [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=facade_source_requested')
+    [Console]::Out.Flush()
+    if ($Initial -cnotin @('absent','stale_zero','stale_nonzero','stale_seven') -or
+        $Case -cnotin @('success','child_throw','cleanup_throw','child_exit_nonzero') -or
+        $SourceKind -cnotin @('synthetic','public')) { throw 'fixture_arguments' }
+    # Execute only the immutable historical comparison, with fixed scalar inputs.
+    # The changed-code control must reject; the equal-code collision must not.
+    # No automatic variable, child result, or actual Run source is altered here.
+    $historicalControls = 0
+    foreach ($comparison in @(@(0,7,$true), @(7,7,$false), @(7,0,$false))) {
+        $nativeExitBeforePresent = $true
+        $nativeExitBeforeValue = $comparison[0]
+        $nativeExitAfterValue = $comparison[1]
+        $historicalRejected = $false
+        try {
+__HISTORICAL_COMPARISON__
+        } catch {
+            if ($_.Exception.Message -cne 'K5 Vision Alpha launcher failed.') { throw }
+            $historicalRejected = $true
+        }
+        if ($historicalRejected -ne $comparison[2]) { throw 'fixture_identity' }
+        $historicalControls += 1
+    }
+    $runSource = Read-K5FacadeSource $Run $RunHash 16384
+    $source = Read-K5FacadeSource $StartSource $StartHash 65536
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput(
+        $source, [ref]$tokens, [ref]$errors)
+    if ($errors.Count -ne 0 -or $null -eq $ast.ParamBlock) { throw 'fixture_identity' }
+    $topTry = @()
+    foreach ($statement in $ast.EndBlock.Statements) {
+        if ($statement -is [Management.Automation.Language.TryStatementAst]) {
+            $topTry += ,$statement
+        }
+    }
+    if ($topTry.Count -ne 1) { throw 'fixture_identity' }
+    $success = @()
+    foreach ($statement in $topTry[0].Body.Statements) {
+        if ($statement -is [Management.Automation.Language.IfStatementAst] -and
+            $statement.Extent.Text.StartsWith('if ($ExitAfterPublicTest) {')) {
+            $success += ,$statement
+        }
+    }
+    if ($success.Count -ne 1) { throw 'fixture_identity' }
+    if ($success[0].Clauses.Count -ne 1 -or $null -ne $success[0].ElseClause -or
+        $success[0].Clauses[0].Item1.Extent.Text -cne '$ExitAfterPublicTest') {
+        throw 'fixture_identity'
+    }
+    $statements = @($success[0].Clauses[0].Item2.Statements)
+    if ($statements.Count -ne 2 -or
+        $statements[0] -isnot [Management.Automation.Language.PipelineAst] -or
+        $statements[1] -isnot [Management.Automation.Language.ReturnStatementAst] -or
+        $statements[1].Extent.Text -cne 'return') { throw 'fixture_identity' }
+    $commands = @($statements[0].PipelineElements)
+    if ($commands.Count -ne 1 -or
+        $commands[0] -isnot [Management.Automation.Language.CommandAst] -or
+        $commands[0].GetCommandName() -cne 'Write-Host' -or
+        $commands[0].CommandElements.Count -ne 2 -or
+        $commands[0].CommandElements[1] -isnot
+            [Management.Automation.Language.StringConstantExpressionAst] -or
+        $commands[0].CommandElements[1].Value -cne
+            'Exiting after one bounded alpha acceptance run.') { throw 'fixture_identity' }
+    # Only the actual product parameter block and final success-return statement
+    # are used. This is a nonmedia facade fixture, never a full Start execution.
+    $body = @'
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+try {
+    $global:K5FacadeEntered += 1
+    if ($Port -ne 8017 -or -not $ExitAfterPublicTest -or $AnalyticsPreflightOnly -or
+        $PublicRtspSource -cne $global:K5FacadeExpectedSource -or
+        -not $PSBoundParameters.ContainsKey('Port') -or
+        -not $PSBoundParameters.ContainsKey('ExitAfterPublicTest') -or
+        $PSBoundParameters.ContainsKey('AnalyticsPreflightOnly') -or
+        $PSBoundParameters.ContainsKey('PublicRtspSource') -ne
+            $global:K5FacadePublicBound -or
+        $PSBoundParameters.Count -ne (2 + [int]$global:K5FacadePublicBound)) {
+        throw 'fixture_arguments'
+    }
+    $global:K5FacadeArgumentsValid = $true
+    if ($global:K5FacadeCase -ceq 'child_throw') { throw 'K5 facade fixture child failure.' }
+    # Synthetic compatibility control; the current product Start has no exit statement.
+    if ($global:K5FacadeCase -ceq 'child_exit_nonzero') { exit 7 }
+__PRODUCT_SUCCESS_RETURN__
+    throw 'fixture_return_missing'
+} finally {
+    $global:K5FacadeCleanup += 1
+    if ($global:K5FacadeCase -ceq 'cleanup_throw') { throw 'K5 facade fixture cleanup failure.' }
+}
+'@
+    $fixture = $ast.ParamBlock.Extent.Text + [char]10 +
+        $body.Replace('__PRODUCT_SUCCESS_RETURN__', $success[0].Extent.Text)
+    [IO.File]::WriteAllText([IO.Path]::Combine($InstallRoot, 'Start-K5VisionAlpha.ps1'),
+        $fixture, [Text.UTF8Encoding]::new($false))
+    [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=facade_source_selected')
+    [Console]::Out.Flush()
+    $fixturePhase = 'command_admission'
+    $global:K5FacadeCase = $Case
+    $global:K5FacadeEntered = 0
+    $global:K5FacadeCleanup = 0
+    $global:K5FacadeArgumentsValid = $false
+    $global:K5FacadeExpectedSource = if ($SourceKind -ceq 'public') {
+        'rtsp://example.invalid:8554/owned%20path'
+    } else { '' }
+    $global:K5FacadePublicBound = $SourceKind -ceq 'public'
+    if ($null -ne (Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue)) {
+        throw 'fixture_not_fresh'
+    }
+    if ($Initial -ceq 'stale_zero') { $global:LASTEXITCODE = 0 }
+    elseif ($Initial -ceq 'stale_nonzero') { $global:LASTEXITCODE = 9 }
+    elseif ($Initial -ceq 'stale_seven') { $global:LASTEXITCODE = 7 }
+    $outcome = 'returned'
+    $fixturePhase = 'probe_invoke'
+    [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=facade_invoke_requested')
+    [Console]::Out.Flush()
+    try {
+        & $Run -InstallRoot $InstallRoot -Port 8017 -ExitAfterPublicTest `
+            -PublicRtspSource $global:K5FacadeExpectedSource
+    } catch {
+        if ($_.FullyQualifiedErrorId.Split(',')[0] -ceq 'VariableIsUndefined' -and
+            [IO.Path]::GetFullPath($_.InvocationInfo.ScriptName) -ceq
+                [IO.Path]::GetFullPath($Run) -and
+            $_.InvocationInfo.Line.Contains('$LASTEXITCODE') -and
+            $runSource.Contains($_.InvocationInfo.Line.Trim())) {
+            $outcome = 'variable_undefined'
+        } elseif ($_.Exception.Message -ceq 'K5 Vision Alpha launcher failed.') {
+            $outcome = 'wrapper_failure'
+        } elseif ($_.Exception.Message -ceq 'K5 facade fixture child failure.') {
+            $outcome = 'child_failure'
+        } elseif ($_.Exception.Message -ceq 'K5 facade fixture cleanup failure.') {
+            $outcome = 'cleanup_failure'
+        } else { $outcome = 'unexpected_error' }
+    }
+    [Console]::Out.WriteLine('K5_ELEMENT_CHECKPOINT=facade_invoke_returned')
+    [Console]::Out.Flush()
+    $fixturePhase = 'probe_record'
+    $null = Read-K5FacadeSource $Run $RunHash 16384
+    $ambient = Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+    $ambientJson = 'null'
+    if ($null -ne $ambient) {
+        if ($ambient.Value -isnot [int] -or $ambient.Value -notin @(0,7,9)) {
+            throw 'fixture_ambient'
+        }
+        $ambientJson = [string]$ambient.Value
+    }
+    $json = '{"schema_version":"run-facade-return-v1","initial":"' + $Initial +
+        '","case":"' + $Case + '","source_kind":"' + $SourceKind +
+        '","outcome":"' + $outcome + '","entered":' +
+        [string]$global:K5FacadeEntered + ',"cleanup":' +
+        [string]$global:K5FacadeCleanup + ',"arguments_valid":' +
+        $global:K5FacadeArgumentsValid.ToString().ToLowerInvariant() +
+        ',"historical_collision":' + ($historicalControls -eq 3).ToString().ToLowerInvariant() +
+        ',"ambient_after":' + $ambientJson + '}'
+    [Console]::Out.WriteLine('K5_RUN_FACADE_RESULT=' + $json)
+    [Console]::Out.Flush()
+    exit 0
+} catch {
+    Write-K5ElementChildFailure $_ $fixturePhase 'primary'
+    exit 1
+}
+""".replace("__ELEMENT_CHILD_DIAGNOSTICS__", ELEMENT_CHILD_DIAGNOSTICS)
+    .replace("__ELEMENT_UTILITY_IMPORT__", ELEMENT_UTILITY_IMPORT)
+    .replace("__HISTORICAL_COMPARISON__", RUN_FACADE_HISTORICAL_COMPARISON)
+    .replace("__FACADE_MANAGEMENT_IMPORT__", RUN_FACADE_MANAGEMENT_IMPORT)
+)
+
+
+def _run_facade_bind_modules(script, powershell, common):
+    script = _element_bind_utility(script, powershell, common)
+    home = common.local_path(powershell).parent
+    manifest = common.local_path(
+        home / "Modules/Microsoft.PowerShell.Management/Microsoft.PowerShell.Management.psd1"
+    )
+    with manifest.open("rb") as stream:
+        raw = stream.read(65537)
+    if not raw or len(raw) > 65536:
+        raise ValueError("Invalid scoped Management manifest")
+    for marker, value in (
+        ("__MANAGEMENT_HOME__", str(home).replace("'", "''")),
+        ("__MANAGEMENT_SHA256__", hashlib.sha256(raw).hexdigest()),
+    ):
+        if script.count(marker) != 1:
+            raise ValueError("Invalid scoped Management template")
+        script = script.replace(marker, value, 1)
+    return script
+
+
+def _run_facade_management_as_utility(line):
+    if type(line) is not bytes or not line.startswith(RUN_FACADE_MANAGEMENT_PREFIX):
+        raise ValueError("Invalid scoped Management observation")
+    normalized = ELEMENT_UTILITY_BINDING_PREFIX + line[len(RUN_FACADE_MANAGEMENT_PREFIX) :].replace(
+        b"management", b"utility"
+    )
+    restored = RUN_FACADE_MANAGEMENT_PREFIX + normalized[
+        len(ELEMENT_UTILITY_BINDING_PREFIX) :
+    ].replace(b"utility", b"management")
+    if restored != line:
+        raise ValueError("Invalid scoped Management schema")
+    return normalized
+
+
+def _run_facade_management_binding_records(raw):
+    if len(raw) > 4096:
+        raise ValueError("Invalid scoped Management observations")
+    records = []
+    for line in raw.splitlines():
+        if not line.startswith(RUN_FACADE_MANAGEMENT_PREFIX):
+            continue
+        normalized = _run_facade_management_as_utility(line)
+        for value in _element_utility_binding_records(normalized + b"\n"):
+            records.append(
+                {
+                    key.replace("utility", "management"): item.replace("utility", "management")
+                    if type(item) is str
+                    else item
+                    for key, item in value.items()
+                }
+            )
+    if len(records) > 1:
+        raise ValueError("Duplicate scoped Management observation")
+    return records
+
+
+def _run_facade_record(output):
+    if type(output) is not bytes or len(output) > 2048:
+        raise ValueError("Invalid fixed facade observation")
+    records = []
+    success_messages = 0
+    for line in output.splitlines():
+        if line.startswith(RUN_FACADE_PREFIX):
+            pairs = json.loads(line[len(RUN_FACADE_PREFIX) :], object_pairs_hook=list)
+            if type(pairs) is not list or any(type(pair) is not tuple for pair in pairs):
+                raise ValueError("Invalid fixed facade observation")
+            value = dict(pairs)
+            if len(value) != len(pairs):
+                raise ValueError("Invalid fixed facade observation")
+            records.append(value)
+        elif line == b"Exiting after one bounded alpha acceptance run.":
+            success_messages += 1
+        else:
+            raise ValueError("Invalid fixed facade observation")
+    if len(records) != 1 or success_messages > 1:
+        raise ValueError("Invalid fixed facade observation")
+    value = records[0]
+    if value.keys() != {
+        "schema_version",
+        "initial",
+        "case",
+        "source_kind",
+        "outcome",
+        "entered",
+        "cleanup",
+        "arguments_valid",
+        "historical_collision",
+        "ambient_after",
+    }:
+        raise ValueError("Invalid fixed facade observation")
+    enums = {
+        "schema_version": {"run-facade-return-v1"},
+        "initial": set(RUN_FACADE_INITIALS),
+        "case": set(RUN_FACADE_CASES),
+        "source_kind": {"synthetic", "public"},
+        "outcome": set(RUN_FACADE_CASES.values()) | {"variable_undefined", "unexpected_error"},
+    }
+    if any(
+        type(value[key]) is not str or value[key] not in options for key, options in enums.items()
+    ):
+        raise ValueError("Invalid fixed facade observation")
+    if any(
+        type(value[key]) is not bool for key in ("arguments_valid", "historical_collision")
+    ) or any(
+        type(value[key]) is not int or not 0 <= value[key] <= 2 for key in ("entered", "cleanup")
+    ):
+        raise ValueError("Invalid fixed facade observation")
+    if value["ambient_after"] is not None and (
+        type(value["ambient_after"]) is not int or value["ambient_after"] not in (0, 7, 9)
+    ):
+        raise ValueError("Invalid fixed facade observation")
+    return value
+
+
+def _run_facade_child_record(output):
+    complete, checkpoints, arguments = _element_complete_records(output)
+    expected = [
+        "utility_manifest_requested",
+        "utility_import_requested",
+        "utility_import_returned",
+        "utility_binding_verified",
+        *RUN_FACADE_MANAGEMENT_CHECKPOINTS,
+        *RUN_FACADE_CHECKPOINTS,
+    ]
+    if complete != output or checkpoints != expected or arguments:
+        raise ValueError("Incomplete fixed facade observations")
+    lines = output.splitlines()
+    if (
+        len(lines) not in (15, 16)
+        or lines[:3] != [ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in expected[:3]]
+        or lines[4] != ELEMENT_CHECKPOINT_PREFIX + b"utility_binding_verified"
+    ):
+        raise ValueError("Invalid scoped Utility observation")
+    _element_require_utility_observation(lines[3])
+    if (
+        lines[5:8]
+        != [
+            ELEMENT_CHECKPOINT_PREFIX + name.encode()
+            for name in RUN_FACADE_MANAGEMENT_CHECKPOINTS[:3]
+        ]
+        or lines[9] != ELEMENT_CHECKPOINT_PREFIX + b"management_binding_verified"
+    ):
+        raise ValueError("Invalid scoped Management observation order")
+    _element_require_utility_observation(_run_facade_management_as_utility(lines[8]))
+    if lines[10:13] != [
+        ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in RUN_FACADE_CHECKPOINTS[:3]
+    ]:
+        raise ValueError("Invalid fixed facade stage order")
+    tail = lines[13:]
+    retained = []
+    if tail[0] == b"Exiting after one bounded alpha acceptance run.":
+        retained.append(tail.pop(0))
+    if len(tail) != 2 or tail[0] != ELEMENT_CHECKPOINT_PREFIX + b"facade_invoke_returned":
+        raise ValueError("Invalid fixed facade result order")
+    return _run_facade_record(b"\n".join([*retained, tail[1]]) + b"\n")
+
+
+def _run_facade_capture_classes(common):
+    class StrictStderrSummary(common.StderrSummary):
+        def __init__(self, stream, *, gated, nonce=""):
+            if gated and re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+                raise ValueError("Invalid facade relay identity")
+            protocol = b""
+            if gated:
+                marker = "K5_GATE_" + nonce + "_"
+                protocol = "".join(
+                    "\n" + marker + value + "\n"
+                    for value in ("STATE=opened", "STATE=started", "EXIT=0")
+                ).encode("ascii")
+            self.facade_child_stderr_empty = False
+            self._facade_expected = (protocol, protocol.replace(b"\n", b"\r\n"))
+            self._facade_offset = 0
+            super().__init__(stream, gated=gated, nonce=nonce)
+
+        def _read(self, stream):
+            summary = self
+
+            class ObservedStream:
+                def read1(self, size):
+                    block = stream.read1(size)
+                    if block and summary._facade_expected:
+                        offset = summary._facade_offset
+                        summary._facade_expected = tuple(
+                            expected
+                            for expected in summary._facade_expected
+                            if expected[offset : offset + len(block)] == block
+                        )
+                        if summary._facade_expected:
+                            summary._facade_offset += len(block)
+                    return block
+
+                def close(self):
+                    stream.close()
+
+            super()._read(ObservedStream())
+            self.facade_child_stderr_empty = not self.read_failed and any(
+                self._facade_offset == len(expected) for expected in self._facade_expected
+            )
+
+    class StrictOwnedProcess(common.OwnedProcess):
+        def wait(self, seconds):
+            super().wait(seconds)
+            if self.stderr_summary.facade_child_stderr_empty is not True:
+                raise common.WitnessError("output_invalid")
+
+    return StrictStderrSummary, StrictOwnedProcess
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires actual Windows Run facade")
+@pytest.mark.parametrize("source_kind", ["synthetic", "public"])
+@pytest.mark.parametrize("initial,case", RUN_FACADE_SCENARIOS)
+def test_windows_run_facade_uses_script_result_not_ambient_native_status(
+    tmp_path, source_kind, initial, case
+):
+    import os
+
+    common = None
+    observed = None
+    context = _element_context("probe", initial=initial)
+    try:
+        module = _startup_witness()
+        common = module.common
+        common.StderrSummary, common.OwnedProcess = _run_facade_capture_classes(common)
+        base = common.local_path(Path(sys._base_executable))
+        binding = dict(
+            K5_WITNESS_BASE_PYTHON=str(base),
+            K5_WITNESS_BASE_PYTHON_SHA256=common.file_hash(base),
+        )
+        supplied = {key: os.environ.get(key) for key in common.GATE_RUNTIME_KEYS}
+        if any(value is not None for value in supplied.values()) and supplied != binding:
+            raise ValueError("Invalid admitted facade runtime")
+        env = module.clean_environment(dict(os.environ), tmp_path)
+        env.update(binding)
+        for key in ("TEMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            Path(env[key]).mkdir(parents=True, exist_ok=True)
+        shell = common.local_path(
+            Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        installed = tmp_path / "owned facade with spaces"
+        installed.mkdir()
+        run_bytes = (ALPHA / "Run-K5VisionAlpha.ps1").read_bytes()
+        run = installed / "Run-K5VisionAlpha.ps1"
+        run.write_bytes(run_bytes)
+        harness = tmp_path / "run-facade.ps1"
+        harness.write_text(
+            _run_facade_bind_modules(RUN_FACADE_SCRIPT, shell, common),
+            encoding="ascii",
+            newline="\n",
+        )
+        output = _capture_element_child(
+            common,
+            [
+                str(shell),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(harness),
+                "-Run",
+                str(run),
+                "-RunHash",
+                hashlib.sha256(run_bytes).hexdigest(),
+                "-StartSource",
+                str(START),
+                "-StartHash",
+                hashlib.sha256(START.read_bytes()).hexdigest(),
+                "-InstallRoot",
+                str(installed),
+                "-Initial",
+                initial,
+                "-Case",
+                case,
+                "-SourceKind",
+                source_kind,
+            ],
+            cwd=tmp_path,
+            env=env,
+            context=context,
+        )
+        observed = _run_facade_child_record(output)
+    except _ElementCaptureFailure:
+        pass  # The qualified capture has already emitted only fixed diagnostics.
+    except Exception as error:
+        try:
+            _element_diagnostic(context, "failed", error, common=common)
+        except Exception:
+            pass
+    if observed is None:
+        # Outside the handler: raw subprocess/path exception context must not be retained.
+        pytest.fail("Source-bound nonmedia Run facade fixture failed", pytrace=False)
+    matches = (
+        observed["initial"] == initial
+        and observed["case"] == case
+        and observed["source_kind"] == source_kind
+        and observed["entered"] == observed["cleanup"] == 1
+        and observed["arguments_valid"]
+        and observed["historical_collision"]
+        and (
+            case == "child_exit_nonzero"
+            or observed["ambient_after"] == RUN_FACADE_INITIALS[initial]
+        )
+        and observed["outcome"] == RUN_FACADE_CASES[case]
+    )
+    if not matches:
+        print(RUN_FACADE_PREFIX.decode() + json.dumps(observed, separators=(",", ":")))
+        pytest.fail("Run facade violated the script-result contract", pytrace=False)
+
+
+def test_run_facade_fixture_is_source_bound_nonmedia_and_does_not_seed_success():
+    source = RUN_FACADE_SCRIPT
+    assert "$bytes = [byte[]]::new($Maximum + 1)" in source
+    assert "$hasher.ComputeHash($bytes, 0, $total)" in source
+    assert "$stream.Dispose()" in source and "$hasher.Dispose()" in source
+    assert "$ast.ParamBlock.Extent.Text" in source
+    assert "$success[0].Extent.Text" in source
+    assert "$statements.Count -ne 2" in source
+    assert "$topTry[0].Body.Statements" in source
+    assert "$success[0].Clauses.Count -ne 1" in source
+    assert "$commands[0].GetCommandName() -cne 'Write-Host'" in source
+    assert "InvocationInfo.Line.Contains('$LASTEXITCODE')" in source
+    assert "$global:LASTEXITCODE = 0" in source  # Explicit stale-input control only.
+    assert "$Initial -ceq 'stale_zero'" in source
+    assert "& $Run -InstallRoot $InstallRoot" in source
+    assert "& $StartSource" not in source and "Start-Process" not in source
+    assert "[Diagnostics.Process]" not in source and "Invoke-RestMethod" not in source
+    assert source.count("Read-K5FacadeSource $Run $RunHash 16384") == 2
+    assert len(source.encode("ascii")) < 32768
+    assert ELEMENT_UTILITY_IMPORT in source
+    assert ELEMENT_CHILD_DIAGNOSTICS in source
+    assert source.index(ELEMENT_UTILITY_IMPORT) < source.index("Get-Variable LASTEXITCODE")
+    start = START.read_text()
+    assert start.count("if ($ExitAfterPublicTest) {") == 1
+    assert "Exiting after one bounded alpha acceptance run." in start
+
+
+def test_run_facade_record_rejects_unbounded_private_or_untyped_observations():
+    value = dict(
+        schema_version="run-facade-return-v1",
+        initial="absent",
+        case="success",
+        source_kind="synthetic",
+        outcome="returned",
+        entered=1,
+        cleanup=1,
+        arguments_valid=True,
+        historical_collision=True,
+        ambient_after=None,
+    )
+
+    def encode(item):
+        return RUN_FACADE_PREFIX + json.dumps(item).encode() + b"\n"
+
+    assert _run_facade_record(encode(value)) == value
+    for invalid in (
+        b"private path\n" + encode(value),
+        encode(value) * 2,
+        b"x" * 2049,
+        encode({**value, "extra": "private"}),
+        encode({**value, "entered": True}),
+        encode({**value, "ambient_after": True}),
+        encode({**value, "outcome": "private"}),
+        RUN_FACADE_PREFIX
+        + b'{"schema_version":"run-facade-return-v1","schema_version":"duplicate"}',
+    ):
+        with pytest.raises(ValueError):
+            _run_facade_record(invalid)
+
+
+@pytest.mark.parametrize("result_failure", [False, True])
+def test_run_facade_failures_have_no_raw_exception_context(
+    tmp_path, monkeypatch, capsys, result_failure
+):
+    from types import SimpleNamespace
+
+    common = SimpleNamespace(
+        GATE_RUNTIME_KEYS=(),
+        local_path=lambda path: Path(path),
+        file_hash=lambda path: "a" * 64,
+        WitnessError=type("FixtureWitnessError", (Exception,), {}),
+        StderrSummary=object,
+        OwnedProcess=object,
+    )
+    env = {
+        key: str(tmp_path / key)
+        for key in (
+            "SYSTEMROOT",
+            "TEMP",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+        )
+    }
+    namespace = test_windows_run_facade_uses_script_result_not_ambient_native_status.__globals__
+    monkeypatch.setitem(
+        namespace,
+        "_startup_witness",
+        lambda: SimpleNamespace(
+            common=common,
+            clean_environment=lambda *args: env.copy(),
+        ),
+    )
+    monkeypatch.setitem(namespace, "_run_facade_bind_modules", lambda script, *args: script)
+
+    calls = []
+
+    def fail_capture(*args, **kwargs):
+        calls.append(True)
+        if result_failure:
+            return b""
+        raise subprocess.TimeoutExpired(
+            ["PRIVATE_FACADE_COMMAND"],
+            15,
+            output=b"PRIVATE_FACADE_OUTPUT",
+            stderr=b"PRIVATE_FACADE_STDERR",
+        )
+
+    monkeypatch.setitem(namespace, "_capture_element_child", fail_capture)
+    monkeypatch.setitem(
+        namespace,
+        "_run_facade_child_record",
+        lambda output: dict(
+            schema_version="run-facade-return-v1",
+            initial="absent",
+            case="success",
+            source_kind="synthetic",
+            outcome="wrapper_failure",
+            entered=1,
+            cleanup=1,
+            arguments_valid=True,
+            historical_collision=True,
+            ambient_after=None,
+        ),
+    )
+    with pytest.raises(pytest.fail.Exception) as failure:
+        test_windows_run_facade_uses_script_result_not_ambient_native_status(
+            tmp_path, "synthetic", "absent", "success"
+        )
+    assert failure.value.__context__ is None
+    assert calls == [True]
+    capture = capsys.readouterr()
+    assert "PRIVATE_FACADE" not in str(failure.value) + capture.out + capture.err
+    if result_failure:
+        assert RUN_FACADE_PREFIX.decode() in capture.out
+        assert '"outcome":"wrapper_failure"' in capture.out
+
+
+def test_run_facade_child_record_requires_both_qualified_module_prefixes():
+    utility = [
+        ELEMENT_CHECKPOINT_PREFIX + name.encode()
+        for name in (
+            "utility_manifest_requested",
+            "utility_import_requested",
+            "utility_import_returned",
+        )
+    ]
+    utility += [_utility_observation_bytes().rstrip(b"\n")]
+    utility += [ELEMENT_CHECKPOINT_PREFIX + b"utility_binding_verified"]
+    utility += [
+        ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in RUN_FACADE_MANAGEMENT_CHECKPOINTS[:3]
+    ]
+    utility += [
+        _utility_observation_bytes()
+        .rstrip(b"\n")
+        .replace(b"UTILITY", b"MANAGEMENT")
+        .replace(b"utility", b"management")
+    ]
+    utility += [ELEMENT_CHECKPOINT_PREFIX + b"management_binding_verified"]
+    stages = [ELEMENT_CHECKPOINT_PREFIX + name.encode() for name in RUN_FACADE_CHECKPOINTS]
+    value = dict(
+        schema_version="run-facade-return-v1",
+        initial="absent",
+        case="success",
+        source_kind="synthetic",
+        outcome="returned",
+        entered=1,
+        cleanup=1,
+        arguments_valid=True,
+        historical_collision=True,
+        ambient_after=None,
+    )
+    record = RUN_FACADE_PREFIX + json.dumps(value).encode()
+    output = b"\n".join([*utility, *stages, record]) + b"\n"
+    assert _run_facade_child_record(output) == value
+    for malformed in (
+        b"\n".join([*utility[:3], *utility[4:], *stages, record]) + b"\n",
+        b"\n".join([*utility, *stages[1:], record]) + b"\n",
+        b"\n".join([*utility, *reversed(stages), record]) + b"\n",
+        b"\n".join([*utility, *stages, stages[-1], record]) + b"\n",
+        b"\n".join([record, *utility[:2], utility[3], utility[2], utility[4], *stages]) + b"\n",
+        b"\n".join([*utility, *stages[:-1], record, stages[-1]]) + b"\n",
+        output + b"PRIVATE_FACADE_OUTPUT\n",
+        b"\n".join([*utility[:8], *utility[9:], *stages, record]) + b"\n",
+        output.replace(b"management_binding_verified", b"management_import_returned"),
+        output.replace(b"element-management-binding-v3", b"element-utility-binding-v3"),
+        output[:-1],
+    ):
+        with pytest.raises(ValueError):
+            _run_facade_child_record(malformed)
+
+
+def test_run_facade_management_binding_reuses_exact_module_admission_before_run(tmp_path):
+    from types import SimpleNamespace
+
+    source = RUN_FACADE_MANAGEMENT_IMPORT
+    assert "__MANAGEMENT_HOME__" in source and "__MANAGEMENT_SHA256__" in source
+    assert "'Modules\\Microsoft.PowerShell.Management'" in source
+    assert "'Microsoft.PowerShell.Management.psd1'" in source
+    assert "[IO.FileAttributes]::ReparsePoint" in source
+    assert "$manifestStream.Length -gt 65536" in source
+    assert "$manifestStream.Dispose()" in source and "$manifestHasher.Dispose()" in source
+    assert "-Name $managementManifest -Global -PassThru -ErrorAction Stop" in source
+    assert "$managementModule.ModuleBase), $expectedHome" in source
+    assert "$managementModule.Path), $managementManifest" in source
+    for command, implementation in (
+        ("Join-Path", "JoinPathCommand"),
+        ("Test-Path", "TestPathCommand"),
+    ):
+        assert f".ExportedCmdlets['{command}']" in source
+        assert f"'Microsoft.PowerShell.Commands.{implementation}'" in source
+    assert "$managementTestToken.Length -ne 8 -or $coreToken.Length -ne 8" in source
+    assert (
+        "[BitConverter]::ToString($managementTestToken) -cne [BitConverter]::ToString($coreToken)"
+        in source
+    )
+    assert "Parser]::Parse" not in source and "Get-Command" not in source
+    assert source.index(RUN_FACADE_MANAGEMENT_TEST_PATH) < source.index(_management_verified)
+    assert RUN_FACADE_SCRIPT.index(source) < RUN_FACADE_SCRIPT.index("& $Run -InstallRoot")
+    common = SimpleNamespace(local_path=lambda path: Path(path))
+    shell = tmp_path / "powershell.exe"
+    for name in ("Utility", "Management"):
+        manifest = (
+            tmp_path / f"Modules/Microsoft.PowerShell.{name}/Microsoft.PowerShell.{name}.psd1"
+        )
+        manifest.parent.mkdir(parents=True)
+        manifest.write_bytes(name.encode("ascii"))
+    bound = _run_facade_bind_modules(RUN_FACADE_SCRIPT, shell, common)
+    for name in ("UTILITY", "MANAGEMENT"):
+        assert f"__{name}_HOME__" not in bound and f"__{name}_SHA256__" not in bound
+        assert hashlib.sha256(name.title().encode("ascii")).hexdigest() in bound
+    manifest.write_bytes(b"x" * 65537)
+    with pytest.raises(ValueError, match="^Invalid scoped Management manifest$"):
+        _run_facade_bind_modules(RUN_FACADE_SCRIPT, shell, common)
+
+
+def test_run_facade_management_observation_is_fixed_typed_and_source_free():
+    record = (
+        _utility_observation_bytes()
+        .replace(b"UTILITY", b"MANAGEMENT")
+        .replace(b"utility", b"management")
+    )
+    observed = _run_facade_management_binding_records(record)
+    assert len(observed) == 1
+    assert observed[0]["schema_version"] == "element-management-binding-v3"
+    assert observed[0]["module_base_kind"] == "exact_pshome"
+    for malformed in (
+        record * 2,
+        record.replace(b"element-management-binding-v3", b"element-utility-binding-v3"),
+        record.replace(b'"module_base_kind":"exact_pshome"', b'"module_base_kind":"PRIVATE_PATH"'),
+        record.replace(b'"module_count_ok":true', b'"module_count_ok":1'),
+        record.replace(b'"module_count_ok":true', b'"module_count_ok":true,"module_count_ok":true'),
+        record + b"x" * 4097,
+    ):
+        with pytest.raises(ValueError):
+            _run_facade_management_binding_records(malformed)
+
+
+def test_run_facade_stderr_observer_accepts_only_exact_relay_protocol():
+    import io
+
+    common = _startup_witness().common
+    summary_type, _ = _run_facade_capture_classes(common)
+    nonce = "1" * 32
+    marker = "K5_GATE_" + nonce + "_"
+    protocol = "".join(
+        "\n" + marker + item + "\n"
+        for item in (
+            "STATE=opened",
+            "STATE=started",
+            "EXIT=0",
+        )
+    ).encode()
+
+    class Chunked(io.BytesIO):
+        def read1(self, size=-1):
+            return super().read1(min(size, 3))
+
+    for wire, accepted in (
+        (protocol, True),
+        (protocol.replace(b"\n", b"\r\n"), True),
+        (b"PRIVATE_STDERR" + protocol, False),
+        (protocol + b"PRIVATE_STDERR", False),
+        (protocol.replace(b"STATE=started", b"PRIVATE_STDERR"), False),
+        (protocol.replace(b"EXIT=0", b"EXIT=7"), False),
+        (protocol.replace(nonce.encode(), b"2" * 32), False),
+        (protocol[:-1], False),
+    ):
+        summary = summary_type(Chunked(wire), gated=True, nonce=nonce)
+        assert summary.finish(1)
+        assert summary.facade_child_stderr_empty is accepted
+        assert not hasattr(summary, "raw")
+    for wire, accepted in ((b"", True), (b"PRIVATE_STDERR", False)):
+        summary = summary_type(Chunked(wire), gated=False)
+        assert summary.finish(1)
+        assert summary.facade_child_stderr_empty is accepted
+
+
+@pytest.mark.parametrize("child_stderr", [False, True])
+def test_run_facade_owned_wait_preserves_child_stderr_refusal(child_stderr):
+    import io
+
+    common = _startup_witness().common
+    waited = []
+
+    class CompletedOwned:
+        def __init__(self, summary):
+            self.stderr_summary = summary
+
+        def wait(self, seconds):
+            waited.append(seconds)
+            assert self.stderr_summary.finish(1)
+
+    common.OwnedProcess = CompletedOwned
+    summary_type, owned_type = _run_facade_capture_classes(common)
+    summary = summary_type(io.BytesIO(b"PRIVATE_STDERR" if child_stderr else b""), gated=False)
+    owned = owned_type(summary)
+    if child_stderr:
+        with pytest.raises(common.WitnessError, match="^output_invalid$"):
+            owned.wait(5)
+    else:
+        owned.wait(5)
+    assert waited == [5]
+
+
+def test_run_facade_matrix_covers_equal_nonzero_success_and_failure_without_syntax_lock():
+    assert len(RUN_FACADE_SCENARIOS) == len(set(RUN_FACADE_SCENARIOS)) == 14
+    assert set(RUN_FACADE_SCENARIOS) == {
+        (initial, case)
+        for initial in ("absent", "stale_zero", "stale_nonzero")
+        for case in RUN_FACADE_CASES
+    } | {("stale_seven", "success"), ("stale_seven", "child_exit_nonzero")}
+    assert RUN_FACADE_INITIALS["stale_seven"] == 7
+    assert "elseif ($Initial -ceq 'stale_seven') { $global:LASTEXITCODE = 7 }" in RUN_FACADE_SCRIPT
+    assert "if ($global:K5FacadeCase -ceq 'child_exit_nonzero') { exit 7 }" in RUN_FACADE_SCRIPT
+    assert hashlib.sha256(RUN_FACADE_HISTORICAL_COMPARISON.encode("ascii")).hexdigest() == (
+        "881ec07c4e790320e4af0e2fa8e582986e0f484096c658be4d694c7c8a114c96"
+    )
+    assert RUN_FACADE_HISTORICAL_COMPARISON in RUN_FACADE_SCRIPT
+    assert "@(0,7,$true), @(7,7,$false), @(7,0,$false)" in RUN_FACADE_SCRIPT
+    # Actual Windows observations enforce the contract, not a chosen source spelling.
+    # Fixture preparation must not autoload path cmdlets before actual Run admission.
+    preparation = RUN_FACADE_SCRIPT.split("__PRODUCT_SUCCESS_RETURN__", 2)[-1].split(
+        "$global:K5FacadeCase = $Case", 1
+    )[0]
+    assert "[IO.Path]::Combine($InstallRoot, 'Start-K5VisionAlpha.ps1')" in preparation
+    assert "Join-Path" not in preparation
+
+
+TEST_NATIVE_CALLS = {
+    "gst_version": {
+        "variable": "gstVersion",
+        "executable": "$gstLaunch",
+        "argv": ["--version"],
+        "capture": True,
+        "discard_stderr": True,
+        "failure": "Reviewed GStreamer runtime version verification failed.",
+        "stdout": b"GStreamer 1.28.7\n",
+    },
+    "cli_version": {
+        "variable": "cliVersion",
+        "executable": "$python",
+        "argv": ["-I", "-B", "-m", "k5vision.cli", "--version"],
+        "capture": True,
+        "discard_stderr": False,
+        "failure": "Installed K5 CLI verification failed.",
+        "stdout": b"k5-vision 0.1.0\n",
+    },
+    "cli_help": {
+        "variable": "cliHelp",
+        "executable": "$python",
+        "argv": ["-I", "-B", "-m", "k5vision.cli", "--help"],
+        "capture": False,
+        "discard_stderr": True,
+        "failure": "Installed K5 CLI smoke test failed.",
+        "stdout": b"usage: k5-vision\n",
+    },
+}
+
+
+def _test_native_helper(source):
+    if type(source) is not bytes or len(source) > 262144:
+        raise ValueError("Invalid Test source")
+    names = re.findall(rb"(?im)^function Invoke-K5NativeProbe(?:\s|\()", source)
+    helpers = re.findall(rb"(?ms)^function Invoke-K5NativeProbe \{\r?\n.*?^\}", source)
+    if (
+        len(names) != 1
+        or len(helpers) != 1
+        or hashlib.sha256(helpers[0]).hexdigest()
+        not in ELEMENT_PRODUCT_HASHES["Invoke-K5NativeProbe"]
+    ):
+        raise ValueError("Unqualified Test native helper")
+    return helpers[0].replace(b"\r\n", b"\n")
+
+
+def _test_native_call_source(boundary):
+    call = TEST_NATIVE_CALLS[boundary]
+    source = TEST.read_text(encoding="utf8").replace("\r\n", "\n")
+    assignment = "$" + call["variable"] + " = Invoke-K5NativeProbe -Executable "
+    assignment += (
+        call["executable"]
+        + " -Arguments @("
+        + ", ".join(json.dumps(value) for value in call["argv"])
+        + ")"
+    )
+    if call["capture"]:
+        assignment += " -CaptureOutput"
+    if call["discard_stderr"]:
+        assignment += " -DiscardStderr"
+    if source.count(assignment) != 1:
+        raise ValueError("Invalid Test native caller")
+    start = source.index(assignment)
+    end = source.index("}", start) + 1
+    block = source[start:end]
+    if (
+        len(block) > 1024
+        or "$" + call["variable"] + ".ExitCode -ne 0" not in block
+        or ('throw "' + call["failure"] + '"') not in block
+    ):
+        raise ValueError("Invalid Test native validator")
+    return block
+
+
+def test_test_facade_uses_exact_qualified_pump_without_ambient_native_status():
+    source = TEST.read_bytes()
+    helper = _test_native_helper(source)
+    assert helper == _test_native_helper(START.read_bytes())
+    assert b"$LASTEXITCODE" not in source and b"Succeeded = $?" not in source
+    assert source.count(b"function Invoke-K5NativeProbe {") == 1
+    assert source.count(b"$exitCode = $child.ExitCode") == 1
+    assert b"[Console]::Out.Write($cliVersion.Stdout)" in source
+    # Compare line positions only after the original helper bytes were admitted.
+    ordering_source = source.replace(b"\r\n", b"\n")
+    admission = ordering_source.index(b"& $launcher -AnalyticsPreflightOnly")
+    for boundary in TEST_NATIVE_CALLS:
+        block = _test_native_call_source(boundary)
+        assert admission < ordering_source.index(block.encode())
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_test_facade_ordering_accepts_qualified_line_endings(tmp_path, monkeypatch, newline):
+    source = TEST.read_bytes().replace(b"\r\n", b"\n")
+    target = tmp_path / "Test-K5VisionAlpha.ps1"
+    target.write_bytes(source.replace(b"\n", newline))
+    monkeypatch.setitem(
+        test_test_facade_uses_exact_qualified_pump_without_ambient_native_status.__globals__,
+        "TEST",
+        target,
+    )
+    test_test_facade_uses_exact_qualified_pump_without_ambient_native_status()
+
+
+def test_test_native_helper_refuses_drift_duplicates_or_unbounded_sources():
+    source = TEST.read_bytes()
+    for altered in (
+        source.replace(b"$exitCode = $child.ExitCode", b"$exitCode = 0"),
+        source + b"\n" + _test_native_helper(source),
+        source + b"\nfunction invoke-k5nativeprobe { return $true }\n",
+        source.replace(b"\n", b"\r\n", 20),
+        b"x" * 262145,
+        b"",
+        source.decode(),
+    ):
+        with pytest.raises(ValueError):
+            _test_native_helper(altered)
+
+
+def _test_native_fixture(boundary):
+    call = TEST_NATIVE_CALLS[boundary]
+    # Reuse the qualified source hash/AST selection, exact-argv wrapper, actual
+    # Process observations and owned cleanup. Do not execute Test's top level.
+    script, _ = _shared_native_fixture("version", Path("unused-owned-config.yml"))
+
+    def replace(before, after):
+        nonlocal script
+        if script.count(before) != 1:
+            raise ValueError("Invalid Test fixture anchor")
+        script = script.replace(before, after, 1)
+
+    replace("$node.Name -ceq 'Invoke-K5NativeProbe'", "$node.Name -ieq 'Invoke-K5NativeProbe'")
+    replace(
+        "$node.Left.VariablePath.UserPath -ceq $wanted",
+        "$node.Left.VariablePath.UserPath -ieq $wanted",
+    )
+    replace(
+        '    $helper = $helpers[0].Extent.Text.Replace("`r`n","`n") + "`n"',
+        "    $helperRaw = $helpers[0].Extent.Text\n"
+        "    $helperHasher = [Security.Cryptography.SHA256]::Create()\n"
+        "    try {\n"
+        "        $helperDigest = [BitConverter]::ToString($helperHasher.ComputeHash(\n"
+        "            [Text.Encoding]::UTF8.GetBytes($helperRaw)))"
+        ".Replace('-','').ToLowerInvariant()\n"
+        "        if ($helperDigest -cnotin @("
+        + ",".join("'" + value + "'" for value in ELEMENT_PRODUCT_HASHES["Invoke-K5NativeProbe"])
+        + ")) { throw 'fixture_identity' }\n"
+        "    } finally { $helperHasher.Dispose() }\n"
+        '    $helper = $helperRaw.Replace("`r`n","`n") + "`n"',
+    )
+    begin = script.index("    $pin = @($ast.EndBlock.Statements")
+    end = script.index("    if ($Boundary -cne 'argv')", begin)
+    replace(
+        script[begin:end],
+        "    $gstreamerVersion = '1.28.7'\n"
+        "    $names = @{gst_version='gstVersion';cli_version='cliVersion';cli_help='cliHelp'}\n",
+    )
+    replace("    $mediaMtx = $Python", "    $gstLaunch = $Python")
+    begin = script.index("        $expected = switch ($Boundary)")
+    end = script.index("        for ($index=0; $index -lt $expected.Count; $index++)", begin)
+    replace(
+        script[begin:end],
+        "        [string[]]$expected = @("
+        + ",".join("'" + argument.replace("'", "''") + "'" for argument in call["argv"])
+        + ")\n"
+        "        if ($Executable -cne $Python -or $Arguments.Count -ne $expected.Count -or\n"
+        "            [bool]$CaptureOutput -ne $" + str(call["capture"]).lower() + " -or\n"
+        "            [bool]$DiscardStderr -ne $"
+        + str(call["discard_stderr"]).lower()
+        + ") { throw 'fixture_policy' }\n",
+    )
+    begin = script.index("    $callerMessages = @{")
+    end = script.index("    $fixturePhase = 'probe_invoke'", begin)
+    replace(
+        script[begin:end],
+        "    $callerMessages = @{\n" + boundary + "='" + call["failure"] + "'\n    }\n",
+    )
+    replace("$MediaMtxVersion -cne '1.21.1'", "$gstreamerVersion -cne '1.28.7'")
+    cases = [
+        dict(mode=boundary + "_" + mode, accept=code == 0, code=code, error=error)
+        for mode, code, error in (("zero", 0, "none"), ("nonzero", 7, "caller"))
+    ]
+    old_cases = json.dumps(
+        [dict(mode=m, accept=a, code=c, error=e) for m, a, c, e in SHARED_NATIVE_CASES["version"]]
+    )
+    replace(old_cases, json.dumps(cases))
+    script = script.replace("K5_ELEMENT_CHECKPOINT=shared_", "K5_ELEMENT_CHECKPOINT=test_process_")
+    expected = call["argv"]
+    python = (
+        "import os,sys,time\nEXPECTED = "
+        + repr(expected)
+        + "\nOUTPUT = "
+        + repr(call["stdout"])
+        + "\nBOUNDARY = "
+        + repr(boundary)
+        + "\n"
+        + r"""
+if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
+    os._exit(42)
+if len(sys.argv) < 2 or sys.argv[1] not in (BOUNDARY + '_zero', BOUNDARY + '_nonzero'):
+    os._exit(43)
+if sys.argv[2:] != EXPECTED:
+    os._exit(41)
+time.sleep(0.2)
+os.write(1, OUTPUT)
+os._exit(7 if sys.argv[1].endswith('_nonzero') else 0)
+"""
+    )
+    return script, python
+
+
+ELEMENT_CHECKPOINTS.update(
+    "test_process_" + boundary + "_" + case + "_" + state
+    for boundary in TEST_NATIVE_CALLS
+    for case in ("zero", "nonzero")
+    for state in ("requested", "passed")
+)
+
+
+def _test_native_reference_script(boundary):
+    script = ELEMENT_REFERENCE_SCRIPT
+    before = "subprocess.Popen([executable, argument], stdin=subprocess.DEVNULL,"
+    after = "subprocess.Popen([executable, *json.loads(argument)], stdin=subprocess.DEVNULL,"
+    assert script.count(before) == 1
+    script = script.replace(before, after, 1)
+    before = "outputs != [b'', expected]"
+    after = "outputs != [" + repr(TEST_NATIVE_CALLS[boundary]["stdout"]) + ", expected]"
+    assert script.count(before) == 1
+    return script.replace(before, after, 1)
+
+
+@pytest.mark.parametrize("boundary", sorted(TEST_NATIVE_CALLS))
+def test_test_native_fixture_keeps_source_identity_argv_exit_and_cleanup(boundary):
+    script, _ = _test_native_fixture(boundary)
+    _test_native_call_source(boundary)
+    for fragment in (
+        "$helpers.Count -ne 1",
+        "$assignments.Count -ne 1",
+        "$helperDigest -cnotin",
+        "$actualHash -cne $StartHash",
+        "$statements[$index].Extent.Text",
+        "$Arguments[$index] -cne $expected[$index]",
+        "$script:fixtureActualExit -ne $case.code",
+        "-not $script:fixtureProcessCleaned",
+        "$ambientValue -ne $expectedAmbient",
+        "$helperHasher.Dispose()",
+    ):
+        assert fragment in script
+    assert "& $Start" not in script
+    assert "K5_ELEMENT_CHECKPOINT=shared_" not in script
+    assert "variant='original'" not in script
+    expected_array = (
+        "[string[]]$expected = @("
+        + ",".join("'" + argument + "'" for argument in TEST_NATIVE_CALLS[boundary]["argv"])
+        + ")"
+    )
+    assert script.count(expected_array) == 1
+    assert "$expected = ConvertFrom-Json" not in script
+    assert len(script.encode()) < 32768
+    for value in ELEMENT_PRODUCT_HASHES["Invoke-K5NativeProbe"]:
+        assert script.count(value) == 1
+    reference = _test_native_reference_script(boundary)
+    assert "*json.loads(argument)" in reference
+    assert "child.wait(timeout=5)" in reference and "child.kill()" in reference
+
+
+@pytest.mark.parametrize("boundary", sorted(TEST_NATIVE_CALLS))
+def test_test_native_oracle_demands_exact_vector_and_real_exit(tmp_path, boundary):
+    _, python = _test_native_fixture(boundary)
+    fixture = tmp_path / "owned Test oracle.py"
+    fixture.write_text(python, encoding="ascii", newline="\n")
+    for case, code in (("zero", 0), ("nonzero", 7)):
+        command = [sys.executable, "-I", "-B", "-S", str(fixture), boundary + "_" + case]
+        result = subprocess.run(
+            command + TEST_NATIVE_CALLS[boundary]["argv"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        assert result.returncode == code
+        assert result.stdout == TEST_NATIVE_CALLS[boundary]["stdout"] and not result.stderr
+        wrong = subprocess.run(
+            command + ["unexpected"], capture_output=True, timeout=5, check=False
+        )
+        assert wrong.returncode == 41 and not wrong.stdout and not wrong.stderr
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires actual Windows Test native processes")
+@pytest.mark.parametrize("boundary", sorted(TEST_NATIVE_CALLS))
+def test_windows_test_native_calls_bind_actual_gui_cui_exit(tmp_path, boundary):
+    import os
+
+    common = None
+    context = _element_context("probe", "ConsoleApplication", "zero", "process", "absent")
+    try:
+        module = _startup_witness()
+        common = module.common
+        base = common.local_path(Path(sys._base_executable))
+        binding = dict(
+            K5_WITNESS_BASE_PYTHON=str(base), K5_WITNESS_BASE_PYTHON_SHA256=common.file_hash(base)
+        )
+        supplied = {key: os.environ.get(key) for key in common.GATE_RUNTIME_KEYS}
+        if any(value is not None for value in supplied.values()) and supplied != binding:
+            raise ValueError("Invalid admitted runtime")
+        env = module.clean_environment(dict(os.environ), tmp_path)
+        env.update(binding)
+        for key in ("TEMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            Path(env[key]).mkdir(parents=True, exist_ok=True)
+        common.admitted_gate_python(env)
+        shell = common.local_path(
+            Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        script, python = _test_native_fixture(boundary)
+        target = tmp_path / "test-native-process.ps1"
+        bound = _element_bind_utility(script, shell, common)
+        target.write_text(bound, encoding="ascii", newline="\n")
+        fixture = tmp_path / "owned Test oracle.py"
+        fixture.write_text(python, encoding="ascii", newline="\n")
+        reference = tmp_path / "independent-reference.py"
+        reference_source = _test_native_reference_script(boundary)
+        reference.write_text(reference_source, encoding="ascii", newline="\n")
+        test_identity = common.file_hash(TEST)
+        _test_native_helper(TEST.read_bytes())
+        for kind, candidate, subsystem in (
+            ("ConsoleApplication", base, 3),
+            ("WindowsApplication", base.with_name("pythonw.exe"), 2),
+        ):
+            executable = common.local_path(candidate)
+            if executable.parent != base.parent or _pe_fixture_subsystem(executable) != subsystem:
+                raise ValueError("Invalid runtime subsystem")
+            identity = common.file_hash(executable)
+            for case, code in (("zero", 0), ("nonzero", 7)):
+                context = _element_context("reference", kind, case, "process", "absent")
+                arguments = [
+                    "-I",
+                    "-B",
+                    "-S",
+                    str(fixture),
+                    boundary + "_" + case,
+                    *TEST_NATIVE_CALLS[boundary]["argv"],
+                ]
+                raw = _capture_element_child(
+                    common,
+                    [
+                        str(base),
+                        "-I",
+                        "-B",
+                        "-S",
+                        str(reference),
+                        str(executable),
+                        json.dumps(arguments),
+                        case,
+                    ],
+                    cwd=tmp_path,
+                    env=env,
+                    context=context,
+                )
+                complete, checkpoints, observations = _element_complete_records(raw)
+                if (
+                    checkpoints
+                    != [
+                        "reference_entered",
+                        "reference_start_requested",
+                        "reference_started",
+                        "reference_waited",
+                        "reference_stdio_verified",
+                        "reference_cleanup_complete",
+                    ]
+                    or observations
+                ):
+                    raise ValueError("Incomplete actual native oracle")
+                retained = [
+                    line
+                    for line in complete.splitlines()
+                    if not line.startswith(ELEMENT_CHECKPOINT_PREFIX)
+                ]
+                if retained != [b"K5_NATIVE_REFERENCE=" + str(code).encode()]:
+                    raise ValueError("Wrong actual native oracle")
+            for initial in ("absent", "stale_zero", "stale_nonzero"):
+                context = _element_context("probe", kind, "zero", "process", initial)
+                if (
+                    common.file_hash(executable) != identity
+                    or common.file_hash(TEST) != test_identity
+                    or target.read_bytes() != bound.encode("ascii")
+                    or fixture.read_bytes() != python.encode("ascii")
+                    or reference.read_bytes() != reference_source.encode("ascii")
+                ):
+                    raise ValueError("Owned source identity changed")
+                raw = _capture_element_child(
+                    common,
+                    [
+                        str(shell),
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-File",
+                        str(target),
+                        "-Start",
+                        str(TEST),
+                        "-StartHash",
+                        test_identity,
+                        "-Python",
+                        str(executable),
+                        "-Fixture",
+                        str(fixture),
+                        "-ConfigPath",
+                        "unused-owned-config.yml",
+                        "-Boundary",
+                        boundary,
+                        "-Initial",
+                        initial,
+                    ],
+                    cwd=tmp_path,
+                    env=env,
+                    context=context,
+                )
+                lines = raw.splitlines()
+                expected = [
+                    ELEMENT_CHECKPOINT_PREFIX
+                    + ("test_process_" + boundary + "_" + case + "_" + state).encode()
+                    for case in ("zero", "nonzero")
+                    for state in ("requested", "passed")
+                ]
+                prefix = [
+                    ELEMENT_CHECKPOINT_PREFIX + name.encode()
+                    for name in (
+                        "utility_manifest_requested",
+                        "utility_import_requested",
+                        "utility_import_returned",
+                    )
+                ]
+                if (
+                    len(lines) != 5 + len(expected)
+                    or lines[:3] != prefix
+                    or lines[4] != ELEMENT_CHECKPOINT_PREFIX + b"utility_binding_verified"
+                    or lines[5:] != expected
+                ):
+                    raise ValueError("Incomplete Test process evidence")
+                _element_require_utility_observation(lines[3])
+            if common.file_hash(executable) != identity or common.file_hash(TEST) != test_identity:
+                raise ValueError("Owned source identity changed")
+    except Exception as error:
+        try:
+            _element_diagnostic(context, "failed", error, common=common)
+        except Exception:
+            pass
+        pytest.fail("Source-bound Test native Process fixture failed", pytrace=False)

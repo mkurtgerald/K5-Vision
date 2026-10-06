@@ -27,6 +27,8 @@ _MAX_BLITS = 1_000_000
 _BI_RGB = 0
 _DIB_RGB_COLORS = 0
 _SRCCOPY = 0x00CC0020
+_BLACKNESS = 0x00000042
+_COLORONCOLOR = 3
 _HGDI_ERROR = ctypes.c_void_p(-1).value
 _MAX_POINTER = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
 
@@ -114,6 +116,8 @@ class _NativeSurfaceBoundary(typing.Protocol):
         width: int,
         height: int,
         target_dc: int,
+        target_width: int | None = None,
+        target_height: int | None = None,
     ) -> None: ...
 
     def destroy_surface(self, handle: int) -> None: ...
@@ -140,6 +144,24 @@ class _BitmapInfo(ctypes.Structure):
         ("bmiHeader", _BitmapInfoHeader),
         ("bmiColors", ctypes.c_uint32 * 1),
     ]
+
+
+def _aspect_fit(
+    width: int, height: int, target_width: int, target_height: int
+) -> tuple[int, int, int, int]:
+    """Center the complete image, rounding down by less than one destination pixel."""
+    if target_width * height <= target_height * width:
+        fitted_width = target_width
+        fitted_height = max(1, height * target_width // width)
+    else:
+        fitted_height = target_height
+        fitted_width = max(1, width * target_height // height)
+    return (
+        (target_width - fitted_width) // 2,
+        (target_height - fitted_height) // 2,
+        fitted_width,
+        fitted_height,
+    )
 
 
 class _Win32DibSurfaceApi:
@@ -186,6 +208,34 @@ class _Win32DibSurfaceApi:
                 ctypes.c_uint32,
             ]
             self._bit_blt.restype = ctypes.c_int
+            self._stretch_blt = self._gdi32.StretchBlt
+            self._stretch_blt.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint32,
+            ]
+            self._stretch_blt.restype = ctypes.c_int
+            self._set_stretch_blt_mode = self._gdi32.SetStretchBltMode
+            self._set_stretch_blt_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            self._set_stretch_blt_mode.restype = ctypes.c_int
+            self._pat_blt = self._gdi32.PatBlt
+            self._pat_blt.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint32,
+            ]
+            self._pat_blt.restype = ctypes.c_int
         except Exception:
             raise _NativeSurfaceError(_NativeSurfaceFailure.LOAD) from None
 
@@ -270,6 +320,8 @@ class _Win32DibSurfaceApi:
         width: int,
         height: int,
         target_dc: int,
+        target_width: int | None = None,
+        target_height: int | None = None,
     ) -> None:
         try:
             source_dc = int(self._create_compatible_dc(ctypes.c_void_p(target_dc)) or 0)
@@ -301,18 +353,13 @@ class _Win32DibSurfaceApi:
             raise _NativeSurfaceError(_NativeSurfaceFailure.BLIT)
 
         try:
-            copied = bool(
-                self._bit_blt(
-                    ctypes.c_void_p(target_dc),
-                    0,
-                    0,
-                    width,
-                    height,
-                    ctypes.c_void_p(source_dc),
-                    0,
-                    0,
-                    _SRCCOPY,
-                )
+            copied = self._copy_to_target(
+                source_dc,
+                target_dc,
+                width,
+                height,
+                width if target_width is None else target_width,
+                height if target_height is None else target_height,
             )
         except Exception:
             copied = False
@@ -334,6 +381,75 @@ class _Win32DibSurfaceApi:
 
         if not copied or restored in {0, _HGDI_ERROR} or not deleted_dc:
             raise _NativeSurfaceError(_NativeSurfaceFailure.BLIT)
+
+    def _copy_to_target(
+        self,
+        source_dc: int,
+        target_dc: int,
+        width: int,
+        height: int,
+        target_width: int,
+        target_height: int,
+    ) -> bool:
+        x, y, fitted_width, fitted_height = _aspect_fit(width, height, target_width, target_height)
+        # Clear every letterbox region on every paint, including after a resize or
+        # source-resolution change. Never leave pixels from the previous image.
+        for left, top, bar_width, bar_height in (
+            (0, 0, target_width, y),
+            (0, y + fitted_height, target_width, target_height - y - fitted_height),
+            (0, y, x, fitted_height),
+            (x + fitted_width, y, target_width - x - fitted_width, fitted_height),
+        ):
+            if (
+                bar_width
+                and bar_height
+                and not self._pat_blt(
+                    ctypes.c_void_p(target_dc), left, top, bar_width, bar_height, _BLACKNESS
+                )
+            ):
+                return False
+        if (fitted_width, fitted_height) == (width, height):
+            return bool(
+                self._bit_blt(
+                    ctypes.c_void_p(target_dc),
+                    x,
+                    y,
+                    width,
+                    height,
+                    ctypes.c_void_p(source_dc),
+                    0,
+                    0,
+                    _SRCCOPY,
+                )
+            )
+
+        previous_mode = int(
+            self._set_stretch_blt_mode(ctypes.c_void_p(target_dc), _COLORONCOLOR) or 0
+        )
+        if not previous_mode:
+            return False
+        copied = False
+        try:
+            # Scale video and already-composed boxes together; no geometry is
+            # recomputed from observations and no source pixels are cropped.
+            copied = bool(
+                self._stretch_blt(
+                    ctypes.c_void_p(target_dc),
+                    x,
+                    y,
+                    fitted_width,
+                    fitted_height,
+                    ctypes.c_void_p(source_dc),
+                    0,
+                    0,
+                    width,
+                    height,
+                    _SRCCOPY,
+                )
+            )
+        finally:
+            restored = bool(self._set_stretch_blt_mode(ctypes.c_void_p(target_dc), previous_mode))
+        return copied and restored
 
     def destroy_surface(self, handle: int) -> None:
         try:
@@ -567,8 +683,10 @@ class BoundedWindowsPresentationSurface:
             self._presented_frame_bytes += frame_bytes
             self._max_source_span_ms = max(self._max_source_span_ms, frame.source_elapsed_ms)
 
-    async def blit(self, target_dc: int) -> None:
-        """Copy the current private surface into one caller-owned GDI device context."""
+    async def blit(
+        self, target_dc: int, *, target_width: int | None = None, target_height: int | None = None
+    ) -> None:
+        """Fit the composed surface to client pixels, or copy 1:1 for direct DC callers."""
         async with self._lock:
             if (
                 self._state != WindowsPresentationSurfaceState.OPEN
@@ -589,6 +707,14 @@ class BoundedWindowsPresentationSurface:
                     WindowsPresentationSurfaceErrorCode.INVALID_TARGET,
                     "presentation target is invalid",
                 )
+            if (target_width is not None or target_height is not None) and any(
+                type(value) is not int or not 1 <= value <= _MAX_DIMENSION
+                for value in (target_width, target_height)
+            ):
+                raise WindowsPresentationSurfaceError(
+                    WindowsPresentationSurfaceErrorCode.INVALID_TARGET,
+                    "presentation target dimensions are invalid",
+                )
             if self._blits >= self._max_blits:
                 self._fail_and_release()
                 raise WindowsPresentationSurfaceError(
@@ -602,12 +728,19 @@ class BoundedWindowsPresentationSurface:
                     "Windows presentation native surface is unavailable",
                 )
             try:
-                self._native_api.blit_surface(
-                    self._surface_handle,
-                    self._width,
-                    self._height,
-                    target_dc,
-                )
+                if target_width is None:
+                    self._native_api.blit_surface(
+                        self._surface_handle, self._width, self._height, target_dc
+                    )
+                else:
+                    self._native_api.blit_surface(
+                        self._surface_handle,
+                        self._width,
+                        self._height,
+                        target_dc,
+                        target_width,
+                        target_height,
+                    )
             except _NativeSurfaceError:
                 self._fail_and_release()
                 raise WindowsPresentationSurfaceError(

@@ -1198,7 +1198,7 @@ class AclDiagnosticTests(unittest.TestCase):
         values.update(ancestor_distance=999, path="PRIVATE_CANARY", sid=PRINCIPAL)
         diagnostic = storage.bounded_acl_diagnostic(values)
         self.assertEqual(
-            set(storage._ACL_DIAGNOSTIC_ENUMS) | {"schema_version", "ancestor_distance"},
+            set(storage._ACL_DIAGNOSTIC_ENUMS) | {"schema_version", "ancestor_distance", "ace"},
             diagnostic.keys(),
         )
         self.assertNotIn("PRIVATE_CANARY", json.dumps(diagnostic))
@@ -1452,6 +1452,269 @@ class TokenOwnerModelTests(unittest.TestCase):
         self.assertEqual(PRINCIPAL, storage._token_owner(native))
         self.assertEqual([4, 4], classes)
         self.assertEqual([5678], handles)
+
+
+# Exact original admission function from reconciliation tree c5b630be. Independent
+# oracle includes exception/cleanup handling; the pinned native helper is unchanged.
+_BASELINE_ADMIT = (
+    "def admit(self, path: Path, *, owned: bool = False, ancestor"
+    ": bool = False) -> None:\n        diagnostic = {\n            "
+    '"phase": "principal_query",\n            "native_call": "none'
+    '",\n            "native_error": "not_observed",\n        }\n   '
+    "     try:\n            _need(self._native.current_user() == s"
+    'elf.principal, "storage_ownership")\n            diagnostic["'
+    'phase"] = "token_owner_query"\n            _need(_token_owner'
+    '(self._native) == self.default_owner, "storage_ownership")\n '
+    '           diagnostic["phase"] = "descriptor_query"\n        '
+    "    owner, entries = self._descriptor(path, diagnostic)\n    "
+    '        trusted = {self.principal, "S-1-5-18", "S-1-5-32-544'
+    '"}\n            if ancestor and (\n                owner == _T'
+    "RUSTED_INSTALLER\n                or any(entry.sid == _TRUSTE"
+    "D_INSTALLER for entry in entries)\n            ):\n           "
+    '     diagnostic["phase"] = "trusted_installer_query"\n       '
+    "         if self._native.trusted_installer():\n              "
+    "      trusted.add(_TRUSTED_INSTALLER)\n            diagnostic"
+    '["phase"] = "ownership_policy"\n            _need(\n          '
+    "      owner in {self.principal, self.default_owner} if owned"
+    ' else owner in trusted,\n                "storage_ownership",'
+    '\n            )\n            diagnostic["phase"] = "ace_policy'
+    '"\n            for entry in entries:\n                if entry'
+    ".kind == 1:\n                    continue  # A denial does no"
+    "t cancel an unsafe allow.\n                if entry.kind != 0"
+    ':\n                    diagnostic["reason"] = "unsupported_ac'
+    'e"\n                    raise StorageError("storage_acl")\n   '
+    "             if ancestor and entry.flags & 0x08:\n           "
+    "         continue\n                sid = entry.sid\n          "
+    '      if sid == "S-1-3-4":\n                    sid = owner\n '
+    '               elif sid == "S-1-3-0" and entry.flags & 0x08:'
+    "\n                    sid = self.principal\n                ma"
+    "sk = self._module._expanded_mask(entry.mask)\n               "
+    " mutation = _ANCESTOR_MUTATION if ancestor else _MUTATION\n  "
+    "              if sid not in trusted and mask & mutation:\n   "
+    '                 diagnostic["reason"] = "foreign_mutating_al'
+    'low"\n                    raise StorageError("storage_acl")\n '
+    "       except StorageError as error:\n            if error.co"
+    'de == "storage_acl":\n                error.acl_diagnostic = '
+    "bounded_acl_diagnostic(diagnostic)\n            raise\n       "
+    ' except Exception as error:\n            if diagnostic["phase'
+    '"] == "descriptor_query":\n                if diagnostic["nat'
+    'ive_error"] not in {"success", "not_observed", "unknown"}:\n '
+    '                   diagnostic["reason"] = "native_query"\n   '
+    '             elif isinstance(error, getattr(self._module, "W'
+    'indowsIdentitySecurityError", ())):\n                    mess'
+    "age = error.args[0] if len(error.args) == 1 else None\n      "
+    "              if type(message) is str:\n                     "
+    "   for messages, reason in (\n                            (_A"
+    'CL_PARSER_ERRORS, "descriptor_parse"),\n                     '
+    '       (_ACL_OWNER_ERRORS, "owner_sid_parse"),\n             '
+    '               (_ACL_DESCRIPTOR_ERRORS, "descriptor_validati'
+    'on"),\n                        ):\n                           '
+    " if message in messages:\n                                dia"
+    'gnostic["reason"] = reason\n                                b'
+    'reak\n            raise StorageError("storage_acl", acl_diagn'
+    "ostic=diagnostic) from None"
+)
+
+
+class AclV2Tests(NativePolicyModelTests):
+    def test_first_refused_ace_keeps_exact_numbers_and_fixed_categories(self):
+        entries = [
+            self.ace(0x80000000),
+            self.ace(0x40000000, "S-1-5-32-545", flags=0x13),
+            self.ace(2, "S-1-5-21-123456789"),
+        ]
+        with self.assertRaises(storage.StorageError) as caught:
+            self.policy(entries=entries).admit(Path("PRIVATE_CANARY"), ancestor=True)
+        record = caught.exception.acl_diagnostic
+        self.assertEqual("storage-acl-admission-v2", record["schema_version"])
+        self.assertEqual(
+            {
+                "ace_type": "allow",
+                "principal_category": "builtin_users",
+                "effective_principal_category": "builtin_users",
+                "access_mask": 0x40000000,
+                "expanded_access_mask": 0x00120116,
+                "inheritance_flags": 0x13,
+            },
+            record["ace"],
+        )
+        self.assertEqual(record, storage.bounded_acl_diagnostic(record))
+
+    def test_unobserved_flags_are_null_and_unsupported_kind_reads_nothing_more(self):
+        class Entry:
+            kind = 7
+
+            def __getattr__(self, name):
+                raise AssertionError("PRIVATE_CANARY getter " + name)
+
+        with self.assertRaises(storage.StorageError) as caught:
+            self.policy(entries=[Entry()]).admit(Path("unused"))
+        self.assertEqual("unsupported_ace", caught.exception.acl_diagnostic["reason"])
+        self.assertIsNone(caught.exception.acl_diagnostic["ace"])
+        with self.assertRaises(storage.StorageError) as caught:
+            self.policy(entries=[self.ace(2, flags=0x13)]).admit(Path("unused"))
+        self.assertIsNone(caught.exception.acl_diagnostic["ace"]["inheritance_flags"])
+
+    def test_principal_categories_are_literal_private_and_well_known_first(self):
+        for sid, category in storage._ACL_PRINCIPALS.items():
+            self.assertEqual(category, storage._principal_category(sid, sid))
+        self.assertEqual("current_user", storage._principal_category(PRINCIPAL, PRINCIPAL))
+        self.assertEqual("redacted_other", storage._principal_category("S-1-5-21-999", PRINCIPAL))
+        for sid in ("S-1-5", "S-1-281474976710655-4294967295"):
+            self.assertEqual("redacted_other", storage._principal_category(sid, PRINCIPAL))
+        self.assertEqual("unknown", storage._principal_category("S-1-281474976710656-1", PRINCIPAL))
+        for sid in (None, True, 1, [], "S-1-5-21-4294967296", "PRIVATE_CANARY", "S-1-5-021-1"):
+            self.assertEqual("unknown", storage._principal_category(sid, PRINCIPAL))
+
+    def test_strict_ace_projection_types_masks_flags_context_and_privacy(self):
+        class Integer(int):
+            pass
+
+        valid = dict(
+            ace_type="allow",
+            principal_category="everyone",
+            effective_principal_category="everyone",
+            access_mask=2,
+            expanded_access_mask=2,
+            inheritance_flags=0,
+        )
+        for field in ("access_mask", "expanded_access_mask", "inheritance_flags"):
+            for invalid in (True, False, -1, 2**64, 2.0, "2", Integer(2), None, [], {}):
+                result = storage._bounded_ace({**valid, field: invalid})
+                self.assertIsNone(result[field])
+        for mask in (0x200, 0x02000000, 0xFFFFFFFF):
+            self.assertIsNone(storage._bounded_ace({**valid, "access_mask": mask})["access_mask"])
+        for flags in range(32):
+            expected = None if flags & 8 and not flags & 3 else flags
+            self.assertEqual(
+                expected,
+                storage._bounded_ace({**valid, "inheritance_flags": flags})["inheritance_flags"],
+            )
+        for phase, reason in (
+            ("descriptor_query", "descriptor_parse"),
+            ("ace_policy", "unsupported_ace"),
+            ("unknown", "foreign_mutating_allow"),
+        ):
+            self.assertIsNone(
+                storage.bounded_acl_diagnostic(dict(phase=phase, reason=reason, ace=valid))["ace"]
+            )
+        canary = "S-1-5-21-123456789"
+        record = storage._refused_allow(canary, canary, PRINCIPAL, 2, 2, 0)
+        record.update(sid=canary, path="PRIVATE_CANARY", account="PRIVATE_CANARY")
+        text = json.dumps(storage._bounded_ace(record))
+        for forbidden in (canary, "PRIVATE_CANARY", hashlib.sha256(canary.encode()).hexdigest()):
+            self.assertNotIn(forbidden, text)
+
+    def test_original_decision_calls_and_cleanup_parity_matrix(self):
+        namespace = dict(storage.__dict__)
+        exec(_BASELINE_ADMIT, namespace)
+        original = namespace["admit"]
+        masks = (
+            0,
+            1,
+            2,
+            4,
+            0x10,
+            0x40,
+            0x100,
+            0x10000,
+            0x40000,
+            0x80000,
+            0x1000000,
+            0x80000000,
+            0x40000000,
+            0x20000000,
+            0x10000000,
+        )
+        principals = (*storage._ACL_PRINCIPALS, PRINCIPAL, "S-1-5-21-999")
+        for ancestor, owned in ((False, False), (True, False), (False, True)):
+            for sid in principals:
+                for mask in masks:
+                    for flags in range(32):
+
+                        def outcome(
+                            admit, sid=sid, mask=mask, flags=flags, owned=owned, ancestor=ancestor
+                        ):
+                            calls = []
+
+                            class Entry:
+                                def __getattribute__(self, name):
+                                    calls.append(name)
+                                    return {"kind": 0, "sid": sid, "mask": mask, "flags": flags}[
+                                        name
+                                    ]
+
+                            policy = self.policy(entries=[Entry()])
+                            policy._native.current_user = lambda: (
+                                calls.append("current_user") or PRINCIPAL
+                            )
+                            descriptor = policy._native.descriptor
+                            policy._native.descriptor = lambda path: (
+                                calls.append("descriptor"),
+                                descriptor(path),
+                            )[1]
+                            try:
+                                admit(policy, Path("unused"), owned=owned, ancestor=ancestor)
+                                return None, calls
+                            except storage.StorageError as error:
+                                return (type(error), error.code, error.report), calls
+
+                        self.assertEqual(
+                            outcome(original), outcome(storage.NativeStoragePolicy.admit)
+                        )
+
+
+class EarlyStoragePreflightTests(StorageTests):
+    def test_preflight_pass_has_no_reusable_path_or_retention_authority(self):
+        before = {str(path): path.read_bytes() for path in self.work.rglob("*") if path.is_file()}
+        with (
+            mock.patch.object(storage, "NativeStoragePolicy", return_value=self.policy),
+            mock.patch.object(storage, "retain_bundle", side_effect=AssertionError("retention")),
+            mock.patch.object(storage.shutil, "disk_usage", side_effect=AssertionError("capacity")),
+        ):
+            record = storage.storage_preflight(self.runner, self.workspace, self.runner_temp)
+        self.assertEqual("passed", record["status"])
+        self.assertEqual("not_started", record["retention_state"])
+        self.assertIs(record["later_admission_required"], True)
+        self.assertNotIn(str(self.work), json.dumps(record))
+        self.assertFalse(self.root.parent.exists())
+        self.assertEqual(
+            before,
+            {str(path): path.read_bytes() for path in self.work.rglob("*") if path.is_file()},
+        )
+        self.policy.denied = self.work
+        with self.assertRaises(storage.StorageError):
+            storage.derive_storage_root(self.runner, self.workspace, self.runner_temp, self.policy)
+
+    def test_preflight_known_ancestor_two_refusal_and_constructor_failure(self):
+        def refuse(path, **kwargs):
+            if path == self.work.parent:
+                raise storage.StorageError(
+                    "storage_acl",
+                    acl_diagnostic={
+                        "phase": "ace_policy",
+                        "reason": "foreign_mutating_allow",
+                        "native_call": "GetNamedSecurityInfoW",
+                        "native_error": "success",
+                        "ace": storage._refused_allow(
+                            "S-1-5-32-545", "S-1-5-32-545", PRINCIPAL, 0x40, 0x40, 0
+                        ),
+                    },
+                )
+
+        self.policy.admit = refuse
+        with mock.patch.object(storage, "NativeStoragePolicy", return_value=self.policy):
+            record = storage.storage_preflight(self.runner, self.workspace, self.runner_temp)
+        self.assertEqual("refused", record["status"])
+        self.assertEqual("storage_root", record["stage"])
+        self.assertEqual(2, record["storage_acl"]["ancestor_distance"])
+        self.assertFalse(self.root.parent.exists())
+        with mock.patch.object(
+            storage, "NativeStoragePolicy", side_effect=storage.StorageError("storage_helper")
+        ):
+            failed = storage.storage_preflight(self.runner, self.workspace, self.runner_temp)
+        self.assertEqual("storage_construction", failed["stage"])
+        self.assertEqual("storage_helper", failed["code"])
 
 
 if __name__ == "__main__":

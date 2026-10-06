@@ -124,10 +124,14 @@ def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
         assert (
             "  push:\n    branches:\n      - feat/installed-analytics-operator-20261003\n"
             "      - feat/alpha-analytics-preflight-20261004\n"
-            "      - fix/transactional-alpha-upgrade-20261003\n    paths:\n" in triggers
+            "      - fix/transactional-alpha-upgrade-20261003\n"
+            "      - feat/installed-alpha-facade-witness-20261005\n    paths:\n" in triggers
         )
         assert "github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'" in admission
         assert "github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'" in admission
+        assert (
+            "github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'" in admission
+        )
         assert "pull_request:" not in triggers and "workflow_dispatch:" not in triggers
         assert "github.repository == 'mkurtgerald/K5-Vision'" in admission
         assert "github.ref == 'refs/heads/feat/installed-analytics-operator-20261003'" in admission
@@ -256,6 +260,27 @@ def test_qualification_upload_requires_its_validation_outcome(path: Path) -> Non
                 assert "if: always()" not in header
                 assert "path: artifacts/installed-alpha-wheel-provenance.json" in upload
                 assert "*.whl" not in upload and "k5-qualification-artifacts" not in upload
+                continue
+            if path.name == _INSTALLED_CANDIDATE and any(
+                f"name: {name}\n" in upload
+                for name in (
+                    "installed-alpha-facades-witness",
+                    "installed-alpha-facades-expectations",
+                )
+            ):
+                facade = [step for step in steps if "        id: safe_facade_evidence\n" in step]
+                assert len(facade) == 1
+                assert (
+                    "if: success() && steps.alpha_facade_witness.outcome == 'success'" in facade[0]
+                )
+                assert (
+                    "--validate-receipt --expectations $env:K5_ALPHA_FACADE_EXPECTATIONS"
+                    in facade[0]
+                )
+                assert steps.index(facade[0]) < steps.index(upload)
+                header = upload.split("        uses:", maxsplit=1)[0]
+                assert "if: success() && steps.safe_facade_evidence.outcome == 'success'" in header
+                assert "if: always()" not in header
                 continue
             assert steps.index(validation) < steps.index(upload)
             header = upload.split("        uses:", maxsplit=1)[0]

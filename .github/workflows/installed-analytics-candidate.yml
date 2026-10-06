@@ -6,10 +6,12 @@ on:
       - feat/installed-analytics-operator-20261003
       - feat/alpha-analytics-preflight-20261004
       - fix/transactional-alpha-upgrade-20261003
+      - feat/installed-alpha-facade-witness-20261005
     paths:
       - .github/workflows/installed-analytics-candidate.yml
       - scripts/installed_analytics_witness.py
       - scripts/installed_alpha_launcher_witness.py
+      - scripts/installed_alpha_facade_witness.py
       - scripts/windows_owned_preflight.py
       - scripts/capture_installer_wheel_provenance.py
       - scripts/installer_wheel_requirements.py
@@ -33,6 +35,8 @@ on:
       - scripts/windows-alpha/runtime-requirements.txt
       - tests/test_installed_analytics_witness.py
       - tests/test_installed_alpha_launcher_witness.py
+      - tests/test_installed_alpha_facade_witness.py
+      - tests/test_windows_alpha_facade_witness.py
       - tests/test_installed_analytics_candidate_workflow.py
       - tests/test_windows_alpha_analytics.py
 
@@ -45,7 +49,7 @@ permissions:
 jobs:
   hosted_admission:
     name: hosted-candidate-admission
-    if: github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003')
+    if: github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005')
     runs-on: windows-latest
     timeout-minutes: 10
     outputs:
@@ -68,10 +72,11 @@ jobs:
             $legacyBranch = "feat/installed-analytics-operator-20261003"
             $launcherBranch = "feat/alpha-analytics-preflight-20261004"
             $upgradeBranch = "fix/transactional-alpha-upgrade-20261003"
-            if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $upgradeBranch)) { throw "Unreviewed candidate branch refused." }
+            $facadeBranch = "feat/installed-alpha-facade-witness-20261005"
+            if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $upgradeBranch, $facadeBranch)) { throw "Unreviewed candidate branch refused." }
             $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
             $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
-            # PR319/321 require three applicable hosted gates; PR318 retains all five.
+            # Launcher/upgrade/facade require three applicable gates; legacy retains all five.
             $required = @{
               "355859781" = "CI"
               "369354936" = "Windows Alpha Script Smoke"
@@ -115,7 +120,7 @@ jobs:
 
   installed-analytics-candidate:
     needs: hosted_admission
-    if: needs.hosted_admission.result == 'success' && needs.hosted_admission.outputs.qualified_sha == github.sha && (github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'))
+    if: needs.hosted_admission.result == 'success' && needs.hosted_admission.outputs.qualified_sha == github.sha && (github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'))
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 25
     concurrency:
@@ -134,6 +139,10 @@ jobs:
       K5_INSTALLED_CONTROLLER_OWNED: ""
       K5_ALPHA_LAUNCHER_OWNED: ""
       K5_ALPHA_LAUNCHER_OUTPUT: artifacts\installed-alpha-start-script-witness.json
+      K5_ALPHA_FACADE_OWNED: ""
+      K5_ALPHA_FACADE_INPUTS: artifacts\installed-alpha-facades-inputs.json
+      K5_ALPHA_FACADE_EXPECTATIONS: artifacts\installed-alpha-facades-expectations.json
+      K5_ALPHA_FACADE_OUTPUT: artifacts\installed-alpha-facades-witness.json
 
     steps:
       - name: Revalidate exact admitted candidate before native work
@@ -152,10 +161,11 @@ jobs:
             $legacyBranch = "feat/installed-analytics-operator-20261003"
             $launcherBranch = "feat/alpha-analytics-preflight-20261004"
             $upgradeBranch = "fix/transactional-alpha-upgrade-20261003"
-            if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $upgradeBranch)) { throw "Unreviewed candidate branch refused." }
+            $facadeBranch = "feat/installed-alpha-facade-witness-20261005"
+            if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $upgradeBranch, $facadeBranch)) { throw "Unreviewed candidate branch refused." }
             $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
             $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
-            # PR319/321 require three applicable hosted gates; PR318 retains all five.
+            # Launcher/upgrade/facade require three applicable gates; legacy retains all five.
             $required = @{
               "355859781" = "CI"
               "369354936" = "Windows Alpha Script Smoke"
@@ -216,6 +226,7 @@ jobs:
           $gitSha256 = (Get-FileHash -LiteralPath $git -Algorithm SHA256).Hash.ToLowerInvariant()
           Write-Host "K5_CHECKOUT_GIT_VERSION=$versionText"
           Write-Host "K5_CHECKOUT_GIT_SHA256=$gitSha256"
+          "K5_CHECKOUT_GIT_SHA256=$gitSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           (Split-Path -Parent $git) | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Checkout immutable candidate
@@ -227,7 +238,125 @@ jobs:
       - name: Require idle exact physical host before provisioning
         timeout-minutes: 1
         shell: powershell
-        run: .\scripts\assert-stage-one-physical-admission.ps1
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:K5_CANDIDATE_BRANCH -cne "fix/transactional-alpha-upgrade-20261003") {
+              .\scripts\assert-stage-one-physical-admission.ps1
+          } else {
+              # All Git children close before the existing PowerShell host snapshot.
+              # No Python orchestrator, mutable-source import or newline reconstruction.
+              function Read-K5GitObject([string]$Expression, [string]$Kind, [int]$Limit) {
+                  $process = $null
+                  try {
+                      $start = [Diagnostics.ProcessStartInfo]::new()
+                      $start.FileName = 'C:\Program Files\Git\cmd\git.exe'
+                      $start.Arguments = '--no-replace-objects --no-lazy-fetch -c protocol.allow=never cat-file --batch'
+                      $start.WorkingDirectory = $env:GITHUB_WORKSPACE
+                      $start.UseShellExecute = $false
+                      $start.CreateNoWindow = $true
+                      $start.RedirectStandardInput = $true
+                      $start.RedirectStandardOutput = $true
+                      $start.RedirectStandardError = $true
+                      foreach ($key in @($start.EnvironmentVariables.Keys)) {
+                          if ($key -like 'GIT_*') { $start.EnvironmentVariables.Remove($key) }
+                      }
+                      $start.EnvironmentVariables['GIT_NO_REPLACE_OBJECTS'] = '1'
+                      $start.EnvironmentVariables['GIT_NO_LAZY_FETCH'] = '1'
+                      $start.EnvironmentVariables['GIT_ALLOW_PROTOCOL'] = ''
+                      $process = [Diagnostics.Process]::new()
+                      $process.StartInfo = $start
+                      if (-not $process.Start()) { throw "source" }
+                      # Drain without retaining any stderr, including on malformed framing.
+                      $drain = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+                      $watch = [Diagnostics.Stopwatch]::StartNew()
+                      $process.StandardInput.WriteLine($Expression)
+                      $process.StandardInput.Close()
+                      $stream = $process.StandardOutput.BaseStream
+                      function Read-K5Bytes([int]$Count) {
+                          $buffer = [byte[]]::new($Count)
+                          $offset = 0
+                          while ($offset -lt $Count) {
+                              $remaining = 10000 - [int]$watch.ElapsedMilliseconds
+                              if ($remaining -le 0) { throw "source" }
+                              $read = $stream.ReadAsync($buffer, $offset, $Count - $offset)
+                              if (-not $read.Wait($remaining)) { throw "source" }
+                              if ($read.Result -eq 0) { throw "source" }
+                              $offset += $read.Result
+                          }
+                          return ,$buffer
+                      }
+                      $header = [Collections.Generic.List[byte]]::new()
+                      while ($true) {
+                          $next = Read-K5Bytes 1
+                          if ($next[0] -eq 10) { break }
+                          if ($header.Count -ge 96) { throw "source" }
+                          $header.Add($next[0])
+                      }
+                      $line = [Text.Encoding]::ASCII.GetString($header.ToArray())
+                      if ($line -cnotmatch '\A([0-9a-f]{40}) (blob|commit) ([1-9][0-9]{0,6})\z') { throw "source" }
+                      $oid, $type, $size = $Matches[1], $Matches[2], [int]$Matches[3]
+                      if ($type -cne $Kind -or $size -gt $Limit) { throw "source" }
+                      $body = Read-K5Bytes $size
+                      $terminator = Read-K5Bytes 1
+                      if ($terminator[0] -ne 10) { throw "source" }
+                      $extra = [byte[]]::new(1)
+                      $remaining = 10000 - [int]$watch.ElapsedMilliseconds
+                      if ($remaining -le 0) { throw "source" }
+                      $end = $stream.ReadAsync($extra, 0, 1)
+                      if (-not $end.Wait($remaining) -or $end.Result -ne 0) { throw "source" }
+                      $remaining = 10000 - [int]$watch.ElapsedMilliseconds
+                      if ($remaining -le 0 -or -not $process.WaitForExit($remaining) -or $process.ExitCode -ne 0) { throw "source" }
+                      $remaining = 10000 - [int]$watch.ElapsedMilliseconds
+                      if ($remaining -le 0 -or -not $drain.Wait($remaining)) { throw "source" }
+                      $prefix = [Text.Encoding]::ASCII.GetBytes("$type $size" + [char]0)
+                      $sha1 = [Security.Cryptography.SHA1]::Create()
+                      try {
+                          $framed = [byte[]]::new($prefix.Length + $body.Length)
+                          [Array]::Copy($prefix, 0, $framed, 0, $prefix.Length)
+                          [Array]::Copy($body, 0, $framed, $prefix.Length, $body.Length)
+                          $digest = ([BitConverter]::ToString($sha1.ComputeHash($framed))).Replace('-', '').ToLowerInvariant()
+                      } finally { $sha1.Dispose() }
+                      if ($digest -cne $oid) { throw "source" }
+                      return @{ oid = $oid; bytes = $body }
+                  } finally {
+                      if ($null -ne $process) {
+                          try {
+                            if (-not $process.HasExited) { $process.Kill() }
+                            if (-not $process.WaitForExit(2000)) { throw "source" }
+                        } finally { $process.Dispose() }
+                      }
+                  }
+              }
+              try {
+                  if ($env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
+                      $env:K5_STAGE_ONE_REVISION -cnotmatch '\A[0-9a-f]{40}\z' -or
+                      $env:K5_STAGE_ONE_REVISION -cne $env:GITHUB_SHA -or
+                      $env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or
+                      $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,19}\z') { throw "source" }
+                  $git = 'C:\Program Files\Git\cmd\git.exe'
+                  if ($env:K5_CHECKOUT_GIT_SHA256 -cnotmatch '\A[0-9a-f]{64}\z' -or
+                      (Get-FileHash -LiteralPath $git -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_CHECKOUT_GIT_SHA256) { throw "source" }
+                  $utf8 = [Text.UTF8Encoding]::new($false, $true)
+                  $commit = Read-K5GitObject $env:K5_STAGE_ONE_REVISION 'commit' 65536
+                  if ($commit.oid -cne $env:K5_STAGE_ONE_REVISION) { throw "source" }
+                  $commitText = $utf8.GetString($commit.bytes)
+                  if ($commitText -cnotmatch '\Atree ([0-9a-f]{40})\n') { throw "source" }
+                  $tree = $Matches[1]
+                  $producer = Read-K5GitObject ($env:K5_STAGE_ONE_REVISION + ':scripts/assert-stage-one-physical-admission.ps1') 'blob' 131072
+                  $sha256 = [Security.Cryptography.SHA256]::Create()
+                  try { $producerHash = ([BitConverter]::ToString($sha256.ComputeHash($producer.bytes))).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }
+                  $script = [scriptblock]::Create($utf8.GetString($producer.bytes))
+                  $context = @{
+                      repository = 'mkurtgerald/K5-Vision'; source_sha = $env:K5_STAGE_ONE_REVISION
+                      source_tree = $tree; producer_sha256 = $producerHash
+                      run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT; phase = 'pre_storage'
+                  }
+              } catch {
+                  Write-Host 'K5_HOST_NAME_OBSERVATION_UNAVAILABLE'
+                  throw 'Exact host diagnostic source binding refused.'
+              }
+              & $script -DiagnosticContext $context
+          }
 
       - name: Checkout immutable Analytics source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -255,6 +384,279 @@ jobs:
             if ($LASTEXITCODE -ne 0 -or $actual.Count -ne 1 -or $actual[0] -cne $sources[$source]) { throw "Exact Git checkout revision mismatch." }
           }
 
+      - name: Observe read-only storage admission before provisioning
+        if: github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+        timeout-minutes: 1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          try {
+              $runner = [IO.DirectoryInfo]::new($env:RUNNER_WORKSPACE)
+              $workspace = [IO.DirectoryInfo]::new($env:GITHUB_WORKSPACE)
+              $temporary = [IO.DirectoryInfo]::new($env:RUNNER_TEMP)
+              if ($runner.Name -cne 'K5-Vision' -or $workspace.Name -cne 'K5-Vision' -or
+                  $workspace.Parent.FullName -cne $runner.FullName -or $temporary.Name -cne '_temp' -or
+                  $temporary.Parent.FullName -cne $runner.Parent.FullName) { throw "runtime" }
+              $base = Join-Path $runner.Parent.FullName '_tool\Python\3.12.10\x64\python.exe'
+              foreach ($path in @($env:RUNNER_WORKSPACE, $env:GITHUB_WORKSPACE, $env:RUNNER_TEMP, $base)) {
+                  if (-not [IO.Path]::IsPathRooted($path) -or $path.StartsWith('\\') -or
+                      [IO.Path]::GetFullPath($path) -cne $path) { throw "runtime" }
+                  $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                  if ($item.FullName -cne $path -or ($path -ceq $base -and $item.PSIsContainer) -or
+                      ($path -cne $base -and -not $item.PSIsContainer)) { throw "runtime" }
+                  while ($null -ne $item) {
+                      if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                          -not [string]::IsNullOrEmpty($item.LinkType)) { throw "runtime" }
+                      $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+                  }
+              }
+              if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+                  '4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a') { throw "runtime" }
+          } catch {
+              Write-Host 'K5_STORAGE_PREFLIGHT={"schema_version":"storage-preflight-v1","scope":"read-only-early-storage-admission","status":"refused","stage":"runtime_binding","code":"runtime_unavailable","storage_acl":null,"retention_state":"not_started","later_admission_required":true}'
+              throw 'Existing exact storage-preflight runtime unavailable.'
+          }
+          $bootstrap = @'
+          # Fixed stdlib bootstrap: only verified binary Git source executes.
+          import hashlib, json, os, re, stat, subprocess, sys, threading, types
+          from pathlib import Path
+
+          def require(value):
+              if not value:
+                  raise ValueError('binding')
+
+          def ordinary(path, directory):
+              require(path.is_absolute() and len(path.parts) <= 64 and not str(path).startswith(('\\\\', '//')))
+              for item in reversed((path, *path.parents)):
+                  info = item.lstat()
+                  require(not stat.S_ISLNK(info.st_mode) and not getattr(info, 'st_file_attributes', 0) & 0x400)
+                  is_dir = item != path or directory
+                  require(stat.S_ISDIR(info.st_mode) if is_dir else stat.S_ISREG(info.st_mode) and info.st_nlink == 1)
+              require(path.resolve(strict=True) == path)
+
+          def file_digest(path):
+              before = path.lstat()
+              require(0 < before.st_size <= 64 * 1024 * 1024)
+              identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+              digest, count = hashlib.sha256(), 0
+              with path.open('rb') as stream:
+                  require(identity(os.fstat(stream.fileno())) == identity(before))
+                  while True:
+                      chunk = stream.read(1024 * 1024)
+                      if not chunk:
+                          break
+                      count += len(chunk)
+                      require(count <= before.st_size)
+                      digest.update(chunk)
+                  require(identity(os.fstat(stream.fileno())) == identity(before))
+              require(count == before.st_size and identity(path.lstat()) == identity(before))
+              return digest.hexdigest()
+
+          class SourceCleanupError(ValueError):
+              pass
+
+          def read_object(git, root, expression, kind, limit):
+              # Every output read is bounded independently of the deadline. The foreground
+              # never blocks in a pipe read, including if termination of our child fails.
+              env = {key: value for key, value in os.environ.items() if not key.upper().startswith('GIT_')}
+              env['GIT_NO_REPLACE_OBJECTS'] = '1'
+              env['GIT_NO_LAZY_FETCH'] = '1'
+              env['GIT_ALLOW_PROTOCOL'] = ''
+              done, state = threading.Event(), {}
+              process = subprocess.Popen([str(git), '--no-replace-objects', '--no-lazy-fetch', '-c', 'protocol.allow=never', 'cat-file', '--batch'],
+                                         cwd=root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL, shell=False, bufsize=0)
+              reader = None
+              def read_exact(count):
+                  data = bytearray()
+                  while len(data) < count:
+                      chunk = process.stdout.read(count - len(data))
+                      require(bool(chunk))
+                      data.extend(chunk)
+                  return bytes(data)
+              def receive():
+                  try:
+                      request = expression.encode('ascii') + b'\n'
+                      require(process.stdin.write(request) == len(request))
+                      process.stdin.close()
+                      header = process.stdout.readline(98)
+                      match = re.fullmatch(rb'([0-9a-f]{40}) (blob|commit) ([1-9][0-9]{0,6})\n', header)
+                      require(match is not None)
+                      oid, actual_kind, size = match[1].decode('ascii'), match[2].decode('ascii'), int(match[3])
+                      require(actual_kind == kind and 0 < size <= limit)
+                      body = read_exact(size)
+                      require(read_exact(1) == b'\n' and process.stdout.read(1) == b'')
+                      require(hashlib.sha1(kind.encode('ascii') + b' ' + str(size).encode('ascii') + b'\0' + body).hexdigest() == oid)
+                      state['result'] = oid, body
+                  except BaseException:
+                      state['failed'] = True
+                  finally:
+                      done.set()
+              try:
+                  reader = threading.Thread(target=receive, daemon=True)
+                  reader.start()
+                  require(done.wait(10) and 'result' in state and not state.get('failed'))
+                  require(process.wait(timeout=2) == 0)
+                  return state['result']
+              finally:
+                  quiet = True
+                  try:
+                      if process.poll() is None:
+                          process.kill()
+                  except BaseException:
+                      quiet = False
+                  try:
+                      quiet = process.wait(timeout=2) is not None and quiet
+                  except BaseException:
+                      quiet = False
+                  for stream in (process.stdin, process.stdout):
+                      try:
+                          stream.close()
+                      except BaseException:
+                          quiet = False
+                  if reader is not None:
+                      try:
+                          reader.join(timeout=2)
+                          quiet = not reader.is_alive() and quiet
+                      except BaseException:
+                          quiet = False
+                  if not quiet:
+                      raise SourceCleanupError('binding')
+          record = dict(schema_version='storage-preflight-v1', scope='read-only-early-storage-admission',
+                        status='refused', stage='runtime_binding', code='runtime_unavailable', storage_acl=None,
+                        retention_state='not_started', later_admission_required=True)
+          try:
+              require(os.name == 'nt' and sys.implementation.name == 'cpython' and sys.version_info[:3] == (3, 12, 10))
+              require(sys.prefix == sys.base_prefix and sys.flags.isolated == 1 and sys.flags.no_site == 1 and sys.dont_write_bytecode)
+              runner, workspace, temporary = (Path(os.environ[key]) for key in ('RUNNER_WORKSPACE', 'GITHUB_WORKSPACE', 'RUNNER_TEMP'))
+              require(workspace.parent == runner and workspace.name == runner.name == 'K5-Vision')
+              require(temporary.parent == runner.parent and temporary.name == '_temp')
+              runtime = runner.parent / '_tool/Python/3.12.10/x64/python.exe'
+              require(Path(sys.executable) == runtime)
+              for path in (runner, workspace, temporary):
+                  ordinary(path, True)
+              ordinary(runtime, False)
+              require(file_digest(runtime) == '4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a')
+              record.update(stage='source_binding', code='source_unavailable')
+              revision = os.environ['K5_STAGE_ONE_REVISION']
+              require(re.fullmatch('[0-9a-f]{40}', revision) and revision == os.environ['GITHUB_SHA'])
+              require(os.environ['GITHUB_REPOSITORY'] == 'mkurtgerald/K5-Vision')
+              require(os.environ['K5_CANDIDATE_BRANCH'] == 'fix/transactional-alpha-upgrade-20261003')
+              for key in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'):
+                  require(re.fullmatch('[1-9][0-9]{0,19}', os.environ[key]))
+              git = Path(r'C:\Program Files\Git\cmd\git.exe')
+              ordinary(git, False)
+              ordinary(workspace / '.git', True)
+              require(re.fullmatch('[0-9a-f]{64}', os.environ['K5_CHECKOUT_GIT_SHA256']))
+              require(file_digest(git) == os.environ['K5_CHECKOUT_GIT_SHA256'])
+              oid, commit = read_object(git, workspace, revision, 'commit', 65536)
+              require(oid == revision and re.match(rb'tree [0-9a-f]{40}\n', commit))
+              oid, source = read_object(git, workspace, revision + ':scripts/installer_wheel_storage.py', 'blob', 131072)
+              module = types.ModuleType('_k5_early_storage')
+              module.__file__ = str(workspace / 'scripts/installer_wheel_storage.py')
+              exec(compile(source, '<k5-verified-storage-preflight>', 'exec'), module.__dict__)
+              record = module.storage_preflight(runner, workspace, temporary)
+          except SourceCleanupError:
+              record['code'] = 'source_cleanup_failed'
+          except BaseException:
+              pass
+          print('K5_STORAGE_PREFLIGHT=' + json.dumps(record, sort_keys=True, separators=(',', ':')))
+          raise SystemExit(0 if record['status'] == 'passed' else 1)
+          '@
+          try {
+              $probe = @($bootstrap | & $base -I -B -S - 2>$null)
+              $probeExit = $LASTEXITCODE
+              if ($probe.Count -ne 1 -or $probe[0] -isnot [string] -or $probe[0].Length -gt 4096 -or
+                  -not $probe[0].StartsWith('K5_STORAGE_PREFLIGHT={') -or $probeExit -notin @(0, 1)) { throw 'probe' }
+              # Reproject only the complete fixed schema; never echo a child output line.
+              function Test-K5Keys($Value, [string]$Keys) {
+                  if ($null -eq $Value -or $Value.GetType().FullName -cne 'System.Management.Automation.PSCustomObject' -or
+                      (@($Value.PSObject.Properties.Name | Sort-Object) -join ',') -cne $Keys) { throw 'probe' }
+              }
+              function Test-K5Enum($Value, $Choices) {
+                  if ($Value -isnot [string] -or $Value -cnotin $Choices) { throw 'probe' }
+              }
+              function Test-K5Integer($Value, [long]$Minimum, [long]$Maximum) {
+                  if (($Value -isnot [int] -and $Value -isnot [long]) -or $Value -lt $Minimum -or $Value -gt $Maximum) { throw 'probe' }
+              }
+              $observed = $probe[0].Substring('K5_STORAGE_PREFLIGHT='.Length) | ConvertFrom-Json -ErrorAction Stop
+              Test-K5Keys $observed 'code,later_admission_required,retention_state,schema_version,scope,stage,status,storage_acl'
+              Test-K5Enum $observed.schema_version @('storage-preflight-v1')
+              Test-K5Enum $observed.scope @('read-only-early-storage-admission')
+              Test-K5Enum $observed.retention_state @('not_started')
+              Test-K5Enum $observed.status @('passed', 'refused')
+              Test-K5Enum $observed.stage @('runtime_binding', 'source_binding', 'storage_construction', 'storage_root')
+              $stageCodes = @{
+                  runtime_binding = @('runtime_unavailable')
+                  source_binding = @('source_unavailable', 'source_cleanup_failed')
+                  storage_construction = @('storage_path', 'storage_policy', 'storage_helper', 'storage_identity', 'storage_ownership', 'storage_interrupted')
+                  storage_root = @('storage_path', 'storage_layout', 'storage_volume', 'storage_ownership', 'storage_acl', 'storage_helper', 'storage_interrupted', 'passed')
+              }
+              Test-K5Enum $observed.code $stageCodes[$observed.stage]
+              if ($observed.later_admission_required -isnot [bool] -or -not $observed.later_admission_required -or
+                  (($probeExit -eq 0) -ne ($observed.status -ceq 'passed')) -or
+                  (($observed.code -ceq 'passed') -ne ($observed.status -ceq 'passed'))) { throw 'probe' }
+              $acl = $null
+              if ($null -ne $observed.storage_acl) {
+                  if ($observed.code -cne 'storage_acl') { throw 'probe' }
+                  $inputAcl = $observed.storage_acl
+                  $aclKeys = 'ace,admission_mode,ancestor_distance,native_call,native_error,path_context,path_role,phase,reason,schema_version'
+                  Test-K5Keys $inputAcl $aclKeys
+                  Test-K5Enum $inputAcl.schema_version @('storage-acl-admission-v2')
+                  Test-K5Enum $inputAcl.path_role @('runner_workspace', 'workspace', 'runner_temp', 'work_root', 'ancestor', 'unknown')
+                  Test-K5Enum $inputAcl.path_context @('runner_workspace', 'workspace', 'runner_temp', 'work_root', 'unknown')
+                  Test-K5Enum $inputAcl.admission_mode @('ancestor', 'owned', 'existing', 'unknown')
+                  Test-K5Enum $inputAcl.phase @('principal_query', 'token_owner_query', 'descriptor_query', 'trusted_installer_query', 'ownership_policy', 'ace_policy', 'unknown')
+                  Test-K5Enum $inputAcl.native_call @('GetNamedSecurityInfoW', 'none', 'unknown')
+                  Test-K5Enum $inputAcl.native_error @('success', 'access_denied', 'path_missing', 'invalid_parameter', 'insufficient_buffer', 'invalid_acl', 'invalid_security_descriptor', 'other_error', 'not_observed', 'unknown')
+                  Test-K5Enum $inputAcl.reason @('foreign_mutating_allow', 'unsupported_ace', 'native_query', 'descriptor_parse', 'owner_sid_parse', 'descriptor_validation', 'unknown')
+                  if ($null -ne $inputAcl.ancestor_distance) { Test-K5Integer $inputAcl.ancestor_distance 1 64 }
+                  $ace = $null
+                  if ($null -ne $inputAcl.ace) {
+                      if ($inputAcl.phase -cne 'ace_policy' -or $inputAcl.reason -cne 'foreign_mutating_allow') { throw 'probe' }
+                      $inputAce = $inputAcl.ace
+                      $aceKeys = 'access_mask,ace_type,effective_principal_category,expanded_access_mask,inheritance_flags,principal_category'
+                      Test-K5Keys $inputAce $aceKeys
+                      Test-K5Enum $inputAce.ace_type @('allow', 'deny', 'unknown')
+                      $categories = @('local_system', 'builtin_administrators', 'builtin_users', 'everyone', 'authenticated_users', 'creator_owner', 'owner_rights', 'trusted_installer_sid', 'current_user', 'redacted_other', 'unknown')
+                      Test-K5Enum $inputAce.principal_category $categories
+                      Test-K5Enum $inputAce.effective_principal_category $categories
+                      if ($null -ne $inputAce.access_mask) {
+                          Test-K5Integer $inputAce.access_mask 0 4294967295
+                          if ([long]$inputAce.access_mask -band (-bnot [long]4045341183)) { throw 'probe' }
+                      }
+                      if ($null -ne $inputAce.expanded_access_mask) {
+                          Test-K5Integer $inputAce.expanded_access_mask 0 4294967295
+                          if ($null -eq $inputAce.access_mask) { throw 'probe' }
+                          $expanded = [long]$inputAce.access_mask
+                          foreach ($pair in @(@([long]2147483648, [long]1179785), @([long]1073741824, [long]1179926), @([long]536870912, [long]1179808), @([long]268435456, [long]2032127))) {
+                              if ($expanded -band $pair[0]) { $expanded = ($expanded -band (-bnot $pair[0])) -bor $pair[1] }
+                          }
+                          if ($inputAce.expanded_access_mask -ne $expanded) { throw 'probe' }
+                      }
+                      if ($null -ne $inputAce.inheritance_flags) {
+                          Test-K5Integer $inputAce.inheritance_flags 0 31
+                          if (($inputAce.inheritance_flags -band 8) -and -not ($inputAce.inheritance_flags -band 3)) { throw 'probe' }
+                      }
+                      $ace = [ordered]@{}
+                      foreach ($key in $aceKeys.Split(',')) { $ace[$key] = $inputAce.$key }
+                  }
+                  $acl = [ordered]@{}
+                  foreach ($key in $aclKeys.Split(',')) { $acl[$key] = $inputAcl.$key }
+                  $acl.ace = $ace
+              }
+              $observed = [ordered]@{
+                  schema_version = 'storage-preflight-v1'; scope = 'read-only-early-storage-admission'
+                  status = $observed.status; stage = $observed.stage; code = $observed.code
+                  storage_acl = $acl; retention_state = 'not_started'; later_admission_required = $true
+              }
+          } catch {
+              Write-Host 'K5_STORAGE_PREFLIGHT={"schema_version":"storage-preflight-v1","scope":"read-only-early-storage-admission","status":"refused","stage":"runtime_binding","code":"bootstrap_unavailable","storage_acl":null,"retention_state":"not_started","later_admission_required":true}'
+              throw 'Existing exact storage-preflight bootstrap unavailable.'
+          }
+          Write-Host ('K5_STORAGE_PREFLIGHT=' + ($observed | ConvertTo-Json -Compress -Depth 4))
+          if ($probeExit -ne 0) { throw 'Early read-only storage admission refused; later acceptance remains required.' }
+
       - name: Provision existing reviewed GStreamer runtime
         shell: powershell
         env:
@@ -262,7 +664,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003")) { throw "Unreviewed candidate branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -327,7 +729,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003")) { throw "Unreviewed candidate branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -357,7 +759,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003")) { throw "Unreviewed candidate branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -397,7 +799,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Installed receipt violated exact source-free contract." }
 
       - name: Prepare independently bound offline Start-script inputs
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
         timeout-minutes: 6
         shell: powershell
         env:
@@ -405,7 +807,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003")) { throw "Unreviewed launcher branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed launcher branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -483,7 +885,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Independent launcher input admission failed." }
 
       - name: Recheck fresh exact candidate before installed Start-script acceptance
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
         timeout-minutes: 1
         shell: powershell
         env:
@@ -491,21 +893,21 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003")) { throw "Unreviewed launcher branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed launcher branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
           if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; Start-script acceptance refused." }
 
       - name: Recheck idle host before installed Start-script witness
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
         timeout-minutes: 1
         shell: powershell
         run: .\scripts\assert-stage-one-physical-admission.ps1
 
       - name: Prove installed Start-script refusal and two analytics launches
         id: alpha_launcher_witness
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
         timeout-minutes: 10
         shell: powershell
         run: |
@@ -535,6 +937,136 @@ jobs:
           & $env:K5_WITNESS_BASE_PYTHON -I -B -S "$root\source\scripts\installed_alpha_launcher_witness.py" --validate-receipt --expectations "$root\installed-alpha-start-script-expectations.json" --output $env:K5_ALPHA_LAUNCHER_OUTPUT
           if ($LASTEXITCODE -ne 0) { throw "Installed Start-script receipt violated independent source-free contract." }
 
+      - name: Prepare independently bound offline facade inputs
+        if: github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
+        timeout-minutes: 1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:K5_ALPHA_LAUNCHER_OWNED
+          $base = $env:K5_WITNESS_BASE_PYTHON
+          if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_WITNESS_BASE_PYTHON_SHA256) { throw "Admitted base Python changed." }
+          $facade = Join-Path $env:RUNNER_TEMP ("k5-alpha-facades-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $facade) { throw "Facade input path already exists." }
+          New-Item -ItemType Directory -Path $facade -ErrorAction Stop | Out-Null
+          "K5_ALPHA_FACADE_OWNED=$facade" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Reuse independently admitted raw-source/wheel/model/seed/cache inputs.
+          # The new installed runtime will be independently probed by this controller.
+          @'
+          try:
+              import importlib.util, os, sys, uuid
+              from pathlib import Path
+              root, facade_root = Path(sys.argv[1]), Path(sys.argv[2])
+              source = root / "source"
+              controller = source / "scripts/installed_alpha_facade_witness.py"
+              spec = importlib.util.spec_from_file_location("facade", controller)
+              facade = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(facade)
+              launcher, common = facade.alpha, facade.common
+              initial = common.read_json(root / "inputs.json")
+              launcher.validate_expectations(initial, installed=False)
+              common.require(initial["revision"] == os.environ["K5_STAGE_ONE_REVISION"])
+              common.require(common.digest(launcher.tree_manifest(source)) == initial["source_tree_sha256"])
+              expected = {
+                  **initial, "run_nonce": uuid.uuid4().hex,
+                  "facade_controller_sha256": common.file_hash(controller),
+              }
+              common.require(expected["run_nonce"] != initial["run_nonce"])
+              facade.validate_expectations(expected, installed=False)
+              output = Path(os.environ["K5_ALPHA_FACADE_INPUTS"])
+              common.local_path(output.parent.absolute(), directory=True)
+              with output.open("xb") as stream:
+                  stream.write(common.canonical(expected) + b"\n")
+              (facade_root / "work").mkdir()
+          except BaseException:
+              print("K5_ALPHA_FACADE_INPUT_PREPARATION_FAILED")
+              raise SystemExit(1)
+          '@ | & $base -I -B -S - $root $facade
+          if ($LASTEXITCODE -ne 0) { throw "Independent facade input admission failed." }
+
+      - name: Recheck fresh exact candidate before installed facade acceptance
+        if: github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
+        timeout-minutes: 1
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+          K5_EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:K5_CANDIDATE_BRANCH -cne "feat/installed-alpha-facade-witness-20261005") { throw "Unreviewed facade branch refused." }
+          $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
+          $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+          $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
+          if ($head.name -cne $env:K5_CANDIDATE_BRANCH) { throw "Candidate branch identity mismatch." }
+          if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; installed facade acceptance refused." }
+
+      - name: Recheck idle host before installed facade witness
+        if: github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
+
+      - name: Prove actual installed Test and two Run facades
+        id: alpha_facade_witness
+        if: github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
+        timeout-minutes: 10
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:K5_ALPHA_LAUNCHER_OWNED
+          $facade = $env:K5_ALPHA_FACADE_OWNED
+          $base = $env:K5_WITNESS_BASE_PYTHON
+          if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_WITNESS_BASE_PYTHON_SHA256) { throw "Admitted base Python changed." }
+          $wheels = @(Get-ChildItem -LiteralPath "$root\wheels" -Filter 'k5_vision-*.whl' -File)
+          if ($wheels.Count -ne 1) { throw "Exactly one admitted K5 wheel required." }
+          & $base -I -B -S "$root\source\scripts\installed_alpha_facade_witness.py" --expectations $env:K5_ALPHA_FACADE_INPUTS --admitted-expectations $env:K5_ALPHA_FACADE_EXPECTATIONS --output $env:K5_ALPHA_FACADE_OUTPUT --repo $env:GITHUB_WORKSPACE --analytics-source "$env:GITHUB_WORKSPACE\analytics-lab" --k5-wheel $wheels[0].FullName --wheelhouse "$root\wheelhouse" --evidence-root $env:K5_ANALYTICS_EVIDENCE_ROOT --local-appdata $env:LOCALAPPDATA --git 'C:\Program Files\Git\cmd\git.exe' --temp-root $facade --work-root "$facade\work"
+          if ($LASTEXITCODE -ne 0) { throw "Installed facade witness failed." }
+
+      - name: Verify installed facade owned media cleanup
+        if: always() && (steps.alpha_facade_witness.outcome == 'success' || steps.alpha_facade_witness.outcome == 'failure' || steps.alpha_facade_witness.outcome == 'cancelled')
+        timeout-minutes: 1
+        shell: powershell
+        run: .\scripts\assert-stage-one-physical-admission.ps1
+
+      - name: Validate exact source-free installed facade receipt
+        id: safe_facade_evidence
+        if: success() && steps.alpha_facade_witness.outcome == 'success'
+        timeout-minutes: 1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:K5_ALPHA_LAUNCHER_OWNED
+          $facade = $env:K5_ALPHA_FACADE_OWNED
+          $base = $env:K5_WITNESS_BASE_PYTHON
+          if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_WITNESS_BASE_PYTHON_SHA256) { throw "Admitted base Python changed." }
+          # Caller-held source-free inputs bind the admitted expectations before
+          # the distinct read-only receipt validator; no authority comes from output.
+          @'
+          try:
+              import importlib.util, os, sys
+              from pathlib import Path
+              root, facade_root = Path(sys.argv[1]), Path(sys.argv[2])
+              controller = root / "source/scripts/installed_alpha_facade_witness.py"
+              spec = importlib.util.spec_from_file_location("facade", controller)
+              facade = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(facade)
+              common = facade.common
+              initial = common.read_json(Path(os.environ["K5_ALPHA_FACADE_INPUTS"]))
+              admitted = common.read_json(Path(os.environ["K5_ALPHA_FACADE_EXPECTATIONS"]))
+              facade.validate_expectations(initial, installed=False)
+              facade.validate_expectations(admitted)
+              common.require(initial["revision"] == os.environ["K5_STAGE_ONE_REVISION"])
+              common.require(common.file_hash(controller) == initial["facade_controller_sha256"])
+              common.require(all(admitted[key] == value for key, value in initial.items()))
+              common.require(not (facade_root / "work").exists())
+          except BaseException:
+              print("K5_ALPHA_FACADE_AUTHORITY_VALIDATION_FAILED")
+              raise SystemExit(1)
+          '@ | & $base -I -B -S - $root $facade
+          if ($LASTEXITCODE -ne 0) { throw "Independent facade authority validation failed." }
+          & $base -I -B -S "$root\source\scripts\installed_alpha_facade_witness.py" --validate-receipt --expectations $env:K5_ALPHA_FACADE_EXPECTATIONS --output $env:K5_ALPHA_FACADE_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw "Installed facade receipt violated independent source-free contract." }
+
       - name: Retain exact qualified wheel provenance locally
         id: wheel_provenance
         if: github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' && steps.safe_evidence.outcome == 'success' && steps.safe_alpha_evidence.outcome == 'success'
@@ -558,9 +1090,30 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+          # The controllers alone know whether their collectors/Jobs are quiescent.
+          # Any remaining work root, missing ownership proof or denied read preserves
+          # ALL shared input/controller roots. Never override their deletion guard.
+          $preserveOwnedRoots = $false
+          $guardedRoots = @{ K5_ALPHA_LAUNCHER_OWNED = "k5-alpha-launcher-"; K5_ALPHA_FACADE_OWNED = "k5-alpha-facades-" }
+          foreach ($name in $guardedRoots.Keys) {
+            $owned = [Environment]::GetEnvironmentVariable($name, "Process")
+            if ([string]::IsNullOrWhiteSpace($owned)) { continue }
+            try {
+              $expected = Join-Path $env:RUNNER_TEMP ($guardedRoots[$name] + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+              if ([IO.Path]::GetFullPath($owned) -cne [IO.Path]::GetFullPath($expected)) { throw "ownership" }
+              try {
+                $null = [IO.File]::GetAttributes((Join-Path $owned "work"))
+                $preserveOwnedRoots = $true
+              } catch [IO.FileNotFoundException] {
+                # Only positively absent controller work authorizes outer cleanup.
+              } catch [IO.DirectoryNotFoundException] {
+              } catch { $preserveOwnedRoots = $true }
+            } catch { $preserveOwnedRoots = $true }
+          }
+          if ($preserveOwnedRoots) { throw "Controller work retained or unavailable; preserving all owned roots for diagnosis." }
           $cleanupComplete = $true
-          $prefixes = @{ K5_INSTALLED_WORK_OWNED = "k5-installed-work-"; K5_INSTALLED_EVIDENCE_OWNED = "k5-installed-evidence-"; K5_INSTALLED_CONTROLLER_OWNED = "k5-installed-controller-"; K5_ALPHA_LAUNCHER_OWNED = "k5-alpha-launcher-" }
-          foreach ($name in @("K5_INSTALLED_WORK_OWNED", "K5_INSTALLED_EVIDENCE_OWNED", "K5_INSTALLED_CONTROLLER_OWNED", "K5_ALPHA_LAUNCHER_OWNED")) {
+          $prefixes = @{ K5_INSTALLED_WORK_OWNED = "k5-installed-work-"; K5_INSTALLED_EVIDENCE_OWNED = "k5-installed-evidence-"; K5_INSTALLED_CONTROLLER_OWNED = "k5-installed-controller-"; K5_ALPHA_LAUNCHER_OWNED = "k5-alpha-launcher-"; K5_ALPHA_FACADE_OWNED = "k5-alpha-facades-" }
+          foreach ($name in @("K5_INSTALLED_WORK_OWNED", "K5_INSTALLED_EVIDENCE_OWNED", "K5_INSTALLED_CONTROLLER_OWNED", "K5_ALPHA_LAUNCHER_OWNED", "K5_ALPHA_FACADE_OWNED")) {
             $owned = [Environment]::GetEnvironmentVariable($name, "Process")
             if ([string]::IsNullOrWhiteSpace($owned)) { continue }
             try {
@@ -587,6 +1140,24 @@ jobs:
         with:
           name: installed-alpha-start-script-witness
           path: artifacts/installed-alpha-start-script-witness.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload only validated installed facade receipt
+        if: success() && steps.safe_facade_evidence.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: installed-alpha-facades-witness
+          path: artifacts/installed-alpha-facades-witness.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Retain only validated source-free facade expectations
+        if: success() && steps.safe_facade_evidence.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: installed-alpha-facades-expectations
+          path: artifacts/installed-alpha-facades-expectations.json
           if-no-files-found: error
           retention-days: 14
 

@@ -138,17 +138,121 @@ _ACL_DESCRIPTOR_ERRORS = frozenset(
 )
 
 
-def bounded_acl_diagnostic(value):
-    """Project only fixed vocabulary; no paths, accounts, SIDs, ACEs or error text."""
+_ACL_PRINCIPALS = {
+    "S-1-5-18": "local_system",
+    "S-1-5-32-544": "builtin_administrators",
+    "S-1-5-32-545": "builtin_users",
+    "S-1-1-0": "everyone",
+    "S-1-5-11": "authenticated_users",
+    "S-1-3-0": "creator_owner",
+    "S-1-3-4": "owner_rights",
+    _TRUSTED_INSTALLER: "trusted_installer_sid",
+}
+_ACL_CATEGORIES = frozenset(_ACL_PRINCIPALS.values()) | {
+    "current_user",
+    "redacted_other",
+    "unknown",
+}
+
+
+def _principal_category(sid, current):
+    if (
+        type(sid) is not str
+        or len(sid) > 184
+        or not re.fullmatch(r"S-1-[0-9]{1,15}(?:-[0-9]{1,10}){0,15}", sid)
+    ):
+        return "unknown"
+    pieces = sid.split("-")[2:]
+    if any(str(int(part)) != part for part in pieces):
+        return "unknown"
+    if int(pieces[0]) > 0xFFFFFFFFFFFF or any(int(part) > 0xFFFFFFFF for part in pieces[1:]):
+        return "unknown"
+    return _ACL_PRINCIPALS.get(sid, "current_user" if sid == current else "redacted_other")
+
+
+def _bounded_ace(value):
+    try:
+        return _project_ace(value)
+    except BaseException:
+        return None
+
+
+def _project_ace(value):
     if type(value) is not dict:
         return None
-    result = {"schema_version": "storage-acl-admission-v1"}
+    result = {}
+    for key, choices in (
+        ("ace_type", {"allow", "deny", "unknown"}),
+        ("principal_category", _ACL_CATEGORIES),
+        ("effective_principal_category", _ACL_CATEGORIES),
+    ):
+        item = value.get(key)
+        result[key] = item if type(item) is str and item in choices else "unknown"
+    raw, expanded = value.get("access_mask"), value.get("expanded_access_mask")
+    valid = type(raw) is int and 0 <= raw <= 0xFFFFFFFF and not raw & ~0xF11F01FF
+    result["access_mask"] = raw if valid else None
+    expected = raw if valid else 0
+    for generic, specific in (
+        (0x80000000, 0x00120089),
+        (0x40000000, 0x00120116),
+        (0x20000000, 0x001200A0),
+        (0x10000000, 0x001F01FF),
+    ):
+        if expected & generic:
+            expected = (expected & ~generic) | specific
+    result["expanded_access_mask"] = (
+        expanded if valid and type(expanded) is int and expanded == expected else None
+    )
+    flags = value.get("inheritance_flags")
+    result["inheritance_flags"] = (
+        flags
+        if type(flags) is int and 0 <= flags <= 0x1F and not (flags & 0x08 and not flags & 0x03)
+        else None
+    )
+    return result
+
+
+def _refused_allow(raw_sid, effective_sid, current, raw_mask, mask, flags):
+    # Only operands already read by the admission are observed. No ACE getter,
+    # native query or later entry is touched. Unknown flags are not a zero.
+    try:
+        return _bounded_ace(
+            {
+                "ace_type": "allow",
+                "principal_category": _principal_category(raw_sid, current),
+                "effective_principal_category": _principal_category(effective_sid, current),
+                "access_mask": raw_mask,
+                "expanded_access_mask": mask,
+                "inheritance_flags": flags,
+            }
+        )
+    except BaseException:
+        return None  # Diagnostic failure cannot replace the established refusal.
+
+
+def bounded_acl_diagnostic(value):
+    """Project fixed vocabulary and validated numbers; never identities or error text."""
+    try:
+        return _project_acl_diagnostic(value)
+    except BaseException:
+        return None
+
+
+def _project_acl_diagnostic(value):
+    if type(value) is not dict:
+        return None
+    result = {"schema_version": "storage-acl-admission-v2"}
     for name, choices in _ACL_DIAGNOSTIC_ENUMS.items():
         item = value.get(name)
         result[name] = item if type(item) is str and item in choices else "unknown"
     distance = value.get("ancestor_distance")
     result["ancestor_distance"] = (
         distance if type(distance) is int and 1 <= distance <= 64 else None
+    )
+    result["ace"] = (
+        _bounded_ace(value.get("ace"))
+        if result["phase"] == "ace_policy" and result["reason"] == "foreign_mutating_allow"
+        else None
     )
     return result
 
@@ -461,7 +565,10 @@ class NativeStoragePolicy:
             "native_error": "not_observed",
         }
         try:
-            _need(self._native.current_user() == self.principal, "storage_ownership")
+            _need(
+                self._native.current_user() == (observed_principal := self.principal),
+                "storage_ownership",
+            )
             diagnostic["phase"] = "token_owner_query"
             _need(_token_owner(self._native) == self.default_owner, "storage_ownership")
             diagnostic["phase"] = "descriptor_query"
@@ -486,17 +593,21 @@ class NativeStoragePolicy:
                 if entry.kind != 0:
                     diagnostic["reason"] = "unsupported_ace"
                     raise StorageError("storage_acl")
-                if ancestor and entry.flags & 0x08:
+                flags = None
+                if ancestor and (flags := entry.flags) & 0x08:
                     continue
-                sid = entry.sid
+                raw_sid = sid = entry.sid
                 if sid == "S-1-3-4":
                     sid = owner
-                elif sid == "S-1-3-0" and entry.flags & 0x08:
+                elif sid == "S-1-3-0" and (flags := entry.flags) & 0x08:
                     sid = self.principal
-                mask = self._module._expanded_mask(entry.mask)
+                mask = self._module._expanded_mask(raw_mask := entry.mask)
                 mutation = _ANCESTOR_MUTATION if ancestor else _MUTATION
                 if sid not in trusted and mask & mutation:
                     diagnostic["reason"] = "foreign_mutating_allow"
+                    diagnostic["ace"] = _refused_allow(
+                        raw_sid, sid, observed_principal, raw_mask, mask, flags
+                    )
                     raise StorageError("storage_acl")
         except StorageError as error:
             if error.code == "storage_acl":
@@ -630,6 +741,30 @@ def derive_storage_root(runner_workspace: Path, workspace: Path, runner_temp: Pa
         raise
     except Exception:
         raise StorageError("storage_path") from None
+
+
+def storage_preflight(runner_workspace: Path, workspace: Path, runner_temp: Path):
+    """One read-only observation, never a reusable retention/acceptance authority."""
+    result = {
+        "schema_version": "storage-preflight-v1",
+        "scope": "read-only-early-storage-admission",
+        "status": "refused",
+        "stage": "storage_construction",
+        "code": "storage_policy",
+        "storage_acl": None,
+        "retention_state": "not_started",
+        "later_admission_required": True,
+    }
+    try:
+        policy = NativeStoragePolicy()
+        result["stage"] = "storage_root"
+        derive_storage_root(runner_workspace, workspace, runner_temp, policy)
+        result.update(status="passed", code="passed")
+    except StorageError as error:
+        result.update(code=error.code, storage_acl=bounded_acl_diagnostic(error.acl_diagnostic))
+    except BaseException:
+        result["code"] = "storage_interrupted"
+    return result
 
 
 def _relative(value: object) -> str:

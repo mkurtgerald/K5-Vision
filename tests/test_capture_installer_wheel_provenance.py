@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import subprocess
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -242,6 +244,89 @@ def execute(bundle):
     )
 
 
+def test_runtime_pin_matches_exact_tracked_git_blob_manifest():
+    command = ["git", "--no-replace-objects", "--no-lazy-fetch", "-c", "protocol.allow=never"]
+    entries = subprocess.check_output(
+        [*command, "ls-files", "--stage", "-z", "--", "src/k5vision"],
+        cwd=ROOT,
+        timeout=10,
+    ).split(b"\0")
+    objects = []
+    for entry in entries:
+        if not entry:
+            continue
+        metadata, path = entry.split(b"\t", 1)
+        mode, oid, stage = metadata.split()
+        assert mode == b"100644" and stage == b"0"
+        objects.append((oid, path.decode().removeprefix("src/")))
+    assert objects
+    raw = subprocess.check_output(
+        [*command, "cat-file", "--batch"],
+        input=b"".join(oid + b"\n" for oid, _ in objects),
+        cwd=ROOT,
+        timeout=10,
+    )
+    assert len(raw) <= 8 * 1024 * 1024
+    manifest = {}
+    for expected_oid, path in objects:
+        header, raw = raw.split(b"\n", 1)
+        oid, kind, size = header.split()
+        assert oid == expected_oid and kind == b"blob"
+        size = int(size)
+        content, raw = raw[:size], raw[size:]
+        assert len(content) == size and raw[:1] == b"\n"
+        raw = raw[1:]
+        assert hashlib.sha1(b"blob " + str(size).encode() + b"\0" + content).hexdigest() == (
+            expected_oid.decode()
+        )
+        manifest[path] = hashlib.sha256(content).hexdigest()
+    assert not raw
+    independent = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert len(manifest) == 133
+    assert capture.RUNTIME_REVISION == "f14fc48768dbb36599e9c311ae99d371c24c600a"
+    assert independent == capture.RUNTIME_PAYLOAD_SHA256
+
+
+def test_runtime_mutation_cannot_be_admitted_by_rebinding_caller_expectations(bundle):
+    target = bundle.source / "src/k5vision/__init__.py"
+    target.write_bytes(target.read_bytes() + b"\n# unreviewed runtime fixture mutation\n")
+    common, alpha = bundle.tools.alpha.common, bundle.tools.alpha
+    bundle.expected["source_tree_sha256"] = common.digest(alpha.tree_manifest(bundle.source))
+    bundle.expected["k5_payload_sha256"] = common.digest(alpha.source_payload(bundle.source))
+    with pytest.raises(capture.CaptureError, match="runtime_identity"):
+        capture.source_identity(bundle.source, bundle.tools, bundle.expected)
+    assert not bundle.storage.exists() and not bundle.args.output.exists()
+
+
+def test_old_runtime_expectation_is_refused_before_retention(bundle):
+    bundle.expected["k5_payload_sha256"] = (
+        "c755ac54055c3d36ca12da20089f349b76477c7f1757c88b2cda9751160de92e"
+    )
+    with pytest.raises(capture.CaptureError, match="runtime_identity"):
+        capture.source_identity(bundle.source, bundle.tools, bundle.expected)
+    assert not bundle.storage.exists() and not bundle.args.output.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("revision", "eccd0cb88c31e75c98d328ebb5fb7f0407ea5cd1"),
+        ("revision", "b" * 40),
+        ("payload_sha256", "c755ac54055c3d36ca12da20089f349b76477c7f1757c88b2cda9751160de92e"),
+        ("payload_sha256", "c" * 64),
+    ],
+    ids=["old-revision", "other-revision", "old-payload", "other-payload"],
+)
+def test_old_or_changed_runtime_provenance_is_rejected(bundle, field, value):
+    execute(bundle)
+    provenance = json.loads(bundle.args.output.read_bytes())
+    provenance["runtime"][field] = value
+    with pytest.raises(capture.CaptureError, match="output_schema"):
+        capture.validate_provenance(provenance)
+
+
 def test_generated_full_capture_retains_originals_and_independent_subset(bundle):
     result = execute(bundle)
     assert result["archive_count"] == 36
@@ -415,7 +500,7 @@ def test_capture_hook_and_branch_route_keep_prior_admission_and_cleanup():
     text = (ROOT / ".github/workflows/installed-analytics-candidate.yml").read_text()
     branch = "fix/transactional-alpha-upgrade-20261003"
     assert f"      - {branch}" in text
-    assert "@($legacyBranch, $launcherBranch, $upgradeBranch)" in text
+    assert "@($legacyBranch, $launcherBranch, $upgradeBranch, $facadeBranch)" in text
     assert '$upgradeBranch = "' + branch + '"' in text
     assert "group: stage-one-operator-physical" in text and "cancel-in-progress: false" in text
     assert text.count("    runs-on:") == 2
@@ -762,3 +847,40 @@ def test_main_loading_error_emits_fixed_diagnostic_without_exception_text(monkey
     assert record["stage"] == "tool_loading" and record["error_class"] == "runtime_error"
     assert record["retention_state"] == "not_started" and not record["cleanup_known"]
     assert "PRIVATE_CANARY" not in output
+
+
+def test_failure_envelope_reprojects_nested_ace_without_identity_or_speculation(bundle):
+    diagnostic = capture.CaptureDiagnostics()
+    diagnostic.enter("storage_root")
+    diagnostic.retention("not_started")
+    value = {
+        "phase": "ace_policy",
+        "reason": "foreign_mutating_allow",
+        "native_call": "GetNamedSecurityInfoW",
+        "native_error": "success",
+        "ancestor_distance": 2,
+        "ace": {
+            "ace_type": "allow",
+            "principal_category": "builtin_users",
+            "effective_principal_category": "builtin_users",
+            "access_mask": 0x40000000,
+            "expanded_access_mask": 0x00120116,
+            "inheritance_flags": 0x13,
+            "sid": "S-1-5-21-PRIVATE_CANARY",
+        },
+    }
+    error = bundle.tools.storage.StorageError("storage_acl", acl_diagnostic=value)
+    record = capture.failure_diagnostic(error, diagnostic, bundle.tools)
+    assert record["storage_acl"]["schema_version"] == "storage-acl-admission-v2"
+    assert record["storage_acl"]["ace"]["access_mask"] == 0x40000000
+    assert record["retention_state"] == "not_started"
+    assert record["cleanup_known"] and not record["cleanup_pending"]
+    assert "PRIVATE_CANARY" not in json.dumps(record)
+    error.acl_diagnostic["ace"]["access_mask"] = True
+    error.acl_diagnostic["ace"]["principal_category"] = "PRIVATE_CANARY"
+    reprojection = capture.failure_diagnostic(error, diagnostic, bundle.tools)
+    assert reprojection["storage_acl"]["ace"]["access_mask"] is None
+    assert reprojection["storage_acl"]["ace"]["expanded_access_mask"] is None
+    assert reprojection["storage_acl"]["ace"]["principal_category"] == "unknown"
+    error.acl_diagnostic.update(phase="descriptor_query", reason="descriptor_parse")
+    assert capture.failure_diagnostic(error, diagnostic, bundle.tools)["storage_acl"]["ace"] is None
