@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import pytest
@@ -164,6 +165,47 @@ def test_provider_failure_and_malformed_output_fail_open() -> None:
     assert delivery.snapshot.passthrough_frames == 3
     retained = delivery.snapshot.model_dump_json().casefold()
     assert "private-provider-failure" not in retained
+
+
+def test_oversized_lazy_provider_is_bounded_and_fails_open_without_partial_overlay() -> None:
+    frames = (_frame(33), _frame(34), _frame(35))
+    consumed = 0
+
+    def values() -> Iterator[_Tracked]:
+        nonlocal consumed
+        for _ in range(3):
+            consumed += 1
+            yield _Tracked(track_id="private-overflow-track", category="private-overflow-category")
+
+    async def provider(_frame: PresentationVideoFrame) -> Iterator[_Tracked]:
+        return values()
+
+    delivery = BoundedAnalyticsOverlayDelivery(
+        _Runner(frames),
+        provider,
+        max_observations=1,
+        max_frames=1,
+    )
+    received: list[PresentationVideoFrame] = []
+
+    result = asyncio.run(
+        delivery.run("rtsp://private-source/live", lambda frame: _append(received, frame))
+    )
+
+    assert result.state is LivePresentationState.COMPLETE
+    assert consumed == 2
+    assert len(received) == len(frames)
+    assert all(actual is original for actual, original in zip(received, frames, strict=True))
+    assert delivery.snapshot.processed_frames == 3
+    assert delivery.snapshot.provider_submissions == 1
+    assert delivery.snapshot.provider_completions == 0
+    assert delivery.snapshot.analytics_failures == 1
+    assert delivery.snapshot.passthrough_frames == 3
+    assert delivery.snapshot.overlay_frames == 0
+    assert delivery.snapshot.rendered_boxes == 0
+    retained = delivery.snapshot.model_dump_json().casefold()
+    assert "private-overflow-track" not in retained
+    assert "private-overflow-category" not in retained
 
 
 def test_provider_timeout_fails_open_without_delaying_next_frame() -> None:
