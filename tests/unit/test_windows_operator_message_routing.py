@@ -25,6 +25,7 @@ _KINDS = (_Win32OperatorShellApi, _InteractiveWin32OperatorShellApi, _CatalogWin
 _QUIT = 0x0012
 _CLOSE = 0x0010
 _MOVE = 0x0200
+_THREAD_MESSAGES = ctypes.c_void_p(-1).value
 
 
 @pytest.fixture(autouse=True)
@@ -33,6 +34,8 @@ def isolated_routes(monkeypatch):
 
 
 class Queue:
+    """Queued-input model; virtual PostQuitMessage generation is native-witness scope."""
+
     def __init__(self, messages=()):
         self.messages = deque(messages)
         self.children = {171: 71, 172: 72, 271: 71, 272: 72}
@@ -44,14 +47,24 @@ class Queue:
         self.releases = []
 
     def peek(self, pointer, owner, first, last, removal):
-        assert (first, last, removal) == (0, 0, 1)
-        self.filters.append(owner.value)
+        selected = owner.value
+        if selected == _THREAD_MESSAGES:
+            assert (first, last, removal) == (_QUIT, _QUIT, 1)
+        else:
+            assert selected in {71, 72, 73}
+            assert (first, last, removal) == (0, 0, 1)
+        self.filters.append((selected, first, last, removal))
         # Sent callbacks are independent of the HWND queued-message filter.
         if self.callbacks:
             self.callbacks.popleft()()
         for index, item in enumerate(self.messages):
             hwnd, kind, *parameters = item
-            if kind != _QUIT and hwnd != owner.value and self.children.get(hwnd) != owner.value:
+            if selected == _THREAD_MESSAGES:
+                if hwnd or kind != _QUIT:
+                    continue
+            elif hwnd != selected and self.children.get(hwnd) != selected:
+                # A thread quit does not become a window message just because
+                # WM_QUIT bypasses the message-number range filters.
                 continue
             del self.messages[index]
             message = ctypes.cast(pointer, ctypes.POINTER(_Win32Message)).contents
@@ -117,7 +130,11 @@ def test_two_pumps_preserve_owner_children_foreign_messages_and_capacity(first_k
     assert b.take_geometry_change()
     assert not a.take_geometry_change()
     assert not any(hwnd == 999 for hwnd, _ in queue.dispatched)
-    assert set(queue.filters) == {71, 72}
+    assert {value for value in queue.filters if value[0] != _THREAD_MESSAGES} == {
+        (71, 0, 0, 1),
+        (72, 0, 0, 1),
+    }
+    assert (_THREAD_MESSAGES, _QUIT, _QUIT, 1) in queue.filters
     assert len(routing._ROUTES.active) == 2
 
 
@@ -491,3 +508,83 @@ def test_dispatch_cannot_replace_pump_generation_even_on_final_batch_item(kind, 
     assert queue.dispatched == [(71, 0x0400)]
     assert tuple(queue.messages) == ((71, 0x0401),)
     api._message_route.require(71)
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_quit_probe_preserves_foreign_thread_and_window_messages_with_one_message_budget(kind):
+    foreign = [(0, 0x8001), (0, 0x0111), (999, _QUIT), (999, _MOVE)]
+    queue = Queue([*foreign, (71, _MOVE), (72, _MOVE)])
+    a, b = api_for(kind, 71, queue), api_for(kind, 72, queue)
+    assert a.pump_messages(71, 1) == (1, False)
+    assert b.pump_messages(72, 1) == (1, False)
+    assert list(queue.messages) == foreign
+    assert queue.dispatched == [(71, _MOVE), (72, _MOVE)]
+    assert queue.filters == [
+        (_THREAD_MESSAGES, _QUIT, _QUIT, 1),
+        (71, 0, 0, 1),
+        (_THREAD_MESSAGES, _QUIT, _QUIT, 1),
+        (72, 0, 0, 1),
+    ]
+    # Model an explicit queued thread quit. The native witness separately uses
+    # PostQuitMessage, whose coalesced/low-priority generation is not a deque.
+    queue.messages.append((0, _QUIT))
+    assert a.pump_messages(71, 1) == (1, True)
+    calls = len(queue.filters)
+    assert b.pump_messages(72, 1) == (0, True)
+    assert a.pump_messages(71, 1) == (0, True)
+    assert len(queue.filters) == calls
+    assert list(queue.messages) == foreign
+    assert queue.dispatched == [(71, _MOVE), (72, _MOVE)]
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("callback_poll", ["thread", "window"])
+def test_both_native_polls_revalidate_exact_registration_before_dispatch(kind, callback_poll):
+    queue = Queue([(71, _MOVE), (0, 0x8001), (999, _MOVE)])
+    api = api_for(kind, 71, queue)
+
+    def reuse():
+        api._message_route.unregister(71)
+        api._message_route.register(71)
+
+    if callback_poll == "window":
+        queue.callbacks.append(lambda: None)
+    queue.callbacks.append(reuse)
+    with pytest.raises(_NativeShellError):
+        api.pump_messages(71, 1)
+    assert len(queue.filters) == (1 if callback_poll == "thread" else 2)
+    assert not queue.dispatched and not api._pointer_events
+    assert (0, 0x8001) in queue.messages and (999, _MOVE) in queue.messages
+    if callback_poll == "thread":
+        assert (71, _MOVE) in queue.messages
+    api._message_route.require(71)
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_sent_peer_quit_during_empty_thread_probe_prevents_later_window_consumption(kind):
+    queue = Queue([(71, _MOVE), (0, 0x8001)])
+    a, b = api_for(kind, 71, queue), api_for(kind, 72, queue)
+    queue.callbacks.append(lambda: b._message_route.observe_quit(72))
+    assert a.pump_messages(71, 1) == (0, True)
+    assert b.pump_messages(72, 1) == (0, True)
+    assert queue.filters == [(_THREAD_MESSAGES, _QUIT, _QUIT, 1)]
+    assert list(queue.messages) == [(71, _MOVE), (0, 0x8001)]
+    assert not queue.dispatched
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_quit_probe_contract_violation_fails_without_dispatch_or_quit_fanout(kind):
+    queue = Queue()
+    a, b = api_for(kind, 71, queue), api_for(kind, 72, queue)
+
+    def invalid_probe(pointer, owner, first, last, removal):
+        assert (owner.value, first, last, removal) == (_THREAD_MESSAGES, _QUIT, _QUIT, 1)
+        message = ctypes.cast(pointer, ctypes.POINTER(_Win32Message)).contents
+        message.hwnd, message.message = 0, 0x8001
+        return 1
+
+    a._peek_message = invalid_probe
+    with pytest.raises(_NativeShellError):
+        a.pump_messages(71, 1)
+    assert not b._message_route.quit_requested(72)
+    assert not queue.dispatched

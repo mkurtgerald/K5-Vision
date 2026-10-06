@@ -368,17 +368,37 @@ class _Win32OperatorShellApi:
         return self._message_route.quit_requested(shell)
 
     def _peek_shell_message(self, shell: int, message: _Win32Message, registration: object) -> bool:
-        """Select only our queued HWND/child messages; sent dispatch is still native."""
+        """Retrieve one thread quit or one owned-window message, never foreign work."""
         self._message_route.require(shell, registration=registration)
+        if self._message_route.quit_requested(shell):
+            return False
+        # Do not rely on a HWND-filtered poll to return a thread quit. The API's
+        # explicit WM_QUIT exception names message-number range filters. Select
+        # thread quit directly with HWND=-1; never consume another thread message
+        # or poll every window with a null HWND. At most one message is removed.
+        available = bool(
+            self._peek_message(
+                ctypes.byref(message), ctypes.c_void_p(-1), _WM_QUIT, _WM_QUIT, _PM_REMOVE
+            )
+        )
+        if available:
+            if message.message != _WM_QUIT or int(message.hwnd or 0) != 0:
+                raise _NativeShellError(_NativeShellFailure.PUMP)
+            # Sent callbacks can retire the poller while PeekMessage removes a
+            # quit. Preserve fan-out to its still-live peers before revalidation.
+            self._message_route.observe_thread_quit()
+        self._message_route.require(shell, registration=registration)
+        if available:
+            return True
+        if self._message_route.quit_requested(shell):
+            return False
         available = bool(
             self._peek_message(ctypes.byref(message), ctypes.c_void_p(shell), 0, 0, _PM_REMOVE)
         )
         if available and message.message == _WM_QUIT:
-            # The quit was removed from this thread even if a sent callback
-            # retired this shell. Valid peers must still receive the signal.
             self._message_route.observe_thread_quit()
-        # PeekMessage may run sent callbacks before returning, even on an empty
-        # queue. Reusing this API/handle must not validate the old poll generation.
+        # Both polls dispatch sent callbacks, including when their queue is empty.
+        # A reused API/handle must never validate this old registration.
         self._message_route.require(shell, registration=registration)
         return available
 

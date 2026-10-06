@@ -107,7 +107,7 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
     all_windows: list[int] = []
     consumed: dict[str, list[tuple[int, int, int, int]]] = {"a": [], "b": []}
     dispatched: dict[str, list[tuple[int, int, int, int]]] = {"a": [], "b": []}
-    filters: dict[str, list[int]] = {"a": [], "b": []}
+    filters: dict[str, list[tuple[int, int, int, int]]] = {"a": [], "b": []}
     pump_results: dict[str, list[tuple[int, bool]]] = {"a": [], "b": []}
     cleanup_errors: list[str] = []
     cleanup_markers: list[tuple[int, int, int, int]] = []
@@ -140,7 +140,7 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
 
         def peek(pointer, hwnd, minimum, maximum, flags):
             same_thread()
-            filters[name].append(int(getattr(hwnd, "value", hwnd) or 0))
+            filters[name].append((int(getattr(hwnd, "value", hwnd) or 0), minimum, maximum, flags))
             result = native_peek(pointer, hwnd, minimum, maximum, flags)
             if result:
                 consumed[name].append(event(ctypes.cast(pointer, message_pointer).contents))
@@ -247,7 +247,7 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
         b_shell_retained = inspect_marker(shells["b"])
         b_child_retained = inspect_marker(children["b"])
         sentinel_after_a = inspect_marker(sentinel)
-        a_call_count = len(filters["a"])
+        a_call_count = len(pump_results["a"])
 
         for _ in range(_MAX_CYCLES):
             pump("b")
@@ -363,14 +363,28 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
     assert markers(consumed["a"]) == markers(dispatched["a"]) == expected_a
     assert markers(consumed["b"]) == markers(dispatched["b"]) == expected_b
     assert all(owned_targets_only.values())
-    assert all(filters[name] and set(filters[name]) == {shells[name]} for name in apis)
+    # Each native retrieval selects either this exact HWND/children or only
+    # thread WM_QUIT. Never accept an all-window or unrestricted thread poll.
+    thread_quit_filter = (int(ctypes.c_void_p(-1).value), _WM_QUIT, _WM_QUIT, _PM_REMOVE)
+    assert all(
+        filters[name]
+        and (shells[name], 0, 0, _PM_REMOVE) in filters[name]
+        and thread_quit_filter in filters[name]
+        and set(filters[name]) <= {(shells[name], 0, 0, _PM_REMOVE), thread_quit_filter}
+        for name in apis
+    )
     assert all(
         0 <= count <= _PUMP_BOUND and not close
         for values in routing_results.values()
         for count, close in values
     )
     assert all(0 <= count <= 1 for count, _ in quit_results)
-    assert quit_a[1] and quit_b == (0, True)
+    assert quit_a[1] and quit_b == (0, True), {
+        "quit_a": quit_a,
+        "quit_b": quit_b,
+        "quit_results": quit_results,
+        "thread_quit_consumed": sum(value[1] == _WM_QUIT for value in consumed["a"]),
+    }
     assert sticky_quit == ((0, True), (0, True))
     assert sum(value[1] == _WM_QUIT for value in consumed["a"]) == 1
     assert not any(value[1] == _WM_QUIT for value in consumed["b"])

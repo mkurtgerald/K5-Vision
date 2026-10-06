@@ -601,7 +601,10 @@ def test_old_win32_pointer_backlog_cannot_cross_a_geometry_fence(request):
     api._map_window_points = lambda *_args: 0
     queue = deque([(0, 100), (0x0201, 150), (0x0202, 160), (0x0201, 220), (0x0202, 230)])
 
-    def peek(pointer, *_args):
+    def peek(pointer, owner, *filters):
+        if owner.value == ctypes.c_void_p(-1).value:
+            assert filters == (0x0012, 0x0012, 1)
+            return 0
         if not queue:
             return 0
         kind, timestamp = queue.popleft()
@@ -721,7 +724,10 @@ def test_pointer_fence_preserves_catalog_and_other_window_messages(request):
     queue = deque([(71, 0x0201), (99, 0x0201), (88, 0x0201), (71, 0x0111)])
     dispatched, commands = [], []
 
-    def peek(pointer, owner, *_args):
+    def peek(pointer, owner, *filters):
+        if owner.value == ctypes.c_void_p(-1).value:
+            assert filters == (0x0012, 0x0012, 1)
+            return 0
         assert owner.value == 71
         for index, (hwnd, kind) in enumerate(queue):
             if hwnd not in {71, 99}:

@@ -341,8 +341,12 @@ def test_sent_callback_and_queued_command_each_enter_once_and_close_stays_deferr
         assert api.drain_playback_commands(4) == (WindowsPlaybackCommand.PAUSE,)
         queue = deque([(0x111, _RESUME_BUTTON_ID, 101)])
 
-        def peek(pointer, *_args):
+        def peek(pointer, owner, *filters):
             import ctypes
+
+            if owner.value == ctypes.c_void_p(-1).value:
+                assert filters == (0x0012, 0x0012, 1)
+                return 0
 
             if not queue:
                 return 0

@@ -219,7 +219,7 @@ def test_real_shell_settled_resize_preserves_two_owned_camera_tiles(
             "a9969c9c6a99c8d6a480ee9d48c18a22adb50d7e460b5ecd2dde7f8f8ef7d1ba"
         ),
         "windows_operator_application": (
-            "f57644e649e2a7366774cf9b3438fac1182eb31f33c42d04dd302eb12d547747"
+            "e616a7fdacc403a1acb720adef2a0432fd4eecdc0c1636c6433ebda587592471"
         ),
         "windows_operator_interaction": (
             "a5d5efaf32c6fdee3d1506b3e173e363f1fc8ff42c4eb6f6e2dfd8c7ad711d37"
