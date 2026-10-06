@@ -196,10 +196,13 @@ class BoundedPlaybackPump:
                 try:
                     if self._pause_control is not None:
                         await self._pause_control.wait_until_running()
-                    await asyncio.wait_for(
-                        consumer(memoryview(item.packet), item.source_elapsed_ms),
-                        timeout=self._consumer_timeout_seconds,
-                    )
+                        async with self._pause_control.work_timeout(self._consumer_timeout_seconds):
+                            await consumer(memoryview(item.packet), item.source_elapsed_ms)
+                    else:
+                        await asyncio.wait_for(
+                            consumer(memoryview(item.packet), item.source_elapsed_ms),
+                            timeout=self._consumer_timeout_seconds,
+                        )
                 except asyncio.CancelledError:
                     self._state = PlaybackPumpState.CANCELLED
                     raise

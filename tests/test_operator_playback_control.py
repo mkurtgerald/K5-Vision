@@ -361,3 +361,103 @@ def test_playback_control_route_requires_human_session_and_rejects_unknown_contr
     assert missing.status_code == 404
     assert "rtsp://" not in missing.text.casefold()
     assert str(tmp_path).casefold() not in missing.text.casefold()
+
+
+def test_active_work_deadline_survives_multiple_pause_waits_without_reset():
+    async def exercise():
+        control = PlaybackPauseControl()
+        loop = asyncio.get_running_loop()
+        async with control.work_timeout(1.0):
+            bound = control._work_deadline.get()
+            assert bound is not None
+            deadline = bound[1]
+            for _ in range(3):
+                await asyncio.sleep(0.005)
+                remaining = deadline.when() - loop.time()
+                await control.pause()
+
+                async def resume_later():
+                    await asyncio.sleep(0.02)
+                    await control.resume()
+
+                resume = asyncio.create_task(resume_later())
+                await control.wait_until_running()
+                await resume
+                # Admission excludes the wait, but never restores a fresh 1s budget.
+                assert 0 < deadline.when() - loop.time() <= remaining
+                assert deadline.when() - loop.time() > remaining - 0.01
+        assert control._work_deadline.get() is None
+
+    asyncio.run(exercise())
+
+
+def test_child_pause_waiter_cannot_suspend_parent_work_deadline():
+    async def exercise():
+        control = PlaybackPauseControl()
+        child = None
+        with pytest.raises(TimeoutError):
+            async with control.work_timeout(0.02):
+                await control.pause()
+                child = asyncio.create_task(control.wait_until_running())
+                await child
+        assert child is not None and child.cancelled()
+        assert control._work_deadline.get() is None
+
+    asyncio.run(exercise())
+
+
+def test_overdue_work_deadline_cannot_be_hidden_by_pause(monkeypatch):
+    async def exercise():
+        control = PlaybackPauseControl()
+        loop = asyncio.get_running_loop()
+        with pytest.raises(TimeoutError):
+            async with control.work_timeout(1.0):
+                await control.pause()
+                deadline = control._work_deadline.get()[1]
+                # The scheduled deadline callback has not run yet, but active work
+                # already exhausted its budget. No real blocking sleep is needed.
+                with monkeypatch.context() as patch:
+                    patch.setattr(loop, "time", lambda: deadline.when() + 1)
+                    await control.wait_until_running()
+        assert control._work_deadline.get() is None
+
+    asyncio.run(exercise())
+
+
+def test_cancel_paused_playback_releases_coordinator_control_and_capacity(tmp_path):
+    async def exercise():
+        registry, device = _registry(tmp_path)
+        root = tmp_path / "recordings"
+        recording_id, control_id = uuid4(), uuid4()
+        await _write_recording_pair(root, recording_id, device.id)
+        owner = _principal("pause-owner")
+
+        class Launcher(_BlockingLauncher):
+            async def run(self, *args, pause_control=None, **kwargs):
+                self.control = pause_control
+                await pause_control.pause()
+                self.started.set()
+                await pause_control.wait_until_running()
+                raise AssertionError("cancelled playback resumed")
+
+        launcher = Launcher()
+        coordinator = BoundedOperatorPlaybackCoordinator(registry, _Resolver(), root, launcher)
+        request = OperatorPlaybackRequest(recording_id=recording_id, control_id=control_id)
+        task = asyncio.create_task(coordinator.play(owner, request))
+        try:
+            await asyncio.wait_for(launcher.started.wait(), 1)
+            assert coordinator.active_playbacks == 1
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert coordinator.active_playbacks == 0
+            with pytest.raises(OperatorPlaybackError) as error:
+                await coordinator.control(owner, control_id, OperatorPlaybackControlAction.RESUME)
+            assert error.value.code is OperatorPlaybackErrorCode.CONTROL_NOT_FOUND
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            registry.close()
+
+    asyncio.run(exercise())

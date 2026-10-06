@@ -125,6 +125,10 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
 
     def _acquire_pointer_capture(self, shell: int) -> None:
         try:
+            # Sent callbacks can move capture without a queued CAPTURECHANGED.
+            # Never steal capture from another shell or an unrelated control.
+            if int(self._get_capture() or 0) not in {0, shell}:
+                raise _NativeShellError(_NativeShellFailure.PUMP)
             self._set_capture(ctypes.c_void_p(shell))
             captured = int(self._get_capture() or 0)
         except Exception:
@@ -133,11 +137,13 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
             raise _NativeShellError(_NativeShellFailure.PUMP)
         self._capture_active = True
 
-    def _release_pointer_capture(self) -> None:
+    def _release_pointer_capture(self, shell: int) -> None:
         if not self._capture_active:
             return
         self._capture_active = False
         try:
+            if int(self._get_capture() or 0) != shell:
+                return  # A sent callback transferred ownership; leave it alone.
             released = bool(self._release_capture())
         except Exception:
             raise _NativeShellError(_NativeShellFailure.PUMP) from None
@@ -147,7 +153,7 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
     def _cancel_pointer_capture(self, shell: int) -> None:
         if not self._capture_active:
             return
-        self._release_pointer_capture()
+        self._release_pointer_capture(shell)
         self._append_pointer_event(
             kind=WindowsPointerEventKind.CANCEL,
             shell=shell,
@@ -171,13 +177,11 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
         close_requested = False
         message = _Win32Message()
         try:
-            while count < max_messages and self._peek_message(
-                ctypes.byref(message),
-                None,
-                0,
-                0,
-                _PM_REMOVE,
-            ):
+            registration = self._message_route.registration(shell)
+            if self._thread_quit_requested(shell):
+                self._cancel_pointer_capture(shell)
+                return 0, True
+            while count < max_messages and self._peek_shell_message(shell, message, registration):
                 count += 1
                 hwnd = int(message.hwnd or 0)
                 self._note_geometry_message(shell, message)
@@ -224,9 +228,13 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
                         hwnd=hwnd,
                         lparam=int(message.lParam),
                     )
-                    self._release_pointer_capture()
+                    self._release_pointer_capture(shell)
                 self._translate_message(ctypes.byref(message))
                 self._dispatch_message(ctypes.byref(message))
+            self._message_route.require(shell, registration=registration)
+            if self._thread_quit_requested(shell):
+                self._cancel_pointer_capture(shell)
+                close_requested = True
         except _NativeShellError:
             raise
         except Exception:
@@ -262,7 +270,7 @@ class _InteractiveWin32OperatorShellApi(_Win32OperatorShellApi):
             except Exception:
                 raise _NativeShellError(_NativeShellFailure.PUMP) from None
             if captured == shell:
-                self._release_pointer_capture()
+                self._release_pointer_capture(shell)
             else:
                 # Capture may already have moved to a command control or another
                 # window. Never release someone else's capture during resize.

@@ -58,3 +58,22 @@ def test_real_win32_runtime_routes_transient_frame_to_sparse_non_grid_target() -
         assert runtime_closed.open_surface_count == 0
 
     asyncio.run(scenario())
+
+
+def test_real_win32_generated_playback_pause_resume_and_cancellation(tmp_path, capsys) -> None:
+    """Generated decoder output reaches real native presentation; no codec/UI claim."""
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).with_name("test_current_gate_playback_pause_windows.py")
+    spec = importlib.util.spec_from_file_location("generated_native_pause_witness", path)
+    assert spec is not None and spec.loader is not None
+    witness = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(witness)
+    receipt = asyncio.run(witness.run_generated_pause_witness(tmp_path))
+    assert receipt["native_presentation"] and receipt["exceeds_default_packet_deadline"]
+    # The existing gate has no artifact upload and suppresses captured passing output.
+    # Emit only the bounded, media/source/handle-free receipt to its retained job log.
+    with capsys.disabled():
+        print("K5_GENERATED_PAUSE_WITNESS " + json.dumps(receipt, sort_keys=True))

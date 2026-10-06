@@ -18,5 +18,10 @@ class PausablePresentationPlaybackDelivery(BoundedPresentationPlaybackDelivery):
         if pause_control is not None and not isinstance(pause_control, PlaybackPauseControl):
             raise TypeError("pause_control must be a PlaybackPauseControl")
         super().__init__(*args, **kwargs)
+        self._pause_control = pause_control
         if pause_control is not None:
             self._pump.bind_pause_control(pause_control)
+
+    async def _wait_for_frame_admission(self) -> None:
+        if self._pause_control is not None:
+            await self._pause_control.wait_until_running()

@@ -55,9 +55,9 @@ def test_native_capture_acquires_verifies_and_releases() -> None:
     native._acquire_pointer_capture(71)
     assert native._capture_active is True
 
-    native._release_pointer_capture()
+    native._release_pointer_capture(71)
     assert native._capture_active is False
-    native._release_pointer_capture()
+    native._release_pointer_capture(71)
 
 
 def test_native_capture_verification_and_release_fail_closed() -> None:
@@ -70,7 +70,7 @@ def test_native_capture_verification_and_release_fail_closed() -> None:
     failed_release = _native_capture_api(released=False)
     failed_release._capture_active = True
     with pytest.raises(_NativeShellError) as release_error:
-        failed_release._release_pointer_capture()
+        failed_release._release_pointer_capture(71)
     assert release_error.value.failure == _NativeShellFailure.PUMP
     assert failed_release._capture_active is False
 
