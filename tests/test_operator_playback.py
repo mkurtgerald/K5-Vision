@@ -15,9 +15,10 @@ from k5vision.media.framed_recording import FramedAtomicRecordingSink
 from k5vision.media.mixed_presentation import MixedLiveStream, MixedPlaybackStream
 from k5vision.media.playback_schedule import PlaybackRate
 from k5vision.media.recording_descriptor import RecordingStreamDescriptor, VideoCodec
-from k5vision.media.windows_operator_runtime import (
-    WindowsOperatorRuntimeSnapshot,
-    WindowsOperatorRuntimeState,
+from k5vision.media.windows_operator_control import WindowsOperatorControlSnapshot
+from k5vision.media.windows_operator_session import (
+    WindowsOperatorSessionSnapshot,
+    WindowsOperatorSessionState,
 )
 from k5vision.operator_launch import ResolvedLiveSource
 from k5vision.operator_playback import (
@@ -220,34 +221,33 @@ class _PresentationDelivery:
         return object()
 
 
-class _Runtime:
+class _Control:
     def __init__(self) -> None:
         self.streams = None
+        self.layout = None
         self.closed = False
 
-    async def start(self, streams):
+    async def run(self, *, streams, layout, width, height):
         self.streams = tuple(streams)
-        return object()
-
-    async def wait(self) -> WindowsOperatorRuntimeSnapshot:
-        return WindowsOperatorRuntimeSnapshot(
-            state=WindowsOperatorRuntimeState.COMPLETE,
-            viewport_count=2,
-            open_surface_count=2,
-            stream_count=2,
-            delivered_frames=14,
-            presentations=14,
-        )
-
-    async def close(self) -> WindowsOperatorRuntimeSnapshot:
+        self.layout = layout
         self.closed = True
-        return WindowsOperatorRuntimeSnapshot(
-            state=WindowsOperatorRuntimeState.CLOSED,
-            viewport_count=2,
-            open_surface_count=0,
-            stream_count=2,
-            delivered_frames=14,
-            presentations=14,
+        return WindowsOperatorControlSnapshot(
+            session=WindowsOperatorSessionSnapshot(
+                state=WindowsOperatorSessionState.COMPLETE,
+                cycles=2,
+                shell_open=False,
+                generation=1,
+                viewport_count=2,
+                open_surface_count=0,
+                delivered_frames=14,
+                presentations=14,
+                pumped_messages=3,
+            ),
+            active_layout=layout,
+            queued_controls=0,
+            processed_controls=2,
+            replacements=0,
+            stop_requests=0,
         )
 
 
@@ -260,13 +260,13 @@ def test_windows_playback_launcher_composes_live_and_recorded_streams(tmp_path: 
         descriptor = RecordingStreamDescriptor.model_validate_json(
             (root / f"{recording_id}.k5d").read_text(encoding="utf-8")
         )
-        runtime = _Runtime()
-        captured_layouts = []
+        runtime = _Control()
+        captured_controls = []
 
         launcher = WindowsMixedOperatorPlaybackLauncher(
-            runtime_factory=lambda layout: captured_layouts.append(layout) or runtime,
+            control_factory=lambda control: captured_controls.append(control) or runtime,
             live_delivery_factory=lambda payload_type: _PresentationDelivery(),
-            playback_factory=lambda *args: _PresentationDelivery(),
+            playback_factory=lambda *args, **kwargs: _PresentationDelivery(),
         )
         metrics = await launcher.run(
             ResolvedLiveSource("rtsp://192.0.2.20/live", 96),
@@ -281,7 +281,8 @@ def test_windows_playback_launcher_composes_live_and_recorded_streams(tmp_path: 
 
         assert metrics.descriptor_verified is True
         assert metrics.delivered_frames == 14
-        assert len(captured_layouts) == 1
+        assert len(captured_controls) == 1
+        assert metrics.processed_controls == 2
         assert runtime.closed is True
         assert len(runtime.streams) == 2
         assert isinstance(runtime.streams[0], MixedLiveStream)

@@ -241,6 +241,9 @@ class BoundedPresentationPlaybackDelivery:
                 "presentation playback decoder failed",
             ) from None
 
+    async def _wait_for_frame_admission(self) -> None:
+        """Extension boundary for pause admission before any frame consumer starts."""
+
     async def _emit_frames(
         self,
         frames: Sequence[PresentationVideoFrame],
@@ -273,11 +276,13 @@ class BoundedPresentationPlaybackDelivery:
                     PresentationPlaybackErrorCode.FRAME_LIMIT,
                     "presentation playback frame limit exceeded",
                 )
+            await self._wait_for_frame_admission()
             try:
-                await asyncio.wait_for(
-                    consumer(frame),
-                    timeout=self._frame_consumer_timeout_seconds,
-                )
+                # Direct await starts the consumer in this task without a queued
+                # task between pause admission and its first instruction. An
+                # already-started consumer retains its real wall-time bound.
+                async with asyncio.timeout(self._frame_consumer_timeout_seconds):
+                    await consumer(frame)
             except asyncio.CancelledError:
                 raise
             except TimeoutError:

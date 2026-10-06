@@ -22,7 +22,11 @@ from k5vision.media.windows_operator_host import (
     WindowsOperatorHostSnapshot,
     WindowsOperatorHostState,
 )
-from k5vision.media.windows_operator_runtime import BoundedWindowsOperatorRuntime
+from k5vision.media.windows_operator_message_routing import OwnedShellMessageRoute
+from k5vision.media.windows_operator_runtime import (
+    BoundedWindowsOperatorRuntime,
+    PresentationRuntimeFactory,
+)
 from k5vision.media.windows_presentation_target import BoundedWindowsPresentationTarget
 from k5vision.media.windows_viewport_layout import BoundedWindowsViewportLayout
 from k5vision.media.windows_viewport_runtime import BoundedWindowsViewportRuntime
@@ -181,6 +185,7 @@ class _Win32OperatorShellApi:
         if sys.platform != "win32":
             raise _NativeShellError(_NativeShellFailure.UNSUPPORTED_PLATFORM)
         self._geometry_change_pending = False
+        self._message_route = OwnedShellMessageRoute()
         try:
             loader = ctypes.WinDLL
             self._user32 = loader("user32", use_last_error=True)
@@ -251,6 +256,7 @@ class _Win32OperatorShellApi:
 
     def create_shell(self, width: int, height: int) -> int:
         try:
+            self._message_route.require_available()
             instance = int(self._get_module_handle(None) or 0)
             shell = int(
                 self._create_window(
@@ -273,6 +279,16 @@ class _Win32OperatorShellApi:
             raise _NativeShellError(_NativeShellFailure.CREATE) from None
         if shell == 0:
             raise _NativeShellError(_NativeShellFailure.CREATE)
+        try:
+            self._message_route.register(shell)
+        except Exception:
+            # CreateWindow can dispatch sent messages before returning. Recheck
+            # registration after it returns and roll back only this created HWND.
+            try:
+                self._destroy_window(ctypes.c_void_p(shell))
+            except Exception:
+                pass
+            raise _NativeShellError(_NativeShellFailure.CREATE) from None
         return shell
 
     def client_size(self, shell: int) -> tuple[int, int]:
@@ -348,18 +364,33 @@ class _Win32OperatorShellApi:
         self._geometry_change_pending = False
         return pending
 
+    def _thread_quit_requested(self, shell: int) -> bool:
+        return self._message_route.quit_requested(shell)
+
+    def _peek_shell_message(self, shell: int, message: _Win32Message, registration: object) -> bool:
+        """Select only our queued HWND/child messages; sent dispatch is still native."""
+        self._message_route.require(shell, registration=registration)
+        available = bool(
+            self._peek_message(ctypes.byref(message), ctypes.c_void_p(shell), 0, 0, _PM_REMOVE)
+        )
+        if available and message.message == _WM_QUIT:
+            # The quit was removed from this thread even if a sent callback
+            # retired this shell. Valid peers must still receive the signal.
+            self._message_route.observe_thread_quit()
+        # PeekMessage may run sent callbacks before returning, even on an empty
+        # queue. Reusing this API/handle must not validate the old poll generation.
+        self._message_route.require(shell, registration=registration)
+        return available
+
     def pump_messages(self, shell: int, max_messages: int) -> tuple[int, bool]:
         count = 0
         close_requested = False
         message = _Win32Message()
         try:
-            while count < max_messages and self._peek_message(
-                ctypes.byref(message),
-                None,
-                0,
-                0,
-                _PM_REMOVE,
-            ):
+            registration = self._message_route.registration(shell)
+            if self._thread_quit_requested(shell):
+                return 0, True
+            while count < max_messages and self._peek_shell_message(shell, message, registration):
                 count += 1
                 hwnd = int(message.hwnd or 0)
                 self._note_geometry_message(shell, message)
@@ -368,20 +399,38 @@ class _Win32OperatorShellApi:
                     continue
                 self._translate_message(ctypes.byref(message))
                 self._dispatch_message(ctypes.byref(message))
+            self._message_route.require(shell, registration=registration)
+            close_requested = self._thread_quit_requested(shell) or close_requested
         except Exception:
             raise _NativeShellError(_NativeShellFailure.PUMP) from None
         return count, close_requested
 
     def destroy_shell(self, shell: int) -> None:
         try:
-            destroyed = bool(self._destroy_window(ctypes.c_void_p(shell)))
+            registration = self._message_route.registration(shell)
         except Exception:
             raise _NativeShellError(_NativeShellFailure.DESTROY) from None
+        destroyed = False
+        try:
+            destroyed = bool(self._destroy_window(ctypes.c_void_p(shell)))
+        except Exception:
+            pass
+        finally:
+            try:
+                # A sent destruction callback must not retire a newer same-HWND
+                # registration or leak a private routing error across the boundary.
+                self._message_route.unregister(shell, registration=registration)
+            except Exception:
+                destroyed = False
         if not destroyed:
             raise _NativeShellError(_NativeShellFailure.DESTROY)
 
 
-def _default_host_factory(parent_handle: int) -> BoundedWindowsOperatorHost:
+def _default_host_factory(
+    parent_handle: int,
+    *,
+    presentation_runtime_factory: PresentationRuntimeFactory | None = None,
+) -> BoundedWindowsOperatorHost:
     def target_factory() -> BoundedWindowsPresentationTarget:
         return BoundedWindowsPresentationTarget(parent_handle=parent_handle)
 
@@ -395,6 +444,7 @@ def _default_host_factory(parent_handle: int) -> BoundedWindowsOperatorHost:
         return BoundedWindowsOperatorRuntime(
             layout,
             windows_runtime_factory=windows_runtime_factory,
+            presentation_runtime_factory=presentation_runtime_factory,
         )
 
     return BoundedWindowsOperatorHost(runtime_factory=operator_runtime_factory)

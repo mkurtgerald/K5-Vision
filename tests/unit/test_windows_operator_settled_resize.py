@@ -583,7 +583,7 @@ def test_native_geometry_change_releases_only_this_shell_capture():
         assert released == ([71] if captured == 71 else [])
 
 
-def test_old_win32_pointer_backlog_cannot_cross_a_geometry_fence():
+def test_old_win32_pointer_backlog_cannot_cross_a_geometry_fence(request):
     import ctypes
     from collections import deque
 
@@ -610,6 +610,11 @@ def test_old_win32_pointer_backlog_cannot_cross_a_geometry_fence():
         message.lParam = (100 << 16) | 350
         return 1
 
+    from k5vision.media.windows_operator_message_routing import OwnedShellMessageRoute
+
+    api._message_route = OwnedShellMessageRoute()
+    api._message_route.register(71)
+    request.addfinalizer(lambda: api._message_route.unregister(71))
     api._peek_message = peek
     api._translate_message = lambda *_args: 1
     api._dispatch_message = lambda *_args: 0
@@ -700,7 +705,7 @@ def test_native_geometry_intent_is_scoped_to_own_shell():
         assert api.take_geometry_change() is False
 
 
-def test_pointer_fence_preserves_catalog_and_other_window_messages():
+def test_pointer_fence_preserves_catalog_and_other_window_messages(request):
     import ctypes
     from collections import deque
 
@@ -716,26 +721,35 @@ def test_pointer_fence_preserves_catalog_and_other_window_messages():
     queue = deque([(71, 0x0201), (99, 0x0201), (88, 0x0201), (71, 0x0111)])
     dispatched, commands = [], []
 
-    def peek(pointer, *_args):
-        if not queue:
-            return 0
-        hwnd, kind = queue.popleft()
-        message = ctypes.cast(pointer, ctypes.POINTER(_Win32Message)).contents
-        message.hwnd, message.message, message.time = hwnd, kind, 100
-        return 1
+    def peek(pointer, owner, *_args):
+        assert owner.value == 71
+        for index, (hwnd, kind) in enumerate(queue):
+            if hwnd not in {71, 99}:
+                continue
+            del queue[index]
+            message = ctypes.cast(pointer, ctypes.POINTER(_Win32Message)).contents
+            message.hwnd, message.message, message.time = hwnd, kind, 100
+            return 1
+        return 0
 
     def dispatch(pointer):
         message = ctypes.cast(pointer, ctypes.POINTER(_Win32Message)).contents
         dispatched.append((message.hwnd, message.message))
         return 0
 
+    from k5vision.media.windows_operator_message_routing import OwnedShellMessageRoute
+
+    api._message_route = OwnedShellMessageRoute()
+    api._message_route.register(71)
+    request.addfinalizer(lambda: api._message_route.unregister(71))
     api._peek_message = peek
     api._translate_message = lambda *_args: 1
     api._dispatch_message = dispatch
     api._consume_catalog_command_message = lambda *args: commands.append(args) or True
-    assert api.pump_messages(71, 4) == (4, False)
+    assert api.pump_messages(71, 4) == (3, False)
     assert api.drain_pointer_events(16) == ()
-    assert dispatched == [(99, 0x0201), (88, 0x0201)]
+    assert dispatched == [(99, 0x0201)]
+    assert tuple(queue) == ((88, 0x0201),)
     assert len(commands) == 1
     assert not api._capture_active
 

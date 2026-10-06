@@ -436,3 +436,27 @@ def test_snapshot_is_source_path_identifier_and_payload_free(tmp_path: Path) -> 
     assert str(tmp_path) not in payload
     assert "source_id" not in payload
     assert "recording_id" not in payload
+
+
+def test_pausing_during_active_callback_does_not_disable_its_timeout(tmp_path):
+    from k5vision.media.playback_control import PlaybackPauseControl
+
+    packets = _packets()
+    path = _write_recording(tmp_path, "paused-stall", packets)
+    control = PlaybackPauseControl()
+    pump = BoundedPlaybackPump(path, _descriptor(packets), 0, 200, consumer_timeout_seconds=0.02)
+    pump.bind_pause_control(control)
+
+    async def exercise():
+        async def consume(_packet, _elapsed):
+            await control.pause()
+            await asyncio.Event().wait()
+
+        with pytest.raises(PlaybackPumpError) as error:
+            await asyncio.wait_for(pump.run(consume), 1)
+        assert error.value.code == PlaybackPumpErrorCode.CONSUMER_TIMEOUT
+        assert pump.snapshot.state == PlaybackPumpState.FAILED
+        assert pump.snapshot.delivered_packets == 0
+        assert control._work_deadline.get() is None
+
+    asyncio.run(exercise())

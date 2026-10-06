@@ -212,17 +212,20 @@ def test_real_shell_settled_resize_preserves_two_owned_camera_tiles(
     from k5vision.media.windows_presentation_target import _Win32WindowTargetApi
 
     reviewed = {
+        "windows_operator_message_routing": (
+            "b4425ac7245db953d2128446bf2c9733aebb76ab86f80f0e0db6ab40eae87a2e"
+        ),
         "viewport_client_projection": (
             "a9969c9c6a99c8d6a480ee9d48c18a22adb50d7e460b5ecd2dde7f8f8ef7d1ba"
         ),
         "windows_operator_application": (
-            "e43eb21fe8fb065c16daf998675586b64e3c6997e0b75d3009abcca67efe581c"
+            "f57644e649e2a7366774cf9b3438fac1182eb31f33c42d04dd302eb12d547747"
         ),
         "windows_operator_interaction": (
-            "86380c57e93806ea288edbeab8c5c699e249485217715bb2e1862216c18e9fba"
+            "a5d5efaf32c6fdee3d1506b3e173e363f1fc8ff42c4eb6f6e2dfd8c7ad711d37"
         ),
         "windows_operator_catalog_ui": (
-            "44ee120191597e38c8b827876a678b3fe376d38bf383ff36c560c5c87e5c8bc0"
+            "15ac8232d703ca5b086ec6446d9814facb80317b695de181ad8413edc7c92688"
         ),
         "windows_operator_catalog_overlay": (
             "70f14b993d1d5ae29377af8d452bffa0b38b70a437838ab2947593d81ca83e25"
@@ -597,3 +600,39 @@ def test_real_shell_settled_resize_preserves_two_owned_camera_tiles(
     receipt = asyncio.run(scenario())
     with capsys.disabled():
         print("K5_NATIVE_SETTLED_SHELL_RECEIPT=" + json.dumps(receipt, sort_keys=True))
+
+
+@pytest.mark.parametrize("shell_kind", ("base", "interactive", "catalog"))
+def test_real_owned_shell_queued_message_routing(
+    shell_kind: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Keep the generated routing witness in the already-selected Windows gate."""
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).with_name("test_current_gate_message_routing_windows.py")
+    spec = importlib.util.spec_from_file_location("k5_owned_message_routing_witness", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    receipt = module.run_owned_queued_message_routing(shell_kind)
+    with capsys.disabled():
+        print("K5_NATIVE_QUEUED_MESSAGE_ROUTING_RECEIPT=" + json.dumps(receipt, sort_keys=True))
+
+
+def test_real_owned_playback_shell_controls(capsys: pytest.CaptureFixture[str]) -> None:
+    """Select the lazy BUTTON/sent-close witness in the existing Windows gate."""
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).with_name("test_operator_playback_shell_windows.py")
+    spec = importlib.util.spec_from_file_location("k5_owned_playback_shell_witness", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    receipt = module.run_owned_playback_shell_controls()
+    with capsys.disabled():
+        print("K5_NATIVE_PLAYBACK_SHELL_RECEIPT=" + json.dumps(receipt, sort_keys=True))
