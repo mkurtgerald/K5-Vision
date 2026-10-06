@@ -20,12 +20,57 @@ _PUMP_BOUND = 2
 _MAX_CYCLES = 32
 _COOKIE = 1 << 40
 _SIGNED_COOKIE = -(1 << 40)
+_QUEUE_STATUS_MASK = 0x1DFF  # Documented input, paint, timer, send and all-posted bits.
+_QUIT_DIAGNOSTIC_PROBES = (
+    ("thread_quit", -1, _WM_QUIT, _WM_QUIT),
+    ("all_quit", None, _WM_QUIT, _WM_QUIT),
+    ("thread_head", -1, 0, 0),
+    ("global_head", None, 0, 0),
+)
+
+
+def _collect_quit_diagnostics(validate, queue_status, peek) -> dict[str, object]:
+    """Bounded non-removing observation after the original quit results are frozen.
+
+    Four PeekMessage and two GetQueueStatus observations request neither removal
+    nor explicit queued dispatch. Native internals can process events, dispatch
+    sent callbacks, generate virtual messages and alter queue-status change flags.
+    The count is bounded, not callback duration. Owner validity is checked after
+    each observation; none can turn the already captured product failure into a pass.
+    """
+
+    def checked(call, *args):
+        validate()
+        result = call(*args)
+        validate()
+        return result
+
+    before = checked(queue_status)
+    probes = {}
+    for label, selector, minimum, maximum in _QUIT_DIAGNOSTIC_PROBES:
+        probes[label] = checked(peek, selector, minimum, maximum, _PM_NOREMOVE)
+    after = checked(queue_status)
+    return {
+        "queue_status_before": before,
+        "queue_status_after": after,
+        "probes": probes,
+        "peek_calls": len(_QUIT_DIAGNOSTIC_PROBES),
+        "removal_requested": False,
+        "queued_dispatch_requested": False,
+        "observed_after_product_results_frozen": True,
+        "sent_callbacks_may_run": True,
+        "virtual_messages_may_be_generated": True,
+        "queue_status_change_flags_may_be_cleared": True,
+        "observations_are_sequential_not_atomic": True,
+    }
 
 
 def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
     """Exercise real create/pump/destroy APIs; assert outcomes after owner cleanup."""
     if sys.platform != "win32":
         raise RuntimeError("queued routing qualification requires Windows")
+
+    import json
 
     from k5vision.media.windows_operator_application import (
         _Win32Message,
@@ -99,6 +144,7 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
     )
     get_thread = bind(kernel32, "GetCurrentThreadId", [], ctypes.c_uint32)
     show_window = bind(user32, "ShowWindow", [ctypes.c_void_p, ctypes.c_int], ctypes.c_int)
+    get_queue_status = bind(user32, "GetQueueStatus", [ctypes.c_uint32], ctypes.c_uint32)
     raw_peek = apis["a"]._peek_message
     raw_destroy = apis["a"]._destroy_window
     native_thread = int(get_thread())
@@ -113,6 +159,15 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
     cleanup_markers: list[tuple[int, int, int, int]] = []
     quit_posted = False
     sentinel = 0
+    registrations: dict[str, object] = {}
+    quit_diagnostics = None
+    post_quit_thread_matches = False
+    quit_cleanup_result = None
+    post_quit_abi_verified = (
+        isinstance(post_quit, ctypes._CFuncPtr)
+        and post_quit.argtypes == [ctypes.c_int]
+        and post_quit.restype is None
+    )
 
     def same_thread() -> None:
         if threading.get_ident() != owner_thread or int(get_thread()) != native_thread:
@@ -126,6 +181,43 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
             or int(window_thread(ctypes.c_void_p(hwnd), None)) != native_thread
         ):
             raise RuntimeError("queued-routing witness refused a non-owned HWND")
+
+    def validate_diagnostic_owners() -> None:
+        same_thread()
+        for name, shell in shells.items():
+            apis[name]._message_route.require(shell, registration=registrations[name])
+            require_owned(shell)
+
+    def diagnostic_queue_status():
+        result = int(get_queue_status(_QUEUE_STATUS_MASK))
+        return {"current": result >> 16, "changed": result & 0xFFFF}
+
+    def diagnostic_peek(selector, minimum, maximum, flags):
+        if flags != _PM_NOREMOVE:
+            raise RuntimeError("quit diagnostic refused a removing observation")
+        message = _Win32Message()
+        available = bool(
+            raw_peek(
+                ctypes.byref(message),
+                None if selector is None else ctypes.c_void_p(selector),
+                minimum,
+                maximum,
+                flags,
+            )
+        )
+        if not available:
+            return {"available": False}
+        hwnd = int(message.hwnd or 0)
+        if hwnd == 0:
+            scope = "thread"
+        elif hwnd in shells.values():
+            scope = "owned_shell"
+        elif hwnd in all_windows:
+            scope = "owned_generated_child_or_sentinel"
+        else:
+            scope = "foreign_window"
+        # Never retain HWND, WPARAM, LPARAM, text or source identity in diagnostics.
+        return {"available": True, "message": int(message.message), "scope": scope}
 
     def event(message) -> tuple[int, int, int, int]:
         return (
@@ -222,6 +314,7 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
             same_thread()
             shell = api.create_shell(384, 240)
             shells[name] = shell
+            registrations[name] = api._message_route.registration(shell)
             all_windows.append(shell)
             require_owned(shell)
             show_window(ctypes.c_void_p(shell), 0)  # Hide immediately; no activation/capture APIs.
@@ -285,7 +378,10 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
 
         # One generated thread quit must fan out to both live shell owners.
         same_thread()
+        thread_before_post = int(get_thread())
         post_quit(0)
+        thread_after_post = int(get_thread())
+        post_quit_thread_matches = thread_before_post == thread_after_post == native_thread
         quit_posted = True
         quit_a = (0, False)
         quit_results = []
@@ -298,6 +394,25 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
         quit_results.append(quit_b)
         sticky_quit = (pump("a", 1), pump("b", 1))
         sentinel_after_quit = inspect_marker(sentinel)
+        # Freeze every original result before additional diagnostics: observations
+        # cannot satisfy the product's earlier quit/preservation assertions.
+        quit_diagnostics = _collect_quit_diagnostics(
+            validate_diagnostic_owners, diagnostic_queue_status, diagnostic_peek
+        )
+        quit_diagnostics.update(
+            {
+                "post_quit_thread_matches": post_quit_thread_matches,
+                "post_quit_abi_verified": post_quit_abi_verified,
+                "thread_selector_is_pointer_width_all_ones": (
+                    ctypes.c_void_p(-1).value == (1 << (8 * ctypes.sizeof(ctypes.c_void_p))) - 1
+                ),
+                "product_quit_results": tuple(quit_results),
+                "product_sticky_quit": sticky_quit,
+                "product_thread_quit_consumed": sum(
+                    value[1] == _WM_QUIT for value in consumed["a"]
+                ),
+            }
+        )
     finally:
         # Cleanup is owner-local, best-effort for *every* resource, and runs
         # before behavior assertions even when create/post/pump raises.
@@ -307,7 +422,15 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
             try:
                 same_thread()
                 message = _Win32Message()
-                raw_peek(ctypes.byref(message), ctypes.c_void_p(-1), _WM_QUIT, _WM_QUIT, _PM_REMOVE)
+                removed = bool(
+                    raw_peek(
+                        ctypes.byref(message), ctypes.c_void_p(-1), _WM_QUIT, _WM_QUIT, _PM_REMOVE
+                    )
+                )
+                quit_cleanup_result = {
+                    "removed": removed,
+                    "was_thread_quit": removed and message.message == _WM_QUIT and not message.hwnd,
+                }
             except Exception:
                 cleanup_errors.append("generated thread quit cleanup failed")
         # Remove only generated marker messages addressed to our exact HWNDs.
@@ -349,6 +472,10 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
                     cleanup_errors.append("owned shell fallback cleanup raised")
         remaining_windows = [hwnd for hwnd in all_windows if is_window(ctypes.c_void_p(hwnd))]
 
+    if quit_diagnostics is not None:
+        quit_diagnostics["existing_quit_cleanup_result"] = quit_cleanup_result
+        # Failed pytest cases retain this bounded source/handle-free snapshot.
+        print("K5_NATIVE_QUIT_DIAGNOSTIC=" + json.dumps(quit_diagnostics, sort_keys=True))
     assert not cleanup_errors, cleanup_errors
     assert not remaining_windows, "queued-routing witness left an owned HWND alive"
     assert not cleanup_markers
@@ -384,6 +511,7 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
         "quit_b": quit_b,
         "quit_results": quit_results,
         "thread_quit_consumed": sum(value[1] == _WM_QUIT for value in consumed["a"]),
+        "diagnostic": quit_diagnostics,
     }
     assert sticky_quit == ((0, True), (0, True))
     assert sum(value[1] == _WM_QUIT for value in consumed["a"]) == 1
@@ -392,6 +520,7 @@ def run_owned_queued_message_routing(shell_kind: str) -> dict[str, object]:
     return {
         "schema_version": "1",
         "qualification": "owned-generated-queued-message-routing",
+        "quit_diagnostics": quit_diagnostics,
         "shell_kind": shell_kind,
         "native_pointer_bits": 64,
         "concurrent_operator_shells": 2,

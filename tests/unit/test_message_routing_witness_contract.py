@@ -98,6 +98,7 @@ def test_witness_uses_inert_queued_markers_without_global_input_or_capture() -> 
         "GetWindowThreadProcessId",
         "GetCurrentThreadId",
         "ShowWindow",
+        "GetQueueStatus",
     }
     assert not _calls(helper) & {
         "SetCapture",
@@ -196,3 +197,141 @@ def test_qualification_keeps_x64_message_abi_and_bounded_calls_explicit() -> Non
         and isinstance(call.func, ast.Name)
         and call.func.id == "range"
     )
+
+
+def _diagnostic_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "quit_diagnostic_source", _INTEGRATION / _WITNESS_NAME
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_quit_diagnostic_probe_is_bounded_nonremoving_and_revalidates_every_call():
+    module = _diagnostic_module()
+    events = []
+    preserved = [(999, 0x8003), (0, 0x8001), (71, 0x8002)]
+
+    def validate():
+        events.append("validate")
+
+    def status():
+        events.append("status")
+        return {"current": 0x100, "changed": 0x100}
+
+    def peek(selector, minimum, maximum, flags):
+        assert flags == 0
+        events.append((selector, minimum, maximum, flags))
+        for hwnd, message in preserved:
+            if selector == -1 and hwnd != 0:
+                continue
+            if minimum and not minimum <= message <= maximum:
+                continue
+            scope = "thread" if hwnd == 0 else "foreign_window"
+            return {"available": True, "message": message, "scope": scope}
+        return {"available": False}
+
+    result = module._collect_quit_diagnostics(validate, status, peek)
+    assert events == [
+        "validate",
+        "status",
+        "validate",
+        "validate",
+        (-1, 0x12, 0x12, 0),
+        "validate",
+        "validate",
+        (None, 0x12, 0x12, 0),
+        "validate",
+        "validate",
+        (-1, 0, 0, 0),
+        "validate",
+        "validate",
+        (None, 0, 0, 0),
+        "validate",
+        "validate",
+        "status",
+        "validate",
+    ]
+    assert preserved == [(999, 0x8003), (0, 0x8001), (71, 0x8002)]
+    assert result["probes"]["global_head"]["scope"] == "foreign_window"
+    assert result["probes"]["thread_head"]["scope"] == "thread"
+    assert result["peek_calls"] == 4
+    assert result["removal_requested"] is False
+    assert result["queued_dispatch_requested"] is False
+    assert result["observed_after_product_results_frozen"]
+    assert result["sent_callbacks_may_run"]
+    assert result["virtual_messages_may_be_generated"]
+    assert result["queue_status_change_flags_may_be_cleared"]
+    assert result["observations_are_sequential_not_atomic"]
+
+
+def test_quit_diagnostic_stops_after_reentrant_owner_retirement_in_status_or_peek():
+    import pytest
+
+    module = _diagnostic_module()
+    for during in ("status", "peek"):
+        valid = [True]
+        events = []
+
+        def validate(valid=valid):
+            if not valid[0]:
+                raise RuntimeError("owner retired")
+
+        def status(events=events, during=during, valid=valid):
+            events.append("status")
+            if during == "status":
+                valid[0] = False
+            return {"current": 0, "changed": 0}
+
+        def peek(*args, events=events, valid=valid):
+            events.append("peek")
+            valid[0] = False
+            return {"available": False}
+
+        with pytest.raises(RuntimeError, match="owner retired"):
+            module._collect_quit_diagnostics(validate, status, peek)
+        assert events == (["status"] if during == "status" else ["status", "peek"])
+
+
+def test_native_diagnostics_follow_frozen_product_results_and_never_remove_foreign_work():
+    tree = _tree(_WITNESS_NAME)
+    helper = _function(tree, _HELPER_NAME)
+    resource_try = next(node for node in helper.body if isinstance(node, ast.Try))
+    sequence = [ast.unparse(node) for node in resource_try.body]
+    observed = next(
+        index for index, text in enumerate(sequence) if "quit_diagnostics = _collect" in text
+    )
+    sticky = next(index for index, text in enumerate(sequence) if text.startswith("sticky_quit ="))
+    sentinel = next(
+        index for index, text in enumerate(sequence) if text.startswith("sentinel_after_quit =")
+    )
+    assert observed > sentinel > sticky
+    assert (
+        sum(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "post_quit"
+            for node in ast.walk(helper)
+        )
+        == 1
+    )
+    diagnostic_peek = next(
+        node
+        for node in helper.body
+        if isinstance(node, ast.FunctionDef) and node.name == "diagnostic_peek"
+    )
+    assert "flags != _PM_NOREMOVE" in ast.unparse(diagnostic_peek)
+    assert _calls(diagnostic_peek).isdisjoint({"dispatch", "native_dispatch", "_dispatch_message"})
+    assert "wParam" not in ast.unparse(diagnostic_peek)
+    assert "lParam" not in ast.unparse(diagnostic_peek)
+    owner_check = next(
+        node
+        for node in helper.body
+        if isinstance(node, ast.FunctionDef) and node.name == "validate_diagnostic_owners"
+    )
+    assert "registration=registrations[name]" in ast.unparse(owner_check)
+    assert {"same_thread", "require_owned", "require"} <= _calls(owner_check)
