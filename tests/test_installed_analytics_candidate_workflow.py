@@ -1,7 +1,9 @@
 """Exact trusted-branch admission for the installed normal-app native witness."""
 
 import ast
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -35,9 +37,9 @@ def test_hosted_admission_precedes_exactly_one_physical_job():
     hosted = _job("hosted_admission")
     native = _job("installed-analytics-candidate")
     assert "    runs-on: windows-latest\n" in hosted
-    assert "    timeout-minutes: 10\n" in hosted
+    assert "    timeout-minutes: 18\n" in hosted
     assert hosted.count("      - name: ") == 1
-    assert "        timeout-minutes: 9\n" in hosted
+    assert "        timeout-minutes: 17\n" in hosted
     assert "    needs: hosted_admission\n" in native
     assert "needs.hosted_admission.result == 'success'" in native
     assert "needs.hosted_admission.outputs.qualified_sha == github.sha" in native
@@ -69,6 +71,26 @@ def test_candidate_route_is_two_jobs_on_only_four_exact_trusted_branches():
     assert text.count("runs-on:") == 2
     assert text.count("runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]") == 1
     assert "    timeout-minutes: 25\n" in _job("installed-analytics-candidate")
+
+
+def test_hosted_wait_covers_the_existing_smoke_bound_with_nested_hard_limits():
+    hosted = _job("hosted_admission")
+    smoke = (ROOT / ".github/workflows/windows-alpha-script-smoke.yml").read_text()
+    smoke_minutes = int(re.search(r"    timeout-minutes: (\d+)", smoke).group(1))
+    poll_minutes = int(
+        re.search(r"\$deadline = \[DateTime\]::UtcNow.AddMinutes\((\d+)\)", hosted)[1]
+    )
+    step_minutes = int(re.search(r"        timeout-minutes: (\d+)", hosted)[1])
+    job_minutes = int(re.search(r"    timeout-minutes: (\d+)", hosted)[1])
+    assert (smoke_minutes, poll_minutes, step_minutes, job_minutes) == (15, 16, 17, 18)
+    assert smoke_minutes + 1 == poll_minutes == step_minutes - 1 == job_minutes - 2
+    assert "    timeout-minutes: 25\n" in _job("installed-analytics-candidate")
+    assert "Start-Sleep -Seconds 15" in hosted
+    assert "[DateTime]::UtcNow -ge $deadline" in hosted
+    assert (
+        'throw "An exact-candidate hosted qualification failed; native execution refused."'
+        in hosted
+    )
 
 
 def test_launcher_upgrade_and_facade_branches_require_their_three_applicable_hosted_gates():
@@ -295,8 +317,8 @@ def test_required_hosted_gates_match_audited_runtime_pr_paths_and_exact_sha():
     assert '$_.event -ceq "pull_request"' in text
     assert "$_.name -ceq $required[$id]" in text
     assert "$_." + 'conclusion -cne "success"' in text
-    assert "$deadline = [DateTime]::UtcNow.AddMinutes(8)" in _job("hosted_admission")
-    assert "        timeout-minutes: 9\n" in _job("hosted_admission")
+    assert "$deadline = [DateTime]::UtcNow.AddMinutes(16)" in _job("hosted_admission")
+    assert "        timeout-minutes: 17\n" in _job("hosted_admission")
     assert text.index("if (-not $qualified") < text.index("Checkout immutable candidate")
 
 
@@ -618,7 +640,7 @@ def test_hosted_output_is_written_only_after_bounded_green_admission():
     assert script.count("$env:GITHUB_OUTPUT") == 1
     assert '"qualified_sha=$env:K5_EXPECTED_SHA"' in script
     assert script.index("if (-not $qualified") < script.index("$env:GITHUB_OUTPUT")
-    assert "$deadline = [DateTime]::UtcNow.AddMinutes(8)" in script
+    assert "$deadline = [DateTime]::UtcNow.AddMinutes(16)" in script
     assert "[DateTime]::UtcNow -ge $deadline" in script
     assert "while ([DateTime]::UtcNow -lt $deadline)" in script
     assert "Start-Sleep -Seconds 15" in script
@@ -1408,7 +1430,8 @@ def test_host_wrapper_is_raw_binary_git_bound_and_finishes_before_same_process_g
     assert "':scripts/assert-stage-one-physical-admission.ps1') 'blob' 131072" in script
     assert "[Text.UTF8Encoding]::new($false, $true)" in script
     assert "$sha256.ComputeHash($producer.bytes)" in script
-    assert "[scriptblock]::Create($utf8.GetString($producer.bytes))" in script
+    assert "$producerText = $utf8.GetString($producer.bytes)" in script
+    assert "[scriptblock]::Create($producerText)" in script
     assert "return ,$buffer" in script
     assert "CopyToAsync([IO.Stream]::Null)" in script
     assert "$drain.Wait($remaining)" in script
@@ -1423,6 +1446,71 @@ def test_host_wrapper_is_raw_binary_git_bound_and_finishes_before_same_process_g
         "Get-Process",
     ):
         assert forbidden not in script
+
+
+def test_host_source_binding_has_bounded_failure_stages_and_restores_input_encoding():
+    script = _run_script(_step("Require idle exact physical host before provisioning"))
+    assert script.count("[Console]::InputEncoding = $inputEncoding") == 1
+    assert script.count("[Console]::InputEncoding = $previousInputEncoding") == 1
+    assert "$previousInputEncoding.CodePage -eq 65001" in script
+    assert "$previousInputEncoding.GetPreamble().Length -gt 0" in script
+    assert "$inputEncoding.GetPreamble().Length -ne 0" in script
+    assert "[Convert]::ToBase64String($inputEncoding.GetBytes($request))" in script
+    assert "[Convert]::ToBase64String($asciiRequest)" in script
+    assert (
+        script.index("$previousInputEncoding = [Console]::InputEncoding")
+        < script.index("if ($normalizeInputEncoding) { [Console]::InputEncoding = $inputEncoding }")
+        < script.index("$process.Start()")
+        < script.index(
+            "if ($normalizeInputEncoding) { [Console]::InputEncoding = $previousInputEncoding }"
+        )
+        < script.index("CopyToAsync([IO.Stream]::Null)")
+    )
+    assert "$started = $false" in script and "$started = $process.Start()" in script
+    assert script.index("if ($started) {") < script.index("$process.HasExited")
+    assert set(re.findall(r"\$sourceBindingDiagnostic.stage = '([^']+)'", script)) == {
+        "git_binary",
+        "commit_read",
+        "commit_identity",
+        "commit_decode",
+        "commit_tree",
+        "producer_read",
+        "producer_hash",
+        "producer_decode",
+        "script_compile",
+        "context",
+    }
+    assert set(re.findall(r"\$sourceBindingDiagnostic.reason = '([^']+)'", script)) == {
+        "process_setup",
+        "input_encoding",
+        "process_start",
+        "stderr_drain",
+        "request_write",
+        "header_read",
+        "header_format",
+        "object_kind_or_size",
+        "body_read",
+        "terminator",
+        "end_of_output",
+        "process_exit",
+        "object_hash",
+        "process_cleanup",
+        "identity",
+        "object_id",
+        "utf8",
+        "shape",
+        "sha256",
+        "syntax",
+        "construct",
+    }
+    failure = script.split("Write-Host 'K5_HOST_NAME_OBSERVATION_UNAVAILABLE'", 1)[1]
+    assert "schema_version = 'host-source-binding-v1'" in failure
+    assert "scope = 'diagnostic-only-source-binding'" in failure
+    assert "edge_admission = $false" in failure and "retry_authority = $false" in failure
+    assert "} catch {}" in failure
+    assert "throw 'Exact host diagnostic source binding refused.'" in failure
+    for forbidden in ("$_.", "$env:", "$Expression", "$producer", "$commit", "$git"):
+        assert forbidden not in failure
 
 
 def _fake_git_process(payload, exit_code=0):
@@ -1723,6 +1811,7 @@ def test_actual_powershell_binary_reader_bounds_and_raw_bytes(tmp_path, case):
     script_path = tmp_path / "reader.ps1"
     script_path.write_text(
         "$ErrorActionPreference='Stop'\n$env:GITHUB_WORKSPACE=$PSScriptRoot\n"
+        "$sourceBindingDiagnostic=@{stage='test';reason='initial'}\n"
         + reader
         + "\ntry { $value=Read-K5GitObject ('a'*40) 'blob' 131072;"
         " Write-Output ('BYTES='+[Convert]::ToBase64String($value.bytes)); exit 0 }"
@@ -1741,6 +1830,199 @@ def test_actual_powershell_binary_reader_bounds_and_raw_bytes(tmp_path, case):
         assert result.stdout.strip() == "BYTES=" + base64.b64encode(body).decode()
     else:
         assert result.stdout.strip() == "SOURCE_REFUSED"
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell required")
+@pytest.mark.parametrize(
+    "case",
+    [
+        "oem437",
+        "utf8",
+        "utf8-bom",
+        "unsupported-encoding",
+        "wrong-sha",
+        "bad-git-hash",
+        "missing-commit",
+        "wrong-kind",
+        "missing-producer",
+        "invalid-utf8",
+        "invalid-script",
+        "start-failure",
+    ],
+)
+def test_real_git_powershell_immutable_binding_and_encoding_restoration(tmp_path, case):
+    git = Path(r"C:\Program Files\Git\cmd\git.exe")
+    assert git.is_file(), (
+        "The hosted witness requires the same fixed Git installation as the reader"
+    )
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(
+        GIT_AUTHOR_NAME="source-fixture",
+        GIT_AUTHOR_EMAIL="source-fixture@example.invalid",
+        GIT_COMMITTER_NAME="source-fixture",
+        GIT_COMMITTER_EMAIL="source-fixture@example.invalid",
+        GIT_AUTHOR_DATE="2000-01-01T00:00:00+0000",
+        GIT_COMMITTER_DATE="2000-01-01T00:00:00+0000",
+        GIT_NO_REPLACE_OBJECTS="1",
+        GIT_NO_LAZY_FETCH="1",
+        GIT_ALLOW_PROTOCOL="",
+    )
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git_bytes(*arguments, data=None):
+        return subprocess.run(
+            [str(git), "-c", "protocol.allow=never", "-C", str(repository), *arguments],
+            input=data,
+            capture_output=True,
+            env=environment,
+            timeout=10,
+            check=True,
+        ).stdout
+
+    git_bytes("-c", "init.templateDir=", "init", "--quiet", "--object-format=sha1")
+    body = (ROOT / "scripts/assert-stage-one-physical-admission.ps1").read_bytes()
+    if case == "utf8-bom":
+        body = body.replace(b"\n", b"\r\n") + b"\r\n\n"
+    elif case == "invalid-utf8":
+        body = b"\xff"
+    elif case == "invalid-script":
+        body = b"param(\n"
+    blob = git_bytes("hash-object", "-w", "--stdin", data=body).decode().strip()
+    scripts_tree = (
+        git_bytes(
+            "mktree", data=f"100644 blob {blob}\tassert-stage-one-physical-admission.ps1\n".encode()
+        )
+        .decode()
+        .strip()
+    )
+    tree = (
+        git_bytes(
+            "mktree",
+            data=b""
+            if case == "missing-producer"
+            else f"040000 tree {scripts_tree}\tscripts\n".encode(),
+        )
+        .decode()
+        .strip()
+    )
+    revision = git_bytes("commit-tree", tree, data=b"immutable source witness\n").decode().strip()
+    assert git_bytes("cat-file", "blob", blob) == body
+    # A different working file must not influence immutable loading or execution.
+    (repository / "scripts").mkdir()
+    (repository / "scripts/assert-stage-one-physical-admission.ps1").write_text(
+        "throw 'PRIVATE_CANARY mutable source executed'\n"
+    )
+    environment.update(
+        GITHUB_WORKSPACE=str(repository),
+        GITHUB_REPOSITORY="mkurtgerald/K5-Vision",
+        K5_CANDIDATE_BRANCH=UPGRADE_BRANCH,
+        GITHUB_SHA=revision,
+        K5_STAGE_ONE_REVISION=revision,
+        GITHUB_RUN_ID="100",
+        GITHUB_RUN_ATTEMPT="2",
+        K5_CHECKOUT_GIT_SHA256=hashlib.sha256(git.read_bytes()).hexdigest(),
+    )
+    if case == "wrong-sha":
+        environment["GITHUB_SHA"] = "0" * 40
+    elif case == "bad-git-hash":
+        environment["K5_CHECKOUT_GIT_SHA256"] = "0" * 64
+    elif case in {"missing-commit", "wrong-kind"}:
+        environment["GITHUB_SHA"] = environment["K5_STAGE_ONE_REVISION"] = (
+            "0" * 40 if case == "missing-commit" else blob
+        )
+    wrapper = _run_script(_step("Require idle exact physical host before provisioning"))
+    invocation = "& $script -DiagnosticContext $context"
+    assert wrapper.count(invocation) == 1
+    # Exercise the exact binding wrapper, but never invoke the physical guard.
+    wrapper = wrapper.replace(
+        invocation,
+        "$compiledHash = [Security.Cryptography.SHA256]::Create(); "
+        "try { $compiled = ([BitConverter]::ToString($compiledHash.ComputeHash("
+        "[Text.Encoding]::UTF8.GetBytes($script.ToString()))))"
+        ".Replace('-', '').ToLowerInvariant() } "
+        "finally { $compiledHash.Dispose() }; "
+        "Write-Output ('BOUND=' + (@{source_sha=$context.source_sha; "
+        "source_tree=$context.source_tree; producer_sha256=$context.producer_sha256; "
+        "compiled_sha256=$compiled} | ConvertTo-Json -Compress))",
+    )
+    if case == "start-failure":
+        wrapper = wrapper.replace(
+            "$start.FileName = 'C:\\Program Files\\Git\\cmd\\git.exe'",
+            "$start.FileName = (Join-Path $env:GITHUB_WORKSPACE 'missing-git.exe')",
+        )
+    encoding = {
+        "oem437": "[Text.Encoding]::GetEncoding(437)",
+        "utf8": "[Text.UTF8Encoding]::new($false)",
+        "unsupported-encoding": "[Text.UnicodeEncoding]::new($false, $false)",
+    }.get(case, "[Text.UTF8Encoding]::new($true)")
+    witness = tmp_path / "binding-witness.ps1"
+    witness.write_text(
+        "$ErrorActionPreference='Stop'\n$before=[Console]::InputEncoding\n$exitCode=0\n"
+        "try {\n$requested=" + encoding + "\n[Console]::InputEncoding=$requested\n"
+        "$expected=[Console]::InputEncoding\n"
+        "if ($expected.CodePage -ne $requested.CodePage -or "
+        "[Convert]::ToBase64String($expected.GetPreamble()) -cne "
+        "[Convert]::ToBase64String($requested.GetPreamble())) "
+        "{ throw 'ENCODING_FIXTURE_UNAVAILABLE' }\ntry {\n" + wrapper + "\n} catch {\n"
+        "Write-Output 'BINDING_WITNESS_REFUSED'; $exitCode=1\n} finally {\n"
+        "$actual=[Console]::InputEncoding\n"
+        "$restored=$actual.CodePage -eq $expected.CodePage -and "
+        "[Convert]::ToBase64String($actual.GetPreamble()) -ceq "
+        "[Convert]::ToBase64String($expected.GetPreamble())\n"
+        "Write-Output ('ENCODING_RESTORED='+$restored)\n}\n"
+        "} finally { [Console]::InputEncoding=$before }\nexit $exitCode\n"
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-File", str(witness)],
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+    assert "PRIVATE_CANARY" not in result.stdout + result.stderr
+    lines = result.stdout.splitlines()
+    assert lines.count("ENCODING_RESTORED=True") == 1, result.stdout + result.stderr
+    refused = {
+        "wrong-sha": ("environment", "context"),
+        "unsupported-encoding": ("commit_read", "input_encoding"),
+        "bad-git-hash": ("git_binary", "identity"),
+        "missing-commit": ("commit_read", "header_format"),
+        "wrong-kind": ("commit_read", "object_kind_or_size"),
+        "missing-producer": ("producer_read", "header_format"),
+        "invalid-utf8": ("producer_decode", "utf8"),
+        "invalid-script": ("script_compile", "syntax"),
+        "start-failure": ("commit_read", "process_start"),
+    }
+    records = [
+        line.split("=", 1)[1] for line in lines if line.startswith("K5_HOST_SOURCE_BINDING=")
+    ]
+    bound = [line.split("=", 1)[1] for line in lines if line.startswith("BOUND=")]
+    if case in refused:
+        assert result.returncode == 1 and not bound
+        assert lines.count("BINDING_WITNESS_REFUSED") == 1
+        assert lines.count("K5_HOST_NAME_OBSERVATION_UNAVAILABLE") == 1
+        assert len(records) == 1
+        stage, reason = refused[case]
+        assert json.loads(records[0]) == {
+            "schema_version": "host-source-binding-v1",
+            "scope": "diagnostic-only-source-binding",
+            "status": "refused",
+            "stage": stage,
+            "reason": reason,
+            "edge_admission": False,
+            "retry_authority": False,
+        }
+    else:
+        assert result.returncode == 0 and not records, result.stdout + result.stderr
+        assert "K5_HOST_NAME_OBSERVATION_UNAVAILABLE" not in lines
+        assert len(bound) == 1
+        assert json.loads(bound[0]) == {
+            "source_sha": revision,
+            "source_tree": tree,
+            "producer_sha256": hashlib.sha256(body).hexdigest(),
+            "compiled_sha256": hashlib.sha256(body).hexdigest(),
+        }
 
 
 @pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell required")

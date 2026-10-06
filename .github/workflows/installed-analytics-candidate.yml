@@ -53,7 +53,7 @@ jobs:
     name: hosted-candidate-admission
     if: github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005')
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 18
     outputs:
       qualified_sha: ${{ steps.qualify.outputs.qualified_sha }}
     env:
@@ -62,7 +62,7 @@ jobs:
     steps:
       - name: Require exact trusted head and green hosted PR qualification
         id: qualify
-        timeout-minutes: 9
+        timeout-minutes: 17
         shell: powershell
         env:
           K5_GITHUB_TOKEN: ${{ github.token }}
@@ -111,7 +111,8 @@ jobs:
             }
             return $qualified
           }
-          $deadline = [DateTime]::UtcNow.AddMinutes(8)
+          # Cover the smoke job's 15-minute bound plus a bounded scheduling margin.
+          $deadline = [DateTime]::UtcNow.AddMinutes(16)
           $qualified = $false
           while ([DateTime]::UtcNow -lt $deadline) {
             if (Test-K5CandidateHostedGates) { $qualified = $true; break }
@@ -247,9 +248,12 @@ jobs:
           } else {
               # All Git children close before the existing PowerShell host snapshot.
               # No Python orchestrator, mutable-source import or newline reconstruction.
+              $sourceBindingDiagnostic = @{ stage = 'environment'; reason = 'context' }
               function Read-K5GitObject([string]$Expression, [string]$Kind, [int]$Limit) {
                   $process = $null
+                  $started = $false
                   try {
+                      $sourceBindingDiagnostic.reason = 'process_setup'
                       $start = [Diagnostics.ProcessStartInfo]::new()
                       $start.FileName = 'C:\Program Files\Git\cmd\git.exe'
                       $start.Arguments = '--no-replace-objects --no-lazy-fetch -c protocol.allow=never cat-file --batch'
@@ -267,10 +271,31 @@ jobs:
                       $start.EnvironmentVariables['GIT_ALLOW_PROTOCOL'] = ''
                       $process = [Diagnostics.Process]::new()
                       $process.StartInfo = $start
-                      if (-not $process.Start()) { throw "source" }
+                      # Framework StandardInput inherits Console.InputEncoding and
+                      # AutoFlush can emit its BOM during Start, before WriteLine.
+                      $sourceBindingDiagnostic.reason = 'input_encoding'
+                      $previousInputEncoding = [Console]::InputEncoding
+                      $normalizeInputEncoding = $previousInputEncoding.CodePage -eq 65001 -and $previousInputEncoding.GetPreamble().Length -gt 0
+                      $inputEncoding = $(if ($normalizeInputEncoding) { [Text.UTF8Encoding]::new($false) } else { $previousInputEncoding })
+                      $request = $Expression + [Environment]::NewLine
+                      $asciiRequest = [Text.Encoding]::ASCII.GetBytes($request)
+                      if ($inputEncoding.GetPreamble().Length -ne 0 -or
+                          [Text.Encoding]::ASCII.GetString($asciiRequest) -cne $request -or
+                          [Convert]::ToBase64String($inputEncoding.GetBytes($request)) -cne [Convert]::ToBase64String($asciiRequest)) { throw "source" }
+                      try {
+                          # Change only UTF-8's preamble, never the shared console code page.
+                          if ($normalizeInputEncoding) { [Console]::InputEncoding = $inputEncoding }
+                          $sourceBindingDiagnostic.reason = 'process_start'
+                          $started = $process.Start()
+                          if (-not $started) { throw "source" }
+                      } finally {
+                          if ($normalizeInputEncoding) { [Console]::InputEncoding = $previousInputEncoding }
+                      }
                       # Drain without retaining any stderr, including on malformed framing.
+                      $sourceBindingDiagnostic.reason = 'stderr_drain'
                       $drain = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
                       $watch = [Diagnostics.Stopwatch]::StartNew()
+                      $sourceBindingDiagnostic.reason = 'request_write'
                       $process.StandardInput.WriteLine($Expression)
                       $process.StandardInput.Close()
                       $stream = $process.StandardOutput.BaseStream
@@ -288,6 +313,7 @@ jobs:
                           return ,$buffer
                       }
                       $header = [Collections.Generic.List[byte]]::new()
+                      $sourceBindingDiagnostic.reason = 'header_read'
                       while ($true) {
                           $next = Read-K5Bytes 1
                           if ($next[0] -eq 10) { break }
@@ -295,21 +321,29 @@ jobs:
                           $header.Add($next[0])
                       }
                       $line = [Text.Encoding]::ASCII.GetString($header.ToArray())
+                      $sourceBindingDiagnostic.reason = 'header_format'
                       if ($line -cnotmatch '\A([0-9a-f]{40}) (blob|commit) ([1-9][0-9]{0,6})\z') { throw "source" }
                       $oid, $type, $size = $Matches[1], $Matches[2], [int]$Matches[3]
+                      $sourceBindingDiagnostic.reason = 'object_kind_or_size'
                       if ($type -cne $Kind -or $size -gt $Limit) { throw "source" }
+                      $sourceBindingDiagnostic.reason = 'body_read'
                       $body = Read-K5Bytes $size
+                      $sourceBindingDiagnostic.reason = 'terminator'
                       $terminator = Read-K5Bytes 1
                       if ($terminator[0] -ne 10) { throw "source" }
+                      $sourceBindingDiagnostic.reason = 'end_of_output'
                       $extra = [byte[]]::new(1)
                       $remaining = 10000 - [int]$watch.ElapsedMilliseconds
                       if ($remaining -le 0) { throw "source" }
                       $end = $stream.ReadAsync($extra, 0, 1)
                       if (-not $end.Wait($remaining) -or $end.Result -ne 0) { throw "source" }
+                      $sourceBindingDiagnostic.reason = 'process_exit'
                       $remaining = 10000 - [int]$watch.ElapsedMilliseconds
                       if ($remaining -le 0 -or -not $process.WaitForExit($remaining) -or $process.ExitCode -ne 0) { throw "source" }
+                      $sourceBindingDiagnostic.reason = 'stderr_drain'
                       $remaining = 10000 - [int]$watch.ElapsedMilliseconds
                       if ($remaining -le 0 -or -not $drain.Wait($remaining)) { throw "source" }
+                      $sourceBindingDiagnostic.reason = 'object_hash'
                       $prefix = [Text.Encoding]::ASCII.GetBytes("$type $size" + [char]0)
                       $sha1 = [Security.Cryptography.SHA1]::Create()
                       try {
@@ -322,10 +356,15 @@ jobs:
                       return @{ oid = $oid; bytes = $body }
                   } finally {
                       if ($null -ne $process) {
+                          $readReason = $sourceBindingDiagnostic.reason
+                          $sourceBindingDiagnostic.reason = 'process_cleanup'
                           try {
-                            if (-not $process.HasExited) { $process.Kill() }
-                            if (-not $process.WaitForExit(2000)) { throw "source" }
-                        } finally { $process.Dispose() }
+                              if ($started) {
+                                  if (-not $process.HasExited) { $process.Kill() }
+                                  if (-not $process.WaitForExit(2000)) { throw "source" }
+                              }
+                          } finally { $process.Dispose() }
+                          $sourceBindingDiagnostic.reason = $readReason
                       }
                   }
               }
@@ -335,19 +374,38 @@ jobs:
                       $env:K5_STAGE_ONE_REVISION -cne $env:GITHUB_SHA -or
                       $env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or
                       $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,19}\z') { throw "source" }
+                  $sourceBindingDiagnostic.stage = 'git_binary'
+                  $sourceBindingDiagnostic.reason = 'identity'
                   $git = 'C:\Program Files\Git\cmd\git.exe'
                   if ($env:K5_CHECKOUT_GIT_SHA256 -cnotmatch '\A[0-9a-f]{64}\z' -or
                       (Get-FileHash -LiteralPath $git -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_CHECKOUT_GIT_SHA256) { throw "source" }
                   $utf8 = [Text.UTF8Encoding]::new($false, $true)
+                  $sourceBindingDiagnostic.stage = 'commit_read'
                   $commit = Read-K5GitObject $env:K5_STAGE_ONE_REVISION 'commit' 65536
+                  $sourceBindingDiagnostic.stage = 'commit_identity'
+                  $sourceBindingDiagnostic.reason = 'object_id'
                   if ($commit.oid -cne $env:K5_STAGE_ONE_REVISION) { throw "source" }
+                  $sourceBindingDiagnostic.stage = 'commit_decode'
+                  $sourceBindingDiagnostic.reason = 'utf8'
                   $commitText = $utf8.GetString($commit.bytes)
+                  $sourceBindingDiagnostic.stage = 'commit_tree'
+                  $sourceBindingDiagnostic.reason = 'shape'
                   if ($commitText -cnotmatch '\Atree ([0-9a-f]{40})\n') { throw "source" }
                   $tree = $Matches[1]
+                  $sourceBindingDiagnostic.stage = 'producer_read'
                   $producer = Read-K5GitObject ($env:K5_STAGE_ONE_REVISION + ':scripts/assert-stage-one-physical-admission.ps1') 'blob' 131072
+                  $sourceBindingDiagnostic.stage = 'producer_hash'
+                  $sourceBindingDiagnostic.reason = 'sha256'
                   $sha256 = [Security.Cryptography.SHA256]::Create()
                   try { $producerHash = ([BitConverter]::ToString($sha256.ComputeHash($producer.bytes))).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }
-                  $script = [scriptblock]::Create($utf8.GetString($producer.bytes))
+                  $sourceBindingDiagnostic.stage = 'producer_decode'
+                  $sourceBindingDiagnostic.reason = 'utf8'
+                  $producerText = $utf8.GetString($producer.bytes)
+                  $sourceBindingDiagnostic.stage = 'script_compile'
+                  $sourceBindingDiagnostic.reason = 'syntax'
+                  $script = [scriptblock]::Create($producerText)
+                  $sourceBindingDiagnostic.stage = 'context'
+                  $sourceBindingDiagnostic.reason = 'construct'
                   $context = @{
                       repository = 'mkurtgerald/K5-Vision'; source_sha = $env:K5_STAGE_ONE_REVISION
                       source_tree = $tree; producer_sha256 = $producerHash
@@ -355,6 +413,18 @@ jobs:
                   }
               } catch {
                   Write-Host 'K5_HOST_NAME_OBSERVATION_UNAVAILABLE'
+                  try {
+                      $failureRecord = [ordered]@{
+                          schema_version = 'host-source-binding-v1'
+                          scope = 'diagnostic-only-source-binding'
+                          status = 'refused'
+                          stage = $sourceBindingDiagnostic.stage
+                          reason = $sourceBindingDiagnostic.reason
+                          edge_admission = $false
+                          retry_authority = $false
+                      }
+                      Write-Host ('K5_HOST_SOURCE_BINDING=' + ($failureRecord | ConvertTo-Json -Compress))
+                  } catch {}
                   throw 'Exact host diagnostic source binding refused.'
               }
               & $script -DiagnosticContext $context
