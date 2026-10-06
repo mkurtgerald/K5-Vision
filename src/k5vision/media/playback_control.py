@@ -11,7 +11,9 @@ import asyncio
 import enum
 import time
 import typing
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -73,6 +75,9 @@ class PlaybackPauseControl:
         self._running.set()
         self._paused = asyncio.Event()
         self._lock = asyncio.Lock()
+        self._work_deadline: ContextVar[tuple[asyncio.Task[typing.Any], asyncio.Timeout] | None] = (
+            ContextVar("playback_work_deadline", default=None)
+        )
 
     def _raw_now(self) -> float:
         try:
@@ -128,7 +133,45 @@ class PlaybackPauseControl:
             return self.snapshot
 
     async def wait_until_running(self) -> None:
-        await self._running.wait()
+        """Admit work only while running; exempt this task's explicit pause wait."""
+        if self._state is PlaybackControlState.RUNNING:
+            return
+        bound = self._work_deadline.get()
+        # Context is inherited by decoder/consumer child tasks. Such a child must
+        # never suspend the deadline bounding its parent's active work.
+        deadline = bound[1] if bound is not None and bound[0] is asyncio.current_task() else None
+        remaining = None
+        if deadline is not None:
+            when = deadline.when()
+            if deadline.expired() or (
+                when is not None and when <= asyncio.get_running_loop().time()
+            ):
+                raise TimeoutError
+            if when is not None:
+                remaining = when - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError
+                deadline.reschedule(None)
+        try:
+            # Resume can be superseded by Pause before an awakened waiter runs.
+            while self._state is PlaybackControlState.PAUSED:
+                await self._running.wait()
+        finally:
+            if deadline is not None and remaining is not None and not deadline.expired():
+                deadline.reschedule(asyncio.get_running_loop().time() + remaining)
+
+    @asynccontextmanager
+    async def work_timeout(self, seconds: float) -> AsyncIterator[None]:
+        """Bound callback work while excluding only its explicit pause-admission waits."""
+        owner = asyncio.current_task()
+        if owner is None:
+            raise RuntimeError("playback work deadline requires a task")
+        async with asyncio.timeout(seconds) as deadline:
+            token = self._work_deadline.set((owner, deadline))
+            try:
+                yield
+            finally:
+                self._work_deadline.reset(token)
 
     async def sleep(self, delay: float) -> None:
         """Sleep for virtual playback time and stop consuming delay while paused."""

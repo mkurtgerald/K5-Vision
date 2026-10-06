@@ -284,13 +284,22 @@ def test_runtime_pin_matches_exact_tracked_git_blob_manifest():
     independent = hashlib.sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    assert len(manifest) == 133
-    assert capture.RUNTIME_REVISION == "f14fc48768dbb36599e9c311ae99d371c24c600a"
+    assert len(manifest) == 136
+    assert capture.RUNTIME_REVISION == "2fa3133e892e633967e4734d363ee4431a43ac0d"
     assert independent == capture.RUNTIME_PAYLOAD_SHA256
 
 
-def test_runtime_mutation_cannot_be_admitted_by_rebinding_caller_expectations(bundle):
-    target = bundle.source / "src/k5vision/__init__.py"
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "__init__.py",
+        "media/windows_operator_message_routing.py",
+        "media/windows_operator_playback_ui.py",
+        "media/windows_operator_window_procedure.py",
+    ],
+)
+def test_runtime_mutation_cannot_be_admitted_by_rebinding_caller_expectations(bundle, relative):
+    target = bundle.source / "src/k5vision" / relative
     target.write_bytes(target.read_bytes() + b"\n# unreviewed runtime fixture mutation\n")
     common, alpha = bundle.tools.alpha.common, bundle.tools.alpha
     bundle.expected["source_tree_sha256"] = common.digest(alpha.tree_manifest(bundle.source))
@@ -300,10 +309,15 @@ def test_runtime_mutation_cannot_be_admitted_by_rebinding_caller_expectations(bu
     assert not bundle.storage.exists() and not bundle.args.output.exists()
 
 
-def test_old_runtime_expectation_is_refused_before_retention(bundle):
-    bundle.expected["k5_payload_sha256"] = (
-        "c755ac54055c3d36ca12da20089f349b76477c7f1757c88b2cda9751160de92e"
-    )
+@pytest.mark.parametrize(
+    "previous_payload",
+    [
+        "c755ac54055c3d36ca12da20089f349b76477c7f1757c88b2cda9751160de92e",
+        "f72765e7abf3c38a42285fd6cb26f46690e8b2321c600f2ddb5d5bc56eb2f3ec",
+    ],
+)
+def test_old_runtime_expectation_is_refused_before_retention(bundle, previous_payload):
+    bundle.expected["k5_payload_sha256"] = previous_payload
     with pytest.raises(capture.CaptureError, match="runtime_identity"):
         capture.source_identity(bundle.source, bundle.tools, bundle.expected)
     assert not bundle.storage.exists() and not bundle.args.output.exists()

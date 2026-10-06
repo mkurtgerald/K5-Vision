@@ -34,11 +34,13 @@ from k5vision.media.recording_descriptor import (
     parse_recording_descriptor,
 )
 from k5vision.media.viewport_geometry import ViewportGeometry, ViewportLayout, ViewportPlacement
-from k5vision.media.windows_operator_runtime import (
-    BoundedWindowsOperatorRuntime,
-    WindowsOperatorRuntimeSnapshot,
-    WindowsOperatorRuntimeState,
+from k5vision.media.windows_operator_application import _default_host_factory
+from k5vision.media.windows_operator_control import WindowsOperatorControlSnapshot
+from k5vision.media.windows_operator_playback_ui import (
+    BoundedPlaybackWindowsOperatorApplication,
+    BoundedPlaybackWindowsOperatorControl,
 )
+from k5vision.media.windows_operator_session import WindowsOperatorSessionState
 from k5vision.operator_launch import (
     OperatorLaunchError,
     OperatorSourceResolver,
@@ -112,6 +114,7 @@ class OperatorPlaybackMetrics(BaseModel):
     presentations: int = Field(default=0, ge=0, le=_MAX_COUNT)
     processed_controls: int = Field(default=0, ge=0, le=_MAX_COUNT)
     descriptor_verified: bool = False
+    completed: bool = True
 
 
 class OperatorPlaybackReceipt(BaseModel):
@@ -163,32 +166,46 @@ class OperatorPlaybackLauncher(Protocol):
 
 
 class _WindowsOperatorBoundary(Protocol):
-    async def start(self, streams: tuple[MixedLiveStream | MixedPlaybackStream, ...]) -> object: ...
-
-    async def wait(self) -> WindowsOperatorRuntimeSnapshot: ...
-
-    async def close(self) -> WindowsOperatorRuntimeSnapshot: ...
+    async def run(
+        self,
+        *,
+        width: int,
+        height: int,
+        layout: ViewportLayout,
+        streams: tuple[MixedLiveStream | MixedPlaybackStream, ...],
+    ) -> WindowsOperatorControlSnapshot: ...
 
 
 class WindowsMixedOperatorPlaybackLauncher:
-    """Present the current live source beside one bounded recorded playback."""
+    """Present current live and recorded sources in one owned interactive shell."""
 
-    def __init__(self, *, runtime_factory=None, live_delivery_factory=None, playback_factory=None):
-        self._runtime_factory = runtime_factory or self._default_runtime_factory
+    def __init__(self, *, control_factory=None, live_delivery_factory=None, playback_factory=None):
+        self._control_factory = control_factory or self._default_control_factory
         self._live_delivery_factory = live_delivery_factory or _default_delivery_factory
         self._playback_factory = playback_factory or PausablePresentationPlaybackDelivery
-        if not callable(self._runtime_factory):
-            raise TypeError("runtime_factory must be callable")
+        if not callable(self._control_factory):
+            raise TypeError("control_factory must be callable")
         if not callable(self._live_delivery_factory):
             raise TypeError("live_delivery_factory must be callable")
         if not callable(self._playback_factory):
             raise TypeError("playback_factory must be callable")
 
     @staticmethod
-    def _default_runtime_factory(layout: ViewportLayout) -> BoundedWindowsOperatorRuntime:
-        return BoundedWindowsOperatorRuntime(
-            layout,
-            presentation_runtime_factory=_stage_one_presentation_runtime_factory,
+    def _default_control_factory(
+        pause_control: PlaybackPauseControl,
+    ) -> BoundedPlaybackWindowsOperatorControl:
+        def host_factory(parent_handle: int):
+            return _default_host_factory(
+                parent_handle,
+                presentation_runtime_factory=_stage_one_presentation_runtime_factory,
+            )
+
+        return BoundedPlaybackWindowsOperatorControl(
+            pause_control=pause_control,
+            application_factory=lambda: BoundedPlaybackWindowsOperatorApplication(
+                pause_control=pause_control,
+                host_factory=host_factory,
+            ),
         )
 
     async def run(
@@ -236,73 +253,56 @@ class WindowsMixedOperatorPlaybackLauncher:
                 )
             )
             live_delivery = self._live_delivery_factory(source.payload_type)
-            if pause_control is None:
-                playback_delivery = self._playback_factory(
-                    recording_path,
-                    descriptor,
-                    start_ms,
-                    end_ms,
-                    rate,
-                )
-            else:
-                playback_delivery = self._playback_factory(
-                    recording_path,
-                    descriptor,
-                    start_ms,
-                    end_ms,
-                    rate,
-                    pause_control=pause_control,
-                )
+            control = pause_control if pause_control is not None else PlaybackPauseControl()
+            if not isinstance(control, PlaybackPauseControl):
+                raise TypeError("pause control is invalid")
+            playback_delivery = self._playback_factory(
+                recording_path,
+                descriptor,
+                start_ms,
+                end_ms,
+                rate,
+                pause_control=control,
+            )
             streams = (
                 MixedLiveStream(slot=0, source_uri=source.source_uri, delivery=live_delivery),
                 MixedPlaybackStream(slot=1, delivery=playback_delivery),
             )
-            runtime: _WindowsOperatorBoundary = self._runtime_factory(layout)
+            session: _WindowsOperatorBoundary = self._control_factory(control)
         except Exception:
             raise OperatorPlaybackError(
                 OperatorPlaybackErrorCode.PLAYBACK_FAILURE,
                 "operator playback failed",
             ) from None
 
-        primary_error: BaseException | None = None
         try:
-            await runtime.start(streams)
-            final = await runtime.wait()
-            if final.state is not WindowsOperatorRuntimeState.COMPLETE:
+            # The accepted session owns cancellation and terminal cleanup. Do not
+            # race its run() with a second close() path in this auth boundary.
+            final = await session.run(width=width, height=height, layout=layout, streams=streams)
+            if not isinstance(final, WindowsOperatorControlSnapshot) or final.session.state not in {
+                WindowsOperatorSessionState.COMPLETE,
+                WindowsOperatorSessionState.USER_CLOSED,
+            }:
                 raise OperatorPlaybackError(
                     OperatorPlaybackErrorCode.PLAYBACK_FAILURE,
                     "operator playback failed",
                 )
             return OperatorPlaybackMetrics(
-                delivered_frames=final.delivered_frames,
-                presentations=final.presentations,
-                processed_controls=0,
+                delivered_frames=final.session.delivered_frames,
+                presentations=final.session.presentations,
+                processed_controls=final.processed_controls,
                 descriptor_verified=True,
+                completed=final.session.state is WindowsOperatorSessionState.COMPLETE,
             )
-        except asyncio.CancelledError as exc:
-            primary_error = exc
+        except asyncio.CancelledError:
             raise
-        except OperatorPlaybackError as exc:
-            primary_error = exc
+        except OperatorPlaybackError:
             raise
-        except Exception as exc:
-            primary_error = exc
+        except Exception:
             raise OperatorPlaybackError(
                 OperatorPlaybackErrorCode.PLAYBACK_FAILURE,
                 "operator playback failed",
             ) from None
-        finally:
-            try:
-                await runtime.close()
-            except asyncio.CancelledError:
-                if primary_error is None:
-                    raise
-            except Exception:
-                if primary_error is None:
-                    raise OperatorPlaybackError(
-                        OperatorPlaybackErrorCode.PLAYBACK_FAILURE,
-                        "operator playback cleanup failed",
-                    ) from None
 
 
 def _load_recording_pair(root: Path, recording_id: UUID) -> tuple[Path, RecordingStreamDescriptor]:
@@ -599,6 +599,7 @@ class BoundedOperatorPlaybackCoordinator:
                 )
             return OperatorPlaybackReceipt(
                 recording_id=request.recording_id,
+                completed=metrics.completed,
                 delivered_frames=metrics.delivered_frames,
                 presentations=metrics.presentations,
                 processed_controls=metrics.processed_controls,

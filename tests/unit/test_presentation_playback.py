@@ -280,3 +280,289 @@ def test_single_use_and_constructor_bounds_fail_closed(tmp_path: Path) -> None:
             100,
             decoder_factory=0,  # type: ignore[arg-type]
         )
+
+
+class BatchPauseDecoder(FakeDecoder):
+    async def decode(self, _packet, _source_elapsed_ms):
+        return [self.frame(0), self.frame(40)]
+
+    async def flush(self):
+        return [self.frame(80)]
+
+    @staticmethod
+    def frame(ms):
+        return PresentationVideoFrame(memoryview(b"abcd"), 1, 1, 4, PixelFormat.BGRX, ms)
+
+
+def _pausable_delivery(tmp_path, control, decoder, **kwargs):
+    from k5vision.media.pausable_presentation_playback import PausablePresentationPlaybackDelivery
+
+    packets = _packets()[:1]
+    path = _write_recording(tmp_path, packets)
+    return PausablePresentationPlaybackDelivery(
+        path,
+        _descriptor(packets),
+        0,
+        1000,
+        pause_control=control,
+        decoder_factory=lambda _payload: decoder,
+        **kwargs,
+    )
+
+
+def test_acknowledged_pause_fences_remaining_batch_and_flush_frames(tmp_path):
+    from k5vision.media.playback_control import PlaybackPauseControl
+
+    control, decoder = PlaybackPauseControl(), BatchPauseDecoder()
+    delivery = _pausable_delivery(tmp_path, control, decoder)
+
+    async def exercise():
+        paused = asyncio.Event()
+        frames = []
+
+        async def consume(frame):
+            frames.append(frame.source_elapsed_ms)
+            if len(frames) == 1:
+                assert (await control.pause()).state.value == "paused"
+                paused.set()
+
+        task = asyncio.create_task(delivery.run(consume))
+        try:
+            await asyncio.wait_for(paused.wait(), 1)
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert frames == [0]
+            assert not task.done()
+            # A resume immediately superseded by pause cannot release stale waiters.
+            await control.resume()
+            await control.pause()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert frames == [0]
+            await control.resume()
+            result = await asyncio.wait_for(task, 1)
+            assert frames == [0, 40, 80]
+            assert result.delivered_frames == 3
+            assert result.state == PresentationPlaybackState.COMPLETE
+            assert decoder.closed
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+def test_pause_past_default_packet_and_frame_deadlines_resumes_in_order(tmp_path):
+    from k5vision.media.playback_control import PlaybackPauseControl
+
+    control, decoder = PlaybackPauseControl(), BatchPauseDecoder()
+    delivery = _pausable_delivery(tmp_path, control, decoder)
+
+    async def exercise():
+        paused = asyncio.Event()
+        frames = []
+
+        async def consume(frame):
+            frames.append(frame.source_elapsed_ms)
+            if len(frames) == 1:
+                await control.pause()
+                paused.set()
+
+        task = asyncio.create_task(delivery.run(consume))
+        try:
+            await asyncio.wait_for(paused.wait(), 1)
+            # Exceed the actual defaults: packet callback 8s, frame consumer 0.5s.
+            await asyncio.sleep(8.05)
+            assert frames == [0] and not task.done()
+            assert delivery.snapshot.delivered_frames == 1
+            await control.resume()
+            result = await asyncio.wait_for(task, 1)
+            assert frames == [0, 40, 80]
+            assert result.delivered_frames == 3 and decoder.closed
+            assert control.snapshot.paused_total_ms >= 8000
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("phase", ["decode", "flush"])
+def test_pause_during_decoder_operation_fences_its_returned_frames(tmp_path, phase):
+    from k5vision.media.playback_control import PlaybackPauseControl
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Decoder(BatchPauseDecoder):
+        async def decode(self, packet, elapsed):
+            if phase == "decode":
+                entered.set()
+                await release.wait()
+            return [self.frame(0)]
+
+        async def flush(self):
+            if phase == "flush":
+                entered.set()
+                await release.wait()
+            return [self.frame(40)]
+
+    control, decoder = PlaybackPauseControl(), Decoder()
+    delivery = _pausable_delivery(
+        tmp_path,
+        control,
+        decoder,
+        pump_consumer_timeout_seconds=0.05,
+        frame_consumer_timeout_seconds=0.025,
+    )
+
+    async def exercise():
+        frames = []
+
+        async def consume(frame):
+            frames.append(frame.source_elapsed_ms)
+
+        task = asyncio.create_task(delivery.run(consume))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            await control.pause()
+            expected = [] if phase == "decode" else [0]
+            release.set()
+            await asyncio.sleep(0.1)
+            assert frames == expected and not task.done()
+            await control.resume()
+            result = await asyncio.wait_for(task, 1)
+            assert frames == [0, 40]
+            assert result.state == PresentationPlaybackState.COMPLETE
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            assert decoder.closed
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("phase", ["decode", "flush", "consumer"])
+def test_pause_does_not_extend_already_started_work_timeout(tmp_path, phase):
+    from k5vision.media.playback_control import PlaybackPauseControl
+
+    entered, never = asyncio.Event(), asyncio.Event()
+
+    class Decoder(BatchPauseDecoder):
+        async def decode(self, packet, elapsed):
+            if phase == "decode":
+                entered.set()
+                await never.wait()
+            return [self.frame(0)]
+
+        async def flush(self):
+            if phase == "flush":
+                entered.set()
+                await never.wait()
+            return []
+
+    control, decoder = PlaybackPauseControl(), Decoder()
+    delivery = _pausable_delivery(
+        tmp_path,
+        control,
+        decoder,
+        decoder_timeout_seconds=0.03,
+        frame_consumer_timeout_seconds=0.03,
+        pump_consumer_timeout_seconds=0.5,
+    )
+
+    async def exercise():
+        async def consume(frame):
+            if phase == "consumer":
+                entered.set()
+                await never.wait()
+
+        task = asyncio.create_task(delivery.run(consume))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            await control.pause()
+            with pytest.raises(PresentationPlaybackError) as error:
+                await asyncio.wait_for(task, 1)
+            assert error.value.code == (
+                PresentationPlaybackErrorCode.CONSUMER_TIMEOUT
+                if phase == "consumer"
+                else PresentationPlaybackErrorCode.DECODER_TIMEOUT
+            )
+            assert delivery.snapshot.state == PresentationPlaybackState.FAILED
+            assert decoder.closed
+            assert "SECRET" not in str(error.value)
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("pause_at", [0, 40, 80])
+def test_cancel_while_paused_at_batch_or_flush_admission_closes_decoder(tmp_path, pause_at):
+    from k5vision.media.playback_control import PlaybackPauseControl
+
+    class Decoder(BatchPauseDecoder):
+        async def flush(self):
+            return [self.frame(80), self.frame(120)]
+
+    control, decoder = PlaybackPauseControl(), Decoder()
+    delivery = _pausable_delivery(tmp_path, control, decoder)
+
+    async def exercise():
+        paused, frames = asyncio.Event(), []
+
+        async def consume(frame):
+            frames.append(frame.source_elapsed_ms)
+            if frame.source_elapsed_ms == pause_at:
+                await control.pause()
+                paused.set()
+
+        task = asyncio.create_task(delivery.run(consume))
+        await asyncio.wait_for(paused.wait(), 1)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert decoder.closed
+        assert delivery.snapshot.state == PresentationPlaybackState.CANCELLED
+        assert frames == [ms for ms in (0, 40, 80) if ms <= pause_at]
+        assert delivery.snapshot.delivered_frames == len(frames)
+        assert control._work_deadline.get() is None
+
+    asyncio.run(exercise())
+
+
+def test_pause_cannot_acknowledge_between_frame_admission_and_consumer_start(tmp_path, monkeypatch):
+    from k5vision.media.playback_control import PlaybackPauseControl
+
+    control, decoder = PlaybackPauseControl(), FakeDecoder()
+    delivery = _pausable_delivery(tmp_path, control, decoder)
+
+    async def exercise():
+        admitted = delivery._wait_for_frame_admission
+        pause_tasks, states_at_start = [], []
+
+        async def admit_then_queue_pause():
+            await admitted()
+            # The pause will run before a newly scheduled consumer task. A direct
+            # consumer await must start immediately in the admitted task instead.
+            pause_tasks.append(asyncio.create_task(control.pause()))
+
+        monkeypatch.setattr(delivery, "_wait_for_frame_admission", admit_then_queue_pause)
+
+        async def consume(frame):
+            states_at_start.append(control.snapshot.state.value)
+
+        result = await delivery.run(consume)
+        await asyncio.gather(*pause_tasks)
+        assert states_at_start == ["running"]
+        assert control.snapshot.state.value == "paused"
+        assert result.delivered_frames == 1 and decoder.closed
+
+    asyncio.run(exercise())

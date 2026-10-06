@@ -33,7 +33,6 @@ from k5vision.media.windows_operator_control import (
     WindowsOperatorControlSnapshot,
 )
 from k5vision.media.windows_operator_interaction import (
-    _PM_REMOVE,
     _WM_CANCELMODE,
     _WM_CAPTURECHANGED,
     _WM_CLOSE,
@@ -244,13 +243,11 @@ class _CatalogWin32OperatorShellApi(_InteractiveWin32OperatorShellApi):
         close_requested = False
         message = _Win32Message()
         try:
-            while count < max_messages and self._peek_message(
-                ctypes.byref(message),
-                None,
-                0,
-                0,
-                _PM_REMOVE,
-            ):
+            registration = self._message_route.registration(shell)
+            if self._thread_quit_requested(shell):
+                self._cancel_pointer_capture(shell)
+                return 0, True
+            while count < max_messages and self._peek_shell_message(shell, message, registration):
                 count += 1
                 hwnd = int(message.hwnd or 0)
                 self._note_geometry_message(shell, message)
@@ -264,9 +261,12 @@ class _CatalogWin32OperatorShellApi(_InteractiveWin32OperatorShellApi):
                 if message.message == _WM_CAPTURECHANGED:
                     self._capture_was_lost(shell)
                     continue
-                if message.message == _WM_COMMAND and self._consume_catalog_command_message(
-                    int(message.wParam),
-                    int(message.lParam),
+                if (
+                    message.message == _WM_COMMAND
+                    and hwnd == shell
+                    and self._consume_catalog_command_message(
+                        int(message.wParam), int(message.lParam)
+                    )
                 ):
                     continue
                 if hwnd in self._ui_handles:
@@ -306,9 +306,13 @@ class _CatalogWin32OperatorShellApi(_InteractiveWin32OperatorShellApi):
                         hwnd=hwnd,
                         lparam=int(message.lParam),
                     )
-                    self._release_pointer_capture()
+                    self._release_pointer_capture(shell)
                 self._translate_message(ctypes.byref(message))
                 self._dispatch_message(ctypes.byref(message))
+            self._message_route.require(shell, registration=registration)
+            if self._thread_quit_requested(shell):
+                self._cancel_pointer_capture(shell)
+                close_requested = True
         except _NativeShellError:
             raise
         except Exception:
@@ -332,6 +336,10 @@ class _CatalogWin32OperatorShellApi(_InteractiveWin32OperatorShellApi):
         return rejected
 
     def destroy_shell(self, shell: int) -> None:
+        try:
+            self._message_route.require(shell)
+        except Exception:
+            raise _NativeShellError(_NativeShellFailure.DESTROY) from None
         self._catalog_commands.clear()
         self._catalog_rejections = 0
         self._view_editor = 0
