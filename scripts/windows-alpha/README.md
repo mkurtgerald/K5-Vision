@@ -193,7 +193,7 @@ wheels, K5 and Analytics wheels, and admitted Python's bundled pip wheel. It
 cross-checks receipt/source identities, exact archive hashes and metadata, then
 checks the full 36-input dependency graph and the separate 30-wheel Windows
 installer subset. The runtime package payload is pinned independently to the
-136 tracked files at `2fa3133e892e633967e4734d363ee4431a43ac0d`; another source
+136 tracked files at `044486401699634234843dfdf0fe02b938cc757f`; another source
 payload requires a separate reviewed binding change. A compatible version label
 or a locally rebuilt wheel is not a substitute for the qualified archive bytes.
 

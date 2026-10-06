@@ -24,9 +24,9 @@ from types import SimpleNamespace
 
 SCHEMA = "k5-native-wheel-provenance-v1"
 OUTPUT_NAME = "installed-alpha-wheel-provenance.json"
-RUNTIME_REVISION = "2fa3133e892e633967e4734d363ee4431a43ac0d"
-# Independently computed from the 136 exact tracked src/k5vision files at 2fa3133e.
-RUNTIME_PAYLOAD_SHA256 = "6b03a5168a55db435ab7b3b2272220b0bc0d7e53c2bca029760d3526d58da751"
+RUNTIME_REVISION = "044486401699634234843dfdf0fe02b938cc757f"
+# Independently computed from the 136 exact tracked src/k5vision files at 04448640.
+RUNTIME_PAYLOAD_SHA256 = "692e238ee1cd93cad319dc361b05acf0824638dab1cfa1ff2e0b24a6ce5de70f"
 MAX_JSON = 1024 * 1024
 MAX_WHEEL = 256 * 1024 * 1024
 MODULES = (

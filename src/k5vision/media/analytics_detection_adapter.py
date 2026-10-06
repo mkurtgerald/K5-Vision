@@ -9,6 +9,7 @@ or propagated into the overlay contract.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from itertools import islice
 from typing import Any
 
 from k5vision.media.detection_overlay import (
@@ -34,12 +35,16 @@ def adapt_analytics_tracked_detections(
     analytics package at product runtime. Exact producer compatibility is qualified
     separately against a pinned Analytics-lab revision. Producer scope is never
     trusted here; site/source/session authority remains product-owned upstream.
+
+    Consume only the configured bound plus one overflow sentinel before converting
+    any detection. This bounds item count and avoids producer length hints; it
+    cannot interrupt a blocking producer ``__iter__`` or ``__next__`` call.
     """
     if type(max_observations) is not int or not 1 <= max_observations <= _MAX_TRACKED_OBSERVATIONS:
         raise ValueError(f"max_observations must be between 1 and {_MAX_TRACKED_OBSERVATIONS}")
 
     try:
-        selected = tuple(values)
+        selected = tuple(islice(values, max_observations + 1))
     except TypeError as exc:
         raise AnalyticsDetectionAdapterError("analytics detections must be iterable") from exc
     if len(selected) > max_observations:

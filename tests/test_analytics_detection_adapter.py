@@ -1,4 +1,5 @@
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import pytest
@@ -58,6 +59,79 @@ def test_adapter_converts_only_transient_overlay_fields() -> None:
 def test_adapter_bounds_input_count_before_conversion() -> None:
     with pytest.raises(AnalyticsDetectionAdapterError, match="count"):
         adapt_analytics_tracked_detections((_tracked(), _tracked()), max_observations=1)
+
+
+@pytest.mark.parametrize("count", (0, 1, 3))
+@pytest.mark.parametrize("container", ("tuple", "list", "iterator", "generator"))
+def test_adapter_accepts_finite_inputs_through_exact_limit(count: int, container: str) -> None:
+    items = [_tracked() for _ in range(count)]
+    values = {
+        "tuple": tuple(items),
+        "list": items,
+        "iterator": iter(items),
+        "generator": (item for item in items),
+    }[container]
+
+    observations = adapt_analytics_tracked_detections(values, max_observations=3)
+
+    assert len(observations) == count
+    assert all(observation.category == "person" for observation in observations)
+
+
+@pytest.mark.parametrize("limit", (1, 128, 512))
+def test_adapter_stops_at_overflow_before_converting_any_detection(limit: int) -> None:
+    consumed = 0
+
+    class UnconvertedDetection:
+        @property
+        def track_id(self) -> str:
+            raise AssertionError("overflow must be rejected before detection conversion")
+
+    def values() -> Iterator[UnconvertedDetection]:
+        nonlocal consumed
+        for _ in range(limit + 1):
+            consumed += 1
+            yield UnconvertedDetection()
+        raise AssertionError("producer advanced beyond the overflow sentinel")
+
+    with pytest.raises(AnalyticsDetectionAdapterError, match="count"):
+        adapt_analytics_tracked_detections(values(), max_observations=limit)
+
+    assert consumed == limit + 1
+
+
+def test_adapter_does_not_consult_producer_length() -> None:
+    class UntrustedLength:
+        def __iter__(self) -> Iterator[_Tracked]:
+            return iter((_tracked(),))
+
+        def __len__(self) -> int:
+            raise AssertionError("untrusted producer length must not be requested")
+
+    assert len(adapt_analytics_tracked_detections(UntrustedLength(), max_observations=1)) == 1
+
+
+def test_adapter_does_not_consult_producer_length_hint() -> None:
+    class UntrustedLengthHint:
+        def __init__(self) -> None:
+            self._values = iter((_tracked(),))
+
+        def __iter__(self) -> Iterator[_Tracked]:
+            return self
+
+        def __next__(self) -> _Tracked:
+            return next(self._values)
+
+        def __length_hint__(self) -> int:
+            raise AssertionError("untrusted producer length hint must not be requested")
+
+    assert len(adapt_analytics_tracked_detections(UntrustedLengthHint(), max_observations=1)) == 1
+
+
+@pytest.mark.parametrize("values", (None, 1, object()))
+def test_adapter_preserves_sanitized_noniterable_error(values: object) -> None:
+    with pytest.raises(AnalyticsDetectionAdapterError, match="must be iterable"):
+        adapt_analytics_tracked_detections(values)  # type: ignore[arg-type]
 
 
 def test_adapter_fails_closed_with_sanitized_invalid_value() -> None:
