@@ -6,8 +6,8 @@ import asyncio
 import enum
 import os
 import stat
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import UUID
 
@@ -59,6 +59,7 @@ class OperatorExportHandle:
     file_identity: FileIdentity
     boundary: str
     response_bytes: int
+    _reservation: object = field(repr=False, compare=False)
 
 
 def _identity_from_stat(result: os.stat_result) -> FileIdentity:
@@ -176,25 +177,36 @@ class BoundedOperatorExportCoordinator:
         self._recording_root = Path(recording_root).expanduser().resolve(strict=False)
         self._max_export_bytes = max_export_bytes
         self._max_active_exports = max_active_exports
-        self._active_exports = 0
+        self._reservations: set[object] = set()
         self._state_lock = asyncio.Lock()
 
     @property
     def active_exports(self) -> int:
-        return self._active_exports
+        return len(self._reservations)
 
-    async def _reserve(self) -> None:
+    async def _reserve(self) -> object:
         async with self._state_lock:
-            if self._active_exports >= self._max_active_exports:
+            if len(self._reservations) >= self._max_active_exports:
                 raise OperatorExportError(
                     OperatorExportErrorCode.EXPORT_BUSY,
                     "operator export capacity is currently exhausted",
                 )
-            self._active_exports += 1
+            reservation = object()
+            self._reservations.add(reservation)
+            return reservation
 
-    async def release(self) -> None:
-        async with self._state_lock:
-            self._active_exports = max(0, self._active_exports - 1)
+    def release(self, handle: OperatorExportHandle) -> None:
+        """Release only this lease, once, without a cancellation checkpoint.
+
+        Reservation mutations are confined to the coordinator's event loop and
+        never suspend. A late body finalizer cannot release another response's slot.
+        """
+        self._reservations.discard(handle._reservation)
+
+    def _validation_finished(self, reservation: object, worker: asyncio.Task) -> None:
+        self._reservations.discard(reservation)
+        if not worker.cancelled():
+            worker.exception()  # Retrieve a failure after the request was cancelled.
 
     async def begin_export(
         self,
@@ -246,40 +258,45 @@ class BoundedOperatorExportCoordinator:
                 "recording export exceeds the configured byte limit",
             )
 
-        await self._reserve()
-        worker = asyncio.create_task(
-            asyncio.to_thread(_verify_recording_for_export, recording_path, descriptor)
-        )
+        reservation = await self._reserve()
+        worker: asyncio.Task | None = None
         try:
-            identity = await asyncio.shield(worker)
-        except asyncio.CancelledError:
+            validation = asyncio.to_thread(_verify_recording_for_export, recording_path, descriptor)
             try:
-                await asyncio.shield(worker)
-            except Exception:
-                pass
-            await self.release()
-            raise
-        except OperatorExportError:
-            await self.release()
-            raise
-        except Exception:
-            await self.release()
+                worker = asyncio.create_task(validation)
+            except BaseException:
+                validation.close()
+                raise
+            identity = await asyncio.shield(worker)
+            return OperatorExportHandle(
+                recording_id=recording_id,
+                recording_path=recording_path,
+                descriptor_bytes=descriptor_bytes,
+                file_bytes=descriptor.file_bytes,
+                file_identity=identity,
+                boundary=boundary,
+                response_bytes=response_bytes,
+                _reservation=reservation,
+            )
+        except BaseException as exc:
+            if worker is not None and not worker.done():
+                # Cancellation cannot stop to_thread validation. Keep its capacity
+                # reserved until it settles, even if the request is cancelled again.
+                worker.add_done_callback(
+                    lambda finished: self._validation_finished(reservation, finished)
+                )
+            else:
+                self._reservations.discard(reservation)
+            if isinstance(exc, (asyncio.CancelledError, OperatorExportError)):
+                raise
+            if not isinstance(exc, Exception):
+                raise
             raise OperatorExportError(
                 OperatorExportErrorCode.EXPORT_INVALID,
                 "recording export could not be validated",
             ) from None
 
-        return OperatorExportHandle(
-            recording_id=recording_id,
-            recording_path=recording_path,
-            descriptor_bytes=descriptor_bytes,
-            file_bytes=descriptor.file_bytes,
-            file_identity=identity,
-            boundary=boundary,
-            response_bytes=response_bytes,
-        )
-
-    async def stream(self, handle: OperatorExportHandle) -> AsyncIterator[bytes]:
+    async def stream(self, handle: OperatorExportHandle) -> AsyncGenerator[bytes, None]:
         """Stream the canonical descriptor and immutable recording without retaining a copy."""
         if not isinstance(handle, OperatorExportHandle):
             raise TypeError("handle must be an OperatorExportHandle")
@@ -323,4 +340,4 @@ class BoundedOperatorExportCoordinator:
 
             yield footer
         finally:
-            await self.release()
+            self.release(handle)
