@@ -8,6 +8,7 @@ from uuid import UUID
 
 from fastapi import FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from k5vision.auth_sessions import UserSessionManager
 from k5vision.media.playback_schedule import PlaybackRate
@@ -15,6 +16,7 @@ from k5vision.operator_export import (
     BoundedOperatorExportCoordinator,
     OperatorExportError,
     OperatorExportErrorCode,
+    OperatorExportHandle,
 )
 from k5vision.operator_launch import OperatorSourceResolver
 from k5vision.operator_playback import (
@@ -78,6 +80,40 @@ _EXPORT_ERROR_STATUS = {
     OperatorExportErrorCode.EXPORT_BUSY: status.HTTP_429_TOO_MANY_REQUESTS,
     OperatorExportErrorCode.EXPORT_INVALID: status.HTTP_503_SERVICE_UNAVAILABLE,
 }
+
+
+class _OperatorExportResponse(StreamingResponse):
+    """Own the export lease before headers until the response has fully unwound."""
+
+    def __init__(
+        self,
+        coordinator: BoundedOperatorExportCoordinator,
+        handle: OperatorExportHandle,
+    ) -> None:
+        self._coordinator = coordinator
+        self._handle = handle
+        self._stream = coordinator.stream(handle)
+        super().__init__(
+            self._stream,
+            media_type=f"multipart/mixed; boundary={handle.boundary}",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Length": str(handle.response_bytes),
+                "X-Content-Type-Options": "nosniff",
+                "X-K5-Recording-Id": str(handle.recording_id),
+                "X-K5-Descriptor-Validated": "true",
+            },
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                await self._stream.aclose()
+            finally:
+                # Also covers a body that never started and cancelled aclose().
+                self._coordinator.release(self._handle)
 
 
 def _extract_bearer(authorization: list[str] | None) -> str | None:
@@ -283,17 +319,11 @@ def install_operator_recording_api(
                 detail=str(exc),
             ) from None
 
-        return StreamingResponse(
-            export_coordinator.stream(handle),
-            media_type=f"multipart/mixed; boundary={handle.boundary}",
-            headers={
-                "Cache-Control": "no-store",
-                "Content-Length": str(handle.response_bytes),
-                "X-Content-Type-Options": "nosniff",
-                "X-K5-Recording-Id": str(recording_id),
-                "X-K5-Descriptor-Validated": "true",
-            },
-        )
+        try:
+            return _OperatorExportResponse(export_coordinator, handle)
+        except BaseException:
+            export_coordinator.release(handle)
+            raise
 
     @application.post(
         "/api/v1/operator/recordings/{recording_id}/playback",
