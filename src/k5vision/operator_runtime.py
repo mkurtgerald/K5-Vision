@@ -185,7 +185,14 @@ def _local_test_source(source_uri: str) -> tuple[str, str]:
 class LocalTestSourceResolver(OperatorSourceResolver):
     """Resolve one explicit loopback-only synthetic alpha stream."""
 
-    __slots__ = ("_source_uri", "_source_ip", "_stream_token", "_payload_type", "_payload_probe")
+    __slots__ = (
+        "_source_uri",
+        "_pinned_source_uri",
+        "_source_ip",
+        "_stream_token",
+        "_payload_type",
+        "_payload_probe",
+    )
 
     def __init__(
         self,
@@ -226,7 +233,7 @@ class LocalTestSourceResolver(OperatorSourceResolver):
         try:
             payload_type = self._payload_type
             if payload_type is None:
-                payload_type = await self._payload_probe(self._source_uri)
+                payload_type = await self._payload_probe(self._pinned_source_uri)
             if isinstance(payload_type, bool) or not 96 <= payload_type <= 127:
                 raise ValueError("operator RTP payload type is invalid")
         except Exception:
@@ -269,6 +276,7 @@ class PublicTestSourceResolver(OperatorSourceResolver):
             raise TypeError("payload_probe must be callable")
 
         self._source_uri = urlunsplit(("rtsp", parsed.netloc, parsed.path, parsed.query, ""))
+        self._pinned_source_uri = _rewrite_public_test_source(parsed, normalized_ip)
         self._source_ip = normalized_ip
         self._stream_token = _sanitize_stream_token(stream_token)
         self._payload_type = payload_type
@@ -301,7 +309,7 @@ class PublicTestSourceResolver(OperatorSourceResolver):
                 "selected live source could not be resolved",
             ) from None
         return ResolvedLiveSource(
-            self._source_uri,
+            self._pinned_source_uri,
             payload_type,
             endpoint_ip=self._source_ip,
         )
