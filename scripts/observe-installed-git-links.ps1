@@ -20,7 +20,7 @@ Set-StrictMode -Version Latest
 # This observation never confers storage, retry, exception or delivery authority.
 $guardSha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d'
 # Exact frozen collector bytes; neither environment nor arguments can change this pin.
-$collectorSha256 = '0e4553dd178cb8e08a43507e40c0e1a4db8b80086a64e54daa58fcb8c94a2eae'
+$collectorSha256 = '80e71119497c25b1274069ed065ca60dc671207b3b68da2beab314053836f429'
 $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
 
 function Assert-K5OrdinaryPath([string]$Path, [bool]$Directory) {
@@ -286,7 +286,7 @@ function Assert-K5SameProfileRunner {
 
 function Save-K5DaclInventory($Record, [hashtable]$Context, [hashtable]$Writer) {
     $keys = @('schema_version','scope','target','status','code','closure_complete',
-        'exception_authority','storage_admission','retry_authority','bytes_read','elapsed_ms')
+        'exception_authority','storage_admission','retry_authority','bytes_read','elapsed_ms','progress')
     if ($Record['status'] -ceq 'observed') {
         $keys += @('records','object_count','dacl_bytes','path_units','repair_ready')
     }
@@ -301,12 +301,28 @@ function Save-K5DaclInventory($Record, [hashtable]$Context, [hashtable]$Writer) 
     Assert-K5Integer $Record['bytes_read'] 0 0
     Assert-K5Integer $Record['elapsed_ms'] 0 90000
     if ($Record['closure_complete'] -isnot [bool]) { throw 'record' }
+    $progress = $Record['progress']
+    Assert-K5RecordKeys $progress @('stage','last_operation','snapshot_pass','current_snapshot_objects',
+        'first_snapshot_objects','second_snapshot_objects','current_depth','metadata_reads_completed',
+        'dacl_reads_completed','directory_query_calls','volume_checks_completed')
+    if ($progress['stage'] -cnotin @('anchor','snapshot_1','snapshot_2','snapshot_compare','snapshot_complete') -or
+        $progress['last_operation'] -cnotin @('none','metadata','dacl','enumeration','comparison')) { throw 'record' }
+    Assert-K5Integer $progress['snapshot_pass'] 0 2
+    Assert-K5Integer $progress['current_depth'] 0 33
+    Assert-K5Integer $progress['volume_checks_completed'] 0 1
+    foreach ($key in @('current_snapshot_objects','first_snapshot_objects','second_snapshot_objects')) {
+        Assert-K5Integer $progress[$key] 0 50000
+    }
+    foreach ($key in @('metadata_reads_completed','dacl_reads_completed','directory_query_calls')) {
+        Assert-K5Integer $progress[$key] 0 400004
+    }
+
     if ($Record['status'] -cne 'observed') {
         if ($Record['closure_complete'] -or $Record['code'] -cnotin @('platform','abi','anchor_open','relative_open',
             'metadata','filesystem','reparse','path_type','acl_unavailable','acl_null','identity_mismatch',
             'path_shape','name_bound','time_bound','changed','handle_bound','cleanup_failed','internal',
             'enumeration','file_size','bytes_bound','alias_count','inventory_bound','inventory_changed')) { throw 'record' }
-        return @{ status='refused'; code=$Record['code']; repair_ready=$false; backup_verified=$false }
+        return @{ status='refused'; code=$Record['code']; repair_ready=$false; backup_verified=$false; progress=$progress; inventory_elapsed_ms=$Record['elapsed_ms'] }
     }
     if (-not $Record['closure_complete'] -or $Record['code'] -cne 'none' -or
         $Record['repair_ready'] -isnot [bool] -or $Record['repair_ready']) { throw 'record' }
@@ -376,11 +392,11 @@ function Save-K5DaclInventory($Record, [hashtable]$Context, [hashtable]$Writer) 
     $backup = [K5FixedGitObservation]::SaveBackup($localAppData, $name, $bytes)
     if ($backup['status'] -cne 'observed') {
         return @{ status='refused'; code=$backup['code']; repair_ready=$false;
-            backup_verified=$false; backup_may_exist=$true }
+            backup_verified=$false; backup_may_exist=$true; progress=$progress }
     }
     if (-not $backup['readback_verified'] -or $backup['repair_ready']) { throw 'backup_verify' }
     return @{ status='observed'; code='none'; repair_ready=$false; backup_verified=$true;
-        backup=$backup; object_count=$records.Count; writer_sid=$Writer.writer_sid;
+        backup=$backup; object_count=$records.Count; writer_sid=$Writer.writer_sid; progress=$progress;
         inventory_elapsed_ms=$Record['elapsed_ms']; rollback_status='not_implemented' }
 }
 

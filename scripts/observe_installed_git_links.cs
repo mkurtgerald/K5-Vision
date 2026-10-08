@@ -99,6 +99,7 @@ public static class K5FixedGitObservation
             result["code"] = "time_bound";
         }
         if (complete != null) result = complete;
+        result["progress"] = observation.Progress();
         result["bytes_read"] = observation.BytesRead;
         result["elapsed_ms"] = elapsed;
         return result;
@@ -170,7 +171,7 @@ public static class K5FixedGitObservation
         internal IntPtr Handle;
         internal bool Directory;
         internal Metadata Initial;
-        internal string Acl;
+        internal byte[] DaclBytes;
         internal Dictionary<string, object> Dacl;
     }
 
@@ -180,6 +181,20 @@ public static class K5FixedGitObservation
         private readonly List<IntPtr> owned = new List<IntPtr>();
         private readonly List<Held> held = new List<Held>();
         internal long BytesRead { get { return 0; } }
+        private string stage = "anchor", lastOperation = "none";
+        private int snapshotPass = 0, currentObjects = 0, firstObjects = 0, secondObjects = 0;
+        private int currentDepth = 0, metadataReads = 0, daclReads = 0, directoryQueries = 0;
+        private int volumeChecks = 0;
+        internal Dictionary<string, object> Progress()
+        {
+            return new Dictionary<string, object> {
+                { "stage", stage }, { "last_operation", lastOperation }, { "snapshot_pass", snapshotPass },
+                { "current_snapshot_objects", currentObjects }, { "first_snapshot_objects", firstObjects },
+                { "second_snapshot_objects", secondObjects }, { "current_depth", currentDepth },
+                { "metadata_reads_completed", metadataReads }, { "dacl_reads_completed", daclReads },
+                { "directory_query_calls", directoryQueries }, { "volume_checks_completed", volumeChecks }
+            };
+        }
         internal long ElapsedMs { get { return watch.ElapsedMilliseconds; } }
 
         private void Tick() { Require(ElapsedMs <= MaxElapsedMs, "time_bound"); }
@@ -195,7 +210,7 @@ public static class K5FixedGitObservation
             if (handle != IntPtr.Zero && handle != InvalidHandle) owned.Add(handle);
         }
 
-        private Held Capture(IntPtr handle, bool directory, bool inventory = false)
+        private Held Capture(IntPtr handle, bool directory, bool inventory = false, bool verifyVolume = false)
         {
             Tick();
             Held item = new Held();
@@ -207,9 +222,9 @@ public static class K5FixedGitObservation
                 directory = (shape.Attributes & AttributeDirectory) != 0;
             }
             item.Directory = directory;
-            item.Initial = ReadMetadata(handle, directory);
-            item.Dacl = ReadAclRecord(handle);
-            item.Acl = (string)item.Dacl["dacl_sha256"];
+            item.Initial = ReadMetadata(handle, directory, verifyVolume);
+            item.DaclBytes = ReadDaclBytes(handle);
+            item.Dacl = DescribeDacl(item.DaclBytes);
             held.Add(item);
             return item;
         }
@@ -225,7 +240,7 @@ public static class K5FixedGitObservation
                 0x02000000 | FileOpenReparsePoint, IntPtr.Zero);
             Own(handle);
             Require(handle != IntPtr.Zero && handle != InvalidHandle, "anchor_open");
-            return Capture(handle, true);
+            return Capture(handle, true, false, true);
         }
 
         private Held OpenRelative(Held parent, string component, bool directory, bool inventory = false)
@@ -294,22 +309,31 @@ public static class K5FixedGitObservation
             finally { pin.Free(); }
         }
 
-        private Metadata ReadMetadata(IntPtr handle, bool directory)
+        private Metadata ReadMetadata(IntPtr handle, bool directory, bool verifyVolume = false)
         {
+            lastOperation = "metadata";
             Tick();
             Require(Native.GetFileType(handle) == 1, "path_type"); // FILE_TYPE_DISK
             ByHandleInformation info;
             Require(Native.GetFileInformationByHandle(handle, out info), "metadata");
             Tick();
-            uint serial, maximumComponentLength, flags;
-            StringBuilder filesystem = new StringBuilder(32);
-            Require(Native.GetVolumeInformationByHandleW(handle, IntPtr.Zero, 0,
-                out serial, out maximumComponentLength, out flags, filesystem, 32), "filesystem");
-            Tick();
-            Require(String.Equals(filesystem.ToString(), "NTFS", StringComparison.Ordinal) &&
-                (flags & 0x00000008) != 0 && (flags & 0x00400000) != 0 &&
-                maximumComponentLength > 0, "filesystem");
-            Require(serial == info.VolumeSerial, "identity_mismatch");
+            uint serial = info.VolumeSerial;
+            if (verifyVolume)
+            {
+                // Only the trusted anchor needs a volume-capability query. Every
+                // child is no-follow relative and its reported serial is checked
+                // against its held parent before it enters the inventory.
+                uint maximumComponentLength, flags;
+                StringBuilder filesystem = new StringBuilder(32);
+                Require(Native.GetVolumeInformationByHandleW(handle, IntPtr.Zero, 0,
+                    out serial, out maximumComponentLength, out flags, filesystem, 32), "filesystem");
+                Tick();
+                Require(String.Equals(filesystem.ToString(), "NTFS", StringComparison.Ordinal) &&
+                    (flags & 0x00000008) != 0 && (flags & 0x00400000) != 0 &&
+                    maximumComponentLength > 0, "filesystem");
+                Require(serial == info.VolumeSerial, "identity_mismatch");
+                volumeChecks++;
+            }
             ulong identifier = U64(Query(handle, 6, 8, true), 0); // NTFS FileInternalInformation
             byte[] basic = Query(handle, 4, 40, true); // FileBasicInformation; includes ChangeTime.
             ulong byHandleId = ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow;
@@ -326,16 +350,38 @@ public static class K5FixedGitObservation
             result.Id = identifier;
             result.Links = info.Links;
             result.Attributes = info.Attributes;
+            metadataReads++;
             return result;
         }
 
-        private string ReadAcl(IntPtr handle)
+        private static bool SameBytes(byte[] left, byte[] right)
         {
-            return (string)ReadAclRecord(handle)["dacl_sha256"];
+            if (left.Length != right.Length) return false;
+            for (int i = 0; i < left.Length; i++) if (left[i] != right[i]) return false;
+            return true;
         }
 
-        private Dictionary<string, object> ReadAclRecord(IntPtr handle, int checkBackup = 0)
+        private bool SameDacl(Held item, int checkBackup = 0)
         {
+            // Fresh native security read, compared without hashing/Base64/record
+            // allocation. Never substitute a cached value for the reobservation.
+            return SameBytes(item.DaclBytes, ReadDaclBytes(item.Handle, checkBackup));
+        }
+
+        private static Dictionary<string, object> DescribeDacl(byte[] normalized)
+        {
+            RawSecurityDescriptor raw = new RawSecurityDescriptor(normalized, 0);
+            using (SHA256 hash = SHA256.Create())
+                return new Dictionary<string, object> {
+                    { "control", (int)raw.ControlFlags }, { "dacl_sha256", Hex(hash.ComputeHash(normalized)) },
+                    { "dacl_base64", Convert.ToBase64String(normalized) },
+                    { "dacl_bytes", normalized.Length }, { "ace_count", raw.DiscretionaryAcl.Count }
+                };
+        }
+
+        private byte[] ReadDaclBytes(IntPtr handle, int checkBackup = 0)
+        {
+            lastOperation = "dacl";
             Tick();
             IntPtr descriptor = IntPtr.Zero;
             try
@@ -389,12 +435,8 @@ public static class K5FixedGitObservation
                     raw.DiscretionaryAcl);
                 byte[] normalized = new byte[stable.BinaryLength];
                 stable.GetBinaryForm(normalized, 0);
-                using (SHA256 hash = SHA256.Create())
-                    return new Dictionary<string, object> {
-                        { "control", (int)flags }, { "dacl_sha256", Hex(hash.ComputeHash(normalized)) },
-                        { "dacl_base64", Convert.ToBase64String(normalized) },
-                        { "dacl_bytes", normalized.Length }, { "ace_count", raw.DiscretionaryAcl.Count }
-                    };
+                daclReads++;
+                return normalized;
             }
             finally
             {
@@ -434,6 +476,7 @@ public static class K5FixedGitObservation
                 int queries = 0;
                 while (true)
                 {
+                    lastOperation = "enumeration";
                     Tick();
                     Require(++queries <= MaxObjects + 3, "inventory_bound");
                     Array.Clear(buffer, 0, buffer.Length);
@@ -441,6 +484,7 @@ public static class K5FixedGitObservation
                     int status = Native.NtQueryDirectoryFile(directory.Handle, IntPtr.Zero,
                         IntPtr.Zero, IntPtr.Zero, ref io, pin.AddrOfPinnedObject(),
                         (uint)buffer.Length, 12, true, IntPtr.Zero, restart);
+                    directoryQueries++;
                     restart = false;
                     Tick();
                     if (status == unchecked((int)0x80000006)) // STATUS_NO_MORE_FILES
@@ -472,6 +516,7 @@ public static class K5FixedGitObservation
 
         private void Walk(Held node, string path, string parentId, int depth)
         {
+            currentDepth = depth;
             Tick();
             Require(depth <= 32 && inventory.Count < MaxObjects && path.Length <= 4096,
                 "inventory_bound");
@@ -489,6 +534,7 @@ public static class K5FixedGitObservation
             record["link_count"] = node.Initial.Links;
             record["attributes"] = node.Initial.Attributes;
             inventory.Add(record);
+            currentObjects = inventory.Count;
             if (node.Directory)
             {
                 // Names come from the already-held directory handle, never a
@@ -505,7 +551,7 @@ public static class K5FixedGitObservation
                 }
             }
             Require(SameObject(node.Initial, ReadMetadata(node.Handle, node.Directory)) &&
-                node.Acl == ReadAcl(node.Handle), "changed");
+                SameDacl(node), "changed");
         }
 
         private List<Dictionary<string, object>> Snapshot(Held root)
@@ -516,6 +562,7 @@ public static class K5FixedGitObservation
             pathUnits = 0;
             enumeratedUnits = 0;
             discoveredCount = 0;
+            currentObjects = 0;
             Walk(root, @"C:\K5PhysicalRunner", "outside-approved-root", 0);
             return inventory;
         }
@@ -524,15 +571,24 @@ public static class K5FixedGitObservation
         {
             Held anchor = OpenAnchor();
             Held root = OpenRelative(anchor, "K5PhysicalRunner", true);
+            stage = "snapshot_1";
+            snapshotPass = 1;
             List<Dictionary<string, object>> first = Snapshot(root);
+            firstObjects = first.Count;
+            stage = "snapshot_2";
+            snapshotPass = 2;
             List<Dictionary<string, object>> second = Snapshot(root);
+            secondObjects = second.Count;
+            stage = "snapshot_compare";
+            lastOperation = "comparison";
             Require(first.Count == second.Count, "inventory_changed");
             for (int i = 0; i < first.Count; i++)
                 foreach (string key in new string[] { "path", "object_id", "parent_id", "object_kind",
                     "link_count", "attributes", "control", "dacl_base64", "dacl_sha256", "dacl_bytes", "ace_count" })
                     Require(Object.Equals(first[i][key], second[i][key]), "inventory_changed");
             Require(SameObject(anchor.Initial, ReadMetadata(anchor.Handle, true)) &&
-                anchor.Acl == ReadAcl(anchor.Handle), "changed");
+                SameDacl(anchor), "changed");
+            stage = "snapshot_complete";
             Dictionary<string, object> result = BaseRecord();
             result["status"] = "observed";
             result["code"] = "none";
@@ -575,7 +631,7 @@ public static class K5FixedGitObservation
             List<string> parentIds = new List<string>();
             foreach (Held parent in custodyParents)
             {
-                Require(parent.Acl == (string)ReadAclRecord(parent.Handle, 2)["dacl_sha256"], "changed");
+                Require(SameDacl(parent, 2), "changed");
                 parentIds.Add(parent.Initial.Volume.ToString("x8", CultureInfo.InvariantCulture) + ":" +
                     parent.Initial.Id.ToString("x16", CultureInfo.InvariantCulture));
             }
@@ -608,7 +664,7 @@ public static class K5FixedGitObservation
                 Require(status == 0 && io.Status == 0 && io.Information.ToUInt64() == 2 &&
                     handle != IntPtr.Zero && handle != InvalidHandle, "backup_create");
                 Metadata initial = ReadMetadata(handle, false);
-                string initialDacl = (string)ReadAclRecord(handle, 1)["dacl_sha256"];
+                byte[] initialDacl = ReadDaclBytes(handle, 1);
                 string digest;
                 using (SHA256 hash = SHA256.Create()) digest = Hex(hash.ComputeHash(bytes));
                 using (Microsoft.Win32.SafeHandles.SafeFileHandle safe =
@@ -630,12 +686,12 @@ public static class K5FixedGitObservation
                 // single-link/non-reparse file type and security remain invariant.
                 Require(initial.Volume == afterWrite.Volume && initial.Id == afterWrite.Id &&
                     initial.Links == afterWrite.Links &&
-                    initialDacl == (string)ReadAclRecord(handle, 1)["dacl_sha256"], "backup_verify");
+                    SameBytes(initialDacl, ReadDaclBytes(handle, 1)), "backup_verify");
                 foreach (Held parent in custodyParents)
                     Require(SameObject(parent.Initial, ReadMetadata(parent.Handle, true)) &&
-                        parent.Acl == (string)ReadAclRecord(parent.Handle, 2)["dacl_sha256"], "changed");
+                        SameDacl(parent, 2), "changed");
                 Require(SameObject(anchor.Initial, ReadMetadata(anchor.Handle, true)) &&
-                    anchor.Acl == ReadAcl(anchor.Handle), "changed");
+                    SameDacl(anchor), "changed");
                 return new Dictionary<string, object> {
                     { "status", "observed" }, { "code", "none" },
                     { "backup_role", "current-profile-local-app-data" }, { "backup_name", name },

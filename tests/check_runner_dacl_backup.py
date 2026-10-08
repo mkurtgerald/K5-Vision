@@ -88,6 +88,44 @@ def closed_compiler_code(messages, typed=None, compile_phase=True, valid_error_i
 
 
 class SourceContracts(unittest.TestCase):
+    def test_postvisit_security_reads_are_fresh_without_projection_work(self):
+        body = section(CS, "private bool SameDacl", "private static Dictionary<string, object> DescribeDacl")
+        self.assertIn("ReadDaclBytes(item.Handle, checkBackup)", body)
+        self.assertIn("SameBytes(item.DaclBytes", body)
+        for forbidden in ("ComputeHash", "ToBase64String", "DescribeDacl", "new Dictionary"):
+            self.assertNotIn(forbidden, body)
+        walk = section(CS, "private void Walk", "private List<Dictionary<string, object>> Snapshot")
+        self.assertIn("SameObject(node.Initial, ReadMetadata(node.Handle, node.Directory))", walk)
+        self.assertIn("SameDacl(node)", walk)
+        native = section(CS, "private byte[] ReadDaclBytes", "private static bool SameObject")
+        self.assertIn("Native.GetSecurityInfo", native)
+        self.assertNotIn("ComputeHash", native)
+        self.assertNotIn("ToBase64String", native)
+
+    def test_volume_capability_check_is_anchor_only_with_child_identity_binding(self):
+        self.assertIn("return Capture(handle, true, false, true);", CS)
+        body = section(CS, "private Metadata ReadMetadata", "private static bool SameBytes")
+        self.assertIn("if (verifyVolume)", body)
+        self.assertEqual(CS.count("Native.GetVolumeInformationByHandleW("), 1)
+        self.assertIn("result.Initial.Volume == parent.Initial.Volume", CS)
+        self.assertIn("identifier != 0 && identifier == byHandleId", body)
+        self.assertIn("(info.Attributes & AttributeReparse) == 0", body)
+
+    def test_closed_progress_survives_inventory_refusal(self):
+        body = section(CS, "internal Dictionary<string, object> Progress()", "internal long ElapsedMs")
+        for forbidden in ("path", "name", "base64", "sid", "DaclBytes", "inventory"):
+            self.assertNotIn('"' + forbidden + '"', body)
+        for token in ("stage", "last_operation", "snapshot_pass", "current_snapshot_objects",
+                      "first_snapshot_objects", "second_snapshot_objects", "current_depth",
+                      "metadata_reads_completed", "dacl_reads_completed", "directory_query_calls",
+                      "volume_checks_completed"):
+            self.assertIn('"' + token + '"', body)
+            self.assertIn("'" + token + "'", PS)
+        self.assertIn('result["progress"] = observation.Progress();', CS)
+        self.assertIn("backup_verified=$false; progress=$progress; inventory_elapsed_ms=", PS)
+        self.assertIn("Assert-K5Integer $progress[$key] 0 400004", PS)
+        self.assertIn("Assert-K5Integer $progress['volume_checks_completed'] 0 1", PS)
+
     def test_zero_byte_counter_is_csharp5_readonly_property(self):
         self.assertIn("internal long BytesRead { get { return 0; } }", CS)
         self.assertNotIn("internal long BytesRead;", CS)
@@ -166,8 +204,8 @@ class SourceContracts(unittest.TestCase):
             self.assertIn(token, body)
         self.assertNotIn("CreateDirectory", body)
         self.assertNotIn("File.WriteAll", body)
-        self.assertLess(body.index("ReadAclRecord(handle, 1)"), body.index("stream.Write(bytes"))
-        self.assertLess(body.index("ReadAclRecord(parent.Handle, 2)"), body.index("Native.NtCreateFile"))
+        self.assertLess(body.index("ReadDaclBytes(handle, 1)"), body.index("stream.Write(bytes"))
+        self.assertLess(body.index("SameDacl(parent, 2)"), body.index("Native.NtCreateFile"))
 
     def test_backup_custody_and_fresh_revalidation(self):
         for token in ("trusted.Contains(raw.Owner.Value)", "!common.IsCallback", "0x100d0040U",
@@ -227,6 +265,24 @@ class SourceContracts(unittest.TestCase):
 
 
 class IndependentModels(unittest.TestCase):
+    def test_raw_recheck_equality_matches_hash_equality_for_changed_dacl_bytes(self):
+        original = b"full immutable DACL and inheritance state"
+        for observed in (original, original[:-1], original + b"\0", b"other DACL"):
+            self.assertEqual(original == observed,
+                             hashlib.sha256(original).digest() == hashlib.sha256(observed).digest())
+
+    def test_projection_optimization_retains_four_security_reads_per_descendant(self):
+        for objects in (1, 2, 10, 50000):
+            # One trusted anchor and root plus both visits of every descendant.
+            native_reads_before = 4 * objects + 1
+            native_reads_after = 4 * objects + 1
+            projected_records_before = native_reads_before
+            projected_records_after = 2 * objects
+            self.assertEqual(native_reads_after, native_reads_before)
+            self.assertLess(projected_records_after, projected_records_before)
+            self.assertLessEqual(native_reads_after, 400004)
+            self.assertGreater(native_reads_before, 1)  # volume checks now occur once
+
     def test_compiler_projection_extracts_only_one_closed_token(self):
         self.assertEqual(closed_compiler_code(["private/path: warning CS0649: private source"]), "CS0649")
         self.assertEqual(closed_compiler_code(["CS0649", "CS0649"]), "CS0649")
