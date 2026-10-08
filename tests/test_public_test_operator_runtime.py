@@ -72,7 +72,7 @@ def test_public_test_source_rejects_credentials_or_unsafe_scheme(
         resolve_public_test_source_ip(source)
 
 
-def test_public_test_resolver_preserves_hostname_and_binds_enrolled_public_ip(
+def test_public_test_resolver_pins_probe_and_playback_to_enrolled_public_ip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(operator_runtime_module, "getaddrinfo", _public_dns)
@@ -97,10 +97,10 @@ def test_public_test_resolver_preserves_hostname_and_binds_enrolled_public_ip(
 
     resolved = asyncio.run(resolver.resolve(device, "public-test"))
 
-    assert resolved.source_uri == "rtsp://stream.example.test:1935/app/live?profile=main"
+    assert resolved.source_uri == "rtsp://8.8.8.8:1935/app/live?profile=main"
     assert resolved.payload_type == 97
     assert resolved.endpoint_ip == "8.8.8.8"
-    assert probed == [resolved.source_uri]
+    assert probed == ["rtsp://8.8.8.8:1935/app/live?profile=main"]
 
 
 def test_local_test_source_is_loopback_only() -> None:

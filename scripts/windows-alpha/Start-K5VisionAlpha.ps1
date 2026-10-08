@@ -119,14 +119,15 @@ function Test-K5AlphaOperatorReceipt([object]$Receipt, [bool]$AnalyticsRequired)
     $counterNames = @("delivered_frames", "presentations")
     if ($AnalyticsRequired) {
         foreach ($name in @("analytics_enabled", "analytics_provider_submissions",
-                            "analytics_provider_completions", "analytics_failures")) {
+                            "analytics_provider_completions", "analytics_rendered_boxes",
+                            "analytics_failures")) {
             if ($name -cnotin $fields) { return $false }
         }
         if ($Receipt.analytics_enabled -isnot [bool] -or -not $Receipt.analytics_enabled) {
             return $false
         }
         $counterNames += @("analytics_provider_submissions", "analytics_provider_completions",
-                           "analytics_failures")
+                           "analytics_rendered_boxes", "analytics_failures")
     }
     foreach ($name in $counterNames) {
         $counter = $Receipt.$name
@@ -718,6 +719,7 @@ try {
     }
     if ($analyticsRequired) {
         Write-Host ("K5 analytics PASS: submissions={0}, completions={1}, failures=0" -f $receipt.analytics_provider_submissions, $receipt.analytics_provider_completions)
+        Write-Host ("K5 analytics rendered boxes: {0}" -f $receipt.analytics_rendered_boxes)
     }
 
     Write-Host ("K5 operator PASS: frames={0}, presentations={1}" -f $receipt.delivered_frames, $receipt.presentations)

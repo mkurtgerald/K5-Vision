@@ -103,6 +103,7 @@ def test_selected_analytics_gate_precedes_any_operator_pass() -> None:
         "analytics_enabled",
         "analytics_provider_submissions",
         "analytics_provider_completions",
+        "analytics_rendered_boxes",
         "analytics_failures",
     ):
         assert name in helper
@@ -151,15 +152,16 @@ def _powershell(script: str, *, timeout: int = 45) -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows PowerShell 5.1")
-def test_windows_receipts_are_typed_and_fail_closed_without_requiring_boxes() -> None:
+def test_windows_receipts_are_typed_fail_closed_and_require_rendered_boxes() -> None:
     video = {"completed": True, "delivered_frames": 225, "presentations": 225}
     enabled = {
         **video,
         "analytics_enabled": True,
         "analytics_provider_submissions": 2,
         "analytics_provider_completions": 1,
+        "analytics_rendered_boxes": 1,
         "analytics_failures": 0,
-        "analytics_overlays_rendered": 0,
+        "analytics_overlays_rendered": 99,
     }
     cases = [
         (None, True, False),
@@ -184,7 +186,11 @@ def test_windows_receipts_are_typed_and_fail_closed_without_requiring_boxes() ->
     for field in ("delivered_frames", "presentations"):
         for value in (True, 1.0):
             cases.append(({**enabled, field: value}, True, False))
-    for field in ("analytics_provider_submissions", "analytics_provider_completions"):
+    for field in (
+        "analytics_provider_submissions",
+        "analytics_provider_completions",
+        "analytics_rendered_boxes",
+    ):
         for value in (False, True, 0):
             cases.append(({**enabled, field: value}, True, False))
     for value in (False, "true", 1):

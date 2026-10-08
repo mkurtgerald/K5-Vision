@@ -285,7 +285,7 @@ def test_runtime_pin_matches_exact_tracked_git_blob_manifest():
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     assert len(manifest) == 136
-    assert capture.RUNTIME_REVISION == "2017afdfefd80f81df610ead7461b41ad667c621"
+    assert capture.RUNTIME_REVISION == "e56a35de05f9ff0ddaf5d218dbeebb1c46d56835"
     assert independent == capture.RUNTIME_PAYLOAD_SHA256
 
 
