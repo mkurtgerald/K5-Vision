@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 # Invoked only as independently hash-verified, strict UTF-8 in-memory bytes.
 # This fixed one-attempt transport is not installer or retry authority.
-$sourceCommit = '10c2d4e64f494eef37b7c969c94ea1de5420bc77'
+$sourceCommit = 'afd444750cec76512bdaa6ff566bdbca2fc62dce'
 $repository = 'mkurtgerald/K5-Vision'
 $branch = 'review/git-link-metadata-20261008'
 $apiRoot = 'https://api.github.com/repos/mkurtgerald/K5-Vision/'
@@ -17,7 +17,7 @@ $utf8 = [Text.UTF8Encoding]::new($false, $true)
 $pins = @(
     @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
     @{ name = 'observe_installed_git_links.cs'; size = 34207; blob = '1e5bc986d255210f5cd82770bb472027c590f8bb'; sha256 = 'eeb76812034a45604fbe43171cecbffcc413af8c31fca611e0f2a75bf202059a' },
-    @{ name = 'observe-installed-git-links.ps1'; size = 18150; blob = '2cadebc723f48a7602dd6172ecad2a58211e93ef'; sha256 = 'f5b51a6ba796bf8b6e0acbbc31cfd976fbd87760a870821f4b35194c74144062' }
+    @{ name = 'observe-installed-git-links.ps1'; size = 20889; blob = 'cb919a3bdf6eb7dc85cab9ebc0420603b972f1c8'; sha256 = 'dcea700b6055401dafbbb0e7895b36dc1b7b750b125f282f1f8c5020092ab7e9' }
 )
 
 function Assert-OrdinaryPath([string]$Path, [bool]$Directory) {
@@ -168,8 +168,12 @@ function Assert-InboxCompiler {
     $compiler = Get-Item -LiteralPath $compilerPath -Force -ErrorAction Stop
     if ($compiler.FullName -cne $compilerPath -or $compiler.PSIsContainer -or
         ($compiler.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'runtime' }
+    $script:systemCorePath = Join-Path $runtime 'System.Core.dll'
+    $systemCore = Get-Item -LiteralPath $script:systemCorePath -Force -ErrorAction Stop
+    if ($systemCore.FullName -cne $script:systemCorePath -or $systemCore.PSIsContainer -or
+        ($systemCore.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'runtime' }
     if ($null -ne ('K5FixedGitObservation' -as [type])) { throw 'type_reuse' }
-    # Existing OS, PowerShell and .NET/compiler are explicit trust assumptions.
+    # Existing OS, PowerShell and .NET/compiler/references are explicit trust assumptions.
 }
 
 function Assert-CompilerIdle {
@@ -197,11 +201,13 @@ function Get-BundleRoot {
 }
 
 function New-PinnedBundle {
+    if ($Mode -ceq 'HostedQualify') { $script:qualificationPhase = 'bundle_creation' }
     $root = Get-BundleRoot
     New-PrivateDirectory $root
     $scripts = Join-Path $root 'scripts'
     New-PrivateDirectory $scripts
     $sources = @{}
+    if ($Mode -ceq 'HostedQualify') { $script:qualificationPhase = 'source_binding' }
     foreach ($pin in $pins) {
         $bytes = Get-PinnedSource $pin
         $path = Join-Path $scripts $pin.name
@@ -245,34 +251,85 @@ function Assert-RetainedArtifacts {
     # never replaces the workflow's required successful qualification/observation.
 }
 
+function Get-HostedFailureProjection([Management.Automation.ErrorRecord]$FailureRecord) {
+    $reason = 'unknown'
+    $compilerCode = 'unknown'
+    # Exact validation literals only; arbitrary error text never leaves this function.
+    switch -CaseSensitive ($FailureRecord.Exception.Message) {
+        'path' { $reason = 'path' }
+        'compiler_inventory' { $reason = 'compiler_inventory' }
+        'compiler_occupied' { $reason = 'compiler_occupied' }
+        'exists' { $reason = 'exists' }
+        'directory' { $reason = 'directory' }
+        'response_size' { $reason = 'response_size' }
+        'response_empty' { $reason = 'response_empty' }
+        'api_request' { $reason = 'api_request' }
+        'api_response' { $reason = 'api_response' }
+        'source_metadata' { $reason = 'source_metadata' }
+        'source_encoding' { $reason = 'source_encoding' }
+        'source_size' { $reason = 'source_size' }
+        'source_hash' { $reason = 'source_hash' }
+        'source_blob' { $reason = 'source_blob' }
+        'source_parse' { $reason = 'source_parse' }
+        'compiled_type' { $reason = 'compiled_type' }
+        'compiler_artifacts' { $reason = 'compiler_artifacts' }
+        'compiler_environment' { $reason = 'compiler_environment' }
+    }
+    if ($script:qualificationPhase -ceq 'compile' -and $FailureRecord.FullyQualifiedErrorId -cin @(
+        'SOURCE_CODE_ERROR,Microsoft.PowerShell.Commands.AddTypeCommand',
+        'COMPILER_ERRORS,Microsoft.PowerShell.Commands.AddTypeCommand'
+    )) {
+        $reason = 'compiler_error'
+        if ($FailureRecord.TargetObject -is [System.CodeDom.Compiler.CompilerError] -and
+            $FailureRecord.TargetObject.ErrorNumber -cmatch '\ACS[0-9]{4}\z') {
+            $compilerCode = $FailureRecord.TargetObject.ErrorNumber
+        }
+    }
+    return @{ reason = $reason; compiler_code = $compilerCode }
+}
+
 function Invoke-HostedQualification {
+    $script:qualificationPhase = 'compiler_idle_pre'
     Assert-CompilerIdle
     $bundle = New-PinnedBundle
     foreach ($name in @('observe-installed-git-links.ps1', 'assert-stage-one-physical-admission.ps1')) {
+        $script:qualificationPhase = $(if ($name -ceq 'observe-installed-git-links.ps1') { 'wrapper_parse' } else { 'guard_parse' })
         $tokens = $null
         $errors = $null
         $scriptText = $utf8.GetString($bundle.sources[$name])
         $null = [Management.Automation.Language.Parser]::ParseInput($scriptText, [ref]$tokens, [ref]$errors)
         if ($errors.Count -ne 0) { throw 'source_parse' }
     }
+    $script:qualificationPhase = 'compiler_temp'
     $compilerTemp = Join-Path $bundle.root 'compiler-temp'
     New-PrivateDirectory $compilerTemp
     $previousTemp = [Environment]::GetEnvironmentVariable('TEMP', 'Process')
     $previousTmp = [Environment]::GetEnvironmentVariable('TMP', 'Process')
+    $compileFailure = $null
+    $restoreError = $null
     try {
         [Environment]::SetEnvironmentVariable('TEMP', $compilerTemp, 'Process')
         [Environment]::SetEnvironmentVariable('TMP', $compilerTemp, 'Process')
         $source = $utf8.GetString($bundle.sources['observe_installed_git_links.cs'])
-        $types = @(Add-Type -TypeDefinition $source -Language CSharp -PassThru -ErrorAction Stop -WarningAction SilentlyContinue -Verbose:$false -Debug:$false)
+        $script:qualificationPhase = 'compile'
+        $types = @(Add-Type -TypeDefinition $source -Language CSharp -PassThru -ReferencedAssemblies @($script:systemCorePath) -ErrorAction Stop -WarningAction SilentlyContinue -Verbose:$false -Debug:$false)
+        $script:qualificationPhase = 'compiled_type'
         if (@($types | Where-Object { $_.FullName -ceq 'K5FixedGitObservation' }).Count -ne 1) { throw 'compiled_type' }
         # Do not invoke any collector method, wrapper, guard or native entry point.
+    } catch {
+        $compileFailure = $_
+        throw
     } finally {
-        $restoreFailed = $false
-        try { [Environment]::SetEnvironmentVariable('TEMP', $previousTemp, 'Process') } catch { $restoreFailed = $true }
-        try { [Environment]::SetEnvironmentVariable('TMP', $previousTmp, 'Process') } catch { $restoreFailed = $true }
-        if ($restoreFailed) { throw 'compiler_environment' }
+        try { [Environment]::SetEnvironmentVariable('TEMP', $previousTemp, 'Process') } catch { if ($null -eq $restoreError) { $restoreError = $_ } }
+        try { [Environment]::SetEnvironmentVariable('TMP', $previousTmp, 'Process') } catch { if ($null -eq $restoreError) { $restoreError = $_ } }
+        if ($null -ne $restoreError -and $null -eq $compileFailure) {
+            $script:qualificationPhase = 'compiler_environment'
+            throw [Management.Automation.RuntimeException]::new('compiler_environment', $restoreError.Exception)
+        }
     }
+    $script:qualificationPhase = 'compiler_idle_post'
     Assert-CompilerIdle
+    $script:qualificationPhase = 'compiler_artifacts'
     Assert-CompilerArtifacts $compilerTemp
 }
 
@@ -292,6 +349,9 @@ function Invoke-PhysicalPost {
 
 $failure = 'context_binding'
 $passed = $false
+$failureRecord = $null
+$script:qualificationPhase = 'unknown'
+$projection = @{ reason = 'unknown'; compiler_code = 'unknown' }
 try {
     Assert-Context
     $failure = 'runtime_binding'
@@ -321,12 +381,20 @@ try {
     }
     $passed = $true
 } catch {
+    $failureRecord = $_
+    if ($Mode -ceq 'HostedQualify' -and $failure -ceq 'hosted_qualification') {
+        $projection = Get-HostedFailureProjection $failureRecord
+    }
+    # Keep the original ErrorRecord private, including when environment restoration failed.
     # Never emit exception details, compiler text, source, paths, token, or environment.
 }
 $record = [ordered]@{
     schema_version = 'fixed-git-metadata-preparation-v1'; mode = $Mode
     status = $(if ($passed) { 'passed' } else { 'refused' })
     code = $(if ($passed) { 'none' } else { $failure })
+    phase = $(if ($passed) { 'none' } else { $script:qualificationPhase })
+    reason = $(if ($passed) { 'none' } else { $projection.reason })
+    compiler_code = $(if ($passed) { 'none' } else { $projection.compiler_code })
     source_commit = $sourceCommit; compiler_artifacts_retained = $true
     storage_admission = $false; retry_authority = $false; exception_authority = $false
 }

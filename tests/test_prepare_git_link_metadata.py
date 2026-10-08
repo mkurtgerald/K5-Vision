@@ -13,7 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 TEXT = (ROOT / "scripts/prepare-git-link-metadata.ps1").read_text(encoding="utf-8")
-COMMIT = "10c2d4e64f494eef37b7c969c94ea1de5420bc77"
+COMMIT = "afd444750cec76512bdaa6ff566bdbca2fc62dce"
 BRANCH = "review/git-link-metadata-20261008"
 REF = "refs/heads/" + BRANCH
 REPOSITORY = "mkurtgerald/K5-Vision"
@@ -28,8 +28,8 @@ PINS = {
         "eeb76812034a45604fbe43171cecbffcc413af8c31fca611e0f2a75bf202059a",
     ),
     "observe-installed-git-links.ps1": (
-        18150, "2cadebc723f48a7602dd6172ecad2a58211e93ef",
-        "f5b51a6ba796bf8b6e0acbbc31cfd976fbd87760a870821f4b35194c74144062",
+        20889, "cb919a3bdf6eb7dc85cab9ebc0420603b972f1c8",
+        "dcea700b6055401dafbbb0e7895b36dc1b7b750b125f282f1f8c5020092ab7e9",
     ),
 }
 
@@ -140,7 +140,7 @@ def test_exact_source_bytes_and_pins(name):
 
 @pytest.mark.parametrize("path,digest", [
     ("tests/test_installed_git_link_csharp_contract.py", "8a9909ffa73db4be2203743ba3bf86df7c4bc40c2dd49513d977f2edbe530057"),
-    ("tests/test_observe_installed_git_links_wrapper.py", "df719627b95af3695bb494562e5c43935013641a18039acc3330aa47a7fa689f"),
+    ("tests/test_observe_installed_git_links_wrapper.py", "0e9d9dfcce4079f9d63ad42c9bb0b19961f821b8802c8009cee781fc3c9ce44a"),
 ])
 def test_frozen_candidate_tests_remain_unchanged(path, digest):
     assert hashlib.sha256((ROOT / path).read_bytes()).hexdigest() == digest
@@ -368,10 +368,182 @@ def test_compiler_inventory_artifacts_and_logs_are_bounded_and_non_destructive()
         assert token not in TEXT
     assert TEXT.count("Write-Host") == 1
     assert "throw 'Fixed Git metadata preparation refused. Existing owners were preserved.'" in TEXT
-    assert "$_" not in TEXT.split("$failure = 'context_binding'", 1)[1]
+    dispatch = TEXT.split("$failure = 'context_binding'", 1)[1]
+    assert "$failureRecord = $_" in dispatch
+    record = dispatch.split("$record = [ordered]@{", 1)[1]
+    for private in ("$failureRecord", "TargetObject", "Exception", "FullyQualifiedErrorId"):
+        assert private not in record
     assert "hard compiler disk quota" in TEXT
 
 
 def test_source_checks_explicitly_do_not_claim_windows_or_native_proof():
     assert "not a PowerShell parser or Windows execution proof" in __doc__
     assert "No PowerShell, C#, CLI, Git, network, sockets, compilation, or runtime setup" in __doc__
+
+
+HOSTED_PHASES = {
+    "compiler_idle_pre", "bundle_creation", "source_binding", "wrapper_parse", "guard_parse",
+    "compiler_temp", "compile", "compiled_type", "compiler_environment", "compiler_idle_post",
+    "compiler_artifacts", "unknown",
+}
+HOSTED_REASONS = {
+    "path", "compiler_inventory", "compiler_occupied", "exists", "directory",
+    "response_size", "response_empty", "api_request", "api_response", "source_metadata",
+    "source_encoding", "source_size", "source_hash", "source_blob", "source_parse",
+    "compiled_type", "compiler_artifacts", "compiler_environment",
+}
+ADD_TYPE_IDS = {
+    "SOURCE_CODE_ERROR,Microsoft.PowerShell.Commands.AddTypeCommand",
+    "COMPILER_ERRORS,Microsoft.PowerShell.Commands.AddTypeCommand",
+}
+
+
+def hosted_projection_model(phase, message, error_id="", compiler_type=False, error_number=None):
+    """Closed projection model, never a PowerShell ErrorRecord/runtime simulation."""
+    reason = message if type(message) is str and message in HOSTED_REASONS else "unknown"
+    compiler_code = "unknown"
+    if phase == "compile" and error_id in ADD_TYPE_IDS:
+        reason = "compiler_error"
+        if (compiler_type is True and type(error_number) is str
+                and re.fullmatch(r"CS[0-9]{4}", error_number)):
+            compiler_code = error_number
+    return {"phase": phase if phase in HOSTED_PHASES else "unknown",
+            "reason": reason, "compiler_code": compiler_code}
+
+
+def test_repair_inbox_core_reference_is_fixed_checked_and_explicit():
+    runtime = section("function Assert-InboxCompiler", "function Assert-CompilerIdle")
+    hosted = section("function Invoke-HostedQualification", "function Invoke-PhysicalPost")
+    assert "$runtime -cne 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319'" in runtime
+    assert "$script:systemCorePath = Join-Path $runtime 'System.Core.dll'" in runtime
+    assert "$systemCore = Get-Item -LiteralPath $script:systemCorePath -Force -ErrorAction Stop" in runtime
+    assert "$systemCore.FullName -cne $script:systemCorePath -or $systemCore.PSIsContainer" in runtime
+    assert "$systemCore.Attributes -band [IO.FileAttributes]::ReparsePoint" in runtime
+    assert "-ReferencedAssemblies @($script:systemCorePath)" in hosted
+    assert TEXT.count("-ReferencedAssemblies") == 1
+    for forbidden in ("LinkType", "HardLink", "Assert-OrdinaryPath $script:systemCorePath",
+                      "Get-ChildItem", "Assembly]::Load", "GAC", "Install", "Download"):
+        assert forbidden not in runtime
+
+
+def test_repair_hosted_phase_precedes_each_fixed_substage():
+    hosted = section("function Invoke-HostedQualification", "function Invoke-PhysicalPost")
+    for phase, operation in (
+        ("compiler_idle_pre", "Assert-CompilerIdle"),
+        ("compiler_temp", "$compilerTemp = Join-Path"),
+        ("compile", "$types = @(Add-Type"),
+        ("compiled_type", "if (@($types | Where-Object"),
+        ("compiler_idle_post", "Assert-CompilerIdle\n    $script:qualificationPhase = 'compiler_artifacts'"),
+        ("compiler_artifacts", "Assert-CompilerArtifacts $compilerTemp"),
+    ):
+        assert hosted.index(f"$script:qualificationPhase = '{phase}'") < hosted.index(operation)
+    assert "if ($name -ceq 'observe-installed-git-links.ps1') { 'wrapper_parse' } else { 'guard_parse' }" in hosted
+    assert hosted.index("'wrapper_parse'") < hosted.index("ParseInput")
+    bundle = section("function New-PinnedBundle", "function Assert-CompilerArtifacts")
+    for phase, operation in (("bundle_creation", "$root = Get-BundleRoot"),
+                             ("source_binding", "$bytes = Get-PinnedSource $pin")):
+        assert bundle.index(f"$script:qualificationPhase = '{phase}'") < bundle.index(operation)
+    assert bundle.count("if ($Mode -ceq 'HostedQualify')") == 2
+    phases = set(re.findall(r"\$script:qualificationPhase = '([^']+)'", TEXT))
+    assert phases | {"wrapper_parse", "guard_parse"} == HOSTED_PHASES
+
+
+def test_repair_hosted_projection_is_closed_and_never_serializes_private_error():
+    projection = section("function Get-HostedFailureProjection", "function Invoke-HostedQualification")
+    pairs = re.findall(r"'([^']+)' \{ \$reason = '([^']+)' \}", projection)
+    assert dict(pairs) == {reason: reason for reason in HOSTED_REASONS}
+    assert "switch -CaseSensitive ($FailureRecord.Exception.Message)" in projection
+    assert "$script:qualificationPhase -ceq 'compile'" in projection
+    for error_id in ADD_TYPE_IDS:
+        assert f"'{error_id}'" in projection
+    assert "$FailureRecord.FullyQualifiedErrorId -cin @(" in projection
+    assert "$FailureRecord.TargetObject -is [System.CodeDom.Compiler.CompilerError]" in projection
+    assert "$FailureRecord.TargetObject.ErrorNumber -cmatch '\\ACS[0-9]{4}\\z'" in projection
+    assert "$reason = 'unknown'" in projection and "$compilerCode = 'unknown'" in projection
+    for forbidden in ("ErrorText", "ToString", "Write-Host", "Write-Output", "ConvertTo-Json",
+                      "-match 'CS", ".Split(", ".Substring(", "$reason = $FailureRecord"):
+        assert forbidden not in projection
+    dispatch = TEXT.split("$failure = 'context_binding'", 1)[1]
+    assert "$failureRecord = $_" in dispatch
+    assert "$Mode -ceq 'HostedQualify' -and $failure -ceq 'hosted_qualification'" in dispatch
+    assert "$projection = Get-HostedFailureProjection $failureRecord" in dispatch
+    record = dispatch.split("$record = [ordered]@{", 1)[1]
+    assert "phase = " in record and "reason = " in record and "compiler_code = " in record
+    assert "$failureRecord" not in record and "TargetObject" not in record
+
+
+def test_repair_original_error_survives_both_environment_restore_failures():
+    hosted = section("function Invoke-HostedQualification", "function Invoke-PhysicalPost")
+    assert "$compileFailure = $null" in hosted
+    assert "$restoreError = $null" in hosted
+    assert "$compileFailure = $_\n        throw" in hosted
+    restore = hosted.split("} finally {", 1)[1]
+    condition = "if ($null -ne $restoreError -and $null -eq $compileFailure)"
+    assert condition in restore
+    refusal = "throw [Management.Automation.RuntimeException]::new('compiler_environment', $restoreError.Exception)"
+    assert refusal in restore and restore.index(condition) < restore.index(refusal)
+    assert restore.count("catch { if ($null -eq $restoreError) { $restoreError = $_ } }") == 2
+    assert "$compileFailure =" not in restore
+
+
+@pytest.mark.parametrize("reason", sorted(HOSTED_REASONS))
+def test_repair_known_validation_reason_model(reason):
+    assert hosted_projection_model("source_binding", reason) == {
+        "phase": "source_binding", "reason": reason, "compiler_code": "unknown"}
+
+
+@pytest.mark.parametrize("message", [
+    "SOURCE_CODE_ERROR", "source_parse token-secret", "SOURCE_PARSE", "source_parse\n",
+    "CS0246 C:\\private\\source.cs Bearer secret", "api_response body-secret", "", None,
+])
+def test_repair_unknown_error_text_model_never_leaks(message):
+    assert hosted_projection_model("wrapper_parse", message) == {
+        "phase": "wrapper_parse", "reason": "unknown", "compiler_code": "unknown"}
+
+
+@pytest.mark.parametrize("error_id", sorted(ADD_TYPE_IDS))
+@pytest.mark.parametrize("typed,number,expected", [
+    (True, "CS0246", "CS0246"), (True, "CS0000", "CS0000"), (False, "CS0246", "unknown"),
+    (True, "cs0246", "unknown"), (True, "CS0246\n", "unknown"), (True, "CS02460", "unknown"),
+    (True, "CS246", "unknown"), (True, "CS0246 secret", "unknown"), (True, None, "unknown"),
+])
+def test_repair_compiler_code_requires_known_id_typed_target_and_exact_number(error_id, typed, number, expected):
+    result = hosted_projection_model("compile", "private compiler text", error_id, typed, number)
+    assert result == {"phase": "compile", "reason": "compiler_error", "compiler_code": expected}
+
+
+@pytest.mark.parametrize("phase,error_id", [
+    ("wrapper_parse", "SOURCE_CODE_ERROR,Microsoft.PowerShell.Commands.AddTypeCommand"),
+    ("compile", "SOURCE_CODE_ERROR"), ("compile", "COMPILER_ERRORS"),
+    ("compile", "SOURCE_CODE_ERROR,OtherCommand"),
+    ("compile", "source_code_error,Microsoft.PowerShell.Commands.AddTypeCommand"),
+    ("compile", "SOURCE_CODE_ERROR,Microsoft.PowerShell.Commands.AddTypeCommand\n"),
+])
+def test_repair_unrecognized_compiler_record_model_is_unknown(phase, error_id):
+    assert hosted_projection_model(phase, "private text", error_id, True, "CS0246") == {
+        "phase": phase, "reason": "unknown", "compiler_code": "unknown"}
+
+
+@pytest.mark.parametrize("primary,temp_failed,tmp_failed", [
+    (object(), True, True), (object(), True, False), (object(), False, True),
+    (object(), False, False), (None, True, True), (None, False, False),
+])
+def test_repair_restore_precedence_model(primary, temp_failed, tmp_failed):
+    original = primary
+    temp_error, tmp_error = object(), object()
+    restore_errors = [temp_error if temp_failed else None, tmp_error if tmp_failed else None]
+    restore_error = None
+    attempted = []
+    for error in restore_errors:
+        attempted.append(error)
+        if restore_error is None and error is not None:
+            restore_error = error
+    result = primary
+    if restore_error is not None and primary is None:
+        result = ("compiler_environment", restore_error)
+    assert attempted == restore_errors
+    assert restore_error is (temp_error if temp_failed else tmp_error if tmp_failed else None)
+    if original is not None:
+        assert result is original
+    else:
+        assert result == (("compiler_environment", restore_error) if restore_error is not None else None)
