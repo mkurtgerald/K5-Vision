@@ -20,7 +20,7 @@ Set-StrictMode -Version Latest
 # This observation never confers storage, retry, exception or delivery authority.
 $guardSha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d'
 # Exact frozen collector bytes; neither environment nor arguments can change this pin.
-$collectorSha256 = '22c73e7ffd587b97bab44c644cbb98c0c5f7f8598dba58a5b019f59194c1a712'
+$collectorSha256 = 'e4a4e5826d1a341c3159f22910c569c7c5c1b3ae1f1fede00eb3718612e9ac6c'
 $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
 
 function Assert-K5OrdinaryPath([string]$Path, [bool]$Directory) {
@@ -204,27 +204,149 @@ function Assert-K5Integer($Value, [long]$Minimum, [long]$Maximum) {
         $Value -lt $Minimum -or $Value -gt $Maximum) { throw 'record' }
 }
 
+# Inserted into the hash-pinned observation wrapper, not invoked as another file.
+# Local CIM reads only. No service control, account changes, or permissions writes.
+function Get-K5ConfiguredRunnerIdentity([string]$ServiceName, [string]$TokenSid) {
+    $result = [ordered]@{
+        status = 'refused'; code = 'service_name'; service_name = $null
+        configured_sid = $null; process_owner_sid = $null; service_pid = $null
+        current_token_matches = $false; owned_ancestry_verified = $false
+    }
+    $phase = 'service_name'
+    try {
+        if ($ServiceName -cnotmatch '\Aactions\.runner\.[A-Za-z0-9_.-]{1,241}\z' -or
+            $TokenSid -cnotmatch '\AS-1-[0-9-]{1,180}\z') { throw 'identity' }
+        $result.service_name = $ServiceName
+        $filter = "Name='$ServiceName'"
+        $expectedPath = 'C:\K5PhysicalRunner\bin\RunnerService.exe'
+        $previous = $null
+        # Reobserve config, live process owner and complete ancestry. PID alone is
+        # never identity; creation dates and ancestry edges must match both times.
+        for ($pass = 0; $pass -lt 2; $pass++) {
+            $phase = 'service_query'
+            $services = @(Get-CimInstance -ClassName Win32_Service -Filter $filter -Property Name,StartName,State,ProcessId,PathName,ServiceType -OperationTimeoutSec 5 -ErrorAction Stop)
+            if ($services.Count -ne 1) { $phase = 'service_absent_or_ambiguous'; throw 'identity' }
+            $service = $services[0]
+            $phase = 'service_scope'
+            if ($service.Name -cne $ServiceName -or $service.State -cne 'Running' -or
+                $service.ServiceType -cne 'Own Process' -or
+                ($service.PathName -cne $expectedPath -and $service.PathName -cne ('"' + $expectedPath + '"')) -or
+                [uint32]$service.ProcessId -le 0) { throw 'identity' }
+            $phase = 'configured_account'
+            $startName = [string]$service.StartName
+            $configuredSid = $null
+            switch -CaseSensitive ($startName) {
+                'LocalSystem' { $configuredSid = 'S-1-5-18' }
+                'NT AUTHORITY\SYSTEM' { $configuredSid = 'S-1-5-18' }
+                'NT AUTHORITY\LocalService' { $configuredSid = 'S-1-5-19' }
+                'NT AUTHORITY\LOCAL SERVICE' { $configuredSid = 'S-1-5-19' }
+                'NT AUTHORITY\NetworkService' { $configuredSid = 'S-1-5-20' }
+                'NT AUTHORITY\NETWORK SERVICE' { $configuredSid = 'S-1-5-20' }
+            }
+            if ($null -eq $configuredSid) {
+                # Deliberately no domain/remote account lookup or implicit fallback.
+                if ($startName -cnotmatch '\A(?:\.|VLR-CYZ4PK3)\\([A-Za-z0-9_.-]{1,64})\z') { throw 'identity' }
+                $accountName = $Matches[1]
+                $accounts = @(Get-CimInstance -ClassName Win32_UserAccount -Filter "LocalAccount=True AND Domain='VLR-CYZ4PK3' AND Name='$accountName'" -Property Name,Domain,LocalAccount,SID,Disabled -OperationTimeoutSec 5 -ErrorAction Stop)
+                if ($accounts.Count -ne 1 -or -not $accounts[0].LocalAccount -or $accounts[0].Disabled -or
+                    $accounts[0].Name -cne $accountName -or $accounts[0].Domain -cne 'VLR-CYZ4PK3' -or
+                    $accounts[0].SID -cnotmatch '\AS-1-5-21-[0-9-]{1,160}\z') { throw 'identity' }
+                $configuredSid = [string]$accounts[0].SID
+            }
+            $result.configured_sid = $configuredSid
+            $phase = 'process_query'
+            $processes = @(Get-CimInstance -ClassName Win32_Process -Property Name,ProcessId,ParentProcessId,CreationDate,ExecutablePath -OperationTimeoutSec 5 -ErrorAction Stop)
+            if ($processes.Count -eq 0 -or $processes.Count -gt 32768) { throw 'identity' }
+            $byId = @{}
+            foreach ($process in $processes) {
+                $processId = [uint32]$process.ProcessId
+                if ($byId.ContainsKey($processId)) { throw 'identity' }
+                $byId[$processId] = $process
+            }
+            $phase = 'service_process'
+            $serviceId = [uint32]$service.ProcessId
+            if (-not $byId.ContainsKey($serviceId)) { throw 'identity' }
+            $result.service_pid = $serviceId
+            $serviceProcess = $byId[$serviceId]
+            if ($serviceProcess.Name -cne 'RunnerService.exe' -or
+                $serviceProcess.ExecutablePath -cne $expectedPath -or
+                $null -eq $serviceProcess.CreationDate) { throw 'identity' }
+            $phase = 'process_owner'
+            # GetOwnerSid is read-only. No other CIM method is called.
+            $owner = Invoke-CimMethod -InputObject $serviceProcess -MethodName GetOwnerSid -OperationTimeoutSec 5 -ErrorAction Stop
+            if ($owner.ReturnValue -ne 0 -or $owner.Sid -cnotmatch '\AS-1-[0-9-]{1,180}\z') { throw 'identity' }
+            $result.process_owner_sid = [string]$owner.Sid
+            $result.current_token_matches = $TokenSid -ceq $configuredSid
+            $phase = 'account_mismatch'
+            if ($owner.Sid -cne $configuredSid -or $TokenSid -cne $configuredSid) { throw 'identity' }
+            $phase = 'owned_ancestry'
+            $cursor = [uint32]$PID
+            $seen = @{}
+            $chain = [Collections.Generic.List[string]]::new()
+            $found = $false
+            $workerCount = 0
+            for ($depth = 0; $depth -lt 32; $depth++) {
+                if ($seen.ContainsKey($cursor) -or -not $byId.ContainsKey($cursor)) { throw 'identity' }
+                $seen[$cursor] = $true
+                $node = $byId[$cursor]
+                if ($null -eq $node.CreationDate) { throw 'identity' }
+                $chain.Add(([string]$cursor + ':' + $node.CreationDate.ToUniversalTime().Ticks))
+                if ($node.Name -ceq 'Runner.Worker.exe') { $workerCount++ }
+                if ($cursor -eq $serviceId) { $found = $true; break }
+                $parentId = [uint32]$node.ParentProcessId
+                if (-not $byId.ContainsKey($parentId) -or $null -eq $byId[$parentId].CreationDate -or
+                    $byId[$parentId].CreationDate -gt $node.CreationDate) { throw 'identity' }
+                $cursor = $parentId
+            }
+            if (-not $found -or $workerCount -ne 1) { throw 'identity' }
+            $fingerprint = @($service.Name,$startName,$service.PathName,$service.State,$service.ServiceType,
+                $configuredSid,[string]$owner.Sid,($chain -join ',')) -join '|'
+            $phase = 'identity_changed'
+            if ($null -ne $previous -and $fingerprint -cne $previous) { throw 'identity' }
+            $previous = $fingerprint
+        }
+        $phase = 'current_token_changed'
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        try {
+            if ($null -eq $identity.User -or $identity.User.Value -cne $TokenSid) { throw 'identity' }
+        } finally { $identity.Dispose() }
+        $result.status = 'verified'
+        $result.code = 'none'
+        $result.configured_sid = $configuredSid
+        $result.process_owner_sid = [string]$owner.Sid
+        $result.service_pid = $serviceId
+        $result.current_token_matches = $true
+        $result.owned_ancestry_verified = $true
+    } catch {
+        # Emit only a closed reason vocabulary, never raw account, provider,
+        # exception, executable or command-line text.
+        $result.code = $phase
+    }
+    return $result
+}
+
 function Assert-K5DiagnosticRecord($Record, [hashtable]$Context) {
     $keys = @('schema_version','scope','target','status','code','closure_complete',
         'exception_authority','storage_admission','retry_authority','bytes_read','elapsed_ms')
     if ($Record['status'] -ceq 'observed') {
-        $keys += @('current_token_sid','service_identity','group_metadata','retention_nodes','directories')
+        $keys += @('current_token_sid','service_identity','runner_service_name','group_metadata','retention_nodes','directories')
     }
     Assert-K5RecordKeys $Record $keys
-    if ($Record['schema_version'] -cne 'fixed-runner-acl-observation-v1' -or
+    if ($Record['schema_version'] -cne 'fixed-runner-acl-prerequisite-v1' -or
         $Record['scope'] -cne 'fixed-runner-readonly-acl' -or
         $Record['target'] -cne 'runner-root-chain' -or
         $Record['status'] -cnotin @('observed','refused')) { throw 'record' }
     foreach ($key in @('exception_authority','storage_admission','retry_authority')) {
         if ($Record[$key] -isnot [bool] -or $Record[$key]) { throw 'record' }
     }
-    Assert-K5Integer $Record['bytes_read'] 0 0
+    Assert-K5Integer $Record['bytes_read'] 0 1024
     Assert-K5Integer $Record['elapsed_ms'] 0 19999
     if ($Record['closure_complete'] -isnot [bool]) { throw 'record' }
     if ($Record['status'] -ceq 'observed') {
         if (-not $Record['closure_complete'] -or $Record['code'] -cne 'none' -or
             $Record['service_identity'] -cne 'unresolved' -or $Record['group_metadata'] -cne 'not_queried' -or
             $Record['retention_nodes'] -cne 'not_queried' -or
+            $Record['runner_service_name'] -cnotmatch '\Aactions\.runner\.[A-Za-z0-9_.-]{1,241}\z' -or
             $Record['current_token_sid'] -cnotmatch '\AS-1-[0-9-]{1,180}\z') { throw 'record' }
         Assert-K5Integer $Record['elapsed_ms'] 0 8000
         $roles = @('volume_root','runner_root','work_root','repository_parent','workspace','temp_root')
@@ -252,10 +374,22 @@ function Assert-K5DiagnosticRecord($Record, [hashtable]$Context) {
     } else {
         if ($Record['closure_complete'] -or $Record['code'] -cnotin @('platform','abi','anchor_open','relative_open',
             'metadata','filesystem','reparse','path_type','acl_unavailable','acl_null','identity_mismatch',
-            'path_shape','name_bound','time_bound','changed','handle_bound','cleanup_failed','internal','enumeration','file_size')) { throw 'record' }
+            'path_shape','name_bound','time_bound','changed','handle_bound','cleanup_failed','internal','enumeration','file_size','read_failed','bytes_bound','alias_count','service_metadata_absent','service_metadata')) { throw 'record' }
     }
     $sanitized = [ordered]@{}
     foreach ($key in $keys) { $sanitized[$key] = $Record[$key] }
+    $serviceStatus = 'not_queried'
+    if ($Record['status'] -ceq 'observed') {
+        $configured = Get-K5ConfiguredRunnerIdentity $Record['runner_service_name'] $Record['current_token_sid']
+        $sanitized['configured_runner_identity'] = $configured
+        $serviceStatus = $configured.status
+        $sanitized['service_identity'] = $(if ($serviceStatus -ceq 'verified') { 'verified' } else { 'unresolved' })
+    }
+    # These prerequisites are NOT established by a fixed six-directory sample.
+    $sanitized['repair_ready'] = $false
+    $sanitized['required_writers'] = 'unresolved'
+    $sanitized['affected_subtree_inventory'] = 'not_collected'
+    $sanitized['rollback_backup'] = 'not_created'
     $sanitized['source_sha'] = $Context.source_sha
     $sanitized['run_id'] = $Context.run_id
     $sanitized['run_attempt'] = $Context.run_attempt
@@ -263,7 +397,7 @@ function Assert-K5DiagnosticRecord($Record, [hashtable]$Context) {
     $sanitized['compiler_artifacts_retained'] = $true
     $text = ConvertTo-Json -InputObject $sanitized -Compress -Depth 8
     if ($strictUtf8.GetByteCount($text) -gt 65536 -or $text -match '[\r\n]') { throw 'record' }
-    return @{text=$text;status=$Record['status']}
+    return @{text=$text;status=$Record['status'];service_status=$serviceStatus}
 }
 
 $guard = $null
@@ -366,16 +500,16 @@ try {
 if ($failed -or -not $postPassed -or $null -eq $result) {
     $projection = Get-K5FailureProjection $failureError
     $record = [ordered]@{
-        schema_version = 'fixed-runner-acl-observation-wrapper-v1'
+        schema_version = 'fixed-runner-acl-prerequisite-wrapper-v1'
         scope = 'fixed-runner-readonly-acl'; status = 'refused'; code = $failure
         reason = $projection.reason; compiler_code = $projection.compiler_code
         storage_admission = $false; retry_authority = $false; exception_authority = $false
         requires_separate_post_admission = $true; compiler_artifacts_retained = $true
     }
-    Write-Host ('K5_RUNNER_ACL_OBSERVATION=' + ($record | ConvertTo-Json -Compress -Depth 4))
+    Write-Host ('K5_RUNNER_ACL_PREREQUISITE=' + ($record | ConvertTo-Json -Compress -Depth 4))
     throw 'Runner ACL observation refused. Existing owners were preserved.'
 }
-Write-Host ('K5_RUNNER_ACL_OBSERVATION=' + $result.text)
-if ($result.status -cne 'observed') {
+Write-Host ('K5_RUNNER_ACL_PREREQUISITE=' + $result.text)
+if ($result.status -cne 'observed' -or $result.service_status -cne 'verified') {
     throw 'Runner ACL observation refused. Existing owners were preserved.'
 }

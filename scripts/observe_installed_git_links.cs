@@ -1,4 +1,4 @@
-// Task-local, read-only owner/DACL observation of the fixed runner directory chain.
+// Task-local, read-only ACL and .service prerequisite observation. No repair code.
 // C:\ is an explicitly trusted OS/device-map anchor. Every descendant is opened
 // as one component relative to a held parent. No namespace or runtime framework.
 // Windows PowerShell 5.1 / .NET Framework / C# 5; source tests are not native proof.
@@ -44,7 +44,7 @@ public static class K5FixedGitObservation
         "alias_outside_root", "alias_duplicate", "alias_missing_primary", "alias_count",
         "identity_mismatch", "path_shape", "name_bound", "file_size", "bytes_bound",
         "time_bound", "enumeration", "changed", "read_failed", "handle_bound",
-        "cleanup_failed", "internal"
+        "cleanup_failed", "internal", "service_metadata_absent", "service_metadata"
     };
 
     // Invoke only after the parent has admitted this own PowerShell observation step.
@@ -102,7 +102,7 @@ public static class K5FixedGitObservation
     {
         return new Dictionary<string, object>(StringComparer.Ordinal)
         {
-            { "schema_version", "fixed-runner-acl-observation-v1" },
+            { "schema_version", "fixed-runner-acl-prerequisite-v1" },
             { "scope", "fixed-runner-readonly-acl" },
             { "target", "runner-root-chain" },
             { "status", "refused" },
@@ -199,7 +199,7 @@ public static class K5FixedGitObservation
             return Capture(handle, true);
         }
 
-        private Held OpenRelative(Held parent, string component, bool directory)
+        private Held OpenRelative(Held parent, string component, bool directory, bool serviceMetadata = false)
         {
             ValidateComponent(component); // Before allocating/opening any alias.
             Require(parent != null && parent.Directory, "path_type");
@@ -229,6 +229,9 @@ public static class K5FixedGitObservation
                     FileOpenReparsePoint | FileSynchronousIoNonalert |
                     (directory ? FileDirectoryFile : FileNonDirectoryFile));
                 Own(handle); // Own even an anomalous non-null handle on failure.
+                if (serviceMetadata && status == unchecked((int)0xc0000034) &&
+                    (handle == IntPtr.Zero || handle == InvalidHandle))
+                    throw new Refusal("service_metadata_absent");
                 Require(status == 0 && io.Status == 0 && handle != IntPtr.Zero &&
                     handle != InvalidHandle, "relative_open");
                 Held result = Capture(handle, directory);
@@ -527,16 +530,50 @@ public static class K5FixedGitObservation
             return result;
         }
 
+        private string ReadServiceName(Held file)
+        {
+            // Only the fixed runner .service file is read. Never .credentials,
+            // .runner, logs, executable content, or a caller-provided pathname.
+            Require(file.Initial.Links == 1 && file.Initial.Size <= 512, "service_metadata");
+            long position;
+            Require(Native.SetFilePointerEx(file.Handle, 0, out position, 0) && position == 0,
+                "read_failed");
+            byte[] bytes = new byte[(int)file.Initial.Size];
+            uint received;
+            Tick();
+            Require(BytesRead <= 1024 - bytes.Length, "bytes_bound");
+            bool read = Native.ReadFile(file.Handle, bytes, (uint)bytes.Length, out received, IntPtr.Zero);
+            Require(received <= bytes.Length, "read_failed");
+            BytesRead += received;
+            Tick();
+            Require(read && received == bytes.Length, "read_failed");
+            string text;
+            try { text = new UTF8Encoding(false, true).GetString(bytes); }
+            catch (DecoderFallbackException) { throw new Refusal("service_metadata"); }
+            if (text.StartsWith("\ufeff", StringComparison.Ordinal)) text = text.Substring(1);
+            if (text.EndsWith("\r\n", StringComparison.Ordinal)) text = text.Substring(0, text.Length - 2);
+            else if (text.EndsWith("\n", StringComparison.Ordinal)) text = text.Substring(0, text.Length - 1);
+            Require(text.Length > 15 && text.Length <= 256 &&
+                text.StartsWith("actions.runner.", StringComparison.Ordinal), "service_metadata");
+            foreach (char value in text)
+                Require((value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+                    (value >= '0' && value <= '9') || value == '.' || value == '_' || value == '-',
+                    "service_metadata");
+            return text;
+        }
+
         internal Dictionary<string, object> RunStorage()
         {
-            // Fixed existing directory chain only. No file content, recursion, service
-            // discovery, name lookup, permission mutation, or directory creation.
+            // Fixed directory chain and one non-secret .service metadata file only.
+            // No recursion, executable reads, permission mutation, or creation.
             Held anchor = OpenAnchor();
             Held runner = OpenRelative(anchor, "K5PhysicalRunner", true);
             Held work = OpenRelative(runner, "_work", true);
             Held repo = OpenRelative(work, "K5-Vision", true);
             Held workspace = OpenRelative(repo, "K5-Vision", true);
             Held temp = OpenRelative(work, "_temp", true);
+            Held serviceFile = OpenRelative(runner, ".service", false, true);
+            string serviceName = ReadServiceName(serviceFile);
             Held[] nodes = new Held[] { anchor, runner, work, repo, workspace, temp };
             string[] roles = new string[] { "volume_root", "runner_root", "work_root", "repository_parent", "workspace", "temp_root" };
             string tokenSid;
@@ -557,9 +594,10 @@ public static class K5FixedGitObservation
             }
             foreach (Held item in held)
             {
-                Require(item.Initial.Same(ReadMetadata(item.Handle, true)), "changed");
+                Require(item.Initial.Same(ReadMetadata(item.Handle, item.Directory)), "changed");
                 Require(item.Acl == ReadAcl(item.Handle), "changed");
             }
+            Require(ReadServiceName(serviceFile) == serviceName, "changed");
             using (System.Security.Principal.WindowsIdentity identity = System.Security.Principal.WindowsIdentity.GetCurrent())
                 Require(identity.User != null && identity.User.Value == tokenSid, "changed");
             Dictionary<string, object> result = BaseRecord();
@@ -568,6 +606,7 @@ public static class K5FixedGitObservation
             result["closure_complete"] = true;
             result["current_token_sid"] = tokenSid;
             result["service_identity"] = "unresolved";
+            result["runner_service_name"] = serviceName;
             result["group_metadata"] = "not_queried";
             result["retention_nodes"] = "not_queried";
             result["directories"] = records;
