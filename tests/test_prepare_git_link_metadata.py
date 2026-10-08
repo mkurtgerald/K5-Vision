@@ -13,7 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 TEXT = (ROOT / "scripts/prepare-git-link-metadata.ps1").read_text(encoding="utf-8")
-COMMIT = "afd444750cec76512bdaa6ff566bdbca2fc62dce"
+COMMIT = "4d6e7bee294cd972c015961959db08baea371d58"
 BRANCH = "review/git-link-metadata-20261008"
 REF = "refs/heads/" + BRANCH
 REPOSITORY = "mkurtgerald/K5-Vision"
@@ -387,7 +387,8 @@ HOSTED_PHASES = {
     "compiler_artifacts", "unknown",
 }
 HOSTED_REASONS = {
-    "path", "compiler_inventory", "compiler_occupied", "exists", "directory",
+    "path_lexical", "path_canonical", "path_component", "path_fullname", "path_type",
+    "path_depth", "path_reparse", "path_link", "compiler_inventory", "compiler_occupied", "exists", "directory",
     "response_size", "response_empty", "api_request", "api_response", "source_metadata",
     "source_encoding", "source_size", "source_hash", "source_blob", "source_parse",
     "compiled_type", "compiler_artifacts", "compiler_environment",
@@ -547,3 +548,200 @@ def test_repair_restore_precedence_model(primary, temp_failed, tmp_failed):
         assert result is original
     else:
         assert result == (("compiler_environment", restore_error) if restore_error is not None else None)
+
+
+PATH_REASONS = {
+    "path_lexical", "path_canonical", "path_component", "path_fullname", "path_type",
+    "path_depth", "path_reparse", "path_link",
+}
+
+
+def artifact_observation_model(entries, root_failure=None):
+    """Shallow, first-refusal model; counts describe checks reached, not a full inventory."""
+    observation = {
+        "state": "partial_at_refusal", "scope": "root", "observed_type": "unknown",
+        "entries_seen": 0, "files_seen": 0, "directories_seen": 0,
+        "reparse_seen": 0, "links_seen": 0, "invalid_seen": 0,
+    }
+    if root_failure:
+        return root_failure, observation
+    total_bytes = 0
+    for entry in entries:
+        observation["scope"] = "entry"
+        observation["observed_type"] = "unknown"
+        observation["entries_seen"] += 1
+        if observation["entries_seen"] > 64:
+            return "compiler_artifacts", observation
+        failure = entry.get("failure")
+        if failure in {"path_lexical", "path_canonical", "path_component", "path_fullname", "unknown"}:
+            observation["invalid_seen"] += 1
+            return failure, observation
+        is_directory = entry.get("directory", False)
+        observation["observed_type"] = "directory" if is_directory else "file"
+        observation["directories_seen" if is_directory else "files_seen"] += 1
+        if is_directory:
+            failure = "path_type"
+        elif entry.get("reparse"):
+            observation["reparse_seen"] += 1
+            failure = "path_reparse"
+        elif entry.get("link"):
+            observation["links_seen"] += 1
+            failure = "path_link"
+        elif failure not in {"path_depth", "path_reparse", "path_link"}:
+            failure = None
+        if failure:
+            observation["invalid_seen"] += 1
+            return failure, observation
+        size = entry.get("size", 0)
+        total_bytes += size
+        if size < 0 or total_bytes > 16777216:
+            observation["invalid_seen"] += 1
+            return "compiler_artifacts", observation
+    return None, observation
+
+
+def test_artifact_projection_path_categories_keep_all_gates_and_order():
+    path = section("function Assert-OrdinaryPath", "function Read-BoundedStream")
+    assert set(re.findall(r"throw '(path_[a-z]+)'", path)) == PATH_REASONS
+    assert "throw 'path'" not in path
+    ordered = [
+        "throw 'path_lexical'", "GetFullPath($Path) -cne $Path", "throw 'path_canonical'",
+        "throw 'path_component'", "Get-Item -LiteralPath $Path -Force -ErrorAction Stop",
+        "$item.FullName -cne $Path", "throw 'path_fullname'", "[bool]$item.PSIsContainer",
+        "throw 'path_type'", "$count -gt 32", "throw 'path_depth'",
+        "$item.Attributes -band [IO.FileAttributes]::ReparsePoint", "throw 'path_reparse'",
+        "$item.LinkType", "throw 'path_link'",
+    ]
+    assert [path.index(token) for token in ordered] == sorted(path.index(token) for token in ordered)
+    assert path.count("Get-Item") == 1
+    for gate in ("$Path.Length -gt 1024", "$Path.Substring(2).Contains(':')",
+                 "$part.Length -eq 0", "$part -in @('.', '..')", "$part.EndsWith('.')",
+                 "$part.EndsWith(' ')", "$item.Directory", "$item.Parent"):
+        assert gate in path
+    # An unexpected metadata/canonicalization exception keeps its original ErrorRecord.
+    assert "catch" not in path
+
+
+def test_artifact_projection_stays_shallow_and_stops_at_first_refused_entry():
+    artifacts = section("function Assert-CompilerArtifacts", "function Assert-RetainedArtifacts")
+    path = section("function Assert-OrdinaryPath", "function Read-BoundedStream")
+    assert "Assert-OrdinaryPath $Path $true $observation" in artifacts
+    assert "Assert-OrdinaryPath $entry $false $observation" in artifacts
+    assert "$script:compilerArtifactObservation = $observation" in artifacts
+    assert "state = 'partial_at_refusal'" in artifacts
+    for field in ("entries_seen", "files_seen", "directories_seen", "reparse_seen", "links_seen", "invalid_seen"):
+        assert f"{field} = 0" in artifacts
+    assert "scope = 'root'; observed_type = 'unknown'" in artifacts
+    assert "$observation.scope = 'entry'" in artifacts
+    assert "$observation.observed_type = 'unknown'" in artifacts
+    assert artifacts.index("$count++") < artifacts.index("$observation.entries_seen = $count")
+    assert artifacts.index("$count -gt 64") < artifacts.index("$entry = [string]$entries.Current")
+    assert "catch { $observation.invalid_seen++; throw }" in artifacts
+    assert artifacts.count("MoveNext()") == 1 and artifacts.count("Get-Item") == 1
+    assert artifacts.count("EnumerateFileSystemEntries") == 1
+    assert "SearchOption" not in artifacts and "Recurse" not in artifacts
+    assert path.count("$Observation.scope -ceq 'entry'") == 3
+    assert path.count("$count -eq 1") == 2
+    # The existing second metadata read, length bound, and enumerator disposal survive.
+    assert "$file = Get-Item -LiteralPath $entry -Force -ErrorAction Stop" in artifacts
+    assert "$file.Length -lt 0 -or $bytes -gt 16777216" in artifacts
+    assert "finally { $entries.Dispose() }" in artifacts
+
+
+def test_artifact_projection_output_is_hosted_failure_only_and_has_no_private_values():
+    projection = section("function Get-HostedFailureProjection", "function Invoke-HostedQualification")
+    assert "$script:qualificationPhase -ceq 'compiler_artifacts'" in projection
+    assert "compiler_artifact_observation = $artifactObservation" in projection
+    assert "$artifactObservation = $null" in projection
+    dispatch = TEXT.split("$failure = 'context_binding'", 1)[1]
+    assert "$script:compilerArtifactObservation = $null" in dispatch
+    assert "compiler_artifact_observation = $null" in dispatch
+    assert "compiler_artifact_observation = $(if ($passed) { $null } else { $projection.compiler_artifact_observation })" in dispatch
+    record = dispatch.split("$record = [ordered]@{", 1)[1]
+    for private in ("$Path", "$entry", "$file", "$item", "$failureRecord", "Exception", "TargetObject", "FullyQualifiedErrorId"):
+        assert private not in record
+    observation_source = section("function Assert-CompilerArtifacts", "function Assert-RetainedArtifacts")
+    for forbidden in (".FullName", ".Name", "Write-Host", "Write-Output", "ConvertTo-Json"):
+        assert forbidden not in observation_source
+
+
+def test_artifact_projection_ordinary_child_directory_remains_refused_not_admitted():
+    def entries():
+        yield {"size": 2}
+        yield {"directory": True}
+        raise AssertionError("first directory refusal must stop further enumeration")
+
+    reason, observation = artifact_observation_model(entries())
+    assert reason == "path_type"
+    assert observation == {
+        "state": "partial_at_refusal", "scope": "entry", "observed_type": "directory",
+        "entries_seen": 2, "files_seen": 1, "directories_seen": 1,
+        "reparse_seen": 0, "links_seen": 0, "invalid_seen": 1,
+    }
+    # A high-integrity CodeDOM child is one possible directory, never evidence of this run's exact entry.
+    assert "Assert-OrdinaryPath $entry $false $observation" in section(
+        "function Assert-CompilerArtifacts", "function Assert-RetainedArtifacts")
+
+
+@pytest.mark.parametrize("failure", sorted(PATH_REASONS | {"unknown"}))
+def test_artifact_projection_root_refusal_has_no_enumerated_entries(failure):
+    def entries():
+        raise AssertionError("root refusal cannot enumerate children")
+        yield
+
+    reason, observation = artifact_observation_model(entries(), root_failure=failure)
+    assert reason == failure and observation["scope"] == "root"
+    assert all(value == 0 for key, value in observation.items() if key.endswith("_seen"))
+
+
+@pytest.mark.parametrize("failure", ["path_lexical", "path_canonical", "path_component", "path_fullname", "unknown"])
+def test_artifact_projection_early_failure_cannot_claim_entry_type(failure):
+    reason, observation = artifact_observation_model([{"failure": failure, "directory": True}])
+    assert reason == failure and observation["observed_type"] == "unknown"
+    assert observation["entries_seen"] == observation["invalid_seen"] == 1
+    assert observation["files_seen"] == observation["directories_seen"] == 0
+
+
+@pytest.mark.parametrize("entry,expected", [
+    ({"reparse": True}, "path_reparse"), ({"link": True}, "path_link"),
+    ({"failure": "path_depth"}, "path_depth"),
+    ({"failure": "path_reparse"}, "path_reparse"),  # Ancestor flag is not a child flag.
+    ({"failure": "path_link"}, "path_link"),
+    ({"directory": True, "reparse": True, "link": True}, "path_type"),
+    ({"reparse": True, "link": True}, "path_reparse"),
+])
+def test_artifact_projection_preserves_gate_precedence_and_partial_flag_counts(entry, expected):
+    reason, observation = artifact_observation_model([entry])
+    assert reason == expected and observation["invalid_seen"] == 1
+    assert observation["reparse_seen"] == int(not entry.get("directory") and bool(entry.get("reparse")))
+    assert observation["links_seen"] == int(not entry.get("directory") and not entry.get("reparse") and bool(entry.get("link")))
+
+
+@pytest.mark.parametrize("count", [0, 1, 64, 65, 100])
+def test_artifact_projection_count_cap_is_65_and_does_not_read_65th_metadata(count):
+    class UnreadableMetadata(dict):
+        def get(self, *args):
+            raise AssertionError("cap refusal must not inspect the 65th entry")
+
+    entries = [{}] * min(count, 64) + ([UnreadableMetadata()] * max(0, count - 64))
+    reason, observation = artifact_observation_model(entries)
+    assert reason == ("compiler_artifacts" if count > 64 else None)
+    assert observation["entries_seen"] == min(count, 65)
+    assert observation["files_seen"] == min(count, 64)
+    assert observation["invalid_seen"] == 0
+    assert all(0 <= value <= 65 for key, value in observation.items() if key.endswith("_seen"))
+    if count > 64:
+        assert observation["observed_type"] == "unknown"
+
+
+@pytest.mark.parametrize("sizes,refused", [([0], False), ([16777216], False), ([16777217], True), ([-1], True), ([16777216, 1], True)])
+def test_artifact_projection_preserves_retained_file_size_bounds(sizes, refused):
+    reason, observation = artifact_observation_model([{"size": size} for size in sizes])
+    assert reason == ("compiler_artifacts" if refused else None)
+    assert observation["invalid_seen"] == int(refused)
+
+
+@pytest.mark.parametrize("message", ["path", "path_type private-name", "path_type\n", "PATH_TYPE", "C:\\private\\file", "Bearer token"])
+def test_artifact_projection_unknown_stays_unknown_without_message_scraping(message):
+    assert hosted_projection_model("compiler_artifacts", message) == {
+        "phase": "compiler_artifacts", "reason": "unknown", "compiler_code": "unknown"}

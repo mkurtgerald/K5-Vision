@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 # Invoked only as independently hash-verified, strict UTF-8 in-memory bytes.
 # This fixed one-attempt transport is not installer or retry authority.
-$sourceCommit = 'afd444750cec76512bdaa6ff566bdbca2fc62dce'
+$sourceCommit = '4d6e7bee294cd972c015961959db08baea371d58'
 $repository = 'mkurtgerald/K5-Vision'
 $branch = 'review/git-link-metadata-20261008'
 $apiRoot = 'https://api.github.com/repos/mkurtgerald/K5-Vision/'
@@ -20,21 +20,37 @@ $pins = @(
     @{ name = 'observe-installed-git-links.ps1'; size = 20889; blob = 'cb919a3bdf6eb7dc85cab9ebc0420603b972f1c8'; sha256 = 'dcea700b6055401dafbbb0e7895b36dc1b7b750b125f282f1f8c5020092ab7e9' }
 )
 
-function Assert-OrdinaryPath([string]$Path, [bool]$Directory) {
+function Assert-OrdinaryPath([string]$Path, [bool]$Directory, [hashtable]$Observation = $null) {
     if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 1024 -or
         $Path -cnotmatch '\A[A-Z]:\\' -or $Path -match '[\x00-\x1f"<>|?*]' -or
-        $Path.Substring(2).Contains(':') -or [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'path' }
+        $Path.Substring(2).Contains(':')) { throw 'path_lexical' }
+    if ([IO.Path]::GetFullPath($Path) -cne $Path) { throw 'path_canonical' }
     foreach ($part in $Path.Substring(3).Split('\')) {
         if ($part.Length -eq 0 -or $part -in @('.', '..') -or
-            $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'path' }
+            $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'path_component' }
     }
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-    if ($item.FullName -cne $Path -or [bool]$item.PSIsContainer -ne $Directory) { throw 'path' }
+    if ($item.FullName -cne $Path) { throw 'path_fullname' }
+    $isDirectory = [bool]$item.PSIsContainer
+    if ($null -ne $Observation) {
+        $Observation.observed_type = $(if ($isDirectory) { 'directory' } else { 'file' })
+        if ($Observation.scope -ceq 'entry') {
+            if ($isDirectory) { $Observation.directories_seen++ } else { $Observation.files_seen++ }
+        }
+    }
+    if ($isDirectory -ne $Directory) { throw 'path_type' }
     $count = 0
     while ($null -ne $item) {
         $count++
-        if ($count -gt 32 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
-            -not [string]::IsNullOrEmpty($item.LinkType)) { throw 'path' }
+        if ($count -gt 32) { throw 'path_depth' }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            if ($null -ne $Observation -and $Observation.scope -ceq 'entry' -and $count -eq 1) { $Observation.reparse_seen++ }
+            throw 'path_reparse'
+        }
+        if (-not [string]::IsNullOrEmpty($item.LinkType)) {
+            if ($null -ne $Observation -and $Observation.scope -ceq 'entry' -and $count -eq 1) { $Observation.links_seen++ }
+            throw 'path_link'
+        }
         $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
     }
 }
@@ -222,19 +238,32 @@ function New-PinnedBundle {
 }
 
 function Assert-CompilerArtifacts([string]$Path) {
-    Assert-OrdinaryPath $Path $true
+    # Counts cover only checks reached before first refusal, never a full inventory.
+    # Flag counts describe the entry itself, not its ancestors or unexamined metadata.
+    $observation = @{
+        state = 'partial_at_refusal'; scope = 'root'; observed_type = 'unknown'
+        entries_seen = 0; files_seen = 0; directories_seen = 0
+        reparse_seen = 0; links_seen = 0; invalid_seen = 0
+    }
+    $script:compilerArtifactObservation = $observation
+    Assert-OrdinaryPath $Path $true $observation
     $entries = [IO.Directory]::EnumerateFileSystemEntries($Path).GetEnumerator()
     $count = 0
     [long]$bytes = 0
     try {
         while ($entries.MoveNext()) {
+            $observation.scope = 'entry'
+            $observation.observed_type = 'unknown'
             $count++
+            $observation.entries_seen = $count
             if ($count -gt 64) { throw 'compiler_artifacts' }
             $entry = [string]$entries.Current
-            Assert-OrdinaryPath $entry $false
-            $file = Get-Item -LiteralPath $entry -Force -ErrorAction Stop
-            $bytes += $file.Length
-            if ($file.Length -lt 0 -or $bytes -gt 16777216) { throw 'compiler_artifacts' }
+            try {
+                Assert-OrdinaryPath $entry $false $observation
+                $file = Get-Item -LiteralPath $entry -Force -ErrorAction Stop
+                $bytes += $file.Length
+                if ($file.Length -lt 0 -or $bytes -gt 16777216) { throw 'compiler_artifacts' }
+            } catch { $observation.invalid_seen++; throw }
         }
     } finally { $entries.Dispose() }
     # Retained files only: acceptance bounds, not a hard compiler disk quota.
@@ -256,7 +285,14 @@ function Get-HostedFailureProjection([Management.Automation.ErrorRecord]$Failure
     $compilerCode = 'unknown'
     # Exact validation literals only; arbitrary error text never leaves this function.
     switch -CaseSensitive ($FailureRecord.Exception.Message) {
-        'path' { $reason = 'path' }
+        'path_lexical' { $reason = 'path_lexical' }
+        'path_canonical' { $reason = 'path_canonical' }
+        'path_component' { $reason = 'path_component' }
+        'path_fullname' { $reason = 'path_fullname' }
+        'path_type' { $reason = 'path_type' }
+        'path_depth' { $reason = 'path_depth' }
+        'path_reparse' { $reason = 'path_reparse' }
+        'path_link' { $reason = 'path_link' }
         'compiler_inventory' { $reason = 'compiler_inventory' }
         'compiler_occupied' { $reason = 'compiler_occupied' }
         'exists' { $reason = 'exists' }
@@ -285,7 +321,9 @@ function Get-HostedFailureProjection([Management.Automation.ErrorRecord]$Failure
             $compilerCode = $FailureRecord.TargetObject.ErrorNumber
         }
     }
-    return @{ reason = $reason; compiler_code = $compilerCode }
+    $artifactObservation = $null
+    if ($script:qualificationPhase -ceq 'compiler_artifacts') { $artifactObservation = $script:compilerArtifactObservation }
+    return @{ reason = $reason; compiler_code = $compilerCode; compiler_artifact_observation = $artifactObservation }
 }
 
 function Invoke-HostedQualification {
@@ -351,7 +389,8 @@ $failure = 'context_binding'
 $passed = $false
 $failureRecord = $null
 $script:qualificationPhase = 'unknown'
-$projection = @{ reason = 'unknown'; compiler_code = 'unknown' }
+$script:compilerArtifactObservation = $null
+$projection = @{ reason = 'unknown'; compiler_code = 'unknown'; compiler_artifact_observation = $null }
 try {
     Assert-Context
     $failure = 'runtime_binding'
@@ -395,6 +434,7 @@ $record = [ordered]@{
     phase = $(if ($passed) { 'none' } else { $script:qualificationPhase })
     reason = $(if ($passed) { 'none' } else { $projection.reason })
     compiler_code = $(if ($passed) { 'none' } else { $projection.compiler_code })
+    compiler_artifact_observation = $(if ($passed) { $null } else { $projection.compiler_artifact_observation })
     source_commit = $sourceCommit; compiler_artifacts_retained = $true
     storage_admission = $false; retry_authority = $false; exception_authority = $false
 }
