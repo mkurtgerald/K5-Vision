@@ -1,0 +1,104 @@
+name: Owner Windows Installer Candidate
+on:
+  push:
+    branches:
+      - fix/transactional-alpha-upgrade-20261003
+    paths:
+      - scripts/windows-alpha/**
+      - scripts/provision-stage03-gstreamer.ps1
+      - .github/workflows/owner-windows-installer-candidate.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  build-installer-candidate:
+    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+    runs-on: windows-2025
+    timeout-minutes: 55
+    steps:
+      - name: Checkout exact installer source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Compile graphical owner launcher
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build\owner-installer'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path -LiteralPath $compiler)) { throw 'Expected Windows GUI compiler unavailable.' }
+          $source = Join-Path $env:GITHUB_WORKSPACE 'scripts\windows-alpha\owner-installer\K5VisionAlpha.cs'
+          $exe = Join-Path $out 'K5VisionAlpha.exe'
+          & $compiler /nologo /target:winexe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll "/out:$exe" $source
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $exe)) { throw 'Owner GUI compilation failed.' }
+          $probe = Start-Process -FilePath $exe -ArgumentList '--self-check' -PassThru -Wait -WindowStyle Hidden -ErrorAction Stop
+          if ($probe.ExitCode -ne 3) { throw 'GUI must refuse incomplete runtime.' }
+
+      - name: Acquire pinned upstream CPython 3.12.10 setup
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $uri = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe'
+          $target = Join-Path $env:GITHUB_WORKSPACE 'build\owner-installer\python-3.12.10-amd64.exe'
+          Invoke-WebRequest -Uri $uri -OutFile $target -UseBasicParsing -ErrorAction Stop
+          $hash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+          if ($hash -cne '67B5635E80EA51072B87941312D00EC8927C4DB9BA18938F7AD2D27B328B95FB') { throw 'Pinned Python artifact hash mismatch.' }
+          $sig = Get-AuthenticodeSignature -FilePath $target
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Python Software Foundation') { throw 'Python vendor signature verification failed.' }
+          Write-Host 'K5_BUNDLED_PYTHON_IDENTITY=3.12.10/verified'
+
+      - name: Compile double-click setup candidate
+        id: compile_setup
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install innosetup --version=6.4.0 --no-progress --yes --limit-output
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Inno Setup compiler installation failed.' }
+          $compiler = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $compiler)) { throw 'Pinned Inno compiler missing.' }
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts\windows-alpha\owner-installer\K5VisionAlpha.iss'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'dist\owner-installer'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          & $compiler "/DSourceRoot=$env:GITHUB_WORKSPACE" "/DK5Revision=$env:GITHUB_SHA" $script
+          if ($LASTEXITCODE -ne 0) { throw 'Inno setup compilation failed.' }
+          $exe = Join-Path $out ("K5VisionAlpha-Setup-" + $env:GITHUB_SHA + ".exe")
+          if (-not (Test-Path -LiteralPath $exe)) { throw 'Compiled installer missing.' }
+          if ((Get-Item -LiteralPath $exe).Length -le 25000000) { throw 'Python payload unexpectedly absent.' }
+          $sha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath (Join-Path $out 'SHA256.txt') -Encoding ASCII -Value ("$sha  " + (Split-Path $exe -Leaf))
+          Write-Host "K5_INSTALLER_CANDIDATE_SHA256=$sha"
+          Write-Host "K5_SOURCE_REVISION=$env:GITHUB_SHA"
+
+      - name: Retain explicitly unqualified candidate
+        if: steps.compile_setup.conclusion == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: unqualified-owner-installer-${{ github.sha }}
+          path: dist/owner-installer/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Qualify clean Windows install launcher and shortcuts
+        if: steps.compile_setup.conclusion == 'success'
+        shell: powershell
+        timeout-minutes: 25
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = Join-Path $env:GITHUB_WORKSPACE ("dist\owner-installer\K5VisionAlpha-Setup-" + $env:GITHUB_SHA + ".exe")
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait -ErrorAction Stop
+          if ($p.ExitCode -ne 0) { throw ('One-click setup install failed: ' + $p.ExitCode) }
+          $root = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha'
+          $gui = Join-Path $root 'K5VisionAlpha.exe'
+          if (-not (Test-Path -LiteralPath $gui)) { throw 'GUI missing after install.' }
+          $probe = Start-Process -FilePath $gui -ArgumentList '--self-check' -PassThru -Wait -WindowStyle Hidden -ErrorAction Stop
+          if ($probe.ExitCode -ne 0) { throw 'Installed GUI runtime self-check failed.' }
+          if (-not (Test-Path -LiteralPath (Join-Path $root 'unins000.exe'))) { throw 'Windows uninstaller missing.' }
+          $programs = Join-Path ([Environment]::GetFolderPath('Programs')) 'K5 Vision Alpha.lnk'
+          if (-not (Test-Path -LiteralPath $programs)) { throw 'Start Menu shortcut missing.' }
+          $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'K5 Vision Alpha.lnk'
+          if (-not (Test-Path -LiteralPath $desktop)) { throw 'Desktop shortcut missing.' }
+          Write-Host 'K5_OWNER_SETUP_INSTALL_LAUNCH_SHORTCUT_CHECK=passed'
