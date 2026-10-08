@@ -185,14 +185,7 @@ def _local_test_source(source_uri: str) -> tuple[str, str]:
 class LocalTestSourceResolver(OperatorSourceResolver):
     """Resolve one explicit loopback-only synthetic alpha stream."""
 
-    __slots__ = (
-        "_source_uri",
-        "_pinned_source_uri",
-        "_source_ip",
-        "_stream_token",
-        "_payload_type",
-        "_payload_probe",
-    )
+    __slots__ = ("_source_uri", "_source_ip", "_stream_token", "_payload_type", "_payload_probe")
 
     def __init__(
         self,
@@ -233,7 +226,7 @@ class LocalTestSourceResolver(OperatorSourceResolver):
         try:
             payload_type = self._payload_type
             if payload_type is None:
-                payload_type = await self._payload_probe(self._pinned_source_uri)
+                payload_type = await self._payload_probe(self._source_uri)
             if isinstance(payload_type, bool) or not 96 <= payload_type <= 127:
                 raise ValueError("operator RTP payload type is invalid")
         except Exception:
@@ -247,7 +240,14 @@ class LocalTestSourceResolver(OperatorSourceResolver):
 class PublicTestSourceResolver(OperatorSourceResolver):
     """Resolve one credential-free public test stream to a pinned public address."""
 
-    __slots__ = ("_source_uri", "_source_ip", "_stream_token", "_payload_type", "_payload_probe")
+    __slots__ = (
+        "_source_uri",
+        "_pinned_source_uri",
+        "_source_ip",
+        "_stream_token",
+        "_payload_type",
+        "_payload_probe",
+    )
 
     def __init__(
         self,
@@ -300,7 +300,7 @@ class PublicTestSourceResolver(OperatorSourceResolver):
                 raise ValueError("public RTSP test source address changed")
             payload_type = self._payload_type
             if payload_type is None:
-                payload_type = await self._payload_probe(self._source_uri)
+                payload_type = await self._payload_probe(self._pinned_source_uri)
             if isinstance(payload_type, bool) or not 96 <= payload_type <= 127:
                 raise ValueError("operator RTP payload type is invalid")
         except Exception:
