@@ -10,15 +10,18 @@ fail closed; no secret is copied into public API models or retained evidence.
 from __future__ import annotations
 
 from os import environ
+from pathlib import Path
 
 from fastapi import FastAPI
 
+from k5vision import installed_profile
 from k5vision.analytics_config import (
     AnalyticsConfigurationError,
     load_analytics_configuration,
 )
 from k5vision.analytics_runtime import AnalyticsProviderFactory
 from k5vision.media.analytics_overlay_delivery import AnalyticsObservationProvider
+from k5vision.operator_launch import OperatorLauncher, OperatorSourceResolver
 from k5vision.operator_recording import STAGE_ONE_RECORDING_ROOT_ENV
 from k5vision.operator_runtime import build_environment_operator_runtime
 
@@ -51,3 +54,73 @@ def create_stage_one_app(
         operator_launcher=launcher,
         operator_recording_root=recording_root,
     )
+
+
+def _create_installed_operator_app(
+    *,
+    application_root: str | Path,
+    identity_directory: str | Path,
+    device_database: str | Path,
+    recording_root: str | Path,
+    source_resolver: OperatorSourceResolver | None = None,
+    launcher: OperatorLauncher | None = None,
+) -> FastAPI:
+    """Internal durable composition, requiring an explicitly supplied private runtime.
+
+    No CLI/Alpha launcher selects this factory. The current Stage03 credential
+    trial bundle is not customer configuration, so it must never fill this seam.
+    A supported installed source provider and physical restart/recording/playback
+    acceptance remain prerequisites before exposing an installed operator mode.
+    Admission uses a copied environment and explicit database paths; it never
+    temporarily rebinds another application's process-wide identity or storage.
+    Existing optional service/admin token authentication is unchanged.
+    """
+    if not callable(getattr(source_resolver, "resolve", None)) or not callable(
+        getattr(launcher, "run", None)
+    ):
+        raise installed_profile.InstalledProfileError(
+            "Installed operator requires an explicit private source resolver and launcher."
+        )
+    installed_profile.refuse_trial_sources(environ)
+    profile = installed_profile.load_installed_profile(
+        application_root=application_root,
+        identity_directory=identity_directory,
+        device_database=device_database,
+        recording_root=recording_root,
+    )
+    # Reuse existing identity conflict checks on a disposable mapping only.
+    # Explicit factory arguments remove the need for process-global rebinding.
+    with installed_profile.installed_profile_environment(profile, dict(environ)):
+        pass
+    application = create_app(
+        control_plane_site_id=profile.identity.site_id,
+        user_db_path=profile.identity.database_path,
+        device_db_path=profile.device_database,
+        operator_source_resolver=source_resolver,
+        operator_launcher=launcher,
+        operator_recording_root=profile.recording_root,
+    )
+    required = (
+        "user_registry",
+        "device_registry",
+        "operator_launch_coordinator",
+        "operator_recording_coordinator",
+        "operator_playback_coordinator",
+        "operator_playback_timeline",
+        "operator_export_coordinator",
+        "operator_recording_catalog",
+    )
+    if any(getattr(application.state, name, None) is None for name in required):
+        for name in ("user_registry", "device_registry"):
+            registry = getattr(application.state, name, None)
+            if registry is not None:
+                try:
+                    registry.close()
+                except Exception:
+                    # Still attempt the other owned close; never delete state or
+                    # expose storage exceptions while reporting failed startup.
+                    pass
+        raise installed_profile.InstalledProfileError(
+            "Installed operator application construction was incomplete."
+        )
+    return application
