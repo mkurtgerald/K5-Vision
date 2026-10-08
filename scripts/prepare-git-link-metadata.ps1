@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 # Invoked only as independently hash-verified, strict UTF-8 in-memory bytes.
 # This fixed one-attempt transport is not installer or retry authority.
-$sourceCommit = '4d6e7bee294cd972c015961959db08baea371d58'
+$sourceCommit = 'efeda351e1ec9191c215ad5850da543e1996a0d6'
 $repository = 'mkurtgerald/K5-Vision'
 $branch = 'review/git-link-metadata-20261008'
 $apiRoot = 'https://api.github.com/repos/mkurtgerald/K5-Vision/'
@@ -17,7 +17,7 @@ $utf8 = [Text.UTF8Encoding]::new($false, $true)
 $pins = @(
     @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
     @{ name = 'observe_installed_git_links.cs'; size = 34207; blob = '1e5bc986d255210f5cd82770bb472027c590f8bb'; sha256 = 'eeb76812034a45604fbe43171cecbffcc413af8c31fca611e0f2a75bf202059a' },
-    @{ name = 'observe-installed-git-links.ps1'; size = 20889; blob = 'cb919a3bdf6eb7dc85cab9ebc0420603b972f1c8'; sha256 = 'dcea700b6055401dafbbb0e7895b36dc1b7b750b125f282f1f8c5020092ab7e9' }
+    @{ name = 'observe-installed-git-links.ps1'; size = 20836; blob = 'f9823484108e452ed8b52019085bdcb053811ed5'; sha256 = '5c48387241276037d4e17f2c8a8bb3fb3ec76a7db85bb4207db26fc2d9c13f1a' }
 )
 
 function Assert-OrdinaryPath([string]$Path, [bool]$Directory, [hashtable]$Observation = $null) {
@@ -270,6 +270,7 @@ function Assert-CompilerArtifacts([string]$Path) {
 }
 
 function Assert-RetainedArtifacts {
+    $script:qualificationPhase = 'compiler_artifacts'
     $root = Get-BundleRoot
     if (Test-Path -LiteralPath $root -ErrorAction Stop) {
         Assert-OrdinaryPath $root $true
@@ -367,20 +368,27 @@ function Invoke-HostedQualification {
     }
     $script:qualificationPhase = 'compiler_idle_post'
     Assert-CompilerIdle
-    $script:qualificationPhase = 'compiler_artifacts'
-    Assert-CompilerArtifacts $compilerTemp
+    # Final artifact admission belongs to the separate same-host HostedPost,
+    # after this owned PowerShell process exits. Its strict policy is unchanged.
 }
 
 function Invoke-PhysicalPost {
     # Fresh exact original source; independent of a killed observation process,
     # prior bundle, compilation or mutable on-disk script. Never compile here.
+    $guardFailure = $null
+    $idleFailure = $null
     try {
         $guardBytes = Get-PinnedSource $pins[0]
         $guard = [scriptblock]::Create($utf8.GetString($guardBytes))
         & $guard > $null
+    } catch {
+        $guardFailure = $_
+        throw
     } finally {
         # Even a guard refusal must independently check compiler occupancy.
-        Assert-CompilerIdle
+        # Keep the original guard ErrorRecord if both checks refuse.
+        try { Assert-CompilerIdle } catch { $idleFailure = $_ }
+        if ($null -ne $idleFailure -and $null -eq $guardFailure) { throw $idleFailure }
     }
     Assert-RetainedArtifacts
 }
@@ -421,7 +429,10 @@ try {
     $passed = $true
 } catch {
     $failureRecord = $_
-    if ($Mode -ceq 'HostedQualify' -and $failure -ceq 'hosted_qualification') {
+    if (($Mode -ceq 'HostedQualify' -and $failure -ceq 'hosted_qualification') -or
+        ($script:qualificationPhase -ceq 'compiler_artifacts' -and (
+            ($Mode -ceq 'HostedPost' -and $failure -ceq 'hosted_post') -or
+            ($Mode -ceq 'PhysicalPost' -and $failure -ceq 'physical_post')))) {
         $projection = Get-HostedFailureProjection $failureRecord
     }
     # Keep the original ErrorRecord private, including when environment restoration failed.

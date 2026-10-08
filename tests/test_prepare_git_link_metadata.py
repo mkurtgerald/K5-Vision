@@ -6,6 +6,7 @@ The approved hosted job separately establishes actual PS5.1 parsing/compilation.
 
 import base64
 import hashlib
+import itertools
 import re
 from pathlib import Path
 
@@ -13,7 +14,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 TEXT = (ROOT / "scripts/prepare-git-link-metadata.ps1").read_text(encoding="utf-8")
-COMMIT = "4d6e7bee294cd972c015961959db08baea371d58"
+COMMIT = "efeda351e1ec9191c215ad5850da543e1996a0d6"
 BRANCH = "review/git-link-metadata-20261008"
 REF = "refs/heads/" + BRANCH
 REPOSITORY = "mkurtgerald/K5-Vision"
@@ -28,8 +29,8 @@ PINS = {
         "eeb76812034a45604fbe43171cecbffcc413af8c31fca611e0f2a75bf202059a",
     ),
     "observe-installed-git-links.ps1": (
-        20889, "cb919a3bdf6eb7dc85cab9ebc0420603b972f1c8",
-        "dcea700b6055401dafbbb0e7895b36dc1b7b750b125f282f1f8c5020092ab7e9",
+        20836, "f9823484108e452ed8b52019085bdcb053811ed5",
+        "5c48387241276037d4e17f2c8a8bb3fb3ec76a7db85bb4207db26fc2d9c13f1a",
     ),
 }
 
@@ -140,7 +141,7 @@ def test_exact_source_bytes_and_pins(name):
 
 @pytest.mark.parametrize("path,digest", [
     ("tests/test_installed_git_link_csharp_contract.py", "8a9909ffa73db4be2203743ba3bf86df7c4bc40c2dd49513d977f2edbe530057"),
-    ("tests/test_observe_installed_git_links_wrapper.py", "0e9d9dfcce4079f9d63ad42c9bb0b19961f821b8802c8009cee781fc3c9ce44a"),
+    ("tests/test_observe_installed_git_links_wrapper.py", "67f696d7b61986bb0d6a191a5de44aa7c8f5359bd4bb312b7c58de1bdf4f7e10"),
 ])
 def test_frozen_candidate_tests_remain_unchanged(path, digest):
     assert hashlib.sha256((ROOT / path).read_bytes()).hexdigest() == digest
@@ -434,10 +435,9 @@ def test_repair_hosted_phase_precedes_each_fixed_substage():
         ("compiler_temp", "$compilerTemp = Join-Path"),
         ("compile", "$types = @(Add-Type"),
         ("compiled_type", "if (@($types | Where-Object"),
-        ("compiler_idle_post", "Assert-CompilerIdle\n    $script:qualificationPhase = 'compiler_artifacts'"),
-        ("compiler_artifacts", "Assert-CompilerArtifacts $compilerTemp"),
     ):
         assert hosted.index(f"$script:qualificationPhase = '{phase}'") < hosted.index(operation)
+    assert hosted.rindex("$script:qualificationPhase = 'compiler_idle_post'") < hosted.rindex("Assert-CompilerIdle")
     assert "if ($name -ceq 'observe-installed-git-links.ps1') { 'wrapper_parse' } else { 'guard_parse' }" in hosted
     assert hosted.index("'wrapper_parse'") < hosted.index("ParseInput")
     bundle = section("function New-PinnedBundle", "function Assert-CompilerArtifacts")
@@ -648,7 +648,7 @@ def test_artifact_projection_stays_shallow_and_stops_at_first_refused_entry():
     assert "finally { $entries.Dispose() }" in artifacts
 
 
-def test_artifact_projection_output_is_hosted_failure_only_and_has_no_private_values():
+def test_artifact_projection_output_has_no_private_values():
     projection = section("function Get-HostedFailureProjection", "function Invoke-HostedQualification")
     assert "$script:qualificationPhase -ceq 'compiler_artifacts'" in projection
     assert "compiler_artifact_observation = $artifactObservation" in projection
@@ -745,3 +745,133 @@ def test_artifact_projection_preserves_retained_file_size_bounds(sizes, refused)
 def test_artifact_projection_unknown_stays_unknown_without_message_scraping(message):
     assert hosted_projection_model("compiler_artifacts", message) == {
         "phase": "compiler_artifacts", "reason": "unknown", "compiler_code": "unknown"}
+
+
+def test_phase_order_final_artifacts_are_only_admitted_by_independent_post_modes():
+    hosted = section("function Invoke-HostedQualification", "function Invoke-PhysicalPost")
+    assert "Assert-CompilerArtifacts" not in hosted
+    assert "Assert-RetainedArtifacts" not in hosted
+    assert "'compiler_artifacts'" not in hosted
+    retained = section("function Assert-RetainedArtifacts", "function Get-HostedFailureProjection")
+    assert retained.index("$script:qualificationPhase = 'compiler_artifacts'") < retained.index("Get-BundleRoot")
+    assert "Assert-CompilerArtifacts $compilerTemp" in retained
+    hosted_post = section("        'HostedPost' {", "        'PhysicalObserve' {")
+    physical_post = section("function Invoke-PhysicalPost", "$failure = 'context_binding'")
+    for post in (hosted_post, physical_post):
+        assert post.index("Assert-CompilerIdle") < post.index("Assert-RetainedArtifacts")
+    assert TEXT.count("Assert-CompilerArtifacts $compilerTemp") == 1
+
+
+def test_phase_order_physical_post_preserves_guard_error_and_still_checks_idle():
+    post = section("function Invoke-PhysicalPost", "$failure = 'context_binding'")
+    assert "$guardFailure = $null" in post and "$idleFailure = $null" in post
+    assert "$guardFailure = $_\n        throw" in post
+    cleanup = post.split("} finally {", 1)[1]
+    assert "try { Assert-CompilerIdle } catch { $idleFailure = $_ }" in cleanup
+    assert "if ($null -ne $idleFailure -and $null -eq $guardFailure) { throw $idleFailure }" in cleanup
+    assert cleanup.index("throw $idleFailure") < cleanup.index("Assert-RetainedArtifacts")
+
+
+def test_phase_order_post_projection_is_restricted_to_the_final_artifact_phase():
+    dispatch = TEXT.split("$failure = 'context_binding'", 1)[1]
+    assert "($Mode -ceq 'HostedQualify' -and $failure -ceq 'hosted_qualification')" in dispatch
+    assert "($script:qualificationPhase -ceq 'compiler_artifacts' -and (" in dispatch
+    assert "($Mode -ceq 'HostedPost' -and $failure -ceq 'hosted_post')" in dispatch
+    assert "($Mode -ceq 'PhysicalPost' -and $failure -ceq 'physical_post')" in dispatch
+    assert dispatch.count("Get-HostedFailureProjection $failureRecord") == 1
+
+
+def phase_order_projection_model(mode, failure, phase, message, observation=None):
+    allowed = (mode == "HostedQualify" and failure == "hosted_qualification") or (
+        phase == "compiler_artifacts" and (mode, failure) in {
+            ("HostedPost", "hosted_post"), ("PhysicalPost", "physical_post")})
+    result = hosted_projection_model(phase, message) if allowed else {
+        "phase": phase, "reason": "unknown", "compiler_code": "unknown"}
+    result["compiler_artifact_observation"] = observation if allowed and phase == "compiler_artifacts" else None
+    return result
+
+
+@pytest.mark.parametrize("mode,failure", [("HostedPost", "hosted_post"), ("PhysicalPost", "physical_post")])
+@pytest.mark.parametrize("entries,root_failure", [
+    ([{"directory": True}], None), ([{"reparse": True}], None), ([{"link": True}], None),
+    ([{"size": 16777217}], None), ([{}] * 65, None), ([], "path_reparse"),
+])
+def test_phase_order_post_refusals_keep_closed_reasons_and_partial_counts(mode, failure, entries, root_failure):
+    reason, observation = artifact_observation_model(entries, root_failure)
+    result = phase_order_projection_model(mode, failure, "compiler_artifacts", reason, observation)
+    assert result == {"phase": "compiler_artifacts", "reason": reason,
+                      "compiler_code": "unknown", "compiler_artifact_observation": observation}
+
+
+@pytest.mark.parametrize("mode,failure,phase", [
+    ("PhysicalObserve", "physical_observation", "compiler_artifacts"),
+    ("HostedPost", "runtime_binding", "compiler_artifacts"),
+    ("PhysicalPost", "context_binding", "compiler_artifacts"),
+    ("HostedPost", "hosted_post", "unknown"),
+    ("PhysicalPost", "physical_post", "compiler_idle_post"),
+    ("PhysicalPost", "hosted_post", "compiler_artifacts"),
+    ("HostedPost", "physical_post", "compiler_artifacts"),
+])
+def test_phase_order_unrelated_failures_do_not_receive_artifact_projection(mode, failure, phase):
+    result = phase_order_projection_model(mode, failure, phase, "path_type", {"private": "not projected"})
+    assert result["reason"] == "unknown" and result["compiler_code"] == "unknown"
+    assert result["compiler_artifact_observation"] is None
+
+
+@pytest.mark.parametrize("guard_failed,idle_failed", itertools.product((False, True), repeat=2))
+def test_phase_order_physical_guard_and_idle_both_fail_closed(guard_failed, idle_failed):
+    guard, idle = object(), object()
+    guard_error = guard if guard_failed else None
+    attempted = ["fresh_original_guard", "compiler_idle"]
+    idle_error = idle if idle_failed else None
+    result = guard_error or idle_error
+    if result is None:
+        attempted.append("retained_artifacts")
+    assert attempted[:2] == ["fresh_original_guard", "compiler_idle"]
+    assert ("retained_artifacts" in attempted) is (not guard_failed and not idle_failed)
+    assert result is (guard if guard_failed else idle if idle_failed else None)
+
+
+OUTCOMES = ("success", "failure", "cancelled", "skipped", "timeout", "", None)
+
+
+def test_phase_order_truth_table_requires_compile_qualification_and_final_posts():
+    # A pure decision model. Actions must establish all outcomes on the same job's host.
+    physical_launches = []
+    for overall, qualification, hosted_post in itertools.product(OUTCOMES, repeat=3):
+        launch = overall == qualification == hosted_post == "success"
+        if launch:
+            physical_launches.append((overall, qualification, hosted_post))
+        for observation, physical_post in itertools.product(OUTCOMES, repeat=2):
+            accepted = launch and observation == physical_post == "success"
+            assert accepted is all(value == "success" for value in (
+                overall, qualification, hosted_post, observation, physical_post))
+    assert physical_launches == [("success", "success", "success")]
+    # A passing final post after a compilation refusal cannot resurrect qualification.
+    for compiled in (False, True):
+        for restored, idle, final_artifacts in itertools.product((False, True), repeat=3):
+            qualify = compiled and restored and idle
+            hosted_success = qualify and final_artifacts
+            assert hosted_success is all((compiled, restored, idle, final_artifacts))
+
+
+def test_phase_order_existing_workflow_owns_always_run_same_host_process_boundaries():
+    workflow = (ROOT / ".github/workflows/installed-git-link-metadata.yml").read_text(encoding="utf-8")
+    hosted = workflow.split("  hosted_qualify:\n", 1)[1].split("  physical_observe:\n", 1)[0]
+    physical = workflow.split("  physical_observe:\n", 1)[1]
+    assert "    runs-on: windows-latest" in hosted
+    assert "    runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]" in physical
+    for job, first_mode, final_mode in (
+        (hosted, "HostedQualify", "HostedPost"), (physical, "PhysicalObserve", "PhysicalPost"),
+    ):
+        steps = job.split("      - name: ")[1:]
+        assert len(steps) == 2
+        assert f"K5_METADATA_MODE: {first_mode}" in steps[0]
+        assert f"K5_METADATA_MODE: {final_mode}" in steps[1]
+        assert "if: ${{ always() }}" in steps[1]
+        assert all("shell: powershell" in step for step in steps)
+    for gate in ("result", "outputs.qualification", "outputs.post_admission"):
+        assert f"needs.hosted_qualify.{gate} == 'success'" in physical
+    assert "continue-on-error" not in workflow
+    assert "qualification: ${{ steps.qualify.outcome }}" in hosted
+    assert "post_admission: ${{ steps.post.outcome }}" in hosted
