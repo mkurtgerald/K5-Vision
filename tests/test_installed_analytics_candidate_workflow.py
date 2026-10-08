@@ -11,6 +11,15 @@ from pathlib import Path
 
 import pytest
 
+
+def canonical_checkout_bytes(raw):
+    """Match the hosted source reader's sole allowed checkout transformation."""
+    text = raw.decode("utf-8", errors="strict").replace("\r\n", "\n")
+    if "\r" in text:
+        raise ValueError("source_encoding")
+    return text.encode("utf-8", errors="strict")
+
+
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/installed-analytics-candidate.yml"
 BASELINE = ROOT / ".github/workflows/stage-one-operator-physical.yml"
@@ -1872,7 +1881,7 @@ def test_all_initializer_sources_match_frozen_local_blob_bytes():
         ),
     }
     for filename in ("assert-installed-git-alias.ps1", "admit_installed_git_alias.cs"):
-        data = (ROOT / "scripts" / filename).read_bytes()
+        data = canonical_checkout_bytes((ROOT / "scripts" / filename).read_bytes())
         expected[filename] = (
             len(data),
             hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest(),
@@ -2587,3 +2596,23 @@ def test_controlled_direct_git_calls_have_owned_deadlines_and_closed_output():
         assert "$start.FileName = $AdmittedGitPath" in utility
         assert ".GetNewClosure())" in script
     assert all(utility == utilities[0] for utility in utilities)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (b"first\nsecond\n", b"first\nsecond\n"),
+        (b"first\r\nsecond\r\n", b"first\nsecond\n"),
+        (b"first\r\nsecond\n", b"first\nsecond\n"),
+        (b"\xef\xbb\xbffirst\r\n", b"\xef\xbb\xbffirst\n"),
+    ],
+)
+def test_source_pin_reader_only_canonicalizes_checkout_crlf(raw, expected):
+    # BOMs and all other content remain byte-visible to the unchanged exact pins.
+    assert canonical_checkout_bytes(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [b"first\rsecond\n", b"first\r\r\n", b"first\n\xff"])
+def test_source_pin_reader_rejects_bare_cr_and_invalid_utf8(raw):
+    with pytest.raises(ValueError):
+        canonical_checkout_bytes(raw)

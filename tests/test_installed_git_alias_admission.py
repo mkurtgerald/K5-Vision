@@ -16,8 +16,19 @@ from pathlib import Path
 
 import pytest
 
+
+def canonical_checkout_bytes(raw):
+    """Match the hosted source reader's sole allowed checkout transformation."""
+    text = raw.decode("utf-8", errors="strict").replace("\r\n", "\n")
+    if "\r" in text:
+        raise ValueError("source_encoding")
+    return text.encode("utf-8", errors="strict")
+
+
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_BYTES = (ROOT / "scripts/admit_installed_git_alias.cs").read_bytes()
+SOURCE_BYTES = canonical_checkout_bytes(
+    (ROOT / "scripts/admit_installed_git_alias.cs").read_bytes()
+)
 SOURCE = SOURCE_BYTES.decode("utf-8")
 WRAPPER = (ROOT / "scripts/assert-installed-git-alias.ps1").read_text(encoding="utf-8")
 ROOT_ID, CMD_ID = 101, 202
@@ -1226,3 +1237,23 @@ def test_hosted_compile_diagnostic_model_never_leaks_untyped_or_noncanonical_cod
     ):
         result = code
     assert result == expected
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (b"first\nsecond\n", b"first\nsecond\n"),
+        (b"first\r\nsecond\r\n", b"first\nsecond\n"),
+        (b"first\r\nsecond\n", b"first\nsecond\n"),
+        (b"\xef\xbb\xbffirst\r\n", b"\xef\xbb\xbffirst\n"),
+    ],
+)
+def test_source_pin_reader_only_canonicalizes_checkout_crlf(raw, expected):
+    # BOMs and all other content remain byte-visible to the unchanged exact pins.
+    assert canonical_checkout_bytes(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [b"first\rsecond\n", b"first\r\r\n", b"first\n\xff"])
+def test_source_pin_reader_rejects_bare_cr_and_invalid_utf8(raw):
+    with pytest.raises(ValueError):
+        canonical_checkout_bytes(raw)
