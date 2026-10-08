@@ -15,7 +15,8 @@ Set-StrictMode -Version Latest
 # separately reviewed short Actions step timeout, not by this wrapper's timer.
 # ObserveGuarded has its own 20-second current-step watchdog. Abrupt exit or an
 # Actions timeout can bypass every finally below: a SEPARATE always-run original
-# post-admission plus compiler-idle check MUST pass before accepting any result.
+# post-admission, compiler-idle and final compiler-artifact checks MUST pass
+# after this PowerShell process exits before accepting any provisional result.
 # This observation never confers storage, retry, exception or delivery authority.
 $guardSha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d'
 # Exact frozen collector bytes; neither environment nor arguments can change this pin.
@@ -342,7 +343,6 @@ try {
     Add-K5PinnedCollector $collectorText $compilerTemp $systemCorePath
     $failure = 'compiler_idle_after'
     Assert-K5CompilerIdle
-    Assert-K5CompilerArtifacts $compilerTemp
     $failure = 'collector_observation'
     $record = [K5FixedGitObservation]::ObserveGuarded()
     $failure = 'record_validation'
@@ -358,7 +358,6 @@ try {
         try {
             & $guard > $null
             Assert-K5CompilerIdle
-            if ($compilerTempCreated) { Assert-K5CompilerArtifacts $compilerTemp }
             $postPassed = $true
         } catch {
             $failed = $true

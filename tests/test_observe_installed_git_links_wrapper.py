@@ -162,13 +162,11 @@ def test_original_admission_surrounds_compilation_and_observation():
         "New-K5CompilerDirectory $compilerTemp",
         "Add-K5PinnedCollector $collectorText $compilerTemp",
         "Assert-K5CompilerIdle",
-        "Assert-K5CompilerArtifacts $compilerTemp",
         "[K5FixedGitObservation]::ObserveGuarded()",
         "Assert-K5DiagnosticRecord $record $context",
         "} finally {",
         "& $guard > $null",
         "Assert-K5CompilerIdle",
-        "if ($compilerTempCreated) { Assert-K5CompilerArtifacts $compilerTemp }",
         "$postPassed = $true",
     )
     offset = 0
@@ -178,6 +176,19 @@ def test_original_admission_surrounds_compilation_and_observation():
     assert main.index("foreach ($file in @($collectorFile, $guardFile))") > offset
     assert main.index("if ($failed -or -not $postPassed") > offset
     assert TEXT.count("[K5FixedGitObservation]::ObserveGuarded()") == 1
+    assert main.count("Assert-K5CompilerIdle") == 3
+
+
+def test_final_artifact_admission_never_scans_inside_observation_process():
+    main = TEXT.split("$guard = $null", 1)[1]
+    assert "Assert-K5CompilerArtifacts" not in main
+    # The unused checker may remain, but no function or top-level call can invoke
+    # it before this PowerShell process exits. Directories remain inadmissible at
+    # final admission; their transient presence establishes no provenance.
+    assert TEXT.count("Assert-K5CompilerArtifacts") == 1
+    assert "function Assert-K5CompilerArtifacts([string]$Path)" in TEXT
+    assert TEXT.count("EnumerateFileSystemEntries") == 1
+    assert "after this PowerShell process exits" in TEXT
 
 
 def test_compiler_idle_gate_is_bounded_names_only_and_never_signals_processes():
@@ -422,6 +433,91 @@ def test_normal_or_failed_results_always_require_separate_final_admission():
     assert "storage_admission = $false" in failure
     assert "retry_authority = $false" in failure
     assert "exception_authority = $false" in failure
+    assert "if ($failed -or -not $postPassed -or $null -eq $result)" in TEXT
+    assert "if ($result.status -cne 'observed')" in failure
+    assert failure.count("throw 'Installed Git link observation refused.") == 2
+
+
+def wrapper_acceptance_model(errors=None, collector_status="observed", separate_post="success"):
+    """Source-bound phase model, not PowerShell execution or physical evidence."""
+    errors = errors or {}
+    main = TEXT.split("$failure = 'pre_admission'", 1)[1]
+    observation = main.split("} catch {\n    # No exception text", 1)[0]
+    phases = ["pre_admission", *re.findall(r"\$failure = '([a-z_]+)'", observation)]
+    assert phases == [
+        "pre_admission", "compiler_idle_before", "collector_binding", "runtime_binding",
+        "compiler_temp", "collector_compile", "compiler_idle_after", "collector_observation",
+        "record_validation",
+    ]
+    first_error = None
+    first_phase = None
+    result = None
+    seen = []
+    for phase in phases:
+        seen.append(phase)
+        if phase in errors:
+            first_error, first_phase = errors[phase], phase
+            break
+        if phase == "record_validation":
+            result = collector_status
+    # The original guard and compiler-idle finalization still run. Any first
+    # error remains primary when host admission or handle cleanup also fails.
+    for phase in ("post_admission", "file_cleanup"):
+        seen.append(phase)
+        if phase in errors and first_error is None:
+            first_error, first_phase = errors[phase], phase
+    wrapper_passed = first_error is None and result == "observed"
+    return {
+        "status": "observed" if wrapper_passed else "refused",
+        "first_error": first_error,
+        "first_phase": first_phase,
+        "seen": seen,
+        "requires_separate_post_admission": True,
+        "accepted": wrapper_passed and separate_post == "success",
+    }
+
+
+@pytest.mark.parametrize(
+    "separate_post", [None, "pending", "failure", "skipped", "cancelled", "timed_out", "success"]
+)
+def test_observed_model_is_provisional_until_independent_post_succeeds(separate_post):
+    result = wrapper_acceptance_model(separate_post=separate_post)
+    assert result["status"] == "observed"
+    assert result["requires_separate_post_admission"] is True
+    assert result["accepted"] is (separate_post == "success")
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["pre_admission", "compiler_idle_before", "collector_compile", "compiler_idle_after",
+     "collector_observation", "record_validation", "post_admission", "file_cleanup"],
+)
+def test_model_never_accepts_failed_compile_admission_observation_or_cleanup(phase):
+    error_record = object()
+    result = wrapper_acceptance_model({phase: error_record})
+    assert result["first_error"] is error_record
+    assert result["first_phase"] == phase
+    assert result["status"] == "refused"
+    assert result["accepted"] is False
+    assert result["seen"][-2:] == ["post_admission", "file_cleanup"]
+    if phase in ("pre_admission", "compiler_idle_before", "collector_compile", "compiler_idle_after"):
+        assert "collector_observation" not in result["seen"]
+
+
+@pytest.mark.parametrize("phase", ["pre_admission", "collector_compile", "post_admission"])
+def test_model_preserves_first_error_record_when_finalization_also_fails(phase):
+    first_error = object()
+    errors = {"post_admission": object(), "file_cleanup": object(), phase: first_error}
+    result = wrapper_acceptance_model(errors)
+    assert result["first_error"] is first_error
+    assert result["first_phase"] == phase
+    assert result["accepted"] is False
+
+
+def test_model_cannot_upgrade_collector_refusal_with_successful_final_post():
+    result = wrapper_acceptance_model(collector_status="refused", separate_post="success")
+    assert result["status"] == "refused"
+    assert result["accepted"] is False
 
 
 def test_native_record_dictionary_schema_flags_context_and_output_are_closed():
