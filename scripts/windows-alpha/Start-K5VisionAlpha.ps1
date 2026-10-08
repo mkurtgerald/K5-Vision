@@ -718,7 +718,8 @@ try {
         throw "K5 Windows operator alpha test did not complete the selected acceptance checks."
     }
     if ($analyticsRequired) {
-        Write-Host ("K5 analytics PASS: submissions={0}, completions={1}, rendered_boxes={2}, failures=0" -f $receipt.analytics_provider_submissions, $receipt.analytics_provider_completions, $receipt.analytics_rendered_boxes)
+        Write-Host ("K5 analytics PASS: submissions={0}, completions={1}, failures=0" -f $receipt.analytics_provider_submissions, $receipt.analytics_provider_completions)
+        Write-Host ("K5 analytics rendered boxes: {0}" -f $receipt.analytics_rendered_boxes)
     }
 
     Write-Host ("K5 operator PASS: frames={0}, presentations={1}" -f $receipt.delivered_frames, $receipt.presentations)
