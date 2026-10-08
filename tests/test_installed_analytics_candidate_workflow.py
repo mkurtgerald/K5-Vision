@@ -1711,6 +1711,335 @@ def test_fixed_storage_packet_preserves_binary_bytes(body):
     assert namespace["verified_storage_source"](packet, packet[0][0]) == body
 
 
+def _storage_packet_producer_fragments():
+    """Extract only the production emitter and success-output statements, never admission."""
+    binder = _run_script(_step("Bind early storage source under held Git admission"))
+    emitter = re.findall(
+        r"(?m)^[ \t]*(\$sourceObjects = \[object\[\]\]::new\(4\)\n"
+        r"(?:[ \t]+\$sourceObjects\[\d\] = [^\n]+\n){4}"
+        r"[ \t]+\$sourcePacket = ConvertTo-Json -InputObject \$sourceObjects -Compress -Depth 4)$",
+        binder,
+        re.S,
+    )
+    helper = (ROOT / "scripts/assert-installed-git-alias.ps1").read_text()
+    buffered = re.findall(r"(?m)^\s*(\$buffer = @\(& \$Operation .+\))$", helper)
+    output = re.findall(
+        r"(?m)^\s*(foreach \(\$item in \$buffer\) \{ Write-Output -NoEnumerate \$item \})$",
+        helper,
+    )
+    assert len(emitter) == len(buffered) == len(output) == 1
+    return emitter[0], buffered[0], output[0]
+
+
+def _binary_storage_packet():
+    # Deterministically find real object hashes with NUL and high bytes in both
+    # tree-member OIDs. Neither a Git process nor a repository is needed.
+    for nonce in range(65536):
+        packet = _source_packet(b"synthetic\0\x80\xff\r\n" + nonce.to_bytes(4, "big"))
+        if all(
+            0 in (oid := bytes.fromhex(packet[index][0])) and max(oid) >= 128 for index in (2, 3)
+        ):
+            return packet
+    raise AssertionError("storage_packet_fixture_generation")
+
+
+def _storage_packet_producer_script(packet, buffered):
+    emitter, buffering, output = _storage_packet_producer_fragments()
+    records = ",\n".join(
+        "@{ oid = '" + oid + "'; bytes = [Convert]::FromBase64String('" + data + "') }"
+        for oid, _, data in packet
+    )
+    # The callback returns the raw reader's plain hashtable: scalar string OID,
+    # byte[] body. The Git path is an unused argument, never executed or opened.
+    seam = buffering + "\n" + output if buffered else "& $Operation"
+    return (
+        r"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+try {
+    if ($PSVersionTable.PSEdition -cne 'Desktop' -or
+        $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1 -or
+        -not [Environment]::Is64BitProcess) { throw 'runtime' }
+    function Invoke-SyntheticSuccess([scriptblock]$Operation) {
+"""
+        + seam
+        + "\n}\n$records = @(\n"
+        + records
+        + r"""
+)
+function Read-SyntheticObject([hashtable]$Record) {
+    $operation = {
+        param([string]$AdmittedGitPath)
+        $oid = $Record.oid
+        $body = $Record.bytes
+        return @{ oid = $oid; bytes = $body }
+    }.GetNewClosure()
+    return Invoke-SyntheticSuccess -Operation $operation
+}
+$commit = Read-SyntheticObject $records[0]
+$rootTree = Read-SyntheticObject $records[1]
+$scriptsTree = Read-SyntheticObject $records[2]
+$storage = Read-SyntheticObject $records[3]
+"""
+        + emitter
+        + r"""
+
+[Console]::Out.Write($sourcePacket)
+} catch {
+    [Console]::Error.WriteLine('storage_packet_producer_refused')
+    exit 1
+}
+"""
+    )
+
+
+def _storage_packet_contract_reason(raw, expected):
+    """Keep exact JSON authoritative; diagnose refusals without exposing any data."""
+    import base64
+    import binascii
+
+    if len(raw) > 620000:
+        return "json_size"
+    try:
+        packet = json.loads(raw)
+    except (UnicodeError, ValueError):
+        return "json_encoding"
+    namespace = _early_reader_namespace()
+    try:
+        body = namespace["verified_storage_source"](packet, expected[0][0])
+    except namespace["SourceBindingError"] as error:
+        # The unchanged strict consumer runs first. This is a closed diagnostic
+        # projection only; it never repairs, flattens or retries the packet.
+        if type(packet) is not list or len(packet) != 4:
+            return "root_shape"
+        bodies = []
+        for index, entry in enumerate(packet):
+            if type(entry) is not list or len(entry) != 3:
+                return "entry_shape"
+            oid, kind, encoded = entry
+            if type(oid) is not str:
+                return "oid_scalar"
+            if re.fullmatch("[0-9a-f]{40}", oid) is None:
+                return "oid_format"
+            if kind != ("commit", "tree", "tree", "blob")[index]:
+                return "entry_kind"
+            if type(encoded) is not str:
+                return "base64_scalar"
+            if not 0 < len(encoded) <= 4 * (((65536 if index == 0 else 131072) + 2) // 3):
+                return "base64_size"
+            try:
+                decoded = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error):
+                return "base64_encoding"
+            if base64.b64encode(decoded).decode("ascii") != encoded:
+                return "base64_canonical"
+            bodies.append(decoded)
+        if error.code == "source_object_hash":
+            return "object_hash"
+        for index, name, mode in (
+            (1, b"scripts", b"40000"),
+            (2, b"installer_wheel_storage.py", b"100644"),
+        ):
+            try:
+                namespace["tree_member"](bodies[index], name, mode)
+            except namespace["SourceBindingError"] as tree_error:
+                return (
+                    "tree_membership"
+                    if tree_error.code == "source_module_read"
+                    else "tree_structure"
+                )
+        return {
+            "source_commit_identity": "commit_identity",
+            "source_module_read": "tree_membership",
+            "source_object_size": "object_size",
+        }.get(error.code, "consumer_refused")
+    if packet != expected or body != base64.b64decode(expected[3][2], validate=True):
+        return "source_bytes"
+    return "ok"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell 5.1 packet contract required")
+@pytest.mark.parametrize("buffered", [False, True], ids=["direct", "success-output-seam"])
+def test_windows_powershell_storage_packet_contract(tmp_path, buffered):
+    """No alias Begin, compilation, Git, network, storage module or media execution."""
+    packet = _binary_storage_packet()
+    script = tmp_path / "synthetic-storage-packet.ps1"
+    script.write_text(_storage_packet_producer_script(packet, buffered), encoding="utf-8")
+    try:
+        result = subprocess.run(
+            [
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(script),
+            ],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pytest.fail("storage_packet_contract:producer_unavailable", pytrace=False)
+    if result.returncode != 0 or result.stderr:
+        pytest.fail("storage_packet_contract:producer_refused", pytrace=False)
+    reason = _storage_packet_contract_reason(result.stdout, packet)
+    if reason != "ok":
+        pytest.fail("storage_packet_contract:" + reason, pytrace=False)
+
+
+def test_storage_packet_fixture_extracts_exact_production_statements_only():
+    emitter, buffering, output = _storage_packet_producer_fragments()
+    assert "\n".join(line.strip() for line in emitter.splitlines()) == "\n".join(
+        [
+            "$sourceObjects = [object[]]::new(4)",
+            "$sourceObjects[0] = [object[]]@($commit.oid, 'commit', "
+            "[Convert]::ToBase64String($commit.bytes))",
+            "$sourceObjects[1] = [object[]]@($rootTree.oid, 'tree', "
+            "[Convert]::ToBase64String($rootTree.bytes))",
+            "$sourceObjects[2] = [object[]]@($scriptsTree.oid, 'tree', "
+            "[Convert]::ToBase64String($scriptsTree.bytes))",
+            "$sourceObjects[3] = [object[]]@($storage.oid, 'blob', "
+            "[Convert]::ToBase64String($storage.bytes))",
+            "$sourcePacket = ConvertTo-Json -InputObject $sourceObjects -Compress -Depth 4",
+        ]
+    )
+    assert buffering == (
+        "$buffer = @(& $Operation 'C:\\Program Files\\Git\\cmd\\git.exe' "
+        "2>$null 3>$null 4>$null 5>$null 6>$null)"
+    )
+    assert output == "foreach ($item in $buffer) { Write-Output -NoEnumerate $item }"
+    packet = _binary_storage_packet()
+    for buffered in (False, True):
+        script = _storage_packet_producer_script(packet, buffered)
+        assert emitter in script
+        assert (buffering in script) is buffered
+        assert (output in script) is buffered
+        assert "return @{ oid = $oid; bytes = $body }" in script
+        for forbidden in (
+            "::Begin",
+            "Add-Type",
+            "Start-Process",
+            "ProcessStartInfo",
+            "Invoke-Expression",
+            "Invoke-RestMethod",
+            "Read-K5GitObject",
+            "installer_wheel_storage.py",
+        ):
+            assert forbidden not in script
+
+
+def test_storage_packet_fixture_keeps_production_and_source_pins_frozen():
+    for path, digest in (
+        (WORKFLOW, "5c21c54304ba5d8b0f7b7af4687a0ceb1fd34dfbc199919524f3cccc44a88087"),
+        (
+            ROOT / "scripts/assert-installed-git-alias.ps1",
+            "67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8",
+        ),
+        (
+            ROOT / "scripts/admit_installed_git_alias.cs",
+            "a751156ee06792f8f4625fa988c73a54c8e9a0a24937c06ab9264762f965d23f",
+        ),
+    ):
+        assert hashlib.sha256(canonical_checkout_bytes(path.read_bytes())).hexdigest() == digest
+
+
+def test_storage_packet_binary_model_uses_real_high_and_nul_tree_oids():
+    import base64
+
+    packet = _binary_storage_packet()
+    for index in (2, 3):
+        oid = bytes.fromhex(packet[index][0])
+        assert 0 in oid and max(oid) >= 128
+        assert oid in base64.b64decode(packet[index - 1][2], validate=True)
+    assert _storage_packet_contract_reason(json.dumps(packet), packet) == "ok"
+
+
+@pytest.mark.parametrize(
+    "fault,reason",
+    [
+        ("json", "json_encoding"),
+        ("root", "root_shape"),
+        ("entry", "entry_shape"),
+        ("oid-scalar", "oid_scalar"),
+        ("oid-format", "oid_format"),
+        ("kind", "entry_kind"),
+        ("base64-scalar", "base64_scalar"),
+        ("base64-size", "base64_size"),
+        ("base64", "base64_encoding"),
+        ("base64-canonical", "base64_canonical"),
+        ("tree", "tree_structure"),
+        ("membership", "tree_membership"),
+        ("hash", "object_hash"),
+    ],
+)
+def test_storage_packet_contract_diagnostics_are_closed(fault, reason):
+    import base64
+    import copy
+
+    expected = _binary_storage_packet()
+    packet = copy.deepcopy(expected)
+    canary = "PRIVATE_PACKET_ERROR_PATH_CANARY"
+    if fault == "root":
+        packet = {canary: packet}
+    elif fault == "entry":
+        packet[0] = {canary: packet[0]}
+    elif fault == "oid-scalar":
+        packet[0][0] = [packet[0][0]]
+    elif fault == "oid-format":
+        packet[0][0] = canary
+    elif fault == "kind":
+        packet[0][1] = canary
+    elif fault == "base64-scalar":
+        packet[0][2] = {canary: packet[0][2]}
+    elif fault == "base64-size":
+        packet[0][2] = ""
+    elif fault == "base64":
+        packet[0][2] = canary + "%"
+    elif fault == "base64-canonical":
+        packet[0][2] = "YR=="
+    elif fault == "tree":
+        packet = _source_packet(root_name=b"../scripts")
+        expected = copy.deepcopy(packet)
+    elif fault == "membership":
+        packet = _source_packet(root_name=b"other")
+        expected = copy.deepcopy(packet)
+    elif fault == "hash":
+        packet[3][2] = base64.b64encode(canary.encode()).decode("ascii")
+    actual = _storage_packet_contract_reason(
+        canary if fault == "json" else json.dumps(packet), expected
+    )
+    assert actual == reason and canary not in actual
+
+
+def test_storage_packet_contract_runs_early_with_closed_output_in_hosted_smoke():
+    smoke = (ROOT / ".github/workflows/windows-alpha-script-smoke.yml").read_text()
+    marker = "      - name: Verify exact PowerShell storage packet contract\n"
+    step = smoke.split(marker, 1)[1].split("\n      - name: ", 1)[0]
+    assert "timeout-minutes: 1" in step
+    assert "shell: powershell" in step
+    assert (
+        "python -m pytest tests/test_installed_analytics_candidate_workflow.py::"
+        "test_windows_powershell_storage_packet_contract --no-cov -q --tb=no"
+    ) in step
+    assert "if ($LASTEXITCODE -ne 0)" in step
+    assert smoke.index("Install targeted test dependencies") < smoke.index(marker)
+    for later in (
+        "Verify clean Windows alpha runtime dependency install",
+        "Run Windows alpha boundary regressions",
+        "Verify exact candidate workflow and owned Windows relay boundary",
+    ):
+        assert smoke.index(marker) < smoke.index(later)
+    source = (
+        Path(__file__)
+        .read_text()
+        .split("def test_windows_powershell_storage_packet_contract(", 1)[1]
+        .split("\ndef test_storage_packet_fixture_extracts", 1)[0]
+    )
+    assert "capture_output=True" in source and "timeout=15" in source
+    assert source.count("pytrace=False") == 3
+    assert "result.stderr\n" not in source and "print(" not in source
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -2558,7 +2887,7 @@ def test_actual_windows_early_storage_packet_preserves_four_binary_git_objects(t
     kinds = ("commit", "tree", "tree", "blob")
     bodies = (b"commit-bytes", b"root-tree", b"scripts-tree", b"storage-source")
     script = "$ErrorActionPreference = 'Stop'\n"
-    for index, (name, body) in enumerate(zip(names, bodies)):
+    for index, (name, body) in enumerate(zip(names, bodies, strict=True)):
         encoded = base64.b64encode(body).decode("ascii")
         script += (
             f"${name} = @{{ oid = ('{chr(97 + index)}' * 40); "
@@ -2576,7 +2905,7 @@ def test_actual_windows_early_storage_packet_preserves_four_binary_git_objects(t
     assert result.returncode == 0, result.stderr[-1000:]
     packet = json.loads(result.stdout)
     assert type(packet) is list and len(packet) == 4
-    for index, (entry, kind, body) in enumerate(zip(packet, kinds, bodies)):
+    for index, (entry, kind, body) in enumerate(zip(packet, kinds, bodies, strict=True)):
         assert type(entry) is list and len(entry) == 3
         assert entry[0] == chr(97 + index) * 40 and entry[1] == kind
         assert base64.b64decode(entry[2], validate=True) == body
