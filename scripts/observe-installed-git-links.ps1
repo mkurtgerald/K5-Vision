@@ -20,7 +20,7 @@ Set-StrictMode -Version Latest
 # This observation never confers storage, retry, exception or delivery authority.
 $guardSha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d'
 # Exact frozen collector bytes; neither environment nor arguments can change this pin.
-$collectorSha256 = 'eeb76812034a45604fbe43171cecbffcc413af8c31fca611e0f2a75bf202059a'
+$collectorSha256 = '22c73e7ffd587b97bab44c644cbb98c0c5f7f8598dba58a5b019f59194c1a712'
 $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
 
 function Assert-K5OrdinaryPath([string]$Path, [bool]$Directory) {
@@ -205,74 +205,55 @@ function Assert-K5Integer($Value, [long]$Minimum, [long]$Maximum) {
 }
 
 function Assert-K5DiagnosticRecord($Record, [hashtable]$Context) {
-    if ($Record -isnot [Collections.Generic.Dictionary[string,object]] -or
-        -not $Record.ContainsKey('status') -or $Record['status'] -isnot [string] -or
-        $Record['status'] -cnotin @('observed', 'refused')) { throw 'record' }
-    $keys = @('schema_version', 'scope', 'target', 'status', 'code', 'closure_complete',
-        'exception_authority', 'storage_admission', 'retry_authority', 'bytes_read', 'elapsed_ms')
+    $keys = @('schema_version','scope','target','status','code','closure_complete',
+        'exception_authority','storage_admission','retry_authority','bytes_read','elapsed_ms')
     if ($Record['status'] -ceq 'observed') {
-        $keys += @('link_count', 'primary_sha256', 'aliases')
+        $keys += @('current_token_sid','service_identity','group_metadata','retention_nodes','directories')
     }
     Assert-K5RecordKeys $Record $keys
-    foreach ($key in @('schema_version', 'scope', 'target', 'status', 'code')) {
-        if ($Record[$key] -isnot [string]) { throw 'record' }
+    if ($Record['schema_version'] -cne 'fixed-runner-acl-observation-v1' -or
+        $Record['scope'] -cne 'fixed-runner-readonly-acl' -or
+        $Record['target'] -cne 'runner-root-chain' -or
+        $Record['status'] -cnotin @('observed','refused')) { throw 'record' }
+    foreach ($key in @('exception_authority','storage_admission','retry_authority')) {
+        if ($Record[$key] -isnot [bool] -or $Record[$key]) { throw 'record' }
     }
-    if ($Record['schema_version'] -cne 'fixed-git-hardlink-observation-v2' -or
-        $Record['scope'] -cne 'fixed-git-readonly-metadata' -or
-        $Record['target'] -cne 'cmd/git.exe') { throw 'record' }
-    foreach ($key in @('exception_authority', 'storage_admission', 'retry_authority')) {
-        if ($Record[$key] -isnot [bool] -or $Record[$key] -ne $false) { throw 'record' }
-    }
-    if ($Record['closure_complete'] -isnot [bool]) { throw 'record' }
-    Assert-K5Integer $Record['bytes_read'] 0 134217728
+    Assert-K5Integer $Record['bytes_read'] 0 0
     Assert-K5Integer $Record['elapsed_ms'] 0 19999
-    if ($Record['status'] -ceq 'refused') {
-        $codes = @('platform', 'abi', 'anchor_open', 'relative_open', 'metadata', 'filesystem',
-            'reparse', 'path_type', 'acl_unavailable', 'acl_null', 'alias_outside_root',
-            'alias_duplicate', 'alias_missing_primary', 'alias_count', 'identity_mismatch',
-            'path_shape', 'name_bound', 'file_size', 'bytes_bound', 'time_bound', 'enumeration',
-            'changed', 'read_failed', 'handle_bound', 'cleanup_failed', 'internal')
-        if ($Record['closure_complete'] -ne $false -or $Record['code'] -cnotin $codes) { throw 'record' }
-    } else {
-        if ($Record['closure_complete'] -ne $true -or $Record['code'] -cne 'none' -or
-            $Record['primary_sha256'] -isnot [string] -or
-            $Record['primary_sha256'] -cnotmatch '\A[0-9a-f]{64}\z') { throw 'record' }
-        Assert-K5Integer $Record['link_count'] 1 16
-        Assert-K5Integer $Record['bytes_read'] 1 134217728
+    if ($Record['closure_complete'] -isnot [bool]) { throw 'record' }
+    if ($Record['status'] -ceq 'observed') {
+        if (-not $Record['closure_complete'] -or $Record['code'] -cne 'none' -or
+            $Record['service_identity'] -cne 'unresolved' -or $Record['group_metadata'] -cne 'not_queried' -or
+            $Record['retention_nodes'] -cne 'not_queried' -or
+            $Record['current_token_sid'] -cnotmatch '\AS-1-[0-9-]{1,180}\z') { throw 'record' }
         Assert-K5Integer $Record['elapsed_ms'] 0 8000
-        $aliases = $Record['aliases']
-        if ($aliases -isnot [Collections.IList] -or $aliases.Count -ne $Record['link_count']) { throw 'record' }
-        $seen = @{}
-        $first = $null
-        foreach ($alias in $aliases) {
-            Assert-K5RecordKeys $alias @('relative_name', 'ntfs_volume_serial', 'ntfs_file_id',
-                'link_count', 'size_bytes', 'sha256', 'acl_sha256')
-            foreach ($key in @('relative_name', 'ntfs_volume_serial', 'ntfs_file_id', 'sha256', 'acl_sha256')) {
-                if ($alias[$key] -isnot [string]) { throw 'record' }
-            }
-            if ($alias['relative_name'].Length -gt 1024 -or
-                $alias['relative_name'] -cnotmatch '\A[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\z' -or
-                $alias['ntfs_volume_serial'] -cnotmatch '\A[0-9a-f]{8}\z' -or
-                $alias['ntfs_file_id'] -cnotmatch '\A[0-9a-f]{16}\z' -or
-                $alias['sha256'] -cne $Record['primary_sha256'] -or
-                $alias['acl_sha256'] -cnotmatch '\A[0-9a-f]{64}\z') { throw 'record' }
-            foreach ($part in $alias['relative_name'].Split('/')) {
-                if ($part -in @('.', '..') -or $part.EndsWith('.')) { throw 'record' }
-            }
-            if ($seen.ContainsKey($alias['relative_name'])) { throw 'record' }
-            $seen[$alias['relative_name']] = $true
-            Assert-K5Integer $alias['link_count'] 1 16
-            Assert-K5Integer $alias['size_bytes'] 1 33554432
-            if ($alias['link_count'] -ne $Record['link_count']) { throw 'record' }
-            if ($null -eq $first) { $first = $alias }
-            foreach ($key in @('ntfs_volume_serial', 'ntfs_file_id', 'acl_sha256', 'size_bytes')) {
-                if ($alias[$key] -cne $first[$key]) { throw 'record' }
+        $roles = @('volume_root','runner_root','work_root','repository_parent','workspace','temp_root')
+        $directories = $Record['directories']
+        if ($directories -isnot [Collections.IList] -or $directories.Count -ne 6) { throw 'record' }
+        for ($i=0; $i -lt 6; $i++) {
+            $item = $directories[$i]
+            Assert-K5RecordKeys $item @('owner_sid','control','acl_sha256','owner_dacl_base64','aces','role','ntfs_volume_serial','ntfs_file_id')
+            if ($item['role'] -cne $roles[$i] -or $item['owner_sid'] -cnotmatch '\AS-1-[0-9-]{1,180}\z' -or
+                $item['acl_sha256'] -cnotmatch '\A[0-9a-f]{64}\z' -or
+                $item['ntfs_volume_serial'] -cnotmatch '\A[0-9a-f]{8}\z' -or
+                $item['ntfs_file_id'] -cnotmatch '\A[0-9a-f]{16}\z' -or
+                $item['owner_dacl_base64'] -isnot [string] -or $item['owner_dacl_base64'].Length -gt 87384 -or
+                $item['owner_dacl_base64'] -cnotmatch '\A[A-Za-z0-9+/]+={0,2}\z') { throw 'record' }
+            Assert-K5Integer $item['control'] 0 65535
+            if ($item['aces'] -isnot [Collections.IList] -or $item['aces'].Count -gt 128) { throw 'record' }
+            foreach ($ace in $item['aces']) {
+                Assert-K5RecordKeys $ace @('type','flags','mask','sid')
+                Assert-K5Integer $ace['type'] 0 255
+                Assert-K5Integer $ace['flags'] 0 255
+                Assert-K5Integer $ace['mask'] 0 4294967295
+                if ($ace['sid'] -cnotmatch '\AS-1-[0-9-]{1,180}\z') { throw 'record' }
             }
         }
-        if (-not $seen.ContainsKey('cmd/git.exe') -or
-            $Record['bytes_read'] -ne ($first['size_bytes'] * ($Record['link_count'] + 2))) { throw 'record' }
+    } else {
+        if ($Record['closure_complete'] -or $Record['code'] -cnotin @('platform','abi','anchor_open','relative_open',
+            'metadata','filesystem','reparse','path_type','acl_unavailable','acl_null','identity_mismatch',
+            'path_shape','name_bound','time_bound','changed','handle_bound','cleanup_failed','internal','enumeration','file_size')) { throw 'record' }
     }
-    # A readable owner/DACL fingerprint is evidence only, never ACL admission.
     $sanitized = [ordered]@{}
     foreach ($key in $keys) { $sanitized[$key] = $Record[$key] }
     $sanitized['source_sha'] = $Context.source_sha
@@ -280,9 +261,9 @@ function Assert-K5DiagnosticRecord($Record, [hashtable]$Context) {
     $sanitized['run_attempt'] = $Context.run_attempt
     $sanitized['requires_separate_post_admission'] = $true
     $sanitized['compiler_artifacts_retained'] = $true
-    $text = ConvertTo-Json -InputObject $sanitized -Compress -Depth 5
+    $text = ConvertTo-Json -InputObject $sanitized -Compress -Depth 8
     if ($strictUtf8.GetByteCount($text) -gt 65536 -or $text -match '[\r\n]') { throw 'record' }
-    return @{ text = $text; status = $Record['status'] }
+    return @{text=$text;status=$Record['status']}
 }
 
 $guard = $null
@@ -385,16 +366,16 @@ try {
 if ($failed -or -not $postPassed -or $null -eq $result) {
     $projection = Get-K5FailureProjection $failureError
     $record = [ordered]@{
-        schema_version = 'fixed-git-hardlink-observation-wrapper-v2'
-        scope = 'fixed-git-readonly-metadata'; status = 'refused'; code = $failure
+        schema_version = 'fixed-runner-acl-observation-wrapper-v1'
+        scope = 'fixed-runner-readonly-acl'; status = 'refused'; code = $failure
         reason = $projection.reason; compiler_code = $projection.compiler_code
         storage_admission = $false; retry_authority = $false; exception_authority = $false
         requires_separate_post_admission = $true; compiler_artifacts_retained = $true
     }
-    Write-Host ('K5_GIT_LINK_OBSERVATION=' + ($record | ConvertTo-Json -Compress -Depth 4))
-    throw 'Installed Git link observation refused. Existing owners were preserved.'
+    Write-Host ('K5_RUNNER_ACL_OBSERVATION=' + ($record | ConvertTo-Json -Compress -Depth 4))
+    throw 'Runner ACL observation refused. Existing owners were preserved.'
 }
-Write-Host ('K5_GIT_LINK_OBSERVATION=' + $result.text)
+Write-Host ('K5_RUNNER_ACL_OBSERVATION=' + $result.text)
 if ($result.status -cne 'observed') {
-    throw 'Installed Git link observation refused. Existing owners were preserved.'
+    throw 'Runner ACL observation refused. Existing owners were preserved.'
 }

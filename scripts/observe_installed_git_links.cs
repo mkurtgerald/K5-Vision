@@ -1,4 +1,4 @@
-// Task-local, read-only observation of C:\Program Files\Git\cmd\git.exe.
+// Task-local, read-only owner/DACL observation of the fixed runner directory chain.
 // C:\ is an explicitly trusted OS/device-map anchor. Every descendant is opened
 // as one component relative to a held parent. No namespace or runtime framework.
 // Windows PowerShell 5.1 / .NET Framework / C# 5; source tests are not native proof.
@@ -67,7 +67,7 @@ public static class K5FixedGitObservation
         {
             Require(Environment.OSVersion.Platform == PlatformID.Win32NT, "platform");
             AssertAbi();
-            complete = observation.Run();
+            complete = observation.RunStorage();
         }
         catch (Refusal error)
         {
@@ -102,9 +102,9 @@ public static class K5FixedGitObservation
     {
         return new Dictionary<string, object>(StringComparer.Ordinal)
         {
-            { "schema_version", "fixed-git-hardlink-observation-v2" },
-            { "scope", "fixed-git-readonly-metadata" },
-            { "target", "cmd/git.exe" },
+            { "schema_version", "fixed-runner-acl-observation-v1" },
+            { "scope", "fixed-runner-readonly-acl" },
+            { "target", "runner-root-chain" },
             { "status", "refused" },
             { "code", "internal" },
             { "closure_complete", false },
@@ -311,6 +311,11 @@ public static class K5FixedGitObservation
 
         private string ReadAcl(IntPtr handle)
         {
+            return (string)ReadAclRecord(handle)["acl_sha256"];
+        }
+
+        private Dictionary<string, object> ReadAclRecord(IntPtr handle)
+        {
             Tick();
             IntPtr descriptor = IntPtr.Zero;
             try
@@ -350,7 +355,23 @@ public static class K5FixedGitObservation
                 {
                     string digest = Hex(hash.ComputeHash(normalized));
                     Tick();
-                    return digest;
+                    Require(raw.DiscretionaryAcl.Count <= 128, "acl_unavailable");
+                    List<Dictionary<string, object>> entries = new List<Dictionary<string, object>>();
+                    foreach (GenericAce ace in raw.DiscretionaryAcl)
+                    {
+                        KnownAce known = ace as KnownAce;
+                        Require(known != null && known.SecurityIdentifier != null, "acl_unavailable");
+                        entries.Add(new Dictionary<string, object> {
+                            { "type", (int)ace.AceType }, { "flags", (int)ace.AceFlags },
+                            { "mask", unchecked((uint)known.AccessMask) },
+                            { "sid", known.SecurityIdentifier.Value }
+                        });
+                    }
+                    return new Dictionary<string, object> {
+                        { "owner_sid", raw.Owner.Value }, { "control", (int)retained },
+                        { "acl_sha256", digest }, { "owner_dacl_base64", Convert.ToBase64String(normalized) },
+                        { "aces", entries }
+                    };
                 }
             }
             finally
@@ -503,6 +524,53 @@ public static class K5FixedGitObservation
             result["link_count"] = primary.Initial.Links;
             result["primary_sha256"] = primaryHash;
             result["aliases"] = aliases;
+            return result;
+        }
+
+        internal Dictionary<string, object> RunStorage()
+        {
+            // Fixed existing directory chain only. No file content, recursion, service
+            // discovery, name lookup, permission mutation, or directory creation.
+            Held anchor = OpenAnchor();
+            Held runner = OpenRelative(anchor, "K5PhysicalRunner", true);
+            Held work = OpenRelative(runner, "_work", true);
+            Held repo = OpenRelative(work, "K5-Vision", true);
+            Held workspace = OpenRelative(repo, "K5-Vision", true);
+            Held temp = OpenRelative(work, "_temp", true);
+            Held[] nodes = new Held[] { anchor, runner, work, repo, workspace, temp };
+            string[] roles = new string[] { "volume_root", "runner_root", "work_root", "repository_parent", "workspace", "temp_root" };
+            string tokenSid;
+            using (System.Security.Principal.WindowsIdentity identity = System.Security.Principal.WindowsIdentity.GetCurrent())
+            {
+                Require(identity.User != null, "acl_unavailable");
+                tokenSid = identity.User.Value;
+            }
+            List<Dictionary<string, object>> records = new List<Dictionary<string, object>>();
+            for (int i = 0; i < nodes.Length; i++)
+            {
+                Dictionary<string, object> record = ReadAclRecord(nodes[i].Handle);
+                Require((string)record["acl_sha256"] == nodes[i].Acl, "changed");
+                record["role"] = roles[i];
+                record["ntfs_volume_serial"] = nodes[i].Initial.Volume.ToString("x8", CultureInfo.InvariantCulture);
+                record["ntfs_file_id"] = nodes[i].Initial.Id.ToString("x16", CultureInfo.InvariantCulture);
+                records.Add(record);
+            }
+            foreach (Held item in held)
+            {
+                Require(item.Initial.Same(ReadMetadata(item.Handle, true)), "changed");
+                Require(item.Acl == ReadAcl(item.Handle), "changed");
+            }
+            using (System.Security.Principal.WindowsIdentity identity = System.Security.Principal.WindowsIdentity.GetCurrent())
+                Require(identity.User != null && identity.User.Value == tokenSid, "changed");
+            Dictionary<string, object> result = BaseRecord();
+            result["status"] = "observed";
+            result["code"] = "none";
+            result["closure_complete"] = true;
+            result["current_token_sid"] = tokenSid;
+            result["service_identity"] = "unresolved";
+            result["group_metadata"] = "not_queried";
+            result["retention_nodes"] = "not_queried";
+            result["directories"] = records;
             return result;
         }
 
