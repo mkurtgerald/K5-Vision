@@ -123,8 +123,9 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $output)) {
             throw 'Owner Windows GUI compilation failed.'
           }
-          & $output --self-check
-          if ($LASTEXITCODE -ne 3) {
+          # A GUI-subsystem executable must be awaited; LASTEXITCODE may be stale.
+          $guiProbe = Start-Process -FilePath $output -ArgumentList '--self-check' -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+          if ($guiProbe.ExitCode -ne 3) {
             throw 'Owner GUI must refuse a missing installed runtime.'
           }
           Write-Host 'K5_OWNER_GUI_HOSTED_COMPILE=passed'
