@@ -38,7 +38,8 @@ class OwnerGuiContract(unittest.TestCase):
         self.assertIn('K5VisionAlpha.cs', workflow)
         self.assertIn('K5_OWNER_GUI_HOSTED_COMPILE=passed', workflow)
         self.assertIn('if ($LASTEXITCODE -ne 3)', workflow)
-        self.assertIn('scripts/windows-alpha/owner-installer/K5VisionAlpha.cs', workflow)
+        self.assertIn("$env:GITHUB_WORKSPACE", workflow)
+        self.assertIn("'scripts\\windows-alpha\\owner-installer\\K5VisionAlpha.cs'", workflow)
 
 
 if __name__ == "__main__":
