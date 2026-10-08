@@ -137,7 +137,8 @@ function Test-K5AlphaOperatorReceipt([object]$Receipt, [bool]$AnalyticsRequired)
         if ($name -cne "analytics_failures" -and $counter -lt 1) { return $false }
     }
     if ($AnalyticsRequired -and ($Receipt.analytics_failures -ne 0 -or
-        $Receipt.analytics_provider_completions -gt $Receipt.analytics_provider_submissions)) {
+        $Receipt.analytics_provider_completions -gt $Receipt.analytics_provider_submissions -or
+        $Receipt.analytics_provider_submissions -gt $Receipt.delivered_frames)) {
         return $false
     }
     return $true
