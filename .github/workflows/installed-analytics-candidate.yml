@@ -1105,12 +1105,14 @@ jobs:
               $rootTree = Read-K5GitObject ($env:K5_STAGE_ONE_REVISION + '^{tree}') 'tree' 131072
               $scriptsTree = Read-K5GitObject ($env:K5_STAGE_ONE_REVISION + ':scripts') 'tree' 131072
               $storage = Read-K5GitObject ($env:K5_STAGE_ONE_REVISION + ':scripts/installer_wheel_storage.py') 'blob' 131072
-              $sourcePacket = @(
-                  @($commit.oid, 'commit', [Convert]::ToBase64String($commit.bytes)),
-                  @($rootTree.oid, 'tree', [Convert]::ToBase64String($rootTree.bytes)),
-                  @($scriptsTree.oid, 'tree', [Convert]::ToBase64String($scriptsTree.bytes)),
-                  @($storage.oid, 'blob', [Convert]::ToBase64String($storage.bytes))
-              ) | ConvertTo-Json -Compress -Depth 3
+              # Never enumerate nested Git objects through the PowerShell pipeline:
+              # preserve the four [oid, kind, base64] records as actual JSON arrays.
+              $sourceObjects = [object[]]::new(4)
+              $sourceObjects[0] = [object[]]@($commit.oid, 'commit', [Convert]::ToBase64String($commit.bytes))
+              $sourceObjects[1] = [object[]]@($rootTree.oid, 'tree', [Convert]::ToBase64String($rootTree.bytes))
+              $sourceObjects[2] = [object[]]@($scriptsTree.oid, 'tree', [Convert]::ToBase64String($scriptsTree.bytes))
+              $sourceObjects[3] = [object[]]@($storage.oid, 'blob', [Convert]::ToBase64String($storage.bytes))
+              $sourcePacket = ConvertTo-Json -InputObject $sourceObjects -Compress -Depth 4
               if ($sourcePacket.Length -gt 620000) { throw 'source' }
           } catch {
               Write-Host 'K5_STORAGE_PREFLIGHT={"schema_version":"storage-preflight-v1","scope":"read-only-early-storage-admission","status":"refused","stage":"source_binding","code":"source_read_unavailable","storage_acl":null,"retention_state":"not_started","later_admission_required":true}'

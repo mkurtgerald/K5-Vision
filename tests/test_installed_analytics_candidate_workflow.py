@@ -2546,6 +2546,42 @@ def test_bootstrap_source_failure_is_a_distinct_bounded_refusal(tmp_path, capsys
     assert record["status"] == "refused" and record["storage_acl"] is None
 
 
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell required")
+def test_actual_windows_early_storage_packet_preserves_four_binary_git_objects(tmp_path):
+    import base64
+
+    binder = _run_script(_step("Bind early storage source under held Git admission"))
+    start = binder.index("$sourceObjects = [object[]]::new(4)")
+    end = binder.index("if ($sourcePacket.Length -gt 620000)", start)
+    producer = binder[start:end]
+    names = ("commit", "rootTree", "scriptsTree", "storage")
+    kinds = ("commit", "tree", "tree", "blob")
+    bodies = (b"commit-bytes", b"root-tree", b"scripts-tree", b"storage-source")
+    script = "$ErrorActionPreference = 'Stop'\n"
+    for index, (name, body) in enumerate(zip(names, bodies)):
+        encoded = base64.b64encode(body).decode("ascii")
+        script += (
+            f"${name} = @{{ oid = ('{chr(97 + index)}' * 40); "
+            f"bytes = [Convert]::FromBase64String('{encoded}') }}\n"
+        )
+    script += producer + "\nWrite-Output $sourcePacket\n"
+    script_path = tmp_path / "source-packet.ps1"
+    script_path.write_text(script, encoding="utf-8")
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-File", str(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr[-1000:]
+    packet = json.loads(result.stdout)
+    assert type(packet) is list and len(packet) == 4
+    for index, (entry, kind, body) in enumerate(zip(packet, kinds, bodies)):
+        assert type(entry) is list and len(entry) == 3
+        assert entry[0] == chr(97 + index) * 40 and entry[1] == kind
+        assert base64.b64decode(entry[2], validate=True) == body
+
+
 def test_storage_packet_handoff_is_bounded_data_with_strict_single_links(tmp_path):
     namespace = _early_reader_namespace()
     path = tmp_path / "storage-source.json"
