@@ -9,15 +9,15 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 # Invoked only as independently hash-verified, strict UTF-8 in-memory bytes.
 # This fixed one-attempt transport is not installer or retry authority.
-$sourceCommit = 'dd3818de0e1f3c70bf7b8488b8ee399d18677ae1'
+$sourceCommit = '5998cdb1d797c5ae06b61cde9a468a7f9b469d8a'
 $repository = 'mkurtgerald/K5-Vision'
 $branch = 'review/git-link-metadata-20261008'
 $apiRoot = 'https://api.github.com/repos/mkurtgerald/K5-Vision/'
 $utf8 = [Text.UTF8Encoding]::new($false, $true)
 $pins = @(
     @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
-    @{ name = 'observe_installed_git_links.cs'; size = 38174; blob = '9a55aaddad82c094aca075f69f6f32492bd6259b'; sha256 = '22c73e7ffd587b97bab44c644cbb98c0c5f7f8598dba58a5b019f59194c1a712' },
-    @{ name = 'observe-installed-git-links.ps1'; size = 19844; blob = '05622487190993b37828e5543d29d79b54409f22'; sha256 = 'f7475f3e49b47529eb428f742eca6b04d26f8b40f464107f491837a36345d66a' }
+    @{ name = 'observe_installed_git_links.cs'; size = 40663; blob = '84208315f60dd3d47e448b16b5834f2e00e173e8'; sha256 = 'e4a4e5826d1a341c3159f22910c569c7c5c1b3ae1f1fede00eb3718612e9ac6c' },
+    @{ name = 'observe-installed-git-links.ps1'; size = 28221; blob = '4be2ceb6d26cb75f0dc3d987891be1f132971e2d'; sha256 = '16f9ad4e4ce5bd734278a462870662d0d7cf220e90930763164cccef5d0cb03f' }
 )
 
 function Assert-OrdinaryPath([string]$Path, [bool]$Directory, [hashtable]$Observation = $null) {

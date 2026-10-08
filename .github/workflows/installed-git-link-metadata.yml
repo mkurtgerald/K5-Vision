@@ -47,8 +47,8 @@ jobs:
           Set-StrictMode -Version Latest
           # API origin, blob identity, byte count and digest are fixed by reviewed source.
           # No checkout, executable path lookup, redirects, retries, or source-file reopen.
-          $expectedBlob = 'f0248c9ada23cc68a748ddd76386df887b061194'
-          $expectedDigest = 'daaa32ca0f79d565a3cf51797d94530ace959ab7163fb2b29ac612541a07e58a'
+          $expectedBlob = 'eded1510dad342d253b84610143512eb21bea7ba'
+          $expectedDigest = 'e674fa6584034f3c33609a6cf5b65e8aabd716f3baab2494253272dc41e6b22b'
           $expectedSize = 23884
           $maximumResponse = 131072
           $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
@@ -133,8 +133,8 @@ jobs:
           Set-StrictMode -Version Latest
           # API origin, blob identity, byte count and digest are fixed by reviewed source.
           # No checkout, executable path lookup, redirects, retries, or source-file reopen.
-          $expectedBlob = 'f0248c9ada23cc68a748ddd76386df887b061194'
-          $expectedDigest = 'daaa32ca0f79d565a3cf51797d94530ace959ab7163fb2b29ac612541a07e58a'
+          $expectedBlob = 'eded1510dad342d253b84610143512eb21bea7ba'
+          $expectedDigest = 'e674fa6584034f3c33609a6cf5b65e8aabd716f3baab2494253272dc41e6b22b'
           $expectedSize = 23884
           $maximumResponse = 131072
           $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
@@ -236,8 +236,8 @@ jobs:
           Set-StrictMode -Version Latest
           # API origin, blob identity, byte count and digest are fixed by reviewed source.
           # No checkout, executable path lookup, redirects, retries, or source-file reopen.
-          $expectedBlob = 'f0248c9ada23cc68a748ddd76386df887b061194'
-          $expectedDigest = 'daaa32ca0f79d565a3cf51797d94530ace959ab7163fb2b29ac612541a07e58a'
+          $expectedBlob = 'eded1510dad342d253b84610143512eb21bea7ba'
+          $expectedDigest = 'e674fa6584034f3c33609a6cf5b65e8aabd716f3baab2494253272dc41e6b22b'
           $expectedSize = 23884
           $maximumResponse = 131072
           $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
@@ -322,8 +322,8 @@ jobs:
           Set-StrictMode -Version Latest
           # API origin, blob identity, byte count and digest are fixed by reviewed source.
           # No checkout, executable path lookup, redirects, retries, or source-file reopen.
-          $expectedBlob = 'f0248c9ada23cc68a748ddd76386df887b061194'
-          $expectedDigest = 'daaa32ca0f79d565a3cf51797d94530ace959ab7163fb2b29ac612541a07e58a'
+          $expectedBlob = 'eded1510dad342d253b84610143512eb21bea7ba'
+          $expectedDigest = 'e674fa6584034f3c33609a6cf5b65e8aabd716f3baab2494253272dc41e6b22b'
           $expectedSize = 23884
           $maximumResponse = 131072
           $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
