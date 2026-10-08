@@ -1,4 +1,4 @@
-// Task-local, read-only ACL and .service prerequisite observation. No repair code.
+// Task-local, read-only full runner DACL/inheritance inventory. No ACL setter.
 // C:\ is an explicitly trusted OS/device-map anchor. Every descendant is opened
 // as one component relative to a held parent. No namespace or runtime framework.
 // Windows PowerShell 5.1 / .NET Framework / C# 5; source tests are not native proof.
@@ -13,19 +13,18 @@ using System.Text;
 
 public static class K5FixedGitObservation
 {
-    private const int MaxLinks = 16;
     private const int MaxHandles = 64;
     private const int MaxNameUnits = 1024;
-    private const int LinkBufferBytes = 65536;
-    private const long MaxFileBytes = 32L * 1024 * 1024;
-    private const long MaxTotalBytes = 128L * 1024 * 1024;
-    private const long MaxElapsedMs = 8000;
+    private const long MaxElapsedMs = 75000;
+    private const int MaxObjects = 50000;
+    private const long MaxDaclBytes = 64L * 1024 * 1024;
+    private const long MaxPathUnits = 8L * 1024 * 1024;
     private const uint ReadControl = 0x00020000;
     private const uint Synchronize = 0x00100000;
     private const uint ReadAttributes = 0x00000080;
     private const uint ReadData = 0x00000001;
     private const uint Traverse = 0x00000020;
-    private const uint ShareRead = 0x00000001;
+    private const uint ShareRead = 0x00000003; // read/write sharing; deny delete/rename
     private const uint ObjCaseInsensitive = 0x00000040;
     private const uint ObjDontReparse = 0x00001000;
     private const uint FileDirectoryFile = 0x00000001;
@@ -34,7 +33,6 @@ public static class K5FixedGitObservation
     private const uint FileOpenReparsePoint = 0x00200000;
     private const uint AttributeDirectory = 0x00000010;
     private const uint AttributeReparse = 0x00000400;
-    private const int FileHardLinkInformation = 46;
     private static readonly IntPtr InvalidHandle = new IntPtr(-1);
     private static readonly Encoding StrictUtf16 = new UnicodeEncoding(false, false, true);
     private static readonly HashSet<string> Codes = new HashSet<string>(StringComparer.Ordinal)
@@ -44,15 +42,23 @@ public static class K5FixedGitObservation
         "alias_outside_root", "alias_duplicate", "alias_missing_primary", "alias_count",
         "identity_mismatch", "path_shape", "name_bound", "file_size", "bytes_bound",
         "time_bound", "enumeration", "changed", "read_failed", "handle_bound",
-        "cleanup_failed", "internal", "service_metadata_absent", "service_metadata"
+        "cleanup_failed", "internal", "inventory_bound", "inventory_changed", "backup_create", "backup_verify", "backup_security"
     };
+
+    // One owned-process deadline covers identity checks, both inventories,
+    // validation, backup/readback and the wrapper's normal post checks together.
+    public static System.Threading.Timer StartObservationDeadline()
+    {
+        return new System.Threading.Timer(delegate(object state) { Environment.Exit(124); },
+            null, 150000, System.Threading.Timeout.Infinite);
+    }
 
     // Invoke only after the parent has admitted this own PowerShell observation step.
     // Compilation is complete before this timer starts. No process lookup or kills.
     public static Dictionary<string, object> ObserveGuarded()
     {
         System.Threading.Timer watchdog = new System.Threading.Timer(
-            delegate(object state) { Environment.Exit(124); }, null, 20000,
+            delegate(object state) { Environment.Exit(124); }, null, 90000,
             System.Threading.Timeout.Infinite);
         try { return Observe(); }
         finally { watchdog.Dispose(); }
@@ -67,7 +73,7 @@ public static class K5FixedGitObservation
         {
             Require(Environment.OSVersion.Platform == PlatformID.Win32NT, "platform");
             AssertAbi();
-            complete = observation.RunStorage();
+            complete = observation.RunInventory();
         }
         catch (Refusal error)
         {
@@ -98,13 +104,41 @@ public static class K5FixedGitObservation
         return result;
     }
 
+    // Only a new metadata-backup file outside the affected runner tree is written.
+    // The caller must supply the exact reviewed inventory bytes; no ACL setter exists.
+    public static Dictionary<string, object> SaveBackup(string localAppData, string name, byte[] bytes)
+    {
+        Observation observation = new Observation();
+        System.Threading.Timer watchdog = new System.Threading.Timer(
+            delegate(object state) { Environment.Exit(124); }, null, 30000,
+            System.Threading.Timeout.Infinite);
+        Dictionary<string, object> result = new Dictionary<string, object> {
+            { "status", "refused" }, { "code", "internal" },
+            { "readback_verified", false }, { "repair_ready", false }
+        };
+        try { result = observation.SaveBackup(localAppData, name, bytes); }
+        catch (Refusal error) { result["code"] = Codes.Contains(error.Code) ? error.Code : "internal"; }
+        catch (Exception) { result["code"] = "internal"; }
+        finally
+        {
+            watchdog.Dispose();
+            if (!observation.CloseAll())
+            {
+                result["status"] = "refused";
+                result["code"] = "cleanup_failed";
+                result["readback_verified"] = false;
+            }
+        }
+        return result;
+    }
+
     private static Dictionary<string, object> BaseRecord()
     {
         return new Dictionary<string, object>(StringComparer.Ordinal)
         {
-            { "schema_version", "fixed-runner-acl-prerequisite-v1" },
-            { "scope", "fixed-runner-readonly-acl" },
-            { "target", "runner-root-chain" },
+            { "schema_version", "fixed-runner-dacl-inventory-v1" },
+            { "scope", "fixed-runner-readonly-dacl-inventory" },
+            { "target", "runner-root-subtree" },
             { "status", "refused" },
             { "code", "internal" },
             { "closure_complete", false },
@@ -129,13 +163,6 @@ public static class K5FixedGitObservation
     {
         internal uint Volume, Links, Attributes;
         internal ulong Id;
-        internal long Size, Created, Modified, Changed;
-        internal bool Same(Metadata other)
-        {
-            return Volume == other.Volume && Id == other.Id && Links == other.Links &&
-                Attributes == other.Attributes && Size == other.Size &&
-                Created == other.Created && Modified == other.Modified && Changed == other.Changed;
-        }
     }
 
     private sealed class Held
@@ -144,13 +171,7 @@ public static class K5FixedGitObservation
         internal bool Directory;
         internal Metadata Initial;
         internal string Acl;
-    }
-
-    private sealed class Link
-    {
-        internal Held Parent;
-        internal ulong ParentId;
-        internal string Name, Relative;
+        internal Dictionary<string, object> Dacl;
     }
 
     private sealed class Observation
@@ -174,14 +195,21 @@ public static class K5FixedGitObservation
             if (handle != IntPtr.Zero && handle != InvalidHandle) owned.Add(handle);
         }
 
-        private Held Capture(IntPtr handle, bool directory)
+        private Held Capture(IntPtr handle, bool directory, bool inventory = false)
         {
             Tick();
             Held item = new Held();
             item.Handle = handle;
+            if (inventory)
+            {
+                ByHandleInformation shape;
+                Require(Native.GetFileInformationByHandle(handle, out shape), "metadata");
+                directory = (shape.Attributes & AttributeDirectory) != 0;
+            }
             item.Directory = directory;
             item.Initial = ReadMetadata(handle, directory);
-            item.Acl = ReadAcl(handle);
+            item.Dacl = ReadAclRecord(handle);
+            item.Acl = (string)item.Dacl["dacl_sha256"];
             held.Add(item);
             return item;
         }
@@ -190,7 +218,8 @@ public static class K5FixedGitObservation
         {
             BeforeOpen();
             // The ONLY absolute filesystem open: trusted C:\ OS/device-map anchor.
-            // Share-read refuses conflicting writers/deleters; no fallback or retry.
+            // Metadata reads allow existing content writers, but deny rename/deletion.
+            // Content timestamps are not a DACL snapshot invariant.
             IntPtr handle = Native.CreateFileW(@"\\?\C:\", ReadAttributes | ReadControl |
                 Synchronize | Traverse, ShareRead, IntPtr.Zero, 3,
                 0x02000000 | FileOpenReparsePoint, IntPtr.Zero);
@@ -199,7 +228,7 @@ public static class K5FixedGitObservation
             return Capture(handle, true);
         }
 
-        private Held OpenRelative(Held parent, string component, bool directory, bool serviceMetadata = false)
+        private Held OpenRelative(Held parent, string component, bool directory, bool inventory = false)
         {
             ValidateComponent(component); // Before allocating/opening any alias.
             Require(parent != null && parent.Directory, "path_type");
@@ -224,17 +253,14 @@ public static class K5FixedGitObservation
                 IoStatusBlock io = new IoStatusBlock();
                 IntPtr handle = IntPtr.Zero;
                 int status = Native.NtOpenFile(out handle,
-                    ReadAttributes | ReadControl | Synchronize | (directory ? Traverse : ReadData),
+                    ReadAttributes | ReadControl | Synchronize | (directory || inventory ? ReadData : 0),
                     ref attributes, ref io, ShareRead,
                     FileOpenReparsePoint | FileSynchronousIoNonalert |
-                    (directory ? FileDirectoryFile : FileNonDirectoryFile));
+                    (inventory ? 0 : (directory ? FileDirectoryFile : FileNonDirectoryFile)));
                 Own(handle); // Own even an anomalous non-null handle on failure.
-                if (serviceMetadata && status == unchecked((int)0xc0000034) &&
-                    (handle == IntPtr.Zero || handle == InvalidHandle))
-                    throw new Refusal("service_metadata_absent");
                 Require(status == 0 && io.Status == 0 && handle != IntPtr.Zero &&
                     handle != InvalidHandle, "relative_open");
-                Held result = Capture(handle, directory);
+                Held result = Capture(handle, directory, inventory);
                 Require(result.Initial.Volume == parent.Initial.Volume, "identity_mismatch");
                 return result;
             }
@@ -290,92 +316,85 @@ public static class K5FixedGitObservation
             Require(identifier != 0 && identifier == byHandleId, "identity_mismatch");
             Require((info.Attributes & AttributeReparse) == 0, "reparse");
             Require(((info.Attributes & AttributeDirectory) != 0) == directory, "path_type");
-            Require(U32(basic, 32) == info.Attributes &&
-                U64(basic, 0) == info.Created.Value && U64(basic, 16) == info.Modified.Value,
-                "changed");
-            ulong size = ((ulong)info.SizeHigh << 32) | info.SizeLow;
-            Require(size <= Int64.MaxValue, "file_size");
+            Require(U32(basic, 32) == info.Attributes, "changed");
             if (!directory)
             {
-                Require(info.Links >= 1 && info.Links <= MaxLinks, "alias_count");
-                Require(size > 0 && size <= (ulong)MaxFileBytes, "file_size");
+                Require(info.Links == 1, "alias_count"); // Unknown/outside hardlink closure refuses.
             }
             Metadata result = new Metadata();
             result.Volume = serial;
             result.Id = identifier;
             result.Links = info.Links;
             result.Attributes = info.Attributes;
-            result.Size = (long)size;
-            result.Created = unchecked((long)U64(basic, 0));
-            result.Modified = unchecked((long)U64(basic, 16));
-            result.Changed = unchecked((long)U64(basic, 24));
             return result;
         }
 
         private string ReadAcl(IntPtr handle)
         {
-            return (string)ReadAclRecord(handle)["acl_sha256"];
+            return (string)ReadAclRecord(handle)["dacl_sha256"];
         }
 
-        private Dictionary<string, object> ReadAclRecord(IntPtr handle)
+        private Dictionary<string, object> ReadAclRecord(IntPtr handle, int checkBackup = 0)
         {
             Tick();
             IntPtr descriptor = IntPtr.Zero;
             try
             {
                 IntPtr owner, dacl;
-                uint status = Native.GetSecurityInfo(handle, 1, 0x00000005,
+                uint status = Native.GetSecurityInfo(handle, 1, checkBackup != 0 ? 0x00000005U : 0x00000004U,
                     out owner, IntPtr.Zero, out dacl, IntPtr.Zero, out descriptor);
-                Tick();
-                Require(status == 0 && descriptor != IntPtr.Zero && owner != IntPtr.Zero,
-                    "acl_unavailable"); // OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
-                Require(dacl != IntPtr.Zero, "acl_null");
-                ushort control = 0;
-                uint revision = 0;
+                Require(status == 0 && descriptor != IntPtr.Zero && dacl != IntPtr.Zero,
+                    "acl_unavailable"); // Inventory: DACL only. New backup: owner + DACL custody check only.
+                ushort control;
+                uint revision;
                 Require(Native.IsValidSecurityDescriptor(descriptor) &&
-                    Native.GetSecurityDescriptorControl(descriptor, out control, out revision),
-                    "acl_unavailable");
-                Require(revision == 1 && (control & 0x8004) == 0x8004, "acl_unavailable");
+                    Native.GetSecurityDescriptorControl(descriptor, out control, out revision) &&
+                    revision == 1 && (control & 0x8004) == 0x8004, "acl_unavailable");
                 uint length = Native.GetSecurityDescriptorLength(descriptor);
                 Require(length >= 20 && length <= 65536, "acl_unavailable");
                 byte[] bytes = new byte[(int)length];
                 Marshal.Copy(descriptor, bytes, 0, bytes.Length);
                 RawSecurityDescriptor raw = new RawSecurityDescriptor(bytes, 0);
-                Require(raw.Owner != null && raw.DiscretionaryAcl != null, "acl_null");
-                Require(raw.SystemAcl == null, "acl_unavailable");
-                // Re-encode owner + DACL as a stable self-relative descriptor. This
-                // excludes native pointers, padding, omitted group, and all SACL data.
-                ControlFlags retained = raw.ControlFlags & (ControlFlags.OwnerDefaulted |
-                    ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclDefaulted |
-                    ControlFlags.DiscretionaryAclAutoInheritRequired |
-                    ControlFlags.DiscretionaryAclAutoInherited |
-                    ControlFlags.DiscretionaryAclProtected | ControlFlags.SelfRelative);
-                RawSecurityDescriptor stable = new RawSecurityDescriptor(retained,
-                    raw.Owner, null, null, raw.DiscretionaryAcl);
+                Require(raw.DiscretionaryAcl != null && raw.DiscretionaryAcl.Count <= 128,
+                    "acl_unavailable");
+                if (checkBackup != 0)
+                {
+                    HashSet<string> trusted = new HashSet<string>(StringComparer.Ordinal) {
+                        "S-1-5-18", "S-1-5-32-544", "S-1-5-21-283315059-370827648-873861665-1000"
+                    };
+                    Require(raw.Owner != null && trusted.Contains(raw.Owner.Value), "backup_security");
+                    foreach (GenericAce ace in raw.DiscretionaryAcl)
+                    {
+                        CommonAce common = ace as CommonAce;
+                        Require(common != null && !common.IsCallback &&
+                            (common.AceQualifier == AceQualifier.AccessAllowed ||
+                             common.AceQualifier == AceQualifier.AccessDenied), "backup_security");
+                        if (common.AceQualifier == AceQualifier.AccessAllowed &&
+                            (common.AceFlags & AceFlags.InheritOnly) == 0 && common.AccessMask != 0)
+                        {
+                            // On ancestors, ordinary add-file/subdirectory rights
+                            // cannot replace our FILE_CREATE backup. Refuse effective
+                            // delete-child/delete, WRITE_DAC/OWNER or GENERIC_ALL.
+                            uint mask = unchecked((uint)common.AccessMask);
+                            if (checkBackup == 1 || (mask & 0x100d0040U) != 0)
+                                Require(trusted.Contains(common.SecurityIdentifier.Value), "backup_security");
+                        }
+                    }
+                }
+                ControlFlags flags = raw.ControlFlags & (ControlFlags.DiscretionaryAclPresent |
+                    ControlFlags.DiscretionaryAclDefaulted | ControlFlags.DiscretionaryAclAutoInheritRequired |
+                    ControlFlags.DiscretionaryAclAutoInherited | ControlFlags.DiscretionaryAclProtected |
+                    ControlFlags.SelfRelative);
+                RawSecurityDescriptor stable = new RawSecurityDescriptor(flags, null, null, null,
+                    raw.DiscretionaryAcl);
                 byte[] normalized = new byte[stable.BinaryLength];
                 stable.GetBinaryForm(normalized, 0);
                 using (SHA256 hash = SHA256.Create())
-                {
-                    string digest = Hex(hash.ComputeHash(normalized));
-                    Tick();
-                    Require(raw.DiscretionaryAcl.Count <= 128, "acl_unavailable");
-                    List<Dictionary<string, object>> entries = new List<Dictionary<string, object>>();
-                    foreach (GenericAce ace in raw.DiscretionaryAcl)
-                    {
-                        KnownAce known = ace as KnownAce;
-                        Require(known != null && known.SecurityIdentifier != null, "acl_unavailable");
-                        entries.Add(new Dictionary<string, object> {
-                            { "type", (int)ace.AceType }, { "flags", (int)ace.AceFlags },
-                            { "mask", unchecked((uint)known.AccessMask) },
-                            { "sid", known.SecurityIdentifier.Value }
-                        });
-                    }
                     return new Dictionary<string, object> {
-                        { "owner_sid", raw.Owner.Value }, { "control", (int)retained },
-                        { "acl_sha256", digest }, { "owner_dacl_base64", Convert.ToBase64String(normalized) },
-                        { "aces", entries }
+                        { "control", (int)flags }, { "dacl_sha256", Hex(hash.ComputeHash(normalized)) },
+                        { "dacl_base64", Convert.ToBase64String(normalized) },
+                        { "dacl_bytes", normalized.Length }, { "ace_count", raw.DiscretionaryAcl.Count }
                     };
-                }
             }
             finally
             {
@@ -384,233 +403,254 @@ public static class K5FixedGitObservation
             }
         }
 
-        private List<Link> Closure(Held primary, Held git, Held cmd)
+        private static bool SameObject(Metadata left, Metadata right)
         {
-            Require(git.Initial.Volume == primary.Initial.Volume &&
-                cmd.Initial.Volume == primary.Initial.Volume && git.Initial.Id != cmd.Initial.Id,
-                "identity_mismatch");
-            byte[] bytes = Query(primary.Handle, FileHardLinkInformation, LinkBufferBytes, false);
-            Require(bytes.Length >= 30, "enumeration");
-            uint needed = U32(bytes, 0);
-            uint count = U32(bytes, 4);
-            Require(needed == (uint)bytes.Length && needed <= LinkBufferBytes, "enumeration");
-            Require(count >= 1 && count <= MaxLinks && count == primary.Initial.Links, "alias_count");
-            List<Link> result = new List<Link>();
-            HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            bool hasPrimary = false;
-            int position = 8; // Native FILE_LINKS_INFORMATION.Entry starts at offset 8.
-            for (uint index = 0; index < count; index++)
-            {
-                Tick();
-                Require((position & 7) == 0 && position <= bytes.Length - 20, "enumeration");
-                uint next = U32(bytes, position);
-                ulong parentId = U64(bytes, position + 8);
-                uint nameUnits = U32(bytes, position + 16);
-                Require(parentId != 0, "identity_mismatch");
-                Require(nameUnits >= 1 && nameUnits <= MaxNameUnits, "name_bound");
-                int nameBytes = checked((int)nameUnits * 2); // WCHAR count, not byte count.
-                int end = checked(position + 20 + nameBytes);
-                Require(end <= bytes.Length, "enumeration");
-                string name;
-                try { name = StrictUtf16.GetString(bytes, position + 20, nameBytes); }
-                catch (DecoderFallbackException) { throw new Refusal("path_shape"); }
-                ValidateComponent(name);
-                // Only two genuine, already-held NTFS parents are resolvable. Never
-                // search a directory, open by ID, or open metadata outside this closure.
-                Held parent;
-                string relative;
-                if (parentId == git.Initial.Id) { parent = git; relative = name; }
-                else if (parentId == cmd.Initial.Id) { parent = cmd; relative = "cmd/" + name; }
-                else throw new Refusal("alias_outside_root");
-                Require(names.Add(relative), "alias_duplicate");
-                if (parent == cmd && String.Equals(name, "git.exe", StringComparison.OrdinalIgnoreCase))
-                    hasPrimary = true;
-                result.Add(new Link { Parent = parent, ParentId = parentId, Name = name, Relative = relative });
-                if (index + 1 < count)
-                {
-                    int minimum = checked((20 + nameBytes + 7) & ~7);
-                    Require(next >= (uint)minimum && (next & 7) == 0 &&
-                        next <= (uint)(bytes.Length - position - 20), "enumeration");
-                    position = checked(position + (int)next);
-                }
-                else
-                {
-                    // No counted NUL terminator is permitted. At most native tail padding.
-                    Require(next == 0 && bytes.Length >= end &&
-                        bytes.Length <= ((end + 7) & ~7), "enumeration");
-                }
-            }
-            Require(hasPrimary, "alias_missing_primary");
-            result.Sort(delegate(Link a, Link b) { return StringComparer.Ordinal.Compare(a.Relative, b.Relative); });
-            return result;
+            // A running runner appends logs. Data size/time changes are not ACL changes.
+            return left.Volume == right.Volume && left.Id == right.Id && left.Links == right.Links &&
+                left.Attributes == right.Attributes;
         }
 
-        private string Digest(Held file)
+        private void Release(Held item)
         {
-            Tick();
-            long newPosition;
-            Require(Native.SetFilePointerEx(file.Handle, 0, out newPosition, 0) && newPosition == 0,
-                "read_failed"); // Position of our held handle only, no filesystem mutation.
-            Tick();
-            long read = 0;
-            byte[] buffer = new byte[65536];
-            using (SHA256 hash = SHA256.Create())
-            {
-                while (read < file.Initial.Size)
-                {
-                    Tick();
-                    uint request = (uint)Math.Min((long)buffer.Length, file.Initial.Size - read);
-                    // Bound the requested transfer BEFORE ReadFile, including failed/short reads.
-                    Require(request > 0 && BytesRead <= MaxTotalBytes - request, "bytes_bound");
-                    uint received;
-                    bool ok = Native.ReadFile(file.Handle, buffer, request, out received, IntPtr.Zero);
-                    Require(received <= request, "read_failed");
-                    BytesRead = checked(BytesRead + received);
-                    Tick();
-                    Require(ok && received > 0, "read_failed");
-                    read = checked(read + received);
-                    hash.TransformBlock(buffer, 0, (int)received, buffer, 0);
-                }
-                Require(read == file.Initial.Size, "read_failed");
-                hash.TransformFinalBlock(new byte[0], 0, 0);
-                Tick();
-                return Hex(hash.Hash);
-            }
+            Require(Native.CloseHandle(item.Handle), "cleanup_failed");
+            owned.Remove(item.Handle);
+            held.Remove(item);
         }
 
-        internal Dictionary<string, object> Run()
+        private List<Dictionary<string, object>> inventory;
+        private HashSet<string> identities;
+        private long daclBytes, pathUnits, enumeratedUnits;
+        private int discoveredCount;
+
+        private List<string> ReadChildNames(Held directory)
+        {
+            Require(directory.Directory, "path_type");
+            List<string> names = new List<string>();
+            byte[] buffer = new byte[4096];
+            GCHandle pin = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+            try
+            {
+                bool restart = true;
+                int queries = 0;
+                while (true)
+                {
+                    Tick();
+                    Require(++queries <= MaxObjects + 3, "inventory_bound");
+                    Array.Clear(buffer, 0, buffer.Length);
+                    IoStatusBlock io = new IoStatusBlock();
+                    int status = Native.NtQueryDirectoryFile(directory.Handle, IntPtr.Zero,
+                        IntPtr.Zero, IntPtr.Zero, ref io, pin.AddrOfPinnedObject(),
+                        (uint)buffer.Length, 12, true, IntPtr.Zero, restart);
+                    restart = false;
+                    Tick();
+                    if (status == unchecked((int)0x80000006)) // STATUS_NO_MORE_FILES
+                    {
+                        Require(io.Status == status && io.Information.ToUInt64() == 0, "enumeration");
+                        break;
+                    }
+                    ulong used = io.Information.ToUInt64();
+                    Require(status == 0 && io.Status == 0 && used >= 14 && used <= 4096,
+                        "enumeration");
+                    uint length = U32(buffer, 8);
+                    Require(U32(buffer, 0) == 0 && length >= 2 && length <= 2048 &&
+                        (length & 1) == 0 && used >= 12 + length && used <= ((12 + length + 7) & ~7U),
+                        "enumeration");
+                    string name;
+                    try { name = StrictUtf16.GetString(buffer, 12, (int)length); }
+                    catch (DecoderFallbackException) { throw new Refusal("path_shape"); }
+                    if (name == "." || name == "..") continue;
+                    ValidateComponent(name);
+                    enumeratedUnits += name.Length;
+                    Require(++discoveredCount < MaxObjects &&
+                        enumeratedUnits <= MaxPathUnits, "inventory_bound");
+                    names.Add(name);
+                }
+                return names;
+            }
+            finally { pin.Free(); }
+        }
+
+        private void Walk(Held node, string path, string parentId, int depth)
+        {
+            Tick();
+            Require(depth <= 32 && inventory.Count < MaxObjects && path.Length <= 4096,
+                "inventory_bound");
+            pathUnits += path.Length;
+            daclBytes += (int)node.Dacl["dacl_bytes"];
+            Require(pathUnits <= MaxPathUnits && daclBytes <= MaxDaclBytes, "inventory_bound");
+            string objectId = node.Initial.Volume.ToString("x8", CultureInfo.InvariantCulture) + ":" +
+                node.Initial.Id.ToString("x16", CultureInfo.InvariantCulture);
+            Require(identities.Add(objectId), "identity_mismatch");
+            Dictionary<string, object> record = new Dictionary<string, object>(node.Dacl);
+            record["path"] = path;
+            record["object_id"] = objectId;
+            record["parent_id"] = parentId;
+            record["object_kind"] = node.Directory ? "directory" : "file";
+            record["link_count"] = node.Initial.Links;
+            record["attributes"] = node.Initial.Attributes;
+            inventory.Add(record);
+            if (node.Directory)
+            {
+                // Names come from the already-held directory handle, never a
+                // pathname reopen. The kernel cannot follow a substituted junction.
+                List<string> names = ReadChildNames(node);
+                names.Sort(StringComparer.Ordinal);
+                HashSet<string> unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (string name in names)
+                {
+                    Require(unique.Add(name), "path_shape");
+                    Held child = OpenRelative(node, name, false, true);
+                    Walk(child, path + @"\" + name, objectId, depth + 1);
+                    Release(child);
+                }
+            }
+            Require(SameObject(node.Initial, ReadMetadata(node.Handle, node.Directory)) &&
+                node.Acl == ReadAcl(node.Handle), "changed");
+        }
+
+        private List<Dictionary<string, object>> Snapshot(Held root)
+        {
+            inventory = new List<Dictionary<string, object>>();
+            identities = new HashSet<string>(StringComparer.Ordinal);
+            daclBytes = 0;
+            pathUnits = 0;
+            enumeratedUnits = 0;
+            discoveredCount = 0;
+            Walk(root, @"C:\K5PhysicalRunner", "outside-approved-root", 0);
+            return inventory;
+        }
+
+        internal Dictionary<string, object> RunInventory()
         {
             Held anchor = OpenAnchor();
-            Held programFiles = OpenRelative(anchor, "Program Files", true);
-            Held git = OpenRelative(programFiles, "Git", true);
-            Held cmd = OpenRelative(git, "cmd", true);
-            Held primary = OpenRelative(cmd, "git.exe", false);
-            Require(primary.Initial.Size <= MaxTotalBytes / (primary.Initial.Links + 2L), "bytes_bound");
-            string primaryHash = Digest(primary);
-            List<Link> first = Closure(primary, git, cmd);
-            List<Dictionary<string, object>> aliases = new List<Dictionary<string, object>>();
-            foreach (Link link in first)
-            {
-                Held alias = OpenRelative(link.Parent, link.Name, false);
-                Require(alias.Initial.Same(primary.Initial), "identity_mismatch");
-                Require(String.Equals(alias.Acl, primary.Acl, StringComparison.Ordinal), "identity_mismatch");
-                string digest = Digest(alias);
-                Require(String.Equals(digest, primaryHash, StringComparison.Ordinal), "identity_mismatch");
-                aliases.Add(new Dictionary<string, object>(StringComparer.Ordinal)
-                {
-                    { "relative_name", link.Relative },
-                    { "ntfs_volume_serial", alias.Initial.Volume.ToString("x8", CultureInfo.InvariantCulture) },
-                    { "ntfs_file_id", alias.Initial.Id.ToString("x16", CultureInfo.InvariantCulture) },
-                    { "link_count", alias.Initial.Links },
-                    { "size_bytes", alias.Initial.Size },
-                    { "sha256", digest },
-                    { "acl_sha256", alias.Acl }
-                });
-            }
-            Require(String.Equals(Digest(primary), primaryHash, StringComparison.Ordinal), "changed");
-            List<Link> second = Closure(primary, git, cmd);
-            Require(first.Count == second.Count, "changed");
+            Held root = OpenRelative(anchor, "K5PhysicalRunner", true);
+            List<Dictionary<string, object>> first = Snapshot(root);
+            List<Dictionary<string, object>> second = Snapshot(root);
+            Require(first.Count == second.Count, "inventory_changed");
             for (int i = 0; i < first.Count; i++)
-                Require(first[i].ParentId == second[i].ParentId &&
-                    String.Equals(first[i].Relative, second[i].Relative, StringComparison.Ordinal), "changed");
-            // Recheck every held ancestor and alias, including ACL and ChangeTime.
-            foreach (Held item in held)
-            {
-                Require(item.Initial.Same(ReadMetadata(item.Handle, item.Directory)), "changed");
-                Require(String.Equals(item.Acl, ReadAcl(item.Handle), StringComparison.Ordinal), "changed");
-            }
-            Tick();
+                foreach (string key in new string[] { "path", "object_id", "parent_id", "object_kind",
+                    "link_count", "attributes", "control", "dacl_base64", "dacl_sha256", "dacl_bytes", "ace_count" })
+                    Require(Object.Equals(first[i][key], second[i][key]), "inventory_changed");
+            Require(SameObject(anchor.Initial, ReadMetadata(anchor.Handle, true)) &&
+                anchor.Acl == ReadAcl(anchor.Handle), "changed");
             Dictionary<string, object> result = BaseRecord();
             result["status"] = "observed";
             result["code"] = "none";
             result["closure_complete"] = true;
-            result["link_count"] = primary.Initial.Links;
-            result["primary_sha256"] = primaryHash;
-            result["aliases"] = aliases;
+            result["records"] = first;
+            result["object_count"] = first.Count;
+            result["dacl_bytes"] = daclBytes;
+            result["path_units"] = pathUnits;
+            result["repair_ready"] = false;
             return result;
         }
 
-        private string ReadServiceName(Held file)
+        internal Dictionary<string, object> SaveBackup(string localAppData, string name, byte[] bytes)
         {
-            // Only the fixed runner .service file is read. Never .credentials,
-            // .runner, logs, executable content, or a caller-provided pathname.
-            Require(file.Initial.Links == 1 && file.Initial.Size <= 512, "service_metadata");
-            long position;
-            Require(Native.SetFilePointerEx(file.Handle, 0, out position, 0) && position == 0,
-                "read_failed");
-            byte[] bytes = new byte[(int)file.Initial.Size];
-            uint received;
-            Tick();
-            Require(BytesRead <= 1024 - bytes.Length, "bytes_bound");
-            bool read = Native.ReadFile(file.Handle, bytes, (uint)bytes.Length, out received, IntPtr.Zero);
-            Require(received <= bytes.Length, "read_failed");
-            BytesRead += received;
-            Tick();
-            Require(read && received == bytes.Length, "read_failed");
-            string text;
-            try { text = new UTF8Encoding(false, true).GetString(bytes); }
-            catch (DecoderFallbackException) { throw new Refusal("service_metadata"); }
-            if (text.StartsWith("\ufeff", StringComparison.Ordinal)) text = text.Substring(1);
-            if (text.EndsWith("\r\n", StringComparison.Ordinal)) text = text.Substring(0, text.Length - 2);
-            else if (text.EndsWith("\n", StringComparison.Ordinal)) text = text.Substring(0, text.Length - 1);
-            Require(text.Length > 15 && text.Length <= 256 &&
-                text.StartsWith("actions.runner.", StringComparison.Ordinal), "service_metadata");
-            foreach (char value in text)
-                Require((value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
-                    (value >= '0' && value <= '9') || value == '.' || value == '_' || value == '-',
-                    "service_metadata");
-            return text;
-        }
-
-        internal Dictionary<string, object> RunStorage()
-        {
-            // Fixed directory chain and one non-secret .service metadata file only.
-            // No recursion, executable reads, permission mutation, or creation.
+            Require(bytes != null && bytes.Length > 0 && bytes.Length <= 256 * 1024 * 1024,
+                "bytes_bound");
+            Require(localAppData != null && localAppData ==
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "path_shape");
+            string[] parts = localAppData.Split('\\');
+            Require(parts.Length == 5 && parts[0] == "C:" && parts[1] == "Users" &&
+                parts[3] == "AppData" && parts[4] == "Local", "path_shape");
+            ValidateComponent(parts[2]);
+            ValidateComponent(name);
+            const string prefix = "K5RunnerDaclBackup-";
+            Require(name.StartsWith(prefix, StringComparison.Ordinal) &&
+                name.EndsWith(".json", StringComparison.Ordinal), "path_shape");
+            string[] run = name.Substring(prefix.Length, name.Length - prefix.Length - 5).Split('-');
+            Require(run.Length == 2, "path_shape");
+            foreach (string value in run)
+            {
+                Require(value.Length >= 1 && value.Length <= 20 && value[0] != '0', "path_shape");
+                foreach (char digit in value) Require(digit >= '0' && digit <= '9', "path_shape");
+            }
             Held anchor = OpenAnchor();
-            Held runner = OpenRelative(anchor, "K5PhysicalRunner", true);
-            Held work = OpenRelative(runner, "_work", true);
-            Held repo = OpenRelative(work, "K5-Vision", true);
-            Held workspace = OpenRelative(repo, "K5-Vision", true);
-            Held temp = OpenRelative(work, "_temp", true);
-            Held serviceFile = OpenRelative(runner, ".service", false, true);
-            string serviceName = ReadServiceName(serviceFile);
-            Held[] nodes = new Held[] { anchor, runner, work, repo, workspace, temp };
-            string[] roles = new string[] { "volume_root", "runner_root", "work_root", "repository_parent", "workspace", "temp_root" };
-            string tokenSid;
-            using (System.Security.Principal.WindowsIdentity identity = System.Security.Principal.WindowsIdentity.GetCurrent())
+            Held users = OpenRelative(anchor, "Users", true);
+            Held profile = OpenRelative(users, parts[2], true);
+            Held appData = OpenRelative(profile, "AppData", true);
+            Held local = OpenRelative(appData, "Local", true);
+            Held[] custodyParents = new Held[] { users, profile, appData, local };
+            List<string> parentIds = new List<string>();
+            foreach (Held parent in custodyParents)
             {
-                Require(identity.User != null, "acl_unavailable");
-                tokenSid = identity.User.Value;
+                Require(parent.Acl == (string)ReadAclRecord(parent.Handle, 2)["dacl_sha256"], "changed");
+                parentIds.Add(parent.Initial.Volume.ToString("x8", CultureInfo.InvariantCulture) + ":" +
+                    parent.Initial.Id.ToString("x16", CultureInfo.InvariantCulture));
             }
-            List<Dictionary<string, object>> records = new List<Dictionary<string, object>>();
-            for (int i = 0; i < nodes.Length; i++)
+            IntPtr buffer = IntPtr.Zero;
+            IntPtr unicodeBuffer = IntPtr.Zero;
+            IntPtr handle = IntPtr.Zero;
+            try
             {
-                Dictionary<string, object> record = ReadAclRecord(nodes[i].Handle);
-                Require((string)record["acl_sha256"] == nodes[i].Acl, "changed");
-                record["role"] = roles[i];
-                record["ntfs_volume_serial"] = nodes[i].Initial.Volume.ToString("x8", CultureInfo.InvariantCulture);
-                record["ntfs_file_id"] = nodes[i].Initial.Id.ToString("x16", CultureInfo.InvariantCulture);
-                records.Add(record);
+                BeforeOpen();
+                buffer = Marshal.StringToHGlobalUni(name);
+                UnicodeString nativeName = new UnicodeString();
+                nativeName.Length = checked((ushort)(name.Length * 2));
+                nativeName.MaximumLength = checked((ushort)(nativeName.Length + 2));
+                nativeName.Buffer = buffer;
+                unicodeBuffer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+                Marshal.StructureToPtr(nativeName, unicodeBuffer, false);
+                ObjectAttributes attributes = new ObjectAttributes();
+                attributes.Length = (uint)Marshal.SizeOf(typeof(ObjectAttributes));
+                attributes.RootDirectory = local.Handle;
+                attributes.ObjectName = unicodeBuffer;
+                attributes.Attributes = ObjCaseInsensitive | ObjDontReparse;
+                IoStatusBlock io = new IoStatusBlock();
+                // FILE_CREATE: refuse any existing name. Inherit normal profile
+                // security; never change directory, owner, group, SACL or DACL.
+                int status = Native.NtCreateFile(out handle, ReadData | 2 | ReadAttributes |
+                    ReadControl | Synchronize, ref attributes, ref io, IntPtr.Zero,
+                    0x00000080, 1, 2, FileNonDirectoryFile | FileOpenReparsePoint |
+                    FileSynchronousIoNonalert, IntPtr.Zero, 0);
+                Own(handle);
+                Require(status == 0 && io.Status == 0 && io.Information.ToUInt64() == 2 &&
+                    handle != IntPtr.Zero && handle != InvalidHandle, "backup_create");
+                Metadata initial = ReadMetadata(handle, false);
+                string initialDacl = (string)ReadAclRecord(handle, 1)["dacl_sha256"];
+                string digest;
+                using (SHA256 hash = SHA256.Create()) digest = Hex(hash.ComputeHash(bytes));
+                using (Microsoft.Win32.SafeHandles.SafeFileHandle safe =
+                    new Microsoft.Win32.SafeHandles.SafeFileHandle(handle, false))
+                using (System.IO.FileStream stream = new System.IO.FileStream(safe,
+                    System.IO.FileAccess.ReadWrite, 65536, false))
+                {
+                    stream.Write(bytes, 0, bytes.Length);
+                    stream.Flush(true); // Flush file data through the OS before verification.
+                    Require(stream.Length == bytes.Length, "backup_verify");
+                    stream.Position = 0;
+                    using (SHA256 hash = SHA256.Create())
+                        Require(Hex(hash.ComputeHash(stream)) == digest, "backup_verify");
+                    Require(stream.Position == bytes.Length && stream.Length == bytes.Length,
+                        "backup_verify");
+                }
+                Metadata afterWrite = ReadMetadata(handle, false);
+                // Our own data write may set FILE_ATTRIBUTE_ARCHIVE. Identity,
+                // single-link/non-reparse file type and security remain invariant.
+                Require(initial.Volume == afterWrite.Volume && initial.Id == afterWrite.Id &&
+                    initial.Links == afterWrite.Links &&
+                    initialDacl == (string)ReadAclRecord(handle, 1)["dacl_sha256"], "backup_verify");
+                foreach (Held parent in custodyParents)
+                    Require(SameObject(parent.Initial, ReadMetadata(parent.Handle, true)) &&
+                        parent.Acl == (string)ReadAclRecord(parent.Handle, 2)["dacl_sha256"], "changed");
+                Require(SameObject(anchor.Initial, ReadMetadata(anchor.Handle, true)) &&
+                    anchor.Acl == ReadAcl(anchor.Handle), "changed");
+                return new Dictionary<string, object> {
+                    { "status", "observed" }, { "code", "none" },
+                    { "backup_role", "current-profile-local-app-data" }, { "backup_name", name },
+                    { "backup_sha256", digest }, { "backup_bytes", bytes.Length },
+                    { "backup_object_id", initial.Volume.ToString("x8", CultureInfo.InvariantCulture) +
+                        ":" + initial.Id.ToString("x16", CultureInfo.InvariantCulture) },
+                    { "readback_verified", true }, { "repair_ready", false },
+                    { "backup_parent_ids", parentIds }, { "requires_fresh_custody_revalidation", true }
+                };
             }
-            foreach (Held item in held)
+            finally
             {
-                Require(item.Initial.Same(ReadMetadata(item.Handle, item.Directory)), "changed");
-                Require(item.Acl == ReadAcl(item.Handle), "changed");
+                if (unicodeBuffer != IntPtr.Zero) Marshal.FreeHGlobal(unicodeBuffer);
+                if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
             }
-            Require(ReadServiceName(serviceFile) == serviceName, "changed");
-            using (System.Security.Principal.WindowsIdentity identity = System.Security.Principal.WindowsIdentity.GetCurrent())
-                Require(identity.User != null && identity.User.Value == tokenSid, "changed");
-            Dictionary<string, object> result = BaseRecord();
-            result["status"] = "observed";
-            result["code"] = "none";
-            result["closure_complete"] = true;
-            result["current_token_sid"] = tokenSid;
-            result["service_identity"] = "unresolved";
-            result["runner_service_name"] = serviceName;
-            result["group_metadata"] = "not_queried";
-            result["retention_nodes"] = "not_queried";
-            result["directories"] = records;
-            return result;
         }
 
         internal bool CloseAll()
@@ -671,12 +711,7 @@ public static class K5FixedGitObservation
             Marshal.SizeOf(typeof(ByHandleInformation)) == 52 &&
             Offset(typeof(ByHandleInformation), "VolumeSerial") == 28 &&
             Offset(typeof(ByHandleInformation), "FileIndexHigh") == 44 &&
-            Offset(typeof(ByHandleInformation), "FileIndexLow") == 48 &&
-            Marshal.SizeOf(typeof(LinkEntryLayout)) == 24 &&
-            Offset(typeof(LinkEntryLayout), "ParentFileId") == 8 &&
-            Offset(typeof(LinkEntryLayout), "NameUnits") == 16 &&
-            Offset(typeof(LinkEntryLayout), "FirstNameUnit") == 20 &&
-            Offset(typeof(LinksLayout), "Entry") == 8, "abi");
+            Offset(typeof(ByHandleInformation), "FileIndexLow") == 48, "abi");
     }
 
     private static int Offset(Type type, string field) { return Marshal.OffsetOf(type, field).ToInt32(); }
@@ -716,22 +751,6 @@ public static class K5FixedGitObservation
         internal NativeFileTime Created, Accessed, Modified;
         internal uint VolumeSerial, SizeHigh, SizeLow, Links, FileIndexHigh, FileIndexLow;
     }
-    [StructLayout(LayoutKind.Explicit, Size = 24)]
-    private struct LinkEntryLayout
-    {
-        [FieldOffset(0)] internal uint NextEntryOffset;
-        [FieldOffset(8)] internal ulong ParentFileId;
-        [FieldOffset(16)] internal uint NameUnits;
-        [FieldOffset(20)] internal ushort FirstNameUnit;
-    }
-    [StructLayout(LayoutKind.Explicit, Size = 32)]
-    private struct LinksLayout
-    {
-        [FieldOffset(0)] internal uint BytesNeeded;
-        [FieldOffset(4)] internal uint EntriesReturned;
-        [FieldOffset(8)] internal LinkEntryLayout Entry;
-    }
-
     private static class Native
     {
         // Resolve only the existing trusted Windows system DLLs, never the work directory.
@@ -743,6 +762,17 @@ public static class K5FixedGitObservation
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         internal static extern int NtQueryInformationFile(IntPtr handle, ref IoStatusBlock io,
             IntPtr information, uint length, int informationClass);
+        [DllImport("ntdll.dll", ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        internal static extern int NtQueryDirectoryFile(IntPtr handle, IntPtr eventHandle,
+            IntPtr apcRoutine, IntPtr apcContext, ref IoStatusBlock io, IntPtr information,
+            uint length, int informationClass, [MarshalAs(UnmanagedType.U1)] bool singleEntry,
+            IntPtr fileName, [MarshalAs(UnmanagedType.U1)] bool restartScan);
+        [DllImport("ntdll.dll", ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        internal static extern int NtCreateFile(out IntPtr handle, uint access,
+            ref ObjectAttributes attributes, ref IoStatusBlock io, IntPtr allocationSize,
+            uint fileAttributes, uint share, uint disposition, uint options, IntPtr eaBuffer, uint eaLength);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         internal static extern IntPtr CreateFileW(string name, uint access, uint share,
@@ -760,15 +790,6 @@ public static class K5FixedGitObservation
         [DllImport("kernel32.dll", ExactSpelling = true)]
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         internal static extern uint GetFileType(IntPtr handle);
-        [DllImport("kernel32.dll", ExactSpelling = true)]
-        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        internal static extern bool ReadFile(IntPtr handle, [Out] byte[] buffer, uint count,
-            out uint read, IntPtr overlapped);
-        [DllImport("kernel32.dll", ExactSpelling = true)]
-        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        internal static extern bool SetFilePointerEx(IntPtr handle, long distance, out long position, uint method);
         [DllImport("kernel32.dll", ExactSpelling = true)]
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [return: MarshalAs(UnmanagedType.Bool)]

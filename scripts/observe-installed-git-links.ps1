@@ -13,14 +13,14 @@ Set-StrictMode -Version Latest
 # Compilation uses the existing Windows-inbox Desktop 5.1/.NET toolchain. It can
 # create official compiler children and task-private files. It is bounded by a
 # separately reviewed short Actions step timeout, not by this wrapper's timer.
-# ObserveGuarded has its own 20-second current-step watchdog. Abrupt exit or an
+# The observation stage has one 150-second owned-process aggregate watchdog. Abrupt exit or an
 # Actions timeout can bypass every finally below: a SEPARATE always-run original
 # post-admission, compiler-idle and final compiler-artifact checks MUST pass
 # after this PowerShell process exits before accepting any provisional result.
 # This observation never confers storage, retry, exception or delivery authority.
 $guardSha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d'
 # Exact frozen collector bytes; neither environment nor arguments can change this pin.
-$collectorSha256 = 'e4a4e5826d1a341c3159f22910c569c7c5c1b3ae1f1fede00eb3718612e9ac6c'
+$collectorSha256 = 'a9950ca2fd5a425353e7af9075045fe595bfc9c4e32c27abc3c7705e67c04665'
 $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
 
 function Assert-K5OrdinaryPath([string]$Path, [bool]$Directory) {
@@ -171,7 +171,9 @@ function Get-K5FailureProjection([Management.Automation.ErrorRecord]$FailureErro
         $knownReasons = @('context', 'path', 'size', 'read', 'hash', 'binding',
             'compiler_inventory', 'compiler_occupied', 'runtime', 'type_reuse',
             'compiler_temp_exists', 'compiler_temp', 'compiler_artifacts',
-            'compiled_type', 'compiler_environment', 'record')
+            'compiled_type', 'compiler_environment', 'record', 'writer_identity', 'writer_membership',
+            'runner_inventory', 'runner_occupied', 'runner_ancestry', 'runner_owner', 'runner_scope',
+            'runner_changed', 'backup_bound', 'backup_verify')
         foreach ($knownReason in $knownReasons) {
             if ($FailureError.Exception.Message -ceq $knownReason) {
                 $reason = $knownReason
@@ -204,202 +206,165 @@ function Assert-K5Integer($Value, [long]$Minimum, [long]$Maximum) {
         $Value -lt $Minimum -or $Value -gt $Maximum) { throw 'record' }
 }
 
-# Inserted into the hash-pinned observation wrapper, not invoked as another file.
-# Local CIM reads only. No service control, account changes, or permissions writes.
-function Get-K5ConfiguredRunnerIdentity([string]$ServiceName, [string]$TokenSid) {
-    $result = [ordered]@{
-        status = 'refused'; code = 'service_name'; service_name = $null
-        configured_sid = $null; process_owner_sid = $null; service_pid = $null
-        current_token_matches = $false; owned_ancestry_verified = $false
-    }
-    $phase = 'service_name'
+# Read-only identity prerequisite. Preserve the observed runner startup mode.
+# No .service file, service inference/control, account lookup or credential read.
+function Assert-K5SameProfileRunner {
+    $expectedSid = 'S-1-5-21-283315059-370827648-873861665-1000'
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     try {
-        if ($ServiceName -cnotmatch '\Aactions\.runner\.[A-Za-z0-9_.-]{1,241}\z' -or
-            $TokenSid -cnotmatch '\AS-1-[0-9-]{1,180}\z') { throw 'identity' }
-        $result.service_name = $ServiceName
-        $filter = "Name='$ServiceName'"
-        $expectedPath = 'C:\K5PhysicalRunner\bin\RunnerService.exe'
-        $previous = $null
-        # Reobserve config, live process owner and complete ancestry. PID alone is
-        # never identity; creation dates and ancestry edges must match both times.
-        for ($pass = 0; $pass -lt 2; $pass++) {
-            $phase = 'service_query'
-            $services = @(Get-CimInstance -ClassName Win32_Service -Filter $filter -Property Name,StartName,State,ProcessId,PathName,ServiceType -OperationTimeoutSec 5 -ErrorAction Stop)
-            if ($services.Count -ne 1) { $phase = 'service_absent_or_ambiguous'; throw 'identity' }
-            $service = $services[0]
-            $phase = 'service_scope'
-            if ($service.Name -cne $ServiceName -or $service.State -cne 'Running' -or
-                $service.ServiceType -cne 'Own Process' -or
-                ($service.PathName -cne $expectedPath -and $service.PathName -cne ('"' + $expectedPath + '"')) -or
-                [uint32]$service.ProcessId -le 0) { throw 'identity' }
-            $phase = 'configured_account'
-            $startName = [string]$service.StartName
-            $configuredSid = $null
-            switch -CaseSensitive ($startName) {
-                'LocalSystem' { $configuredSid = 'S-1-5-18' }
-                'NT AUTHORITY\SYSTEM' { $configuredSid = 'S-1-5-18' }
-                'NT AUTHORITY\LocalService' { $configuredSid = 'S-1-5-19' }
-                'NT AUTHORITY\LOCAL SERVICE' { $configuredSid = 'S-1-5-19' }
-                'NT AUTHORITY\NetworkService' { $configuredSid = 'S-1-5-20' }
-                'NT AUTHORITY\NETWORK SERVICE' { $configuredSid = 'S-1-5-20' }
-            }
-            if ($null -eq $configuredSid) {
-                # Deliberately no domain/remote account lookup or implicit fallback.
-                if ($startName -cnotmatch '\A(?:\.|VLR-CYZ4PK3)\\([A-Za-z0-9_.-]{1,64})\z') { throw 'identity' }
-                $accountName = $Matches[1]
-                $accounts = @(Get-CimInstance -ClassName Win32_UserAccount -Filter "LocalAccount=True AND Domain='VLR-CYZ4PK3' AND Name='$accountName'" -Property Name,Domain,LocalAccount,SID,Disabled -OperationTimeoutSec 5 -ErrorAction Stop)
-                if ($accounts.Count -ne 1 -or -not $accounts[0].LocalAccount -or $accounts[0].Disabled -or
-                    $accounts[0].Name -cne $accountName -or $accounts[0].Domain -cne 'VLR-CYZ4PK3' -or
-                    $accounts[0].SID -cnotmatch '\AS-1-5-21-[0-9-]{1,160}\z') { throw 'identity' }
-                $configuredSid = [string]$accounts[0].SID
-            }
-            $result.configured_sid = $configuredSid
-            $phase = 'process_query'
-            $processes = @(Get-CimInstance -ClassName Win32_Process -Property Name,ProcessId,ParentProcessId,CreationDate,ExecutablePath -OperationTimeoutSec 5 -ErrorAction Stop)
-            if ($processes.Count -eq 0 -or $processes.Count -gt 32768) { throw 'identity' }
-            $byId = @{}
-            foreach ($process in $processes) {
-                $processId = [uint32]$process.ProcessId
-                if ($byId.ContainsKey($processId)) { throw 'identity' }
-                $byId[$processId] = $process
-            }
-            $phase = 'service_process'
-            $serviceId = [uint32]$service.ProcessId
-            if (-not $byId.ContainsKey($serviceId)) { throw 'identity' }
-            $result.service_pid = $serviceId
-            $serviceProcess = $byId[$serviceId]
-            if ($serviceProcess.Name -cne 'RunnerService.exe' -or
-                $serviceProcess.ExecutablePath -cne $expectedPath -or
-                $null -eq $serviceProcess.CreationDate) { throw 'identity' }
-            $phase = 'process_owner'
-            # GetOwnerSid is read-only. No other CIM method is called.
-            $owner = Invoke-CimMethod -InputObject $serviceProcess -MethodName GetOwnerSid -OperationTimeoutSec 5 -ErrorAction Stop
-            if ($owner.ReturnValue -ne 0 -or $owner.Sid -cnotmatch '\AS-1-[0-9-]{1,180}\z') { throw 'identity' }
-            $result.process_owner_sid = [string]$owner.Sid
-            $result.current_token_matches = $TokenSid -ceq $configuredSid
-            $phase = 'account_mismatch'
-            if ($owner.Sid -cne $configuredSid -or $TokenSid -cne $configuredSid) { throw 'identity' }
-            $phase = 'owned_ancestry'
-            $cursor = [uint32]$PID
-            $seen = @{}
-            $chain = [Collections.Generic.List[string]]::new()
-            $found = $false
-            $workerCount = 0
-            for ($depth = 0; $depth -lt 32; $depth++) {
-                if ($seen.ContainsKey($cursor) -or -not $byId.ContainsKey($cursor)) { throw 'identity' }
-                $seen[$cursor] = $true
-                $node = $byId[$cursor]
-                if ($null -eq $node.CreationDate) { throw 'identity' }
-                $chain.Add(([string]$cursor + ':' + $node.CreationDate.ToUniversalTime().Ticks))
-                if ($node.Name -ceq 'Runner.Worker.exe') { $workerCount++ }
-                if ($cursor -eq $serviceId) { $found = $true; break }
-                $parentId = [uint32]$node.ParentProcessId
-                if (-not $byId.ContainsKey($parentId) -or $null -eq $byId[$parentId].CreationDate -or
-                    $byId[$parentId].CreationDate -gt $node.CreationDate) { throw 'identity' }
-                $cursor = $parentId
-            }
-            if (-not $found -or $workerCount -ne 1) { throw 'identity' }
-            $fingerprint = @($service.Name,$startName,$service.PathName,$service.State,$service.ServiceType,
-                $configuredSid,[string]$owner.Sid,($chain -join ',')) -join '|'
-            $phase = 'identity_changed'
-            if ($null -ne $previous -and $fingerprint -cne $previous) { throw 'identity' }
-            $previous = $fingerprint
-        }
-        $phase = 'current_token_changed'
-        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        try {
-            if ($null -eq $identity.User -or $identity.User.Value -cne $TokenSid) { throw 'identity' }
-        } finally { $identity.Dispose() }
-        $result.status = 'verified'
-        $result.code = 'none'
-        $result.configured_sid = $configuredSid
-        $result.process_owner_sid = [string]$owner.Sid
-        $result.service_pid = $serviceId
-        $result.current_token_matches = $true
-        $result.owned_ancestry_verified = $true
-    } catch {
-        # Emit only a closed reason vocabulary, never raw account, provider,
-        # exception, executable or command-line text.
-        $result.code = $phase
+        if ($null -eq $identity.User -or $identity.User.Value -cne $expectedSid) { throw 'writer_identity' }
+        $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+        $au = [Security.Principal.SecurityIdentifier]::new('S-1-5-11')
+        if (-not $principal.IsInRole($au)) { throw 'writer_membership' }
+    } finally { $identity.Dispose() }
+    $rows = @(Get-CimInstance -ClassName Win32_Process -Property Name,ProcessId,ParentProcessId,CreationDate,ExecutablePath -OperationTimeoutSec 5 -ErrorAction Stop)
+    if ($rows.Count -lt 1 -or $rows.Count -gt 32768) { throw 'runner_inventory' }
+    $byId = @{}
+    $workers = 0
+    foreach ($row in $rows) {
+        $id = [uint32]$row.ProcessId
+        if ($byId.ContainsKey($id)) { throw 'runner_inventory' }
+        $byId[$id] = $row
+        if ($row.Name -ceq 'Runner.Worker.exe') { $workers++ }
     }
-    return $result
+    if ($workers -ne 1) { throw 'runner_occupied' }
+    $cursor = [uint32]$PID
+    $seen = @{}
+    $chain = [Collections.Generic.List[string]]::new()
+    $workerSeen = $false
+    $listenerSeen = $false
+    for ($depth = 0; $depth -lt 32; $depth++) {
+        if ($seen.ContainsKey($cursor) -or -not $byId.ContainsKey($cursor)) { throw 'runner_ancestry' }
+        $seen[$cursor] = $true
+        $node = $byId[$cursor]
+        if ($null -eq $node.CreationDate) { throw 'runner_ancestry' }
+        $chain.Add(([string]$cursor + ':' + $node.CreationDate.ToUniversalTime().Ticks))
+        if ($cursor -eq [uint32]$PID -or $node.Name -ceq 'Runner.Worker.exe' -or $node.Name -ceq 'Runner.Listener.exe') {
+            $owner = Invoke-CimMethod -InputObject $node -MethodName GetOwnerSid -OperationTimeoutSec 5 -ErrorAction Stop
+            if ($owner.ReturnValue -ne 0 -or $owner.Sid -cne $expectedSid) { throw 'runner_owner' }
+        }
+        if ($node.Name -ceq 'Runner.Worker.exe') {
+            if ($workerSeen -or $node.ExecutablePath -cne 'C:\K5PhysicalRunner\bin\Runner.Worker.exe') { throw 'runner_scope' }
+            $workerSeen = $true
+        }
+        if ($node.Name -ceq 'Runner.Listener.exe') {
+            if (-not $workerSeen -or $node.ExecutablePath -cne 'C:\K5PhysicalRunner\bin\Runner.Listener.exe') { throw 'runner_scope' }
+            $listenerSeen = $true
+            break
+        }
+        $parentId = [uint32]$node.ParentProcessId
+        if (-not $byId.ContainsKey($parentId) -or $null -eq $byId[$parentId].CreationDate -or
+            $byId[$parentId].CreationDate -gt $node.CreationDate) { throw 'runner_ancestry' }
+        $cursor = $parentId
+    }
+    if (-not $listenerSeen) { throw 'runner_ancestry' }
+    $fingerprint = $chain -join ','
+    return @{ writer_sid = $expectedSid; identity_fingerprint = $fingerprint;
+    authenticated_users_member = $true; startup_mode_changed = $false }
 }
 
-function Assert-K5DiagnosticRecord($Record, [hashtable]$Context) {
+function Save-K5DaclInventory($Record, [hashtable]$Context, [hashtable]$Writer) {
     $keys = @('schema_version','scope','target','status','code','closure_complete',
         'exception_authority','storage_admission','retry_authority','bytes_read','elapsed_ms')
     if ($Record['status'] -ceq 'observed') {
-        $keys += @('current_token_sid','service_identity','runner_service_name','group_metadata','retention_nodes','directories')
+        $keys += @('records','object_count','dacl_bytes','path_units','repair_ready')
     }
     Assert-K5RecordKeys $Record $keys
-    if ($Record['schema_version'] -cne 'fixed-runner-acl-prerequisite-v1' -or
-        $Record['scope'] -cne 'fixed-runner-readonly-acl' -or
-        $Record['target'] -cne 'runner-root-chain' -or
+    if ($Record['schema_version'] -cne 'fixed-runner-dacl-inventory-v1' -or
+        $Record['scope'] -cne 'fixed-runner-readonly-dacl-inventory' -or
+        $Record['target'] -cne 'runner-root-subtree' -or
         $Record['status'] -cnotin @('observed','refused')) { throw 'record' }
     foreach ($key in @('exception_authority','storage_admission','retry_authority')) {
         if ($Record[$key] -isnot [bool] -or $Record[$key]) { throw 'record' }
     }
-    Assert-K5Integer $Record['bytes_read'] 0 1024
-    Assert-K5Integer $Record['elapsed_ms'] 0 19999
+    Assert-K5Integer $Record['bytes_read'] 0 0
+    Assert-K5Integer $Record['elapsed_ms'] 0 90000
     if ($Record['closure_complete'] -isnot [bool]) { throw 'record' }
-    if ($Record['status'] -ceq 'observed') {
-        if (-not $Record['closure_complete'] -or $Record['code'] -cne 'none' -or
-            $Record['service_identity'] -cne 'unresolved' -or $Record['group_metadata'] -cne 'not_queried' -or
-            $Record['retention_nodes'] -cne 'not_queried' -or
-            $Record['runner_service_name'] -cnotmatch '\Aactions\.runner\.[A-Za-z0-9_.-]{1,241}\z' -or
-            $Record['current_token_sid'] -cnotmatch '\AS-1-[0-9-]{1,180}\z') { throw 'record' }
-        Assert-K5Integer $Record['elapsed_ms'] 0 8000
-        $roles = @('volume_root','runner_root','work_root','repository_parent','workspace','temp_root')
-        $directories = $Record['directories']
-        if ($directories -isnot [Collections.IList] -or $directories.Count -ne 6) { throw 'record' }
-        for ($i=0; $i -lt 6; $i++) {
-            $item = $directories[$i]
-            Assert-K5RecordKeys $item @('owner_sid','control','acl_sha256','owner_dacl_base64','aces','role','ntfs_volume_serial','ntfs_file_id')
-            if ($item['role'] -cne $roles[$i] -or $item['owner_sid'] -cnotmatch '\AS-1-[0-9-]{1,180}\z' -or
-                $item['acl_sha256'] -cnotmatch '\A[0-9a-f]{64}\z' -or
-                $item['ntfs_volume_serial'] -cnotmatch '\A[0-9a-f]{8}\z' -or
-                $item['ntfs_file_id'] -cnotmatch '\A[0-9a-f]{16}\z' -or
-                $item['owner_dacl_base64'] -isnot [string] -or $item['owner_dacl_base64'].Length -gt 87384 -or
-                $item['owner_dacl_base64'] -cnotmatch '\A[A-Za-z0-9+/]+={0,2}\z') { throw 'record' }
-            Assert-K5Integer $item['control'] 0 65535
-            if ($item['aces'] -isnot [Collections.IList] -or $item['aces'].Count -gt 128) { throw 'record' }
-            foreach ($ace in $item['aces']) {
-                Assert-K5RecordKeys $ace @('type','flags','mask','sid')
-                Assert-K5Integer $ace['type'] 0 255
-                Assert-K5Integer $ace['flags'] 0 255
-                Assert-K5Integer $ace['mask'] 0 4294967295
-                if ($ace['sid'] -cnotmatch '\AS-1-[0-9-]{1,180}\z') { throw 'record' }
-            }
-        }
-    } else {
+    if ($Record['status'] -cne 'observed') {
         if ($Record['closure_complete'] -or $Record['code'] -cnotin @('platform','abi','anchor_open','relative_open',
             'metadata','filesystem','reparse','path_type','acl_unavailable','acl_null','identity_mismatch',
-            'path_shape','name_bound','time_bound','changed','handle_bound','cleanup_failed','internal','enumeration','file_size','read_failed','bytes_bound','alias_count','service_metadata_absent','service_metadata')) { throw 'record' }
+            'path_shape','name_bound','time_bound','changed','handle_bound','cleanup_failed','internal',
+            'enumeration','file_size','bytes_bound','alias_count','inventory_bound','inventory_changed')) { throw 'record' }
+        return @{ status='refused'; code=$Record['code']; repair_ready=$false; backup_verified=$false }
     }
-    $sanitized = [ordered]@{}
-    foreach ($key in $keys) { $sanitized[$key] = $Record[$key] }
-    $serviceStatus = 'not_queried'
-    if ($Record['status'] -ceq 'observed') {
-        $configured = Get-K5ConfiguredRunnerIdentity $Record['runner_service_name'] $Record['current_token_sid']
-        $sanitized['configured_runner_identity'] = $configured
-        $serviceStatus = $configured.status
-        $sanitized['service_identity'] = $(if ($serviceStatus -ceq 'verified') { 'verified' } else { 'unresolved' })
+    if (-not $Record['closure_complete'] -or $Record['code'] -cne 'none' -or
+        $Record['repair_ready'] -isnot [bool] -or $Record['repair_ready']) { throw 'record' }
+    Assert-K5Integer $Record['elapsed_ms'] 0 75000
+    Assert-K5Integer $Record['object_count'] 1 50000
+    Assert-K5Integer $Record['dacl_bytes'] 0 67108864
+    Assert-K5Integer $Record['path_units'] 0 8388608
+    $records = $Record['records']
+    if ($records -isnot [Collections.IList] -or $records.Count -ne $Record['object_count']) { throw 'record' }
+    $seen = @{}
+    [long]$totalBytes = 0
+    [long]$totalPaths = 0
+    $rootCount = 0
+    foreach ($item in $records) {
+        Assert-K5RecordKeys $item @('control','dacl_sha256','dacl_base64','dacl_bytes','ace_count',
+            'path','object_id','parent_id','object_kind','link_count','attributes')
+        $path = $item['path']
+        if ($path -isnot [string] -or $path.Length -gt 4096 -or
+            ($path -cne 'C:\K5PhysicalRunner' -and -not $path.StartsWith('C:\K5PhysicalRunner\', [StringComparison]::Ordinal)) -or
+            $item['object_id'] -cnotmatch '\A[0-9a-f]{8}:[0-9a-f]{16}\z' -or
+            $item['object_kind'] -cnotin @('file','directory') -or $seen.ContainsKey($item['object_id']) -or
+            $item['dacl_sha256'] -cnotmatch '\A[0-9a-f]{64}\z') { throw 'record' }
+        if ($path -ceq 'C:\K5PhysicalRunner') {
+            $rootCount++
+            if ($item['parent_id'] -cne 'outside-approved-root' -or $item['object_kind'] -cne 'directory') { throw 'record' }
+        } elseif (-not $seen.ContainsKey($item['parent_id'])) { throw 'record' }
+        $seen[$item['object_id']] = $true
+        Assert-K5Integer $item['control'] 0 65535
+        Assert-K5Integer $item['attributes'] 0 4294967295
+        Assert-K5Integer $item['link_count'] 1 4294967295
+        if ($item['object_kind'] -ceq 'file' -and $item['link_count'] -ne 1) { throw 'record' }
+        Assert-K5Integer $item['ace_count'] 0 128
+        Assert-K5Integer $item['dacl_bytes'] 20 65536
+        if ($item['dacl_base64'] -isnot [string] -or $item['dacl_base64'].Length -gt 87384) { throw 'record' }
+        $dacl = [Convert]::FromBase64String($item['dacl_base64'])
+        if ($dacl.Length -ne $item['dacl_bytes'] -or [Convert]::ToBase64String($dacl) -cne $item['dacl_base64']) { throw 'record' }
+        $hash = [Security.Cryptography.SHA256]::Create()
+        try {
+            $actual = ([BitConverter]::ToString($hash.ComputeHash($dacl))).Replace('-', '').ToLowerInvariant()
+            if ($actual -cne $item['dacl_sha256']) { throw 'record' }
+        } finally { $hash.Dispose() }
+        $raw = [Security.AccessControl.RawSecurityDescriptor]::new($dacl, 0)
+        if ($null -ne $raw.Owner -or $null -ne $raw.Group -or $null -ne $raw.SystemAcl -or
+            $null -eq $raw.DiscretionaryAcl -or [int]$raw.ControlFlags -ne $item['control'] -or
+            $raw.DiscretionaryAcl.Count -ne $item['ace_count']) { throw 'record' }
+        $totalBytes += $dacl.Length
+        $totalPaths += $path.Length
     }
-    # These prerequisites are NOT established by a fixed six-directory sample.
-    $sanitized['repair_ready'] = $false
-    $sanitized['required_writers'] = 'unresolved'
-    $sanitized['affected_subtree_inventory'] = 'not_collected'
-    $sanitized['rollback_backup'] = 'not_created'
-    $sanitized['source_sha'] = $Context.source_sha
-    $sanitized['run_id'] = $Context.run_id
-    $sanitized['run_attempt'] = $Context.run_attempt
-    $sanitized['requires_separate_post_admission'] = $true
-    $sanitized['compiler_artifacts_retained'] = $true
-    $text = ConvertTo-Json -InputObject $sanitized -Compress -Depth 8
-    if ($strictUtf8.GetByteCount($text) -gt 65536 -or $text -match '[\r\n]') { throw 'record' }
-    return @{text=$text;status=$Record['status'];service_status=$serviceStatus}
+    if ($rootCount -ne 1 -or $totalBytes -ne $Record['dacl_bytes'] -or $totalPaths -ne $Record['path_units']) { throw 'record' }
+    # The second actual job/worker/listener identity observation follows inventory.
+    $after = Assert-K5SameProfileRunner
+    if ($after.identity_fingerprint -cne $Writer.identity_fingerprint -or
+        $after.writer_sid -cne $Writer.writer_sid) { throw 'runner_changed' }
+    $envelope = [ordered]@{
+        schema_version='k5-runner-dacl-backup-v1'; scope_root='C:\K5PhysicalRunner'
+        source_sha=$Context.source_sha; run_id=$Context.run_id; run_attempt=$Context.run_attempt
+        writer=$Writer; inventory=$Record; repair_ready=$false
+        rollback_status='not_implemented'; requires_fresh_prechange_revalidation=$true
+        requires_fresh_backup_identity_hash_and_custody_revalidation=$true
+    }
+    $json = ConvertTo-Json -InputObject $envelope -Compress -Depth 12
+    if ($strictUtf8.GetByteCount($json) -gt 268435456) { throw 'backup_bound' }
+    $bytes = $strictUtf8.GetBytes($json)
+    $name = 'K5RunnerDaclBackup-' + $Context.run_id + '-' + $Context.run_attempt + '.json'
+    $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    $script:backupAttempted = $true
+    $backup = [K5FixedGitObservation]::SaveBackup($localAppData, $name, $bytes)
+    if ($backup['status'] -cne 'observed') {
+        return @{ status='refused'; code=$backup['code']; repair_ready=$false;
+            backup_verified=$false; backup_may_exist=$true }
+    }
+    if (-not $backup['readback_verified'] -or $backup['repair_ready']) { throw 'backup_verify' }
+    return @{ status='observed'; code='none'; repair_ready=$false; backup_verified=$true;
+        backup=$backup; object_count=$records.Count; writer_sid=$Writer.writer_sid;
+        inventory_elapsed_ms=$Record['elapsed_ms']; rollback_status='not_implemented' }
 }
 
+$deadline = $null
+$script:backupAttempted = $false
 $guard = $null
 $guardFile = $null
 $collectorFile = $null
@@ -458,10 +423,14 @@ try {
     Add-K5PinnedCollector $collectorText $compilerTemp $systemCorePath
     $failure = 'compiler_idle_after'
     Assert-K5CompilerIdle
+    $failure = 'aggregate_deadline'
+    $deadline = [K5FixedGitObservation]::StartObservationDeadline()
+    $failure = 'runner_identity'
+    $writer = Assert-K5SameProfileRunner
     $failure = 'collector_observation'
     $record = [K5FixedGitObservation]::ObserveGuarded()
     $failure = 'record_validation'
-    $result = Assert-K5DiagnosticRecord $record $context
+    $result = Save-K5DaclInventory $record $context $writer
 } catch {
     # No exception text, paths, compiler output, environment or raw records.
     $failureError = $_
@@ -493,6 +462,7 @@ try {
             }
         }
     }
+    if ($null -ne $deadline) { $deadline.Dispose() }
     # Preserve compiler artifacts. Never recursively remove unknown files, kill
     # unknown compiler processes, or treat an uncertain cleanup as successful.
 }
@@ -500,16 +470,22 @@ try {
 if ($failed -or -not $postPassed -or $null -eq $result) {
     $projection = Get-K5FailureProjection $failureError
     $record = [ordered]@{
-        schema_version = 'fixed-runner-acl-prerequisite-wrapper-v1'
-        scope = 'fixed-runner-readonly-acl'; status = 'refused'; code = $failure
+        schema_version = 'fixed-runner-dacl-backup-wrapper-v1'
+        scope = 'fixed-runner-dacl-backup'; status = 'refused'; code = $failure
+        repair_ready = $false; backup_verified = $false; backup_may_exist = $script:backupAttempted
         reason = $projection.reason; compiler_code = $projection.compiler_code
         storage_admission = $false; retry_authority = $false; exception_authority = $false
         requires_separate_post_admission = $true; compiler_artifacts_retained = $true
     }
-    Write-Host ('K5_RUNNER_ACL_PREREQUISITE=' + ($record | ConvertTo-Json -Compress -Depth 4))
+    Write-Host ('K5_RUNNER_DACL_BACKUP=' + ($record | ConvertTo-Json -Compress -Depth 4))
     throw 'Runner ACL observation refused. Existing owners were preserved.'
 }
-Write-Host ('K5_RUNNER_ACL_PREREQUISITE=' + $result.text)
-if ($result.status -cne 'observed' -or $result.service_status -cne 'verified') {
+$result['source_sha'] = $context.source_sha
+$result['run_id'] = $context.run_id
+$result['run_attempt'] = $context.run_attempt
+$result['requires_separate_post_admission'] = $true
+$result['aggregate_observation_deadline_seconds'] = 150
+Write-Host ('K5_RUNNER_DACL_BACKUP=' + ($result | ConvertTo-Json -Compress -Depth 6))
+if ($result.status -cne 'observed' -or -not $result.backup_verified) {
     throw 'Runner ACL observation refused. Existing owners were preserved.'
 }
