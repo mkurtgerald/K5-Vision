@@ -215,6 +215,7 @@ def create_app(
     control_plane_read_token: str | None = None,
     control_plane_site_id: str | None = None,
     device_db_path: str | Path | None = None,
+    user_db_path: str | Path | None = None,
     device_capacity: int = DEFAULT_DEVICE_CAPACITY,
     max_device_request_bytes: int = MAX_DEVICE_REQUEST_BYTES,
     device_read_rate_limit: int = DEFAULT_DEVICE_READ_RATE_LIMIT,
@@ -300,6 +301,7 @@ def create_app(
     user_registry = install_user_admin_api(
         application,
         site_id=site_id,
+        user_db_path=user_db_path,
         reserved_tokens=tuple(token for token in (write_token, read_token) if token is not None),
     )
     session_manager = application.state.user_session_manager
