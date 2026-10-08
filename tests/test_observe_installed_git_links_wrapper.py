@@ -214,6 +214,36 @@ def test_compilation_selects_existing_inbox_desktop_x64_without_new_attestation(
     assert "Existing inbox .NET/compiler trust is an explicit platform assumption" in body
 
 
+def test_system_core_dependency_is_fixed_inbox_path_checked_like_compiler():
+    body = section("function Assert-K5InboxCompiler", "function New-K5CompilerDirectory")
+    for required in (
+        "$systemCorePath = Join-Path $runtime 'System.Core.dll'",
+        "$systemCore = Get-Item -LiteralPath $systemCorePath -Force -ErrorAction Stop",
+        "$systemCore.FullName -cne $systemCorePath -or $systemCore.PSIsContainer",
+        "($systemCore.Attributes -band [IO.FileAttributes]::ReparsePoint)",
+        "return $systemCorePath",
+    ):
+        assert required in body
+    main = TEXT.split("$guard = $null", 1)[1]
+    assert "$systemCorePath = Assert-K5InboxCompiler" in main
+    assert "Add-K5PinnedCollector $collectorText $compilerTemp $systemCorePath" in main
+    compile_body = section("function Add-K5PinnedCollector", "function Get-K5FailureProjection")
+    assert "[string]$SystemCorePath" in compile_body
+    assert "-ReferencedAssemblies $SystemCorePath" in compile_body
+    assert TEXT.count("-ReferencedAssemblies") == 1
+    assert "HashSet<string>" in COLLECTOR.read_text(encoding="utf-8")
+    for forbidden in (
+        "Assert-K5OrdinaryPath $systemCorePath",
+        "-AssemblyName",
+        "LoadWithPartialName",
+        "Assembly]::Load",
+        "Assembly]::LoadFrom",
+        "Get-ChildItem",
+        "GAC",
+    ):
+        assert forbidden not in TEXT
+
+
 def test_compiler_temp_is_new_exact_private_directory_without_overwrite():
     assert "$compilerTemp = Join-Path $bundleRoot 'compiler-temp'" in TEXT
     body = section("function New-K5CompilerDirectory", "function Assert-K5CompilerArtifacts")
@@ -234,21 +264,133 @@ def test_compiler_temp_is_new_exact_private_directory_without_overwrite():
 
 
 def test_compilation_receives_only_pinned_text_and_restores_temp_in_finally():
-    body = section("function Add-K5PinnedCollector", "function Assert-K5RecordKeys")
+    body = section("function Add-K5PinnedCollector", "function Get-K5FailureProjection")
     assert "Assert-K5OrdinaryPath $CompilerTemp $true" in body
     for name in ("TEMP", "TMP"):
         assert f"GetEnvironmentVariable('{name}', 'Process')" in body
         assert f"SetEnvironmentVariable('{name}', $CompilerTemp, 'Process')" in body
-    assert "Add-Type -TypeDefinition $Source -Language CSharp -PassThru -ErrorAction Stop" in body
+    assert (
+        "Add-Type -TypeDefinition $Source -Language CSharp -PassThru"
+        " -ReferencedAssemblies $SystemCorePath -ErrorAction Stop"
+    ) in body
     assert "-WarningAction SilentlyContinue -Verbose:$false -Debug:$false" in body
     tail = body.split("} finally {", 1)[1]
     assert "SetEnvironmentVariable('TEMP', $previousTemp, 'Process')" in tail
     assert "SetEnvironmentVariable('TMP', $previousTmp, 'Process')" in tail
-    assert tail.count("catch { $restoreFailed = $true }") == 2
-    assert "if ($restoreFailed) { throw 'compiler_environment' }" in tail
+    assert tail.count("catch { if ($null -eq $restoreError) { $restoreError = $_ } }") == 2
+    assert "if ($null -ne $restoreError -and $null -eq $compileError)" in tail
+    assert (
+        "[Management.Automation.RuntimeException]::new('compiler_environment',"
+        " $restoreError.Exception)"
+    ) in tail
     assert "-Path" not in body
     assert "-OutputAssembly" not in body
     assert "'Machine'" not in TEXT
+
+
+def test_compile_error_record_and_original_exception_survive_restore_failure():
+    body = section("function Add-K5PinnedCollector", "function Get-K5FailureProjection")
+    assert "$compileError = $null" in body
+    assert "$restoreError = $null" in body
+    assert re.search(r"} catch \{\s*\$compileError = \$_\s*throw\s*} finally \{", body)
+    assert "throw $compileError" not in body
+    assert "throw $_" not in body
+    assert "if ($restoreFailed)" not in body
+    tail = body.split("} finally {", 1)[1]
+    restore_gate = tail.index("if ($null -ne $restoreError -and $null -eq $compileError)")
+    assert tail.index("SetEnvironmentVariable('TEMP', $previousTemp, 'Process')") < restore_gate
+    assert tail.index("SetEnvironmentVariable('TMP', $previousTmp, 'Process')") < restore_gate
+    assert tail.count("throw ") == 1
+
+
+def test_failure_projection_is_exact_closed_and_never_formats_error_objects():
+    body = section("function Get-K5FailureProjection", "function Assert-K5RecordKeys")
+    expected = {
+        "context",
+        "path",
+        "size",
+        "read",
+        "hash",
+        "binding",
+        "compiler_inventory",
+        "compiler_occupied",
+        "runtime",
+        "type_reuse",
+        "compiler_temp_exists",
+        "compiler_temp",
+        "compiler_artifacts",
+        "compiled_type",
+        "compiler_environment",
+        "record",
+    }
+    assert "[Management.Automation.ErrorRecord]$FailureError" in body
+    known = body.split("$knownReasons = @(", 1)[1].split(")", 1)[0]
+    assert set(re.findall(r"'([a-z_]+)'", known)) == expected
+    assert "$reason = 'unknown'" in body
+    assert "$compilerCode = 'unknown'" in body
+    assert "$FailureError.Exception.Message -ceq $knownReason" in body
+    assert "$reason = $knownReason" in body
+    assert "$FailureError.TargetObject -is [System.CodeDom.Compiler.CompilerError]" in body
+    assert "$number = $FailureError.TargetObject.ErrorNumber" in body
+    assert r"$number -is [string] -and $number -cmatch '\ACS[0-9]{4}\z'" in body
+    assert "$compilerCode = $number" in body
+    assert "return @{ reason = $reason; compiler_code = $compilerCode }" in body
+    for forbidden in (
+        ".ToString(",
+        "Out-String",
+        "ErrorDetails",
+        "InvocationInfo",
+        "ScriptStackTrace",
+        "FileName",
+        "FullyQualifiedErrorId",
+        "ErrorText",
+        "Write-Host",
+        "Write-Error",
+        "ConvertTo-Json",
+        "-match ",
+        "-like ",
+    ):
+        assert forbidden not in body
+    # Source-contract model only: known messages can select a literal; no text
+    # fragment, arbitrary target, or loosely shaped compiler ID can escape.
+    def project(message, number, typed):
+        reason = next((item for item in expected if message == item), "unknown")
+        code = "unknown"
+        if typed and isinstance(number, str) and re.fullmatch(r"CS[0-9]{4}", number):
+            code = number
+        return reason, code
+
+    for reason in expected:
+        assert project(reason, None, False) == (reason, "unknown")
+        assert project(reason.upper(), None, False) == ("unknown", "unknown")
+        assert project(reason + "\nprivate-body", None, False) == ("unknown", "unknown")
+    assert project(r"C:\private\token-CS0246.cs", "CS0246", True) == ("unknown", "CS0246")
+    for number in ("CS0246", "CS0000", "CS9999"):
+        assert project("unknown", number, False) == ("unknown", "unknown")
+    for number in (
+        None, 246, "cs0246", "CS246", "CS00246", "CS0246\n", "CS0246 private", "CS１２３４"
+    ):
+        assert project("unknown", number, True) == ("unknown", "unknown")
+
+
+def test_first_error_and_phase_are_preserved_through_mandatory_post_checks():
+    main = TEXT.split("$guard = $null", 1)[1]
+    assert "$failureError = $null" in main
+    first_catch = main.split("} catch {\n    # No exception text", 1)[1].split("} finally {", 1)[0]
+    assert "$failureError = $_" in first_catch
+    finalization = main.split("} finally {", 1)[1].split("if ($failed -or -not $postPassed", 1)[0]
+    for phase in ("post_admission", "file_cleanup"):
+        assert re.search(
+            r"if \(\$null -eq \$failureError\) \{\s*\$failureError = \$_\s*"
+            + re.escape(f"$failure = '{phase}'") + r"\s*}",
+            finalization,
+        )
+    failure = main.split("if ($failed -or -not $postPassed", 1)[1]
+    assert "$projection = Get-K5FailureProjection $failureError" in failure
+    assert "reason = $projection.reason; compiler_code = $projection.compiler_code" in failure
+    assert "code = $failure" in failure
+    for forbidden in ("$failureError.Exception", "$failureError.TargetObject", "$_", "Out-String"):
+        assert forbidden not in failure
 
 
 def test_compiler_artifact_acceptance_is_bounded_shallow_and_preserves_files():
@@ -306,7 +448,7 @@ def test_native_record_dictionary_schema_flags_context_and_output_are_closed():
     assert "$key -cnotin $Expected" in keys
     assert TEXT.count("Write-Host") == 2
     assert "Write-Error" not in TEXT
-    assert "$_" not in TEXT.split("} catch {\n    # No exception text", 1)[1]
+    assert "$_" not in TEXT.split("if ($failed -or -not $postPassed", 1)[1]
 
 
 def test_refusals_are_allowlisted_and_bound_below_watchdog_budget():

@@ -92,9 +92,16 @@ function Assert-K5InboxCompiler {
     $compiler = Get-Item -LiteralPath $compilerPath -Force -ErrorAction Stop
     if ($compiler.FullName -cne $compilerPath -or $compiler.PSIsContainer -or
         ($compiler.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'runtime' }
+    # Desktop 5.1 Add-Type does not reference System.Core by default. HashSet<T>
+    # requires this fixed existing inbox assembly, with the same system-file checks.
+    $systemCorePath = Join-Path $runtime 'System.Core.dll'
+    $systemCore = Get-Item -LiteralPath $systemCorePath -Force -ErrorAction Stop
+    if ($systemCore.FullName -cne $systemCorePath -or $systemCore.PSIsContainer -or
+        ($systemCore.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'runtime' }
     if ($null -ne ('K5FixedGitObservation' -as [type])) { throw 'type_reuse' }
     # Existing inbox .NET/compiler trust is an explicit platform assumption.
     # No new runtime attestation or single-link policy for system binaries.
+    return $systemCorePath
 }
 
 function New-K5CompilerDirectory([string]$Path) {
@@ -128,23 +135,58 @@ function Assert-K5CompilerArtifacts([string]$Path) {
     } finally { $entries.Dispose() }
 }
 
-function Add-K5PinnedCollector([string]$Source, [string]$CompilerTemp) {
+function Add-K5PinnedCollector([string]$Source, [string]$CompilerTemp, [string]$SystemCorePath) {
     Assert-K5OrdinaryPath $CompilerTemp $true
     $previousTemp = [Environment]::GetEnvironmentVariable('TEMP', 'Process')
     $previousTmp = [Environment]::GetEnvironmentVariable('TMP', 'Process')
+    $compileError = $null
+    $restoreError = $null
     try {
         [Environment]::SetEnvironmentVariable('TEMP', $CompilerTemp, 'Process')
         [Environment]::SetEnvironmentVariable('TMP', $CompilerTemp, 'Process')
         # Fixed verified in-memory text only. No script-path execution, compiler
         # search, new runtime, installer, alternate toolchain or command shell.
-        $types = @(Add-Type -TypeDefinition $Source -Language CSharp -PassThru -ErrorAction Stop -WarningAction SilentlyContinue -Verbose:$false -Debug:$false)
+        $types = @(Add-Type -TypeDefinition $Source -Language CSharp -PassThru -ReferencedAssemblies $SystemCorePath -ErrorAction Stop -WarningAction SilentlyContinue -Verbose:$false -Debug:$false)
         if (@($types | Where-Object { $_.FullName -ceq 'K5FixedGitObservation' }).Count -ne 1) { throw 'compiled_type' }
+    } catch {
+        $compileError = $_
+        throw
     } finally {
-        $restoreFailed = $false
-        try { [Environment]::SetEnvironmentVariable('TEMP', $previousTemp, 'Process') } catch { $restoreFailed = $true }
-        try { [Environment]::SetEnvironmentVariable('TMP', $previousTmp, 'Process') } catch { $restoreFailed = $true }
-        if ($restoreFailed) { throw 'compiler_environment' }
+        # Keep the original ErrorRecord and exception private. A restoration
+        # failure must not replace a pending compile failure or skip either restore.
+        try { [Environment]::SetEnvironmentVariable('TEMP', $previousTemp, 'Process') } catch { if ($null -eq $restoreError) { $restoreError = $_ } }
+        try { [Environment]::SetEnvironmentVariable('TMP', $previousTmp, 'Process') } catch { if ($null -eq $restoreError) { $restoreError = $_ } }
+        if ($null -ne $restoreError -and $null -eq $compileError) {
+            throw [Management.Automation.RuntimeException]::new('compiler_environment', $restoreError.Exception)
+        }
     }
+}
+
+function Get-K5FailureProjection([Management.Automation.ErrorRecord]$FailureError) {
+    $reason = 'unknown'
+    $compilerCode = 'unknown'
+    if ($null -ne $FailureError) {
+        # Select only fixed validation literals; never return exception text.
+        $knownReasons = @('context', 'path', 'size', 'read', 'hash', 'binding',
+            'compiler_inventory', 'compiler_occupied', 'runtime', 'type_reuse',
+            'compiler_temp_exists', 'compiler_temp', 'compiler_artifacts',
+            'compiled_type', 'compiler_environment', 'record')
+        foreach ($knownReason in $knownReasons) {
+            if ($FailureError.Exception.Message -ceq $knownReason) {
+                $reason = $knownReason
+                break
+            }
+        }
+        # Read only the typed CodeDom error number, never the target's contents,
+        # filename, compiler output, error text, invocation or exception details.
+        if ($FailureError.TargetObject -is [System.CodeDom.Compiler.CompilerError]) {
+            $number = $FailureError.TargetObject.ErrorNumber
+            if ($number -is [string] -and $number -cmatch '\ACS[0-9]{4}\z') {
+                $compilerCode = $number
+            }
+        }
+    }
+    return @{ reason = $reason; compiler_code = $compilerCode }
 }
 
 function Assert-K5RecordKeys($Record, [string[]]$Expected) {
@@ -249,6 +291,7 @@ $compilerTemp = $null
 $compilerTempCreated = $false
 $result = $null
 $failure = 'context_binding'
+$failureError = $null
 $failed = $false
 $postPassed = $false
 try {
@@ -291,12 +334,12 @@ try {
     $collectorFile = Open-K5PinnedFile $collectorPath 65536 $collectorSha256
     $collectorText = $strictUtf8.GetString($collectorFile.bytes)
     $failure = 'runtime_binding'
-    Assert-K5InboxCompiler
+    $systemCorePath = Assert-K5InboxCompiler
     $failure = 'compiler_temp'
     New-K5CompilerDirectory $compilerTemp
     $compilerTempCreated = $true
     $failure = 'collector_compile'
-    Add-K5PinnedCollector $collectorText $compilerTemp
+    Add-K5PinnedCollector $collectorText $compilerTemp $systemCorePath
     $failure = 'compiler_idle_after'
     Assert-K5CompilerIdle
     Assert-K5CompilerArtifacts $compilerTemp
@@ -306,6 +349,7 @@ try {
     $result = Assert-K5DiagnosticRecord $record $context
 } catch {
     # No exception text, paths, compiler output, environment or raw records.
+    $failureError = $_
     $failed = $true
 } finally {
     # Normal control flow only. A separate always-run post-admission is mandatory
@@ -318,12 +362,21 @@ try {
             $postPassed = $true
         } catch {
             $failed = $true
-            $failure = 'post_admission'
+            if ($null -eq $failureError) {
+                $failureError = $_
+                $failure = 'post_admission'
+            }
         }
     }
     foreach ($file in @($collectorFile, $guardFile)) {
         if ($null -ne $file) {
-            try { $file.stream.Dispose() } catch { $failed = $true; $failure = 'file_cleanup' }
+            try { $file.stream.Dispose() } catch {
+                $failed = $true
+                if ($null -eq $failureError) {
+                    $failureError = $_
+                    $failure = 'file_cleanup'
+                }
+            }
         }
     }
     # Preserve compiler artifacts. Never recursively remove unknown files, kill
@@ -331,9 +384,11 @@ try {
 }
 
 if ($failed -or -not $postPassed -or $null -eq $result) {
+    $projection = Get-K5FailureProjection $failureError
     $record = [ordered]@{
         schema_version = 'fixed-git-hardlink-observation-wrapper-v2'
         scope = 'fixed-git-readonly-metadata'; status = 'refused'; code = $failure
+        reason = $projection.reason; compiler_code = $projection.compiler_code
         storage_admission = $false; retry_authority = $false; exception_authority = $false
         requires_separate_post_admission = $true; compiler_artifacts_retained = $true
     }
