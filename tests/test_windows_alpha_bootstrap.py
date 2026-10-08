@@ -327,3 +327,20 @@ try {
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+def test_windows_alpha_installer_supports_private_bundled_python_without_path() -> None:
+    text = INSTALL.read_text(encoding="utf-8")
+    assert '[string]$PythonExecutable = ""' in text
+    assert 'Join-Path $InstallRoot "python312\\python.exe"' in text
+    assert "[IO.Path]::IsPathRooted($PythonExecutable)" in text
+    assert "$requestedBundled -cne $expectedBundled" in text
+    assert "[IO.File]::Exists($requestedBundled)" in text
+    assert 'sys.implementation.name == \'cpython\'' in text
+    assert "struct.calcsize('P') == 8" in text
+    assert "& $requestedBundled -I -S -B -c" in text
+    assert "$pythonCommand = $requestedBundled" in text
+    # The existing 3.12 interpreter discovery remains a fallback only when no
+    # K5-owned embedded runtime was supplied.
+    assert "if ($null -eq $pythonCommand) {\n    $py = Get-Command py.exe" in text
+    assert "if ($null -eq $pythonCommand) {\n    foreach ($candidateName" in text
+

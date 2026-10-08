@@ -6,6 +6,7 @@ param(
     [string]$Wheelhouse = "",
     [string]$WheelhouseManifest = "",
     [string]$WheelhouseManifestSha256 = "",
+    [string]$PythonExecutable = "",
     [switch]$SkipDesktopShortcut
 )
 $ErrorActionPreference = "Stop"
@@ -41,12 +42,32 @@ $pythonPrefixArgs = @()
 $pythonIsolation = @()
 if ($offlineCount -eq 3) { $pythonIsolation = @("-I", "-S", "-B") }
 
-$py = Get-Command py.exe -ErrorAction SilentlyContinue
-if ($null -ne $py) {
-    & $py.Source -3.12 @pythonIsolation -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)"
-    if ($LASTEXITCODE -eq 0) {
-        $pythonCommand = $py.Source
-        $pythonPrefixArgs = @("-3.12")
+# A bundled, private CPython is the only explicit interpreter override. This
+# prevents a graphical installer from depending on PATH or touching a user's
+# unrelated Python installation. The interpreter remains isolated under the
+# exact requested K5 install root.
+if (-not [string]::IsNullOrWhiteSpace($PythonExecutable)) {
+    if (-not [IO.Path]::IsPathRooted($PythonExecutable)) {
+        throw "Bundled Python must have an absolute path."
+    }
+    $expectedBundled = [IO.Path]::GetFullPath((Join-Path $InstallRoot "python312\python.exe"))
+    $requestedBundled = [IO.Path]::GetFullPath($PythonExecutable)
+    if ($requestedBundled -cne $expectedBundled -or -not [IO.File]::Exists($requestedBundled)) {
+        throw "Only the K5-bundled Python executable is allowed."
+    }
+    & $requestedBundled -I -S -B -c "import struct, sys; raise SystemExit(0 if sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 12) and struct.calcsize('P') == 8 else 1)"
+    if ($LASTEXITCODE -ne 0) { throw "Bundled CPython 3.12 x64 verification failed." }
+    $pythonCommand = $requestedBundled
+}
+
+if ($null -eq $pythonCommand) {
+    $py = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($null -ne $py) {
+        & $py.Source -3.12 @pythonIsolation -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)"
+        if ($LASTEXITCODE -eq 0) {
+            $pythonCommand = $py.Source
+            $pythonPrefixArgs = @("-3.12")
+        }
     }
 }
 
