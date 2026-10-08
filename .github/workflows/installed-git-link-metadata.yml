@@ -1,5 +1,5 @@
-name: Installed Git Read-only Metadata Diagnostic
-run-name: Fixed Git metadata at ${{ github.sha }}
+name: Installed Runner ACL Read-only Metadata Diagnostic
+run-name: Fixed runner ACL metadata at ${{ github.sha }}
 
 # One reviewed isolated publication; no dispatch, schedule, retry, or main trigger.
 on:
@@ -47,8 +47,8 @@ jobs:
           Set-StrictMode -Version Latest
           # API origin, blob identity, byte count and digest are fixed by reviewed source.
           # No checkout, executable path lookup, redirects, retries, or source-file reopen.
-          $expectedBlob = 'b83f2227b9bb8ccbb3b37ba4fcb4f73d0ee1e048'
-          $expectedDigest = '04ee11ed93aa39f39854a0c6e052c8c9effc5cd7f428e5bec90341df1f09ceb0'
+          $expectedBlob = 'f0248c9ada23cc68a748ddd76386df887b061194'
+          $expectedDigest = 'daaa32ca0f79d565a3cf51797d94530ace959ab7163fb2b29ac612541a07e58a'
           $expectedSize = 23884
           $maximumResponse = 131072
           $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
@@ -133,8 +133,8 @@ jobs:
           Set-StrictMode -Version Latest
           # API origin, blob identity, byte count and digest are fixed by reviewed source.
           # No checkout, executable path lookup, redirects, retries, or source-file reopen.
-          $expectedBlob = 'b83f2227b9bb8ccbb3b37ba4fcb4f73d0ee1e048'
-          $expectedDigest = '04ee11ed93aa39f39854a0c6e052c8c9effc5cd7f428e5bec90341df1f09ceb0'
+          $expectedBlob = 'f0248c9ada23cc68a748ddd76386df887b061194'
+          $expectedDigest = 'daaa32ca0f79d565a3cf51797d94530ace959ab7163fb2b29ac612541a07e58a'
           $expectedSize = 23884
           $maximumResponse = 131072
           $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
@@ -236,8 +236,8 @@ jobs:
           Set-StrictMode -Version Latest
           # API origin, blob identity, byte count and digest are fixed by reviewed source.
           # No checkout, executable path lookup, redirects, retries, or source-file reopen.
-          $expectedBlob = 'b83f2227b9bb8ccbb3b37ba4fcb4f73d0ee1e048'
-          $expectedDigest = '04ee11ed93aa39f39854a0c6e052c8c9effc5cd7f428e5bec90341df1f09ceb0'
+          $expectedBlob = 'f0248c9ada23cc68a748ddd76386df887b061194'
+          $expectedDigest = 'daaa32ca0f79d565a3cf51797d94530ace959ab7163fb2b29ac612541a07e58a'
           $expectedSize = 23884
           $maximumResponse = 131072
           $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
@@ -322,8 +322,8 @@ jobs:
           Set-StrictMode -Version Latest
           # API origin, blob identity, byte count and digest are fixed by reviewed source.
           # No checkout, executable path lookup, redirects, retries, or source-file reopen.
-          $expectedBlob = 'b83f2227b9bb8ccbb3b37ba4fcb4f73d0ee1e048'
-          $expectedDigest = '04ee11ed93aa39f39854a0c6e052c8c9effc5cd7f428e5bec90341df1f09ceb0'
+          $expectedBlob = 'f0248c9ada23cc68a748ddd76386df887b061194'
+          $expectedDigest = 'daaa32ca0f79d565a3cf51797d94530ace959ab7163fb2b29ac612541a07e58a'
           $expectedSize = 23884
           $maximumResponse = 131072
           $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
