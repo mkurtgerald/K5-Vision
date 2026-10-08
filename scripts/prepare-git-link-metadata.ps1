@@ -9,15 +9,15 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 # Invoked only as independently hash-verified, strict UTF-8 in-memory bytes.
 # This fixed one-attempt transport is not installer or retry authority.
-$sourceCommit = '462eaa5ba3775b3aa48915ac23e57101b6d2ceba'
+$sourceCommit = 'bd0312b105058140274c1d76205daa3695a47ee5'
 $repository = 'mkurtgerald/K5-Vision'
 $branch = 'review/git-link-metadata-20261008'
 $apiRoot = 'https://api.github.com/repos/mkurtgerald/K5-Vision/'
 $utf8 = [Text.UTF8Encoding]::new($false, $true)
 $pins = @(
     @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
-    @{ name = 'observe_installed_git_links.cs'; size = 42147; blob = 'b0395a3f2a2272d08829d21f88ede875f442716c'; sha256 = 'a9950ca2fd5a425353e7af9075045fe595bfc9c4e32c27abc3c7705e67c04665' },
-    @{ name = 'observe-installed-git-links.ps1'; size = 26432; blob = '5e6ac65efe60c1a4bff0e1a99ccdadf98b209d71'; sha256 = 'd90c2e597f73f785e1421a6bc9deca59ec1b5732ceb1013f0fad549cba3317f4' }
+    @{ name = 'observe_installed_git_links.cs'; size = 42168; blob = '0524121df98e5e79f05dabd4967f4d7ff5ff48a3'; sha256 = '0e4553dd178cb8e08a43507e40c0e1a4db8b80086a64e54daa58fcb8c94a2eae' },
+    @{ name = 'observe-installed-git-links.ps1'; size = 27587; blob = '51e60d5a8b9f5282932341b310f67911bb0f680a'; sha256 = '4fe427732fe2229a701486b54e2076a83f68be783c5612cc591bd787303dce86' }
 )
 
 function Assert-OrdinaryPath([string]$Path, [bool]$Directory, [hashtable]$Observation = $null) {
@@ -281,6 +281,32 @@ function Assert-RetainedArtifacts {
     # never replaces the workflow's required successful qualification/observation.
 }
 
+function Get-K5ClosedCompilerCode([Management.Automation.ErrorRecord]$FailureRecord) {
+    if ($null -eq $FailureRecord -or $FailureRecord.FullyQualifiedErrorId -cnotin @(
+        'SOURCE_CODE_ERROR,Microsoft.PowerShell.Commands.AddTypeCommand',
+        'COMPILER_ERRORS,Microsoft.PowerShell.Commands.AddTypeCommand'
+    )) { return 'unknown' }
+    if ($FailureRecord.TargetObject -is [System.CodeDom.Compiler.CompilerError] -and
+        $FailureRecord.TargetObject.ErrorNumber -cmatch '\ACS[0-9]{4}\z') {
+        return $FailureRecord.TargetObject.ErrorNumber
+    }
+    # Inspect bounded error messages privately. Never print source/paths, inspect
+    # a string TargetObject, call ToString(), or open compiler files/output.
+    $messages = @($FailureRecord.Exception.Message)
+    if ($null -ne $FailureRecord.ErrorDetails) { $messages += $FailureRecord.ErrorDetails.Message }
+    $codes = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($message in $messages) {
+        if ($null -eq $message) { continue }
+        if ($message -isnot [string] -or $message.Length -gt 8192) { return 'unknown' }
+        $matches = [regex]::Matches($message, '(?<![A-Za-z0-9_])CS[0-9]{4}(?![A-Za-z0-9_])')
+        if ($matches.Count -gt 16) { return 'unknown' }
+        foreach ($match in $matches) { $null = $codes.Add($match.Value) }
+    }
+    if ($codes.Count -ne 1) { return 'unknown' }
+    foreach ($code in $codes) { return $code }
+    return 'unknown'
+}
+
 function Get-HostedFailureProjection([Management.Automation.ErrorRecord]$FailureRecord) {
     $reason = 'unknown'
     $compilerCode = 'unknown'
@@ -317,10 +343,7 @@ function Get-HostedFailureProjection([Management.Automation.ErrorRecord]$Failure
         'COMPILER_ERRORS,Microsoft.PowerShell.Commands.AddTypeCommand'
     )) {
         $reason = 'compiler_error'
-        if ($FailureRecord.TargetObject -is [System.CodeDom.Compiler.CompilerError] -and
-            $FailureRecord.TargetObject.ErrorNumber -cmatch '\ACS[0-9]{4}\z') {
-            $compilerCode = $FailureRecord.TargetObject.ErrorNumber
-        }
+        $compilerCode = Get-K5ClosedCompilerCode $FailureRecord
     }
     $artifactObservation = $null
     if ($script:qualificationPhase -ceq 'compiler_artifacts') { $artifactObservation = $script:compilerArtifactObservation }
