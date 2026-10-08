@@ -110,6 +110,23 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
+      - name: Compile camera-free owner GUI candidate
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path -LiteralPath $compiler)) { throw 'Windows GUI compiler missing.' }
+          $output = Join-Path $env:RUNNER_TEMP 'K5VisionAlpha-GUI.exe'
+          & $compiler /nologo /target:winexe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll "/out:$output" 'scripts/windows-alpha/owner-installer/K5VisionAlpha.cs'
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $output)) {
+            throw 'Owner Windows GUI compilation failed.'
+          }
+          & $output --self-check
+          if ($LASTEXITCODE -ne 3) {
+            throw 'Owner GUI must refuse a missing installed runtime.'
+          }
+          Write-Host 'K5_OWNER_GUI_HOSTED_COMPILE=passed'
+
       - name: Parse Windows alpha PowerShell
         shell: powershell
         run: |
