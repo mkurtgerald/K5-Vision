@@ -179,7 +179,7 @@ public static class K5FixedGitObservation
         private readonly Stopwatch watch = Stopwatch.StartNew();
         private readonly List<IntPtr> owned = new List<IntPtr>();
         private readonly List<Held> held = new List<Held>();
-        internal long BytesRead;
+        internal long BytesRead { get { return 0; } }
         internal long ElapsedMs { get { return watch.ElapsedMilliseconds; } }
 
         private void Tick() { Require(ElapsedMs <= MaxElapsedMs, "time_bound"); }

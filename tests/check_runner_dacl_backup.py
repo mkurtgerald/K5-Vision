@@ -69,7 +69,46 @@ def freeze(records):
     return json.dumps(records, sort_keys=True, separators=(",", ":")).encode()
 
 
+def closed_compiler_code(messages, typed=None, compile_phase=True, valid_error_id=True):
+    if not compile_phase or not valid_error_id:
+        return "unknown"
+    if isinstance(typed, str) and re.fullmatch(r"CS[0-9]{4}", typed):
+        return typed
+    codes = set()
+    for message in messages:
+        if message is None:
+            continue
+        if not isinstance(message, str) or len(message) > 8192:
+            return "unknown"
+        matches = re.findall(r"(?<![A-Za-z0-9_])CS[0-9]{4}(?![A-Za-z0-9_])", message)
+        if len(matches) > 16:
+            return "unknown"
+        codes.update(matches)
+    return next(iter(codes)) if len(codes) == 1 else "unknown"
+
+
 class SourceContracts(unittest.TestCase):
+    def test_zero_byte_counter_is_csharp5_readonly_property(self):
+        self.assertIn("internal long BytesRead { get { return 0; } }", CS)
+        self.assertNotIn("internal long BytesRead;", CS)
+        self.assertNotIn("-IgnoreWarnings", PS)
+        self.assertNotIn("-IgnoreWarnings", PRE)
+        self.assertNotIn("/nowarn", PS + PRE)
+
+    def test_compiler_projection_is_mirrored_bounded_and_phase_gated(self):
+        wrapper = section(PS, "function Get-K5ClosedCompilerCode", "function Get-K5FailureProjection")
+        hosted = section(PRE, "function Get-K5ClosedCompilerCode", "function Get-HostedFailureProjection")
+        self.assertEqual(wrapper, hosted)
+        for token in ("SOURCE_CODE_ERROR,Microsoft.PowerShell.Commands.AddTypeCommand",
+                      "COMPILER_ERRORS,Microsoft.PowerShell.Commands.AddTypeCommand",
+                      "$message.Length -gt 8192", "$matches.Count -gt 16", "$codes.Count -ne 1",
+                      "(?<![A-Za-z0-9_])CS[0-9]{4}(?![A-Za-z0-9_])"):
+            self.assertIn(token, wrapper)
+        self.assertIn("$failure -ceq 'collector_compile'", PS)
+        self.assertIn("$script:qualificationPhase -ceq 'compile'", PRE)
+        for prohibited in ("Write-Host", "Write-Output", "Write-Warning", ".ToString(", "Get-Content"):
+            self.assertNotIn(prohibited, wrapper)
+
     def test_no_acl_setter_or_service_control(self):
         for text in (CS, PS):
             for forbidden in ("SetSecurityInfo", "SetNamedSecurityInfo", "SetFileSecurity", "Set-Acl",
@@ -188,6 +227,26 @@ class SourceContracts(unittest.TestCase):
 
 
 class IndependentModels(unittest.TestCase):
+    def test_compiler_projection_extracts_only_one_closed_token(self):
+        self.assertEqual(closed_compiler_code(["private/path: warning CS0649: private source"]), "CS0649")
+        self.assertEqual(closed_compiler_code(["CS0649", "CS0649"]), "CS0649")
+        self.assertEqual(closed_compiler_code(["CS1002"], typed="CS0649"), "CS0649")
+
+    def test_compiler_projection_refuses_ambiguous_missing_or_embedded_codes(self):
+        for messages in (["CS0649 CS1002"], ["CS0649", "CS1002"], [None, "no code"],
+                         ["xCS0649"], ["CS0649_more"], ["CS06490"], ["cs0649"], [123]):
+            with self.subTest(messages=messages):
+                self.assertEqual(closed_compiler_code(messages), "unknown")
+
+    def test_compiler_projection_refuses_oversize_or_excess_matches(self):
+        self.assertEqual(closed_compiler_code(["CS0649 " + "x" * 8192]), "unknown")
+        self.assertEqual(closed_compiler_code(["CS0649 " * 17]), "unknown")
+        self.assertEqual(closed_compiler_code(["CS0649 " * 16]), "CS0649")
+
+    def test_compiler_projection_needs_compile_phase_and_exact_error_id(self):
+        self.assertEqual(closed_compiler_code(["CS0649"], compile_phase=False), "unknown")
+        self.assertEqual(closed_compiler_code(["CS0649"], valid_error_id=False), "unknown")
+
     def test_directory_names_use_byte_lengths_and_unicode(self):
         for name in (".", "..", "a.txt", "name-😀", "x~file"):
             self.assertEqual(parse_name(wire(name)), name)

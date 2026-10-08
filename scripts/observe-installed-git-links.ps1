@@ -20,7 +20,7 @@ Set-StrictMode -Version Latest
 # This observation never confers storage, retry, exception or delivery authority.
 $guardSha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d'
 # Exact frozen collector bytes; neither environment nor arguments can change this pin.
-$collectorSha256 = 'a9950ca2fd5a425353e7af9075045fe595bfc9c4e32c27abc3c7705e67c04665'
+$collectorSha256 = '0e4553dd178cb8e08a43507e40c0e1a4db8b80086a64e54daa58fcb8c94a2eae'
 $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
 
 function Assert-K5OrdinaryPath([string]$Path, [bool]$Directory) {
@@ -163,6 +163,32 @@ function Add-K5PinnedCollector([string]$Source, [string]$CompilerTemp, [string]$
     }
 }
 
+function Get-K5ClosedCompilerCode([Management.Automation.ErrorRecord]$FailureRecord) {
+    if ($null -eq $FailureRecord -or $FailureRecord.FullyQualifiedErrorId -cnotin @(
+        'SOURCE_CODE_ERROR,Microsoft.PowerShell.Commands.AddTypeCommand',
+        'COMPILER_ERRORS,Microsoft.PowerShell.Commands.AddTypeCommand'
+    )) { return 'unknown' }
+    if ($FailureRecord.TargetObject -is [System.CodeDom.Compiler.CompilerError] -and
+        $FailureRecord.TargetObject.ErrorNumber -cmatch '\ACS[0-9]{4}\z') {
+        return $FailureRecord.TargetObject.ErrorNumber
+    }
+    # Inspect bounded error messages privately. Never print source/paths, inspect
+    # a string TargetObject, call ToString(), or open compiler files/output.
+    $messages = @($FailureRecord.Exception.Message)
+    if ($null -ne $FailureRecord.ErrorDetails) { $messages += $FailureRecord.ErrorDetails.Message }
+    $codes = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($message in $messages) {
+        if ($null -eq $message) { continue }
+        if ($message -isnot [string] -or $message.Length -gt 8192) { return 'unknown' }
+        $matches = [regex]::Matches($message, '(?<![A-Za-z0-9_])CS[0-9]{4}(?![A-Za-z0-9_])')
+        if ($matches.Count -gt 16) { return 'unknown' }
+        foreach ($match in $matches) { $null = $codes.Add($match.Value) }
+    }
+    if ($codes.Count -ne 1) { return 'unknown' }
+    foreach ($code in $codes) { return $code }
+    return 'unknown'
+}
+
 function Get-K5FailureProjection([Management.Automation.ErrorRecord]$FailureError) {
     $reason = 'unknown'
     $compilerCode = 'unknown'
@@ -180,13 +206,8 @@ function Get-K5FailureProjection([Management.Automation.ErrorRecord]$FailureErro
                 break
             }
         }
-        # Read only the typed CodeDom error number, never the target's contents,
-        # filename, compiler output, error text, invocation or exception details.
-        if ($FailureError.TargetObject -is [System.CodeDom.Compiler.CompilerError]) {
-            $number = $FailureError.TargetObject.ErrorNumber
-            if ($number -is [string] -and $number -cmatch '\ACS[0-9]{4}\z') {
-                $compilerCode = $number
-            }
+        if ($failure -ceq 'collector_compile') {
+            $compilerCode = Get-K5ClosedCompilerCode $FailureError
         }
     }
     return @{ reason = $reason; compiler_code = $compilerCode }
