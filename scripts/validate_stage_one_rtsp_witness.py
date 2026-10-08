@@ -75,6 +75,15 @@ def validate_receipt(path: Path, *, revision: str, analytics_revision: str) -> N
         for field in _COUNTERS
     ):
         raise ValueError("receipt counters must be positive bounded integers")
+    # These are counters from one execution. Cleanup may cancel an in-flight
+    # analytics task, so completions need not equal submissions.
+    if not (
+        document["analytics_provider_completions"]
+        <= document["analytics_provider_calls"]
+        <= document["analytics_provider_submissions"]
+        <= document["delivered_frames"]
+    ):
+        raise ValueError("receipt analytics counters are causally inconsistent")
 
 
 def main() -> int:
