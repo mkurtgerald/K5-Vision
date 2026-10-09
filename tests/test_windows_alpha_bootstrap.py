@@ -328,6 +328,7 @@ try {
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
+
 def test_windows_alpha_installer_supports_private_bundled_python_without_path() -> None:
     text = INSTALL.read_text(encoding="utf-8")
     assert '[string]$PythonExecutable = ""' in text
