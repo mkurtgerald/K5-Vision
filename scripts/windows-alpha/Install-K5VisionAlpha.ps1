@@ -116,12 +116,21 @@ if ($offlineCount -eq 3) {
                    "--wheelhouse-manifest-sha256", $WheelhouseManifestSha256)
 }
 $priorRunnerTemp = $env:RUNNER_TEMP
+$priorRunnerToolCache = $env:RUNNER_TOOL_CACHE
 try {
     if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) { $env:RUNNER_TEMP = $env:TEMP }
+    # The GUI, first-launch preflight and operator launcher resolve GStreamer
+    # at the user's LocalAppData path. A hosted runner's tool cache must not
+    # redirect the owner-bundled runtime away from that contract.
+    if (-not [string]::IsNullOrWhiteSpace($PythonExecutable)) {
+        $env:RUNNER_TOOL_CACHE = Join-Path $env:LOCALAPPDATA "K5RunnerTools"
+    }
     & $pythonCommand @pythonPrefixArgs @pythonIsolation @arguments
     if ($LASTEXITCODE -ne 0) { throw "K5 Vision Alpha transaction failed; see recovery details above." }
 }
 finally {
+    if ([string]::IsNullOrWhiteSpace($priorRunnerToolCache)) { Remove-Item Env:RUNNER_TOOL_CACHE -ErrorAction SilentlyContinue }
+    else { $env:RUNNER_TOOL_CACHE = $priorRunnerToolCache }
     if ([string]::IsNullOrWhiteSpace($priorRunnerTemp)) { Remove-Item Env:RUNNER_TEMP -ErrorAction SilentlyContinue }
     else { $env:RUNNER_TEMP = $priorRunnerTemp }
 }
