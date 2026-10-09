@@ -335,7 +335,7 @@ def test_windows_alpha_installer_supports_private_bundled_python_without_path() 
     assert "[IO.Path]::IsPathRooted($PythonExecutable)" in text
     assert "$requestedBundled -cne $expectedBundled" in text
     assert "[IO.File]::Exists($requestedBundled)" in text
-    assert 'sys.implementation.name == \'cpython\'' in text
+    assert "sys.implementation.name == 'cpython'" in text
     assert "struct.calcsize('P') == 8" in text
     assert "& $requestedBundled -I -S -B -c" in text
     assert "$pythonCommand = $requestedBundled" in text
