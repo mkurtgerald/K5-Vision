@@ -9,6 +9,9 @@ on:
       - feat/installed-alpha-facade-witness-20261005
     paths:
       - .github/workflows/installed-analytics-candidate.yml
+      - .github/workflows/owner-windows-installer-candidate.yml
+      - scripts/windows-alpha/owner-installer/**
+      - scripts/provision-stage03-gstreamer.ps1
       - scripts/installed_analytics_witness.py
       - scripts/installed_alpha_launcher_witness.py
       - scripts/installed_alpha_facade_witness.py
