@@ -344,4 +344,3 @@ def test_windows_alpha_installer_supports_private_bundled_python_without_path() 
     # K5-owned embedded runtime was supplied.
     assert "if ($null -eq $pythonCommand) {\n    $py = Get-Command py.exe" in text
     assert "if ($null -eq $pythonCommand) {\n    foreach ($candidateName" in text
-
