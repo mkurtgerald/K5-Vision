@@ -46,6 +46,7 @@ Name: "{userdesktop}\K5 Vision Alpha"; Filename: "{app}\K5VisionAlpha.exe"; Work
 [UninstallDelete]
 ; Only owned files. Never delete camera/user data or another product's paths.
 Type: filesandordirs; Name: "{app}\.venv"
+Type: filesandordirs; Name: "{app}\python312"
 Type: files; Name: "{app}\Start-K5VisionAlpha.ps1"
 Type: files; Name: "{app}\Test-K5VisionAlpha.ps1"
 Type: files; Name: "{app}\Run-K5VisionAlpha.ps1"
