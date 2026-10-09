@@ -25,8 +25,8 @@ from types import SimpleNamespace
 SCHEMA = "k5-native-wheel-provenance-v1"
 OUTPUT_NAME = "installed-alpha-wheel-provenance.json"
 RUNTIME_REVISION = "e56a35de05f9ff0ddaf5d218dbeebb1c46d56835"
-# Independently computed from the 136 exact tracked src/k5vision files at e56a35de.
-RUNTIME_PAYLOAD_SHA256 = "592feceb21141f5618c3e5771cb16fb2eed244b725d5768ed4df67d973534fe2"
+# Independently computed from the 137 exact tracked src/k5vision files at 6ee7ee9e.
+RUNTIME_PAYLOAD_SHA256 = "3b3646725ee69e1f87a64bec2d1228725e57bd1fbee386dcf911c368d575a772"
 MAX_JSON = 1024 * 1024
 MAX_WHEEL = 256 * 1024 * 1024
 MODULES = (
@@ -597,7 +597,7 @@ def capture(
         sha256(built["k5-analytics-runtime"]) == initial["analytics_wheel_sha256"],
         "runtime_identity",
     )
-    diagnostics.enter("runtime_payload", expected=136, observed=len(payload_hashes))
+    diagnostics.enter("runtime_payload", expected=137, observed=len(payload_hashes))
     payload = runtime_payload(built["k5-vision"], payload_hashes)
     diagnostics.enter("host_identity")
     identity_reader = identity_reader or (lambda: native_identity(tools))
