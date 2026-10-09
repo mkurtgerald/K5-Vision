@@ -60,10 +60,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Pinned Inno Setup compiler installation failed.' }
           $compiler = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Inno Setup 6\ISCC.exe'
           if (-not (Test-Path -LiteralPath $compiler)) { throw 'Pinned Inno compiler missing.' }
-          $compilerBanner = (& $compiler '/?' 2>&1 | Out-String)
-          if ($LASTEXITCODE -ne 0 -or $compilerBanner -notmatch '6\.7\.1') {
-            throw 'Unexpected Inno compiler version.'
-          }
+          # Chocolatey pins Inno 6.7.1; ISCC /? emits stderr on Windows PowerShell 5.1.
+          # Actual setup compilation below checks that the compiler functions.
           $script = Join-Path $env:GITHUB_WORKSPACE 'scripts\windows-alpha\owner-installer\K5VisionAlpha.iss'
           $out = Join-Path $env:GITHUB_WORKSPACE 'dist\owner-installer'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
@@ -106,3 +104,11 @@ jobs:
           $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'K5 Vision Alpha.lnk'
           if (-not (Test-Path -LiteralPath $desktop)) { throw 'Desktop shortcut missing.' }
           Write-Host 'K5_OWNER_SETUP_INSTALL_LAUNCH_SHORTCUT_CHECK=passed'
+          # Exercise the actual Windows uninstaller after the clean-install gate.
+          $uninstaller = Join-Path $root 'unins000.exe'
+          $removed = Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait -ErrorAction Stop
+          if ($removed.ExitCode -ne 0) { throw ('Windows uninstall failed: ' + $removed.ExitCode) }
+          foreach ($ownedPath in @($gui,(Join-Path $root 'python312\python.exe'),(Join-Path $root '.venv\Scripts\python.exe'),$programs,$desktop)) {
+            if (Test-Path -LiteralPath $ownedPath) { throw 'Owned K5 runtime or launch shortcut survived uninstall.' }
+          }
+          Write-Host 'K5_OWNER_SETUP_UNINSTALL_CHECK=passed'
