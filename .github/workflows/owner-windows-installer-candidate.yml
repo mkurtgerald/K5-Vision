@@ -104,7 +104,52 @@ jobs:
           $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'K5 Vision Alpha.lnk'
           if (-not (Test-Path -LiteralPath $desktop)) { throw 'Desktop shortcut missing.' }
           Write-Host 'K5_OWNER_SETUP_INSTALL_LAUNCH_SHORTCUT_CHECK=passed'
-          # Exercise the actual Windows uninstaller after the clean-install gate.
+          # Qualify actual graphical startup through both Windows shortcuts.
+          # This is an isolated hosted Windows worker; never touch cameras.
+          function Assert-K5ShortcutLaunch([string]$link) {
+            if (@(Get-Process -Name K5VisionAlpha -ErrorAction SilentlyContinue).Count -ne 0) {
+              throw 'Unexpected pre-existing K5 GUI process.'
+            }
+            Start-Process -FilePath $link -ErrorAction Stop
+            $opened = $null
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              Start-Sleep -Milliseconds 500
+              $running = @(Get-Process -Name K5VisionAlpha -ErrorAction SilentlyContinue)
+              if ($running.Count -gt 1) { throw 'Duplicate K5 GUI instance.' }
+              if ($running.Count -eq 1 -and $running[0].MainWindowTitle -ceq 'K5 Vision Alpha') {
+                $opened = $running[0]
+                break
+              }
+            }
+            if ($null -eq $opened) { throw 'Shortcut did not open the graphical K5 launcher.' }
+            if (-not $opened.CloseMainWindow() -or -not $opened.WaitForExit(10000)) {
+              throw 'K5 GUI could not be closed normally before reinstall.'
+            }
+          }
+          $revisionFile = Join-Path $root 'k5-revision.txt'
+          if (-not (Test-Path -LiteralPath $revisionFile)) { throw 'Installed revision receipt missing.' }
+          if ((Get-Content -LiteralPath $revisionFile -Raw).Trim() -cne $env:GITHUB_SHA) {
+            throw 'Installed runtime revision is not the setup source revision.'
+          }
+          foreach ($shortcut in @($desktop, $programs)) { Assert-K5ShortcutLaunch $shortcut }
+          Write-Host 'K5_OWNER_SETUP_FIRST_GUI_LAUNCH_CHECK=passed'
+
+          # Same-package in-place reinstall is a separate required acceptance gate.
+          # It is not evidence of a different-revision upgrade or rollback.
+          $reinstalled = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait -ErrorAction Stop
+          if ($reinstalled.ExitCode -ne 0) { throw ('In-place reinstall failed: ' + $reinstalled.ExitCode) }
+          $reprobe = Start-Process -FilePath $gui -ArgumentList '--self-check' -PassThru -Wait -WindowStyle Hidden -ErrorAction Stop
+          if ($reprobe.ExitCode -ne 0) { throw 'GUI runtime self-check failed after reinstall.' }
+          if ((Get-Content -LiteralPath $revisionFile -Raw).Trim() -cne $env:GITHUB_SHA) {
+            throw 'Reinstalled runtime revision mismatch.'
+          }
+          foreach ($shortcut in @($desktop, $programs)) {
+            if (-not (Test-Path -LiteralPath $shortcut)) { throw 'Shortcut missing after reinstall.' }
+            Assert-K5ShortcutLaunch $shortcut
+          }
+          Write-Host 'K5_OWNER_SETUP_REINSTALL_CHECK=passed'
+
+          # Exercise the actual Windows uninstaller after all installed gates.
           $uninstaller = Join-Path $root 'unins000.exe'
           $removed = Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait -ErrorAction Stop
           if ($removed.ExitCode -ne 0) { throw ('Windows uninstall failed: ' + $removed.ExitCode) }
