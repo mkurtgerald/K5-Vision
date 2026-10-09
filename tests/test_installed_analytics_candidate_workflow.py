@@ -132,6 +132,9 @@ def test_native_probe_and_host_admission_dependencies_are_exact_and_hosted_quali
     paths = WORKFLOW.read_text().split("    paths:\n", 1)[1].split("\n\n", 1)[0] + "\n"
     expected = {
         ".github/workflows/installed-analytics-candidate.yml",
+        ".github/workflows/owner-windows-installer-candidate.yml",
+        "scripts/windows-alpha/owner-installer/**",
+        "scripts/provision-stage03-gstreamer.ps1",
         "scripts/installed_analytics_witness.py",
         "scripts/installed_alpha_launcher_witness.py",
         "scripts/installed_alpha_facade_witness.py",
@@ -1930,7 +1933,7 @@ def test_storage_packet_fixture_extracts_exact_production_statements_only():
 
 def test_storage_packet_fixture_keeps_production_and_source_pins_frozen():
     for path, digest in (
-        (WORKFLOW, "5c21c54304ba5d8b0f7b7af4687a0ceb1fd34dfbc199919524f3cccc44a88087"),
+        (WORKFLOW, "96fe6b97dbe124514d97a9b06d37a4ea217a0e6cbad7471a2cf2e9a88ad231c6"),
         (
             ROOT / "scripts/assert-installed-git-alias.ps1",
             "67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8",
