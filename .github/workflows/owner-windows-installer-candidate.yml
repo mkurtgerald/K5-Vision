@@ -128,7 +128,18 @@ jobs:
           $gui = Join-Path $root 'K5VisionAlpha.exe'
           if (-not (Test-Path -LiteralPath $gui)) { throw 'GUI missing after install.' }
           $probe = Start-Process -FilePath $gui -ArgumentList '--self-check' -PassThru -Wait -WindowStyle Hidden -ErrorAction Stop
-          if ($probe.ExitCode -ne 0) { throw 'Installed GUI runtime self-check failed.' }
+          if ($probe.ExitCode -ne 0) {
+            # Safe opaque component IDs, not paths or any runtime/owner source data.
+            $missing = @{
+              3 = 'private Python executable'; 4 = 'application virtual environment'
+              5 = 'runtime launcher'; 6 = 'source revision receipt'
+              7 = 'analytics configuration'; 8 = 'person-detection model asset'
+              9 = 'pose-estimation model asset'; 10 = 'GStreamer video runtime'
+            }
+            $component = $missing[[int]$probe.ExitCode]
+            if (-not $component) { $component = 'unrecognized prerequisite failure' }
+            throw ("Installed GUI self-check failed: $component (component code $($probe.ExitCode)).")
+          }
           $installedPython = Join-Path $root '.venv\Scripts\python.exe'
           $installedConfig = Join-Path $root 'analytics-config.json'
           if (-not (Test-Path -LiteralPath $installedPython) -or -not (Test-Path -LiteralPath $installedConfig)) {
@@ -187,7 +198,7 @@ jobs:
           $reinstalled = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait -ErrorAction Stop
           if ($reinstalled.ExitCode -ne 0) { throw ('In-place reinstall failed: ' + $reinstalled.ExitCode) }
           $reprobe = Start-Process -FilePath $gui -ArgumentList '--self-check' -PassThru -Wait -WindowStyle Hidden -ErrorAction Stop
-          if ($reprobe.ExitCode -ne 0) { throw 'GUI runtime self-check failed after reinstall.' }
+          if ($reprobe.ExitCode -ne 0) { throw ('GUI runtime self-check failed after reinstall (component code ' + $reprobe.ExitCode + ').') }
           if ((Get-Content -LiteralPath $revisionFile -Raw).Trim() -cne $env:GITHUB_SHA) {
             throw 'Reinstalled runtime revision mismatch.'
           }
