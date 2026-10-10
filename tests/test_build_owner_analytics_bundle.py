@@ -1,8 +1,8 @@
 """Offline, camera-free checks of the pinned owner Analytics bundle builder."""
 
 import hashlib
-import io
 import importlib.util
+import io
 from pathlib import Path
 
 import pytest
