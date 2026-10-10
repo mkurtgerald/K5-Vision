@@ -21,20 +21,100 @@ if ($env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_ENVIRONMENT -cne 'github-hos
     $env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision') {
     throw 'Installed GUI witness requires the admitted isolated hosted worker.'
 }
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
-
-function Read-K5ControlText($Element) {
-    $pattern = $null
-    if ($Element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
-        return [string]$pattern.Current.Value
+# WinForms accessibility providers vary across hosted Windows images. Use bounded
+# native messages directed only at children of the exact process we launched.
+$nativeControls = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public sealed class K5WitnessControl {
+    internal IntPtr Handle, Root;
+    internal uint Pid;
+    internal bool ReadOnly;
+    public bool IsEnabled { get { Validate(); return K5WitnessNative.IsWindowEnabled(Handle); } }
+    internal void Validate() {
+        uint owner;
+        K5WitnessNative.GetWindowThreadProcessId(Handle, out owner);
+        if (owner != Pid || !K5WitnessNative.IsChild(Root, Handle))
+            throw new InvalidOperationException("Control identity changed.");
     }
-    $pattern = $null
-    if ($Element.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$pattern)) {
-        return [string]$pattern.DocumentRange.GetText(8192)
+    public string Read() {
+        Validate();
+        var text = new StringBuilder(8192);
+        UIntPtr length;
+        if (K5WitnessNative.ReadMessage(Handle, 0x000D, new UIntPtr(8192), text, 2, 2000, out length) == IntPtr.Zero)
+            throw new InvalidOperationException("Control read timed out.");
+        return text.ToString();
     }
-    return ''
+    public void SetValue(string value) {
+        Validate();
+        if (ReadOnly || value == null || value.Length > 2048 || !IsEnabled)
+            throw new InvalidOperationException("Input refused.");
+        UIntPtr result;
+        if (K5WitnessNative.WriteMessage(Handle, 0x000C, UIntPtr.Zero, value, 2, 2000, out result) == IntPtr.Zero ||
+            result == UIntPtr.Zero) throw new InvalidOperationException("Input failed.");
+    }
+    public void Invoke() {
+        Validate();
+        if (!IsEnabled) throw new InvalidOperationException("Button disabled.");
+        K5WitnessNative.SetForegroundWindow(Root);
+        UIntPtr result;
+        if (K5WitnessNative.ClickMessage(Handle, 0x00F5, UIntPtr.Zero, IntPtr.Zero, 2, 5000, out result) == IntPtr.Zero)
+            throw new InvalidOperationException("Button invocation timed out.");
+    }
 }
+public sealed class K5WitnessControls {
+    public K5WitnessControl Input, Status, Button;
+}
+public static class K5WitnessNative {
+    public delegate bool ChildCallback(IntPtr handle, IntPtr parameter);
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, ChildCallback callback, IntPtr parameter);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr handle, out uint process);
+    [DllImport("user32.dll")] public static extern bool IsChild(IntPtr parent, IntPtr child);
+    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr handle);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr handle);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr handle, StringBuilder name, int count);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongW")] public static extern int GetStyle(IntPtr handle, int index);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode)]
+    public static extern IntPtr ReadMessage(IntPtr handle, uint message, UIntPtr count, StringBuilder text, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode)]
+    public static extern IntPtr WriteMessage(IntPtr handle, uint message, UIntPtr count, string text, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW")]
+    public static extern IntPtr ClickMessage(IntPtr handle, uint message, UIntPtr count, IntPtr value, uint flags, uint timeout, out UIntPtr result);
+    public static K5WitnessControls Discover(IntPtr root, uint pid) {
+        uint owner;
+        GetWindowThreadProcessId(root, out owner);
+        if (owner != pid) throw new InvalidOperationException("Window identity mismatch.");
+        var handles = new List<IntPtr>();
+        ChildCallback collect = delegate(IntPtr h, IntPtr p) { handles.Add(h); return true; };
+        EnumChildWindows(root, collect, IntPtr.Zero);
+        GC.KeepAlive(collect);
+        var controls = new K5WitnessControls();
+        int inputs = 0, statuses = 0, buttons = 0;
+        foreach (IntPtr handle in handles) {
+            GetWindowThreadProcessId(handle, out owner);
+            if (owner != pid || !IsChild(root, handle)) continue;
+            var className = new StringBuilder(256);
+            GetClassName(handle, className, className.Capacity);
+            string kind = className.ToString().ToUpperInvariant();
+            var control = new K5WitnessControl { Handle=handle, Root=root, Pid=pid };
+            if (kind.Contains(".EDIT.") || kind == "EDIT") {
+                control.ReadOnly = (GetStyle(handle, -16) & 0x0800) != 0;
+                if (control.ReadOnly) { statuses++; controls.Status = control; }
+                else { inputs++; controls.Input = control; }
+            } else if ((kind.Contains(".BUTTON.") || kind == "BUTTON") && control.Read() == "Run test") {
+                buttons++; controls.Button = control;
+            }
+        }
+        if (inputs != 1 || statuses != 1 || buttons != 1)
+            throw new InvalidOperationException("Native control discovery failed.");
+        return controls;
+    }
+}
+'@
+Add-Type -TypeDefinition $nativeControls
+function Read-K5ControlText($Element) { return [string]$Element.Read() }
 function Get-K5GuiControls($Process) {
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     do {
@@ -45,31 +125,11 @@ function Get-K5GuiControls($Process) {
     if ($Process.HasExited -or $Process.MainWindowHandle -eq [IntPtr]::Zero) {
         throw 'Owned GUI did not open.'
     }
-    $window = [System.Windows.Automation.AutomationElement]::FromHandle($Process.MainWindowHandle)
-    if ($window.Current.ProcessId -ne $Process.Id) { throw 'GUI process identity mismatch.' }
-    $condition = New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::NameProperty, 'Run test')
-    $button = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-    if ($null -eq $button) { throw 'Run action unavailable.' }
-    $all = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-        [System.Windows.Automation.Condition]::TrueCondition)
-    $sourcePattern = $null
-    $status = $null
-    foreach ($element in $all) {
-        # Multiline WinForms edit controls expose TextPattern on some Windows
-        # versions, rather than ValuePattern. Neither is assumed unconditionally.
-        if ((Read-K5ControlText $element).Contains('Ready. Recording is disabled for these tests.')) {
-            $status = $element
-        }
-        $pattern = $null
-        if ($element.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit -and
-            $element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern) -and
-            -not $pattern.Current.IsReadOnly) {
-            $sourcePattern = $pattern
-        }
+    $controls = [K5WitnessNative]::Discover($Process.MainWindowHandle, [uint32]$Process.Id)
+    if (-not $controls.Status.Read().Contains('Ready. Recording is disabled for these tests.')) {
+        throw 'Fresh GUI status mismatch.'
     }
-    if ($null -eq $status -or $null -eq $sourcePattern) { throw 'GUI controls unavailable.' }
-    return @{ Button = $button; Input = $sourcePattern; Status = $status }
+    return $controls
 }
 function Request-K5Publisher([string]$Path, $Payload = $null) {
     $headers = @{ Accept = 'application/json'; Origin = 'https://rtsplink.com' }
@@ -122,8 +182,7 @@ internal static class WitnessFixture {
         $gui = Start-Process -FilePath $fixture -PassThru
         $controls = Get-K5GuiControls $gui
         $controls.Input.SetValue('fixture-only')
-        $invoke = $controls.Button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-        $invoke.Invoke()
+        $controls.Button.Invoke()
         $deadline = [DateTime]::UtcNow.AddSeconds(5)
         do {
             Start-Sleep -Milliseconds 100
@@ -170,12 +229,11 @@ internal static class WitnessFixture {
         $gui = Start-Process -FilePath (Join-Path $root 'K5VisionAlpha.exe') -PassThru
         $stage = 'gui-controls'
         $controls = Get-K5GuiControls $gui
-        if (-not $controls.Button.Current.IsEnabled) { throw 'Installed action disabled.' }
+        if (-not $controls.Button.IsEnabled) { throw 'Installed action disabled.' }
         $controls.Input.SetValue($source)
         $source = ''
         $stage = 'gui-invoke'
-        $invoke = $controls.Button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-        $invoke.Invoke()
+        $controls.Button.Invoke()
         $stage = 'runtime-receipt'
         $expected = 'Synthetic video-only smoke passed; public RTSP analytics NOT qualified.'
         if ($Mode -ceq 'public') {
