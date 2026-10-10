@@ -56,6 +56,13 @@ namespace K5VisionAlpha
             statusBox.ScrollBars = ScrollBars.Vertical;
             statusBox.Text = "Ready. Recording is disabled for these tests.";
             Controls.AddRange(new Control[] { title, explanation, label, sourceBox, runButton, statusBox });
+            int missing = MissingRuntimeComponent(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location));
+            if (missing != 0)
+            {
+                statusBox.Text = "Installation needs repair: " + MissingRuntimeDescription(missing) +
+                    ". Reinstall K5 Vision Alpha (check " + missing + ").";
+                runButton.Enabled = false;
+            }
             FormClosing += OnClosing;
         }
 
@@ -118,6 +125,14 @@ namespace K5VisionAlpha
             }
 
             string root = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+            int missing = MissingRuntimeComponent(root);
+            if (missing != 0)
+            {
+                MessageBox.Show(this, "Installation needs repair: " + MissingRuntimeDescription(missing) +
+                    ". Reinstall K5 Vision Alpha (check " + missing + ").",
+                    "Install repair required", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
             string launcher = Path.Combine(root, "Start-K5VisionAlpha.ps1");
             if (!File.Exists(launcher))
             {
@@ -242,22 +257,45 @@ namespace K5VisionAlpha
             }
         }
 
+        // Fixed component codes are safe for CI and the owner GUI. They never
+        // expose source URIs, private files, installed paths or credentials.
+        private static int MissingRuntimeComponent(string root)
+        {
+            if (!File.Exists(Path.Combine(root, @"python312\python.exe"))) return 3;
+            if (!File.Exists(Path.Combine(root, @".venv\Scripts\python.exe"))) return 4;
+            if (!File.Exists(Path.Combine(root, "Start-K5VisionAlpha.ps1"))) return 5;
+            if (!File.Exists(Path.Combine(root, "k5-revision.txt"))) return 6;
+            if (!File.Exists(Path.Combine(root, "analytics-config.json"))) return 7;
+            if (!File.Exists(Path.Combine(root, @"analytics-models\person-detection-retail-0013\FP16\person-detection-retail-0013.xml"))) return 8;
+            if (!File.Exists(Path.Combine(root, @"analytics-models\human-pose-estimation-0001\FP16\human-pose-estimation-0001.bin"))) return 9;
+            string gst = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                @"K5RunnerTools\k5-gstreamer\1.28.7\msvc_x86_64\bin\gst-launch-1.0.exe");
+            if (!File.Exists(gst)) return 10;
+            return 0;
+        }
+
+        private static string MissingRuntimeDescription(int code)
+        {
+            switch (code)
+            {
+                case 3: return "private Python runtime";
+                case 4: return "private K5 application environment";
+                case 5: return "application launcher";
+                case 6: return "exact revision identity";
+                case 7: return "analytics configuration";
+                case 8: return "person-detection model asset";
+                case 9: return "pose-estimation model asset";
+                case 10: return "GStreamer video runtime";
+                default: return "unknown runtime prerequisite";
+            }
+        }
+
         [STAThread]
         private static int Main(string[] args)
         {
             if (args.Length == 1 && args[0] == "--self-check")
             {
-                string root = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
-                string gst = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    @"K5RunnerTools\k5-gstreamer\1.28.7\msvc_x86_64\bin\gst-launch-1.0.exe");
-                return File.Exists(Path.Combine(root, @"python312\python.exe")) &&
-                    File.Exists(Path.Combine(root, @".venv\Scripts\python.exe")) &&
-                    File.Exists(Path.Combine(root, "Start-K5VisionAlpha.ps1")) &&
-                    File.Exists(Path.Combine(root, "k5-revision.txt")) &&
-                    File.Exists(Path.Combine(root, "analytics-config.json")) &&
-                    File.Exists(Path.Combine(root, @"analytics-models\person-detection-retail-0013\FP16\person-detection-retail-0013.xml")) &&
-                    File.Exists(Path.Combine(root, @"analytics-models\human-pose-estimation-0001\FP16\human-pose-estimation-0001.bin")) &&
-                    File.Exists(gst) ? 0 : 3;
+                return MissingRuntimeComponent(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location));
             }
             if (args.Length != 0) return 2;
             Application.EnableVisualStyles();
