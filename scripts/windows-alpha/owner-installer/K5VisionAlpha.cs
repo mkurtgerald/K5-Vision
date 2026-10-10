@@ -66,6 +66,19 @@ namespace K5VisionAlpha
             FormClosing += OnClosing;
         }
 
+        private static void ConfigureAnalyticsForTest(ProcessStartInfo info, string root, bool publicSource)
+        {
+            // Alter only the child environment. An inherited owner setting must not
+            // enable analytics for generated test patterns or replace the public-test
+            // package selection. Missing/invalid public config still fails preflight.
+            info.EnvironmentVariables.Remove("K5_ANALYTICS_CONFIG");
+            if (publicSource)
+            {
+                string installedAnalyticsConfig = Path.Combine(root, "analytics-config.json");
+                info.EnvironmentVariables["K5_ANALYTICS_CONFIG"] = installedAnalyticsConfig;
+            }
+        }
+
         private static string Quote(string value)
         {
             // Windows argv escaping: double backslashes only when adjacent
@@ -153,11 +166,9 @@ namespace K5VisionAlpha
             info.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + Quote(launcher) +
                 " -ExitAfterPublicTest" + (source.Length == 0 ? "" : " -PublicRtspSource " + Quote(source));
             info.WorkingDirectory = root;
-            // The installed GUI selects the packaged, locally verified analytics config.
-            // No owner environment edits or separate command-line setup are required.
-            string installedAnalyticsConfig = Path.Combine(root, "analytics-config.json");
-            if (File.Exists(installedAnalyticsConfig))
-                info.EnvironmentVariables["K5_ANALYTICS_CONFIG"] = installedAnalyticsConfig;
+            // Synthetic video is an explicitly video-only smoke, never person-detection
+            // evidence. Public tests always select the packaged verified analytics config.
+            ConfigureAnalyticsForTest(info, root, source.Length != 0);
 
             info.UseShellExecute = false;
             info.CreateNoWindow = true;
@@ -174,7 +185,15 @@ namespace K5VisionAlpha
                 string line = e.Data;
                 // Fixed-status projection only; never display the raw URI, credentials or log.
                 if (line == "K5 analytics disabled; video-only alpha acceptance selected.")
-                { failure = "Analytics is not provisioned or configured. This installer cannot pass Stage-One acceptance."; Status(failure); }
+                {
+                    if (source.Length == 0)
+                        Status("Synthetic video-only mode selected; public RTSP analytics remains unqualified.");
+                    else
+                    {
+                        failure = "Analytics is not provisioned or configured. This installer cannot pass Stage-One acceptance.";
+                        Status(failure);
+                    }
+                }
                 if (line == "K5 Vision Alpha health check PASS.") { healthEvidence = true; Status("K5 local service health passed."); }
                 Match a = Regex.Match(line, @"^K5 analytics PASS: submissions=([1-9][0-9]*), completions=([1-9][0-9]*), failures=0$");
                 long submitted, completed;
