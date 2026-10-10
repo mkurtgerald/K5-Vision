@@ -102,3 +102,16 @@ def test_bundle_rejects_unreviewed_model_path(tmp_path, monkeypatch):
     manifest.write_text(json.dumps(record), encoding="utf-8")
     with pytest.raises(ValueError):
         bundle.validate(root)
+
+
+def test_bundle_rejects_linked_model_ancestor(tmp_path, monkeypatch):
+    root = make_bundle(tmp_path, monkeypatch)
+    original = root / "models/example"
+    relocated = tmp_path / "external-example"
+    original.rename(relocated)
+    try:
+        original.symlink_to(relocated, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Creating directory links is unavailable on this host")
+    with pytest.raises(ValueError):
+        bundle.validate(root)
