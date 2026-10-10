@@ -42,9 +42,10 @@ def _unique(items):
 
 
 def _regular(path: Path) -> None:
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
-        raise ValueError("Analytics payload contains a link")
+    for current in (path, *path.parents):
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError("Analytics payload contains a link or reparse ancestor")
     if not path.is_file():
         raise ValueError("Analytics payload entry must be a file")
 
