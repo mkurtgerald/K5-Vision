@@ -99,7 +99,13 @@ begin
     '|gstreamer|wheel-build-base|wheel-build-k5|wheel-copy-analytics|' +
     'wheel-hashes|stage-venv|stage-runtime|stage-preflight|shortcut|' +
     'verify-wheels|activation-prepare|activation-venv|activation-runtime|' +
-    'activation-preflight|commit|complete|') > 0 then
+    'activation-preflight|commit|complete|' +
+    'stage-venv-create|activation-venv-create|' +
+    'stage-pip-install|activation-pip-install|' +
+    'stage-pip-check|activation-pip-check|' +
+    'stage-cli|activation-cli|stage-probe|activation-probe|' +
+    'stage-model-copy|activation-model-copy|' +
+    'stage-analytics-preflight|activation-analytics-preflight|') > 0 then
     Result := Stage;
 end;
 
