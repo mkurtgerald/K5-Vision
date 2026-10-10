@@ -152,6 +152,8 @@ namespace K5VisionAlpha
                 if (String.IsNullOrWhiteSpace(e.Data)) return;
                 string line = e.Data;
                 // Fixed-status projection only; never display the raw URI, credentials or log.
+                if (line == "K5 analytics disabled; video-only alpha acceptance selected.")
+                { failure = "Analytics is not provisioned or configured. This installer cannot pass Stage-One acceptance."; Status(failure); }
                 if (line == "K5 Vision Alpha health check PASS.") { healthEvidence = true; Status("K5 local service health passed."); }
                 Match a = Regex.Match(line, @"^K5 analytics PASS: submissions=([1-9][0-9]*), completions=([1-9][0-9]*), failures=0$");
                 long submitted, completed;
