@@ -62,6 +62,22 @@ Type: files; Name: "{app}\k5-revision.txt"
 Type: files; Name: "{app}\gstreamer-version.txt"
 
 [Code]
+var
+  K5PostInstallEntered: Boolean;
+  K5PostInstallVerified: Boolean;
+
+function GetCustomSetupExitCode: Integer;
+begin
+  { Even if a suppressed post-install error would otherwise return success,
+    never advertise an owner-installable runtime without positive verification. }
+  if not K5PostInstallEntered then
+    Result := 41
+  else if not K5PostInstallVerified then
+    Result := 42
+  else
+    Result := 0;
+end;
+
 function Q(Value: String): String;
 begin
   Result := '"' + Value + '"';
@@ -84,6 +100,7 @@ var
 begin
   if CurStep <> ssPostInstall then
     Exit;
+  K5PostInstallEntered := True;
   AppRoot := ExpandConstant('{app}');
   PythonRoot := AppRoot + '\python312';
   PythonExe := PythonRoot + '\python.exe';
@@ -118,4 +135,5 @@ begin
     Component codes disclose no local source, credential, or media data. }
   RunOrFail(AppRoot + '\K5VisionAlpha.exe', '--self-check',
     'installed graphical runtime verification');
+  K5PostInstallVerified := True;
 end;
