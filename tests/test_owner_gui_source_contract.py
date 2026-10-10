@@ -107,19 +107,22 @@ internal static class OwnerModeProbe
         {
             Environment.SetEnvironmentVariable("K5_ANALYTICS_CONFIG", "untrusted-inherited-config");
             Type launcher = typeof(OwnerModeProbe).Assembly.GetType("K5VisionAlpha.Launcher");
-            MethodInfo select = launcher.GetMethod("ConfigureAnalyticsForTest", BindingFlags.NonPublic | BindingFlags.Static);
+            MethodInfo select = launcher.GetMethod("ConfigureAnalyticsForTest",
+                BindingFlags.NonPublic | BindingFlags.Static);
             if (select == null) return 10;
             string root = Path.Combine(Path.GetTempPath(), "K5 fixture root with spaces");
             var child = new ProcessStartInfo();
             select.Invoke(null, new object[] { child, root, false });
             if (child.EnvironmentVariables.ContainsKey("K5_ANALYTICS_CONFIG")) return 11;
             select.Invoke(null, new object[] { child, root, true });
-            if (child.EnvironmentVariables["K5_ANALYTICS_CONFIG"] != Path.Combine(root, "analytics-config.json")) return 12;
+            if (child.EnvironmentVariables["K5_ANALYTICS_CONFIG"] !=
+                Path.Combine(root, "analytics-config.json")) return 12;
             // Missing public config must still be selected, so installed preflight
             // fails closed rather than silently accepting video-only output.
             select.Invoke(null, new object[] { child, root, false });
             if (child.EnvironmentVariables.ContainsKey("K5_ANALYTICS_CONFIG")) return 13;
-            if (Environment.GetEnvironmentVariable("K5_ANALYTICS_CONFIG") != "untrusted-inherited-config") return 14;
+            if (Environment.GetEnvironmentVariable("K5_ANALYTICS_CONFIG") !=
+                "untrusted-inherited-config") return 14;
             Console.WriteLine("K5_OWNER_ANALYTICS_MODE_CONTRACT=passed");
             return 0;
         }
@@ -150,9 +153,7 @@ internal static class OwnerModeProbe
                 check=False,
             )
             self.assertEqual(compiled.returncode, 0, "Owner GUI mode probe compilation failed")
-            result = subprocess.run(
-                [str(executable)], capture_output=True, timeout=30, check=False
-            )
+            result = subprocess.run([str(executable)], capture_output=True, timeout=30, check=False)
             self.assertEqual(result.returncode, 0, "Owner GUI child mode isolation failed")
             self.assertEqual(result.stdout.strip(), b"K5_OWNER_ANALYTICS_MODE_CONTRACT=passed")
 
