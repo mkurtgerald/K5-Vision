@@ -7,10 +7,7 @@ from pathlib import Path
 
 import pytest
 
-SOURCE = (
-    Path(__file__).resolve().parents[1]
-    / "scripts/windows-alpha/owner_analytics_bundle.py"
-)
+SOURCE = Path(__file__).resolve().parents[1] / "scripts/windows-alpha/owner_analytics_bundle.py"
 SPEC = importlib.util.spec_from_file_location("owner_analytics_bundle", SOURCE)
 assert SPEC is not None and SPEC.loader is not None
 bundle = importlib.util.module_from_spec(SPEC)
