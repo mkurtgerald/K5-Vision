@@ -55,6 +55,12 @@ class OwnerGuiContract(unittest.TestCase):
         )
         self.assertNotIn("bool full = video && analyticsEvidence && boxesEvidence;", source)
 
+    def test_gui_explains_missing_analytics_to_owner(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertIn("K5 analytics disabled; video-only alpha acceptance selected.", source)
+        self.assertIn("Analytics is not provisioned or configured.", source)
+        self.assertIn("Status(failure);", source)
+
     def test_windows_hosted_compiler_is_mandatory_for_gui_changes(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("scripts/windows-alpha/**", workflow)
