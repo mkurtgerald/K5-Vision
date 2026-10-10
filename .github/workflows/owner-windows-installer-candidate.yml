@@ -127,6 +127,22 @@ jobs:
           $root = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha'
           $gui = Join-Path $root 'K5VisionAlpha.exe'
           if (-not (Test-Path -LiteralPath $gui)) { throw 'GUI missing after install.' }
+          # Source-free inventory: fixed labels and boolean presence only,
+          # never owner paths, source URIs, credentials, logs or file contents.
+          $requirements = [ordered]@{
+            private_python = (Join-Path $root 'python312\python.exe')
+            venv_directory = (Join-Path $root '.venv')
+            venv_scripts = (Join-Path $root '.venv\Scripts')
+            venv_python = (Join-Path $root '.venv\Scripts\python.exe')
+            launcher = (Join-Path $root 'Start-K5VisionAlpha.ps1')
+            revision = (Join-Path $root 'k5-revision.txt')
+            analytics_config = (Join-Path $root 'analytics-config.json')
+            model_directory = (Join-Path $root 'analytics-models')
+          }
+          foreach ($entry in $requirements.GetEnumerator()) {
+            Write-Host ('K5_OWNER_COMPONENT_' + $entry.Key + '=' +
+              [int][bool](Test-Path -LiteralPath $entry.Value))
+          }
           $probe = Start-Process -FilePath $gui -ArgumentList '--self-check' -PassThru -Wait -WindowStyle Hidden -ErrorAction Stop
           if ($probe.ExitCode -ne 0) {
             # Safe opaque component IDs, not paths or any runtime/owner source data.
