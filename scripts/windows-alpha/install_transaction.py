@@ -956,10 +956,29 @@ class Installer:
         if self.offline is not None:
             self.offline.verify_scripts(destination)
 
+    def owner_install_stage(self, stage: str) -> None:
+        """Bounded owner-installer stage only, never source/error/path content."""
+        if self.analytics_module is None:
+            return
+        allowed = {
+            "gstreamer", "wheel-build-base", "wheel-build-k5",
+            "wheel-copy-analytics", "wheel-hashes", "stage-venv",
+            "stage-runtime", "stage-preflight", "shortcut",
+            "verify-wheels", "activation-prepare", "activation-venv",
+            "activation-runtime", "activation-preflight", "commit",
+            "complete",
+        }
+        if stage not in allowed:
+            raise RuntimeError("Unexpected owner installer diagnostic stage.")
+        marker = self.source.parent / "owner-install-stage.txt"
+        _plain_ancestors(marker)
+        marker.write_text(stage + "\n", encoding="ascii")
+
     def prepare_wheels(self) -> None:
         if self.offline is not None:
             self.offline.copy_to(self.wheels)
             return
+        self.owner_install_stage("wheel-build-base")
         bootstrap = self.work / "builder"
         self.command([sys.executable, "-m", "venv", bootstrap])
         python = bootstrap / "Scripts" / "python.exe"
@@ -977,6 +996,7 @@ class Installer:
                 "pip",
             ]
         )
+        self.owner_install_stage("wheel-build-k5")
         package_uri = f"https://github.com/mkurtgerald/K5-Vision/archive/{self.revision}.zip"
         self.command(
             [python, "-m", "pip", "wheel", "--no-deps", "--wheel-dir", self.wheels, package_uri]
@@ -984,6 +1004,7 @@ class Installer:
         if len(list(self.wheels.glob("k5_vision-*.whl"))) != 1:
             raise RuntimeError("Expected exactly one reviewed K5 wheel.")
         if self.analytics_module is not None:
+            self.owner_install_stage("wheel-copy-analytics")
             approved_wheels, _ = self.analytics_module.validate(self.analytics_bundle)
             for wheel in approved_wheels:
                 target = self.wheels / wheel.name
@@ -1009,6 +1030,8 @@ class Installer:
     def install_runtime(self, destination: Path) -> None:
         if self.offline is not None:
             self.offline.verify_wheels(self.wheels)
+        if self.analytics_module is not None:
+            self.owner_install_stage("stage-venv" if destination == self.stage else "activation-venv")
         destination.mkdir(exist_ok=True)
         venv = destination / ".venv"
         isolated = ["-I", "-B"] if self.offline is not None else []
@@ -1062,9 +1085,11 @@ class Installer:
                     configuration,
                 ]
             )
+        self.owner_install_stage("stage-runtime" if destination == self.stage else "activation-runtime")
         self.materialize_files(destination)
 
     def preflight(self, destination: Path) -> None:
+        self.owner_install_stage("stage-preflight" if destination == self.stage else "activation-preflight")
         self.command(
             [
                 self.host,
@@ -1110,6 +1135,7 @@ class Installer:
                 self.backup.mkdir()
                 # Never change the shared GStreamer runtime during an upgrade.
                 # A missing/different requested version fails candidate preflight.
+                self.owner_install_stage("gstreamer")
                 if self.offline is None and not any(
                     (self.root / name).exists() for name in MANAGED
                 ):
@@ -1127,14 +1153,17 @@ class Installer:
                         ]
                     )
                 self.prepare_wheels()
+                self.owner_install_stage("wheel-hashes")
                 hashes = self.wheel_hashes()
                 self.install_runtime(self.stage)
                 self.preflight(self.stage)
                 if not skip_shortcut:
                     if self.shortcut is None:
                         raise RuntimeError("Desktop shortcut path is unavailable.")
+                    self.owner_install_stage("shortcut")
                     self.stage_shortcut()
                     state["shortcut"] = str(self.shortcut)
+                self.owner_install_stage("verify-wheels")
                 if not hashes or self.wheel_hashes() != hashes:
                     raise RuntimeError("Staged runtime wheels changed during verification.")
                 targets = self.targets(state)
@@ -1142,6 +1171,7 @@ class Installer:
                     _plain_ancestors(target)
                 self.assert_idle()
                 state["originals"] = {name: target.exists() for name, target in targets.items()}
+                self.owner_install_stage("activation-prepare")
                 state["phase"] = "activating"
                 self.save(state)
                 for name, target in targets.items():
@@ -1159,6 +1189,7 @@ class Installer:
                 self.preflight(self.root)
                 if not skip_shortcut:
                     shutil.copyfile(self.stage / "desktop-shortcut.lnk", self.shortcut)
+                self.owner_install_stage("commit")
                 state["phase"] = "committed"
                 self.save(state)
             except BaseException as failure:
@@ -1172,6 +1203,7 @@ class Installer:
                         f"upgrade workspace. Recovery error: {recovery_failure}"
                     ) from failure
                 raise
+            self.owner_install_stage("complete")
             # A cleanup failure must not turn a committed, verified upgrade into rollback.
             try:
                 self.recover()
