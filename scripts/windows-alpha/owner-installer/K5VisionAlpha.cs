@@ -138,6 +138,12 @@ namespace K5VisionAlpha
             info.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + Quote(launcher) +
                 " -ExitAfterPublicTest" + (source.Length == 0 ? "" : " -PublicRtspSource " + Quote(source));
             info.WorkingDirectory = root;
+            // The installed GUI selects the packaged, locally verified analytics config.
+            // No owner environment edits or separate command-line setup are required.
+            string installedAnalyticsConfig = Path.Combine(root, "analytics-config.json");
+            if (File.Exists(installedAnalyticsConfig))
+                info.EnvironmentVariables["K5_ANALYTICS_CONFIG"] = installedAnalyticsConfig;
+
             info.UseShellExecute = false;
             info.CreateNoWindow = true;
             info.WindowStyle = ProcessWindowStyle.Hidden;
