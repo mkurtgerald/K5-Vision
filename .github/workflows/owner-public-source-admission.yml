@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Validate anonymous issue and revocation without acquiring media
+      - name: Review documented anonymous session initialization without acquiring media
         shell: python
         run: |
           import http.cookiejar
@@ -23,26 +23,33 @@ jobs:
           class NoRedirect(urllib.request.HTTPRedirectHandler):
               def redirect_request(self, *args, **kwargs):
                   return None
-          opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+          cookies = http.cookiejar.CookieJar()
+          opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPCookieProcessor(cookies))
           csrf = None
           issued = False
           failed = False
-          stage = 'session'
-          def request(path, payload=None):
-              headers = {'User-Agent':'K5-Engineering-TestSourceReview/1.0', 'Accept':'application/json', 'Origin':'https://rtsplink.com'}
+          stage = 'homepage'
+          def request(path, payload=None, document=False):
+              headers = {'User-Agent':'K5-Engineering-TestSourceReview/1.0', 'Accept':'text/html' if document else 'application/json', 'Origin':'https://rtsplink.com'}
               data = None
               if payload is not None:
                   data = json.dumps(payload).encode()
                   headers.update({'Content-Type':'application/json','X-CSRF-Token':csrf})
               req = urllib.request.Request('https://rtsplink.com'+path, data=data, headers=headers)
               with opener.open(req, timeout=15) as response:
-                  raw = response.read(262145)
-                  if len(raw) > 262144:
+                  raw = response.read(524289)
+                  if len(raw) > 524288:
                       raise ValueError('Response exceeds bound')
-                  return json.loads(raw)
+                  return None if document else json.loads(raw)
           try:
+              # Follow the documented browser entry before requesting its anonymous
+              # session. No account/authentication endpoint or access-control bypass.
+              request('/', document=True)
+              print('K5_PUBLISHER_HOMEPAGE_COOKIE_COUNT=' + str(len(cookies)))
+              stage = 'session'
               session = request('/api/v1/session/active')
               csrf, nonce = session.get('csrfToken'), session.get('nonce')
+              print('K5_PUBLISHER_SESSION_COOKIE_COUNT=' + str(len(cookies)))
               assert isinstance(csrf,str) and isinstance(nonce,str) and csrf and nonce
               stage = 'catalog'
               catalog = request('/api/v1/streams/catalog')
@@ -53,13 +60,8 @@ jobs:
               source = token.get('rtspUrl')
               assert isinstance(source,str) and len(source) <= 2048
               uri = urllib.parse.urlsplit(source)
-              scheme_ok = uri.scheme == 'rtsp'
-              host_ok = uri.hostname == 'rtsp.rtsplink.com'
-              credential_free = uri.username is None and uri.password is None and not uri.fragment
-              print('K5_PUBLISHER_ISSUED_SCHEME_OK=' + str(scheme_ok).lower())
-              print('K5_PUBLISHER_ISSUED_HOST_OK=' + str(host_ok).lower())
-              print('K5_PUBLISHER_CREDENTIAL_FREE=' + str(credential_free).lower())
-              assert scheme_ok and host_ok and credential_free
+              assert uri.scheme == 'rtsp' and uri.hostname == 'rtsp.rtsplink.com'
+              assert uri.username is None and uri.password is None and not uri.fragment
               print('K5_PUBLISHER_PUBLIC_TOKEN=verified_transiently')
           except urllib.error.HTTPError as error:
               failed = True
@@ -67,9 +69,10 @@ jobs:
               print('K5_PUBLISHER_HTTP_STATUS=' + str(int(error.code)))
               try:
                   body = json.loads(error.read(4096))
-                  code = body.get('code')
-                  allowed = {'SECURITY_VALIDATION_FAILED','RATE_LIMITED','RATE_LIMIT_EXCEEDED','UPGRADE_REQUIRED','VALIDATION_ERROR','INVALID_QUALITY'}
-                  print('K5_PUBLISHER_ERROR_CODE=' + (code if code in allowed else 'unclassified'))
+                  detail = json.dumps(body).lower()
+                  # Only fixed booleans leave this fresh anonymous-session probe.
+                  for category in ('session','csrf','nonce','authentication','login','quality','expired','unauthorized'):
+                      print('K5_PUBLISHER_ERROR_' + category.upper() + '=' + str(category in detail).lower())
               except Exception:
                   print('K5_PUBLISHER_ERROR_CODE=unclassified')
           except Exception:
