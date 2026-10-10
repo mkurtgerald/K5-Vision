@@ -967,6 +967,13 @@ class Installer:
             "verify-wheels", "activation-prepare", "activation-venv",
             "activation-runtime", "activation-preflight", "commit",
             "complete",
+            "stage-venv-create", "activation-venv-create",
+            "stage-pip-install", "activation-pip-install",
+            "stage-pip-check", "activation-pip-check",
+            "stage-cli", "activation-cli",
+            "stage-probe", "activation-probe",
+            "stage-model-copy", "activation-model-copy",
+            "stage-analytics-preflight", "activation-analytics-preflight",
         }
         if stage not in allowed:
             raise RuntimeError("Unexpected owner installer diagnostic stage.")
@@ -1030,14 +1037,17 @@ class Installer:
     def install_runtime(self, destination: Path) -> None:
         if self.offline is not None:
             self.offline.verify_wheels(self.wheels)
+        phase = "stage" if destination == self.stage else "activation"
         if self.analytics_module is not None:
-            self.owner_install_stage("stage-venv" if destination == self.stage else "activation-venv")
+            self.owner_install_stage(f"{phase}-venv")
         destination.mkdir(exist_ok=True)
         venv = destination / ".venv"
         isolated = ["-I", "-B"] if self.offline is not None else []
         bootstrap = ["-I", "-S", "-B"] if self.offline is not None else []
+        self.owner_install_stage(f"{phase}-venv-create")
         self.command([sys.executable, *bootstrap, "-m", "venv", venv])
         python = venv / "Scripts" / "python.exe"
+        self.owner_install_stage(f"{phase}-pip-install")
         self.command(
             [
                 python,
@@ -1051,6 +1061,7 @@ class Installer:
                 *sorted(self.wheels.glob("*.whl")),
             ]
         )
+        self.owner_install_stage(f"{phase}-pip-check")
         self.command([python, *isolated, "-m", "pip", "check"])
         if self.offline is not None:
             # Check the complete installed closure; the resolver is never used.
@@ -1068,11 +1079,15 @@ class Installer:
                     "'Installed wheel closure mismatch'",
                 ]
             )
+        self.owner_install_stage(f"{phase}-cli")
         self.command([python, *isolated, "-m", "k5vision.cli", "--version"])
+        self.owner_install_stage(f"{phase}-probe")
         self.command([python, *isolated, "-c", RUNTIME_PROBE])
         if self.analytics_module is not None:
+            self.owner_install_stage(f"{phase}-model-copy")
             self.analytics_module.materialize_models(self.analytics_bundle, destination)
             configuration = destination / "analytics-config.json"
+            self.owner_install_stage(f"{phase}-analytics-preflight")
             self.command(
                 [
                     python,
@@ -1085,7 +1100,7 @@ class Installer:
                     configuration,
                 ]
             )
-        self.owner_install_stage("stage-runtime" if destination == self.stage else "activation-runtime")
+        self.owner_install_stage(f"{phase}-runtime")
         self.materialize_files(destination)
 
     def preflight(self, destination: Path) -> None:
