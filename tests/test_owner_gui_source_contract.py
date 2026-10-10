@@ -65,7 +65,9 @@ class OwnerGuiContract(unittest.TestCase):
         source = SOURCE.read_text(encoding="utf-8")
         self.assertIn('Path.Combine(root, "analytics-config.json")', source)
         self.assertIn('if (File.Exists(installedAnalyticsConfig))', source)
-        self.assertIn('info.EnvironmentVariables["K5_ANALYTICS_CONFIG"] = installedAnalyticsConfig;', source)
+        self.assertIn(
+            'info.EnvironmentVariables["K5_ANALYTICS_CONFIG"] = installedAnalyticsConfig;', source
+        )
 
     def test_windows_hosted_compiler_is_mandatory_for_gui_changes(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
