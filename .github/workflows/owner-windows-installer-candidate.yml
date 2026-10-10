@@ -129,6 +129,23 @@ jobs:
           if (-not (Test-Path -LiteralPath $gui)) { throw 'GUI missing after install.' }
           $probe = Start-Process -FilePath $gui -ArgumentList '--self-check' -PassThru -Wait -WindowStyle Hidden -ErrorAction Stop
           if ($probe.ExitCode -ne 0) { throw 'Installed GUI runtime self-check failed.' }
+          $installedPython = Join-Path $root '.venv\Scripts\python.exe'
+          $installedConfig = Join-Path $root 'analytics-config.json'
+          if (-not (Test-Path -LiteralPath $installedPython) -or -not (Test-Path -LiteralPath $installedConfig)) {
+            throw 'Installed owner analytics runtime is incomplete.'
+          }
+          $oldConfig = $env:K5_ANALYTICS_CONFIG
+          try {
+            $env:K5_ANALYTICS_CONFIG = $installedConfig
+            $analyticsStatus = (& $installedPython -I -B -m k5vision.cli analytics-preflight | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or $analyticsStatus -cne '{"schema_version":"1","analytics_enabled":true,"status":"ready"}') {
+              throw 'Installed analytics model and package admission failed.'
+            }
+          } finally {
+            if ($null -eq $oldConfig) { Remove-Item Env:K5_ANALYTICS_CONFIG -ErrorAction SilentlyContinue }
+            else { $env:K5_ANALYTICS_CONFIG = $oldConfig }
+          }
+          Write-Host 'K5_OWNER_SETUP_INSTALLED_ANALYTICS_PREFLIGHT=passed'
           if (-not (Test-Path -LiteralPath (Join-Path $root 'unins000.exe'))) { throw 'Windows uninstaller missing.' }
           $programs = Join-Path ([Environment]::GetFolderPath('Programs')) 'K5 Vision Alpha.lnk'
           if (-not (Test-Path -LiteralPath $programs)) { throw 'Start Menu shortcut missing.' }
