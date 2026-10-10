@@ -42,7 +42,7 @@ def verify_model(path: Path, size: int, sha384: str) -> None:
 
 
 def fetch_model(relative: str, size: int, sha384: str, root: Path) -> None:
-    if ".." in Path(relative).parts or re.fullmatch(r"[a-z0-9_./-]+", relative) is None:
+    if ".." in Path(relative).parts or re.fullmatch(r"[A-Za-z0-9_./-]+", relative) is None:
         raise RuntimeError("Unexpected model path")
     target = root / relative
     target.parent.mkdir(parents=True, exist_ok=True)

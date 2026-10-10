@@ -1,6 +1,7 @@
 """Offline, camera-free checks of the pinned owner Analytics bundle builder."""
 
 import hashlib
+import io
 import importlib.util
 from pathlib import Path
 
@@ -33,3 +34,18 @@ def test_model_integrity_refuses_wrong_hash_or_size(tmp_path):
 def test_model_path_traversal_fails_before_network(tmp_path):
     with pytest.raises(RuntimeError):
         bundle.fetch_model("../../private.txt", 1, "0" * 96, tmp_path)
+
+
+def test_pinned_fp16_model_path_builds_without_network(tmp_path, monkeypatch):
+    relative = bundle.MODELS[0][0]
+    assert "/FP16/" in relative
+    payload = b"synthetic validated model bytes"
+
+    def stub_urlopen(request, timeout):
+        assert request.full_url == bundle.MODEL_BASE + relative
+        assert timeout == 40
+        return io.BytesIO(payload)
+
+    monkeypatch.setattr(bundle.urllib.request, "urlopen", stub_urlopen)
+    bundle.fetch_model(relative, len(payload), hashlib.sha384(payload).hexdigest(), tmp_path)
+    assert (tmp_path / relative).read_bytes() == payload
