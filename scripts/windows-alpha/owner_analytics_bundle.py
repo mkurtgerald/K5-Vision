@@ -81,7 +81,7 @@ def validate(bundle: Path) -> tuple[tuple[Path, ...], tuple[tuple[str, Path], ..
         filename = item["filename"]
         size = item["size"]
         sha = item["sha256"]
-        if type(name) is not str or name in seen or name not in VERSIONS or item["version"] != VERSIONS[name] or type(filename) is not str or not re.fullmatch(r"[A-Za-z0-9_.+\\-]+\\.whl", filename) or type(size) is not int or not (0 < size <= 250000000) or type(sha) is not str or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        if type(name) is not str or name in seen or name not in VERSIONS or item["version"] != VERSIONS[name] or type(filename) is not str or not re.fullmatch(r"[A-Za-z0-9_.+-]+[.]whl", filename) or type(size) is not int or not (0 < size <= 250000000) or type(sha) is not str or not re.fullmatch(r"[0-9a-f]{64}", sha):
             raise ValueError("Analytics wheel pin mismatch")
         if filename.split("-")[0].replace("_", "-").lower() != name:
             raise ValueError("Analytics wheel distribution mismatch")
