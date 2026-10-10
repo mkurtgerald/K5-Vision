@@ -194,7 +194,7 @@ namespace K5VisionAlpha
                     BeginInvoke(new Action(delegate
                     {
                         bool video = result == 0 && healthEvidence && presentationEvidence && privacyEvidence;
-                        bool full = video && analyticsEvidence && boxesEvidence;
+                        bool full = source.Length > 0 && video && analyticsEvidence && boxesEvidence;
                         Status(full ? "Stage-One receipt passed: analytics, boxes and operator presentation confirmed." :
                             source.Length == 0 && video ? "Synthetic video-only smoke passed; public RTSP analytics NOT qualified." :
                             result == 0 ? "Stage-One NOT qualified: missing health, analytics, boxes, presentation or privacy evidence." :
