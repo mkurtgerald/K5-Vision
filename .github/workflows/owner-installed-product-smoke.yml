@@ -33,31 +33,35 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 35
     steps:
-      - name: Download exact retained lifecycle-passed setup
+      - name: Download exact repaired setup with independent byte identity
         shell: powershell
+        timeout-minutes: 3
         env:
           GH_READ_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
           $headers = @{ Authorization = "Bearer $env:GH_READ_TOKEN"; Accept = 'application/vnd.github+json' }
           $zip = Join-Path $env:RUNNER_TEMP 'retained-owner-setup.zip'
-          Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri 'https://api.github.com/repos/mkurtgerald/K5-Vision/actions/artifacts/11682351679/zip' -OutFile $zip
-          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'ca05bbb189ee0edd85ecdf96e4376e3eb37fcd23697ff4a57a0b01ed76b12b06') { throw 'Retained artifact identity mismatch.' }
+          Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Headers $headers -Uri 'https://api.github.com/repos/mkurtgerald/K5-Vision/actions/artifacts/11683221888/zip' -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne '4bfd043b2e7694e52a942712b7f25c41e49f20b2e0250cecebc7c476d8ce04ab') { throw 'Retained artifact identity mismatch.' }
           Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'retained-owner-setup')
-          $setup = Join-Path $env:RUNNER_TEMP 'retained-owner-setup\K5VisionAlpha-Setup-87cbde475d2fd523d7d11079f48978c0a8230c85.exe'
-          if ((Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'd12ca034a0eb83c73158b0ba4d380899aafdf1a15aa1a523cbe65ddf5d4ab760') { throw 'Retained executable identity mismatch.' }
-          Write-Host 'K5_PRODUCT_SETUP_IDENTITY=87cbde4_verified'
+          $setup = Join-Path $env:RUNNER_TEMP 'retained-owner-setup\K5VisionAlpha-Setup-887051738890ca2c0e34431bd707fe302654747e.exe'
+          if ((Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant() -cne '5d78b0e464fee40f482fed97ce31c66f4df457b87f023cd3bcaf5ec06d9c19fb') { throw 'Retained executable identity mismatch.' }
+          if ((Get-Item -LiteralPath $setup).Length -ne 163468532) { throw 'Retained executable size mismatch.' }
+          Write-Host 'K5_PRODUCT_SETUP_IDENTITY=8870517_verified'
       - name: Install exact executable without owner shell interaction
         shell: powershell
         timeout-minutes: 23
         run: |
           $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
           $root = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha'
           if (Test-Path -LiteralPath $root) { throw 'Fresh installed-product root required.' }
-          $setup = Join-Path $env:RUNNER_TEMP 'retained-owner-setup\K5VisionAlpha-Setup-87cbde475d2fd523d7d11079f48978c0a8230c85.exe'
+          $setup = Join-Path $env:RUNNER_TEMP 'retained-owner-setup\K5VisionAlpha-Setup-887051738890ca2c0e34431bd707fe302654747e.exe'
           $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait
           if ($p.ExitCode -ne 0) { throw 'Exact setup installation failed.' }
-          if (([IO.File]::ReadAllText((Join-Path $root 'k5-revision.txt'))).Trim() -cne '87cbde475d2fd523d7d11079f48978c0a8230c85') { throw 'Installed revision mismatch.' }
+          if (([IO.File]::ReadAllText((Join-Path $root 'k5-revision.txt'))).Trim() -cne '887051738890ca2c0e34431bd707fe302654747e') { throw 'Installed revision mismatch.' }
           Write-Host 'K5_PRODUCT_INSTALL=passed'
       - name: Invoke real GUI Run test and require installed operator presentation
         shell: powershell
@@ -109,6 +113,9 @@ jobs:
             elseif ($text.Contains('local K5 service did not')) { $diagnostic = 'service-health' }
             elseif ($text.Contains('missing health, analytics')) { $diagnostic = 'receipt-incomplete' }
             elseif ($text.Contains('Test did not pass:')) { $diagnostic = 'runtime-failed' }
+            Write-Host ('K5_PRODUCT_GUI_HEALTH=' + [int]$text.Contains('K5 local service health passed.'))
+            Write-Host ('K5_PRODUCT_GUI_PRESENTATION=' + [int]$text.Contains('Positive operator frames and presentations confirmed.'))
+            Write-Host ('K5_PRODUCT_GUI_PRIVACY=' + [int]$text.Contains('No test media was retained.'))
             if (-not $passed) { Write-Host "K5_PRODUCT_GUI_DIAGNOSTIC=$diagnostic"; throw 'Installed GUI operator smoke did not pass.' }
             Write-Host 'K5_PRODUCT_GUI_SYNTHETIC_OPERATOR=passed'
             Write-Host 'K5_PRODUCT_EXTERNAL_RTSP_ACCEPTANCE=not_tested'
