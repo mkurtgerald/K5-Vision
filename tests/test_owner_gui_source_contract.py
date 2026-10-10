@@ -49,6 +49,11 @@ class OwnerGuiContract(unittest.TestCase):
         ):
             self.assertIn(marker, source)
         self.assertNotIn('result == 0 ? "Test completed."', source)
+        self.assertIn(
+            "bool full = source.Length > 0 && video && analyticsEvidence && boxesEvidence;",
+            source,
+        )
+        self.assertNotIn("bool full = video && analyticsEvidence && boxesEvidence;", source)
 
     def test_windows_hosted_compiler_is_mandatory_for_gui_changes(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
