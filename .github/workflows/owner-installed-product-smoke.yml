@@ -1,0 +1,131 @@
+name: Owner Installed Product Smoke
+on:
+  push:
+    branches: [fix/transactional-alpha-upgrade-20261003]
+    paths:
+      - .github/workflows/owner-installed-product-smoke.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  engineering-source:
+    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Archive tracked engineering source only
+        run: |
+          mkdir -p source-export
+          git archive --format=zip --output=source-export/source.zip HEAD
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: owner-product-engineering-source-${{ github.sha }}
+          path: source-export/source.zip
+          if-no-files-found: error
+          retention-days: 3
+  installed-gui-smoke:
+    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - name: Download exact retained lifecycle-passed setup
+        shell: powershell
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization = "Bearer $env:GH_READ_TOKEN"; Accept = 'application/vnd.github+json' }
+          $zip = Join-Path $env:RUNNER_TEMP 'retained-owner-setup.zip'
+          Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri 'https://api.github.com/repos/mkurtgerald/K5-Vision/actions/artifacts/11682351679/zip' -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'ca05bbb189ee0edd85ecdf96e4376e3eb37fcd23697ff4a57a0b01ed76b12b06') { throw 'Retained artifact identity mismatch.' }
+          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'retained-owner-setup')
+          $setup = Join-Path $env:RUNNER_TEMP 'retained-owner-setup\K5VisionAlpha-Setup-87cbde475d2fd523d7d11079f48978c0a8230c85.exe'
+          if ((Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'd12ca034a0eb83c73158b0ba4d380899aafdf1a15aa1a523cbe65ddf5d4ab760') { throw 'Retained executable identity mismatch.' }
+          Write-Host 'K5_PRODUCT_SETUP_IDENTITY=87cbde4_verified'
+      - name: Install exact executable without owner shell interaction
+        shell: powershell
+        timeout-minutes: 23
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha'
+          if (Test-Path -LiteralPath $root) { throw 'Fresh installed-product root required.' }
+          $setup = Join-Path $env:RUNNER_TEMP 'retained-owner-setup\K5VisionAlpha-Setup-87cbde475d2fd523d7d11079f48978c0a8230c85.exe'
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw 'Exact setup installation failed.' }
+          if (([IO.File]::ReadAllText((Join-Path $root 'k5-revision.txt'))).Trim() -cne '87cbde475d2fd523d7d11079f48978c0a8230c85') { throw 'Installed revision mismatch.' }
+          Write-Host 'K5_PRODUCT_INSTALL=passed'
+      - name: Invoke real GUI Run test and require installed operator presentation
+        shell: powershell
+        timeout-minutes: 7
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
+          $root = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha'
+          $gui = Start-Process -FilePath (Join-Path $root 'K5VisionAlpha.exe') -PassThru
+          $stage = 'gui-open'
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(20)
+            do {
+              Start-Sleep -Milliseconds 250
+              $gui.Refresh()
+            } until ($gui.HasExited -or $gui.MainWindowHandle -ne [IntPtr]::Zero -or [DateTime]::UtcNow -gt $deadline)
+            if ($gui.HasExited -or $gui.MainWindowHandle -eq [IntPtr]::Zero) { throw 'GUI did not open.' }
+            $window = [System.Windows.Automation.AutomationElement]::FromHandle($gui.MainWindowHandle)
+            $buttonCondition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, 'Run test')
+            $button = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition)
+            if ($null -eq $button -or -not $button.Current.IsEnabled) { throw 'Installed test action unavailable.' }
+            $editCondition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
+            $edits = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCondition)
+            $status = $null
+            foreach ($edit in $edits) {
+              $value = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+              if ($value.Current.IsReadOnly) { $status = $value }
+            }
+            if ($null -eq $status) { throw 'GUI status unavailable.' }
+            # Blank input uses generated loopback video only. No cameras, screenshots,
+            # media files, source values, stack traces or raw child logs are retained.
+            $stage = 'run-test'
+            $invoke = $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+            $invoke.Invoke()
+            $deadline = [DateTime]::UtcNow.AddMinutes(5)
+            $passed = $false
+            do {
+              Start-Sleep -Milliseconds 500
+              $text = $status.Current.Value
+              if ($text.Contains('Synthetic video-only smoke passed; public RTSP analytics NOT qualified.')) { $passed = $true; break }
+              if ($text.Contains('Test did not pass:') -or $text.Contains('Stage-One NOT qualified:')) { break }
+            } while ([DateTime]::UtcNow -lt $deadline -and -not $gui.HasExited)
+            # Only bounded fixed diagnostic codes leave this job, never GUI text.
+            $diagnostic = 'no-terminal-status'
+            if ($text.Contains('Analytics did not meet')) { $diagnostic = 'analytics-gate' }
+            elseif ($text.Contains('GStreamer runtime validation failed')) { $diagnostic = 'gstreamer' }
+            elseif ($text.Contains('RTSP test source could not')) { $diagnostic = 'source-decode' }
+            elseif ($text.Contains('local K5 service did not')) { $diagnostic = 'service-health' }
+            elseif ($text.Contains('missing health, analytics')) { $diagnostic = 'receipt-incomplete' }
+            elseif ($text.Contains('Test did not pass:')) { $diagnostic = 'runtime-failed' }
+            if (-not $passed) { Write-Host "K5_PRODUCT_GUI_DIAGNOSTIC=$diagnostic"; throw 'Installed GUI operator smoke did not pass.' }
+            Write-Host 'K5_PRODUCT_GUI_SYNTHETIC_OPERATOR=passed'
+            Write-Host 'K5_PRODUCT_EXTERNAL_RTSP_ACCEPTANCE=not_tested'
+          } catch {
+            Write-Host "K5_PRODUCT_FAILURE_STAGE=$stage"
+            throw 'Installed-product smoke failed; inspect fixed diagnostic codes.'
+          } finally {
+            if (-not $gui.HasExited) { [void]$gui.CloseMainWindow(); [void]$gui.WaitForExit(10000) }
+            $gui.Dispose()
+          }
+      - name: Remove owned installed application
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $uninstaller = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha\unins000.exe'
+          if (Test-Path -LiteralPath $uninstaller) {
+            $p = Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait
+            if ($p.ExitCode -ne 0) { throw 'Owned application cleanup failed.' }
+          }
