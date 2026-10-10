@@ -123,10 +123,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $setup = Join-Path $env:GITHUB_WORKSPACE ("dist\owner-installer\K5VisionAlpha-Setup-" + $env:GITHUB_SHA + ".exe")
           $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait -ErrorAction Stop
-          if ($p.ExitCode -ne 0) { throw ('One-click setup install failed: ' + $p.ExitCode) }
           $root = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha'
           $gui = Join-Path $root 'K5VisionAlpha.exe'
-          if (-not (Test-Path -LiteralPath $gui)) { throw 'GUI missing after install.' }
           # Source-free inventory: fixed labels and boolean presence only,
           # never owner paths, source URIs, credentials, logs or file contents.
           $requirements = [ordered]@{
@@ -143,6 +141,8 @@ jobs:
             Write-Host ('K5_OWNER_COMPONENT_' + $entry.Key + '=' +
               [int][bool](Test-Path -LiteralPath $entry.Value))
           }
+          if ($p.ExitCode -ne 0) { throw ('One-click setup install failed: ' + $p.ExitCode) }
+          if (-not (Test-Path -LiteralPath $gui)) { throw 'GUI missing after install.' }
           $probe = Start-Process -FilePath $gui -ArgumentList '--self-check' -PassThru -Wait -WindowStyle Hidden -ErrorAction Stop
           if ($probe.ExitCode -ne 0) {
             # Safe opaque component IDs, not paths or any runtime/owner source data.
