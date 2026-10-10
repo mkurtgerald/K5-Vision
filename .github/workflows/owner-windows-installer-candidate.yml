@@ -133,7 +133,14 @@ jobs:
             'wheel-copy-analytics','wheel-hashes','stage-venv',
             'stage-runtime','stage-preflight','shortcut','verify-wheels',
             'activation-prepare','activation-venv','activation-runtime',
-            'activation-preflight','commit','complete'
+            'activation-preflight','commit','complete',
+            'stage-venv-create','activation-venv-create',
+            'stage-pip-install','activation-pip-install',
+            'stage-pip-check','activation-pip-check',
+            'stage-cli','activation-cli',
+            'stage-probe','activation-probe',
+            'stage-model-copy','activation-model-copy',
+            'stage-analytics-preflight','activation-analytics-preflight'
           )
           $stage = 'no-stage-receipt'
           if (Test-Path -LiteralPath $stageFile -PathType Leaf) {
