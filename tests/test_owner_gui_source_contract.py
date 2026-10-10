@@ -64,7 +64,7 @@ class OwnerGuiContract(unittest.TestCase):
     def test_packaged_analytics_is_selected_from_gui_without_owner_setup(self):
         source = SOURCE.read_text(encoding="utf-8")
         self.assertIn('Path.Combine(root, "analytics-config.json")', source)
-        self.assertIn('if (File.Exists(installedAnalyticsConfig))', source)
+        self.assertIn("if (File.Exists(installedAnalyticsConfig))", source)
         self.assertIn(
             'info.EnvironmentVariables["K5_ANALYTICS_CONFIG"] = installedAnalyticsConfig;', source
         )
