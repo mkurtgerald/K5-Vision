@@ -1,0 +1,43 @@
+name: Analytics Windows Cache Regression
+
+on:
+  push:
+    branches:
+      - fix/transactional-alpha-upgrade-20261003
+    paths:
+      - src/k5vision/analytics_package.py
+      - tests/test_analytics_windows_cache.py
+      - .github/workflows/analytics-windows-cache-regression.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-cache-regression:
+    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact repair candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Use owner installer Python version
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12.10'
+      - name: Install regression test runner
+        shell: powershell
+        run: |
+          python -m pip install --disable-pip-version-check pytest==8.4.2
+          if ($LASTEXITCODE -ne 0) { throw 'Regression test dependencies unavailable.' }
+      - name: Verify real Windows pip cache and rejection cases
+        shell: powershell
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: |
+          # Synthetic Python only: no camera, model, credentials or retained media.
+          python -m pytest -o addopts= tests/test_analytics_windows_cache.py -q
+          if ($LASTEXITCODE -ne 0) { throw 'Windows analytics package regression failed.' }
