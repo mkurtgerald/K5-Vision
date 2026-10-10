@@ -35,3 +35,39 @@ def test_build_pins_source_and_python_vendor_binary_no_release_promotion():
     assert "actions/checkout@" in content
     assert "actions/create-release" not in content
     assert "[string]$PythonExecutable" in INSTALL.read_text(encoding="utf-8")
+
+
+def test_owner_setup_requires_bundled_analytics_and_native_preflight():
+    script = ISS.read_text(encoding="utf-8")
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    for marker in (
+        "owner_analytics_bundle.py",
+        "analytics\\manifest.json",
+        "analytics\\wheels\\*.whl",
+        "analytics\\models\\*",
+        "Analytics-Lab-LICENSE",
+        "Analytics-Lab-THIRD_PARTY.md",
+        "analytics-config.json",
+        "analytics-models",
+        "Verified owner analytics payload is missing.",
+    ):
+        assert marker in script
+    for marker in (
+        "ref: c8b347ae538991a0c0ce38eabc2dc17b566531d3",
+        "scripts/build_owner_analytics_bundle.py",
+        "K5_OWNER_ANALYTICS_BUNDLE=verified_engineering_only",
+        "K5_OWNER_SETUP_INSTALLED_ANALYTICS_PREFLIGHT=passed",
+        "analytics-preflight",
+    ):
+        assert marker in workflow
+    transaction = (ROOT / "scripts/windows-alpha/install_transaction.py").read_text(
+        encoding="utf-8"
+    )
+    for marker in (
+        "analytics-config.json",
+        "analytics-models",
+        "materialize_models",
+        "module.validate(self.analytics_bundle)",
+        "Installed wheel closure mismatch",
+    ):
+        assert marker in transaction
