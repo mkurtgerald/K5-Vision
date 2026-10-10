@@ -1,0 +1,128 @@
+name: Owner Installed Runtime Diagnosis
+on:
+  push:
+    branches: [fix/transactional-alpha-upgrade-20261003]
+    paths: [.github/workflows/owner-installed-runtime-diagnosis.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  installed-runtime-diagnosis:
+    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Acquire and install byte-bound existing engineering setup
+        shell: powershell
+        timeout-minutes: 24
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $headers = @{ Authorization = "Bearer $env:GH_READ_TOKEN"; Accept = 'application/vnd.github+json' }
+          $zip = Join-Path $env:RUNNER_TEMP 'diag-setup.zip'
+          Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Headers $headers -Uri 'https://api.github.com/repos/mkurtgerald/K5-Vision/actions/artifacts/11683221888/zip' -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne '4bfd043b2e7694e52a942712b7f25c41e49f20b2e0250cecebc7c476d8ce04ab') { throw 'Artifact identity mismatch.' }
+          $directory = Join-Path $env:RUNNER_TEMP 'diag-setup'
+          Expand-Archive -LiteralPath $zip -DestinationPath $directory
+          $setup = Join-Path $directory 'K5VisionAlpha-Setup-887051738890ca2c0e34431bd707fe302654747e.exe'
+          if ((Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant() -cne '5d78b0e464fee40f482fed97ce31c66f4df457b87f023cd3bcaf5ec06d9c19fb') { throw 'Executable identity mismatch.' }
+          $root = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha'
+          if (Test-Path -LiteralPath $root) { throw 'Fresh isolated installation required.' }
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw 'Exact setup installation failed.' }
+          Write-Host 'K5_RUNTIME_DIAG_INSTALL=passed'
+      - name: Diagnose exact installed launcher and decoder with source-free projection
+        shell: python
+        timeout-minutes: 4
+        run: |
+          import base64
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import threading
+          root = pathlib.Path(os.environ['LOCALAPPDATA']) / 'K5VisionAlpha'
+          assert (root / 'k5-revision.txt').read_text().strip() == '887051738890ca2c0e34431bd707fe302654747e'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          def capture(arguments, timeout, environment):
+              process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=environment, creationflags=subprocess.CREATE_NO_WINDOW)
+              buffers = [bytearray(), bytearray()]
+              overflow = threading.Event()
+              def drain(stream, destination):
+                  while True:
+                      block = stream.read(4096)
+                      if not block:
+                          break
+                      if len(destination) + len(block) <= 65536:
+                          destination.extend(block)
+                      else:
+                          overflow.set()
+              threads = [threading.Thread(target=drain,args=(stream,buffer),daemon=True) for stream,buffer in zip((process.stdout,process.stderr),buffers)]
+              for thread in threads:
+                  thread.start()
+              try:
+                  code = process.wait(timeout=timeout)
+              except subprocess.TimeoutExpired:
+                  subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10,check=False)
+                  process.wait(timeout=10)
+                  code = -1
+              for thread in threads:
+                  thread.join(timeout=5)
+              if overflow.is_set() or any(t.is_alive() for t in threads):
+                  return -2, ''
+              return code, buffers[0].decode('utf-8',errors='replace')
+          environment = os.environ.copy()
+          for name in ('K5_ANALYTICS_CONFIG','K5_STAGE03_SOURCE','K5_STAGE03_CAM_CRED','K5_STAGE_ONE_RECORDING_ROOT','K5_PUBLIC_TEST_RTSP_SOURCE','K5_PUBLIC_TEST_SOURCE_IP'):
+              environment.pop(name,None)
+          gst = pathlib.Path(os.environ['LOCALAPPDATA']) / 'K5RunnerTools/k5-gstreamer/1.28.7/msvc_x86_64/bin/gst-inspect-1.0.exe'
+          for element in ('d3d11h264dec','appsink','h264parse','rtph264depay','videoconvert'):
+              code, _ = capture([str(gst),element],15,environment)
+              print('K5_RUNTIME_DIAG_ELEMENT_' + element + '=' + str(int(code == 0)))
+          # Diagnostic wrapper catches the original installed PowerShell error.
+          # No installed file is modified and no caller-selected source is used.
+          script = r'''
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          try {
+              $launcher = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha\Start-K5VisionAlpha.ps1'
+              & $launcher -ExitAfterPublicTest
+              Write-Host 'K5_RUNTIME_DIAG_LAUNCH=passed'
+          } catch {
+              Write-Host ('K5_RUNTIME_DIAG_PRODUCT_LINE=' + [int]$_.InvocationInfo.ScriptLineNumber)
+              $status = 0
+              if ($null -ne $_.Exception.Response) {
+                  try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+              }
+              Write-Host ('K5_RUNTIME_DIAG_HTTP=' + $status)
+              $detail = ([string]$_.Exception.Message) + ' ' + ([string]$_.ErrorDetails.Message)
+              foreach ($reason in @('decoder','timeout','timed out','initialization','execution','presentation','unauthorized','not configured','source','operator','invalid','not found','property','cannot','buffer','sample')) {
+                  $identifier = $reason.Replace(' ','_')
+                  Write-Host ('K5_RUNTIME_DIAG_REASON_' + $identifier + '=' + [int]($detail.IndexOf($reason,[StringComparison]::OrdinalIgnoreCase) -ge 0))
+              }
+              Write-Host 'K5_RUNTIME_DIAG_LAUNCH=failed'
+          }
+          '''
+          encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
+          powershell = pathlib.Path(os.environ['WINDIR']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+          code, output = capture([str(powershell),'-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',encoded],150,environment)
+          for line in output.splitlines():
+              if re.fullmatch(r'K5_RUNTIME_DIAG_(?:PRODUCT_LINE=[0-9]{1,5}|HTTP=[0-9]{1,3}|REASON_[a-z_]{1,32}=[01]|LAUNCH=(?:passed|failed))',line):
+                  print(line)
+          print('K5_RUNTIME_DIAG_WRAPPER_EXIT=' + str(code))
+          print('K5_OWNER_PUBLIC_ACCEPTANCE=not_proven')
+          if code != 0 or 'K5_RUNTIME_DIAG_LAUNCH=' not in output:
+              raise SystemExit(1)
+      - name: Remove only owned installed application
+        if: always()
+        shell: powershell
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $uninstaller = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha\unins000.exe'
+          if (Test-Path -LiteralPath $uninstaller) {
+              $p = Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait
+              if ($p.ExitCode -ne 0) { throw 'Owned application cleanup failed.' }
+          }
