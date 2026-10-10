@@ -12,82 +12,80 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Review documented anonymous session initialization without acquiring media
+      - name: Admit vendor-published public fallback without media playback
         shell: python
         run: |
-          import http.cookiejar
-          import json
-          import urllib.error
+          import html
+          import ipaddress
+          import re
+          import socket
           import urllib.request
           import urllib.parse
           class NoRedirect(urllib.request.HTTPRedirectHandler):
               def redirect_request(self, *args, **kwargs):
                   return None
-          cookies = http.cookiejar.CookieJar()
-          opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPCookieProcessor(cookies))
-          csrf = None
-          issued = False
-          failed = False
-          stage = 'homepage'
-          def request(path, payload=None, document=False):
-              headers = {'User-Agent':'K5-Engineering-TestSourceReview/1.0', 'Accept':'text/html' if document else 'application/json', 'Origin':'https://rtsplink.com'}
-              data = None
-              if payload is not None:
-                  data = json.dumps(payload).encode()
-                  headers.update({'Content-Type':'application/json','X-CSRF-Token':csrf})
-              req = urllib.request.Request('https://rtsplink.com'+path, data=data, headers=headers)
-              with opener.open(req, timeout=15) as response:
-                  raw = response.read(524289)
-                  if len(raw) > 524288:
-                      raise ValueError('Response exceeds bound')
-                  return None if document else json.loads(raw)
+          stage = 'publisher-document'
           try:
-              # Follow the documented browser entry before requesting its anonymous
-              # session. No account/authentication endpoint or access-control bypass.
-              request('/', document=True)
-              print('K5_PUBLISHER_HOMEPAGE_COOKIE_COUNT=' + str(len(cookies)))
-              stage = 'session'
-              session = request('/api/v1/session/active')
-              csrf, nonce = session.get('csrfToken'), session.get('nonce')
-              print('K5_PUBLISHER_SESSION_COOKIE_COUNT=' + str(len(cookies)))
-              assert isinstance(csrf,str) and isinstance(nonce,str) and csrf and nonce
-              stage = 'catalog'
-              catalog = request('/api/v1/streams/catalog')
-              assert len([s for s in catalog.get('streams',[]) if s.get('id') == 'live/people']) == 1
-              stage = 'issue'
-              issued = True
-              token = request('/api/v1/token/generate', {'csrfToken':csrf,'nonce':nonce,'streamName':'live/people','forceNew':False,'quality':{'resolution':'source','fps':'source','allowCompatibilityUpscale':False}})
-              source = token.get('rtspUrl')
-              assert isinstance(source,str) and len(source) <= 2048
-              uri = urllib.parse.urlsplit(source)
-              assert uri.scheme == 'rtsp' and uri.hostname == 'rtsp.rtsplink.com'
-              assert uri.username is None and uri.password is None and not uri.fragment
-              print('K5_PUBLISHER_PUBLIC_TOKEN=verified_transiently')
-          except urllib.error.HTTPError as error:
-              failed = True
-              print('K5_PUBLISHER_FAILURE_STAGE=' + stage)
-              print('K5_PUBLISHER_HTTP_STATUS=' + str(int(error.code)))
-              try:
-                  body = json.loads(error.read(4096))
-                  detail = json.dumps(body).lower()
-                  # Only fixed booleans leave this fresh anonymous-session probe.
-                  for category in ('session','csrf','nonce','authentication','login','quality','expired','unauthorized'):
-                      print('K5_PUBLISHER_ERROR_' + category.upper() + '=' + str(category in detail).lower())
-              except Exception:
-                  print('K5_PUBLISHER_ERROR_CODE=unclassified')
-          except Exception:
-              failed = True
-              print('K5_PUBLISHER_FAILURE_STAGE=' + stage)
-          finally:
-              if issued:
+              opener = urllib.request.build_opener(NoRedirect())
+              req = urllib.request.Request('https://www.wowza.com/developer/rtsp-stream-test', headers={'User-Agent':'K5-Engineering-TestSourceReview/1.0'})
+              with opener.open(req, timeout=15) as response:
+                  raw = response.read(1048577)
+                  assert len(raw) <= 1048576
+                  document = html.unescape(raw.decode('utf-8'))
+              sources = set(re.findall(r'rtsp://[^\s<>\"\x27]+', document))
+              admitted = []
+              for source in sources:
+                  uri = urllib.parse.urlsplit(source)
+                  if uri.hostname == '9627b0bf2a7b.entrypoint.cloud.wowza.com' and uri.port == 1935 and uri.username is None and uri.password is None and not uri.fragment and len(source) <= 2048:
+                      admitted.append((source,uri))
+              assert len(admitted) == 1
+              source, uri = admitted[0]
+              stage = 'public-address-admission'
+              addresses = socket.getaddrinfo(uri.hostname, uri.port, type=socket.SOCK_STREAM)
+              assert addresses and all(ipaddress.ip_address(item[4][0]).is_global for item in addresses)
+              stage = 'rtsp-describe'
+              description = None
+              for family, kind, protocol, _, address in addresses[:4]:
                   try:
-                      request('/api/v1/token/revoke', {'csrfToken':csrf})
-                      state = request('/api/v1/session/active')
-                      assert state.get('active') is False
-                      print('K5_PUBLISHER_PUBLIC_TOKEN=revoked')
-                  except Exception:
-                      failed = True
-                      print('K5_PUBLISHER_PUBLIC_TOKEN=revocation_unconfirmed')
-              print('K5_EXTERNAL_MEDIA_ACCEPTANCE=not_attempted')
-          if failed:
+                      with socket.socket(family, kind, protocol) as client:
+                          client.settimeout(5)
+                          client.connect(address)
+                          message = ('DESCRIBE ' + source + ' RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\nUser-Agent: K5-Engineering-Preflight\r\n\r\n').encode('ascii')
+                          client.sendall(message)
+                          data = b''
+                          while b'\r\n\r\n' not in data:
+                              block = client.recv(8192)
+                              assert block
+                              data += block
+                              assert len(data) <= 65536
+                          header, body = data.split(b'\r\n\r\n',1)
+                          first = header.split(b'\r\n',1)[0]
+                          match = re.fullmatch(rb'RTSP/1\.[01] ([0-9]{3})(?: .*)?', first)
+                          assert match
+                          status = int(match.group(1))
+                          print('K5_VENDOR_PUBLIC_DESCRIBE_STATUS=' + str(status))
+                          if status != 200:
+                              raise ValueError('Public source did not admit playback metadata')
+                          lengths = re.findall(rb'(?im)^content-length:\s*([0-9]+)\s*$',header)
+                          assert len(lengths) == 1 and 0 < int(lengths[0]) <= 65536
+                          length = int(lengths[0])
+                          while len(body) < length:
+                              block = client.recv(min(8192,length-len(body)))
+                              assert block
+                              body += block
+                          description = body[:length]
+                          break
+                  except (OSError, ValueError, AssertionError):
+                      continue
+              assert description is not None
+              video = b'm=video ' in description
+              h264 = re.search(rb'(?im)^a=rtpmap:[0-9]+ H264/90000', description) is not None
+              print('K5_VENDOR_PUBLIC_VIDEO=' + str(video).lower())
+              print('K5_VENDOR_PUBLIC_H264=' + str(h264).lower())
+              assert video and h264
+              print('K5_VENDOR_PUBLIC_SOURCE_PREFLIGHT=passed')
+              print('K5_MEDIA_PLAYBACK=not_attempted')
+              print('K5_PUBLIC_ANALYTICS_ACCEPTANCE=not_proven')
+          except Exception:
+              print('K5_VENDOR_PUBLIC_SOURCE_FAILURE_STAGE=' + stage)
               raise SystemExit(1)
