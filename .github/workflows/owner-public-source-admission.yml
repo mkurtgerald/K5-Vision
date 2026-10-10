@@ -12,48 +12,42 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Inspect official test publisher interface without acquiring media
+      - name: Validate anonymous publisher handshake without acquiring media
         shell: python
         run: |
+          import http.cookiejar
+          import json
           import re
           import urllib.request
           import urllib.parse
           origin = 'https://rtsplink.com'
-          def read(url):
-              request = urllib.request.Request(url, headers={'User-Agent': 'K5-Engineering-TestSourceReview/1.0'})
-              with urllib.request.urlopen(request, timeout=10) as response:
+          opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+          def get(path):
+              request = urllib.request.Request(origin + path, headers={'User-Agent': 'K5-Engineering-TestSourceReview/1.0', 'Accept':'application/json'})
+              with opener.open(request, timeout=15) as response:
                   if urllib.parse.urlsplit(response.url).hostname != 'rtsplink.com':
                       raise RuntimeError('Unexpected publisher origin')
-                  data = response.read(2_000_001)
-                  if len(data) > 2_000_000:
-                      raise RuntimeError('Publisher document exceeds bound')
-                  return data.decode('utf-8')
-          def sanitize(text):
-              text = re.sub(r'(?:rtsp|rtsps|https?)://[^\s\"\x27<>]+', '[URL OMITTED]', text)
-              text = re.sub(r'[^\x20-\x7e]', ' ', text)
-              return text[:1400]
+                  data = response.read(262145)
+                  if len(data) > 262144:
+                      raise RuntimeError('Publisher response exceeds bound')
+                  return json.loads(data)
+          def keys(value):
+              return sorted(k for k in value if re.fullmatch(r'[A-Za-z_]{1,48}', k))[:30] if isinstance(value,dict) else []
           try:
-              html = read(origin + '/')
-              scripts = []
-              for item in re.findall(r'<script[^>]+src=[\"\x27]([^\"\x27]+)', html):
-                  url = urllib.parse.urljoin(origin, item)
-                  if urllib.parse.urlsplit(url).hostname == 'rtsplink.com' and url not in scripts:
-                      scripts.append(url)
-              documents = [html] + [read(url) for url in scripts[:16]]
-              endpoints = set()
-              snippets = []
-              for text in documents:
-                  for match in re.finditer(r'/api/[A-Za-z0-9/_-]+', text):
-                      endpoint = match.group()
-                      if endpoint in endpoints or '/auth/' in endpoint or '/admin/' in endpoint:
-                          continue
-                      endpoints.add(endpoint)
-                      snippets.append(sanitize(text[max(0,match.start()-300):match.end()+1000]))
-              print('K5_PUBLISHER_DOCUMENTS_INSPECTED=' + str(len(documents)))
-              print('K5_PUBLISHER_PUBLIC_INTERFACE_COUNT=' + str(min(len(snippets),16)))
-              for snippet in snippets[:16]:
-                  print('PUBLISHER_INTERFACE: ' + snippet)
+              session = get('/api/v1/session/active')
+              print('K5_PUBLISHER_SESSION_SCHEMA=' + json.dumps(keys(session)))
+              print('K5_PUBLISHER_SESSION_HANDSHAKE=' + str(bool(session.get('csrfToken') and session.get('nonce'))).lower())
+              catalog = get('/api/v1/streams/catalog')
+              print('K5_PUBLISHER_CATALOG_SCHEMA=' + json.dumps(keys(catalog)))
+              streams = catalog.get('streams', [])
+              approved = {'live/test','live/people','live/traffic','live/objects','live/retail','people','traffic','objects','retail'}
+              for stream in streams[:12]:
+                  print('K5_PUBLISHER_STREAM_SCHEMA=' + json.dumps(keys(stream)))
+                  if isinstance(stream,dict):
+                      for key,value in stream.items():
+                          if isinstance(value,str) and value in approved:
+                              print('K5_PUBLISHER_LIBRARY_SELECTOR=' + key + ':' + value)
               print('K5_EXTERNAL_MEDIA_ACCEPTANCE=not_attempted')
           except Exception:
-              print('K5_PUBLISHER_INTERFACE=unavailable')
+              print('K5_PUBLISHER_HANDSHAKE=unavailable')
               raise SystemExit(1)
