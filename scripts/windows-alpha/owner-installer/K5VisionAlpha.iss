@@ -105,7 +105,11 @@ begin
     'stage-pip-check|activation-pip-check|' +
     'stage-cli|activation-cli|stage-probe|activation-probe|' +
     'stage-model-copy|activation-model-copy|' +
-    'stage-analytics-preflight|activation-analytics-preflight|') > 0 then
+    'stage-analytics-preflight|activation-analytics-preflight|' +
+    'stage-analytics-package|activation-analytics-package|' +
+    'stage-analytics-versions|activation-analytics-versions|' +
+    'stage-analytics-path|activation-analytics-path|' +
+    'stage-analytics-model|activation-analytics-model|') > 0 then
     Result := Stage;
 end;
 
