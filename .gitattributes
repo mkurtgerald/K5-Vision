@@ -1,0 +1,4 @@
+# The pinned analytics admission manifest is signed by its canonical LF byte digest.
+# Avoid Windows Git checkout line-ending conversion; never adjust the hash pin.
+src/k5vision/data/analytics-runtime-manifest.json text eol=lf
+src/k5vision/data/analytics-runtime-Apache-2.0.txt text eol=lf

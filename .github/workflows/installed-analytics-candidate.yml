@@ -5,13 +5,33 @@ on:
     branches:
       - feat/installed-analytics-operator-20261003
       - feat/alpha-analytics-preflight-20261004
+      - fix/transactional-alpha-upgrade-20261003
       - feat/installed-alpha-facade-witness-20261005
     paths:
       - .github/workflows/installed-analytics-candidate.yml
+      - .github/workflows/owner-windows-installer-candidate.yml
+      - scripts/windows-alpha/owner-installer/**
+      - scripts/provision-stage03-gstreamer.ps1
       - scripts/installed_analytics_witness.py
       - scripts/installed_alpha_launcher_witness.py
       - scripts/installed_alpha_facade_witness.py
       - scripts/windows_owned_preflight.py
+      - scripts/assert-stage-one-physical-admission.ps1
+      - tests/test_installed_git_alias_admission.py
+      - scripts/admit_installed_git_alias.cs
+      - scripts/assert-installed-git-alias.ps1
+      - scripts/capture_installer_wheel_provenance.py
+      - scripts/installer_wheel_requirements.py
+      - scripts/installer_wheel_storage.py
+      - scripts/windows-alpha/Install-K5VisionAlpha.ps1
+      - scripts/windows-alpha/install_transaction.py
+      - tests/test_capture_installer_wheel_provenance.py
+      - tests/test_installer_wheel_requirements.py
+      - tests/test_installer_wheel_storage.py
+      - tests/test_stage_one_physical_admission_diagnostics.py
+      - tests/test_installer_runtime_platform_dependencies.py
+      - tests/test_windows_alpha_upgrade.py
+      - tests/test_windows_alpha_bootstrap.py
       - scripts/build_analytics_runtime_wheel.py
       - scripts/windows-alpha/Invoke-K5InstalledAnalyticsWitness.ps1
       - scripts/windows-alpha/Start-K5VisionAlpha.ps1
@@ -37,9 +57,9 @@ permissions:
 jobs:
   hosted_admission:
     name: hosted-candidate-admission
-    if: github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005')
+    if: github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005')
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 18
     outputs:
       qualified_sha: ${{ steps.qualify.outputs.qualified_sha }}
     env:
@@ -48,7 +68,7 @@ jobs:
     steps:
       - name: Require exact trusted head and green hosted PR qualification
         id: qualify
-        timeout-minutes: 9
+        timeout-minutes: 17
         shell: powershell
         env:
           K5_GITHUB_TOKEN: ${{ github.token }}
@@ -59,11 +79,12 @@ jobs:
             if ($env:K5_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "Exact candidate SHA required." }
             $legacyBranch = "feat/installed-analytics-operator-20261003"
             $launcherBranch = "feat/alpha-analytics-preflight-20261004"
+            $upgradeBranch = "fix/transactional-alpha-upgrade-20261003"
             $facadeBranch = "feat/installed-alpha-facade-witness-20261005"
-            if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $facadeBranch)) { throw "Unreviewed candidate branch refused." }
+            if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $upgradeBranch, $facadeBranch)) { throw "Unreviewed candidate branch refused." }
             $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
             $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
-            # Launcher/facade branches require three applicable gates; legacy retains all five.
+            # Launcher/upgrade/facade require three applicable gates; legacy retains all five.
             $required = @{
               "355859781" = "CI"
               "369354936" = "Windows Alpha Script Smoke"
@@ -96,7 +117,8 @@ jobs:
             }
             return $qualified
           }
-          $deadline = [DateTime]::UtcNow.AddMinutes(8)
+          # Cover the smoke job's 15-minute bound plus a bounded scheduling margin.
+          $deadline = [DateTime]::UtcNow.AddMinutes(16)
           $qualified = $false
           while ([DateTime]::UtcNow -lt $deadline) {
             if (Test-K5CandidateHostedGates) { $qualified = $true; break }
@@ -107,7 +129,7 @@ jobs:
 
   installed-analytics-candidate:
     needs: hosted_admission
-    if: needs.hosted_admission.result == 'success' && needs.hosted_admission.outputs.qualified_sha == github.sha && (github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'))
+    if: needs.hosted_admission.result == 'success' && needs.hosted_admission.outputs.qualified_sha == github.sha && (github.repository == 'mkurtgerald/K5-Vision' && (github.ref == 'refs/heads/feat/installed-analytics-operator-20261003' || github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'))
     runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]
     timeout-minutes: 25
     concurrency:
@@ -147,11 +169,12 @@ jobs:
             if ($env:K5_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') { throw "Exact candidate SHA required." }
             $legacyBranch = "feat/installed-analytics-operator-20261003"
             $launcherBranch = "feat/alpha-analytics-preflight-20261004"
+            $upgradeBranch = "fix/transactional-alpha-upgrade-20261003"
             $facadeBranch = "feat/installed-alpha-facade-witness-20261005"
-            if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $facadeBranch)) { throw "Unreviewed candidate branch refused." }
+            if ($env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $upgradeBranch, $facadeBranch)) { throw "Unreviewed candidate branch refused." }
             $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
             $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
-            # Launcher/facade branches require three applicable gates; legacy retains all five.
+            # Launcher/upgrade/facade require three applicable gates; legacy retains all five.
             $required = @{
               "355859781" = "CI"
               "369354936" = "Windows Alpha Script Smoke"
@@ -187,32 +210,181 @@ jobs:
           if (-not (Test-K5CandidateHostedGates)) { throw "Exact hosted qualification is no longer green; no physical work admitted." }
 
       - name: Admit existing Git before immutable checkouts
-        timeout-minutes: 1
+        id: git_before_candidate
+        timeout-minutes: 3
         shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
-          # This installation root was observed in candidate run 37164394848.
-          # Never search another installation, download Git or alter machine PATH.
-          $git = 'C:\Program Files\Git\cmd\git.exe'
-          $attributes = [IO.File]::GetAttributes($git)
-          if ($attributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint)) { throw "Existing Git must be a regular executable." }
-          $parent = [IO.DirectoryInfo]::new((Split-Path -Parent $git))
-          while ($null -ne $parent) {
-            $parent.Refresh()
-            if (-not $parent.Exists -or ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Existing Git ancestor is unavailable or aliased." }
-            $parent = $parent.Parent
+          $pins = @(
+              @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
+              @{ name = 'assert-installed-git-alias.ps1'; size = 13028; blob = 'a3f9ae05f204905c9cd2e68f894a6bd53dc4d53c'; sha256 = '67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8' },
+              @{ name = 'admit_installed_git_alias.cs'; size = 36598; blob = '1e45e51c6171d88ff582466ba2664f9b81b75ebf'; sha256 = 'a751156ee06792f8f4625fa988c73a54c8e9a0a24937c06ab9264762f965d23f' }
+          )
+          # Fresh immutable source admission; no executable, checkout file or saved receipt is trusted here.
+          $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+          function Read-K5PinnedBlob($Pin) {
+              $response = $null; $stream = $null; $memory = $null; $sha1 = $null; $sha256 = $null
+              try {
+                  if ($env:GITHUB_API_URL -cne 'https://api.github.com' -or
+                      $env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
+                      [string]::IsNullOrEmpty($env:K5_GITHUB_TOKEN) -or $env:K5_GITHUB_TOKEN.Length -gt 8192 -or
+                      $Pin.size -le 0 -or $Pin.size -gt 65536 -or
+                      $Pin.blob -cnotmatch '\A[0-9a-f]{40}\z' -or $Pin.sha256 -cnotmatch '\A[0-9a-f]{64}\z') { throw 'context' }
+                  $url = 'https://api.github.com/repos/mkurtgerald/K5-Vision/git/blobs/' + $Pin.blob
+                  $request = [Net.HttpWebRequest]::Create($url)
+                  $request.Method = 'GET'; $request.AllowAutoRedirect = $false
+                  $request.Timeout = 15000; $request.ReadWriteTimeout = 15000
+                  $request.MaximumResponseHeadersLength = 16
+                  $request.AutomaticDecompression = [Net.DecompressionMethods]::None
+                  $request.Accept = 'application/vnd.github+json'; $request.UserAgent = 'K5-fixed-git-admission/1'
+                  $request.Headers['Authorization'] = 'Bearer ' + $env:K5_GITHUB_TOKEN
+                  $request.Headers['X-GitHub-Api-Version'] = '2022-11-28'
+                  $response = $request.GetResponse()
+                  if ([int]$response.StatusCode -ne 200 -or $response.ResponseUri.AbsoluteUri -cne $url -or
+                      $response.ContentLength -gt 131072 -or -not [string]::IsNullOrEmpty($response.ContentEncoding)) { throw 'response' }
+                  $stream = $response.GetResponseStream(); $memory = [IO.MemoryStream]::new()
+                  $buffer = [byte[]]::new(4096)
+                  $deadline = [Diagnostics.Stopwatch]::StartNew()
+                  while ($true) {
+                      $remaining = 131072 - [int]$memory.Length
+                      if ($remaining -le 0 -or $deadline.ElapsedMilliseconds -ge 15000) { throw 'response_bound' }
+                      $read = $stream.ReadAsync($buffer, 0, [Math]::Min($buffer.Length, $remaining))
+                      if (-not $read.Wait([Math]::Max(1, 15000 - [int]$deadline.ElapsedMilliseconds))) { throw 'response_timeout' }
+                      if ($read.Result -eq 0) { break }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $record = ConvertFrom-Json -InputObject $strictUtf8.GetString($memory.ToArray()) -ErrorAction Stop
+                  if ($record.sha -isnot [string] -or $record.sha -cne $Pin.blob -or $record.encoding -cne 'base64' -or
+                      ($record.size -isnot [int] -and $record.size -isnot [long]) -or $record.size -ne $Pin.size -or
+                      $record.content -isnot [string] -or $record.content.Length -gt 100000) { throw 'blob' }
+                  $encoded = $record.content.Replace("`r", '').Replace("`n", '')
+                  if ($encoded -cnotmatch '\A(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\z' -or
+                      $encoded.Length -ne 4 * [Math]::Ceiling($Pin.size / 3.0)) { throw 'base64' }
+                  $bytes = [Convert]::FromBase64String($encoded)
+                  if ($bytes.Length -ne $Pin.size -or [Convert]::ToBase64String($bytes) -cne $encoded) { throw 'size' }
+                  $sha256 = [Security.Cryptography.SHA256]::Create(); $sha1 = [Security.Cryptography.SHA1]::Create()
+                  if (([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() -cne $Pin.sha256) { throw 'digest' }
+                  $header = [Text.Encoding]::ASCII.GetBytes('blob ' + [string]$bytes.Length + [char]0)
+                  $framed = [byte[]]::new($header.Length + $bytes.Length)
+                  [Array]::Copy($header, 0, $framed, 0, $header.Length); [Array]::Copy($bytes, 0, $framed, $header.Length, $bytes.Length)
+                  if (([BitConverter]::ToString($sha1.ComputeHash($framed))).Replace('-', '').ToLowerInvariant() -cne $Pin.blob) { throw 'git_blob' }
+                  $null = $strictUtf8.GetString($bytes)
+                  return ,$bytes
+              } catch { throw 'Pinned Git admission source refused; existing owners were preserved.' }
+              finally {
+                  foreach ($owned in @($sha1, $sha256, $memory, $stream, $response)) { if ($null -ne $owned) { $owned.Dispose() } }
+              }
           }
-          $output = @(& $git --version)
-          $exitCode = $LASTEXITCODE
-          if ($exitCode -ne 0 -or $output.Count -ne 1) { throw "Existing Git version could not be verified." }
-          $versionText = ([string]$output[0]).Trim()
-          if ($versionText -cnotmatch '\Agit version (?<major>[0-9]+)\.(?<minor>[0-9]+)\.(?<patch>[0-9]+)\.windows\.[0-9]+\z') { throw "Existing Git for Windows version is unsupported." }
-          $version = [Version]::new([int]$Matches.major, [int]$Matches.minor, [int]$Matches.patch)
-          if ($version -lt [Version]'2.18.0') { throw "Git 2.18 or newer is required for exact checkout provenance." }
-          $gitSha256 = (Get-FileHash -LiteralPath $git -Algorithm SHA256).Hash.ToLowerInvariant()
+          function Assert-K5OrdinaryCompilerPath([string]$Path, [bool]$Directory) {
+              if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 1024 -or $Path -cnotmatch '\A[A-Z]:\\' -or
+                  $Path -match '[\x00-\x1f"<>|?*]' -or $Path.Substring(2).Contains(':') -or
+                  [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'compiler_path' }
+              foreach ($part in $Path.Substring(3).Split('\')) {
+                  if ($part.Length -eq 0 -or $part -in @('.', '..') -or $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'compiler_path' }
+              }
+              $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+              if ($item.FullName -cne $Path -or [bool]$item.PSIsContainer -ne $Directory) { throw 'compiler_type' }
+              $depth = 0
+              while ($null -ne $item) {
+                  $depth++
+                  if ($depth -gt 32 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                      -not [string]::IsNullOrEmpty($item.LinkType)) { throw 'compiler_alias' }
+                  $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+              }
+          }
+          try {
+              if ($env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,19}\z' -or
+                  $env:GITHUB_ACTION -cnotmatch '\A[A-Za-z_][A-Za-z0-9_-]{0,79}\z') { throw 'context' }
+              $guardBytes = Read-K5PinnedBlob $pins[0]
+              $helperBytes = Read-K5PinnedBlob $pins[1]
+              $collectorBytes = Read-K5PinnedBlob $pins[2]
+              $trustedGuard = [scriptblock]::Create($strictUtf8.GetString($guardBytes))
+              & $trustedGuard | Out-Null
+              Assert-K5OrdinaryCompilerPath $env:RUNNER_TEMP $true
+              $privateCompilerTemp = Join-Path $env:RUNNER_TEMP ('k5-installed-git-alias-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT + '-' + $env:GITHUB_ACTION)
+              if (Test-Path -LiteralPath $privateCompilerTemp -ErrorAction Stop) { throw 'compiler_exists' }
+              $created = New-Item -ItemType Directory -Path $privateCompilerTemp -ErrorAction Stop
+              if ($created.FullName -cne $privateCompilerTemp) { throw 'compiler_path' }
+              Assert-K5OrdinaryCompilerPath $privateCompilerTemp $true
+              $invokeGit = & ([scriptblock]::Create($strictUtf8.GetString($helperBytes))) -SourceBytes $collectorBytes -AssertBoundary $trustedGuard -CompilerTemp $privateCompilerTemp
+              if ($invokeGit -isnot [scriptblock]) { throw 'initializer' }
+          } catch { throw 'Fresh exact Git admission initialization refused; existing owners were preserved.' }
+          function Invoke-K5OwnedGitText([string]$AdmittedGitPath, [string]$Arguments, [int]$Budget = 10000) {
+              # Called only inside one fresh held admission. One owned child, bounded output and lifetime.
+              $process = $null; $started = $false; $memory = $null
+              try {
+                  if ($AdmittedGitPath -cne 'C:\Program Files\Git\cmd\git.exe' -or $Budget -notin @(10000, 30000)) { throw 'git' }
+                  $start = [Diagnostics.ProcessStartInfo]::new()
+                  $start.FileName = $AdmittedGitPath; $start.Arguments = $Arguments
+                  $start.WorkingDirectory = $env:GITHUB_WORKSPACE
+                  $start.UseShellExecute = $false; $start.CreateNoWindow = $true
+                  $start.RedirectStandardInput = $true; $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+                  foreach ($key in @($start.EnvironmentVariables.Keys)) {
+                      if ($key -like 'GIT_*') { $start.EnvironmentVariables.Remove($key) }
+                  }
+                  $start.EnvironmentVariables['GIT_NO_REPLACE_OBJECTS'] = '1'
+                  $start.EnvironmentVariables['GIT_NO_LAZY_FETCH'] = '1'
+                  $start.EnvironmentVariables['GIT_ALLOW_PROTOCOL'] = ''
+                  $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
+                  $started = $process.Start()
+                  if (-not $started) { throw 'git' }
+                  $process.StandardInput.Close()
+                  $drain = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+                  $watch = [Diagnostics.Stopwatch]::StartNew()
+                  $stream = $process.StandardOutput.BaseStream
+                  $memory = [IO.MemoryStream]::new(); $buffer = [byte[]]::new(1024)
+                  while ($true) {
+                      $remaining = $Budget - [int]$watch.ElapsedMilliseconds
+                      if ($remaining -le 0) { throw 'git' }
+                      $read = $stream.ReadAsync($buffer, 0, $buffer.Length)
+                      if (-not $read.Wait($remaining)) { throw 'git' }
+                      if ($read.Result -eq 0) { break }
+                      if ($memory.Length + $read.Result -gt 4096) { throw 'git' }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $remaining = $Budget - [int]$watch.ElapsedMilliseconds
+                  if ($remaining -le 0 -or -not $process.WaitForExit($remaining) -or $process.ExitCode -ne 0) { throw 'git' }
+                  $remaining = $Budget - [int]$watch.ElapsedMilliseconds
+                  if ($remaining -le 0 -or -not $drain.Wait($remaining)) { throw 'git' }
+                  $text = [Text.UTF8Encoding]::new($false, $true).GetString($memory.ToArray())
+                  if ($text.Length -gt 0) {
+                      $text = $text -replace '(?:\r?\n)\z', ''
+                      foreach ($line in ($text -split '\r?\n')) { Write-Output $line }
+                  }
+              } catch { throw 'Bounded owned Git operation refused.' }
+              finally {
+                  try {
+                      if ($null -ne $process -and $started) {
+                          if (-not $process.HasExited) { $process.Kill() }
+                          if (-not $process.WaitForExit(2000)) { throw 'Owned Git cleanup refused.' }
+                      }
+                  } finally {
+                      if ($null -ne $memory) { $memory.Dispose() }
+                      if ($null -ne $process) { $process.Dispose() }
+                  }
+              }
+          }
+          $ownedGitText = ${function:Invoke-K5OwnedGitText}
+          # Only the exact approved installed pair is admitted. Never provision Git.
+          $versionText = & $invokeGit -Operation ({
+              param($AdmittedGitPath)
+              $output = @(& $ownedGitText $AdmittedGitPath '--version')
+              if ($output.Count -ne 1) { throw 'version' }
+              $text = ([string]$output[0]).Trim()
+              if ($text -cnotmatch '\Agit version (?<major>[0-9]+)\.(?<minor>[0-9]+)\.(?<patch>[0-9]+)\.windows\.[0-9]+\z') { throw 'version' }
+              $version = [Version]::new([int]$Matches.major, [int]$Matches.minor, [int]$Matches.patch)
+              if ($version -lt [Version]'2.18.0' -or $text -cne 'git version 2.55.0.windows.5') { throw 'version' }
+              return $text
+          }.GetNewClosure())
+          $gitSha256 = '78211c7ed73988da93a6d8a33d47ec6187f464d7ea2a9a00c182bbd7a1ecf30f'
           Write-Host "K5_CHECKOUT_GIT_VERSION=$versionText"
           Write-Host "K5_CHECKOUT_GIT_SHA256=$gitSha256"
-          (Split-Path -Parent $git) | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "K5_CHECKOUT_GIT_SHA256=$gitSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          'C:\Program Files\Git\cmd' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # The pinned checkout action has its own process. These boundary proofs are not a continuous lease.
+          & $invokeGit -Operation { param($AdmittedGitPath) } | Out-Null
 
       - name: Checkout immutable candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -221,9 +393,302 @@ jobs:
           persist-credentials: false
 
       - name: Require idle exact physical host before provisioning
-        timeout-minutes: 1
+        id: git_between_checkouts
+        timeout-minutes: 3
         shell: powershell
-        run: .\scripts\assert-stage-one-physical-admission.ps1
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pins = @(
+              @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
+              @{ name = 'assert-installed-git-alias.ps1'; size = 13028; blob = 'a3f9ae05f204905c9cd2e68f894a6bd53dc4d53c'; sha256 = '67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8' },
+              @{ name = 'admit_installed_git_alias.cs'; size = 36598; blob = '1e45e51c6171d88ff582466ba2664f9b81b75ebf'; sha256 = 'a751156ee06792f8f4625fa988c73a54c8e9a0a24937c06ab9264762f965d23f' }
+          )
+          # Fresh immutable source admission; no executable, checkout file or saved receipt is trusted here.
+          $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+          function Read-K5PinnedBlob($Pin) {
+              $response = $null; $stream = $null; $memory = $null; $sha1 = $null; $sha256 = $null
+              try {
+                  if ($env:GITHUB_API_URL -cne 'https://api.github.com' -or
+                      $env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
+                      [string]::IsNullOrEmpty($env:K5_GITHUB_TOKEN) -or $env:K5_GITHUB_TOKEN.Length -gt 8192 -or
+                      $Pin.size -le 0 -or $Pin.size -gt 65536 -or
+                      $Pin.blob -cnotmatch '\A[0-9a-f]{40}\z' -or $Pin.sha256 -cnotmatch '\A[0-9a-f]{64}\z') { throw 'context' }
+                  $url = 'https://api.github.com/repos/mkurtgerald/K5-Vision/git/blobs/' + $Pin.blob
+                  $request = [Net.HttpWebRequest]::Create($url)
+                  $request.Method = 'GET'; $request.AllowAutoRedirect = $false
+                  $request.Timeout = 15000; $request.ReadWriteTimeout = 15000
+                  $request.MaximumResponseHeadersLength = 16
+                  $request.AutomaticDecompression = [Net.DecompressionMethods]::None
+                  $request.Accept = 'application/vnd.github+json'; $request.UserAgent = 'K5-fixed-git-admission/1'
+                  $request.Headers['Authorization'] = 'Bearer ' + $env:K5_GITHUB_TOKEN
+                  $request.Headers['X-GitHub-Api-Version'] = '2022-11-28'
+                  $response = $request.GetResponse()
+                  if ([int]$response.StatusCode -ne 200 -or $response.ResponseUri.AbsoluteUri -cne $url -or
+                      $response.ContentLength -gt 131072 -or -not [string]::IsNullOrEmpty($response.ContentEncoding)) { throw 'response' }
+                  $stream = $response.GetResponseStream(); $memory = [IO.MemoryStream]::new()
+                  $buffer = [byte[]]::new(4096)
+                  $deadline = [Diagnostics.Stopwatch]::StartNew()
+                  while ($true) {
+                      $remaining = 131072 - [int]$memory.Length
+                      if ($remaining -le 0 -or $deadline.ElapsedMilliseconds -ge 15000) { throw 'response_bound' }
+                      $read = $stream.ReadAsync($buffer, 0, [Math]::Min($buffer.Length, $remaining))
+                      if (-not $read.Wait([Math]::Max(1, 15000 - [int]$deadline.ElapsedMilliseconds))) { throw 'response_timeout' }
+                      if ($read.Result -eq 0) { break }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $record = ConvertFrom-Json -InputObject $strictUtf8.GetString($memory.ToArray()) -ErrorAction Stop
+                  if ($record.sha -isnot [string] -or $record.sha -cne $Pin.blob -or $record.encoding -cne 'base64' -or
+                      ($record.size -isnot [int] -and $record.size -isnot [long]) -or $record.size -ne $Pin.size -or
+                      $record.content -isnot [string] -or $record.content.Length -gt 100000) { throw 'blob' }
+                  $encoded = $record.content.Replace("`r", '').Replace("`n", '')
+                  if ($encoded -cnotmatch '\A(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\z' -or
+                      $encoded.Length -ne 4 * [Math]::Ceiling($Pin.size / 3.0)) { throw 'base64' }
+                  $bytes = [Convert]::FromBase64String($encoded)
+                  if ($bytes.Length -ne $Pin.size -or [Convert]::ToBase64String($bytes) -cne $encoded) { throw 'size' }
+                  $sha256 = [Security.Cryptography.SHA256]::Create(); $sha1 = [Security.Cryptography.SHA1]::Create()
+                  if (([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() -cne $Pin.sha256) { throw 'digest' }
+                  $header = [Text.Encoding]::ASCII.GetBytes('blob ' + [string]$bytes.Length + [char]0)
+                  $framed = [byte[]]::new($header.Length + $bytes.Length)
+                  [Array]::Copy($header, 0, $framed, 0, $header.Length); [Array]::Copy($bytes, 0, $framed, $header.Length, $bytes.Length)
+                  if (([BitConverter]::ToString($sha1.ComputeHash($framed))).Replace('-', '').ToLowerInvariant() -cne $Pin.blob) { throw 'git_blob' }
+                  $null = $strictUtf8.GetString($bytes)
+                  return ,$bytes
+              } catch { throw 'Pinned Git admission source refused; existing owners were preserved.' }
+              finally {
+                  foreach ($owned in @($sha1, $sha256, $memory, $stream, $response)) { if ($null -ne $owned) { $owned.Dispose() } }
+              }
+          }
+          function Assert-K5OrdinaryCompilerPath([string]$Path, [bool]$Directory) {
+              if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 1024 -or $Path -cnotmatch '\A[A-Z]:\\' -or
+                  $Path -match '[\x00-\x1f"<>|?*]' -or $Path.Substring(2).Contains(':') -or
+                  [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'compiler_path' }
+              foreach ($part in $Path.Substring(3).Split('\')) {
+                  if ($part.Length -eq 0 -or $part -in @('.', '..') -or $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'compiler_path' }
+              }
+              $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+              if ($item.FullName -cne $Path -or [bool]$item.PSIsContainer -ne $Directory) { throw 'compiler_type' }
+              $depth = 0
+              while ($null -ne $item) {
+                  $depth++
+                  if ($depth -gt 32 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                      -not [string]::IsNullOrEmpty($item.LinkType)) { throw 'compiler_alias' }
+                  $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+              }
+          }
+          try {
+              if ($env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,19}\z' -or
+                  $env:GITHUB_ACTION -cnotmatch '\A[A-Za-z_][A-Za-z0-9_-]{0,79}\z') { throw 'context' }
+              $guardBytes = Read-K5PinnedBlob $pins[0]
+              $helperBytes = Read-K5PinnedBlob $pins[1]
+              $collectorBytes = Read-K5PinnedBlob $pins[2]
+              $trustedGuard = [scriptblock]::Create($strictUtf8.GetString($guardBytes))
+              & $trustedGuard | Out-Null
+              Assert-K5OrdinaryCompilerPath $env:RUNNER_TEMP $true
+              $privateCompilerTemp = Join-Path $env:RUNNER_TEMP ('k5-installed-git-alias-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT + '-' + $env:GITHUB_ACTION)
+              if (Test-Path -LiteralPath $privateCompilerTemp -ErrorAction Stop) { throw 'compiler_exists' }
+              $created = New-Item -ItemType Directory -Path $privateCompilerTemp -ErrorAction Stop
+              if ($created.FullName -cne $privateCompilerTemp) { throw 'compiler_path' }
+              Assert-K5OrdinaryCompilerPath $privateCompilerTemp $true
+              $invokeGit = & ([scriptblock]::Create($strictUtf8.GetString($helperBytes))) -SourceBytes $collectorBytes -AssertBoundary $trustedGuard -CompilerTemp $privateCompilerTemp
+              if ($invokeGit -isnot [scriptblock]) { throw 'initializer' }
+          } catch { throw 'Fresh exact Git admission initialization refused; existing owners were preserved.' }
+          & $invokeGit -Operation { param($AdmittedGitPath) } | Out-Null
+          if ($env:K5_CANDIDATE_BRANCH -cne "fix/transactional-alpha-upgrade-20261003") {
+              .\scripts\assert-stage-one-physical-admission.ps1
+          } else {
+              # All Git children close before the existing PowerShell host snapshot.
+              # No Python orchestrator, mutable-source import or newline reconstruction.
+              $sourceBindingDiagnostic = @{ stage = 'environment'; reason = 'context' }
+              function Read-K5GitObject([string]$Expression, [string]$Kind, [int]$Limit) {
+                  $operation = {
+                      param($AdmittedGitPath)
+                  $process = $null
+                  $started = $false
+                  try {
+                      $sourceBindingDiagnostic.reason = 'process_setup'
+                      $start = [Diagnostics.ProcessStartInfo]::new()
+                      $start.FileName = $AdmittedGitPath
+                      $start.Arguments = '--no-replace-objects --no-lazy-fetch -c protocol.allow=never cat-file --batch'
+                      $start.WorkingDirectory = $env:GITHUB_WORKSPACE
+                      $start.UseShellExecute = $false
+                      $start.CreateNoWindow = $true
+                      $start.RedirectStandardInput = $true
+                      $start.RedirectStandardOutput = $true
+                      $start.RedirectStandardError = $true
+                      foreach ($key in @($start.EnvironmentVariables.Keys)) {
+                          if ($key -like 'GIT_*') { $start.EnvironmentVariables.Remove($key) }
+                      }
+                      $start.EnvironmentVariables['GIT_NO_REPLACE_OBJECTS'] = '1'
+                      $start.EnvironmentVariables['GIT_NO_LAZY_FETCH'] = '1'
+                      $start.EnvironmentVariables['GIT_ALLOW_PROTOCOL'] = ''
+                      $process = [Diagnostics.Process]::new()
+                      $process.StartInfo = $start
+                      # Framework StandardInput inherits Console.InputEncoding and
+                      # AutoFlush can emit its BOM during Start, before WriteLine.
+                      $sourceBindingDiagnostic.reason = 'input_encoding'
+                      $previousInputEncoding = [Console]::InputEncoding
+                      $normalizeInputEncoding = $previousInputEncoding.CodePage -eq 65001 -and $previousInputEncoding.GetPreamble().Length -gt 0
+                      $inputEncoding = $(if ($normalizeInputEncoding) { [Text.UTF8Encoding]::new($false) } else { $previousInputEncoding })
+                      $request = $Expression + [Environment]::NewLine
+                      $asciiRequest = [Text.Encoding]::ASCII.GetBytes($request)
+                      if ($inputEncoding.GetPreamble().Length -ne 0 -or
+                          [Text.Encoding]::ASCII.GetString($asciiRequest) -cne $request -or
+                          [Convert]::ToBase64String($inputEncoding.GetBytes($request)) -cne [Convert]::ToBase64String($asciiRequest)) { throw "source" }
+                      try {
+                          # Change only UTF-8's preamble, never the shared console code page.
+                          if ($normalizeInputEncoding) { [Console]::InputEncoding = $inputEncoding }
+                          $sourceBindingDiagnostic.reason = 'process_start'
+                          $started = $process.Start()
+                          if (-not $started) { throw "source" }
+                      } finally {
+                          if ($normalizeInputEncoding) { [Console]::InputEncoding = $previousInputEncoding }
+                      }
+                      # Drain without retaining any stderr, including on malformed framing.
+                      $sourceBindingDiagnostic.reason = 'stderr_drain'
+                      $drain = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+                      $watch = [Diagnostics.Stopwatch]::StartNew()
+                      $sourceBindingDiagnostic.reason = 'request_write'
+                      $process.StandardInput.WriteLine($Expression)
+                      $process.StandardInput.Close()
+                      $stream = $process.StandardOutput.BaseStream
+                      function Read-K5Bytes([int]$Count) {
+                          $buffer = [byte[]]::new($Count)
+                          $offset = 0
+                          while ($offset -lt $Count) {
+                              $remaining = 10000 - [int]$watch.ElapsedMilliseconds
+                              if ($remaining -le 0) { throw "source" }
+                              $read = $stream.ReadAsync($buffer, $offset, $Count - $offset)
+                              if (-not $read.Wait($remaining)) { throw "source" }
+                              if ($read.Result -eq 0) { throw "source" }
+                              $offset += $read.Result
+                          }
+                          return ,$buffer
+                      }
+                      $header = [Collections.Generic.List[byte]]::new()
+                      $sourceBindingDiagnostic.reason = 'header_read'
+                      while ($true) {
+                          $next = Read-K5Bytes 1
+                          if ($next[0] -eq 10) { break }
+                          if ($header.Count -ge 96) { throw "source" }
+                          $header.Add($next[0])
+                      }
+                      $line = [Text.Encoding]::ASCII.GetString($header.ToArray())
+                      $sourceBindingDiagnostic.reason = 'header_format'
+                      if ($line -cnotmatch '\A([0-9a-f]{40}) (blob|commit|tree) ([1-9][0-9]{0,6})\z') { throw "source" }
+                      $oid, $type, $size = $Matches[1], $Matches[2], [int]$Matches[3]
+                      $sourceBindingDiagnostic.reason = 'object_kind_or_size'
+                      if ($type -cne $Kind -or $size -gt $Limit) { throw "source" }
+                      $sourceBindingDiagnostic.reason = 'body_read'
+                      $body = Read-K5Bytes $size
+                      $sourceBindingDiagnostic.reason = 'terminator'
+                      $terminator = Read-K5Bytes 1
+                      if ($terminator[0] -ne 10) { throw "source" }
+                      $sourceBindingDiagnostic.reason = 'end_of_output'
+                      $extra = [byte[]]::new(1)
+                      $remaining = 10000 - [int]$watch.ElapsedMilliseconds
+                      if ($remaining -le 0) { throw "source" }
+                      $end = $stream.ReadAsync($extra, 0, 1)
+                      if (-not $end.Wait($remaining) -or $end.Result -ne 0) { throw "source" }
+                      $sourceBindingDiagnostic.reason = 'process_exit'
+                      $remaining = 10000 - [int]$watch.ElapsedMilliseconds
+                      if ($remaining -le 0 -or -not $process.WaitForExit($remaining) -or $process.ExitCode -ne 0) { throw "source" }
+                      $sourceBindingDiagnostic.reason = 'stderr_drain'
+                      $remaining = 10000 - [int]$watch.ElapsedMilliseconds
+                      if ($remaining -le 0 -or -not $drain.Wait($remaining)) { throw "source" }
+                      $sourceBindingDiagnostic.reason = 'object_hash'
+                      $prefix = [Text.Encoding]::ASCII.GetBytes("$type $size" + [char]0)
+                      $sha1 = [Security.Cryptography.SHA1]::Create()
+                      try {
+                          $framed = [byte[]]::new($prefix.Length + $body.Length)
+                          [Array]::Copy($prefix, 0, $framed, 0, $prefix.Length)
+                          [Array]::Copy($body, 0, $framed, $prefix.Length, $body.Length)
+                          $digest = ([BitConverter]::ToString($sha1.ComputeHash($framed))).Replace('-', '').ToLowerInvariant()
+                      } finally { $sha1.Dispose() }
+                      if ($digest -cne $oid) { throw "source" }
+                      return @{ oid = $oid; bytes = $body }
+                  } finally {
+                      if ($null -ne $process) {
+                          $readReason = $sourceBindingDiagnostic.reason
+                          $sourceBindingDiagnostic.reason = 'process_cleanup'
+                          try {
+                              if ($started) {
+                                  if (-not $process.HasExited) { $process.Kill() }
+                                  if (-not $process.WaitForExit(2000)) { throw "source" }
+                              }
+                          } finally { $process.Dispose() }
+                          $sourceBindingDiagnostic.reason = $readReason
+                      }
+                  }
+                  }.GetNewClosure()
+                  return & $invokeGit -Operation $operation
+
+              }
+              try {
+                  if ($env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
+                      $env:K5_STAGE_ONE_REVISION -cnotmatch '\A[0-9a-f]{40}\z' -or
+                      $env:K5_STAGE_ONE_REVISION -cne $env:GITHUB_SHA -or
+                      $env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or
+                      $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,19}\z') { throw "source" }
+                  $sourceBindingDiagnostic.stage = 'git_binary'
+                  $sourceBindingDiagnostic.reason = 'identity'
+                  $git = 'C:\Program Files\Git\cmd\git.exe'
+                  if ($env:K5_CHECKOUT_GIT_SHA256 -cnotmatch '\A[0-9a-f]{64}\z' -or
+                      (Get-FileHash -LiteralPath $git -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_CHECKOUT_GIT_SHA256) { throw "source" }
+                  $utf8 = [Text.UTF8Encoding]::new($false, $true)
+                  $sourceBindingDiagnostic.stage = 'commit_read'
+                  $commit = Read-K5GitObject $env:K5_STAGE_ONE_REVISION 'commit' 65536
+                  $sourceBindingDiagnostic.stage = 'commit_identity'
+                  $sourceBindingDiagnostic.reason = 'object_id'
+                  if ($commit.oid -cne $env:K5_STAGE_ONE_REVISION) { throw "source" }
+                  $sourceBindingDiagnostic.stage = 'commit_decode'
+                  $sourceBindingDiagnostic.reason = 'utf8'
+                  $commitText = $utf8.GetString($commit.bytes)
+                  $sourceBindingDiagnostic.stage = 'commit_tree'
+                  $sourceBindingDiagnostic.reason = 'shape'
+                  if ($commitText -cnotmatch '\Atree ([0-9a-f]{40})\n') { throw "source" }
+                  $tree = $Matches[1]
+                  $sourceBindingDiagnostic.stage = 'producer_read'
+                  $producer = Read-K5GitObject ($env:K5_STAGE_ONE_REVISION + ':scripts/assert-stage-one-physical-admission.ps1') 'blob' 131072
+                  $sourceBindingDiagnostic.stage = 'producer_hash'
+                  $sourceBindingDiagnostic.reason = 'sha256'
+                  $sha256 = [Security.Cryptography.SHA256]::Create()
+                  try { $producerHash = ([BitConverter]::ToString($sha256.ComputeHash($producer.bytes))).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }
+                  $sourceBindingDiagnostic.stage = 'producer_decode'
+                  $sourceBindingDiagnostic.reason = 'utf8'
+                  $producerText = $utf8.GetString($producer.bytes)
+                  $sourceBindingDiagnostic.stage = 'script_compile'
+                  $sourceBindingDiagnostic.reason = 'syntax'
+                  $script = [scriptblock]::Create($producerText)
+                  $sourceBindingDiagnostic.stage = 'context'
+                  $sourceBindingDiagnostic.reason = 'construct'
+                  $context = @{
+                      repository = 'mkurtgerald/K5-Vision'; source_sha = $env:K5_STAGE_ONE_REVISION
+                      source_tree = $tree; producer_sha256 = $producerHash
+                      run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT; phase = 'pre_storage'
+                  }
+              } catch {
+                  Write-Host 'K5_HOST_NAME_OBSERVATION_UNAVAILABLE'
+                  try {
+                      $failureRecord = [ordered]@{
+                          schema_version = 'host-source-binding-v1'
+                          scope = 'diagnostic-only-source-binding'
+                          status = 'refused'
+                          stage = $sourceBindingDiagnostic.stage
+                          reason = $sourceBindingDiagnostic.reason
+                          edge_admission = $false
+                          retry_authority = $false
+                      }
+                      Write-Host ('K5_HOST_SOURCE_BINDING=' + ($failureRecord | ConvertTo-Json -Compress))
+                  } catch {}
+                  throw 'Exact host diagnostic source binding refused.'
+              }
+              & $script -DiagnosticContext $context
+          }
+
+          # Fresh boundary proof immediately before the second pinned action.
+          & $invokeGit -Operation { param($AdmittedGitPath) } | Out-Null
 
       - name: Checkout immutable Analytics source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -234,22 +699,860 @@ jobs:
           persist-credentials: false
 
       - name: Require exact Git-backed source checkouts
-        timeout-minutes: 1
+        id: git_after_analytics
+        timeout-minutes: 3
         shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
+          $pins = @(
+              @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
+              @{ name = 'assert-installed-git-alias.ps1'; size = 13028; blob = 'a3f9ae05f204905c9cd2e68f894a6bd53dc4d53c'; sha256 = '67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8' },
+              @{ name = 'admit_installed_git_alias.cs'; size = 36598; blob = '1e45e51c6171d88ff582466ba2664f9b81b75ebf'; sha256 = 'a751156ee06792f8f4625fa988c73a54c8e9a0a24937c06ab9264762f965d23f' }
+          )
+          # Fresh immutable source admission; no executable, checkout file or saved receipt is trusted here.
+          $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+          function Read-K5PinnedBlob($Pin) {
+              $response = $null; $stream = $null; $memory = $null; $sha1 = $null; $sha256 = $null
+              try {
+                  if ($env:GITHUB_API_URL -cne 'https://api.github.com' -or
+                      $env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
+                      [string]::IsNullOrEmpty($env:K5_GITHUB_TOKEN) -or $env:K5_GITHUB_TOKEN.Length -gt 8192 -or
+                      $Pin.size -le 0 -or $Pin.size -gt 65536 -or
+                      $Pin.blob -cnotmatch '\A[0-9a-f]{40}\z' -or $Pin.sha256 -cnotmatch '\A[0-9a-f]{64}\z') { throw 'context' }
+                  $url = 'https://api.github.com/repos/mkurtgerald/K5-Vision/git/blobs/' + $Pin.blob
+                  $request = [Net.HttpWebRequest]::Create($url)
+                  $request.Method = 'GET'; $request.AllowAutoRedirect = $false
+                  $request.Timeout = 15000; $request.ReadWriteTimeout = 15000
+                  $request.MaximumResponseHeadersLength = 16
+                  $request.AutomaticDecompression = [Net.DecompressionMethods]::None
+                  $request.Accept = 'application/vnd.github+json'; $request.UserAgent = 'K5-fixed-git-admission/1'
+                  $request.Headers['Authorization'] = 'Bearer ' + $env:K5_GITHUB_TOKEN
+                  $request.Headers['X-GitHub-Api-Version'] = '2022-11-28'
+                  $response = $request.GetResponse()
+                  if ([int]$response.StatusCode -ne 200 -or $response.ResponseUri.AbsoluteUri -cne $url -or
+                      $response.ContentLength -gt 131072 -or -not [string]::IsNullOrEmpty($response.ContentEncoding)) { throw 'response' }
+                  $stream = $response.GetResponseStream(); $memory = [IO.MemoryStream]::new()
+                  $buffer = [byte[]]::new(4096)
+                  $deadline = [Diagnostics.Stopwatch]::StartNew()
+                  while ($true) {
+                      $remaining = 131072 - [int]$memory.Length
+                      if ($remaining -le 0 -or $deadline.ElapsedMilliseconds -ge 15000) { throw 'response_bound' }
+                      $read = $stream.ReadAsync($buffer, 0, [Math]::Min($buffer.Length, $remaining))
+                      if (-not $read.Wait([Math]::Max(1, 15000 - [int]$deadline.ElapsedMilliseconds))) { throw 'response_timeout' }
+                      if ($read.Result -eq 0) { break }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $record = ConvertFrom-Json -InputObject $strictUtf8.GetString($memory.ToArray()) -ErrorAction Stop
+                  if ($record.sha -isnot [string] -or $record.sha -cne $Pin.blob -or $record.encoding -cne 'base64' -or
+                      ($record.size -isnot [int] -and $record.size -isnot [long]) -or $record.size -ne $Pin.size -or
+                      $record.content -isnot [string] -or $record.content.Length -gt 100000) { throw 'blob' }
+                  $encoded = $record.content.Replace("`r", '').Replace("`n", '')
+                  if ($encoded -cnotmatch '\A(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\z' -or
+                      $encoded.Length -ne 4 * [Math]::Ceiling($Pin.size / 3.0)) { throw 'base64' }
+                  $bytes = [Convert]::FromBase64String($encoded)
+                  if ($bytes.Length -ne $Pin.size -or [Convert]::ToBase64String($bytes) -cne $encoded) { throw 'size' }
+                  $sha256 = [Security.Cryptography.SHA256]::Create(); $sha1 = [Security.Cryptography.SHA1]::Create()
+                  if (([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() -cne $Pin.sha256) { throw 'digest' }
+                  $header = [Text.Encoding]::ASCII.GetBytes('blob ' + [string]$bytes.Length + [char]0)
+                  $framed = [byte[]]::new($header.Length + $bytes.Length)
+                  [Array]::Copy($header, 0, $framed, 0, $header.Length); [Array]::Copy($bytes, 0, $framed, $header.Length, $bytes.Length)
+                  if (([BitConverter]::ToString($sha1.ComputeHash($framed))).Replace('-', '').ToLowerInvariant() -cne $Pin.blob) { throw 'git_blob' }
+                  $null = $strictUtf8.GetString($bytes)
+                  return ,$bytes
+              } catch { throw 'Pinned Git admission source refused; existing owners were preserved.' }
+              finally {
+                  foreach ($owned in @($sha1, $sha256, $memory, $stream, $response)) { if ($null -ne $owned) { $owned.Dispose() } }
+              }
+          }
+          function Assert-K5OrdinaryCompilerPath([string]$Path, [bool]$Directory) {
+              if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 1024 -or $Path -cnotmatch '\A[A-Z]:\\' -or
+                  $Path -match '[\x00-\x1f"<>|?*]' -or $Path.Substring(2).Contains(':') -or
+                  [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'compiler_path' }
+              foreach ($part in $Path.Substring(3).Split('\')) {
+                  if ($part.Length -eq 0 -or $part -in @('.', '..') -or $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'compiler_path' }
+              }
+              $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+              if ($item.FullName -cne $Path -or [bool]$item.PSIsContainer -ne $Directory) { throw 'compiler_type' }
+              $depth = 0
+              while ($null -ne $item) {
+                  $depth++
+                  if ($depth -gt 32 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                      -not [string]::IsNullOrEmpty($item.LinkType)) { throw 'compiler_alias' }
+                  $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+              }
+          }
+          try {
+              if ($env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,19}\z' -or
+                  $env:GITHUB_ACTION -cnotmatch '\A[A-Za-z_][A-Za-z0-9_-]{0,79}\z') { throw 'context' }
+              $guardBytes = Read-K5PinnedBlob $pins[0]
+              $helperBytes = Read-K5PinnedBlob $pins[1]
+              $collectorBytes = Read-K5PinnedBlob $pins[2]
+              $trustedGuard = [scriptblock]::Create($strictUtf8.GetString($guardBytes))
+              & $trustedGuard | Out-Null
+              Assert-K5OrdinaryCompilerPath $env:RUNNER_TEMP $true
+              $privateCompilerTemp = Join-Path $env:RUNNER_TEMP ('k5-installed-git-alias-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT + '-' + $env:GITHUB_ACTION)
+              if (Test-Path -LiteralPath $privateCompilerTemp -ErrorAction Stop) { throw 'compiler_exists' }
+              $created = New-Item -ItemType Directory -Path $privateCompilerTemp -ErrorAction Stop
+              if ($created.FullName -cne $privateCompilerTemp) { throw 'compiler_path' }
+              Assert-K5OrdinaryCompilerPath $privateCompilerTemp $true
+              $invokeGit = & ([scriptblock]::Create($strictUtf8.GetString($helperBytes))) -SourceBytes $collectorBytes -AssertBoundary $trustedGuard -CompilerTemp $privateCompilerTemp
+              if ($invokeGit -isnot [scriptblock]) { throw 'initializer' }
+          } catch { throw 'Fresh exact Git admission initialization refused; existing owners were preserved.' }
+          function Invoke-K5OwnedGitText([string]$AdmittedGitPath, [string]$Arguments, [int]$Budget = 10000) {
+              # Called only inside one fresh held admission. One owned child, bounded output and lifetime.
+              $process = $null; $started = $false; $memory = $null
+              try {
+                  if ($AdmittedGitPath -cne 'C:\Program Files\Git\cmd\git.exe' -or $Budget -notin @(10000, 30000)) { throw 'git' }
+                  $start = [Diagnostics.ProcessStartInfo]::new()
+                  $start.FileName = $AdmittedGitPath; $start.Arguments = $Arguments
+                  $start.WorkingDirectory = $env:GITHUB_WORKSPACE
+                  $start.UseShellExecute = $false; $start.CreateNoWindow = $true
+                  $start.RedirectStandardInput = $true; $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+                  foreach ($key in @($start.EnvironmentVariables.Keys)) {
+                      if ($key -like 'GIT_*') { $start.EnvironmentVariables.Remove($key) }
+                  }
+                  $start.EnvironmentVariables['GIT_NO_REPLACE_OBJECTS'] = '1'
+                  $start.EnvironmentVariables['GIT_NO_LAZY_FETCH'] = '1'
+                  $start.EnvironmentVariables['GIT_ALLOW_PROTOCOL'] = ''
+                  $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
+                  $started = $process.Start()
+                  if (-not $started) { throw 'git' }
+                  $process.StandardInput.Close()
+                  $drain = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+                  $watch = [Diagnostics.Stopwatch]::StartNew()
+                  $stream = $process.StandardOutput.BaseStream
+                  $memory = [IO.MemoryStream]::new(); $buffer = [byte[]]::new(1024)
+                  while ($true) {
+                      $remaining = $Budget - [int]$watch.ElapsedMilliseconds
+                      if ($remaining -le 0) { throw 'git' }
+                      $read = $stream.ReadAsync($buffer, 0, $buffer.Length)
+                      if (-not $read.Wait($remaining)) { throw 'git' }
+                      if ($read.Result -eq 0) { break }
+                      if ($memory.Length + $read.Result -gt 4096) { throw 'git' }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $remaining = $Budget - [int]$watch.ElapsedMilliseconds
+                  if ($remaining -le 0 -or -not $process.WaitForExit($remaining) -or $process.ExitCode -ne 0) { throw 'git' }
+                  $remaining = $Budget - [int]$watch.ElapsedMilliseconds
+                  if ($remaining -le 0 -or -not $drain.Wait($remaining)) { throw 'git' }
+                  $text = [Text.UTF8Encoding]::new($false, $true).GetString($memory.ToArray())
+                  if ($text.Length -gt 0) {
+                      $text = $text -replace '(?:\r?\n)\z', ''
+                      foreach ($line in ($text -split '\r?\n')) { Write-Output $line }
+                  }
+              } catch { throw 'Bounded owned Git operation refused.' }
+              finally {
+                  try {
+                      if ($null -ne $process -and $started) {
+                          if (-not $process.HasExited) { $process.Kill() }
+                          if (-not $process.WaitForExit(2000)) { throw 'Owned Git cleanup refused.' }
+                      }
+                  } finally {
+                      if ($null -ne $memory) { $memory.Dispose() }
+                      if ($null -ne $process) { $process.Dispose() }
+                  }
+              }
+          }
+          $ownedGitText = ${function:Invoke-K5OwnedGitText}
+          & $invokeGit -Operation { param($AdmittedGitPath) } | Out-Null
           if ((Get-Command git -CommandType Application -ErrorAction Stop).Source -ine 'C:\Program Files\Git\cmd\git.exe') { throw "Checkout Git executable changed." }
           $sources = @{
             $env:GITHUB_WORKSPACE = $env:K5_STAGE_ONE_REVISION
             (Join-Path $env:GITHUB_WORKSPACE 'analytics-lab') = $env:ANALYTICS_LAB_SHA
           }
           foreach ($source in $sources.Keys) {
+            Assert-K5OrdinaryCompilerPath $source $true
             $metadata = Join-Path $source '.git'
             $attributes = [IO.File]::GetAttributes($metadata)
             if (-not ($attributes -band [IO.FileAttributes]::Directory) -or ($attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Real local Git checkout metadata required." }
-            $actual = @(git -C $source rev-parse HEAD)
-            if ($LASTEXITCODE -ne 0 -or $actual.Count -ne 1 -or $actual[0] -cne $sources[$source]) { throw "Exact Git checkout revision mismatch." }
+            & $invokeGit -Operation ({
+                param($AdmittedGitPath)
+                $actual = @(& $ownedGitText $AdmittedGitPath "--no-replace-objects --no-lazy-fetch -c protocol.allow=never -C `"$source`" rev-parse HEAD")
+                if ($actual.Count -ne 1 -or $actual[0] -cne $sources[$source]) { throw "Exact Git checkout revision mismatch." }
+            }.GetNewClosure()) | Out-Null
           }
+
+      - name: Bind early storage source under held Git admission
+        id: git_storage_source
+        if: github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+        timeout-minutes: 3
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pins = @(
+              @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
+              @{ name = 'assert-installed-git-alias.ps1'; size = 13028; blob = 'a3f9ae05f204905c9cd2e68f894a6bd53dc4d53c'; sha256 = '67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8' },
+              @{ name = 'admit_installed_git_alias.cs'; size = 36598; blob = '1e45e51c6171d88ff582466ba2664f9b81b75ebf'; sha256 = 'a751156ee06792f8f4625fa988c73a54c8e9a0a24937c06ab9264762f965d23f' }
+          )
+          # Fresh immutable source admission; no executable, checkout file or saved receipt is trusted here.
+          $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+          function Read-K5PinnedBlob($Pin) {
+              $response = $null; $stream = $null; $memory = $null; $sha1 = $null; $sha256 = $null
+              try {
+                  if ($env:GITHUB_API_URL -cne 'https://api.github.com' -or
+                      $env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
+                      [string]::IsNullOrEmpty($env:K5_GITHUB_TOKEN) -or $env:K5_GITHUB_TOKEN.Length -gt 8192 -or
+                      $Pin.size -le 0 -or $Pin.size -gt 65536 -or
+                      $Pin.blob -cnotmatch '\A[0-9a-f]{40}\z' -or $Pin.sha256 -cnotmatch '\A[0-9a-f]{64}\z') { throw 'context' }
+                  $url = 'https://api.github.com/repos/mkurtgerald/K5-Vision/git/blobs/' + $Pin.blob
+                  $request = [Net.HttpWebRequest]::Create($url)
+                  $request.Method = 'GET'; $request.AllowAutoRedirect = $false
+                  $request.Timeout = 15000; $request.ReadWriteTimeout = 15000
+                  $request.MaximumResponseHeadersLength = 16
+                  $request.AutomaticDecompression = [Net.DecompressionMethods]::None
+                  $request.Accept = 'application/vnd.github+json'; $request.UserAgent = 'K5-fixed-git-admission/1'
+                  $request.Headers['Authorization'] = 'Bearer ' + $env:K5_GITHUB_TOKEN
+                  $request.Headers['X-GitHub-Api-Version'] = '2022-11-28'
+                  $response = $request.GetResponse()
+                  if ([int]$response.StatusCode -ne 200 -or $response.ResponseUri.AbsoluteUri -cne $url -or
+                      $response.ContentLength -gt 131072 -or -not [string]::IsNullOrEmpty($response.ContentEncoding)) { throw 'response' }
+                  $stream = $response.GetResponseStream(); $memory = [IO.MemoryStream]::new()
+                  $buffer = [byte[]]::new(4096)
+                  $deadline = [Diagnostics.Stopwatch]::StartNew()
+                  while ($true) {
+                      $remaining = 131072 - [int]$memory.Length
+                      if ($remaining -le 0 -or $deadline.ElapsedMilliseconds -ge 15000) { throw 'response_bound' }
+                      $read = $stream.ReadAsync($buffer, 0, [Math]::Min($buffer.Length, $remaining))
+                      if (-not $read.Wait([Math]::Max(1, 15000 - [int]$deadline.ElapsedMilliseconds))) { throw 'response_timeout' }
+                      if ($read.Result -eq 0) { break }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $record = ConvertFrom-Json -InputObject $strictUtf8.GetString($memory.ToArray()) -ErrorAction Stop
+                  if ($record.sha -isnot [string] -or $record.sha -cne $Pin.blob -or $record.encoding -cne 'base64' -or
+                      ($record.size -isnot [int] -and $record.size -isnot [long]) -or $record.size -ne $Pin.size -or
+                      $record.content -isnot [string] -or $record.content.Length -gt 100000) { throw 'blob' }
+                  $encoded = $record.content.Replace("`r", '').Replace("`n", '')
+                  if ($encoded -cnotmatch '\A(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\z' -or
+                      $encoded.Length -ne 4 * [Math]::Ceiling($Pin.size / 3.0)) { throw 'base64' }
+                  $bytes = [Convert]::FromBase64String($encoded)
+                  if ($bytes.Length -ne $Pin.size -or [Convert]::ToBase64String($bytes) -cne $encoded) { throw 'size' }
+                  $sha256 = [Security.Cryptography.SHA256]::Create(); $sha1 = [Security.Cryptography.SHA1]::Create()
+                  if (([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() -cne $Pin.sha256) { throw 'digest' }
+                  $header = [Text.Encoding]::ASCII.GetBytes('blob ' + [string]$bytes.Length + [char]0)
+                  $framed = [byte[]]::new($header.Length + $bytes.Length)
+                  [Array]::Copy($header, 0, $framed, 0, $header.Length); [Array]::Copy($bytes, 0, $framed, $header.Length, $bytes.Length)
+                  if (([BitConverter]::ToString($sha1.ComputeHash($framed))).Replace('-', '').ToLowerInvariant() -cne $Pin.blob) { throw 'git_blob' }
+                  $null = $strictUtf8.GetString($bytes)
+                  return ,$bytes
+              } catch { throw 'Pinned Git admission source refused; existing owners were preserved.' }
+              finally {
+                  foreach ($owned in @($sha1, $sha256, $memory, $stream, $response)) { if ($null -ne $owned) { $owned.Dispose() } }
+              }
+          }
+          function Assert-K5OrdinaryCompilerPath([string]$Path, [bool]$Directory) {
+              if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 1024 -or $Path -cnotmatch '\A[A-Z]:\\' -or
+                  $Path -match '[\x00-\x1f"<>|?*]' -or $Path.Substring(2).Contains(':') -or
+                  [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'compiler_path' }
+              foreach ($part in $Path.Substring(3).Split('\')) {
+                  if ($part.Length -eq 0 -or $part -in @('.', '..') -or $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'compiler_path' }
+              }
+              $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+              if ($item.FullName -cne $Path -or [bool]$item.PSIsContainer -ne $Directory) { throw 'compiler_type' }
+              $depth = 0
+              while ($null -ne $item) {
+                  $depth++
+                  if ($depth -gt 32 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                      -not [string]::IsNullOrEmpty($item.LinkType)) { throw 'compiler_alias' }
+                  $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+              }
+          }
+          try {
+              if ($env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,19}\z' -or
+                  $env:GITHUB_ACTION -cnotmatch '\A[A-Za-z_][A-Za-z0-9_-]{0,79}\z') { throw 'context' }
+              $guardBytes = Read-K5PinnedBlob $pins[0]
+              $helperBytes = Read-K5PinnedBlob $pins[1]
+              $collectorBytes = Read-K5PinnedBlob $pins[2]
+              $trustedGuard = [scriptblock]::Create($strictUtf8.GetString($guardBytes))
+              & $trustedGuard | Out-Null
+              Assert-K5OrdinaryCompilerPath $env:RUNNER_TEMP $true
+              $privateCompilerTemp = Join-Path $env:RUNNER_TEMP ('k5-installed-git-alias-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT + '-' + $env:GITHUB_ACTION)
+              if (Test-Path -LiteralPath $privateCompilerTemp -ErrorAction Stop) { throw 'compiler_exists' }
+              $created = New-Item -ItemType Directory -Path $privateCompilerTemp -ErrorAction Stop
+              if ($created.FullName -cne $privateCompilerTemp) { throw 'compiler_path' }
+              Assert-K5OrdinaryCompilerPath $privateCompilerTemp $true
+              $invokeGit = & ([scriptblock]::Create($strictUtf8.GetString($helperBytes))) -SourceBytes $collectorBytes -AssertBoundary $trustedGuard -CompilerTemp $privateCompilerTemp
+              if ($invokeGit -isnot [scriptblock]) { throw 'initializer' }
+          } catch { throw 'Fresh exact Git admission initialization refused; existing owners were preserved.' }
+          $sourceBindingDiagnostic = @{ stage = 'storage_source'; reason = 'context' }
+          function Read-K5GitObject([string]$Expression, [string]$Kind, [int]$Limit) {
+              $operation = {
+                  param($AdmittedGitPath)
+              $process = $null
+              $started = $false
+              try {
+                  $sourceBindingDiagnostic.reason = 'process_setup'
+                  $start = [Diagnostics.ProcessStartInfo]::new()
+                  $start.FileName = $AdmittedGitPath
+                  $start.Arguments = '--no-replace-objects --no-lazy-fetch -c protocol.allow=never cat-file --batch'
+                  $start.WorkingDirectory = $env:GITHUB_WORKSPACE
+                  $start.UseShellExecute = $false
+                  $start.CreateNoWindow = $true
+                  $start.RedirectStandardInput = $true
+                  $start.RedirectStandardOutput = $true
+                  $start.RedirectStandardError = $true
+                  foreach ($key in @($start.EnvironmentVariables.Keys)) {
+                      if ($key -like 'GIT_*') { $start.EnvironmentVariables.Remove($key) }
+                  }
+                  $start.EnvironmentVariables['GIT_NO_REPLACE_OBJECTS'] = '1'
+                  $start.EnvironmentVariables['GIT_NO_LAZY_FETCH'] = '1'
+                  $start.EnvironmentVariables['GIT_ALLOW_PROTOCOL'] = ''
+                  $process = [Diagnostics.Process]::new()
+                  $process.StartInfo = $start
+                  # Framework StandardInput inherits Console.InputEncoding and
+                  # AutoFlush can emit its BOM during Start, before WriteLine.
+                  $sourceBindingDiagnostic.reason = 'input_encoding'
+                  $previousInputEncoding = [Console]::InputEncoding
+                  $normalizeInputEncoding = $previousInputEncoding.CodePage -eq 65001 -and $previousInputEncoding.GetPreamble().Length -gt 0
+                  $inputEncoding = $(if ($normalizeInputEncoding) { [Text.UTF8Encoding]::new($false) } else { $previousInputEncoding })
+                  $request = $Expression + [Environment]::NewLine
+                  $asciiRequest = [Text.Encoding]::ASCII.GetBytes($request)
+                  if ($inputEncoding.GetPreamble().Length -ne 0 -or
+                      [Text.Encoding]::ASCII.GetString($asciiRequest) -cne $request -or
+                      [Convert]::ToBase64String($inputEncoding.GetBytes($request)) -cne [Convert]::ToBase64String($asciiRequest)) { throw "source" }
+                  try {
+                      # Change only UTF-8's preamble, never the shared console code page.
+                      if ($normalizeInputEncoding) { [Console]::InputEncoding = $inputEncoding }
+                      $sourceBindingDiagnostic.reason = 'process_start'
+                      $started = $process.Start()
+                      if (-not $started) { throw "source" }
+                  } finally {
+                      if ($normalizeInputEncoding) { [Console]::InputEncoding = $previousInputEncoding }
+                  }
+                  # Drain without retaining any stderr, including on malformed framing.
+                  $sourceBindingDiagnostic.reason = 'stderr_drain'
+                  $drain = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+                  $watch = [Diagnostics.Stopwatch]::StartNew()
+                  $sourceBindingDiagnostic.reason = 'request_write'
+                  $process.StandardInput.WriteLine($Expression)
+                  $process.StandardInput.Close()
+                  $stream = $process.StandardOutput.BaseStream
+                  function Read-K5Bytes([int]$Count) {
+                      $buffer = [byte[]]::new($Count)
+                      $offset = 0
+                      while ($offset -lt $Count) {
+                          $remaining = 10000 - [int]$watch.ElapsedMilliseconds
+                          if ($remaining -le 0) { throw "source" }
+                          $read = $stream.ReadAsync($buffer, $offset, $Count - $offset)
+                          if (-not $read.Wait($remaining)) { throw "source" }
+                          if ($read.Result -eq 0) { throw "source" }
+                          $offset += $read.Result
+                      }
+                      return ,$buffer
+                  }
+                  $header = [Collections.Generic.List[byte]]::new()
+                  $sourceBindingDiagnostic.reason = 'header_read'
+                  while ($true) {
+                      $next = Read-K5Bytes 1
+                      if ($next[0] -eq 10) { break }
+                      if ($header.Count -ge 96) { throw "source" }
+                      $header.Add($next[0])
+                  }
+                  $line = [Text.Encoding]::ASCII.GetString($header.ToArray())
+                  $sourceBindingDiagnostic.reason = 'header_format'
+                  if ($line -cnotmatch '\A([0-9a-f]{40}) (blob|commit|tree) ([1-9][0-9]{0,6})\z') { throw "source" }
+                  $oid, $type, $size = $Matches[1], $Matches[2], [int]$Matches[3]
+                  $sourceBindingDiagnostic.reason = 'object_kind_or_size'
+                  if ($type -cne $Kind -or $size -gt $Limit) { throw "source" }
+                  $sourceBindingDiagnostic.reason = 'body_read'
+                  $body = Read-K5Bytes $size
+                  $sourceBindingDiagnostic.reason = 'terminator'
+                  $terminator = Read-K5Bytes 1
+                  if ($terminator[0] -ne 10) { throw "source" }
+                  $sourceBindingDiagnostic.reason = 'end_of_output'
+                  $extra = [byte[]]::new(1)
+                  $remaining = 10000 - [int]$watch.ElapsedMilliseconds
+                  if ($remaining -le 0) { throw "source" }
+                  $end = $stream.ReadAsync($extra, 0, 1)
+                  if (-not $end.Wait($remaining) -or $end.Result -ne 0) { throw "source" }
+                  $sourceBindingDiagnostic.reason = 'process_exit'
+                  $remaining = 10000 - [int]$watch.ElapsedMilliseconds
+                  if ($remaining -le 0 -or -not $process.WaitForExit($remaining) -or $process.ExitCode -ne 0) { throw "source" }
+                  $sourceBindingDiagnostic.reason = 'stderr_drain'
+                  $remaining = 10000 - [int]$watch.ElapsedMilliseconds
+                  if ($remaining -le 0 -or -not $drain.Wait($remaining)) { throw "source" }
+                  $sourceBindingDiagnostic.reason = 'object_hash'
+                  $prefix = [Text.Encoding]::ASCII.GetBytes("$type $size" + [char]0)
+                  $sha1 = [Security.Cryptography.SHA1]::Create()
+                  try {
+                      $framed = [byte[]]::new($prefix.Length + $body.Length)
+                      [Array]::Copy($prefix, 0, $framed, 0, $prefix.Length)
+                      [Array]::Copy($body, 0, $framed, $prefix.Length, $body.Length)
+                      $digest = ([BitConverter]::ToString($sha1.ComputeHash($framed))).Replace('-', '').ToLowerInvariant()
+                  } finally { $sha1.Dispose() }
+                  if ($digest -cne $oid) { throw "source" }
+                  return @{ oid = $oid; bytes = $body }
+              } finally {
+                  if ($null -ne $process) {
+                      $readReason = $sourceBindingDiagnostic.reason
+                      $sourceBindingDiagnostic.reason = 'process_cleanup'
+                      try {
+                          if ($started) {
+                              if (-not $process.HasExited) { $process.Kill() }
+                              if (-not $process.WaitForExit(2000)) { throw "source" }
+                          }
+                      } finally { $process.Dispose() }
+                      $sourceBindingDiagnostic.reason = $readReason
+                  }
+              }
+              }.GetNewClosure()
+              return & $invokeGit -Operation $operation
+
+          }
+          try {
+              if ($env:K5_STAGE_ONE_REVISION -cnotmatch '\A[0-9a-f]{40}\z' -or $env:K5_STAGE_ONE_REVISION -cne $env:GITHUB_SHA) { throw 'source' }
+              $commit = Read-K5GitObject $env:K5_STAGE_ONE_REVISION 'commit' 65536
+              $rootTree = Read-K5GitObject ($env:K5_STAGE_ONE_REVISION + '^{tree}') 'tree' 131072
+              $scriptsTree = Read-K5GitObject ($env:K5_STAGE_ONE_REVISION + ':scripts') 'tree' 131072
+              $storage = Read-K5GitObject ($env:K5_STAGE_ONE_REVISION + ':scripts/installer_wheel_storage.py') 'blob' 131072
+              # Never enumerate nested Git objects through the PowerShell pipeline:
+              # preserve the four [oid, kind, base64] records as actual JSON arrays.
+              $sourceObjects = [object[]]::new(4)
+              $sourceObjects[0] = [object[]]@($commit.oid, 'commit', [Convert]::ToBase64String($commit.bytes))
+              $sourceObjects[1] = [object[]]@($rootTree.oid, 'tree', [Convert]::ToBase64String($rootTree.bytes))
+              $sourceObjects[2] = [object[]]@($scriptsTree.oid, 'tree', [Convert]::ToBase64String($scriptsTree.bytes))
+              $sourceObjects[3] = [object[]]@($storage.oid, 'blob', [Convert]::ToBase64String($storage.bytes))
+              $sourcePacket = ConvertTo-Json -InputObject $sourceObjects -Compress -Depth 4
+              if ($sourcePacket.Length -gt 620000) { throw 'source' }
+          } catch {
+              Write-Host 'K5_STORAGE_PREFLIGHT={"schema_version":"storage-preflight-v1","scope":"read-only-early-storage-admission","status":"refused","stage":"source_binding","code":"source_read_unavailable","storage_acl":null,"retention_state":"not_started","later_admission_required":true}'
+              throw 'Exact storage source transport refused.'
+          }
+          try {
+              # Fixed-size data handoff only. Python independently checks every object and membership.
+              Assert-K5OrdinaryCompilerPath $privateCompilerTemp $true
+              $packetPath = Join-Path $privateCompilerTemp 'storage-source.json'
+              $packetBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($sourcePacket)
+              if ($packetBytes.Length -le 0 -or $packetBytes.Length -gt 620000) { throw 'source' }
+              $packetFile = [IO.File]::Open($packetPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+              try { $packetFile.Write($packetBytes, 0, $packetBytes.Length); $packetFile.Flush() }
+              finally { $packetFile.Dispose() }
+              Assert-K5OrdinaryCompilerPath $packetPath $false
+          } catch { throw 'Bounded storage source data handoff refused.' }
+
+      - name: Observe read-only storage admission before provisioning
+        if: github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+        timeout-minutes: 1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          try {
+              $runner = [IO.DirectoryInfo]::new($env:RUNNER_WORKSPACE)
+              $workspace = [IO.DirectoryInfo]::new($env:GITHUB_WORKSPACE)
+              $temporary = [IO.DirectoryInfo]::new($env:RUNNER_TEMP)
+              if ($runner.Name -cne 'K5-Vision' -or $workspace.Name -cne 'K5-Vision' -or
+                  $workspace.Parent.FullName -cne $runner.FullName -or $temporary.Name -cne '_temp' -or
+                  $temporary.Parent.FullName -cne $runner.Parent.FullName) { throw "runtime" }
+              $base = Join-Path $runner.Parent.FullName '_tool\Python\3.12.10\x64\python.exe'
+              foreach ($path in @($env:RUNNER_WORKSPACE, $env:GITHUB_WORKSPACE, $env:RUNNER_TEMP, $base)) {
+                  if (-not [IO.Path]::IsPathRooted($path) -or $path.StartsWith('\\') -or
+                      [IO.Path]::GetFullPath($path) -cne $path) { throw "runtime" }
+                  $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                  if ($item.FullName -cne $path -or ($path -ceq $base -and $item.PSIsContainer) -or
+                      ($path -cne $base -and -not $item.PSIsContainer)) { throw "runtime" }
+                  while ($null -ne $item) {
+                      if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                          -not [string]::IsNullOrEmpty($item.LinkType)) { throw "runtime" }
+                      $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+                  }
+              }
+              if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+                  '4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a') { throw "runtime" }
+          } catch {
+              Write-Host 'K5_STORAGE_PREFLIGHT={"schema_version":"storage-preflight-v1","scope":"read-only-early-storage-admission","status":"refused","stage":"runtime_binding","code":"runtime_unavailable","storage_acl":null,"retention_state":"not_started","later_admission_required":true}'
+              throw 'Existing exact storage-preflight runtime unavailable.'
+          }
+          $bootstrap = @'
+          # Fixed stdlib bootstrap: only verified binary Git source executes.
+          import base64, binascii, hashlib, json, os, re, stat, sys, types
+          from pathlib import Path
+
+          SOURCE_BINDING_CODES = frozenset((
+              'source_unavailable', 'source_environment', 'source_git_metadata',
+              'source_checkout_metadata', 'source_git_hash', 'source_path_shape',
+              'source_path_alias', 'source_path_type', 'source_file_links',
+              'source_path_identity', 'source_file_size', 'source_file_identity',
+              'source_commit_read', 'source_commit_identity', 'source_module_read',
+              'source_module_load', 'source_module_contract', 'source_process_start',
+              'source_request', 'source_object_header', 'source_object_kind',
+              'source_object_size', 'source_object_truncated', 'source_object_terminator',
+              'source_object_trailing', 'source_object_hash', 'source_read_unavailable',
+              'source_read_timeout', 'source_process_exit',
+          ))
+
+          class SourceBindingError(ValueError):
+              def __init__(self, code):
+                  super().__init__('binding')
+                  self.code = code
+
+          def require(value, code='source_unavailable'):
+              if not value:
+                  raise SourceBindingError(code)
+
+          def ordinary(path, directory):
+              require(path.is_absolute() and len(path.parts) <= 64 and not str(path).startswith(('\\\\', '//')), 'source_path_shape')
+              for item in reversed((path, *path.parents)):
+                  info = item.lstat()
+                  require(not stat.S_ISLNK(info.st_mode) and not getattr(info, 'st_file_attributes', 0) & 0x400, 'source_path_alias')
+                  is_dir = item != path or directory
+                  require(stat.S_ISDIR(info.st_mode) if is_dir else stat.S_ISREG(info.st_mode), 'source_path_type')
+                  if not is_dir:
+                      require(info.st_nlink == 1, 'source_file_links')
+              require(path.resolve(strict=True) == path, 'source_path_identity')
+
+          def file_digest(path):
+              before = path.lstat()
+              require(0 < before.st_size <= 64 * 1024 * 1024, 'source_file_size')
+              identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+              digest, count = hashlib.sha256(), 0
+              with path.open('rb') as stream:
+                  require(identity(os.fstat(stream.fileno())) == identity(before), 'source_file_identity')
+                  while True:
+                      chunk = stream.read(1024 * 1024)
+                      if not chunk:
+                          break
+                      count += len(chunk)
+                      require(count <= before.st_size, 'source_file_size')
+                      digest.update(chunk)
+                  require(identity(os.fstat(stream.fileno())) == identity(before), 'source_file_identity')
+              require(count == before.st_size and identity(path.lstat()) == identity(before), 'source_file_identity')
+              return digest.hexdigest()
+
+          def read_source_packet(path):
+              ordinary(path, False)
+              before = path.lstat()
+              require(0 < before.st_size <= 620000, 'source_object_size')
+              require(before.st_nlink == 1, 'source_file_links')
+              identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_nlink)
+              with path.open('rb') as stream:
+                  require(identity(os.fstat(stream.fileno())) == identity(before), 'source_file_identity')
+                  raw = stream.read(620001)
+                  require(len(raw) == before.st_size, 'source_object_size')
+                  require(identity(os.fstat(stream.fileno())) == identity(before), 'source_file_identity')
+              require(identity(path.lstat()) == identity(before), 'source_file_identity')
+              return json.loads(raw.decode('utf-8', errors='strict'))
+
+          def packet_object(packet, index, kind, limit):
+              require(type(packet) is list and len(packet) == 4, 'source_object_header')
+              entry = packet[index]
+              require(type(entry) is list and len(entry) == 3, 'source_object_header')
+              oid, actual_kind, encoded = entry
+              require(type(oid) is str and re.fullmatch('[0-9a-f]{40}', oid), 'source_object_header')
+              require(actual_kind == kind, 'source_object_kind')
+              require(type(encoded) is str and 0 < len(encoded) <= 4 * ((limit + 2) // 3), 'source_object_size')
+              try:
+                  body = base64.b64decode(encoded, validate=True)
+              except (ValueError, binascii.Error):
+                  raise SourceBindingError('source_object_header') from None
+              require(base64.b64encode(body).decode('ascii') == encoded, 'source_object_header')
+              require(0 < len(body) <= limit, 'source_object_size')
+              require(hashlib.sha1(kind.encode('ascii') + b' ' + str(len(body)).encode('ascii') + b'\0' + body).hexdigest() == oid, 'source_object_hash')
+              return oid, body
+
+          def tree_member(body, wanted, wanted_mode):
+              # Fixed two-component membership proof, no filesystem paths or source imports.
+              offset, entries, found, names = 0, 0, None, set()
+              while offset < len(body):
+                  entries += 1
+                  require(entries <= 4096, 'source_object_size')
+                  nul = body.find(b'\0', offset, min(len(body), offset + 1032))
+                  require(nul >= 0 and nul + 21 <= len(body), 'source_object_header')
+                  entry = body[offset:nul].split(b' ', 1)
+                  require(len(entry) == 2, 'source_object_header')
+                  mode, name = entry
+                  require(mode in (b'40000', b'100644', b'100755', b'120000', b'160000'), 'source_object_kind')
+                  require(0 < len(name) <= 1024 and name not in (b'.', b'..') and b'/' not in name and name not in names, 'source_object_header')
+                  names.add(name)
+                  if name == wanted:
+                      require(mode == wanted_mode, 'source_object_kind')
+                      found = body[nul + 1:nul + 21].hex()
+                  offset = nul + 21
+              require(found is not None, 'source_module_read')
+              return found
+
+          def verified_storage_source(packet, revision):
+              oid, commit = packet_object(packet, 0, 'commit', 65536)
+              require(oid == revision, 'source_commit_identity')
+              match = re.match(rb'tree ([0-9a-f]{40})\n', commit)
+              require(match is not None, 'source_commit_identity')
+              root_oid, root_tree = packet_object(packet, 1, 'tree', 131072)
+              require(root_oid == match[1].decode('ascii'), 'source_commit_identity')
+              scripts_oid, scripts_tree = packet_object(packet, 2, 'tree', 131072)
+              require(scripts_oid == tree_member(root_tree, b'scripts', b'40000'), 'source_module_read')
+              module_oid, source = packet_object(packet, 3, 'blob', 131072)
+              require(module_oid == tree_member(scripts_tree, b'installer_wheel_storage.py', b'100644'), 'source_module_read')
+              return source
+          record = dict(schema_version='storage-preflight-v1', scope='read-only-early-storage-admission',
+                        status='refused', stage='runtime_binding', code='runtime_unavailable', storage_acl=None,
+                        retention_state='not_started', later_admission_required=True)
+          try:
+              require(os.name == 'nt' and sys.implementation.name == 'cpython' and sys.version_info[:3] == (3, 12, 10))
+              require(sys.prefix == sys.base_prefix and sys.flags.isolated == 1 and sys.flags.no_site == 1 and sys.dont_write_bytecode)
+              runner, workspace, temporary = (Path(os.environ[key]) for key in ('RUNNER_WORKSPACE', 'GITHUB_WORKSPACE', 'RUNNER_TEMP'))
+              require(workspace.parent == runner and workspace.name == runner.name == 'K5-Vision')
+              require(temporary.parent == runner.parent and temporary.name == '_temp')
+              runtime = runner.parent / '_tool/Python/3.12.10/x64/python.exe'
+              require(Path(sys.executable) == runtime)
+              for path in (runner, workspace, temporary):
+                  ordinary(path, True)
+              ordinary(runtime, False)
+              require(file_digest(runtime) == '4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a')
+              record.update(stage='source_binding', code='source_unavailable')
+              record['code'] = 'source_environment'
+              revision = os.environ['K5_STAGE_ONE_REVISION']
+              require(re.fullmatch('[0-9a-f]{40}', revision) and revision == os.environ['GITHUB_SHA'])
+              require(os.environ['GITHUB_REPOSITORY'] == 'mkurtgerald/K5-Vision')
+              require(os.environ['K5_CANDIDATE_BRANCH'] == 'fix/transactional-alpha-upgrade-20261003')
+              for key in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'):
+                  require(re.fullmatch('[1-9][0-9]{0,19}', os.environ[key]))
+              record['code'] = 'source_checkout_metadata'
+              ordinary(workspace / '.git', True)
+              record['code'] = 'source_git_hash'
+              require(os.environ['K5_CHECKOUT_GIT_SHA256'] == '78211c7ed73988da93a6d8a33d47ec6187f464d7ea2a9a00c182bbd7a1ecf30f')
+              record['code'] = 'source_commit_read'
+              packet_path = temporary / ('k5-installed-git-alias-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '-git_storage_source') / 'storage-source.json'
+              source = verified_storage_source(read_source_packet(packet_path), revision)
+              record['code'] = 'source_module_load'
+              module = types.ModuleType('_k5_early_storage')
+              module.__file__ = str(workspace / 'scripts/installer_wheel_storage.py')
+              exec(compile(source, '<k5-verified-storage-preflight>', 'exec'), module.__dict__)
+              record['code'] = 'source_module_contract'
+              record = module.storage_preflight(runner, workspace, temporary)
+          except SourceBindingError as error:
+              if record['stage'] == 'source_binding' and error.code in SOURCE_BINDING_CODES and error.code != 'source_unavailable':
+                  record['code'] = error.code
+          except BaseException:
+              pass
+          print('K5_STORAGE_PREFLIGHT=' + json.dumps(record, sort_keys=True, separators=(',', ':')))
+          raise SystemExit(0 if record['status'] == 'passed' else 1)
+          '@
+          try {
+              $probe = @($bootstrap | & $base -I -B -S - 2>$null)
+              $probeExit = $LASTEXITCODE
+              if ($probe.Count -ne 1 -or $probe[0] -isnot [string] -or $probe[0].Length -gt 4096 -or
+                  -not $probe[0].StartsWith('K5_STORAGE_PREFLIGHT={') -or $probeExit -notin @(0, 1)) { throw 'probe' }
+              # Reproject only the complete fixed schema; never echo a child output line.
+              function Test-K5Keys($Value, [string]$Keys) {
+                  if ($null -eq $Value -or $Value.GetType().FullName -cne 'System.Management.Automation.PSCustomObject' -or
+                      (@($Value.PSObject.Properties.Name | Sort-Object) -join ',') -cne $Keys) { throw 'probe' }
+              }
+              function Test-K5Enum($Value, $Choices) {
+                  if ($Value -isnot [string] -or $Value -cnotin $Choices) { throw 'probe' }
+              }
+              function Test-K5Integer($Value, [long]$Minimum, [long]$Maximum) {
+                  if (($Value -isnot [int] -and $Value -isnot [long]) -or $Value -lt $Minimum -or $Value -gt $Maximum) { throw 'probe' }
+              }
+              $observed = $probe[0].Substring('K5_STORAGE_PREFLIGHT='.Length) | ConvertFrom-Json -ErrorAction Stop
+              Test-K5Keys $observed 'code,later_admission_required,retention_state,schema_version,scope,stage,status,storage_acl'
+              Test-K5Enum $observed.schema_version @('storage-preflight-v1')
+              Test-K5Enum $observed.scope @('read-only-early-storage-admission')
+              Test-K5Enum $observed.retention_state @('not_started')
+              Test-K5Enum $observed.status @('passed', 'refused')
+              Test-K5Enum $observed.stage @('runtime_binding', 'source_binding', 'storage_construction', 'storage_root')
+              $stageCodes = @{
+                  runtime_binding = @('runtime_unavailable')
+                  source_binding = @(
+                      'source_unavailable', 'source_cleanup_failed', 'source_environment',
+                      'source_git_metadata', 'source_checkout_metadata', 'source_git_hash',
+                      'source_path_shape', 'source_path_alias', 'source_path_type',
+                      'source_file_links', 'source_path_identity', 'source_file_size',
+                      'source_file_identity', 'source_commit_read', 'source_commit_identity',
+                      'source_module_read', 'source_module_load', 'source_module_contract',
+                      'source_process_start', 'source_request', 'source_object_header',
+                      'source_object_kind', 'source_object_size', 'source_object_truncated',
+                      'source_object_terminator', 'source_object_trailing', 'source_object_hash',
+                      'source_read_unavailable', 'source_read_timeout', 'source_process_exit'
+                  )
+                  storage_construction = @('storage_path', 'storage_policy', 'storage_helper', 'storage_identity', 'storage_ownership', 'storage_interrupted')
+                  storage_root = @('storage_path', 'storage_layout', 'storage_volume', 'storage_ownership', 'storage_acl', 'storage_helper', 'storage_interrupted', 'passed')
+              }
+              Test-K5Enum $observed.code $stageCodes[$observed.stage]
+              if ($observed.later_admission_required -isnot [bool] -or -not $observed.later_admission_required -or
+                  (($probeExit -eq 0) -ne ($observed.status -ceq 'passed')) -or
+                  (($observed.code -ceq 'passed') -ne ($observed.status -ceq 'passed'))) { throw 'probe' }
+              $acl = $null
+              if ($null -ne $observed.storage_acl) {
+                  if ($observed.code -cne 'storage_acl') { throw 'probe' }
+                  $inputAcl = $observed.storage_acl
+                  $aclKeys = 'ace,admission_mode,ancestor_distance,native_call,native_error,path_context,path_role,phase,reason,schema_version'
+                  Test-K5Keys $inputAcl $aclKeys
+                  Test-K5Enum $inputAcl.schema_version @('storage-acl-admission-v2')
+                  Test-K5Enum $inputAcl.path_role @('runner_workspace', 'workspace', 'runner_temp', 'work_root', 'ancestor', 'unknown')
+                  Test-K5Enum $inputAcl.path_context @('runner_workspace', 'workspace', 'runner_temp', 'work_root', 'unknown')
+                  Test-K5Enum $inputAcl.admission_mode @('ancestor', 'owned', 'existing', 'unknown')
+                  Test-K5Enum $inputAcl.phase @('principal_query', 'token_owner_query', 'descriptor_query', 'trusted_installer_query', 'ownership_policy', 'ace_policy', 'unknown')
+                  Test-K5Enum $inputAcl.native_call @('GetNamedSecurityInfoW', 'none', 'unknown')
+                  Test-K5Enum $inputAcl.native_error @('success', 'access_denied', 'path_missing', 'invalid_parameter', 'insufficient_buffer', 'invalid_acl', 'invalid_security_descriptor', 'other_error', 'not_observed', 'unknown')
+                  Test-K5Enum $inputAcl.reason @('foreign_mutating_allow', 'unsupported_ace', 'native_query', 'descriptor_parse', 'owner_sid_parse', 'descriptor_validation', 'unknown')
+                  if ($null -ne $inputAcl.ancestor_distance) { Test-K5Integer $inputAcl.ancestor_distance 1 64 }
+                  $ace = $null
+                  if ($null -ne $inputAcl.ace) {
+                      if ($inputAcl.phase -cne 'ace_policy' -or $inputAcl.reason -cne 'foreign_mutating_allow') { throw 'probe' }
+                      $inputAce = $inputAcl.ace
+                      $aceKeys = 'access_mask,ace_type,effective_principal_category,expanded_access_mask,inheritance_flags,principal_category'
+                      Test-K5Keys $inputAce $aceKeys
+                      Test-K5Enum $inputAce.ace_type @('allow', 'deny', 'unknown')
+                      $categories = @('local_system', 'builtin_administrators', 'builtin_users', 'everyone', 'authenticated_users', 'creator_owner', 'owner_rights', 'trusted_installer_sid', 'current_user', 'redacted_other', 'unknown')
+                      Test-K5Enum $inputAce.principal_category $categories
+                      Test-K5Enum $inputAce.effective_principal_category $categories
+                      if ($null -ne $inputAce.access_mask) {
+                          Test-K5Integer $inputAce.access_mask 0 4294967295
+                          if ([long]$inputAce.access_mask -band (-bnot [long]4045341183)) { throw 'probe' }
+                      }
+                      if ($null -ne $inputAce.expanded_access_mask) {
+                          Test-K5Integer $inputAce.expanded_access_mask 0 4294967295
+                          if ($null -eq $inputAce.access_mask) { throw 'probe' }
+                          $expanded = [long]$inputAce.access_mask
+                          foreach ($pair in @(@([long]2147483648, [long]1179785), @([long]1073741824, [long]1179926), @([long]536870912, [long]1179808), @([long]268435456, [long]2032127))) {
+                              if ($expanded -band $pair[0]) { $expanded = ($expanded -band (-bnot $pair[0])) -bor $pair[1] }
+                          }
+                          if ($inputAce.expanded_access_mask -ne $expanded) { throw 'probe' }
+                      }
+                      if ($null -ne $inputAce.inheritance_flags) {
+                          Test-K5Integer $inputAce.inheritance_flags 0 31
+                          if (($inputAce.inheritance_flags -band 8) -and -not ($inputAce.inheritance_flags -band 3)) { throw 'probe' }
+                      }
+                      $ace = [ordered]@{}
+                      foreach ($key in $aceKeys.Split(',')) { $ace[$key] = $inputAce.$key }
+                  }
+                  $acl = [ordered]@{}
+                  foreach ($key in $aclKeys.Split(',')) { $acl[$key] = $inputAcl.$key }
+                  $acl.ace = $ace
+              }
+              $observed = [ordered]@{
+                  schema_version = 'storage-preflight-v1'; scope = 'read-only-early-storage-admission'
+                  status = $observed.status; stage = $observed.stage; code = $observed.code
+                  storage_acl = $acl; retention_state = 'not_started'; later_admission_required = $true
+              }
+          } catch {
+              Write-Host 'K5_STORAGE_PREFLIGHT={"schema_version":"storage-preflight-v1","scope":"read-only-early-storage-admission","status":"refused","stage":"runtime_binding","code":"bootstrap_unavailable","storage_acl":null,"retention_state":"not_started","later_admission_required":true}'
+              throw 'Existing exact storage-preflight bootstrap unavailable.'
+          }
+          Write-Host ('K5_STORAGE_PREFLIGHT=' + ($observed | ConvertTo-Json -Compress -Depth 4))
+          if ($probeExit -ne 0) { throw 'Early read-only storage admission refused; later acceptance remains required.' }
+
+      - name: Independently admit early Git compiler artifacts
+        if: always()
+        timeout-minutes: 2
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pins = @(
+              @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
+              @{ name = 'assert-installed-git-alias.ps1'; size = 13028; blob = 'a3f9ae05f204905c9cd2e68f894a6bd53dc4d53c'; sha256 = '67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8' },
+              @{ name = 'admit_installed_git_alias.cs'; size = 36598; blob = '1e45e51c6171d88ff582466ba2664f9b81b75ebf'; sha256 = 'a751156ee06792f8f4625fa988c73a54c8e9a0a24937c06ab9264762f965d23f' }
+          )
+          # Fresh immutable source admission; no executable, checkout file or saved receipt is trusted here.
+          $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+          function Read-K5PinnedBlob($Pin) {
+              $response = $null; $stream = $null; $memory = $null; $sha1 = $null; $sha256 = $null
+              try {
+                  if ($env:GITHUB_API_URL -cne 'https://api.github.com' -or
+                      $env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
+                      [string]::IsNullOrEmpty($env:K5_GITHUB_TOKEN) -or $env:K5_GITHUB_TOKEN.Length -gt 8192 -or
+                      $Pin.size -le 0 -or $Pin.size -gt 65536 -or
+                      $Pin.blob -cnotmatch '\A[0-9a-f]{40}\z' -or $Pin.sha256 -cnotmatch '\A[0-9a-f]{64}\z') { throw 'context' }
+                  $url = 'https://api.github.com/repos/mkurtgerald/K5-Vision/git/blobs/' + $Pin.blob
+                  $request = [Net.HttpWebRequest]::Create($url)
+                  $request.Method = 'GET'; $request.AllowAutoRedirect = $false
+                  $request.Timeout = 15000; $request.ReadWriteTimeout = 15000
+                  $request.MaximumResponseHeadersLength = 16
+                  $request.AutomaticDecompression = [Net.DecompressionMethods]::None
+                  $request.Accept = 'application/vnd.github+json'; $request.UserAgent = 'K5-fixed-git-admission/1'
+                  $request.Headers['Authorization'] = 'Bearer ' + $env:K5_GITHUB_TOKEN
+                  $request.Headers['X-GitHub-Api-Version'] = '2022-11-28'
+                  $response = $request.GetResponse()
+                  if ([int]$response.StatusCode -ne 200 -or $response.ResponseUri.AbsoluteUri -cne $url -or
+                      $response.ContentLength -gt 131072 -or -not [string]::IsNullOrEmpty($response.ContentEncoding)) { throw 'response' }
+                  $stream = $response.GetResponseStream(); $memory = [IO.MemoryStream]::new()
+                  $buffer = [byte[]]::new(4096)
+                  $deadline = [Diagnostics.Stopwatch]::StartNew()
+                  while ($true) {
+                      $remaining = 131072 - [int]$memory.Length
+                      if ($remaining -le 0 -or $deadline.ElapsedMilliseconds -ge 15000) { throw 'response_bound' }
+                      $read = $stream.ReadAsync($buffer, 0, [Math]::Min($buffer.Length, $remaining))
+                      if (-not $read.Wait([Math]::Max(1, 15000 - [int]$deadline.ElapsedMilliseconds))) { throw 'response_timeout' }
+                      if ($read.Result -eq 0) { break }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $record = ConvertFrom-Json -InputObject $strictUtf8.GetString($memory.ToArray()) -ErrorAction Stop
+                  if ($record.sha -isnot [string] -or $record.sha -cne $Pin.blob -or $record.encoding -cne 'base64' -or
+                      ($record.size -isnot [int] -and $record.size -isnot [long]) -or $record.size -ne $Pin.size -or
+                      $record.content -isnot [string] -or $record.content.Length -gt 100000) { throw 'blob' }
+                  $encoded = $record.content.Replace("`r", '').Replace("`n", '')
+                  if ($encoded -cnotmatch '\A(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\z' -or
+                      $encoded.Length -ne 4 * [Math]::Ceiling($Pin.size / 3.0)) { throw 'base64' }
+                  $bytes = [Convert]::FromBase64String($encoded)
+                  if ($bytes.Length -ne $Pin.size -or [Convert]::ToBase64String($bytes) -cne $encoded) { throw 'size' }
+                  $sha256 = [Security.Cryptography.SHA256]::Create(); $sha1 = [Security.Cryptography.SHA1]::Create()
+                  if (([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() -cne $Pin.sha256) { throw 'digest' }
+                  $header = [Text.Encoding]::ASCII.GetBytes('blob ' + [string]$bytes.Length + [char]0)
+                  $framed = [byte[]]::new($header.Length + $bytes.Length)
+                  [Array]::Copy($header, 0, $framed, 0, $header.Length); [Array]::Copy($bytes, 0, $framed, $header.Length, $bytes.Length)
+                  if (([BitConverter]::ToString($sha1.ComputeHash($framed))).Replace('-', '').ToLowerInvariant() -cne $Pin.blob) { throw 'git_blob' }
+                  $null = $strictUtf8.GetString($bytes)
+                  return ,$bytes
+              } catch { throw 'Pinned Git admission source refused; existing owners were preserved.' }
+              finally {
+                  foreach ($owned in @($sha1, $sha256, $memory, $stream, $response)) { if ($null -ne $owned) { $owned.Dispose() } }
+              }
+          }
+          function Assert-K5OrdinaryCompilerPath([string]$Path, [bool]$Directory) {
+              if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 1024 -or $Path -cnotmatch '\A[A-Z]:\\' -or
+                  $Path -match '[\x00-\x1f"<>|?*]' -or $Path.Substring(2).Contains(':') -or
+                  [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'compiler_path' }
+              foreach ($part in $Path.Substring(3).Split('\')) {
+                  if ($part.Length -eq 0 -or $part -in @('.', '..') -or $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'compiler_path' }
+              }
+              $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+              if ($item.FullName -cne $Path -or [bool]$item.PSIsContainer -ne $Directory) { throw 'compiler_type' }
+              $depth = 0
+              while ($null -ne $item) {
+                  $depth++
+                  if ($depth -gt 32 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                      -not [string]::IsNullOrEmpty($item.LinkType)) { throw 'compiler_alias' }
+                  $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+              }
+          }
+          try {
+              # This is a new same-host PowerShell process after all named owners exited.
+              # Retained compiler artifacts must be ordinary FILES only. Never recurse or clean up.
+              $trustedGuard = [scriptblock]::Create($strictUtf8.GetString((Read-K5PinnedBlob $pins[0])))
+              & $trustedGuard | Out-Null
+              $rows = @(Get-CimInstance -ClassName Win32_Process -Property Name -OperationTimeoutSec 10 -ErrorAction Stop)
+              if ($rows.Count -lt 1 -or $rows.Count -gt 32768) { throw 'compiler_inventory' }
+              foreach ($row in $rows) {
+                  if ($row.Name -isnot [string] -or $row.Name.Length -eq 0 -or $row.Name.Length -gt 260 -or
+                      $row.Name -match '[\x00\\/:\r\n]' -or $row.Name -iin @('csc.exe', 'cvtres.exe', 'vbc.exe', 'VBCSCompiler.exe')) { throw 'compiler_occupied' }
+              }
+              if ($env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,19}\z') { throw 'context' }
+              Assert-K5OrdinaryCompilerPath $env:RUNNER_TEMP $true
+              foreach ($action in @('git_before_candidate', 'git_between_checkouts', 'git_after_analytics', 'git_storage_source')) {
+                  $path = Join-Path $env:RUNNER_TEMP ('k5-installed-git-alias-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT + '-' + $action)
+                  if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { continue }
+                  Assert-K5OrdinaryCompilerPath $path $true
+                  $entries = [IO.Directory]::EnumerateFileSystemEntries($path).GetEnumerator()
+                  $count = 0; [long]$bytes = 0
+                  try {
+                      while ($entries.MoveNext()) {
+                          $count++
+                          if ($count -gt 64) { throw 'compiler_artifacts' }
+                          $entry = [string]$entries.Current
+                          Assert-K5OrdinaryCompilerPath $entry $false
+                          $file = Get-Item -LiteralPath $entry -Force -ErrorAction Stop
+                          $bytes += $file.Length
+                          if ($file.Length -lt 0 -or $bytes -gt 16777216) { throw 'compiler_artifacts' }
+                      }
+                  } finally { $entries.Dispose() }
+              }
+              & $trustedGuard | Out-Null
+              Write-Host 'K5_GIT_COMPILER_POST=passed'
+          } catch { throw 'Independent Git compiler final admission refused; existing owners were preserved.' }
 
       - name: Provision existing reviewed GStreamer runtime
         shell: powershell
@@ -258,7 +1561,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed candidate branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -300,13 +1603,168 @@ jobs:
           "PIP_REQUIRE_VIRTUALENV=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Prepare existing bounded rights-reviewed fixture
+        id: git_fixture_revision
         shell: powershell
         env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
           PYTHONPATH: ${{ github.workspace }}\analytics-lab
         run: |
           $ErrorActionPreference = "Stop"
-          $actual = (git -C analytics-lab rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $actual -cne $env:ANALYTICS_LAB_SHA) { throw "Analytics fixture revision mismatch." }
+          $pins = @(
+              @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
+              @{ name = 'assert-installed-git-alias.ps1'; size = 13028; blob = 'a3f9ae05f204905c9cd2e68f894a6bd53dc4d53c'; sha256 = '67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8' },
+              @{ name = 'admit_installed_git_alias.cs'; size = 36598; blob = '1e45e51c6171d88ff582466ba2664f9b81b75ebf'; sha256 = 'a751156ee06792f8f4625fa988c73a54c8e9a0a24937c06ab9264762f965d23f' }
+          )
+          # Fresh immutable source admission; no executable, checkout file or saved receipt is trusted here.
+          $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+          function Read-K5PinnedBlob($Pin) {
+              $response = $null; $stream = $null; $memory = $null; $sha1 = $null; $sha256 = $null
+              try {
+                  if ($env:GITHUB_API_URL -cne 'https://api.github.com' -or
+                      $env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
+                      [string]::IsNullOrEmpty($env:K5_GITHUB_TOKEN) -or $env:K5_GITHUB_TOKEN.Length -gt 8192 -or
+                      $Pin.size -le 0 -or $Pin.size -gt 65536 -or
+                      $Pin.blob -cnotmatch '\A[0-9a-f]{40}\z' -or $Pin.sha256 -cnotmatch '\A[0-9a-f]{64}\z') { throw 'context' }
+                  $url = 'https://api.github.com/repos/mkurtgerald/K5-Vision/git/blobs/' + $Pin.blob
+                  $request = [Net.HttpWebRequest]::Create($url)
+                  $request.Method = 'GET'; $request.AllowAutoRedirect = $false
+                  $request.Timeout = 15000; $request.ReadWriteTimeout = 15000
+                  $request.MaximumResponseHeadersLength = 16
+                  $request.AutomaticDecompression = [Net.DecompressionMethods]::None
+                  $request.Accept = 'application/vnd.github+json'; $request.UserAgent = 'K5-fixed-git-admission/1'
+                  $request.Headers['Authorization'] = 'Bearer ' + $env:K5_GITHUB_TOKEN
+                  $request.Headers['X-GitHub-Api-Version'] = '2022-11-28'
+                  $response = $request.GetResponse()
+                  if ([int]$response.StatusCode -ne 200 -or $response.ResponseUri.AbsoluteUri -cne $url -or
+                      $response.ContentLength -gt 131072 -or -not [string]::IsNullOrEmpty($response.ContentEncoding)) { throw 'response' }
+                  $stream = $response.GetResponseStream(); $memory = [IO.MemoryStream]::new()
+                  $buffer = [byte[]]::new(4096)
+                  $deadline = [Diagnostics.Stopwatch]::StartNew()
+                  while ($true) {
+                      $remaining = 131072 - [int]$memory.Length
+                      if ($remaining -le 0 -or $deadline.ElapsedMilliseconds -ge 15000) { throw 'response_bound' }
+                      $read = $stream.ReadAsync($buffer, 0, [Math]::Min($buffer.Length, $remaining))
+                      if (-not $read.Wait([Math]::Max(1, 15000 - [int]$deadline.ElapsedMilliseconds))) { throw 'response_timeout' }
+                      if ($read.Result -eq 0) { break }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $record = ConvertFrom-Json -InputObject $strictUtf8.GetString($memory.ToArray()) -ErrorAction Stop
+                  if ($record.sha -isnot [string] -or $record.sha -cne $Pin.blob -or $record.encoding -cne 'base64' -or
+                      ($record.size -isnot [int] -and $record.size -isnot [long]) -or $record.size -ne $Pin.size -or
+                      $record.content -isnot [string] -or $record.content.Length -gt 100000) { throw 'blob' }
+                  $encoded = $record.content.Replace("`r", '').Replace("`n", '')
+                  if ($encoded -cnotmatch '\A(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\z' -or
+                      $encoded.Length -ne 4 * [Math]::Ceiling($Pin.size / 3.0)) { throw 'base64' }
+                  $bytes = [Convert]::FromBase64String($encoded)
+                  if ($bytes.Length -ne $Pin.size -or [Convert]::ToBase64String($bytes) -cne $encoded) { throw 'size' }
+                  $sha256 = [Security.Cryptography.SHA256]::Create(); $sha1 = [Security.Cryptography.SHA1]::Create()
+                  if (([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() -cne $Pin.sha256) { throw 'digest' }
+                  $header = [Text.Encoding]::ASCII.GetBytes('blob ' + [string]$bytes.Length + [char]0)
+                  $framed = [byte[]]::new($header.Length + $bytes.Length)
+                  [Array]::Copy($header, 0, $framed, 0, $header.Length); [Array]::Copy($bytes, 0, $framed, $header.Length, $bytes.Length)
+                  if (([BitConverter]::ToString($sha1.ComputeHash($framed))).Replace('-', '').ToLowerInvariant() -cne $Pin.blob) { throw 'git_blob' }
+                  $null = $strictUtf8.GetString($bytes)
+                  return ,$bytes
+              } catch { throw 'Pinned Git admission source refused; existing owners were preserved.' }
+              finally {
+                  foreach ($owned in @($sha1, $sha256, $memory, $stream, $response)) { if ($null -ne $owned) { $owned.Dispose() } }
+              }
+          }
+          function Assert-K5OrdinaryCompilerPath([string]$Path, [bool]$Directory) {
+              if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 1024 -or $Path -cnotmatch '\A[A-Z]:\\' -or
+                  $Path -match '[\x00-\x1f"<>|?*]' -or $Path.Substring(2).Contains(':') -or
+                  [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'compiler_path' }
+              foreach ($part in $Path.Substring(3).Split('\')) {
+                  if ($part.Length -eq 0 -or $part -in @('.', '..') -or $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'compiler_path' }
+              }
+              $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+              if ($item.FullName -cne $Path -or [bool]$item.PSIsContainer -ne $Directory) { throw 'compiler_type' }
+              $depth = 0
+              while ($null -ne $item) {
+                  $depth++
+                  if ($depth -gt 32 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                      -not [string]::IsNullOrEmpty($item.LinkType)) { throw 'compiler_alias' }
+                  $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+              }
+          }
+          try {
+              if ($env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,19}\z' -or
+                  $env:GITHUB_ACTION -cnotmatch '\A[A-Za-z_][A-Za-z0-9_-]{0,79}\z') { throw 'context' }
+              $guardBytes = Read-K5PinnedBlob $pins[0]
+              $helperBytes = Read-K5PinnedBlob $pins[1]
+              $collectorBytes = Read-K5PinnedBlob $pins[2]
+              $trustedGuard = [scriptblock]::Create($strictUtf8.GetString($guardBytes))
+              & $trustedGuard | Out-Null
+              Assert-K5OrdinaryCompilerPath $env:RUNNER_TEMP $true
+              $privateCompilerTemp = Join-Path $env:RUNNER_TEMP ('k5-installed-git-alias-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT + '-' + $env:GITHUB_ACTION)
+              if (Test-Path -LiteralPath $privateCompilerTemp -ErrorAction Stop) { throw 'compiler_exists' }
+              $created = New-Item -ItemType Directory -Path $privateCompilerTemp -ErrorAction Stop
+              if ($created.FullName -cne $privateCompilerTemp) { throw 'compiler_path' }
+              Assert-K5OrdinaryCompilerPath $privateCompilerTemp $true
+              $invokeGit = & ([scriptblock]::Create($strictUtf8.GetString($helperBytes))) -SourceBytes $collectorBytes -AssertBoundary $trustedGuard -CompilerTemp $privateCompilerTemp
+              if ($invokeGit -isnot [scriptblock]) { throw 'initializer' }
+          } catch { throw 'Fresh exact Git admission initialization refused; existing owners were preserved.' }
+          function Invoke-K5OwnedGitText([string]$AdmittedGitPath, [string]$Arguments, [int]$Budget = 10000) {
+              # Called only inside one fresh held admission. One owned child, bounded output and lifetime.
+              $process = $null; $started = $false; $memory = $null
+              try {
+                  if ($AdmittedGitPath -cne 'C:\Program Files\Git\cmd\git.exe' -or $Budget -notin @(10000, 30000)) { throw 'git' }
+                  $start = [Diagnostics.ProcessStartInfo]::new()
+                  $start.FileName = $AdmittedGitPath; $start.Arguments = $Arguments
+                  $start.WorkingDirectory = $env:GITHUB_WORKSPACE
+                  $start.UseShellExecute = $false; $start.CreateNoWindow = $true
+                  $start.RedirectStandardInput = $true; $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+                  foreach ($key in @($start.EnvironmentVariables.Keys)) {
+                      if ($key -like 'GIT_*') { $start.EnvironmentVariables.Remove($key) }
+                  }
+                  $start.EnvironmentVariables['GIT_NO_REPLACE_OBJECTS'] = '1'
+                  $start.EnvironmentVariables['GIT_NO_LAZY_FETCH'] = '1'
+                  $start.EnvironmentVariables['GIT_ALLOW_PROTOCOL'] = ''
+                  $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
+                  $started = $process.Start()
+                  if (-not $started) { throw 'git' }
+                  $process.StandardInput.Close()
+                  $drain = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+                  $watch = [Diagnostics.Stopwatch]::StartNew()
+                  $stream = $process.StandardOutput.BaseStream
+                  $memory = [IO.MemoryStream]::new(); $buffer = [byte[]]::new(1024)
+                  while ($true) {
+                      $remaining = $Budget - [int]$watch.ElapsedMilliseconds
+                      if ($remaining -le 0) { throw 'git' }
+                      $read = $stream.ReadAsync($buffer, 0, $buffer.Length)
+                      if (-not $read.Wait($remaining)) { throw 'git' }
+                      if ($read.Result -eq 0) { break }
+                      if ($memory.Length + $read.Result -gt 4096) { throw 'git' }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $remaining = $Budget - [int]$watch.ElapsedMilliseconds
+                  if ($remaining -le 0 -or -not $process.WaitForExit($remaining) -or $process.ExitCode -ne 0) { throw 'git' }
+                  $remaining = $Budget - [int]$watch.ElapsedMilliseconds
+                  if ($remaining -le 0 -or -not $drain.Wait($remaining)) { throw 'git' }
+                  $text = [Text.UTF8Encoding]::new($false, $true).GetString($memory.ToArray())
+                  if ($text.Length -gt 0) {
+                      $text = $text -replace '(?:\r?\n)\z', ''
+                      foreach ($line in ($text -split '\r?\n')) { Write-Output $line }
+                  }
+              } catch { throw 'Bounded owned Git operation refused.' }
+              finally {
+                  try {
+                      if ($null -ne $process -and $started) {
+                          if (-not $process.HasExited) { $process.Kill() }
+                          if (-not $process.WaitForExit(2000)) { throw 'Owned Git cleanup refused.' }
+                      }
+                  } finally {
+                      if ($null -ne $memory) { $memory.Dispose() }
+                      if ($null -ne $process) { $process.Dispose() }
+                  }
+              }
+          }
+          $ownedGitText = ${function:Invoke-K5OwnedGitText}
+          & $invokeGit -Operation ({
+              param($AdmittedGitPath)
+              $actual = @(& $ownedGitText $AdmittedGitPath '--no-replace-objects --no-lazy-fetch -c protocol.allow=never -C analytics-lab rev-parse HEAD')
+              if ($actual.Count -ne 1 -or $actual[0] -cne $env:ANALYTICS_LAB_SHA) { throw "Analytics fixture revision mismatch." }
+          }.GetNewClosure()) | Out-Null
           $evidence = Join-Path $env:RUNNER_TEMP ("k5-installed-evidence-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
           if (Test-Path -LiteralPath $evidence) { throw "Fixture evidence path already exists." }
           New-Item -ItemType Directory -Path $evidence -ErrorAction Stop | Out-Null
@@ -314,6 +1772,126 @@ jobs:
           python -B -m analytics_lab.validation_seed --output-dir $evidence
           if ($LASTEXITCODE -ne 0) { throw "Pinned fixture preparation failed." }
           "K5_ANALYTICS_EVIDENCE_ROOT=$evidence" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Independently admit fixture Git compiler artifacts
+        if: always()
+        timeout-minutes: 2
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pins = @(
+              @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
+              @{ name = 'assert-installed-git-alias.ps1'; size = 13028; blob = 'a3f9ae05f204905c9cd2e68f894a6bd53dc4d53c'; sha256 = '67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8' },
+              @{ name = 'admit_installed_git_alias.cs'; size = 36598; blob = '1e45e51c6171d88ff582466ba2664f9b81b75ebf'; sha256 = 'a751156ee06792f8f4625fa988c73a54c8e9a0a24937c06ab9264762f965d23f' }
+          )
+          # Fresh immutable source admission; no executable, checkout file or saved receipt is trusted here.
+          $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+          function Read-K5PinnedBlob($Pin) {
+              $response = $null; $stream = $null; $memory = $null; $sha1 = $null; $sha256 = $null
+              try {
+                  if ($env:GITHUB_API_URL -cne 'https://api.github.com' -or
+                      $env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
+                      [string]::IsNullOrEmpty($env:K5_GITHUB_TOKEN) -or $env:K5_GITHUB_TOKEN.Length -gt 8192 -or
+                      $Pin.size -le 0 -or $Pin.size -gt 65536 -or
+                      $Pin.blob -cnotmatch '\A[0-9a-f]{40}\z' -or $Pin.sha256 -cnotmatch '\A[0-9a-f]{64}\z') { throw 'context' }
+                  $url = 'https://api.github.com/repos/mkurtgerald/K5-Vision/git/blobs/' + $Pin.blob
+                  $request = [Net.HttpWebRequest]::Create($url)
+                  $request.Method = 'GET'; $request.AllowAutoRedirect = $false
+                  $request.Timeout = 15000; $request.ReadWriteTimeout = 15000
+                  $request.MaximumResponseHeadersLength = 16
+                  $request.AutomaticDecompression = [Net.DecompressionMethods]::None
+                  $request.Accept = 'application/vnd.github+json'; $request.UserAgent = 'K5-fixed-git-admission/1'
+                  $request.Headers['Authorization'] = 'Bearer ' + $env:K5_GITHUB_TOKEN
+                  $request.Headers['X-GitHub-Api-Version'] = '2022-11-28'
+                  $response = $request.GetResponse()
+                  if ([int]$response.StatusCode -ne 200 -or $response.ResponseUri.AbsoluteUri -cne $url -or
+                      $response.ContentLength -gt 131072 -or -not [string]::IsNullOrEmpty($response.ContentEncoding)) { throw 'response' }
+                  $stream = $response.GetResponseStream(); $memory = [IO.MemoryStream]::new()
+                  $buffer = [byte[]]::new(4096)
+                  $deadline = [Diagnostics.Stopwatch]::StartNew()
+                  while ($true) {
+                      $remaining = 131072 - [int]$memory.Length
+                      if ($remaining -le 0 -or $deadline.ElapsedMilliseconds -ge 15000) { throw 'response_bound' }
+                      $read = $stream.ReadAsync($buffer, 0, [Math]::Min($buffer.Length, $remaining))
+                      if (-not $read.Wait([Math]::Max(1, 15000 - [int]$deadline.ElapsedMilliseconds))) { throw 'response_timeout' }
+                      if ($read.Result -eq 0) { break }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $record = ConvertFrom-Json -InputObject $strictUtf8.GetString($memory.ToArray()) -ErrorAction Stop
+                  if ($record.sha -isnot [string] -or $record.sha -cne $Pin.blob -or $record.encoding -cne 'base64' -or
+                      ($record.size -isnot [int] -and $record.size -isnot [long]) -or $record.size -ne $Pin.size -or
+                      $record.content -isnot [string] -or $record.content.Length -gt 100000) { throw 'blob' }
+                  $encoded = $record.content.Replace("`r", '').Replace("`n", '')
+                  if ($encoded -cnotmatch '\A(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\z' -or
+                      $encoded.Length -ne 4 * [Math]::Ceiling($Pin.size / 3.0)) { throw 'base64' }
+                  $bytes = [Convert]::FromBase64String($encoded)
+                  if ($bytes.Length -ne $Pin.size -or [Convert]::ToBase64String($bytes) -cne $encoded) { throw 'size' }
+                  $sha256 = [Security.Cryptography.SHA256]::Create(); $sha1 = [Security.Cryptography.SHA1]::Create()
+                  if (([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() -cne $Pin.sha256) { throw 'digest' }
+                  $header = [Text.Encoding]::ASCII.GetBytes('blob ' + [string]$bytes.Length + [char]0)
+                  $framed = [byte[]]::new($header.Length + $bytes.Length)
+                  [Array]::Copy($header, 0, $framed, 0, $header.Length); [Array]::Copy($bytes, 0, $framed, $header.Length, $bytes.Length)
+                  if (([BitConverter]::ToString($sha1.ComputeHash($framed))).Replace('-', '').ToLowerInvariant() -cne $Pin.blob) { throw 'git_blob' }
+                  $null = $strictUtf8.GetString($bytes)
+                  return ,$bytes
+              } catch { throw 'Pinned Git admission source refused; existing owners were preserved.' }
+              finally {
+                  foreach ($owned in @($sha1, $sha256, $memory, $stream, $response)) { if ($null -ne $owned) { $owned.Dispose() } }
+              }
+          }
+          function Assert-K5OrdinaryCompilerPath([string]$Path, [bool]$Directory) {
+              if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 1024 -or $Path -cnotmatch '\A[A-Z]:\\' -or
+                  $Path -match '[\x00-\x1f"<>|?*]' -or $Path.Substring(2).Contains(':') -or
+                  [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'compiler_path' }
+              foreach ($part in $Path.Substring(3).Split('\')) {
+                  if ($part.Length -eq 0 -or $part -in @('.', '..') -or $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'compiler_path' }
+              }
+              $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+              if ($item.FullName -cne $Path -or [bool]$item.PSIsContainer -ne $Directory) { throw 'compiler_type' }
+              $depth = 0
+              while ($null -ne $item) {
+                  $depth++
+                  if ($depth -gt 32 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                      -not [string]::IsNullOrEmpty($item.LinkType)) { throw 'compiler_alias' }
+                  $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+              }
+          }
+          try {
+              # This is a new same-host PowerShell process after all named owners exited.
+              # Retained compiler artifacts must be ordinary FILES only. Never recurse or clean up.
+              $trustedGuard = [scriptblock]::Create($strictUtf8.GetString((Read-K5PinnedBlob $pins[0])))
+              & $trustedGuard | Out-Null
+              $rows = @(Get-CimInstance -ClassName Win32_Process -Property Name -OperationTimeoutSec 10 -ErrorAction Stop)
+              if ($rows.Count -lt 1 -or $rows.Count -gt 32768) { throw 'compiler_inventory' }
+              foreach ($row in $rows) {
+                  if ($row.Name -isnot [string] -or $row.Name.Length -eq 0 -or $row.Name.Length -gt 260 -or
+                      $row.Name -match '[\x00\\/:\r\n]' -or $row.Name -iin @('csc.exe', 'cvtres.exe', 'vbc.exe', 'VBCSCompiler.exe')) { throw 'compiler_occupied' }
+              }
+              if ($env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,19}\z') { throw 'context' }
+              Assert-K5OrdinaryCompilerPath $env:RUNNER_TEMP $true
+              foreach ($action in @('git_fixture_revision')) {
+                  $path = Join-Path $env:RUNNER_TEMP ('k5-installed-git-alias-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT + '-' + $action)
+                  if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { continue }
+                  Assert-K5OrdinaryCompilerPath $path $true
+                  $entries = [IO.Directory]::EnumerateFileSystemEntries($path).GetEnumerator()
+                  $count = 0; [long]$bytes = 0
+                  try {
+                      while ($entries.MoveNext()) {
+                          $count++
+                          if ($count -gt 64) { throw 'compiler_artifacts' }
+                          $entry = [string]$entries.Current
+                          Assert-K5OrdinaryCompilerPath $entry $false
+                          $file = Get-Item -LiteralPath $entry -Force -ErrorAction Stop
+                          $bytes += $file.Length
+                          if ($file.Length -lt 0 -or $bytes -gt 16777216) { throw 'compiler_artifacts' }
+                      }
+                  } finally { $entries.Dispose() }
+              }
+              & $trustedGuard | Out-Null
+              Write-Host 'K5_GIT_COMPILER_POST=passed'
+          } catch { throw 'Independent Git compiler final admission refused; existing owners were preserved.' }
 
       - name: Recheck fresh exact candidate before installed Alpha baseline
         timeout-minutes: 1
@@ -323,7 +1901,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed candidate branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -353,7 +1931,7 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed candidate branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/installed-analytics-operator-20261003", "feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed candidate branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
@@ -393,7 +1971,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Installed receipt violated exact source-free contract." }
 
       - name: Prepare independently bound offline Start-script inputs
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
+        id: git_launcher_archives
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
         timeout-minutes: 6
         shell: powershell
         env:
@@ -401,24 +1980,182 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/alpha-analytics-preflight-20261004", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed launcher branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed launcher branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
           if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; Start-script preparation refused." }
+          $pins = @(
+              @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
+              @{ name = 'assert-installed-git-alias.ps1'; size = 13028; blob = 'a3f9ae05f204905c9cd2e68f894a6bd53dc4d53c'; sha256 = '67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8' },
+              @{ name = 'admit_installed_git_alias.cs'; size = 36598; blob = '1e45e51c6171d88ff582466ba2664f9b81b75ebf'; sha256 = 'a751156ee06792f8f4625fa988c73a54c8e9a0a24937c06ab9264762f965d23f' }
+          )
+          # Fresh immutable source admission; no executable, checkout file or saved receipt is trusted here.
+          $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+          function Read-K5PinnedBlob($Pin) {
+              $response = $null; $stream = $null; $memory = $null; $sha1 = $null; $sha256 = $null
+              try {
+                  if ($env:GITHUB_API_URL -cne 'https://api.github.com' -or
+                      $env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
+                      [string]::IsNullOrEmpty($env:K5_GITHUB_TOKEN) -or $env:K5_GITHUB_TOKEN.Length -gt 8192 -or
+                      $Pin.size -le 0 -or $Pin.size -gt 65536 -or
+                      $Pin.blob -cnotmatch '\A[0-9a-f]{40}\z' -or $Pin.sha256 -cnotmatch '\A[0-9a-f]{64}\z') { throw 'context' }
+                  $url = 'https://api.github.com/repos/mkurtgerald/K5-Vision/git/blobs/' + $Pin.blob
+                  $request = [Net.HttpWebRequest]::Create($url)
+                  $request.Method = 'GET'; $request.AllowAutoRedirect = $false
+                  $request.Timeout = 15000; $request.ReadWriteTimeout = 15000
+                  $request.MaximumResponseHeadersLength = 16
+                  $request.AutomaticDecompression = [Net.DecompressionMethods]::None
+                  $request.Accept = 'application/vnd.github+json'; $request.UserAgent = 'K5-fixed-git-admission/1'
+                  $request.Headers['Authorization'] = 'Bearer ' + $env:K5_GITHUB_TOKEN
+                  $request.Headers['X-GitHub-Api-Version'] = '2022-11-28'
+                  $response = $request.GetResponse()
+                  if ([int]$response.StatusCode -ne 200 -or $response.ResponseUri.AbsoluteUri -cne $url -or
+                      $response.ContentLength -gt 131072 -or -not [string]::IsNullOrEmpty($response.ContentEncoding)) { throw 'response' }
+                  $stream = $response.GetResponseStream(); $memory = [IO.MemoryStream]::new()
+                  $buffer = [byte[]]::new(4096)
+                  $deadline = [Diagnostics.Stopwatch]::StartNew()
+                  while ($true) {
+                      $remaining = 131072 - [int]$memory.Length
+                      if ($remaining -le 0 -or $deadline.ElapsedMilliseconds -ge 15000) { throw 'response_bound' }
+                      $read = $stream.ReadAsync($buffer, 0, [Math]::Min($buffer.Length, $remaining))
+                      if (-not $read.Wait([Math]::Max(1, 15000 - [int]$deadline.ElapsedMilliseconds))) { throw 'response_timeout' }
+                      if ($read.Result -eq 0) { break }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $record = ConvertFrom-Json -InputObject $strictUtf8.GetString($memory.ToArray()) -ErrorAction Stop
+                  if ($record.sha -isnot [string] -or $record.sha -cne $Pin.blob -or $record.encoding -cne 'base64' -or
+                      ($record.size -isnot [int] -and $record.size -isnot [long]) -or $record.size -ne $Pin.size -or
+                      $record.content -isnot [string] -or $record.content.Length -gt 100000) { throw 'blob' }
+                  $encoded = $record.content.Replace("`r", '').Replace("`n", '')
+                  if ($encoded -cnotmatch '\A(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\z' -or
+                      $encoded.Length -ne 4 * [Math]::Ceiling($Pin.size / 3.0)) { throw 'base64' }
+                  $bytes = [Convert]::FromBase64String($encoded)
+                  if ($bytes.Length -ne $Pin.size -or [Convert]::ToBase64String($bytes) -cne $encoded) { throw 'size' }
+                  $sha256 = [Security.Cryptography.SHA256]::Create(); $sha1 = [Security.Cryptography.SHA1]::Create()
+                  if (([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() -cne $Pin.sha256) { throw 'digest' }
+                  $header = [Text.Encoding]::ASCII.GetBytes('blob ' + [string]$bytes.Length + [char]0)
+                  $framed = [byte[]]::new($header.Length + $bytes.Length)
+                  [Array]::Copy($header, 0, $framed, 0, $header.Length); [Array]::Copy($bytes, 0, $framed, $header.Length, $bytes.Length)
+                  if (([BitConverter]::ToString($sha1.ComputeHash($framed))).Replace('-', '').ToLowerInvariant() -cne $Pin.blob) { throw 'git_blob' }
+                  $null = $strictUtf8.GetString($bytes)
+                  return ,$bytes
+              } catch { throw 'Pinned Git admission source refused; existing owners were preserved.' }
+              finally {
+                  foreach ($owned in @($sha1, $sha256, $memory, $stream, $response)) { if ($null -ne $owned) { $owned.Dispose() } }
+              }
+          }
+          function Assert-K5OrdinaryCompilerPath([string]$Path, [bool]$Directory) {
+              if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 1024 -or $Path -cnotmatch '\A[A-Z]:\\' -or
+                  $Path -match '[\x00-\x1f"<>|?*]' -or $Path.Substring(2).Contains(':') -or
+                  [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'compiler_path' }
+              foreach ($part in $Path.Substring(3).Split('\')) {
+                  if ($part.Length -eq 0 -or $part -in @('.', '..') -or $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'compiler_path' }
+              }
+              $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+              if ($item.FullName -cne $Path -or [bool]$item.PSIsContainer -ne $Directory) { throw 'compiler_type' }
+              $depth = 0
+              while ($null -ne $item) {
+                  $depth++
+                  if ($depth -gt 32 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                      -not [string]::IsNullOrEmpty($item.LinkType)) { throw 'compiler_alias' }
+                  $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+              }
+          }
+          try {
+              if ($env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,19}\z' -or
+                  $env:GITHUB_ACTION -cnotmatch '\A[A-Za-z_][A-Za-z0-9_-]{0,79}\z') { throw 'context' }
+              $guardBytes = Read-K5PinnedBlob $pins[0]
+              $helperBytes = Read-K5PinnedBlob $pins[1]
+              $collectorBytes = Read-K5PinnedBlob $pins[2]
+              $trustedGuard = [scriptblock]::Create($strictUtf8.GetString($guardBytes))
+              & $trustedGuard | Out-Null
+              Assert-K5OrdinaryCompilerPath $env:RUNNER_TEMP $true
+              $privateCompilerTemp = Join-Path $env:RUNNER_TEMP ('k5-installed-git-alias-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT + '-' + $env:GITHUB_ACTION)
+              if (Test-Path -LiteralPath $privateCompilerTemp -ErrorAction Stop) { throw 'compiler_exists' }
+              $created = New-Item -ItemType Directory -Path $privateCompilerTemp -ErrorAction Stop
+              if ($created.FullName -cne $privateCompilerTemp) { throw 'compiler_path' }
+              Assert-K5OrdinaryCompilerPath $privateCompilerTemp $true
+              $invokeGit = & ([scriptblock]::Create($strictUtf8.GetString($helperBytes))) -SourceBytes $collectorBytes -AssertBoundary $trustedGuard -CompilerTemp $privateCompilerTemp
+              if ($invokeGit -isnot [scriptblock]) { throw 'initializer' }
+          } catch { throw 'Fresh exact Git admission initialization refused; existing owners were preserved.' }
+          function Invoke-K5OwnedGitText([string]$AdmittedGitPath, [string]$Arguments, [int]$Budget = 10000) {
+              # Called only inside one fresh held admission. One owned child, bounded output and lifetime.
+              $process = $null; $started = $false; $memory = $null
+              try {
+                  if ($AdmittedGitPath -cne 'C:\Program Files\Git\cmd\git.exe' -or $Budget -notin @(10000, 30000)) { throw 'git' }
+                  $start = [Diagnostics.ProcessStartInfo]::new()
+                  $start.FileName = $AdmittedGitPath; $start.Arguments = $Arguments
+                  $start.WorkingDirectory = $env:GITHUB_WORKSPACE
+                  $start.UseShellExecute = $false; $start.CreateNoWindow = $true
+                  $start.RedirectStandardInput = $true; $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+                  foreach ($key in @($start.EnvironmentVariables.Keys)) {
+                      if ($key -like 'GIT_*') { $start.EnvironmentVariables.Remove($key) }
+                  }
+                  $start.EnvironmentVariables['GIT_NO_REPLACE_OBJECTS'] = '1'
+                  $start.EnvironmentVariables['GIT_NO_LAZY_FETCH'] = '1'
+                  $start.EnvironmentVariables['GIT_ALLOW_PROTOCOL'] = ''
+                  $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
+                  $started = $process.Start()
+                  if (-not $started) { throw 'git' }
+                  $process.StandardInput.Close()
+                  $drain = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+                  $watch = [Diagnostics.Stopwatch]::StartNew()
+                  $stream = $process.StandardOutput.BaseStream
+                  $memory = [IO.MemoryStream]::new(); $buffer = [byte[]]::new(1024)
+                  while ($true) {
+                      $remaining = $Budget - [int]$watch.ElapsedMilliseconds
+                      if ($remaining -le 0) { throw 'git' }
+                      $read = $stream.ReadAsync($buffer, 0, $buffer.Length)
+                      if (-not $read.Wait($remaining)) { throw 'git' }
+                      if ($read.Result -eq 0) { break }
+                      if ($memory.Length + $read.Result -gt 4096) { throw 'git' }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $remaining = $Budget - [int]$watch.ElapsedMilliseconds
+                  if ($remaining -le 0 -or -not $process.WaitForExit($remaining) -or $process.ExitCode -ne 0) { throw 'git' }
+                  $remaining = $Budget - [int]$watch.ElapsedMilliseconds
+                  if ($remaining -le 0 -or -not $drain.Wait($remaining)) { throw 'git' }
+                  $text = [Text.UTF8Encoding]::new($false, $true).GetString($memory.ToArray())
+                  if ($text.Length -gt 0) {
+                      $text = $text -replace '(?:\r?\n)\z', ''
+                      foreach ($line in ($text -split '\r?\n')) { Write-Output $line }
+                  }
+              } catch { throw 'Bounded owned Git operation refused.' }
+              finally {
+                  try {
+                      if ($null -ne $process -and $started) {
+                          if (-not $process.HasExited) { $process.Kill() }
+                          if (-not $process.WaitForExit(2000)) { throw 'Owned Git cleanup refused.' }
+                      }
+                  } finally {
+                      if ($null -ne $memory) { $memory.Dispose() }
+                      if ($null -ne $process) { $process.Dispose() }
+                  }
+              }
+          }
+          $ownedGitText = ${function:Invoke-K5OwnedGitText}
           $root = Join-Path $env:RUNNER_TEMP ("k5-alpha-launcher-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
           if (Test-Path -LiteralPath $root) { throw "Launcher input path already exists." }
           New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
           "K5_ALPHA_LAUNCHER_OWNED=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          $git = 'C:\Program Files\Git\cmd\git.exe'
-          & $git -c core.autocrlf=false -c core.eol=lf -C $env:GITHUB_WORKSPACE archive --format=zip --output="$root\source.zip" $env:K5_STAGE_ONE_REVISION
-          if ($LASTEXITCODE -ne 0) { throw "Exact launcher source archive failed." }
-          & $git -c core.autocrlf=false -c core.eol=lf -C "$env:GITHUB_WORKSPACE\analytics-lab" archive --format=zip --output="$root\analytics.zip" $env:ANALYTICS_LAB_SHA
-          if ($LASTEXITCODE -ne 0) { throw "Exact Analytics source archive failed." }
+          Assert-K5OrdinaryCompilerPath $root $true
+          Assert-K5OrdinaryCompilerPath $env:GITHUB_WORKSPACE $true
+          & $invokeGit -Operation ({
+              param($AdmittedGitPath)
+              $output = @(& $ownedGitText $AdmittedGitPath "--no-replace-objects --no-lazy-fetch -c protocol.allow=never -c core.autocrlf=false -c core.eol=lf -C `"$env:GITHUB_WORKSPACE`" archive --format=zip --output=`"$root\source.zip`" $env:K5_STAGE_ONE_REVISION" 30000)
+              if ($output.Count -ne 0) { throw "Exact launcher source archive failed." }
+          }.GetNewClosure()) | Out-Null
+          & $invokeGit -Operation ({
+              param($AdmittedGitPath)
+              $output = @(& $ownedGitText $AdmittedGitPath "--no-replace-objects --no-lazy-fetch -c protocol.allow=never -c core.autocrlf=false -c core.eol=lf -C `"$env:GITHUB_WORKSPACE\analytics-lab`" archive --format=zip --output=`"$root\analytics.zip`" $env:ANALYTICS_LAB_SHA" 30000)
+              if ($output.Count -ne 0) { throw "Exact Analytics source archive failed." }
+          }.GetNewClosure()) | Out-Null
           Expand-Archive -LiteralPath "$root\source.zip" -DestinationPath "$root\source"
           Expand-Archive -LiteralPath "$root\analytics.zip" -DestinationPath "$root\analytics-source"
           $base = $env:K5_WITNESS_BASE_PYTHON
           if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_WITNESS_BASE_PYTHON_SHA256) { throw "Admitted base Python changed." }
+          # Later witness drivers keep their own existing admission, with no alias receipt or continuous lease.
           # Provisioning is explicit and precedes the offline installed witness.
           # No raw process output, credentials, source paths or media are retained.
           @'
@@ -478,8 +2215,128 @@ jobs:
           '@ | & $base -I -B -S - $root
           if ($LASTEXITCODE -ne 0) { throw "Independent launcher input admission failed." }
 
+      - name: Independently admit launcher Git compiler artifacts
+        if: always()
+        timeout-minutes: 2
+        shell: powershell
+        env:
+          K5_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pins = @(
+              @{ name = 'assert-stage-one-physical-admission.ps1'; size = 7643; blob = '9faae324ffaf008a7dc389aaab2d70198c5f4ea1'; sha256 = 'd7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d' },
+              @{ name = 'assert-installed-git-alias.ps1'; size = 13028; blob = 'a3f9ae05f204905c9cd2e68f894a6bd53dc4d53c'; sha256 = '67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8' },
+              @{ name = 'admit_installed_git_alias.cs'; size = 36598; blob = '1e45e51c6171d88ff582466ba2664f9b81b75ebf'; sha256 = 'a751156ee06792f8f4625fa988c73a54c8e9a0a24937c06ab9264762f965d23f' }
+          )
+          # Fresh immutable source admission; no executable, checkout file or saved receipt is trusted here.
+          $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+          function Read-K5PinnedBlob($Pin) {
+              $response = $null; $stream = $null; $memory = $null; $sha1 = $null; $sha256 = $null
+              try {
+                  if ($env:GITHUB_API_URL -cne 'https://api.github.com' -or
+                      $env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
+                      [string]::IsNullOrEmpty($env:K5_GITHUB_TOKEN) -or $env:K5_GITHUB_TOKEN.Length -gt 8192 -or
+                      $Pin.size -le 0 -or $Pin.size -gt 65536 -or
+                      $Pin.blob -cnotmatch '\A[0-9a-f]{40}\z' -or $Pin.sha256 -cnotmatch '\A[0-9a-f]{64}\z') { throw 'context' }
+                  $url = 'https://api.github.com/repos/mkurtgerald/K5-Vision/git/blobs/' + $Pin.blob
+                  $request = [Net.HttpWebRequest]::Create($url)
+                  $request.Method = 'GET'; $request.AllowAutoRedirect = $false
+                  $request.Timeout = 15000; $request.ReadWriteTimeout = 15000
+                  $request.MaximumResponseHeadersLength = 16
+                  $request.AutomaticDecompression = [Net.DecompressionMethods]::None
+                  $request.Accept = 'application/vnd.github+json'; $request.UserAgent = 'K5-fixed-git-admission/1'
+                  $request.Headers['Authorization'] = 'Bearer ' + $env:K5_GITHUB_TOKEN
+                  $request.Headers['X-GitHub-Api-Version'] = '2022-11-28'
+                  $response = $request.GetResponse()
+                  if ([int]$response.StatusCode -ne 200 -or $response.ResponseUri.AbsoluteUri -cne $url -or
+                      $response.ContentLength -gt 131072 -or -not [string]::IsNullOrEmpty($response.ContentEncoding)) { throw 'response' }
+                  $stream = $response.GetResponseStream(); $memory = [IO.MemoryStream]::new()
+                  $buffer = [byte[]]::new(4096)
+                  $deadline = [Diagnostics.Stopwatch]::StartNew()
+                  while ($true) {
+                      $remaining = 131072 - [int]$memory.Length
+                      if ($remaining -le 0 -or $deadline.ElapsedMilliseconds -ge 15000) { throw 'response_bound' }
+                      $read = $stream.ReadAsync($buffer, 0, [Math]::Min($buffer.Length, $remaining))
+                      if (-not $read.Wait([Math]::Max(1, 15000 - [int]$deadline.ElapsedMilliseconds))) { throw 'response_timeout' }
+                      if ($read.Result -eq 0) { break }
+                      $memory.Write($buffer, 0, $read.Result)
+                  }
+                  $record = ConvertFrom-Json -InputObject $strictUtf8.GetString($memory.ToArray()) -ErrorAction Stop
+                  if ($record.sha -isnot [string] -or $record.sha -cne $Pin.blob -or $record.encoding -cne 'base64' -or
+                      ($record.size -isnot [int] -and $record.size -isnot [long]) -or $record.size -ne $Pin.size -or
+                      $record.content -isnot [string] -or $record.content.Length -gt 100000) { throw 'blob' }
+                  $encoded = $record.content.Replace("`r", '').Replace("`n", '')
+                  if ($encoded -cnotmatch '\A(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\z' -or
+                      $encoded.Length -ne 4 * [Math]::Ceiling($Pin.size / 3.0)) { throw 'base64' }
+                  $bytes = [Convert]::FromBase64String($encoded)
+                  if ($bytes.Length -ne $Pin.size -or [Convert]::ToBase64String($bytes) -cne $encoded) { throw 'size' }
+                  $sha256 = [Security.Cryptography.SHA256]::Create(); $sha1 = [Security.Cryptography.SHA1]::Create()
+                  if (([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() -cne $Pin.sha256) { throw 'digest' }
+                  $header = [Text.Encoding]::ASCII.GetBytes('blob ' + [string]$bytes.Length + [char]0)
+                  $framed = [byte[]]::new($header.Length + $bytes.Length)
+                  [Array]::Copy($header, 0, $framed, 0, $header.Length); [Array]::Copy($bytes, 0, $framed, $header.Length, $bytes.Length)
+                  if (([BitConverter]::ToString($sha1.ComputeHash($framed))).Replace('-', '').ToLowerInvariant() -cne $Pin.blob) { throw 'git_blob' }
+                  $null = $strictUtf8.GetString($bytes)
+                  return ,$bytes
+              } catch { throw 'Pinned Git admission source refused; existing owners were preserved.' }
+              finally {
+                  foreach ($owned in @($sha1, $sha256, $memory, $stream, $response)) { if ($null -ne $owned) { $owned.Dispose() } }
+              }
+          }
+          function Assert-K5OrdinaryCompilerPath([string]$Path, [bool]$Directory) {
+              if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 1024 -or $Path -cnotmatch '\A[A-Z]:\\' -or
+                  $Path -match '[\x00-\x1f"<>|?*]' -or $Path.Substring(2).Contains(':') -or
+                  [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'compiler_path' }
+              foreach ($part in $Path.Substring(3).Split('\')) {
+                  if ($part.Length -eq 0 -or $part -in @('.', '..') -or $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'compiler_path' }
+              }
+              $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+              if ($item.FullName -cne $Path -or [bool]$item.PSIsContainer -ne $Directory) { throw 'compiler_type' }
+              $depth = 0
+              while ($null -ne $item) {
+                  $depth++
+                  if ($depth -gt 32 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                      -not [string]::IsNullOrEmpty($item.LinkType)) { throw 'compiler_alias' }
+                  $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+              }
+          }
+          try {
+              # This is a new same-host PowerShell process after all named owners exited.
+              # Retained compiler artifacts must be ordinary FILES only. Never recurse or clean up.
+              $trustedGuard = [scriptblock]::Create($strictUtf8.GetString((Read-K5PinnedBlob $pins[0])))
+              & $trustedGuard | Out-Null
+              $rows = @(Get-CimInstance -ClassName Win32_Process -Property Name -OperationTimeoutSec 10 -ErrorAction Stop)
+              if ($rows.Count -lt 1 -or $rows.Count -gt 32768) { throw 'compiler_inventory' }
+              foreach ($row in $rows) {
+                  if ($row.Name -isnot [string] -or $row.Name.Length -eq 0 -or $row.Name.Length -gt 260 -or
+                      $row.Name -match '[\x00\\/:\r\n]' -or $row.Name -iin @('csc.exe', 'cvtres.exe', 'vbc.exe', 'VBCSCompiler.exe')) { throw 'compiler_occupied' }
+              }
+              if ($env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,19}\z') { throw 'context' }
+              Assert-K5OrdinaryCompilerPath $env:RUNNER_TEMP $true
+              foreach ($action in @('git_launcher_archives')) {
+                  $path = Join-Path $env:RUNNER_TEMP ('k5-installed-git-alias-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT + '-' + $action)
+                  if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { continue }
+                  Assert-K5OrdinaryCompilerPath $path $true
+                  $entries = [IO.Directory]::EnumerateFileSystemEntries($path).GetEnumerator()
+                  $count = 0; [long]$bytes = 0
+                  try {
+                      while ($entries.MoveNext()) {
+                          $count++
+                          if ($count -gt 64) { throw 'compiler_artifacts' }
+                          $entry = [string]$entries.Current
+                          Assert-K5OrdinaryCompilerPath $entry $false
+                          $file = Get-Item -LiteralPath $entry -Force -ErrorAction Stop
+                          $bytes += $file.Length
+                          if ($file.Length -lt 0 -or $bytes -gt 16777216) { throw 'compiler_artifacts' }
+                      }
+                  } finally { $entries.Dispose() }
+              }
+              & $trustedGuard | Out-Null
+              Write-Host 'K5_GIT_COMPILER_POST=passed'
+          } catch { throw 'Independent Git compiler final admission refused; existing owners were preserved.' }
+
       - name: Recheck fresh exact candidate before installed Start-script acceptance
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
         timeout-minutes: 1
         shell: powershell
         env:
@@ -487,21 +2344,21 @@ jobs:
           K5_EXPECTED_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/alpha-analytics-preflight-20261004", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed launcher branch refused." }
+          if ($env:K5_CANDIDATE_BRANCH -cnotin @("feat/alpha-analytics-preflight-20261004", "fix/transactional-alpha-upgrade-20261003", "feat/installed-alpha-facade-witness-20261005")) { throw "Unreviewed launcher branch refused." }
           $branch = [uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)
           $headers = @{ Authorization = "Bearer $env:K5_GITHUB_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
           $head = Invoke-RestMethod -Method Get -Headers $headers -TimeoutSec 20 -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/branches/$branch"
           if ($head.commit.sha -cne $env:K5_EXPECTED_SHA) { throw "Candidate branch advanced; Start-script acceptance refused." }
 
       - name: Recheck idle host before installed Start-script witness
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
         timeout-minutes: 1
         shell: powershell
         run: .\scripts\assert-stage-one-physical-admission.ps1
 
       - name: Prove installed Start-script refusal and two analytics launches
         id: alpha_launcher_witness
-        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
+        if: github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004' || github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' || github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'
         timeout-minutes: 10
         shell: powershell
         run: |
@@ -661,6 +2518,23 @@ jobs:
           & $base -I -B -S "$root\source\scripts\installed_alpha_facade_witness.py" --validate-receipt --expectations $env:K5_ALPHA_FACADE_EXPECTATIONS --output $env:K5_ALPHA_FACADE_OUTPUT
           if ($LASTEXITCODE -ne 0) { throw "Installed facade receipt violated independent source-free contract." }
 
+      - name: Retain exact qualified wheel provenance locally
+        id: wheel_provenance
+        if: github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003' && steps.safe_evidence.outcome == 'success' && steps.safe_alpha_evidence.outcome == 'success'
+        timeout-minutes: 3
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:K5_ALPHA_LAUNCHER_OWNED
+          $base = $env:K5_WITNESS_BASE_PYTHON
+          if ((Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:K5_WITNESS_BASE_PYTHON_SHA256) { throw "Admitted base Python changed." }
+          # Derive the actual pipeline directory; collector independently binds
+          # it to RUNNER_TEMP's parent and refuses aliases or another volume.
+          $runnerWorkspace = Split-Path -Parent $env:GITHUB_WORKSPACE
+          if (-not [string]::IsNullOrWhiteSpace($env:RUNNER_WORKSPACE) -and [IO.Path]::GetFullPath($env:RUNNER_WORKSPACE) -cne [IO.Path]::GetFullPath($runnerWorkspace)) { throw "Runner workspace admission mismatch." }
+          & $base -I -B -S "$root\source\scripts\capture_installer_wheel_provenance.py" --launcher-root $root --receipt $env:K5_ALPHA_LAUNCHER_OUTPUT --normal-receipt $env:K5_INSTALLED_ANALYTICS_OUTPUT --workspace $env:GITHUB_WORKSPACE --runner-workspace $runnerWorkspace --runner-temp $env:RUNNER_TEMP --revision $env:K5_STAGE_ONE_REVISION --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT --base-python-sha256 $env:K5_WITNESS_BASE_PYTHON_SHA256 --output artifacts\installed-alpha-wheel-provenance.json
+          if ($LASTEXITCODE -ne 0) { throw "Qualified wheel provenance capture failed closed." }
+
       - name: Remove only this job's disposable fixture and controller
         if: always()
         timeout-minutes: 1
@@ -735,5 +2609,14 @@ jobs:
         with:
           name: installed-alpha-facades-expectations
           path: artifacts/installed-alpha-facades-expectations.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload source-free wheel provenance only
+        if: success() && steps.wheel_provenance.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: installed-alpha-wheel-provenance
+          path: artifacts/installed-alpha-wheel-provenance.json
           if-no-files-found: error
           retention-days: 14

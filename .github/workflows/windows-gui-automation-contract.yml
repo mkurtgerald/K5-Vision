@@ -1,0 +1,28 @@
+name: Windows GUI Automation Contract
+on:
+  push:
+    branches: [fix/transactional-alpha-upgrade-20261003]
+    paths: [.github/workflows/windows-gui-automation-contract.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify-windows-ui-automation:
+    if: github.repository == 'mkurtgerald/K5-Vision'
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Verify Windows PowerShell GUI property constructors
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
+          $button = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty, 'Run test')
+          if ($null -eq $button) { throw 'GUI button query cannot be constructed.' }
+          $status = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Edit)
+          if ($null -eq $status) { throw 'GUI status query cannot be constructed.' }
+          Write-Host 'K5_GUI_AUTOMATION_CONSTRUCTOR=passed'

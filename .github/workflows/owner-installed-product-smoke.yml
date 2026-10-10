@@ -1,0 +1,90 @@
+name: Owner Installed Product Smoke
+on:
+  push:
+    branches: [fix/transactional-alpha-upgrade-20261003]
+    paths:
+      - .github/workflows/owner-installed-product-smoke.yml
+      - scripts/Test-K5OwnerInstalledGui.ps1
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  installed-gui-smoke:
+    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact test controller only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          sparse-checkout-cone-mode: false
+          sparse-checkout: scripts/Test-K5OwnerInstalledGui.ps1
+      - name: Validate native GUI controller before product installation
+        shell: powershell
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts/Test-K5OwnerInstalledGui.ps1'
+          $tokens = $null
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
+          if (@($errors).Count -gt 0) { throw 'Installed GUI witness parse failed.' }
+          & $script -ControllerSelfTest
+      - name: Download exact repaired setup with independent byte identity
+        shell: powershell
+        timeout-minutes: 3
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $headers = @{ Authorization = "Bearer $env:GH_READ_TOKEN"; Accept = 'application/vnd.github+json' }
+          $zip = Join-Path $env:RUNNER_TEMP 'retained-owner-setup.zip'
+          Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Headers $headers -Uri 'https://api.github.com/repos/mkurtgerald/K5-Vision/actions/artifacts/11683221888/zip' -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne '4bfd043b2e7694e52a942712b7f25c41e49f20b2e0250cecebc7c476d8ce04ab') { throw 'Retained artifact identity mismatch.' }
+          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'retained-owner-setup')
+          $setup = Join-Path $env:RUNNER_TEMP 'retained-owner-setup\K5VisionAlpha-Setup-887051738890ca2c0e34431bd707fe302654747e.exe'
+          if ((Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant() -cne '5d78b0e464fee40f482fed97ce31c66f4df457b87f023cd3bcaf5ec06d9c19fb') { throw 'Retained executable identity mismatch.' }
+          if ((Get-Item -LiteralPath $setup).Length -ne 163468532) { throw 'Retained executable size mismatch.' }
+          Write-Host 'K5_PRODUCT_SETUP_IDENTITY=8870517_verified'
+      - name: Install exact executable without owner shell interaction
+        id: install
+        shell: powershell
+        timeout-minutes: 23
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $root = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha'
+          if (Test-Path -LiteralPath $root) { throw 'Fresh installed-product root required.' }
+          $setup = Join-Path $env:RUNNER_TEMP 'retained-owner-setup\K5VisionAlpha-Setup-887051738890ca2c0e34431bd707fe302654747e.exe'
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw 'Exact setup installation failed.' }
+          if (([IO.File]::ReadAllText((Join-Path $root 'k5-revision.txt'))).Trim() -cne '887051738890ca2c0e34431bd707fe302654747e') { throw 'Installed revision mismatch.' }
+          Write-Host 'K5_PRODUCT_INSTALL=passed'
+      - name: Invoke installed GUI synthetic video operator test
+        shell: powershell
+        timeout-minutes: 7
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/Test-K5OwnerInstalledGui.ps1') -Mode synthetic
+      - name: Invoke same installed GUI external public RTSP analytics test
+        if: always() && steps.install.outcome == 'success'
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/Test-K5OwnerInstalledGui.ps1') -Mode public
+      - name: Remove owned installed application
+        if: always()
+        shell: powershell
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $uninstaller = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha\unins000.exe'
+          if (Test-Path -LiteralPath $uninstaller) {
+            $p = Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait
+            if ($p.ExitCode -ne 0) { throw 'Owned application cleanup failed.' }
+          }

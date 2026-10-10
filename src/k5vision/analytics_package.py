@@ -15,8 +15,9 @@ import importlib.util
 import io
 import json
 import marshal
+import ntpath
 import sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 ANALYTICS_REVISION = "c8b347ae538991a0c0ce38eabc2dc17b566531d3"
 ANALYTICS_DISTRIBUTION = "k5-analytics-runtime"
@@ -97,19 +98,28 @@ def _verify_bytecode(path: Path, sources: dict[Path, bytes]) -> None:
                 importlib.util.cache_from_source(str(source), optimization=optimization)
             ):
                 continue
-            code = compile(
-                data, str(source), "exec", dont_inherit=True, optimize=int(optimization or 0)
-            )
-            expected = marshal.dumps(code)
-            if path.stat().st_size != len(expected) + 16:
-                break
-            actual = path.read_bytes()
-            if (
-                actual[:4] == importlib.util.MAGIC_NUMBER
-                and int.from_bytes(actual[4:8], "little") in (0, 1, 3)
-                and actual[16:] == expected
-            ):
-                return
+            filenames = (str(source),)
+            if isinstance(source, PureWindowsPath) and source.parent.name == "analytics_lab":
+                # pip joins the native site directory to a POSIX RECORD path
+                # before compileall. The resulting co_filename mixes separators.
+                # Recompile only these two same-file spellings from hash-verified
+                # source; never deserialize or trust a filename from the cache.
+                root = source.parent.parent
+                filenames += (ntpath.join(str(root), source.relative_to(root).as_posix()),)
+            for filename in filenames:
+                code = compile(
+                    data, filename, "exec", dont_inherit=True, optimize=int(optimization or 0)
+                )
+                expected = marshal.dumps(code)
+                if path.stat().st_size != len(expected) + 16:
+                    continue
+                actual = path.read_bytes()
+                if (
+                    actual[:4] == importlib.util.MAGIC_NUMBER
+                    and int.from_bytes(actual[4:8], "little") in (0, 1, 3)
+                    and actual[16:] == expected
+                ):
+                    return
             break
     raise AnalyticsPackageError("Analytics package contains unverified bytecode")
 

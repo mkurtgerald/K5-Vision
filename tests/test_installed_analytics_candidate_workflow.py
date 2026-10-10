@@ -1,7 +1,9 @@
 """Exact trusted-branch admission for the installed normal-app native witness."""
 
 import ast
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -9,11 +11,21 @@ from pathlib import Path
 
 import pytest
 
+
+def canonical_checkout_bytes(raw):
+    """Match the hosted source reader's sole allowed checkout transformation."""
+    text = raw.decode("utf-8", errors="strict").replace("\r\n", "\n")
+    if "\r" in text:
+        raise ValueError("source_encoding")
+    return text.encode("utf-8", errors="strict")
+
+
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/installed-analytics-candidate.yml"
 BASELINE = ROOT / ".github/workflows/stage-one-operator-physical.yml"
 BRANCH = "feat/installed-analytics-operator-20261003"
 LAUNCHER_BRANCH = "feat/alpha-analytics-preflight-20261004"
+UPGRADE_BRANCH = "fix/transactional-alpha-upgrade-20261003"
 FACADE_BRANCH = "feat/installed-alpha-facade-witness-20261005"
 
 
@@ -34,9 +46,9 @@ def test_hosted_admission_precedes_exactly_one_physical_job():
     hosted = _job("hosted_admission")
     native = _job("installed-analytics-candidate")
     assert "    runs-on: windows-latest\n" in hosted
-    assert "    timeout-minutes: 10\n" in hosted
+    assert "    timeout-minutes: 18\n" in hosted
     assert hosted.count("      - name: ") == 1
-    assert "        timeout-minutes: 9\n" in hosted
+    assert "        timeout-minutes: 17\n" in hosted
     assert "    needs: hosted_admission\n" in native
     assert "needs.hosted_admission.result == 'success'" in native
     assert "needs.hosted_admission.outputs.qualified_sha == github.sha" in native
@@ -48,11 +60,14 @@ def test_hosted_admission_precedes_exactly_one_physical_job():
     assert "      cancel-in-progress: false\n" in native
 
 
-def test_candidate_route_is_two_jobs_on_only_three_exact_trusted_branches():
+def test_candidate_route_is_two_jobs_on_only_four_exact_trusted_branches():
     text = WORKFLOW.read_text()
     events = text.split("on:\n", 1)[1].split("\npermissions:", 1)[0]
     branches = events.split("    branches:\n", 1)[1].split("    paths:\n", 1)[0]
-    assert branches == f"      - {BRANCH}\n      - {LAUNCHER_BRANCH}\n      - {FACADE_BRANCH}\n"
+    assert branches == (
+        f"      - {BRANCH}\n      - {LAUNCHER_BRANCH}\n"
+        f"      - {UPGRADE_BRANCH}\n      - {FACADE_BRANCH}\n"
+    )
     assert "pull_request" not in events
     assert "workflow_dispatch" not in text
     assert "workflow_call" not in text
@@ -60,19 +75,42 @@ def test_candidate_route_is_two_jobs_on_only_three_exact_trusted_branches():
     assert "github.repository == 'mkurtgerald/K5-Vision'" in text
     assert f"github.ref == 'refs/heads/{BRANCH}'" in text
     assert f"github.ref == 'refs/heads/{LAUNCHER_BRANCH}'" in text
+    assert f"github.ref == 'refs/heads/{UPGRADE_BRANCH}'" in text
     assert f"github.ref == 'refs/heads/{FACADE_BRANCH}'" in text
     assert text.count("runs-on:") == 2
     assert text.count("runs-on: [self-hosted, Windows, X64, k5-physical, camera-lab]") == 1
     assert "    timeout-minutes: 25\n" in _job("installed-analytics-candidate")
 
 
-def test_launcher_and_facade_branches_require_their_three_applicable_hosted_gates():
+def test_hosted_wait_covers_the_existing_smoke_bound_with_nested_hard_limits():
+    hosted = _job("hosted_admission")
+    smoke = (ROOT / ".github/workflows/windows-alpha-script-smoke.yml").read_text()
+    smoke_minutes = int(re.search(r"    timeout-minutes: (\d+)", smoke).group(1))
+    poll_minutes = int(
+        re.search(r"\$deadline = \[DateTime\]::UtcNow.AddMinutes\((\d+)\)", hosted)[1]
+    )
+    step_minutes = int(re.search(r"        timeout-minutes: (\d+)", hosted)[1])
+    job_minutes = int(re.search(r"    timeout-minutes: (\d+)", hosted)[1])
+    assert (smoke_minutes, poll_minutes, step_minutes, job_minutes) == (15, 16, 17, 18)
+    assert smoke_minutes + 1 == poll_minutes == step_minutes - 1 == job_minutes - 2
+    assert "    timeout-minutes: 25\n" in _job("installed-analytics-candidate")
+    assert "Start-Sleep -Seconds 15" in hosted
+    assert "[DateTime]::UtcNow -ge $deadline" in hosted
+    assert (
+        'throw "An exact-candidate hosted qualification failed; native execution refused."'
+        in hosted
+    )
+
+
+def test_launcher_upgrade_and_facade_branches_require_their_three_applicable_hosted_gates():
     gate = _run_script(_step("Require exact trusted head and green hosted PR qualification"))
     assert f'$legacyBranch = "{BRANCH}"' in gate
     assert f'$launcherBranch = "{LAUNCHER_BRANCH}"' in gate
+    assert f'$upgradeBranch = "{UPGRADE_BRANCH}"' in gate
     assert f'$facadeBranch = "{FACADE_BRANCH}"' in gate
     assert (
-        "$env:K5_CANDIDATE_BRANCH -cnotin @($legacyBranch, $launcherBranch, $facadeBranch)" in gate
+        "$env:K5_CANDIDATE_BRANCH -cnotin "
+        "@($legacyBranch, $launcherBranch, $upgradeBranch, $facadeBranch)" in gate
     )
     base = re.search(r"(?ms)\$required = @\{\n(.*?)^\s*\}", gate).group(1)
     assert set(re.findall(r'"([0-9]+)" = ', base)) == {"355859781", "369354936", "361865932"}
@@ -82,15 +120,36 @@ def test_launcher_and_facade_branches_require_their_three_applicable_hosted_gate
     assert "$_.head_branch -ceq $env:K5_CANDIDATE_BRANCH" in gate
 
 
-def test_native_probe_regression_dependency_is_exact_and_hosted_qualified():
-    dependency = "tests/test_windows_alpha_analytics.py"
-    paths = WORKFLOW.read_text().split("    paths:\n", 1)[1].split("\n# Shares", 1)[0]
+def test_native_probe_and_host_admission_dependencies_are_exact_and_hosted_qualified():
+    dependencies = {
+        "tests/test_windows_alpha_analytics.py",
+        "scripts/assert-installed-git-alias.ps1",
+        "scripts/admit_installed_git_alias.cs",
+        "tests/test_installed_git_alias_admission.py",
+        "scripts/assert-stage-one-physical-admission.ps1",
+        "tests/test_stage_one_physical_admission_diagnostics.py",
+    }
+    paths = WORKFLOW.read_text().split("    paths:\n", 1)[1].split("\n\n", 1)[0] + "\n"
     expected = {
         ".github/workflows/installed-analytics-candidate.yml",
+        ".github/workflows/owner-windows-installer-candidate.yml",
+        "scripts/windows-alpha/owner-installer/**",
+        "scripts/provision-stage03-gstreamer.ps1",
         "scripts/installed_analytics_witness.py",
         "scripts/installed_alpha_launcher_witness.py",
         "scripts/installed_alpha_facade_witness.py",
         "scripts/windows_owned_preflight.py",
+        "scripts/capture_installer_wheel_provenance.py",
+        "scripts/installer_wheel_requirements.py",
+        "scripts/installer_wheel_storage.py",
+        "scripts/windows-alpha/Install-K5VisionAlpha.ps1",
+        "scripts/windows-alpha/install_transaction.py",
+        "tests/test_capture_installer_wheel_provenance.py",
+        "tests/test_installer_wheel_requirements.py",
+        "tests/test_installer_wheel_storage.py",
+        "tests/test_installer_runtime_platform_dependencies.py",
+        "tests/test_windows_alpha_upgrade.py",
+        "tests/test_windows_alpha_bootstrap.py",
         "scripts/build_analytics_runtime_wheel.py",
         "scripts/windows-alpha/Invoke-K5InstalledAnalyticsWitness.ps1",
         "scripts/windows-alpha/Start-K5VisionAlpha.ps1",
@@ -105,7 +164,7 @@ def test_native_probe_regression_dependency_is_exact_and_hosted_qualified():
         "tests/test_installed_alpha_facade_witness.py",
         "tests/test_windows_alpha_facade_witness.py",
         "tests/test_installed_analytics_candidate_workflow.py",
-        dependency,
+        *dependencies,
     }
     assert set(paths.splitlines()) == {"      - " + path for path in expected}
     assert len(paths.splitlines()) == len(expected)
@@ -115,13 +174,16 @@ def test_native_probe_regression_dependency_is_exact_and_hosted_qualified():
         .split("  pull_request:\n", 1)[1]
         .split("  push:\n", 1)[0]
     )
-    assert hosted.count('      - "' + dependency + '"\n') == 1
+    for dependency in dependencies:
+        assert hosted.count('      - "' + dependency + '"\n') == 1
 
 
 def test_candidate_and_main_share_non_cancelling_lane_without_new_main_trigger():
     candidate, baseline = WORKFLOW.read_text(), BASELINE.read_text()
-    assert "group: stage-one-operator-physical\n      cancel-in-progress: false" in candidate
     assert "group: stage-one-operator-physical\n  cancel-in-progress: false" in baseline
+    native = _job("installed-analytics-candidate")
+    assert "group: stage-one-operator-physical\n      cancel-in-progress: false" in native
+    assert "\nconcurrency:" not in candidate
     assert "branches:\n      - main\n  workflow_dispatch:\n" in baseline
     assert "if: github.ref == 'refs/heads/main'" in baseline
     assert baseline.count("runs-on:") == 1
@@ -145,9 +207,10 @@ def test_candidate_has_read_only_credentials_exact_checkouts_and_fresh_head_chec
     assert text.count("persist-credentials: false") == 2
     assert text.count("$head.commit.sha -cne $env:K5_EXPECTED_SHA") == 8
     assert text.count("[uri]::EscapeDataString($env:K5_CANDIDATE_BRANCH)") == 8
-    first, native, provisioning, baseline, media = text.split(
+    hosted, first, provisioning, baseline, media = text.split(
         "$head.commit.sha -cne $env:K5_EXPECTED_SHA"
     )[:5]
+    assert "Checkout immutable candidate" not in hosted
     assert "Checkout immutable candidate" not in first
     assert "Checkout immutable candidate" in provisioning
     assert "Prepare existing bounded rights-reviewed fixture" in baseline
@@ -159,7 +222,10 @@ def test_candidate_has_read_only_credentials_exact_checkouts_and_fresh_head_chec
 
 def test_candidate_keeps_ownership_admission_baseline_and_separate_installed_proof():
     text = WORKFLOW.read_text()
-    assert text.count("run: .\\scripts\\assert-stage-one-physical-admission.ps1") == 9
+    assert text.count("run: .\\scripts\\assert-stage-one-physical-admission.ps1") == 8
+    initial = _run_script(_step("Require idle exact physical host before provisioning"))
+    assert "& $script -DiagnosticContext $context" in initial
+    assert "Read-K5GitObject" in initial
     ordered = [
         "Require idle exact physical host before provisioning",
         "Provision existing reviewed GStreamer runtime",
@@ -266,41 +332,38 @@ def test_required_hosted_gates_match_audited_runtime_pr_paths_and_exact_sha():
     assert '$_.event -ceq "pull_request"' in text
     assert "$_.name -ceq $required[$id]" in text
     assert "$_." + 'conclusion -cne "success"' in text
-    assert "$deadline = [DateTime]::UtcNow.AddMinutes(8)" in text
-    assert "timeout-minutes: 9" in text
+    assert "$deadline = [DateTime]::UtcNow.AddMinutes(16)" in _job("hosted_admission")
+    assert "        timeout-minutes: 17\n" in _job("hosted_admission")
     assert text.index("if (-not $qualified") < text.index("Checkout immutable candidate")
 
 
 def test_existing_git_is_admitted_after_hosted_gate_before_either_checkout():
     text = WORKFLOW.read_text()
-    admission = text.split("- name: Admit existing Git before immutable checkouts", 1)[1]
-    admission = admission.split("- name: Checkout immutable candidate", 1)[0]
+    admission = _run_script(_step("Admit existing Git before immutable checkouts"))
     assert text.index("if (-not $qualified") < text.index("Admit existing Git")
     assert text.index("Admit existing Git") < text.index("Checkout immutable candidate")
     assert text.index("Admit existing Git") < text.index("Checkout immutable Analytics source")
-    assert "timeout-minutes: 1" in admission
-    assert "$git = 'C:\\Program Files\\Git\\cmd\\git.exe'" in admission
-    assert "[IO.File]::GetAttributes($git)" in admission
-    assert "[IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint" in admission
-    assert "while ($null -ne $parent)" in admission
-    assert "-not $parent.Exists" in admission
-    assert "$parent.Attributes -band [IO.FileAttributes]::ReparsePoint" in admission
-    assert "$output = @(& $git --version)" in admission
-    assert "$exitCode -ne 0 -or $output.Count -ne 1" in admission
+    assert "timeout-minutes: 3" in _step("Admit existing Git before immutable checkouts")
+    assert "$output = @(& $ownedGitText $AdmittedGitPath '--version')" in admission
+    assert admission.index("$invokeGit = &") < admission.index("$output = @(&")
+    assert "$output.Count -ne 1" in admission
+    assert "$process.ExitCode -ne 0" in admission
     assert r"\.windows\.[0-9]+\z" in admission
     assert "$version -lt [Version]'2.18.0'" in admission
-    assert "Get-FileHash -LiteralPath $git -Algorithm SHA256" in admission
-    assert 'Write-Host "K5_CHECKOUT_GIT_VERSION=$versionText"' in admission
+    assert "$text -cne 'git version 2.55.0.windows.5'" in admission
+    assert "78211c7ed73988da93a6d8a33d47ec6187f464d7ea2a9a00c182bbd7a1ecf30f" in admission
     assert 'Write-Host "K5_CHECKOUT_GIT_SHA256=$gitSha256"' in admission
-    path_export = "(Split-Path -Parent $git) | Out-File -FilePath $env:GITHUB_PATH"
-    assert admission.index("$version -lt") < admission.index(path_export)
+    assert admission.index("$version -lt") < admission.index("$env:GITHUB_PATH")
+    assert admission.rstrip().endswith(
+        "& $invokeGit -Operation { param($AdmittedGitPath) } | Out-Null"
+    )
+    assert "not a continuous lease" in admission
     for forbidden in (
         "Invoke-WebRequest",
         "Invoke-RestMethod",
         "SetEnvironmentVariable",
         "Set-ItemProperty",
         "Set-ExecutionPolicy",
-        "New-Item",
         "Remove-Item",
         "Start-Process",
     ):
@@ -317,7 +380,7 @@ def test_git_backed_exact_revisions_are_required_before_provisioning():
     assert text.index("Require exact Git-backed") < text.index(
         "Provision existing reviewed GStreamer"
     )
-    assert "timeout-minutes: 1" in verification
+    assert "timeout-minutes: 3" in verification
     assert "Get-Command git -CommandType Application -ErrorAction Stop" in verification
     assert "-ine 'C:\\Program Files\\Git\\cmd\\git.exe'" in verification
     assert "$env:GITHUB_WORKSPACE = $env:K5_STAGE_ONE_REVISION" in verification
@@ -326,8 +389,10 @@ def test_git_backed_exact_revisions_are_required_before_provisioning():
     assert "[IO.File]::GetAttributes($metadata)" in verification
     assert "[IO.FileAttributes]::Directory" in verification
     assert "[IO.FileAttributes]::ReparsePoint" in verification
-    assert "@(git -C $source rev-parse HEAD)" in verification
-    assert "$LASTEXITCODE -ne 0 -or $actual.Count -ne 1" in verification
+    assert "@(& $ownedGitText $AdmittedGitPath" in verification
+    assert '`"$source`" rev-parse HEAD' in verification
+    assert "$actual.Count -ne 1" in verification
+    assert "$process.ExitCode -ne 0" in verification
     assert "$actual[0] -cne $sources[$source]" in verification
 
 
@@ -352,8 +417,8 @@ def test_start_inputs_are_prepared_independently_before_offline_witness():
     assert "K5_GITHUB_TOKEN: ${{ github.token }}" in preparation
     assert preparation.index("$head.commit.sha -cne") < preparation.index("New-Item")
     assert preparation.count("-c core.autocrlf=false -c core.eol=lf") == 2
-    assert '--output="$root\\source.zip" $env:K5_STAGE_ONE_REVISION' in preparation
-    assert '--output="$root\\analytics.zip" $env:ANALYTICS_LAB_SHA' in preparation
+    assert '--output=`"$root\\source.zip`" $env:K5_STAGE_ONE_REVISION' in preparation
+    assert '--output=`"$root\\analytics.zip`" $env:ANALYTICS_LAB_SHA' in preparation
     code = preparation.split("@'\n", 1)[1].split("\n          '@", 1)[0]
     code = "\n".join(line[10:] for line in code.splitlines())
     compile(code, "candidate-launcher-inputs", "exec")
@@ -518,7 +583,7 @@ def test_input_preparation_exception_boundary_never_echoes_raw_error():
 
 def test_qualified_preflight_helper_changes_require_future_native_qualification():
     text = WORKFLOW.read_text()
-    paths = text.split("    paths:\n", 1)[1].split("\n# Shares", 1)[0]
+    paths = text.split("    paths:\n", 1)[1].split("\n\n", 1)[0] + "\n"
     assert "      - scripts/windows_owned_preflight.py\n" in paths
     witness = (ROOT / "scripts/installed_alpha_launcher_witness.py").read_text()
     # The controller must bind the imported helper's exact bytes before Start.
@@ -527,6 +592,7 @@ def test_qualified_preflight_helper_changes_require_future_native_qualification(
     assert "Path(__file__).with_name(name).read_bytes()" in preparation
     assert (ROOT / "scripts/windows_owned_preflight.py").is_file()
     assert text.count("runs-on:") == 2
+    assert text.count("runs-on: [self-hosted,") == 1
     assert "group: stage-one-operator-physical\n      cancel-in-progress: false" in text
 
 
@@ -540,7 +606,7 @@ def _physical_guard_accepts(result="success", output="a" * 40, repository=None, 
         "needs.hosted_admission.result": result,
         "needs.hosted_admission.outputs.qualified_sha": output,
         "github.repository": repository or "mkurtgerald/K5-Vision",
-        "github.ref": ref or f"refs/heads/{FACADE_BRANCH}",
+        "github.ref": ref or f"refs/heads/{UPGRADE_BRANCH}",
         "github.sha": "a" * 40,
     }
     for name, value in values.items():
@@ -568,7 +634,7 @@ def test_success_without_the_exact_hosted_output_never_allocates_native(output):
     assert not _physical_guard_accepts(output=output)
 
 
-@pytest.mark.parametrize("branch", [BRANCH, LAUNCHER_BRANCH, FACADE_BRANCH])
+@pytest.mark.parametrize("branch", [BRANCH, LAUNCHER_BRANCH, UPGRADE_BRANCH, FACADE_BRANCH])
 def test_exact_hosted_success_admits_only_each_trusted_candidate_branch(branch):
     assert _physical_guard_accepts(ref=f"refs/heads/{branch}")
     assert not _physical_guard_accepts(ref=f"refs/heads/{branch}", repository="fork/K5-Vision")
@@ -588,7 +654,7 @@ def test_hosted_output_is_written_only_after_bounded_green_admission():
     assert script.count("$env:GITHUB_OUTPUT") == 1
     assert '"qualified_sha=$env:K5_EXPECTED_SHA"' in script
     assert script.index("if (-not $qualified") < script.index("$env:GITHUB_OUTPUT")
-    assert "$deadline = [DateTime]::UtcNow.AddMinutes(8)" in script
+    assert "$deadline = [DateTime]::UtcNow.AddMinutes(16)" in script
     assert "[DateTime]::UtcNow -ge $deadline" in script
     assert "while ([DateTime]::UtcNow -lt $deadline)" in script
     assert "Start-Sleep -Seconds 15" in script
@@ -779,7 +845,7 @@ def _mock_gate_cases(branch):
 
 
 @pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell required")
-@pytest.mark.parametrize("branch", [BRANCH, LAUNCHER_BRANCH, FACADE_BRANCH])
+@pytest.mark.parametrize("branch", [BRANCH, LAUNCHER_BRANCH, UPGRADE_BRANCH, FACADE_BRANCH])
 @pytest.mark.parametrize("hosted", [True, False], ids=["hosted-admission", "native-revalidation"])
 def test_workflow_gate_source_refuses_untrusted_or_incomplete_mock_snapshots(
     tmp_path, branch, hosted
@@ -999,15 +1065,74 @@ def test_facade_uploads_only_validated_hash_authority_and_receipt_after_owned_cl
     assert text.index("Remove only this job's disposable fixture and controller") < text.index(
         "Upload only validated installed facade receipt"
     )
+    for forbidden in ("Set-Acl", "icacls"):
+        assert forbidden not in text
+    # Both reviewed routes share this workflow, but facade steps must never
+    # acquire the upgrade route's retained-wheel or transactional responsibilities.
+    facade_route = "\n".join(
+        step for step in text.split("      - name: ")[1:] if "facade" in step.splitlines()[0]
+    )
     for forbidden in (
         "fix/transactional-alpha-upgrade",
         "capture_installer",
         "installer_wheel_storage",
         "install_transaction",
-        "Set-Acl",
-        "icacls",
     ):
-        assert forbidden not in text
+        assert forbidden not in facade_route
+
+
+def _route_guard_accepts(step_name, branch, normal="success", alpha="success"):
+    """Evaluate actual branch/receipt conditions without invoking either route."""
+    header = _step(step_name).split("        shell:", 1)[0]
+    expression = header.split("        if: ", 1)[1].splitlines()[0]
+    values = {
+        "github.ref": f"refs/heads/{branch}",
+        "steps.safe_evidence.outcome": normal,
+        "steps.safe_alpha_evidence.outcome": alpha,
+    }
+    for name, value in values.items():
+        expression = expression.replace(name, repr(value))
+    tree = ast.parse(expression.replace("&&", " and ").replace("||", " or "), mode="eval")
+    assert all(
+        isinstance(
+            node, (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare, ast.Eq, ast.Constant)
+        )
+        for node in ast.walk(tree)
+    )
+    return eval(compile(tree, "candidate-route-admission", "eval"), {"__builtins__": {}})
+
+
+@pytest.mark.parametrize(
+    "branch", [BRANCH, LAUNCHER_BRANCH, UPGRADE_BRANCH, FACADE_BRANCH, "main", "unreviewed"]
+)
+def test_reconciled_routes_preserve_exact_shared_and_exclusive_branch_selection(branch):
+    for name in (
+        "Prepare independently bound offline Start-script inputs",
+        "Recheck fresh exact candidate before installed Start-script acceptance",
+        "Recheck idle host before installed Start-script witness",
+        "Prove installed Start-script refusal and two analytics launches",
+    ):
+        assert _route_guard_accepts(name, branch) is (
+            branch in {LAUNCHER_BRANCH, UPGRADE_BRANCH, FACADE_BRANCH}
+        )
+    for name in (
+        "Prepare independently bound offline facade inputs",
+        "Recheck fresh exact candidate before installed facade acceptance",
+        "Recheck idle host before installed facade witness",
+        "Prove actual installed Test and two Run facades",
+    ):
+        assert _route_guard_accepts(name, branch) is (branch == FACADE_BRANCH)
+    assert _route_guard_accepts("Retain exact qualified wheel provenance locally", branch) is (
+        branch == UPGRADE_BRANCH
+    )
+
+
+@pytest.mark.parametrize("normal", ["success", "failure", "cancelled", "skipped", ""])
+@pytest.mark.parametrize("alpha", ["success", "failure", "cancelled", "skipped", ""])
+def test_reconciled_upgrade_capture_still_requires_both_successful_receipts(normal, alpha):
+    assert _route_guard_accepts(
+        "Retain exact qualified wheel provenance locally", UPGRADE_BRANCH, normal, alpha
+    ) is (normal == alpha == "success")
 
 
 @pytest.fixture
@@ -1249,3 +1374,1613 @@ def test_actual_facade_final_head_check_refuses_stale_admission(tmp_path, case):
         timeout=30,
     )
     assert (result.returncode == 0) is (case == "exact")
+
+
+def _early_storage_bootstrap():
+    script = _run_script(_step("Observe read-only storage admission before provisioning"))
+    return script.split("$bootstrap = @'\n", 1)[1].split("\n'@", 1)[0]
+
+
+def _early_reader_namespace():
+    source = _early_storage_bootstrap().split("\nrecord = dict(schema_version=", 1)[0]
+    namespace = {}
+    exec(compile(source, "<tested-storage-bootstrap>", "exec"), namespace)
+    return namespace
+
+
+def test_storage_source_failure_codes_are_fixed_and_match_safe_reprojection():
+    namespace = _early_reader_namespace()
+    script = _run_script(_step("Observe read-only storage admission before provisioning"))
+    projected = re.search(r"source_binding = @\((.*?)\)", script, re.S).group(1)
+    codes = set(re.findall(r"'([^']+)'", projected))
+    assert codes == namespace["SOURCE_BINDING_CODES"] | {"source_cleanup_failed"}
+    assert all(re.fullmatch(r"source_[a-z_]{1,40}", code) for code in codes)
+    assert "error.code in SOURCE_BINDING_CODES" in script
+    assert "str(error)" not in script and "repr(error)" not in script
+    assert "record['stage'] == 'source_binding'" in script
+
+
+def test_storage_source_metadata_keeps_hardlink_refusal_with_a_fixed_reason(tmp_path):
+    namespace = _early_reader_namespace()
+    primary, alias = tmp_path / "git.exe", tmp_path / "git-lfs.exe"
+    primary.write_bytes(b"inert fixture; never executed")
+    namespace["ordinary"](primary, False)
+    os.link(primary, alias)
+    with pytest.raises(namespace["SourceBindingError"]) as error:
+        namespace["ordinary"](primary, False)
+    assert error.value.code == "source_file_links"
+    assert primary.stat().st_nlink == alias.stat().st_nlink == 2
+    assert primary.read_bytes() == alias.read_bytes() == b"inert fixture; never executed"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Installed Windows Git metadata required")
+def test_real_installed_git_metadata_preserves_admission_and_reports_bounded_count(capsys):
+    namespace = _early_reader_namespace()
+    git = Path(r"C:\Program Files\Git\cmd\git.exe")
+    record = {
+        "schema_version": "installed-git-metadata-v1",
+        "scope": "diagnostic-only-source-tool-metadata",
+        "classification": "metadata_unavailable",
+        "link_count": None,
+        "storage_admission": False,
+        "retry_authority": False,
+    }
+    try:
+        count = git.lstat().st_nlink
+        if type(count) is int and 1 <= count <= 32768:
+            record.update(
+                classification="single_link" if count == 1 else "multiple_links",
+                link_count=count,
+            )
+    finally:
+        # Only this fixed record is exposed, never paths, identities or exception text.
+        with capsys.disabled():
+            print("\nK5_INSTALLED_GIT_METADATA=" + json.dumps(record, separators=(",", ":")))
+    if record["classification"] == "single_link":
+        namespace["ordinary"](git, False)
+        assert namespace["file_digest"](git) == hashlib.sha256(git.read_bytes()).hexdigest()
+    elif record["classification"] == "multiple_links":
+        with pytest.raises(namespace["SourceBindingError"]) as error:
+            namespace["ordinary"](git, False)
+        assert error.value.code == "source_file_links"
+    else:
+        pytest.fail("Fixed installed Git metadata is unavailable or outside its reporting bound")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Installed Windows Git binary reader required")
+@pytest.mark.parametrize(
+    "case", ["lf", "crlf", "trailing", "binary", "module", "missing", "kind", "limit"]
+)
+def test_real_windows_python_git_reader_preserves_bytes_and_refusals(tmp_path, case):
+    # Exercise the reader layer only. This is not storage/ACL admission, and the
+    # separate metadata witness continues to require refusal of any hardlink.
+    namespace = _early_reader_namespace()
+    git = Path(r"C:\Program Files\Git\cmd\git.exe")
+    assert git.is_file()
+    environment = {
+        key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")
+    }
+    environment.update(
+        GIT_AUTHOR_NAME="source-fixture",
+        GIT_AUTHOR_EMAIL="source-fixture@example.invalid",
+        GIT_COMMITTER_NAME="source-fixture",
+        GIT_COMMITTER_EMAIL="source-fixture@example.invalid",
+        GIT_AUTHOR_DATE="2000-01-01T00:00:00+0000",
+        GIT_COMMITTER_DATE="2000-01-01T00:00:00+0000",
+        GIT_NO_REPLACE_OBJECTS="1",
+        GIT_NO_LAZY_FETCH="1",
+        GIT_ALLOW_PROTOCOL="",
+    )
+
+    def git_bytes(*arguments, data=None):
+        return subprocess.run(
+            [str(git), "-c", "protocol.allow=never", "-C", str(tmp_path), *arguments],
+            input=data,
+            capture_output=True,
+            env=environment,
+            timeout=10,
+            check=True,
+        ).stdout
+
+    git_bytes("-c", "init.templateDir=", "init", "--quiet", "--object-format=sha1")
+    body = {
+        "lf": b"value = 1\n",
+        "crlf": b"value = 1\r\n",
+        "trailing": b"value = 1\r\n\r\n",
+        "binary": b"\xef\xbb\xbf\x00\xff\n",
+    }.get(case, b"value = 1\n")
+    if case == "module":
+        body = (ROOT / "scripts/installer_wheel_storage.py").read_bytes()
+    blob = git_bytes("hash-object", "-w", "--stdin", data=body).decode().strip()
+    import base64
+
+    scripts_tree = (
+        git_bytes("mktree", data=f"100644 blob {blob}\tinstaller_wheel_storage.py\n".encode())
+        .decode()
+        .strip()
+    )
+    tree = (
+        git_bytes("mktree", data=f"040000 tree {scripts_tree}\tscripts\n".encode()).decode().strip()
+    )
+    revision = git_bytes("commit-tree", tree, data=b"immutable reader witness\n").decode().strip()
+    packet = [
+        [oid, kind, base64.b64encode(git_bytes("cat-file", kind, oid)).decode()]
+        for oid, kind in (
+            (revision, "commit"),
+            (tree, "tree"),
+            (scripts_tree, "tree"),
+            (blob, "blob"),
+        )
+    ]
+    if case == "missing":
+        packet.pop()
+    if case == "kind":
+        packet[3][1] = "commit"
+    if case == "limit":
+        packet[3][2] = "A" * 174765
+    if case in {"missing", "kind", "limit"}:
+        with pytest.raises(namespace["SourceBindingError"]):
+            namespace["verified_storage_source"](packet, revision)
+    else:
+        received = namespace["verified_storage_source"](packet, revision)
+        assert received == body
+        if case == "module":
+            import types
+
+            module = types.ModuleType("_k5_early_storage_test")
+            module.__file__ = str(ROOT / "scripts/installer_wheel_storage.py")
+            exec(compile(received, "<verified-test-storage-source>", "exec"), module.__dict__)
+            assert callable(module.storage_preflight)  # Never query the real storage policy.
+
+
+def test_early_preflight_is_branch_only_before_provisioning_without_acceptance_reuse():
+    text = WORKFLOW.read_text()
+    step = _step("Observe read-only storage admission before provisioning")
+    assert f"if: github.ref == 'refs/heads/{UPGRADE_BRANCH}'" in step
+    names = [
+        "Require idle exact physical host before provisioning",
+        "Require exact Git-backed source checkouts",
+        "Bind early storage source under held Git admission",
+        "Observe read-only storage admission before provisioning",
+        "Provision existing reviewed GStreamer runtime",
+        "Set up Python",
+        "Create isolated witness controller",
+    ]
+    assert [text.index("- name: " + name) for name in names] == sorted(
+        text.index("- name: " + name) for name in names
+    )
+    for forbidden in (
+        "setup-python",
+        "Remove-Item",
+        "pip ",
+        "Invoke-WebRequest",
+        "Invoke-RestMethod",
+        "GITHUB_OUTPUT",
+        "GITHUB_ENV",
+        "retain_bundle",
+        "shutil",
+        "Get-Command",
+        "where.exe",
+        "python -m",
+        "LookupAccount",
+    ):
+        assert forbidden not in step
+    assert "New-Item" not in step
+    assert "_tool\\Python\\3.12.10\\x64\\python.exe" in step
+    assert "4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a" in step
+    assert "& $base -I -B -S - 2>$null" in step
+    assert '"code":"bootstrap_unavailable"' in step
+    assert "later_admission_required" in step
+    assert "exec(compile(source, '<k5-verified-storage-preflight>', 'exec')" in step
+    assert "module.__file__ = str(workspace / 'scripts/installer_wheel_storage.py')" in step
+    assert "importlib" not in step
+    assert "sys.prefix == sys.base_prefix" in step
+    assert "path.resolve(strict=True) == path" in step
+    later = text.split("- name: Provision existing reviewed GStreamer runtime", 1)[1]
+    assert "K5_STORAGE_PREFLIGHT" not in later
+    assert "capture_installer_wheel_provenance.py" in later
+
+
+def test_host_wrapper_is_raw_binary_git_bound_and_finishes_before_same_process_guard():
+    script = _run_script(_step("Require idle exact physical host before provisioning"))
+    assert script.count("& $script -DiagnosticContext $context") == 1
+    assert "--no-replace-objects --no-lazy-fetch -c protocol.allow=never cat-file --batch" in script
+    assert "Read-K5GitObject $env:K5_STAGE_ONE_REVISION 'commit' 65536" in script
+    assert "$commit.oid -cne $env:K5_STAGE_ONE_REVISION" in script
+    assert "':scripts/assert-stage-one-physical-admission.ps1') 'blob' 131072" in script
+    assert "[Text.UTF8Encoding]::new($false, $true)" in script
+    assert "$sha256.ComputeHash($producer.bytes)" in script
+    assert "$producerText = $utf8.GetString($producer.bytes)" in script
+    assert "[scriptblock]::Create($producerText)" in script
+    assert "return ,$buffer" in script
+    assert "CopyToAsync([IO.Stream]::Null)" in script
+    assert "$drain.Wait($remaining)" in script
+    assert "$process.WaitForExit(2000)" in script
+    assert script.index("$process.Dispose()") < script.index("& $script -DiagnosticContext")
+    for forbidden in (
+        "Out-String",
+        "ReadAllLines",
+        "ReadToEnd",
+        "Get-CimInstance",
+        "python",
+        "Get-Process",
+    ):
+        assert forbidden not in script
+
+
+def test_host_source_binding_has_bounded_failure_stages_and_restores_input_encoding():
+    script = _run_script(_step("Require idle exact physical host before provisioning"))
+    assert script.count("[Console]::InputEncoding = $inputEncoding") == 1
+    assert script.count("[Console]::InputEncoding = $previousInputEncoding") == 1
+    assert "$previousInputEncoding.CodePage -eq 65001" in script
+    assert "$previousInputEncoding.GetPreamble().Length -gt 0" in script
+    assert "$inputEncoding.GetPreamble().Length -ne 0" in script
+    assert "[Convert]::ToBase64String($inputEncoding.GetBytes($request))" in script
+    assert "[Convert]::ToBase64String($asciiRequest)" in script
+    assert (
+        script.index("$previousInputEncoding = [Console]::InputEncoding")
+        < script.index("if ($normalizeInputEncoding) { [Console]::InputEncoding = $inputEncoding }")
+        < script.index("$process.Start()")
+        < script.index(
+            "if ($normalizeInputEncoding) { [Console]::InputEncoding = $previousInputEncoding }"
+        )
+        < script.index("CopyToAsync([IO.Stream]::Null)")
+    )
+    assert "$started = $false" in script and "$started = $process.Start()" in script
+    assert script.index("if ($started) {") < script.index("$process.HasExited")
+    assert set(re.findall(r"\$sourceBindingDiagnostic.stage = '([^']+)'", script)) == {
+        "git_binary",
+        "commit_read",
+        "commit_identity",
+        "commit_decode",
+        "commit_tree",
+        "producer_read",
+        "producer_hash",
+        "producer_decode",
+        "script_compile",
+        "context",
+    }
+    assert set(re.findall(r"\$sourceBindingDiagnostic.reason = '([^']+)'", script)) == {
+        "process_setup",
+        "input_encoding",
+        "process_start",
+        "stderr_drain",
+        "request_write",
+        "header_read",
+        "header_format",
+        "object_kind_or_size",
+        "body_read",
+        "terminator",
+        "end_of_output",
+        "process_exit",
+        "object_hash",
+        "process_cleanup",
+        "identity",
+        "object_id",
+        "utf8",
+        "shape",
+        "sha256",
+        "syntax",
+        "construct",
+    }
+    failure = script.split("Write-Host 'K5_HOST_NAME_OBSERVATION_UNAVAILABLE'", 1)[1]
+    assert "schema_version = 'host-source-binding-v1'" in failure
+    assert "scope = 'diagnostic-only-source-binding'" in failure
+    assert "edge_admission = $false" in failure and "retry_authority = $false" in failure
+    assert "} catch {}" in failure
+    assert "throw 'Exact host diagnostic source binding refused.'" in failure
+    for forbidden in ("$_.", "$env:", "$Expression", "$producer", "$commit", "$git"):
+        assert forbidden not in failure
+
+
+def _git_frame(body, kind="blob", oid=None):
+    oid = (
+        oid
+        or hashlib.sha1(kind.encode() + b" " + str(len(body)).encode() + b"\0" + body).hexdigest()
+    )
+    return (
+        oid.encode() + b" " + kind.encode() + b" " + str(len(body)).encode() + b"\n" + body + b"\n"
+    )
+
+
+def _source_packet(
+    body=b"value = 1\n",
+    *,
+    root_name=b"scripts",
+    module_name=b"installer_wheel_storage.py",
+    module_mode=b"100644",
+):
+    import base64
+
+    def entry(kind, data):
+        oid = hashlib.sha1(
+            kind.encode() + b" " + str(len(data)).encode() + b"\0" + data
+        ).hexdigest()
+        return [oid, kind, base64.b64encode(data).decode()]
+
+    blob = entry("blob", body)
+    scripts = entry("tree", module_mode + b" " + module_name + b"\0" + bytes.fromhex(blob[0]))
+    root = entry("tree", b"40000 " + root_name + b"\0" + bytes.fromhex(scripts[0]))
+    commit = entry("commit", b"tree " + root[0].encode() + b"\n\nfixed immutable fixture\n")
+    return [commit, root, scripts, blob]
+
+
+@pytest.mark.parametrize(
+    "body", [b"x=1\n", b"x=1\r\n", b"x=1\r\n\r\n", b"x=1", b"\0\xff\xef\xbb\xbf"]
+)
+def test_fixed_storage_packet_preserves_binary_bytes(body):
+    namespace = _early_reader_namespace()
+    packet = _source_packet(body)
+    assert namespace["verified_storage_source"](packet, packet[0][0]) == body
+
+
+def _storage_packet_producer_fragments():
+    """Extract only the production emitter and success-output statements, never admission."""
+    binder = _run_script(_step("Bind early storage source under held Git admission"))
+    emitter = re.findall(
+        r"(?m)^[ \t]*(\$sourceObjects = \[object\[\]\]::new\(4\)\n"
+        r"(?:[ \t]+\$sourceObjects\[\d\] = [^\n]+\n){4}"
+        r"[ \t]+\$sourcePacket = ConvertTo-Json -InputObject \$sourceObjects -Compress -Depth 4)$",
+        binder,
+        re.S,
+    )
+    helper = (ROOT / "scripts/assert-installed-git-alias.ps1").read_text()
+    buffered = re.findall(r"(?m)^\s*(\$buffer = @\(& \$Operation .+\))$", helper)
+    output = re.findall(
+        r"(?m)^\s*(foreach \(\$item in \$buffer\) \{ Write-Output -NoEnumerate \$item \})$",
+        helper,
+    )
+    assert len(emitter) == len(buffered) == len(output) == 1
+    return emitter[0], buffered[0], output[0]
+
+
+def _binary_storage_packet():
+    # Deterministically find real object hashes with NUL and high bytes in both
+    # tree-member OIDs. Neither a Git process nor a repository is needed.
+    for nonce in range(65536):
+        packet = _source_packet(b"synthetic\0\x80\xff\r\n" + nonce.to_bytes(4, "big"))
+        if all(
+            0 in (oid := bytes.fromhex(packet[index][0])) and max(oid) >= 128 for index in (2, 3)
+        ):
+            return packet
+    raise AssertionError("storage_packet_fixture_generation")
+
+
+def _storage_packet_producer_script(packet, buffered):
+    emitter, buffering, output = _storage_packet_producer_fragments()
+    records = ",\n".join(
+        "@{ oid = '" + oid + "'; bytes = [Convert]::FromBase64String('" + data + "') }"
+        for oid, _, data in packet
+    )
+    # The callback returns the raw reader's plain hashtable: scalar string OID,
+    # byte[] body. The Git path is an unused argument, never executed or opened.
+    seam = buffering + "\n" + output if buffered else "& $Operation"
+    return (
+        r"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+try {
+    if ($PSVersionTable.PSEdition -cne 'Desktop' -or
+        $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1 -or
+        -not [Environment]::Is64BitProcess) { throw 'runtime' }
+    function Invoke-SyntheticSuccess([scriptblock]$Operation) {
+"""
+        + seam
+        + "\n}\n$records = @(\n"
+        + records
+        + r"""
+)
+function Read-SyntheticObject([hashtable]$Record) {
+    $operation = {
+        param([string]$AdmittedGitPath)
+        $oid = $Record.oid
+        $body = $Record.bytes
+        return @{ oid = $oid; bytes = $body }
+    }.GetNewClosure()
+    return Invoke-SyntheticSuccess -Operation $operation
+}
+$commit = Read-SyntheticObject $records[0]
+$rootTree = Read-SyntheticObject $records[1]
+$scriptsTree = Read-SyntheticObject $records[2]
+$storage = Read-SyntheticObject $records[3]
+"""
+        + emitter
+        + r"""
+
+[Console]::Out.Write($sourcePacket)
+} catch {
+    [Console]::Error.WriteLine('storage_packet_producer_refused')
+    exit 1
+}
+"""
+    )
+
+
+def _storage_packet_contract_reason(raw, expected):
+    """Keep exact JSON authoritative; diagnose refusals without exposing any data."""
+    import base64
+    import binascii
+
+    if len(raw) > 620000:
+        return "json_size"
+    try:
+        packet = json.loads(raw)
+    except (UnicodeError, ValueError):
+        return "json_encoding"
+    namespace = _early_reader_namespace()
+    try:
+        body = namespace["verified_storage_source"](packet, expected[0][0])
+    except namespace["SourceBindingError"] as error:
+        # The unchanged strict consumer runs first. This is a closed diagnostic
+        # projection only; it never repairs, flattens or retries the packet.
+        if type(packet) is not list or len(packet) != 4:
+            return "root_shape"
+        bodies = []
+        for index, entry in enumerate(packet):
+            if type(entry) is not list or len(entry) != 3:
+                return "entry_shape"
+            oid, kind, encoded = entry
+            if type(oid) is not str:
+                return "oid_scalar"
+            if re.fullmatch("[0-9a-f]{40}", oid) is None:
+                return "oid_format"
+            if kind != ("commit", "tree", "tree", "blob")[index]:
+                return "entry_kind"
+            if type(encoded) is not str:
+                return "base64_scalar"
+            if not 0 < len(encoded) <= 4 * (((65536 if index == 0 else 131072) + 2) // 3):
+                return "base64_size"
+            try:
+                decoded = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error):
+                return "base64_encoding"
+            if base64.b64encode(decoded).decode("ascii") != encoded:
+                return "base64_canonical"
+            bodies.append(decoded)
+        if error.code == "source_object_hash":
+            return "object_hash"
+        for index, name, mode in (
+            (1, b"scripts", b"40000"),
+            (2, b"installer_wheel_storage.py", b"100644"),
+        ):
+            try:
+                namespace["tree_member"](bodies[index], name, mode)
+            except namespace["SourceBindingError"] as tree_error:
+                return (
+                    "tree_membership"
+                    if tree_error.code == "source_module_read"
+                    else "tree_structure"
+                )
+        return {
+            "source_commit_identity": "commit_identity",
+            "source_module_read": "tree_membership",
+            "source_object_size": "object_size",
+        }.get(error.code, "consumer_refused")
+    if packet != expected or body != base64.b64decode(expected[3][2], validate=True):
+        return "source_bytes"
+    return "ok"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell 5.1 packet contract required")
+@pytest.mark.parametrize("buffered", [False, True], ids=["direct", "success-output-seam"])
+def test_windows_powershell_storage_packet_contract(tmp_path, buffered):
+    """No alias Begin, compilation, Git, network, storage module or media execution."""
+    packet = _binary_storage_packet()
+    script = tmp_path / "synthetic-storage-packet.ps1"
+    script.write_text(_storage_packet_producer_script(packet, buffered), encoding="utf-8")
+    try:
+        result = subprocess.run(
+            [
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(script),
+            ],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pytest.fail("storage_packet_contract:producer_unavailable", pytrace=False)
+    if result.returncode != 0 or result.stderr:
+        pytest.fail("storage_packet_contract:producer_refused", pytrace=False)
+    reason = _storage_packet_contract_reason(result.stdout, packet)
+    if reason != "ok":
+        pytest.fail("storage_packet_contract:" + reason, pytrace=False)
+
+
+def test_storage_packet_fixture_extracts_exact_production_statements_only():
+    emitter, buffering, output = _storage_packet_producer_fragments()
+    assert "\n".join(line.strip() for line in emitter.splitlines()) == "\n".join(
+        [
+            "$sourceObjects = [object[]]::new(4)",
+            "$sourceObjects[0] = [object[]]@($commit.oid, 'commit', "
+            "[Convert]::ToBase64String($commit.bytes))",
+            "$sourceObjects[1] = [object[]]@($rootTree.oid, 'tree', "
+            "[Convert]::ToBase64String($rootTree.bytes))",
+            "$sourceObjects[2] = [object[]]@($scriptsTree.oid, 'tree', "
+            "[Convert]::ToBase64String($scriptsTree.bytes))",
+            "$sourceObjects[3] = [object[]]@($storage.oid, 'blob', "
+            "[Convert]::ToBase64String($storage.bytes))",
+            "$sourcePacket = ConvertTo-Json -InputObject $sourceObjects -Compress -Depth 4",
+        ]
+    )
+    assert buffering == (
+        "$buffer = @(& $Operation 'C:\\Program Files\\Git\\cmd\\git.exe' "
+        "2>$null 3>$null 4>$null 5>$null 6>$null)"
+    )
+    assert output == "foreach ($item in $buffer) { Write-Output -NoEnumerate $item }"
+    packet = _binary_storage_packet()
+    for buffered in (False, True):
+        script = _storage_packet_producer_script(packet, buffered)
+        assert emitter in script
+        assert (buffering in script) is buffered
+        assert (output in script) is buffered
+        assert "return @{ oid = $oid; bytes = $body }" in script
+        for forbidden in (
+            "::Begin",
+            "Add-Type",
+            "Start-Process",
+            "ProcessStartInfo",
+            "Invoke-Expression",
+            "Invoke-RestMethod",
+            "Read-K5GitObject",
+            "installer_wheel_storage.py",
+        ):
+            assert forbidden not in script
+
+
+def test_storage_packet_fixture_keeps_production_and_source_pins_frozen():
+    for path, digest in (
+        (WORKFLOW, "96fe6b97dbe124514d97a9b06d37a4ea217a0e6cbad7471a2cf2e9a88ad231c6"),
+        (
+            ROOT / "scripts/assert-installed-git-alias.ps1",
+            "67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8",
+        ),
+        (
+            ROOT / "scripts/admit_installed_git_alias.cs",
+            "a751156ee06792f8f4625fa988c73a54c8e9a0a24937c06ab9264762f965d23f",
+        ),
+    ):
+        assert hashlib.sha256(canonical_checkout_bytes(path.read_bytes())).hexdigest() == digest
+
+
+def test_storage_packet_binary_model_uses_real_high_and_nul_tree_oids():
+    import base64
+
+    packet = _binary_storage_packet()
+    for index in (2, 3):
+        oid = bytes.fromhex(packet[index][0])
+        assert 0 in oid and max(oid) >= 128
+        assert oid in base64.b64decode(packet[index - 1][2], validate=True)
+    assert _storage_packet_contract_reason(json.dumps(packet), packet) == "ok"
+
+
+@pytest.mark.parametrize(
+    "fault,reason",
+    [
+        ("json", "json_encoding"),
+        ("root", "root_shape"),
+        ("entry", "entry_shape"),
+        ("oid-scalar", "oid_scalar"),
+        ("oid-format", "oid_format"),
+        ("kind", "entry_kind"),
+        ("base64-scalar", "base64_scalar"),
+        ("base64-size", "base64_size"),
+        ("base64", "base64_encoding"),
+        ("base64-canonical", "base64_canonical"),
+        ("tree", "tree_structure"),
+        ("membership", "tree_membership"),
+        ("hash", "object_hash"),
+    ],
+)
+def test_storage_packet_contract_diagnostics_are_closed(fault, reason):
+    import base64
+    import copy
+
+    expected = _binary_storage_packet()
+    packet = copy.deepcopy(expected)
+    canary = "PRIVATE_PACKET_ERROR_PATH_CANARY"
+    if fault == "root":
+        packet = {canary: packet}
+    elif fault == "entry":
+        packet[0] = {canary: packet[0]}
+    elif fault == "oid-scalar":
+        packet[0][0] = [packet[0][0]]
+    elif fault == "oid-format":
+        packet[0][0] = canary
+    elif fault == "kind":
+        packet[0][1] = canary
+    elif fault == "base64-scalar":
+        packet[0][2] = {canary: packet[0][2]}
+    elif fault == "base64-size":
+        packet[0][2] = ""
+    elif fault == "base64":
+        packet[0][2] = canary + "%"
+    elif fault == "base64-canonical":
+        packet[0][2] = "YR=="
+    elif fault == "tree":
+        packet = _source_packet(root_name=b"../scripts")
+        expected = copy.deepcopy(packet)
+    elif fault == "membership":
+        packet = _source_packet(root_name=b"other")
+        expected = copy.deepcopy(packet)
+    elif fault == "hash":
+        packet[3][2] = base64.b64encode(canary.encode()).decode("ascii")
+    actual = _storage_packet_contract_reason(
+        canary if fault == "json" else json.dumps(packet), expected
+    )
+    assert actual == reason and canary not in actual
+
+
+def test_storage_packet_contract_runs_early_with_closed_output_in_hosted_smoke():
+    smoke = (ROOT / ".github/workflows/windows-alpha-script-smoke.yml").read_text()
+    marker = "      - name: Verify exact PowerShell storage packet contract\n"
+    step = smoke.split(marker, 1)[1].split("\n      - name: ", 1)[0]
+    assert "timeout-minutes: 1" in step
+    assert "shell: powershell" in step
+    assert (
+        "python -m pytest tests/test_installed_analytics_candidate_workflow.py::"
+        "test_windows_powershell_storage_packet_contract --no-cov -q --tb=no"
+    ) in step
+    assert "if ($LASTEXITCODE -ne 0)" in step
+    assert smoke.index("Install targeted test dependencies") < smoke.index(marker)
+    for later in (
+        "Verify clean Windows alpha runtime dependency install",
+        "Run Windows alpha boundary regressions",
+        "Verify exact candidate workflow and owned Windows relay boundary",
+    ):
+        assert smoke.index(marker) < smoke.index(later)
+    source = (
+        Path(__file__)
+        .read_text()
+        .split("def test_windows_powershell_storage_packet_contract(", 1)[1]
+        .split("\ndef test_storage_packet_fixture_extracts", 1)[0]
+    )
+    assert "capture_output=True" in source and "timeout=15" in source
+    assert source.count("pytrace=False") == 3
+    assert "result.stderr\n" not in source and "print(" not in source
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "not-array",
+        "extra-object",
+        "missing-object",
+        "entry-shape",
+        "bad-oid",
+        "bad-kind",
+        "empty",
+        "oversize",
+        "bad-base64",
+        "noncanonical-base64",
+        "changed-body",
+        "wrong-commit",
+        "wrong-root",
+        "wrong-scripts",
+        "wrong-module",
+        "wrong-root-name",
+        "wrong-module-name",
+        "symlink-module",
+    ],
+)
+def test_fixed_storage_packet_requires_exact_candidate_and_module_membership(case):
+    import base64
+
+    namespace = _early_reader_namespace()
+    packet = _source_packet()
+    revision = packet[0][0]
+    if case == "not-array":
+        packet = "PRIVATE_CANARY"
+    elif case == "extra-object":
+        packet.append(packet[-1])
+    elif case == "missing-object":
+        packet.pop()
+    elif case == "entry-shape":
+        packet[0].append("PRIVATE_CANARY")
+    elif case == "bad-oid":
+        packet[0][0] = "A" * 40
+    elif case == "bad-kind":
+        packet[0][1] = "blob"
+    elif case == "empty":
+        packet[0][2] = ""
+    elif case == "oversize":
+        packet[0][2] = "A" * 87385
+    elif case == "bad-base64":
+        packet[0][2] = "PRIVATE_CANARY%"
+    elif case == "noncanonical-base64":
+        packet[0][2] = "YR=="
+    elif case == "changed-body":
+        packet[0][2] = base64.b64encode(b"other commit\n").decode()
+    elif case == "wrong-commit":
+        revision = "a" * 40
+    elif case == "wrong-root":
+        packet[1] = _source_packet(b"other")[1]
+    elif case == "wrong-scripts":
+        packet[2] = _source_packet(b"other")[2]
+    elif case == "wrong-module":
+        packet[3] = _source_packet(b"other")[3]
+    else:
+        packet = _source_packet(
+            **{
+                "wrong-root-name": {"root_name": b"other"},
+                "wrong-module-name": {"module_name": b"other.py"},
+                "symlink-module": {"module_mode": b"120000"},
+            }[case]
+        )
+        revision = packet[0][0]
+    with pytest.raises(namespace["SourceBindingError"], match="binding"):
+        namespace["verified_storage_source"](packet, revision)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"",
+        b"40000 scripts\0",
+        b"40000 scripts\0" + b"a" * 19,
+        b"00000 scripts\0" + b"a" * 20,
+        b"40000 ../scripts\0" + b"a" * 20,
+        b"40000 scripts\0" + b"a" * 20 + b"40000 scripts\0" + b"b" * 20,
+    ],
+)
+def test_fixed_tree_path_proof_refuses_missing_malformed_and_duplicate_entries(body):
+    namespace = _early_reader_namespace()
+    with pytest.raises(namespace["SourceBindingError"]):
+        namespace["tree_member"](body, b"scripts", b"40000")
+
+
+def test_storage_python_has_no_process_or_git_alias_authority():
+    source = _early_storage_bootstrap()
+    for forbidden in (
+        "subprocess",
+        "threading",
+        "read_object(",
+        "ordinary(git",
+        "GIT_ALIAS",
+        "receipt",
+        "st_nlink >",
+    ):
+        assert forbidden not in source
+    assert "require(info.st_nlink == 1, 'source_file_links')" in source
+    assert "verified_storage_source(read_source_packet(packet_path), revision)" in source
+    assert source.index("source = verified_storage_source") < source.index("exec(compile(source")
+
+
+def test_raw_storage_reader_is_identical_to_host_reader_and_held_per_call():
+    readers = []
+    for name in (
+        "Require idle exact physical host before provisioning",
+        "Bind early storage source under held Git admission",
+    ):
+        script = _run_script(_step(name))
+        start = script.index("function Read-K5GitObject(")
+        finish = script.index("return & $invokeGit -Operation $operation", start)
+        reader = script[start:finish]
+        # indentation differs because host diagnostics retain their branch block
+        readers.append("\n".join(line.strip() for line in reader.splitlines()))
+        assert "$start.FileName = $AdmittedGitPath" in reader
+        assert "10000 - [int]$watch.ElapsedMilliseconds" in reader
+        assert "$process.WaitForExit(2000)" in reader
+        assert "if (-not $process.HasExited) { $process.Kill() }" in reader
+        assert "$process.Dispose()" in reader
+        assert "CopyToAsync([IO.Stream]::Null)" in reader
+        assert (
+            "--no-replace-objects --no-lazy-fetch -c protocol.allow=never cat-file --batch"
+            in reader
+        )
+        assert "$start.EnvironmentVariables.Remove($key)" in reader
+    assert readers[0] == readers[1]
+
+
+def test_each_checkout_is_adjacent_to_fresh_full_boundary_steps():
+    text = WORKFLOW.read_text()
+    names = re.findall(r"^      - name: (.+)$", text, re.M)
+    for checkout, before, after in (
+        (
+            "Checkout immutable candidate",
+            "Admit existing Git before immutable checkouts",
+            "Require idle exact physical host before provisioning",
+        ),
+        (
+            "Checkout immutable Analytics source",
+            "Require idle exact physical host before provisioning",
+            "Require exact Git-backed source checkouts",
+        ),
+    ):
+        index = names.index(checkout)
+        assert names[index - 1 : index + 2] == [before, checkout, after]
+        assert (
+            _run_script(_step(before))
+            .rstrip()
+            .endswith("& $invokeGit -Operation { param($AdmittedGitPath) } | Out-Null")
+        )
+        post = _run_script(_step(after))
+        proof = post.index("& $invokeGit -Operation { param($AdmittedGitPath) } | Out-Null")
+        assert proof > post.index("$invokeGit = &")
+    assert "background" not in text.lower()
+
+
+def test_all_initializer_sources_match_frozen_local_blob_bytes():
+    text = WORKFLOW.read_text()
+    expected = {
+        "assert-stage-one-physical-admission.ps1": (
+            7643,
+            "9faae324ffaf008a7dc389aaab2d70198c5f4ea1",
+            "d7a38b5278802d9ba768d9987b4582a219d490923b0cc4da0c297d29a250b45d",
+        ),
+    }
+    for filename in ("assert-installed-git-alias.ps1", "admit_installed_git_alias.cs"):
+        data = canonical_checkout_bytes((ROOT / "scripts" / filename).read_bytes())
+        expected[filename] = (
+            len(data),
+            hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest(),
+            hashlib.sha256(data).hexdigest(),
+        )
+    pins = re.findall(
+        r"name = '([^']+)'; size = ([0-9]+); blob = '([0-9a-f]{40})'; sha256 = '([0-9a-f]{64})'",
+        text,
+    )
+    assert len(pins) == 27
+    for filename, size, blob, sha256 in pins:
+        assert (int(size), blob, sha256) == expected[filename]
+
+
+def test_compiler_posts_are_separate_always_run_file_only_and_non_mutating():
+    for name, owner_ids in (
+        (
+            "Independently admit early Git compiler artifacts",
+            (
+                "git_before_candidate",
+                "git_between_checkouts",
+                "git_after_analytics",
+                "git_storage_source",
+            ),
+        ),
+        ("Independently admit fixture Git compiler artifacts", ("git_fixture_revision",)),
+        ("Independently admit launcher Git compiler artifacts", ("git_launcher_archives",)),
+    ):
+        post = _step(name)
+        assert "if: always()" in post
+        assert "Assert-K5OrdinaryCompilerPath $entry $false" in post
+        assert "EnumerateFileSystemEntries($path)" in post
+        assert "$count -gt 64" in post and "$bytes -gt 16777216" in post
+        assert "'K5_GIT_COMPILER_POST=passed'" in post
+        assert post.count("& $trustedGuard | Out-Null") == 2
+        for owner_id in owner_ids:
+            assert "'" + owner_id + "'" in post
+            assert WORKFLOW.read_text().index("id: " + owner_id) < WORKFLOW.read_text().index(
+                "- name: " + name
+            )
+        for forbidden in (
+            "Add-Type",
+            "Remove-Item",
+            "-Recurse",
+            "$entry $true",
+            "Set-Acl",
+            "icacls",
+            "[IO.File]::Delete",
+        ):
+            assert forbidden not in post
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell required")
+@pytest.mark.parametrize(
+    "case",
+    [
+        "lf",
+        "crlf",
+        "trailing",
+        "missing",
+        "bad-header",
+        "oversize",
+        "short",
+        "extra",
+        "hash",
+        "wrong-kind",
+        "stderr-flood",
+        "nonzero",
+        "timeout",
+    ],
+    ids=str,
+)
+def test_actual_powershell_binary_reader_bounds_and_raw_bytes(tmp_path, case):
+    import base64
+
+    script = _run_script(_step("Require idle exact physical host before provisioning"))
+    start = script.index("    function Read-K5GitObject(")
+    end = script.index("    try {\n        if ($env:GITHUB_REPOSITORY", start)
+    reader = script[start:end]
+    body = {"lf": b"x=1\n", "crlf": b"x=1\r\n", "trailing": b"x=1\r\n\n"}.get(case, b"x=1\n")
+    frame = _git_frame(body)
+    if case == "missing":
+        frame = b"a" * 40 + b" missing\n"
+    if case == "bad-header":
+        frame = b"PRIVATE_CANARY" * 20 + b"\n"
+    if case == "oversize":
+        frame = b"a" * 40 + b" blob 131073\n"
+    if case == "short":
+        frame = frame[:-3]
+    if case == "extra":
+        frame += b"PRIVATE_CANARY"
+    if case == "hash":
+        frame = _git_frame(body, oid="a" * 40)
+    if case == "wrong-kind":
+        frame = _git_frame(body, "commit")
+    emitter = (
+        "$bytes=[Convert]::FromBase64String('" + base64.b64encode(frame).decode() + "');"
+        "[Console]::OpenStandardOutput().Write($bytes,0,$bytes.Length);"
+    )
+    if case == "stderr-flood":
+        emitter = (
+            "$err=[byte[]]::new(1048576);[Console]::OpenStandardError().Write($err,0,$err.Length);"
+            + emitter
+        )
+    if case == "timeout":
+        emitter = "Start-Sleep -Seconds 30;" + emitter
+    emitter += "exit " + ("3" if case == "nonzero" else "0")
+    encoded = base64.b64encode(emitter.encode("utf-16-le")).decode()
+    # This sole test seam substitutes a local synthetic child for Git. All actual
+    # binary framing, deadline, hashing and process/pipe cleanup code executes.
+    reader = reader.replace(
+        "$start.FileName = $AdmittedGitPath",
+        "$start.FileName = (Get-Command powershell).Source",
+    )
+    reader = re.sub(
+        r"\$start.Arguments = '[^']+'",
+        "$start.Arguments = '-NoProfile -NonInteractive -EncodedCommand " + encoded + "'",
+        reader,
+    )
+    script_path = tmp_path / "reader.ps1"
+    script_path.write_text(
+        "$ErrorActionPreference='Stop'\n$env:GITHUB_WORKSPACE=$PSScriptRoot\n"
+        "$sourceBindingDiagnostic=@{stage='test';reason='initial'}\n"
+        "$invokeGit={param($Operation) & $Operation 'C:\\Program Files\\Git\\cmd\\git.exe'}\n"
+        + reader
+        + "\ntry { $value=Read-K5GitObject ('a'*40) 'blob' 131072;"
+        " Write-Output ('BYTES='+[Convert]::ToBase64String($value.bytes)); exit 0 }"
+        " catch { Write-Output 'SOURCE_REFUSED'; exit 1 }\n"
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-File", str(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    assert "PRIVATE_CANARY" not in result.stdout + result.stderr
+    passed = case in {"lf", "crlf", "trailing", "stderr-flood"}
+    assert result.returncode == (0 if passed else 1)
+    if passed:
+        assert result.stdout.strip() == "BYTES=" + base64.b64encode(body).decode()
+    else:
+        assert result.stdout.strip() == "SOURCE_REFUSED"
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell required")
+@pytest.mark.parametrize(
+    "case",
+    [
+        "oem437",
+        "utf8",
+        "utf8-bom",
+        "unsupported-encoding",
+        "wrong-sha",
+        "bad-git-hash",
+        "missing-commit",
+        "wrong-kind",
+        "missing-producer",
+        "invalid-utf8",
+        "invalid-script",
+        "start-failure",
+    ],
+)
+def test_real_git_powershell_immutable_binding_and_encoding_restoration(tmp_path, case):
+    git = Path(r"C:\Program Files\Git\cmd\git.exe")
+    assert git.is_file(), (
+        "The hosted witness requires the same fixed Git installation as the reader"
+    )
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(
+        GIT_AUTHOR_NAME="source-fixture",
+        GIT_AUTHOR_EMAIL="source-fixture@example.invalid",
+        GIT_COMMITTER_NAME="source-fixture",
+        GIT_COMMITTER_EMAIL="source-fixture@example.invalid",
+        GIT_AUTHOR_DATE="2000-01-01T00:00:00+0000",
+        GIT_COMMITTER_DATE="2000-01-01T00:00:00+0000",
+        GIT_NO_REPLACE_OBJECTS="1",
+        GIT_NO_LAZY_FETCH="1",
+        GIT_ALLOW_PROTOCOL="",
+    )
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git_bytes(*arguments, data=None):
+        return subprocess.run(
+            [str(git), "-c", "protocol.allow=never", "-C", str(repository), *arguments],
+            input=data,
+            capture_output=True,
+            env=environment,
+            timeout=10,
+            check=True,
+        ).stdout
+
+    git_bytes("-c", "init.templateDir=", "init", "--quiet", "--object-format=sha1")
+    body = (ROOT / "scripts/assert-stage-one-physical-admission.ps1").read_bytes()
+    if case == "utf8-bom":
+        body = body.replace(b"\n", b"\r\n") + b"\r\n\n"
+    elif case == "invalid-utf8":
+        body = b"\xff"
+    elif case == "invalid-script":
+        body = b"param(\n"
+    blob = git_bytes("hash-object", "-w", "--stdin", data=body).decode().strip()
+    scripts_tree = (
+        git_bytes(
+            "mktree", data=f"100644 blob {blob}\tassert-stage-one-physical-admission.ps1\n".encode()
+        )
+        .decode()
+        .strip()
+    )
+    tree = (
+        git_bytes(
+            "mktree",
+            data=b""
+            if case == "missing-producer"
+            else f"040000 tree {scripts_tree}\tscripts\n".encode(),
+        )
+        .decode()
+        .strip()
+    )
+    revision = git_bytes("commit-tree", tree, data=b"immutable source witness\n").decode().strip()
+    assert git_bytes("cat-file", "blob", blob) == body
+    # A different working file must not influence immutable loading or execution.
+    (repository / "scripts").mkdir()
+    (repository / "scripts/assert-stage-one-physical-admission.ps1").write_text(
+        "throw 'PRIVATE_CANARY mutable source executed'\n"
+    )
+    environment.update(
+        GITHUB_WORKSPACE=str(repository),
+        GITHUB_REPOSITORY="mkurtgerald/K5-Vision",
+        K5_CANDIDATE_BRANCH=UPGRADE_BRANCH,
+        GITHUB_SHA=revision,
+        K5_STAGE_ONE_REVISION=revision,
+        GITHUB_RUN_ID="100",
+        GITHUB_RUN_ATTEMPT="2",
+        K5_CHECKOUT_GIT_SHA256=hashlib.sha256(git.read_bytes()).hexdigest(),
+    )
+    if case == "wrong-sha":
+        environment["GITHUB_SHA"] = "0" * 40
+    elif case == "bad-git-hash":
+        environment["K5_CHECKOUT_GIT_SHA256"] = "0" * 64
+    elif case in {"missing-commit", "wrong-kind"}:
+        environment["GITHUB_SHA"] = environment["K5_STAGE_ONE_REVISION"] = (
+            "0" * 40 if case == "missing-commit" else blob
+        )
+    wrapper = _run_script(_step("Require idle exact physical host before provisioning"))
+    wrapper = wrapper[wrapper.index("if ($env:K5_CANDIDATE_BRANCH") :]
+    wrapper = (
+        "$invokeGit={param($Operation) & $Operation 'C:\\Program Files\\Git\\cmd\\git.exe'}\n"
+        + wrapper
+    )
+    invocation = "& $script -DiagnosticContext $context"
+    assert wrapper.count(invocation) == 1
+    # Exercise the exact binding wrapper, but never invoke the physical guard.
+    wrapper = wrapper.replace(
+        invocation,
+        "$compiledHash = [Security.Cryptography.SHA256]::Create(); "
+        "try { $compiled = ([BitConverter]::ToString($compiledHash.ComputeHash("
+        "[Text.Encoding]::UTF8.GetBytes($script.ToString()))))"
+        ".Replace('-', '').ToLowerInvariant() } "
+        "finally { $compiledHash.Dispose() }; "
+        "Write-Output ('BOUND=' + (@{source_sha=$context.source_sha; "
+        "source_tree=$context.source_tree; producer_sha256=$context.producer_sha256; "
+        "compiled_sha256=$compiled} | ConvertTo-Json -Compress))",
+    )
+    if case == "start-failure":
+        wrapper = wrapper.replace(
+            "$start.FileName = $AdmittedGitPath",
+            "$start.FileName = (Join-Path $env:GITHUB_WORKSPACE 'missing-git.exe')",
+        )
+    encoding = {
+        "oem437": "[Text.Encoding]::GetEncoding(437)",
+        "utf8": "[Text.UTF8Encoding]::new($false)",
+        "unsupported-encoding": "[Text.UnicodeEncoding]::new($false, $false)",
+    }.get(case, "[Text.UTF8Encoding]::new($true)")
+    witness = tmp_path / "binding-witness.ps1"
+    witness.write_text(
+        "$ErrorActionPreference='Stop'\n$before=[Console]::InputEncoding\n$exitCode=0\n"
+        "try {\n$requested=" + encoding + "\n[Console]::InputEncoding=$requested\n"
+        "$expected=[Console]::InputEncoding\n"
+        "if ($expected.CodePage -ne $requested.CodePage -or "
+        "[Convert]::ToBase64String($expected.GetPreamble()) -cne "
+        "[Convert]::ToBase64String($requested.GetPreamble())) "
+        "{ throw 'ENCODING_FIXTURE_UNAVAILABLE' }\ntry {\n" + wrapper + "\n} catch {\n"
+        "Write-Output 'BINDING_WITNESS_REFUSED'; $exitCode=1\n} finally {\n"
+        "$actual=[Console]::InputEncoding\n"
+        "$restored=$actual.CodePage -eq $expected.CodePage -and "
+        "[Convert]::ToBase64String($actual.GetPreamble()) -ceq "
+        "[Convert]::ToBase64String($expected.GetPreamble())\n"
+        "Write-Output ('ENCODING_RESTORED='+$restored)\n}\n"
+        "} finally { [Console]::InputEncoding=$before }\nexit $exitCode\n"
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-File", str(witness)],
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+    assert "PRIVATE_CANARY" not in result.stdout + result.stderr
+    lines = result.stdout.splitlines()
+    assert lines.count("ENCODING_RESTORED=True") == 1, result.stdout + result.stderr
+    refused = {
+        "wrong-sha": ("environment", "context"),
+        "unsupported-encoding": ("commit_read", "input_encoding"),
+        "bad-git-hash": ("git_binary", "identity"),
+        "missing-commit": ("commit_read", "header_format"),
+        "wrong-kind": ("commit_read", "object_kind_or_size"),
+        "missing-producer": ("producer_read", "header_format"),
+        "invalid-utf8": ("producer_decode", "utf8"),
+        "invalid-script": ("script_compile", "syntax"),
+        "start-failure": ("commit_read", "process_start"),
+    }
+    records = [
+        line.split("=", 1)[1] for line in lines if line.startswith("K5_HOST_SOURCE_BINDING=")
+    ]
+    bound = [line.split("=", 1)[1] for line in lines if line.startswith("BOUND=")]
+    if case in refused:
+        assert result.returncode == 1 and not bound
+        assert lines.count("BINDING_WITNESS_REFUSED") == 1
+        assert lines.count("K5_HOST_NAME_OBSERVATION_UNAVAILABLE") == 1
+        assert len(records) == 1
+        stage, reason = refused[case]
+        assert json.loads(records[0]) == {
+            "schema_version": "host-source-binding-v1",
+            "scope": "diagnostic-only-source-binding",
+            "status": "refused",
+            "stage": stage,
+            "reason": reason,
+            "edge_admission": False,
+            "retry_authority": False,
+        }
+    else:
+        assert result.returncode == 0 and not records, result.stdout + result.stderr
+        assert "K5_HOST_NAME_OBSERVATION_UNAVAILABLE" not in lines
+        assert len(bound) == 1
+        assert json.loads(bound[0]) == {
+            "source_sha": revision,
+            "source_tree": tree,
+            "producer_sha256": hashlib.sha256(body).hexdigest(),
+            "compiled_sha256": hashlib.sha256(body).hexdigest(),
+        }
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell required")
+@pytest.mark.parametrize(
+    "case",
+    [
+        "passed",
+        "refused",
+        "stderr",
+        "empty",
+        "malformed",
+        "identity-canary",
+        "bad-status",
+        "mask-overflow",
+        "distance-overflow",
+        "bool-stage",
+        "array-code",
+        "valid-ace",
+        "constructor-identity",
+        "source-links",
+        "source-object-hash",
+        "source-wrong-stage",
+        "source-unknown-code",
+    ],
+    ids=str,
+)
+def test_actual_powershell_bootstrap_invocation_suppresses_startup_output(tmp_path, case):
+    record = dict(
+        schema_version="storage-preflight-v1",
+        scope="read-only-early-storage-admission",
+        status="passed" if case == "passed" else "refused",
+        stage="storage_root" if case == "passed" else "source_binding",
+        code="passed" if case == "passed" else "source_unavailable",
+        storage_acl=None,
+        retention_state="not_started",
+        later_admission_required=True,
+    )
+    if case == "constructor-identity":
+        record.update(stage="storage_construction", code="storage_identity")
+    if case in {"source-links", "source-wrong-stage"}:
+        record["code"] = "source_file_links"
+        if case == "source-wrong-stage":
+            record["stage"] = "runtime_binding"
+    if case == "source-object-hash":
+        record["code"] = "source_object_hash"
+    if case == "source-unknown-code":
+        record["code"] = "PRIVATE_CANARY"
+    if case == "identity-canary":
+        record["storage_acl"] = {"owner": "PRIVATE_CANARY"}
+    if case in {"mask-overflow", "distance-overflow", "valid-ace"}:
+        record.update(stage="storage_root", code="storage_acl")
+        record["storage_acl"] = dict(
+            schema_version="storage-acl-admission-v2",
+            path_role="ancestor",
+            path_context="runner_workspace",
+            admission_mode="ancestor",
+            phase="ace_policy",
+            native_call="GetNamedSecurityInfoW",
+            native_error="success",
+            reason="foreign_mutating_allow",
+            ancestor_distance=2,
+            ace=dict(
+                ace_type="allow",
+                principal_category="builtin_users",
+                effective_principal_category="builtin_users",
+                access_mask=0x40000000,
+                expanded_access_mask=0x00120116,
+                inheritance_flags=0x13,
+            ),
+        )
+        if case == "mask-overflow":
+            record["storage_acl"]["ace"]["access_mask"] = 2**64
+        if case == "distance-overflow":
+            record["storage_acl"]["ancestor_distance"] = 65
+    if case == "bool-stage":
+        record["stage"] = True
+    if case == "array-code":
+        record["code"] = ["source_unavailable"]
+    if case == "bad-status":
+        record["status"] = "PRIVATE_CANARY"
+    line = "K5_STORAGE_PREFLIGHT=" + json.dumps(record, separators=(",", ":"))
+    if case == "malformed":
+        line = "PRIVATE_CANARY startup"
+    script = _run_script(_step("Observe read-only storage admission before provisioning"))
+    invocation = script.split("\n'@\n", 1)[1]
+    emitter = ""
+    if case != "empty":
+        emitter = "Write-Output '" + line + "'\n"
+    if case == "stderr":
+        emitter += "Write-Error 'PRIVATE_CANARY startup' -ErrorAction Continue\n"
+    harness = (
+        "$ErrorActionPreference='Stop'\n$bootstrap='fixed bootstrap'\n"
+        "$sourcePacket='[]'\n$base='Invoke-TestProbe'\n"
+        "function Invoke-TestProbe {\n"
+        + emitter
+        + "$global:LASTEXITCODE="
+        + ("0" if case == "passed" else "1")
+        + "\n}\n"
+        "try {\n" + invocation + "\n} catch { Write-Output 'TERMINAL_REFUSAL' }\n"
+    )
+    path = tmp_path / "invoke.ps1"
+    path.write_text(harness)
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-File", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=True,
+    )
+    assert "PRIVATE_CANARY" not in result.stdout + result.stderr
+    logs = [line for line in result.stdout.splitlines() if line.startswith("K5_STORAGE_PREFLIGHT=")]
+    assert len(logs) == 1
+    emitted = json.loads(logs[0].split("=", 1)[1])
+    assert emitted["retention_state"] == "not_started"
+    assert emitted["later_admission_required"] is True
+    if case == "passed":
+        assert emitted["status"] == "passed" and "TERMINAL_REFUSAL" not in result.stdout
+    else:
+        assert emitted["status"] == "refused" and "TERMINAL_REFUSAL" in result.stdout
+        if case == "constructor-identity":
+            assert emitted["code"] == "storage_identity"
+        if case in {"source-links", "source-object-hash"}:
+            assert emitted["code"] == record["code"] and emitted["stage"] == "source_binding"
+        if case == "valid-ace":
+            assert emitted["storage_acl"]["ace"]["access_mask"] == 0x40000000
+        elif case in {
+            "mask-overflow",
+            "distance-overflow",
+            "bool-stage",
+            "array-code",
+            "source-wrong-stage",
+            "source-unknown-code",
+        }:
+            assert emitted["code"] == "bootstrap_unavailable"
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell required")
+@pytest.mark.parametrize(
+    "case", ["present", "missing", "changed", "hardlink", "reparse", "alias"], ids=str
+)
+def test_actual_early_powershell_runtime_binding_has_no_setup_or_fallback(tmp_path, case):
+    work = tmp_path / "work"
+    runner = work / "K5-Vision"
+    workspace = runner / "K5-Vision"
+    temporary = work / "_temp"
+    runtime = work / "_tool/Python/3.12.10/x64/python.exe"
+    workspace.mkdir(parents=True)
+    temporary.mkdir()
+    runtime.parent.mkdir(parents=True)
+    if case != "missing":
+        runtime.write_bytes(b"inert fixture, never executed")
+    script = _run_script(_step("Observe read-only storage admission before provisioning"))
+    admission = script.split("$bootstrap = @'", 1)[0]
+    setup = (
+        "$env:RUNNER_WORKSPACE='" + str(runner) + "'\n"
+        "$env:GITHUB_WORKSPACE='" + str(workspace) + "'\n"
+        "$env:RUNNER_TEMP='" + str(temporary) + "'\n"
+    )
+    if case == "alias":
+        setup += "$env:RUNNER_WORKSPACE += '\\..\\K5-Vision'\n"
+    if case != "changed":
+        setup += (
+            "function Get-FileHash { param($LiteralPath,$Algorithm); [pscustomobject]@{"
+            "Hash='4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a'} }\n"
+        )
+    if case in {"hardlink", "reparse"}:
+        setup += (
+            "function Get-Item { param($LiteralPath,[switch]$Force,$ErrorAction);"
+            "$item=Microsoft.PowerShell.Management\\Get-Item @PSBoundParameters;"
+            " if($LiteralPath.EndsWith('python.exe')) { return [pscustomobject]@{"
+            "FullName=$LiteralPath;PSIsContainer=$false;Parent=$null;"
+            + (
+                "LinkType='HardLink';Attributes=0"
+                if case == "hardlink"
+                else "LinkType='';Attributes=[IO.FileAttributes]::ReparsePoint"
+            )
+            + "} }; return $item }\n"
+        )
+    path = tmp_path / "runtime.ps1"
+    path.write_text(
+        setup
+        + "try {\n"
+        + admission
+        + "\nWrite-Output 'RUNTIME_BOUND' } catch { Write-Output 'RUNTIME_REFUSED' }\n"
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-File", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=True,
+    )
+    assert "PRIVATE_CANARY" not in result.stdout + result.stderr
+    if case == "present":
+        assert "RUNTIME_BOUND" in result.stdout
+    else:
+        assert "RUNTIME_REFUSED" in result.stdout
+        emitted = next(
+            line for line in result.stdout.splitlines() if line.startswith("K5_STORAGE_PREFLIGHT=")
+        )
+        assert json.loads(emitted.split("=", 1)[1])["code"] == "runtime_unavailable"
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell required")
+def test_real_powershell_stdin_bootstrap_refuses_impossible_layout_before_native(tmp_path):
+    import sys
+
+    # Use only the existing hosted interpreter to exercise transport; it cannot
+    # satisfy the designated cache/layout and must never reach NativeStoragePolicy.
+    script = _run_script(_step("Observe read-only storage admission before provisioning"))
+    bootstrap_and_invocation = "$bootstrap = @'" + script.split("$bootstrap = @'", 1)[1]
+    path = tmp_path / "stdin.ps1"
+    path.write_text(
+        "$ErrorActionPreference='Stop'\n$base='" + sys.executable.replace("'", "''") + "'\n"
+        "$env:RUNNER_WORKSPACE=$PSScriptRoot\n$env:GITHUB_WORKSPACE=$PSScriptRoot\n"
+        "$env:RUNNER_TEMP=$PSScriptRoot\n$sourcePacket='[]'\ntry {\n"
+        + bootstrap_and_invocation
+        + "\n} catch { Write-Output ('BOOTSTRAP_EXIT=' + $probeExit) }\n"
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-File", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=True,
+    )
+    lines = result.stdout.splitlines()
+    assert "BOOTSTRAP_EXIT=1" in lines
+    records = [
+        json.loads(line.split("=", 1)[1])
+        for line in lines
+        if line.startswith("K5_STORAGE_PREFLIGHT=")
+    ]
+    assert len(records) == 1 and records[0]["code"] == "runtime_unavailable"
+    assert records[0]["status"] == "refused" and records[0]["storage_acl"] is None
+    assert str(tmp_path) not in result.stdout + result.stderr
+    assert "Traceback" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("fault", ["runtime-links", "object-hash", "unknown-code", "exception"])
+def test_bootstrap_source_failure_is_a_distinct_bounded_refusal(tmp_path, capsys, fault):
+    from types import SimpleNamespace
+
+    namespace = _early_reader_namespace()
+    runner = tmp_path / "K5-Vision"
+    workspace = runner / "K5-Vision"
+    temporary = tmp_path / "_temp"
+    runtime = tmp_path / "_tool/Python/3.12.10/x64/python.exe"
+    namespace["os"] = SimpleNamespace(
+        name="nt",
+        environ={
+            "RUNNER_WORKSPACE": str(runner),
+            "GITHUB_WORKSPACE": str(workspace),
+            "RUNNER_TEMP": str(temporary),
+            "GITHUB_REPOSITORY": "mkurtgerald/K5-Vision",
+            "K5_STAGE_ONE_REVISION": "a" * 40,
+            "GITHUB_SHA": "a" * 40,
+            "K5_CANDIDATE_BRANCH": UPGRADE_BRANCH,
+            "GITHUB_RUN_ID": "100",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "K5_CHECKOUT_GIT_SHA256": (
+                "78211c7ed73988da93a6d8a33d47ec6187f464d7ea2a9a00c182bbd7a1ecf30f"
+            ),
+        },
+    )
+    namespace["sys"] = SimpleNamespace(
+        implementation=SimpleNamespace(name="cpython"),
+        version_info=(3, 12, 10),
+        prefix="base",
+        base_prefix="base",
+        flags=SimpleNamespace(isolated=1, no_site=1),
+        dont_write_bytecode=True,
+        executable=str(runtime),
+    )
+
+    def ordinary(path, directory):
+        if (fault == "file-links" and str(path) == r"C:\Program Files\Git\cmd\git.exe") or (
+            fault == "runtime-links" and path == runtime
+        ):
+            raise namespace["SourceBindingError"]("source_file_links")
+
+    namespace["ordinary"] = ordinary
+    namespace["file_digest"] = lambda path: (
+        "4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a"
+        if path == runtime
+        else "b" * 64
+    )
+
+    def fail(*args):
+        if fault == "object-hash":
+            raise namespace["SourceBindingError"]("source_object_hash")
+        if fault == "unknown-code":
+            raise namespace["SourceBindingError"]("PRIVATE_CANARY")
+        if fault == "exception":
+            raise OSError("PRIVATE_CANARY")
+        raise RuntimeError("PRIVATE_CANARY")
+
+    namespace["read_source_packet"] = lambda path: []
+    namespace["verified_storage_source"] = fail
+    source = (
+        "record = dict(schema_version="
+        + _early_storage_bootstrap().split("record = dict(schema_version=", 1)[1]
+    )
+    with pytest.raises(SystemExit) as caught:
+        exec(compile(source, "<tested-bootstrap-entry>", "exec"), namespace)
+    assert caught.value.code == 1
+    output = capsys.readouterr()
+    assert "PRIVATE_CANARY" not in output.out + output.err
+    record = json.loads(output.out.strip().split("=", 1)[1])
+    assert record["stage"] == ("runtime_binding" if fault == "runtime-links" else "source_binding")
+    assert (
+        record["code"]
+        == {
+            "cleanup": "source_cleanup_failed",
+            "file-links": "source_file_links",
+            "runtime-links": "runtime_unavailable",
+            "object-hash": "source_object_hash",
+            "unknown-code": "source_commit_read",
+            "exception": "source_commit_read",
+        }[fault]
+    )
+    assert record["status"] == "refused" and record["storage_acl"] is None
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell required")
+def test_actual_windows_early_storage_packet_preserves_four_binary_git_objects(tmp_path):
+    import base64
+
+    binder = _run_script(_step("Bind early storage source under held Git admission"))
+    start = binder.index("$sourceObjects = [object[]]::new(4)")
+    end = binder.index("if ($sourcePacket.Length -gt 620000)", start)
+    producer = binder[start:end]
+    names = ("commit", "rootTree", "scriptsTree", "storage")
+    kinds = ("commit", "tree", "tree", "blob")
+    bodies = (b"commit-bytes", b"root-tree", b"scripts-tree", b"storage-source")
+    script = "$ErrorActionPreference = 'Stop'\n"
+    for index, (name, body) in enumerate(zip(names, bodies, strict=True)):
+        encoded = base64.b64encode(body).decode("ascii")
+        script += (
+            f"${name} = @{{ oid = ('{chr(97 + index)}' * 40); "
+            f"bytes = [Convert]::FromBase64String('{encoded}') }}\n"
+        )
+    script += producer + "\nWrite-Output $sourcePacket\n"
+    script_path = tmp_path / "source-packet.ps1"
+    script_path.write_text(script, encoding="utf-8")
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-File", str(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr[-1000:]
+    packet = json.loads(result.stdout)
+    assert type(packet) is list and len(packet) == 4
+    for index, (entry, kind, body) in enumerate(zip(packet, kinds, bodies, strict=True)):
+        assert type(entry) is list and len(entry) == 3
+        assert entry[0] == chr(97 + index) * 40 and entry[1] == kind
+        assert base64.b64decode(entry[2], validate=True) == body
+
+
+def test_storage_packet_handoff_is_bounded_data_with_strict_single_links(tmp_path):
+    namespace = _early_reader_namespace()
+    path = tmp_path / "storage-source.json"
+    packet = _source_packet(b"value = 1\r\n")
+    path.write_text(json.dumps(packet))
+    assert namespace["read_source_packet"](path) == packet
+    alias = tmp_path / "alias.json"
+    os.link(path, alias)
+    with pytest.raises(namespace["SourceBindingError"]) as error:
+        namespace["read_source_packet"](path)
+    assert error.value.code == "source_file_links"
+    binder = _step("Bind early storage source under held Git admission")
+    assert "[IO.FileMode]::CreateNew" in binder
+    assert "$packetBytes.Length -gt 620000" in binder
+    assert "'storage-source.json'" in binder
+    assert "GITHUB_ENV" not in binder and "GITHUB_OUTPUT" not in binder
+    assert "Assert-K5OrdinaryCompilerPath $packetPath $false" in binder
+
+
+def test_workflow_run_blocks_fit_actions_hard_character_limit():
+    text = WORKFLOW.read_text()
+    for name in re.findall(r"^      - name: (.+)$", text, re.M):
+        step = _step(name)
+        if "run: |" in step:
+            assert len(_run_script(step)) <= 21000, name
+
+
+def test_controlled_direct_git_calls_have_owned_deadlines_and_closed_output():
+    utilities = []
+    for name in (
+        "Admit existing Git before immutable checkouts",
+        "Require exact Git-backed source checkouts",
+        "Prepare existing bounded rights-reviewed fixture",
+        "Prepare independently bound offline Start-script inputs",
+    ):
+        script = _run_script(_step(name))
+        utility = script.split("function Invoke-K5OwnedGitText(", 1)[1].split("$ownedGitText =", 1)[
+            0
+        ]
+        utilities.append(utility)
+        assert "$memory.Length + $read.Result -gt 4096" in utility
+        assert "$Budget - [int]$watch.ElapsedMilliseconds" in utility
+        assert "$process.ExitCode -ne 0" in utility
+        assert "$process.WaitForExit(2000)" in utility
+        assert "$process.Kill()" in utility and "$process.Dispose()" in utility
+        assert "CopyToAsync([IO.Stream]::Null)" in utility
+        assert "$start.EnvironmentVariables.Remove($key)" in utility
+        assert "$start.FileName = $AdmittedGitPath" in utility
+        assert ".GetNewClosure())" in script
+    assert all(utility == utilities[0] for utility in utilities)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (b"first\nsecond\n", b"first\nsecond\n"),
+        (b"first\r\nsecond\r\n", b"first\nsecond\n"),
+        (b"first\r\nsecond\n", b"first\nsecond\n"),
+        (b"\xef\xbb\xbffirst\r\n", b"\xef\xbb\xbffirst\n"),
+    ],
+)
+def test_source_pin_reader_only_canonicalizes_checkout_crlf(raw, expected):
+    # BOMs and all other content remain byte-visible to the unchanged exact pins.
+    assert canonical_checkout_bytes(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [b"first\rsecond\n", b"first\r\r\n", b"first\n\xff"])
+def test_source_pin_reader_rejects_bare_cr_and_invalid_utf8(raw):
+    with pytest.raises(ValueError):
+        canonical_checkout_bytes(raw)

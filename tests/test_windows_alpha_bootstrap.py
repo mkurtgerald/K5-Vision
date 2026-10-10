@@ -11,23 +11,25 @@ PREFLIGHT = ALPHA / "Test-K5VisionAlpha.ps1"
 RUN = ALPHA / "Run-K5VisionAlpha.ps1"
 START = ALPHA / "Start-K5VisionAlpha.ps1"
 PROVISION = ROOT / "scripts" / "provision-stage03-gstreamer.ps1"
+TRANSACTION = ALPHA / "install_transaction.py"
 PIN = "d531d50d479f46af6ceed324a7cc379745becb61"
 
 
 def test_windows_alpha_bootstrap_files_exist() -> None:
-    for path in (INSTALL, PREFLIGHT, RUN, START, PROVISION):
+    for path in (INSTALL, PREFLIGHT, RUN, START, PROVISION, TRANSACTION):
         assert path.is_file(), path
 
 
 def test_windows_alpha_installer_is_revision_pinned_and_checkout_free() -> None:
     text = INSTALL.read_text(encoding="utf-8")
     assert PIN in text
-    assert "https://github.com/mkurtgerald/K5-Vision/archive/$K5Revision.zip" in text
+    transaction = TRANSACTION.read_text(encoding="utf-8")
+    assert "https://github.com/mkurtgerald/K5-Vision/archive/{self.revision}.zip" in transaction
     assert "K5Revision -notmatch '^[0-9a-fA-F]{40}$'" in text
     assert "pip install $repoRoot" not in text
-    assert "-m pip install --force-reinstall --no-deps $packageUri" in text
-    assert "LOCAL_TEST_SOURCE_ENV" in text
-    assert "Installed K5 Python runtime capability verification PASS." in text
+    assert '"pip", "wheel", "--no-deps"' in transaction
+    assert "LOCAL_TEST_SOURCE_ENV" in transaction
+    assert "self.preflight(self.stage)" in transaction
 
 
 def test_windows_alpha_installer_accepts_python_312_without_legacy_launcher() -> None:
@@ -35,13 +37,16 @@ def test_windows_alpha_installer_accepts_python_312_without_legacy_launcher() ->
     assert "Get-Command py.exe -ErrorAction SilentlyContinue" in text
     assert '"python3.12.exe", "python.exe"' in text
     assert "$pythonCommand = $candidate.Source" in text
-    assert "& $pythonCommand @pythonPrefixArgs -m venv $venv" in text
+    assert "& $pythonCommand @pythonPrefixArgs @pythonIsolation @arguments" in text
+    assert '"--revision", $K5Revision' in text
 
 
 def test_windows_alpha_installer_uses_reviewed_media_provisioner() -> None:
     text = INSTALL.read_text(encoding="utf-8")
     assert "provision-stage03-gstreamer.ps1" in text
-    assert "& $provisioner -Version $GStreamerVersion" in text
+    transaction = TRANSACTION.read_text(encoding="utf-8")
+    assert 'self.source.parent / "provision-stage03-gstreamer.ps1"' in transaction
+    assert '"-Version",' in transaction and "self.gstreamer" in transaction
 
 
 def test_windows_alpha_installer_materializes_launcher_and_shortcut() -> None:
@@ -49,9 +54,9 @@ def test_windows_alpha_installer_materializes_launcher_and_shortcut() -> None:
     assert "Start-K5VisionAlpha.ps1" in text
     assert "Run-K5VisionAlpha.ps1" in text
     assert "K5 Vision Alpha.lnk" in text
-    assert "-ExecutionPolicy Bypass -NoExit -File" in text
+    assert "-ExecutionPolicy Bypass -NoExit -File" in TRANSACTION.read_text(encoding="utf-8")
     assert "[switch]$SkipDesktopShortcut" in text
-    assert "if (-not $SkipDesktopShortcut)" in text
+    assert 'if ($SkipDesktopShortcut) { $arguments += "--skip-shortcut" }' in text
 
 
 def test_windows_alpha_preflight_verifies_installed_runtime_without_camera_contact() -> None:
@@ -180,14 +185,15 @@ def test_windows_alpha_test_does_not_retain_media_or_private_camera_config() -> 
     assert "$env:K5_STAGE03_CAM_CRED =" not in text
 
 
-def test_windows_alpha_installer_cleans_stale_venv_process_before_rebuild() -> None:
+def test_windows_alpha_installer_refuses_running_or_unidentified_processes() -> None:
     text = INSTALL.read_text(encoding="utf-8")
-    assert "Get-CimInstance Win32_Process" in text
-    assert "ExecutablePath" in text
-    assert "Stopping stale K5 Vision Alpha runtime process" in text
-    assert "Stop-Process -Id ([int]$staleProcess.ProcessId) -Force" in text
-    assert "Remove-Item -LiteralPath $venv -Recurse -Force" in text
-    assert "Existing K5 Vision Alpha runtime is still locked." in text
+    transaction = TRANSACTION.read_text(encoding="utf-8")
+    assert "Stop-Process" not in text + transaction
+    assert "Remove-Item -LiteralPath $venv -Recurse -Force" not in text
+    assert "Get-CimInstance Win32_Process" in transaction
+    assert "ExecutablePath" in transaction
+    assert "K5 Alpha is running. Close its windows and retry the upgrade." in transaction
+    assert "Cannot identify a Python process." in transaction
 
 
 def test_windows_alpha_launcher_rejects_occupied_control_plane_port() -> None:
@@ -213,10 +219,11 @@ def test_windows_alpha_installer_installs_reviewed_runtime_dependencies() -> Non
     ):
         assert requirement in dependency_text
     assert '$runtimeRequirements = Join-Path $PSScriptRoot "runtime-requirements.txt"' in text
-    assert "-m pip install --requirement $runtimeRequirements" in text
-    assert "-m pip install --force-reinstall --no-deps $packageUri" in text
-    assert "-m pip check" in text
-    assert "K5 Vision Alpha runtime dependency verification PASS." in text
+    transaction = TRANSACTION.read_text(encoding="utf-8")
+    assert '"--requirement",' in transaction
+    assert 'self.source / "runtime-requirements.txt"' in transaction
+    assert '"--no-index"' in transaction and '"--no-deps"' in transaction
+    assert '"-m", "pip", "check"' in transaction
 
 
 def test_synthetic_source_owns_partial_startup_until_successful_return() -> None:
@@ -320,3 +327,20 @@ try {
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_windows_alpha_installer_supports_private_bundled_python_without_path() -> None:
+    text = INSTALL.read_text(encoding="utf-8")
+    assert '[string]$PythonExecutable = ""' in text
+    assert 'Join-Path $InstallRoot "python312\\python.exe"' in text
+    assert "[IO.Path]::IsPathRooted($PythonExecutable)" in text
+    assert "$requestedBundled -cne $expectedBundled" in text
+    assert "[IO.File]::Exists($requestedBundled)" in text
+    assert "sys.implementation.name == 'cpython'" in text
+    assert "struct.calcsize('P') == 8" in text
+    assert "& $requestedBundled -I -S -B -c" in text
+    assert "$pythonCommand = $requestedBundled" in text
+    # The existing 3.12 interpreter discovery remains a fallback only when no
+    # K5-owned embedded runtime was supplied.
+    assert "if ($null -eq $pythonCommand) {\n    $py = Get-Command py.exe" in text
+    assert "if ($null -eq $pythonCommand) {\n    foreach ($candidateName" in text
