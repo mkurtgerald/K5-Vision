@@ -34,7 +34,8 @@ FILES = (
     "gstreamer-version.txt",
     "k5-revision.txt",
 )
-MANAGED = (".venv", *FILES, "analytics-models", "analytics-config.json")
+MANAGED = (".venv", *FILES)
+ANALYTICS_MANAGED = ("analytics-models", "analytics-config.json")
 WORKSPACE = ".k5-alpha-upgrade"
 LOCK = ".k5-alpha-install.lock"
 FORMAT = "k5-alpha-upgrade-v1"
@@ -856,7 +857,12 @@ class Installer:
         os.replace(temporary, self.journal)
 
     def targets(self, state: dict) -> dict[str, Path]:
-        targets = {name: self.root / name for name in MANAGED}
+        # Old installation journals omit this key and retain their original
+        # exact recovery inventory. New analytics-enabled journals opt in.
+        if "analytics_managed" in state and state["analytics_managed"] is not True:
+            raise RuntimeError("Invalid analytics recovery inventory.")
+        names = MANAGED + ANALYTICS_MANAGED if state.get("analytics_managed") else MANAGED
+        targets = {name: self.root / name for name in names}
         shortcut = state.get("shortcut")
         if shortcut is not None:
             if not isinstance(shortcut, str) or self.shortcut is None:
@@ -1097,6 +1103,8 @@ class Installer:
             self.assert_idle()
             self.work.mkdir()
             state = {"format": FORMAT, "phase": "preparing", "shortcut": None}
+            if self.analytics_bundle is not None:
+                state["analytics_managed"] = True
             self.save(state)
             try:
                 self.backup.mkdir()
