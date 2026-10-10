@@ -272,11 +272,7 @@ def test_unsafe_manifest_path_rejected(installed, relative):
         admission._safe_file(installed.site, relative)
 
 
-@pytest.mark.parametrize("change", ["changed", "missing", "extra", "git-blob"])
-
-def test_offline_wheel_builder_restores_only_pinned_crlf_donor_checkout(
-    installed, tmp_path
-):
+def test_offline_wheel_builder_restores_only_pinned_crlf_donor_checkout(installed, tmp_path):
     source = installed.source / "analytics_lab/tracking.py"
     source.write_bytes(source.read_bytes().replace(b"\n", b"\r\n"))
     wheel = installed.builder.build_wheel(installed.source, tmp_path / "crlf-wheels")
@@ -289,9 +285,7 @@ def test_offline_wheel_builder_restores_only_pinned_crlf_donor_checkout(
     "unverified",
     [b"TRACK = 3\r\n", b"TRACK = 2\r\r\n", b"TRACK = 2\r\nx\n"],
 )
-def test_offline_wheel_builder_refuses_unpinned_or_mixed_crlf(
-    installed, tmp_path, unverified
-):
+def test_offline_wheel_builder_refuses_unpinned_or_mixed_crlf(installed, tmp_path, unverified):
     source = installed.source / "analytics_lab/tracking.py"
     source.write_bytes(unverified)
     output = tmp_path / "unverified-wheels"
@@ -304,10 +298,21 @@ def test_reviewed_manifest_checkout_cannot_change_line_endings():
     root = Path(__file__).resolve().parents[1]
     rule = (root / ".gitattributes").read_text(encoding="ascii")
     assert "src/k5vision/data/analytics-runtime-manifest.json text eol=lf" in rule
-    assert hashlib.sha256(admission._MANIFEST_PATH.read_bytes()).hexdigest() == admission.MANIFEST_SHA256
+    assert "src/k5vision/data/analytics-runtime-Apache-2.0.txt text eol=lf" in rule
+    assert (
+        hashlib.sha256(admission._MANIFEST_PATH.read_bytes()).hexdigest()
+        == admission.MANIFEST_SHA256
+    )
+    notice = next(
+        entry
+        for entry in admission._load_manifest()[1]["files"]
+        if entry["source"] == "supplemental-notice"
+    )
+    notice_bytes = (root / "src/k5vision/data" / notice["source_path"]).read_bytes()
+    assert hashlib.sha256(notice_bytes).hexdigest() == notice["sha256"]
 
 
-
+@pytest.mark.parametrize("change", ["changed", "missing", "extra", "git-blob"])
 def test_offline_builder_rejects_unpinned_inputs(installed, tmp_path, change):
     path = installed.source / "analytics_lab/tracking.py"
     if change == "changed":

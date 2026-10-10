@@ -50,7 +50,7 @@ def _read_verified_checkout_source(root: Path, entry: dict) -> bytes:
             or data.count(b"\n") != data.count(b"\r\n")
         ):
             raise _admission.AnalyticsPackageError(
-                "Analytics checkout source differs from pinned manifest"
+                f"Analytics checkout source differs from pinned manifest: {entry['source_path']}"
             )
         canonical = data.replace(b"\r\n", b"\n")
     if (
@@ -58,7 +58,7 @@ def _read_verified_checkout_source(root: Path, entry: dict) -> bytes:
         or hashlib.sha256(canonical).hexdigest() != entry["sha256"]
     ):
         raise _admission.AnalyticsPackageError(
-            "Analytics checkout source differs from pinned manifest"
+            f"Analytics checkout source differs from pinned manifest: {entry['source_path']}"
         )
     return canonical
 
