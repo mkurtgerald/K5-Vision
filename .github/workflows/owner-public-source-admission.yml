@@ -1,0 +1,56 @@
+name: Owner Public Source Admission
+on:
+  push:
+    branches: [fix/transactional-alpha-upgrade-20261003]
+    paths: [.github/workflows/owner-public-source-admission.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  publisher-interface:
+    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Inspect official test publisher interface without acquiring media
+        shell: python
+        run: |
+          import re
+          import urllib.request
+          import urllib.parse
+          origin = 'https://rtsplink.com'
+          def read(url):
+              request = urllib.request.Request(url, headers={'User-Agent': 'K5-Engineering-TestSourceReview/1.0'})
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  if urllib.parse.urlsplit(response.url).hostname != 'rtsplink.com':
+                      raise RuntimeError('Unexpected publisher origin')
+                  data = response.read(2_000_001)
+                  if len(data) > 2_000_000:
+                      raise RuntimeError('Publisher document exceeds bound')
+                  return data.decode('utf-8')
+          def sanitize(text):
+              text = re.sub(r'(?:rtsp|rtsps|https?)://[^\s\"\x27<>]+', '[URL OMITTED]', text)
+              text = re.sub(r'[^\x20-\x7e]', ' ', text)
+              return text[:600]
+          try:
+              html = read(origin + '/')
+              scripts = []
+              for item in re.findall(r'<script[^>]+src=[\"\x27]([^\"\x27]+)', html):
+                  url = urllib.parse.urljoin(origin, item)
+                  if urllib.parse.urlsplit(url).hostname == 'rtsplink.com':
+                      scripts.append(url)
+              documents = [html] + [read(url) for url in scripts[:8]]
+              snippets = []
+              for text in documents:
+                  for match in re.finditer(r'(?:fetch\(|/api/|generateStream|createStream|pedestrian)', text, re.I):
+                      snippet = sanitize(text[max(0,match.start()-140):match.end()+320])
+                      if snippet not in snippets:
+                          snippets.append(snippet)
+              print('K5_PUBLISHER_DOCUMENTS_INSPECTED=' + str(len(documents)))
+              print('K5_PUBLISHER_INTERFACE_SNIPPETS=' + str(min(len(snippets),20)))
+              for snippet in snippets[:20]:
+                  print('PUBLISHER_INTERFACE: ' + snippet)
+              print('K5_EXTERNAL_MEDIA_ACCEPTANCE=not_attempted')
+          except Exception:
+              print('K5_PUBLISHER_INTERFACE=unavailable')
+              raise SystemExit(1)
