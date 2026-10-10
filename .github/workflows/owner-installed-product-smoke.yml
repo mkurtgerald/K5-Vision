@@ -4,35 +4,35 @@ on:
     branches: [fix/transactional-alpha-upgrade-20261003]
     paths:
       - .github/workflows/owner-installed-product-smoke.yml
+      - scripts/Test-K5OwnerInstalledGui.ps1
   workflow_dispatch:
 permissions:
   contents: read
   actions: read
 jobs:
-  engineering-source:
-    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-          ref: ${{ github.sha }}
-      - name: Archive tracked engineering source only
-        run: |
-          mkdir -p source-export
-          git archive --format=zip --output=source-export/source.zip HEAD
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        with:
-          name: owner-product-engineering-source-${{ github.sha }}
-          path: source-export/source.zip
-          if-no-files-found: error
-          retention-days: 3
   installed-gui-smoke:
     if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
     runs-on: windows-2025
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
+      - name: Checkout exact test controller only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          sparse-checkout-cone-mode: false
+          sparse-checkout: scripts/Test-K5OwnerInstalledGui.ps1
+      - name: Validate native GUI controller before product installation
+        shell: powershell
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts/Test-K5OwnerInstalledGui.ps1'
+          $tokens = $null
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
+          if (@($errors).Count -gt 0) { throw 'Installed GUI witness parse failed.' }
+          & $script -ControllerSelfTest
       - name: Download exact repaired setup with independent byte identity
         shell: powershell
         timeout-minutes: 3
@@ -51,6 +51,7 @@ jobs:
           if ((Get-Item -LiteralPath $setup).Length -ne 163468532) { throw 'Retained executable size mismatch.' }
           Write-Host 'K5_PRODUCT_SETUP_IDENTITY=8870517_verified'
       - name: Install exact executable without owner shell interaction
+        id: install
         shell: powershell
         timeout-minutes: 23
         run: |
@@ -63,72 +64,23 @@ jobs:
           if ($p.ExitCode -ne 0) { throw 'Exact setup installation failed.' }
           if (([IO.File]::ReadAllText((Join-Path $root 'k5-revision.txt'))).Trim() -cne '887051738890ca2c0e34431bd707fe302654747e') { throw 'Installed revision mismatch.' }
           Write-Host 'K5_PRODUCT_INSTALL=passed'
-      - name: Invoke real GUI Run test and require installed operator presentation
+      - name: Invoke installed GUI synthetic video operator test
         shell: powershell
         timeout-minutes: 7
         run: |
           $ErrorActionPreference = 'Stop'
-          Add-Type -AssemblyName UIAutomationClient
-          Add-Type -AssemblyName UIAutomationTypes
-          $root = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha'
-          $gui = Start-Process -FilePath (Join-Path $root 'K5VisionAlpha.exe') -PassThru
-          $stage = 'gui-open'
-          try {
-            $deadline = [DateTime]::UtcNow.AddSeconds(20)
-            do {
-              Start-Sleep -Milliseconds 250
-              $gui.Refresh()
-            } until ($gui.HasExited -or $gui.MainWindowHandle -ne [IntPtr]::Zero -or [DateTime]::UtcNow -gt $deadline)
-            if ($gui.HasExited -or $gui.MainWindowHandle -eq [IntPtr]::Zero) { throw 'GUI did not open.' }
-            $window = [System.Windows.Automation.AutomationElement]::FromHandle($gui.MainWindowHandle)
-            $buttonCondition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, 'Run test')
-            $button = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition)
-            if ($null -eq $button -or -not $button.Current.IsEnabled) { throw 'Installed test action unavailable.' }
-            $editCondition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
-            $edits = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCondition)
-            $status = $null
-            foreach ($edit in $edits) {
-              $value = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-              if ($value.Current.IsReadOnly) { $status = $value }
-            }
-            if ($null -eq $status) { throw 'GUI status unavailable.' }
-            # Blank input uses generated loopback video only. No cameras, screenshots,
-            # media files, source values, stack traces or raw child logs are retained.
-            $stage = 'run-test'
-            $invoke = $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-            $invoke.Invoke()
-            $deadline = [DateTime]::UtcNow.AddMinutes(5)
-            $passed = $false
-            do {
-              Start-Sleep -Milliseconds 500
-              $text = $status.Current.Value
-              if ($text.Contains('Synthetic video-only smoke passed; public RTSP analytics NOT qualified.')) { $passed = $true; break }
-              if ($text.Contains('Test did not pass:') -or $text.Contains('Stage-One NOT qualified:')) { break }
-            } while ([DateTime]::UtcNow -lt $deadline -and -not $gui.HasExited)
-            # Only bounded fixed diagnostic codes leave this job, never GUI text.
-            $diagnostic = 'no-terminal-status'
-            if ($text.Contains('Analytics did not meet')) { $diagnostic = 'analytics-gate' }
-            elseif ($text.Contains('GStreamer runtime validation failed')) { $diagnostic = 'gstreamer' }
-            elseif ($text.Contains('RTSP test source could not')) { $diagnostic = 'source-decode' }
-            elseif ($text.Contains('local K5 service did not')) { $diagnostic = 'service-health' }
-            elseif ($text.Contains('missing health, analytics')) { $diagnostic = 'receipt-incomplete' }
-            elseif ($text.Contains('Test did not pass:')) { $diagnostic = 'runtime-failed' }
-            Write-Host ('K5_PRODUCT_GUI_HEALTH=' + [int]$text.Contains('K5 local service health passed.'))
-            Write-Host ('K5_PRODUCT_GUI_PRESENTATION=' + [int]$text.Contains('Positive operator frames and presentations confirmed.'))
-            Write-Host ('K5_PRODUCT_GUI_PRIVACY=' + [int]$text.Contains('No test media was retained.'))
-            if (-not $passed) { Write-Host "K5_PRODUCT_GUI_DIAGNOSTIC=$diagnostic"; throw 'Installed GUI operator smoke did not pass.' }
-            Write-Host 'K5_PRODUCT_GUI_SYNTHETIC_OPERATOR=passed'
-            Write-Host 'K5_PRODUCT_EXTERNAL_RTSP_ACCEPTANCE=not_tested'
-          } catch {
-            Write-Host "K5_PRODUCT_FAILURE_STAGE=$stage"
-            throw 'Installed-product smoke failed; inspect fixed diagnostic codes.'
-          } finally {
-            if (-not $gui.HasExited) { [void]$gui.CloseMainWindow(); [void]$gui.WaitForExit(10000) }
-            $gui.Dispose()
-          }
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/Test-K5OwnerInstalledGui.ps1') -Mode synthetic
+      - name: Invoke same installed GUI external public RTSP analytics test
+        if: always() && steps.install.outcome == 'success'
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/Test-K5OwnerInstalledGui.ps1') -Mode public
       - name: Remove owned installed application
         if: always()
         shell: powershell
+        timeout-minutes: 2
         run: |
           $ErrorActionPreference = 'Stop'
           $uninstaller = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha\unins000.exe'
