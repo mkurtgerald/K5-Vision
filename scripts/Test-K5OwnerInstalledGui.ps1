@@ -53,7 +53,7 @@ function Get-K5GuiControls($Process) {
     if ($null -eq $button) { throw 'Run action unavailable.' }
     $all = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants,
         [System.Windows.Automation.Condition]::TrueCondition)
-    $input = $null
+    $sourcePattern = $null
     $status = $null
     foreach ($element in $all) {
         # Multiline WinForms edit controls expose TextPattern on some Windows
@@ -65,11 +65,11 @@ function Get-K5GuiControls($Process) {
         if ($element.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit -and
             $element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern) -and
             -not $pattern.Current.IsReadOnly) {
-            $input = $pattern
+            $sourcePattern = $pattern
         }
     }
-    if ($null -eq $status -or $null -eq $input) { throw 'GUI controls unavailable.' }
-    return @{ Button = $button; Input = $input; Status = $status }
+    if ($null -eq $status -or $null -eq $sourcePattern) { throw 'GUI controls unavailable.' }
+    return @{ Button = $button; Input = $sourcePattern; Status = $status }
 }
 function Request-K5Publisher([string]$Path, $Payload = $null) {
     $headers = @{ Accept = 'application/json'; Origin = 'https://rtsplink.com' }
@@ -216,6 +216,20 @@ internal static class WitnessFixture {
     $failed = $true
     # Never print exception text, response bodies, URLs, cookies or GUI contents.
     Write-Host ("K5_INSTALLED_GUI_FAILURE_STAGE=" + $stage)
+    Write-Host ('K5_GUI_WITNESS_FAILURE_LINE=' + [int]$_.InvocationInfo.ScriptLineNumber)
+    if ($ControllerSelfTest) {
+        $reason = 'unclassified'
+        $detail = [string]$_.Exception.Message
+        if ($detail -match 'null-valued') { $reason = 'null-value' }
+        elseif ($detail -match 'overload') { $reason = 'overload' }
+        elseif ($detail -match 'pattern') { $reason = 'pattern' }
+        elseif ($detail -match 'controls unavailable') { $reason = 'control-discovery' }
+        elseif ($detail -match 'Run action unavailable') { $reason = 'button-discovery' }
+        elseif ($detail -match 'did not open') { $reason = 'window-discovery' }
+        elseif ($detail -match 'compile|compilation|error CS') { $reason = 'fixture-compilation' }
+        elseif ($detail -match 'conversion|convert') { $reason = 'type-conversion' }
+        Write-Host ('K5_GUI_WITNESS_FIXTURE_DIAGNOSTIC=' + $reason)
+    }
 } finally {
     if ($null -ne $gui) {
         try {
