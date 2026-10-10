@@ -12,42 +12,79 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Validate anonymous publisher handshake without acquiring media
+      - name: Validate anonymous issue and revocation without acquiring media
         shell: python
         run: |
           import http.cookiejar
           import json
-          import re
+          import urllib.error
           import urllib.request
           import urllib.parse
-          origin = 'https://rtsplink.com'
-          opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-          def get(path):
-              request = urllib.request.Request(origin + path, headers={'User-Agent': 'K5-Engineering-TestSourceReview/1.0', 'Accept':'application/json'})
-              with opener.open(request, timeout=15) as response:
-                  if urllib.parse.urlsplit(response.url).hostname != 'rtsplink.com':
-                      raise RuntimeError('Unexpected publisher origin')
-                  data = response.read(262145)
-                  if len(data) > 262144:
-                      raise RuntimeError('Publisher response exceeds bound')
-                  return json.loads(data)
-          def keys(value):
-              return sorted(k for k in value if re.fullmatch(r'[A-Za-z_]{1,48}', k))[:30] if isinstance(value,dict) else []
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+          opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+          csrf = None
+          issued = False
+          failed = False
+          stage = 'session'
+          def request(path, payload=None):
+              headers = {'User-Agent':'K5-Engineering-TestSourceReview/1.0', 'Accept':'application/json', 'Origin':'https://rtsplink.com'}
+              data = None
+              if payload is not None:
+                  data = json.dumps(payload).encode()
+                  headers.update({'Content-Type':'application/json','X-CSRF-Token':csrf})
+              req = urllib.request.Request('https://rtsplink.com'+path, data=data, headers=headers)
+              with opener.open(req, timeout=15) as response:
+                  raw = response.read(262145)
+                  if len(raw) > 262144:
+                      raise ValueError('Response exceeds bound')
+                  return json.loads(raw)
           try:
-              session = get('/api/v1/session/active')
-              print('K5_PUBLISHER_SESSION_SCHEMA=' + json.dumps(keys(session)))
-              print('K5_PUBLISHER_SESSION_HANDSHAKE=' + str(bool(session.get('csrfToken') and session.get('nonce'))).lower())
-              catalog = get('/api/v1/streams/catalog')
-              print('K5_PUBLISHER_CATALOG_SCHEMA=' + json.dumps(keys(catalog)))
-              streams = catalog.get('streams', [])
-              approved = {'live/test','live/people','live/traffic','live/objects','live/retail','people','traffic','objects','retail'}
-              for stream in streams[:12]:
-                  print('K5_PUBLISHER_STREAM_SCHEMA=' + json.dumps(keys(stream)))
-                  if isinstance(stream,dict):
-                      for key,value in stream.items():
-                          if isinstance(value,str) and value in approved:
-                              print('K5_PUBLISHER_LIBRARY_SELECTOR=' + key + ':' + value)
-              print('K5_EXTERNAL_MEDIA_ACCEPTANCE=not_attempted')
+              session = request('/api/v1/session/active')
+              csrf, nonce = session.get('csrfToken'), session.get('nonce')
+              assert isinstance(csrf,str) and isinstance(nonce,str) and csrf and nonce
+              stage = 'catalog'
+              catalog = request('/api/v1/streams/catalog')
+              assert len([s for s in catalog.get('streams',[]) if s.get('id') == 'live/people']) == 1
+              stage = 'issue'
+              issued = True
+              token = request('/api/v1/token/generate', {'csrfToken':csrf,'nonce':nonce,'streamName':'live/people','forceNew':False,'quality':{'resolution':'source','fps':'source','allowCompatibilityUpscale':False}})
+              source = token.get('rtspUrl')
+              assert isinstance(source,str) and len(source) <= 2048
+              uri = urllib.parse.urlsplit(source)
+              scheme_ok = uri.scheme == 'rtsp'
+              host_ok = uri.hostname == 'rtsp.rtsplink.com'
+              credential_free = uri.username is None and uri.password is None and not uri.fragment
+              print('K5_PUBLISHER_ISSUED_SCHEME_OK=' + str(scheme_ok).lower())
+              print('K5_PUBLISHER_ISSUED_HOST_OK=' + str(host_ok).lower())
+              print('K5_PUBLISHER_CREDENTIAL_FREE=' + str(credential_free).lower())
+              assert scheme_ok and host_ok and credential_free
+              print('K5_PUBLISHER_PUBLIC_TOKEN=verified_transiently')
+          except urllib.error.HTTPError as error:
+              failed = True
+              print('K5_PUBLISHER_FAILURE_STAGE=' + stage)
+              print('K5_PUBLISHER_HTTP_STATUS=' + str(int(error.code)))
+              try:
+                  body = json.loads(error.read(4096))
+                  code = body.get('code')
+                  allowed = {'SECURITY_VALIDATION_FAILED','RATE_LIMITED','RATE_LIMIT_EXCEEDED','UPGRADE_REQUIRED','VALIDATION_ERROR','INVALID_QUALITY'}
+                  print('K5_PUBLISHER_ERROR_CODE=' + (code if code in allowed else 'unclassified'))
+              except Exception:
+                  print('K5_PUBLISHER_ERROR_CODE=unclassified')
           except Exception:
-              print('K5_PUBLISHER_HANDSHAKE=unavailable')
+              failed = True
+              print('K5_PUBLISHER_FAILURE_STAGE=' + stage)
+          finally:
+              if issued:
+                  try:
+                      request('/api/v1/token/revoke', {'csrfToken':csrf})
+                      state = request('/api/v1/session/active')
+                      assert state.get('active') is False
+                      print('K5_PUBLISHER_PUBLIC_TOKEN=revoked')
+                  except Exception:
+                      failed = True
+                      print('K5_PUBLISHER_PUBLIC_TOKEN=revocation_unconfirmed')
+              print('K5_EXTERNAL_MEDIA_ACCEPTANCE=not_attempted')
+          if failed:
               raise SystemExit(1)
