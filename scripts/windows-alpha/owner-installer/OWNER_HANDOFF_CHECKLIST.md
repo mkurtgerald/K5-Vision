@@ -4,7 +4,7 @@
 
 The owner workflow is graphical. Do not use PowerShell, Command Prompt, Git, Python, manual dependency installation, or environment-variable edits.
 
-1. **Identify the build.** Use the verified release or GitHub Actions installer artifact associated with the exact approved 40-character source revision and its published SHA-256. A build labeled `unqualified` is for engineering validation only, not an owner acceptance handoff.
+1. **Identify the build and download the installer directly.** The owner handoff must provide a direct `.exe` or `.msi` download associated with the exact approved 40-character source revision and a published SHA-256. An Actions `.zip` archive requiring extraction is an engineering artifact, **not** the owner handoff. Do not install a build labeled `unqualified`.
 2. **Install.** On a clean, supported 64-bit Windows machine, double-click `K5VisionAlpha-Setup-<revision>.exe`. Follow the Windows installation dialog. The installer must install its private Python runtime, necessary dependencies, and GStreamer without separate setup.
 3. **Launch.** Open **K5 Vision Alpha** from the desktop shortcut, then close and reopen it from the Start Menu. No terminal window or manual preparation should be required. Installation and launch failures must provide useful graphical messages.
 4. **Synthetic source sanity check.** With the source field blank, choose **Run test**. This is a local, non-recording smoke test only; it does **not** qualify public RTSP or analytics overlay acceptance.
