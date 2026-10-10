@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 namespace K5VisionAlpha
@@ -14,6 +15,7 @@ namespace K5VisionAlpha
         private readonly Button runButton = new Button();
         private Process active;
         private volatile string failure = "The K5 test could not complete.";
+        private volatile bool healthEvidence, analyticsEvidence, boxesEvidence, presentationEvidence, privacyEvidence;
 
         internal Launcher()
         {
@@ -127,6 +129,7 @@ namespace K5VisionAlpha
             runButton.Enabled = false;
             sourceBox.Enabled = false;
             failure = "Check the installer or try a different public RTSP stream.";
+            healthEvidence = analyticsEvidence = boxesEvidence = presentationEvidence = privacyEvidence = false;
             Status("Starting a bounded non-recording operator test...");
 
             var info = new ProcessStartInfo();
@@ -149,15 +152,23 @@ namespace K5VisionAlpha
                 if (String.IsNullOrWhiteSpace(e.Data)) return;
                 string line = e.Data;
                 // Fixed-status projection only; never display the raw URI, credentials or log.
-                if (line.Contains("health check PASS")) Status("K5 local service health passed.");
-                if (line.StartsWith("K5 analytics PASS:", StringComparison.Ordinal))
-                    Status("Analytics completed with zero reported failures.");
-                if (line.StartsWith("K5 analytics rendered boxes:", StringComparison.Ordinal))
-                    Status("Rendered detection-box receipt produced.");
-                if (line.StartsWith("K5 operator PASS:", StringComparison.Ordinal))
-                    Status("Operator video presentation completed.");
-                if (line.Contains("No test-stream recording or retained media"))
-                    Status("No test media was retained.");
+                if (line == "K5 Vision Alpha health check PASS.") { healthEvidence = true; Status("K5 local service health passed."); }
+                Match a = Regex.Match(line, @"^K5 analytics PASS: submissions=([1-9][0-9]*), completions=([1-9][0-9]*), failures=0$");
+                long submitted, completed;
+                if (a.Success && Int64.TryParse(a.Groups[1].Value, out submitted) &&
+                    Int64.TryParse(a.Groups[2].Value, out completed) && completed <= submitted)
+                { analyticsEvidence = true; Status("Positive analytics submissions and completions; zero failures."); }
+                Match b = Regex.Match(line, @"^K5 analytics rendered boxes: ([1-9][0-9]*)$");
+                long boxCount;
+                if (b.Success && Int64.TryParse(b.Groups[1].Value, out boxCount))
+                { boxesEvidence = true; Status("Positive rendered detection-box count confirmed."); }
+                Match o = Regex.Match(line, @"^K5 operator PASS: frames=([1-9][0-9]*), presentations=([1-9][0-9]*)$");
+                long frames, presentations;
+                if (o.Success && Int64.TryParse(o.Groups[1].Value, out frames) &&
+                    Int64.TryParse(o.Groups[2].Value, out presentations))
+                { presentationEvidence = true; Status("Positive operator frames and presentations confirmed."); }
+                if (line == "No test-stream recording or retained media was created.")
+                { privacyEvidence = true; Status("No test media was retained."); }
             };
             active.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
             {
@@ -174,18 +185,23 @@ namespace K5VisionAlpha
             active.Exited += delegate(object s, EventArgs e)
             {
                 int code = -1;
-                try { code = active.ExitCode; } catch (InvalidOperationException) { }
+                Process finished = (Process)s;
+                try { finished.WaitForExit(); code = finished.ExitCode; } catch (InvalidOperationException) { }
                 int result = code;
                 if (IsDisposed || Disposing) return;
                 try
                 {
                     BeginInvoke(new Action(delegate
                     {
-                        Status(result == 0 ? "Test completed." :
+                        bool video = result == 0 && healthEvidence && presentationEvidence && privacyEvidence;
+                        bool full = video && analyticsEvidence && boxesEvidence;
+                        Status(full ? "Stage-One receipt passed: analytics, boxes and operator presentation confirmed." :
+                            source.Length == 0 && video ? "Synthetic video-only smoke passed; public RTSP analytics NOT qualified." :
+                            result == 0 ? "Stage-One NOT qualified: missing health, analytics, boxes, presentation or privacy evidence." :
                             "Test did not pass: " + failure + " (exit " + result + ")");
                         runButton.Enabled = true;
                         sourceBox.Enabled = true;
-                        active.Dispose();
+                        finished.Dispose();
                         active = null;
                     }));
                 }
