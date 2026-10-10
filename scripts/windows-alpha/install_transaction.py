@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import ensurepip
 import hashlib
+import importlib.util
 import itertools
 import json
 import os
@@ -33,7 +34,7 @@ FILES = (
     "gstreamer-version.txt",
     "k5-revision.txt",
 )
-MANAGED = (".venv", *FILES)
+MANAGED = (".venv", *FILES, "analytics-models", "analytics-config.json")
 WORKSPACE = ".k5-alpha-upgrade"
 LOCK = ".k5-alpha-install.lock"
 FORMAT = "k5-alpha-upgrade-v1"
@@ -732,6 +733,20 @@ class Installer:
         self.gstreamer = gstreamer
         self.shortcut = shortcut.absolute() if shortcut else None
         self.run = run
+        # The graphical installer requires a verified pinned engineering payload.
+        # The standalone source installer remains backwards-compatible.
+        candidate = self.source.parent / "analytics"
+        self.analytics_bundle = candidate if candidate.exists() else None
+        self.analytics_module = None
+        if self.analytics_bundle is not None:
+            helper = self.source / "owner_analytics_bundle.py"
+            spec = importlib.util.spec_from_file_location("_k5_owner_analytics", helper)
+            if spec is None or spec.loader is None:
+                raise RuntimeError("Owner analytics admission module is missing.")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            module.validate(self.analytics_bundle)
+            self.analytics_module = module
         self.work = self.root / WORKSPACE
         self.stage = self.work / "candidate"
         self.backup = self.work / "backup"
@@ -962,6 +977,18 @@ class Installer:
         )
         if len(list(self.wheels.glob("k5_vision-*.whl"))) != 1:
             raise RuntimeError("Expected exactly one reviewed K5 wheel.")
+        if self.analytics_module is not None:
+            approved_wheels, _ = self.analytics_module.validate(self.analytics_bundle)
+            for wheel in approved_wheels:
+                target = self.wheels / wheel.name
+                if target.exists():
+                    raise RuntimeError("Analytics wheel collides with K5 runtime.")
+                shutil.copyfile(wheel, target)
+                with wheel.open("rb") as source, target.open("rb") as installed:
+                    if hashlib.file_digest(source, "sha256").digest() != hashlib.file_digest(
+                        installed, "sha256"
+                    ).digest():
+                        raise RuntimeError("Analytics wheel changed while staging.")
 
     def wheel_hashes(self) -> dict[str, str]:
         if self.offline is not None:
@@ -1014,6 +1041,21 @@ class Installer:
             )
         self.command([python, *isolated, "-m", "k5vision.cli", "--version"])
         self.command([python, *isolated, "-c", RUNTIME_PROBE])
+        if self.analytics_module is not None:
+            self.analytics_module.materialize_models(self.analytics_bundle, destination)
+            configuration = destination / "analytics-config.json"
+            self.command(
+                [
+                    python,
+                    *isolated,
+                    "-c",
+                    "from k5vision.analytics_config import load_analytics_configuration; "
+                    "import sys; "
+                    "assert load_analytics_configuration({'K5_ANALYTICS_CONFIG': "
+                    "sys.argv[1]}) is not None",
+                    configuration,
+                ]
+            )
         self.materialize_files(destination)
 
     def preflight(self, destination: Path) -> None:
