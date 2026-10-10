@@ -974,6 +974,10 @@ class Installer:
             "stage-probe", "activation-probe",
             "stage-model-copy", "activation-model-copy",
             "stage-analytics-preflight", "activation-analytics-preflight",
+            "stage-analytics-package", "activation-analytics-package",
+            "stage-analytics-versions", "activation-analytics-versions",
+            "stage-analytics-path", "activation-analytics-path",
+            "stage-analytics-model", "activation-analytics-model",
         }
         if stage not in allowed:
             raise RuntimeError("Unexpected owner installer diagnostic stage.")
@@ -1087,6 +1091,50 @@ class Installer:
             self.owner_install_stage(f"{phase}-model-copy")
             self.analytics_module.materialize_models(self.analytics_bundle, destination)
             configuration = destination / "analytics-config.json"
+            # Each independent read-only admission keeps its original strict
+            # predicate. Separate stages localize Windows errors without
+            # collecting traceback, model bytes, media or owner paths.
+            self.owner_install_stage(f"{phase}-analytics-package")
+            self.command(
+                [
+                    python, *isolated, "-c",
+                    "from k5vision.analytics_package import validate_installed_analytics; "
+                    "validate_installed_analytics()",
+                ]
+            )
+            self.owner_install_stage(f"{phase}-analytics-versions")
+            self.command(
+                [
+                    python, *isolated, "-c",
+                    "from k5vision.analytics_config import RUNTIME_VERSIONS; "
+                    "from importlib.metadata import version; "
+                    "assert all(version(n) == v for n, v in RUNTIME_VERSIONS.items())",
+                ]
+            )
+            self.owner_install_stage(f"{phase}-analytics-path")
+            self.command(
+                [
+                    python, *isolated, "-c",
+                    "from k5vision.analytics_config import _local_path; import sys; "
+                    "_local_path(sys.argv[1], directory=False); "
+                    "_local_path(sys.argv[2], directory=True)",
+                    configuration,
+                    destination / "analytics-models",
+                ]
+            )
+            self.owner_install_stage(f"{phase}-analytics-model")
+            self.command(
+                [
+                    python, *isolated, "-c",
+                    "from k5vision.analytics_package import validate_installed_analytics; "
+                    "validate_installed_analytics(); "
+                    "from analytics_lab.artifacts import "
+                    "OPENVINO_OMZ_2023_FP16, verify_artifact_set; "
+                    "from pathlib import Path; import sys; "
+                    "verify_artifact_set(Path(sys.argv[1]), OPENVINO_OMZ_2023_FP16)",
+                    destination / "analytics-models",
+                ]
+            )
             self.owner_install_stage(f"{phase}-analytics-preflight")
             self.command(
                 [
