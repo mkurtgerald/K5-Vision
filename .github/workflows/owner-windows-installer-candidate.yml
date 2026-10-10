@@ -125,6 +125,23 @@ jobs:
           $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait -ErrorAction Stop
           $root = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha'
           $gui = Join-Path $root 'K5VisionAlpha.exe'
+          # Output is restricted to fixed code identifiers, never installer log
+          # text, stack traces, owner paths, credentials, sources, or media.
+          $stageFile = Join-Path $root 'payload\owner-install-stage.txt'
+          $allowedStages = @(
+            'gstreamer','wheel-build-base','wheel-build-k5',
+            'wheel-copy-analytics','wheel-hashes','stage-venv',
+            'stage-runtime','stage-preflight','shortcut','verify-wheels',
+            'activation-prepare','activation-venv','activation-runtime',
+            'activation-preflight','commit','complete'
+          )
+          $stage = 'no-stage-receipt'
+          if (Test-Path -LiteralPath $stageFile -PathType Leaf) {
+            $rawStage = [IO.File]::ReadAllText($stageFile, [Text.Encoding]::ASCII).Trim()
+            if ($allowedStages -ccontains $rawStage) { $stage = $rawStage }
+            else { $stage = 'invalid-stage-receipt' }
+          }
+          Write-Host "K5_OWNER_TRANSACTION_STAGE=$stage"
           # Source-free inventory: fixed labels and boolean presence only,
           # never owner paths, source URIs, credentials, logs or file contents.
           $requirements = [ordered]@{
