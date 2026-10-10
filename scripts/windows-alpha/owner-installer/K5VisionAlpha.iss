@@ -65,6 +65,7 @@ Type: files; Name: "{app}\gstreamer-version.txt"
 var
   K5PostInstallEntered: Boolean;
   K5PostInstallVerified: Boolean;
+  K5PostInstallPhase: Integer;
 
 function GetCustomSetupExitCode: Integer;
 begin
@@ -73,7 +74,7 @@ begin
   if not K5PostInstallEntered then
     Result := 41
   else if not K5PostInstallVerified then
-    Result := 42
+    Result := 41 + K5PostInstallPhase
   else
     Result := 0;
 end;
@@ -101,6 +102,7 @@ begin
   if CurStep <> ssPostInstall then
     Exit;
   K5PostInstallEntered := True;
+  K5PostInstallPhase := 1;
   AppRoot := ExpandConstant('{app}');
   PythonRoot := AppRoot + '\python312';
   PythonExe := PythonRoot + '\python.exe';
@@ -110,6 +112,7 @@ begin
     RaiseException('Verified owner analytics payload is missing.');
   if not FileExists(PySetup) or not FileExists(Bootstrap) then
     RaiseException('K5 installer payload is incomplete.');
+  K5PostInstallPhase := 2;
   if not FileExists(PythonExe) then
   begin
     Parameters := '/quiet InstallAllUsers=0 Include_pip=1 Include_test=0 ' +
@@ -118,12 +121,14 @@ begin
   end;
   if not FileExists(PythonExe) then
     RaiseException('Private Python runtime is unavailable.');
+  K5PostInstallPhase := 3;
   Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
     Q(Bootstrap) + ' -InstallRoot ' + Q(AppRoot) +
     ' -PythonExecutable ' + Q(PythonExe) +
     ' -K5Revision {#K5Revision} -SkipDesktopShortcut';
   RunOrFail(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     Parameters, 'transactional runtime installation');
+  K5PostInstallPhase := 4;
   if not FileExists(AppRoot + '\.venv\Scripts\python.exe') or
      not FileExists(AppRoot + '\Start-K5VisionAlpha.ps1') or
      not FileExists(AppRoot + '\k5-revision.txt') or
@@ -133,6 +138,7 @@ begin
   { The installer cannot report success unless the SAME installed GUI
     executable passes the runtime check exercised by hosted Windows CI.
     Component codes disclose no local source, credential, or media data. }
+  K5PostInstallPhase := 5;
   RunOrFail(AppRoot + '\K5VisionAlpha.exe', '--self-check',
     'installed graphical runtime verification');
   K5PostInstallVerified := True;
