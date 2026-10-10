@@ -113,4 +113,9 @@ begin
      not FileExists(AppRoot + '\analytics-config.json') or
      not DirExists(AppRoot + '\analytics-models') then
     RaiseException('The installed K5 runtime is incomplete.');
+  { The installer cannot report success unless the SAME installed GUI
+    executable passes the runtime check exercised by hosted Windows CI.
+    Component codes disclose no local source, credential, or media data. }
+  RunOrFail(AppRoot + '\K5VisionAlpha.exe', '--self-check',
+    'installed graphical runtime verification');
 end;
