@@ -8,10 +8,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $stage = 'host-admission'
 $gui = $null
-$session = $null
-$csrf = $null
 $source = ''
-$issued = $false
 $failed = $false
 $root = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha'
 
@@ -131,28 +128,49 @@ function Get-K5GuiControls($Process) {
     }
     return $controls
 }
-function Request-K5Publisher([string]$Path, $Payload = $null) {
-    $headers = @{ Accept = 'application/json'; Origin = 'https://rtsplink.com' }
-    $arguments = @{
-        Uri = ('https://rtsplink.com' + $Path)
-        WebSession = $script:session
-        UseBasicParsing = $true
-        TimeoutSec = 15
-        MaximumRedirection = 0
-        Headers = $headers
-        ErrorAction = 'Stop'
+function Resolve-K5VendorPublicSource {
+    # Use only the stream Wowza explicitly publishes for developer testing.
+    # Its live DESCRIBE/H.264 preflight passed independently. No auth bypass,
+    # account, cookies, downloads of media, or literal RTSP URI is retained.
+    $request = [Net.WebRequest]::CreateHttp('https://www.wowza.com/developer/rtsp-stream-test')
+    $request.Method = 'GET'
+    $request.UserAgent = 'K5-Engineering-TestSourceReview/1.0'
+    $request.AllowAutoRedirect = $false
+    $request.Timeout = 15000
+    $request.ReadWriteTimeout = 5000
+    $response = $null
+    $stream = $null
+    $memory = New-Object IO.MemoryStream
+    try {
+        $response = $request.GetResponse()
+        if ([int]$response.StatusCode -ne 200) { throw 'Publisher document unavailable.' }
+        $stream = $response.GetResponseStream()
+        $buffer = New-Object byte[] 8192
+        while (($count = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            if ($memory.Length + $count -gt 1048576) { throw 'Publisher document exceeds bound.' }
+            $memory.Write($buffer, 0, $count)
+        }
+        $encoding = New-Object Text.UTF8Encoding($false, $true)
+        $document = [Net.WebUtility]::HtmlDecode($encoding.GetString($memory.ToArray()))
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+        $memory.Dispose()
     }
-    if ($null -ne $Payload) {
-        $headers['X-CSRF-Token'] = $script:csrf
-        $arguments['Method'] = 'POST'
-        $arguments['ContentType'] = 'application/json'
-        $arguments['Body'] = ($Payload | ConvertTo-Json -Compress -Depth 5)
+    $approved = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($match in [regex]::Matches($document, 'rtsp://[^\s<>"'']+')) {
+        $value = $match.Value
+        [Uri]$candidate = $null
+        if ($value.Length -le 2048 -and [Uri]::TryCreate($value, [UriKind]::Absolute, [ref]$candidate) -and
+            $candidate.Scheme -ceq 'rtsp' -and
+            $candidate.Host -ceq '9627b0bf2a7b.entrypoint.cloud.wowza.com' -and
+            $candidate.Port -eq 1935 -and $candidate.UserInfo.Length -eq 0 -and
+            $candidate.Fragment.Length -eq 0) { [void]$approved.Add($value) }
     }
-    $response = Invoke-WebRequest @arguments
-    if ($response.StatusCode -ne 200 -or $response.Content.Length -gt 262144) {
-        throw 'Publisher response refused.'
-    }
-    return ($response.Content | ConvertFrom-Json)
+    if ($approved.Count -ne 1) { throw 'Unique approved public source unavailable.' }
+    # The installed launcher independently resolves and pins globally routable
+    # DNS before touching RTSP. Never replace that product admission boundary.
+    foreach ($value in $approved) { return [string]$value }
 }
 try {
     if ($ControllerSelfTest) {
@@ -195,35 +213,9 @@ internal static class WitnessFixture {
         if (([IO.File]::ReadAllText((Join-Path $root 'k5-revision.txt'))).Trim() -cne
             '887051738890ca2c0e34431bd707fe302654747e') { throw 'Installed revision mismatch.' }
         if ($Mode -ceq 'public') {
-            $stage = 'publisher-session'
-            $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-            $handshake = Request-K5Publisher '/api/v1/session/active'
-            $csrf = $handshake.csrfToken
-            $nonce = $handshake.nonce
-            if ($csrf -isnot [string] -or $nonce -isnot [string] -or
-                $csrf.Length -lt 1 -or $csrf.Length -gt 2048 -or $csrf -match '[\r\n]' -or
-                $nonce.Length -lt 1 -or $nonce.Length -gt 2048) { throw 'Publisher handshake refused.' }
-            $stage = 'publisher-catalog'
-            $catalog = Request-K5Publisher '/api/v1/streams/catalog'
-            $people = @($catalog.streams | Where-Object { $_.id -ceq 'live/people' })
-            if ($people.Count -ne 1) { throw 'Approved public library source unavailable.' }
-            $stage = 'publisher-token'
-            # Only this fresh anonymous session's public library token is created.
-            # No signup, paid profile, account session, media download or local file.
-            $issued = $true
-            $token = Request-K5Publisher '/api/v1/token/generate' @{
-                csrfToken = $csrf; nonce = $nonce; streamName = 'live/people'; forceNew = $false
-                quality = @{ resolution = 'source'; fps = 'source'; allowCompatibilityUpscale = $false }
-            }
-            $source = $token.rtspUrl
-            $uri = $null
-            if ($source -isnot [string] -or $source.Length -gt 2048 -or
-                -not [Uri]::TryCreate($source, [UriKind]::Absolute, [ref]$uri) -or
-                $uri.Scheme -cne 'rtsp' -or $uri.Host -cne 'rtsp.rtsplink.com' -or
-                $uri.UserInfo.Length -ne 0 -or $uri.Fragment.Length -ne 0) {
-                throw 'Publisher media destination refused.'
-            }
-            Write-Host 'K5_PUBLIC_LIBRARY_SOURCE=issued_transiently'
+            $stage = 'publisher-document'
+            $source = Resolve-K5VendorPublicSource
+            Write-Host 'K5_PUBLIC_LIBRARY_SOURCE=vendor_published_transiently'
         }
         $stage = 'gui-open'
         $gui = Start-Process -FilePath (Join-Path $root 'K5VisionAlpha.exe') -PassThru
@@ -300,14 +292,6 @@ internal static class WitnessFixture {
         } catch { $failed = $true; Write-Host 'K5_INSTALLED_GUI_CLOSE=failed' }
         $gui.Dispose()
     }
-    if ($issued) {
-        try {
-            $null = Request-K5Publisher '/api/v1/token/revoke' @{ csrfToken = $csrf }
-            $state = Request-K5Publisher '/api/v1/session/active'
-            if ($state.active -ne $false) { throw 'Session still active.' }
-            Write-Host 'K5_PUBLIC_LIBRARY_TOKEN=revoked'
-        } catch { $failed = $true; Write-Host 'K5_PUBLIC_LIBRARY_TOKEN=revocation_unconfirmed' }
-    }
-    $source = $csrf = $nonce = $token = $session = $handshake = $null
+    $source = $null
 }
 if ($failed) { throw 'Installed GUI witness failed; only fixed diagnostic codes are published.' }
