@@ -254,6 +254,9 @@ namespace K5VisionAlpha
                     File.Exists(Path.Combine(root, @".venv\Scripts\python.exe")) &&
                     File.Exists(Path.Combine(root, "Start-K5VisionAlpha.ps1")) &&
                     File.Exists(Path.Combine(root, "k5-revision.txt")) &&
+                    File.Exists(Path.Combine(root, "analytics-config.json")) &&
+                    File.Exists(Path.Combine(root, @"analytics-models\person-detection-retail-0013\FP16\person-detection-retail-0013.xml")) &&
+                    File.Exists(Path.Combine(root, @"analytics-models\human-pose-estimation-0001\FP16\human-pose-estimation-0001.bin")) &&
                     File.Exists(gst) ? 0 : 3;
             }
             if (args.Length != 0) return 2;
