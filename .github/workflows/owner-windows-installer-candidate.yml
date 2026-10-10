@@ -10,6 +10,10 @@ on:
       - .github/workflows/installed-analytics-candidate.yml
       - src/k5vision/**
       - scripts/installed_analytics_witness.py
+      - scripts/build_owner_analytics_bundle.py
+      - scripts/build_analytics_runtime_wheel.py
+      - src/k5vision/analytics_config.py
+      - src/k5vision/analytics_package.py
   workflow_dispatch:
 permissions:
   contents: read
@@ -53,6 +57,30 @@ jobs:
           $sig = Get-AuthenticodeSignature -FilePath $target
           if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Python Software Foundation') { throw 'Python vendor signature verification failed.' }
           Write-Host 'K5_BUNDLED_PYTHON_IDENTITY=3.12.10/verified'
+
+      - name: Checkout exact Analytics Lab engineering donor
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: mkurtgerald/Analytics-lab
+          ref: c8b347ae538991a0c0ce38eabc2dc17b566531d3
+          path: build/owner-analytics-donor
+          persist-credentials: false
+
+      - name: Build and verify pinned local analytics payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $donor = Join-Path $env:GITHUB_WORKSPACE 'build/owner-analytics-donor'
+          $output = Join-Path $env:GITHUB_WORKSPACE 'build/owner-installer/analytics'
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts/build_owner_analytics_bundle.py'
+          & py -3.12 -I -B $script --analytics-source $donor --output-dir $output
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned analytics payload verification failed.' }
+          foreach ($item in @('manifest.json','Analytics-Lab-LICENSE','Analytics-Lab-THIRD-PARTY.md')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $output $item))) {
+              throw 'Verified analytics payload is incomplete.'
+            }
+          }
+          Write-Host 'K5_OWNER_ANALYTICS_BUNDLE=verified_engineering_only'
 
       - name: Compile double-click setup candidate
         id: compile_setup
