@@ -75,7 +75,7 @@ jobs:
           $script = Join-Path $env:GITHUB_WORKSPACE 'scripts/build_owner_analytics_bundle.py'
           & py -3.12 -I -B $script --analytics-source $donor --output-dir $output
           if ($LASTEXITCODE -ne 0) { throw 'Pinned analytics payload verification failed.' }
-          foreach ($item in @('manifest.json','Analytics-Lab-LICENSE','Analytics-Lab-THIRD-PARTY.md')) {
+          foreach ($item in @('manifest.json','Analytics-Lab-LICENSE','Analytics-Lab-THIRD_PARTY.md')) {
             if (-not (Test-Path -LiteralPath (Join-Path $output $item))) {
               throw 'Verified analytics payload is incomplete.'
             }
