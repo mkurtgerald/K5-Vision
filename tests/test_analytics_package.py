@@ -273,6 +273,41 @@ def test_unsafe_manifest_path_rejected(installed, relative):
 
 
 @pytest.mark.parametrize("change", ["changed", "missing", "extra", "git-blob"])
+
+def test_offline_wheel_builder_restores_only_pinned_crlf_donor_checkout(
+    installed, tmp_path
+):
+    source = installed.source / "analytics_lab/tracking.py"
+    source.write_bytes(source.read_bytes().replace(b"\n", b"\r\n"))
+    wheel = installed.builder.build_wheel(installed.source, tmp_path / "crlf-wheels")
+    with zipfile.ZipFile(wheel) as archive:
+        assert archive.read("analytics_lab/tracking.py") == b"TRACK = 2\n"
+    assert source.read_bytes() == b"TRACK = 2\r\n"
+
+
+@pytest.mark.parametrize(
+    "unverified",
+    [b"TRACK = 3\r\n", b"TRACK = 2\r\r\n", b"TRACK = 2\r\nx\n"],
+)
+def test_offline_wheel_builder_refuses_unpinned_or_mixed_crlf(
+    installed, tmp_path, unverified
+):
+    source = installed.source / "analytics_lab/tracking.py"
+    source.write_bytes(unverified)
+    output = tmp_path / "unverified-wheels"
+    with pytest.raises(admission.AnalyticsPackageError):
+        installed.builder.build_wheel(installed.source, output)
+    assert not output.exists()
+
+
+def test_reviewed_manifest_checkout_cannot_change_line_endings():
+    root = Path(__file__).resolve().parents[1]
+    rule = (root / ".gitattributes").read_text(encoding="ascii")
+    assert "src/k5vision/data/analytics-runtime-manifest.json text eol=lf" in rule
+    assert hashlib.sha256(admission._MANIFEST_PATH.read_bytes()).hexdigest() == admission.MANIFEST_SHA256
+
+
+
 def test_offline_builder_rejects_unpinned_inputs(installed, tmp_path, change):
     path = installed.source / "analytics_lab/tracking.py"
     if change == "changed":
