@@ -140,7 +140,11 @@ jobs:
             'stage-cli','activation-cli',
             'stage-probe','activation-probe',
             'stage-model-copy','activation-model-copy',
-            'stage-analytics-preflight','activation-analytics-preflight'
+            'stage-analytics-preflight','activation-analytics-preflight',
+            'stage-analytics-package','activation-analytics-package',
+            'stage-analytics-versions','activation-analytics-versions',
+            'stage-analytics-path','activation-analytics-path',
+            'stage-analytics-model','activation-analytics-model'
           )
           $stage = 'no-stage-receipt'
           if (Test-Path -LiteralPath $stageFile -PathType Leaf) {
