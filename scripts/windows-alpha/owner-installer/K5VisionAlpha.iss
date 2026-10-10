@@ -60,6 +60,7 @@ Type: files; Name: "{app}\Test-K5VisionAlpha.ps1"
 Type: files; Name: "{app}\Run-K5VisionAlpha.ps1"
 Type: files; Name: "{app}\k5-revision.txt"
 Type: files; Name: "{app}\gstreamer-version.txt"
+Type: files; Name: "{app}\payload\owner-install-stage.txt"
 
 [Code]
 var
@@ -84,6 +85,24 @@ begin
   Result := '"' + Value + '"';
 end;
 
+function OwnerFailureStage: String;
+var
+  Raw: AnsiString;
+  Stage: String;
+begin
+  Result := 'not-reported';
+  if not LoadStringFromFile(ExpandConstant('{app}\payload\owner-install-stage.txt'), Raw) then
+    Exit;
+  Stage := Trim(String(Raw));
+  { Accept fixed identifiers only. Never project source, exception, log, or path data. }
+  if Pos('|' + Stage + '|',
+    '|gstreamer|wheel-build-base|wheel-build-k5|wheel-copy-analytics|' +
+    'wheel-hashes|stage-venv|stage-runtime|stage-preflight|shortcut|' +
+    'verify-wheels|activation-prepare|activation-venv|activation-runtime|' +
+    'activation-preflight|commit|complete|') > 0 then
+    Result := Stage;
+end;
+
 procedure RunOrFail(const Executable, Parameters, StageName: String);
 var
   ExitCode: Integer;
@@ -91,8 +110,14 @@ begin
   if not Exec(Executable, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
     RaiseException('K5 ' + StageName + ' could not start. No camera was contacted.');
   if ExitCode <> 0 then
+  begin
+    if StageName = 'transactional runtime installation' then
+      RaiseException('K5 runtime installation failed at verified stage ' +
+        OwnerFailureStage() + ' (code ' + IntToStr(ExitCode) + '). ' +
+        'The installation was not accepted; no camera was contacted.');
     RaiseException('K5 ' + StageName + ' did not complete (code ' +
       IntToStr(ExitCode) + '). Installation cannot be accepted.');
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
