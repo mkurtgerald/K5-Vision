@@ -34,6 +34,12 @@ Source: "{#SourceRoot}\scripts\windows-alpha\Start-K5VisionAlpha.ps1"; DestDir: 
 Source: "{#SourceRoot}\scripts\windows-alpha\Test-K5VisionAlpha.ps1"; DestDir: "{app}\payload\windows-alpha"; Flags: ignoreversion
 Source: "{#SourceRoot}\scripts\windows-alpha\Run-K5VisionAlpha.ps1"; DestDir: "{app}\payload\windows-alpha"; Flags: ignoreversion
 Source: "{#SourceRoot}\scripts\windows-alpha\install_transaction.py"; DestDir: "{app}\payload\windows-alpha"; Flags: ignoreversion
+Source: "{#SourceRoot}\scripts\windows-alpha\owner_analytics_bundle.py"; DestDir: "{app}\payload\windows-alpha"; Flags: ignoreversion
+Source: "{#SourceRoot}\build\owner-installer\analytics\manifest.json"; DestDir: "{app}\payload\analytics"; Flags: ignoreversion
+Source: "{#SourceRoot}\build\owner-installer\analytics\wheels\*.whl"; DestDir: "{app}\payload\analytics\wheels"; Flags: ignoreversion
+Source: "{#SourceRoot}\build\owner-installer\analytics\models\*"; DestDir: "{app}\payload\analytics\models"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceRoot}\build\owner-installer\analytics\Analytics-Lab-LICENSE"; DestDir: "{app}\payload\analytics"; Flags: ignoreversion
+Source: "{#SourceRoot}\build\owner-installer\analytics\Analytics-Lab-THIRD_PARTY.md"; DestDir: "{app}\payload\analytics"; Flags: ignoreversion
 Source: "{#SourceRoot}\scripts\windows-alpha\runtime-requirements.txt"; DestDir: "{app}\payload\windows-alpha"; Flags: ignoreversion
 Source: "{#SourceRoot}\scripts\provision-stage03-gstreamer.ps1"; DestDir: "{app}\payload"; Flags: ignoreversion
 Source: "{#SourceRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
@@ -47,6 +53,8 @@ Name: "{userdesktop}\K5 Vision Alpha"; Filename: "{app}\K5VisionAlpha.exe"; Work
 ; Only owned files. Never delete camera/user data or another product's paths.
 Type: filesandordirs; Name: "{app}\.venv"
 Type: filesandordirs; Name: "{app}\python312"
+Type: filesandordirs; Name: "{app}\analytics-models"
+Type: files; Name: "{app}\analytics-config.json"
 Type: files; Name: "{app}\Start-K5VisionAlpha.ps1"
 Type: files; Name: "{app}\Test-K5VisionAlpha.ps1"
 Type: files; Name: "{app}\Run-K5VisionAlpha.ps1"
@@ -81,6 +89,8 @@ begin
   PythonExe := PythonRoot + '\python.exe';
   PySetup := AppRoot + '\payload\python-3.12.10-amd64.exe';
   Bootstrap := AppRoot + '\payload\windows-alpha\Install-K5VisionAlpha.ps1';
+  if not FileExists(AppRoot + '\payload\analytics\manifest.json') then
+    RaiseException('Verified owner analytics payload is missing.');
   if not FileExists(PySetup) or not FileExists(Bootstrap) then
     RaiseException('K5 installer payload is incomplete.');
   if not FileExists(PythonExe) then
@@ -99,6 +109,8 @@ begin
     Parameters, 'transactional runtime installation');
   if not FileExists(AppRoot + '\.venv\Scripts\python.exe') or
      not FileExists(AppRoot + '\Start-K5VisionAlpha.ps1') or
-     not FileExists(AppRoot + '\k5-revision.txt') then
+     not FileExists(AppRoot + '\k5-revision.txt') or
+     not FileExists(AppRoot + '\analytics-config.json') or
+     not DirExists(AppRoot + '\analytics-models') then
     RaiseException('The installed K5 runtime is incomplete.');
 end;
