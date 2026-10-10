@@ -1780,3 +1780,40 @@ def test_offline_metadata_ids_are_bounded_without_shrinking_payloads():
     assert all(case[1] == b"x" * case[4] for case in oversized)
     many_tags = next(case for case in cases if case[4] == 65)
     assert many_tags[1].count(b"Tag: py3-none-any\n") == 65
+
+
+class FakeAnalyticsInstaller(FakeInstaller):
+    """Exercise new managed model/config paths through the existing journal."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.analytics_bundle = Path("synthetic-owner-bundle")
+
+    def install_runtime(self, destination):
+        super().install_runtime(destination)
+        (destination / "analytics-models").mkdir()
+        (destination / "analytics-models" / "model.bin").write_bytes(b"new pinned model")
+        (destination / "analytics-config.json").write_bytes(b"new pinned config")
+
+
+def test_analytics_upgrade_rolls_back_models_and_config_on_failed_activation(previous):
+    (previous / "analytics-models").mkdir()
+    (previous / "analytics-models" / "model.bin").write_bytes(b"original model")
+    (previous / "analytics-config.json").write_bytes(b"original config")
+    before = snapshot(previous)
+    installer = FakeAnalyticsInstaller(previous)
+    installer.fail = "active-preflight"
+    with pytest.raises(RuntimeError, match="injected active-preflight"):
+        installer.install(skip_shortcut=True)
+    assert snapshot(previous) == before
+    assert not installer.work.exists()
+
+
+def test_analytics_upgrade_commits_both_runtime_and_model_assets(previous):
+    installer = FakeAnalyticsInstaller(previous)
+    installer.install(skip_shortcut=True)
+    assert (previous / ".venv" / "runtime").read_bytes() == b"new runtime"
+    assert (previous / "analytics-models" / "model.bin").read_bytes() == b"new pinned model"
+    assert (previous / "analytics-config.json").read_bytes() == b"new pinned config"
+    assert (previous / "recording.bin").read_bytes() == b"user data\0\xff"
+    assert not installer.work.exists()
