@@ -706,14 +706,73 @@ try {
 
     Write-Host "Launching the authenticated K5 Windows operator path..."
     $operatorHeaders = @{ Authorization = "Bearer $sessionToken" }
-    $receipt = Invoke-RestMethod -Method Post -Uri "$baseUri/api/v1/operator/live" -Headers $operatorHeaders -ContentType "application/json" -TimeoutSec 60 -Body (
-        ConvertTo-K5Json @{
-            device_id = $device.id
-            stream_token = $streamToken
-            width = 1280
-            height = 720
+    try {
+        $receipt = Invoke-RestMethod -Method Post -Uri "$baseUri/api/v1/operator/live" -Headers $operatorHeaders -ContentType "application/json" -TimeoutSec 60 -Body (
+            ConvertTo-K5Json @{
+                device_id = $device.id
+                stream_token = $streamToken
+                width = 1280
+                height = 720
+            }
+        )
+    } catch {
+        # Classify only a bounded, source-free service error; never print
+        # response bodies, RTSP sources, credentials or exception text.
+        $failureRecord = $_
+        $operatorFailureClass = "unknown"
+        try {
+            $response = $failureRecord.Exception.Response
+            if ($null -ne $response -and [int]$response.StatusCode -eq 503) {
+                $body = [string]$failureRecord.ErrorDetails.Message
+                if ([string]::IsNullOrWhiteSpace($body)) {
+                    $responseStream = $response.GetResponseStream()
+                    try {
+                        if ($null -ne $responseStream) {
+                            $buffer = New-Object byte[] 2049
+                            $count = $responseStream.Read($buffer, 0, $buffer.Length)
+                            if ($count -gt 0 -and $count -le 2048) {
+                                $decoder = [Text.UTF8Encoding]::new($false, $true)
+                                $body = $decoder.GetString($buffer, 0, $count)
+                            }
+                        }
+                    } finally {
+                        if ($null -ne $responseStream) { $responseStream.Dispose() }
+                    }
+                }
+                if ($body.Length -le 2048) {
+                    $detail = [string](ConvertFrom-Json -InputObject $body -ErrorAction Stop).detail
+                    if ($detail.Length -le 1024) {
+                        switch -Regex ($detail) {
+                            '^selected live source could not be resolved$' {
+                                $operatorFailureClass = "source_unavailable"
+                                break
+                            }
+                            '^configured analytics could not start$' {
+                                $operatorFailureClass = "analytics_start_failure"
+                                break
+                            }
+                            '^Live operator runtime is not configured$' {
+                                $operatorFailureClass = "unconfigured"
+                                break
+                            }
+                            '^live operator runtime failed at (execution_failure|start_failure|assembly_failure|cleanup_failure):' {
+                                $operatorFailureClass = $Matches[1]
+                                break
+                            }
+                            '^live operator runtime failed$' {
+                                $operatorFailureClass = "launch_failure"
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {
+            $operatorFailureClass = "unknown"
         }
-    )
+        Write-Host ("K5_OPERATOR_LIVE_FAILURE=" + $operatorFailureClass)
+        throw "K5 Windows operator live request failed."
+    }
     if (-not (Test-K5AlphaOperatorReceipt -Receipt $receipt -AnalyticsRequired $analyticsRequired)) {
         throw "K5 Windows operator alpha test did not complete the selected acceptance checks."
     }

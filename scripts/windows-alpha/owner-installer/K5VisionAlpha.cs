@@ -114,6 +114,25 @@ namespace K5VisionAlpha
             // Preserve a specific decoder failure across later generic error lines.
             // Return fixed GUI messages only, never any part of a native diagnostic.
             if (previous == DecoderFailure || String.IsNullOrWhiteSpace(line)) return previous;
+            // Only exact fixed launcher-projected classes are eligible.
+            if (line == "K5_OPERATOR_LIVE_FAILURE=source_unavailable")
+                return "The public RTSP source could not be resolved or opened.";
+            if (line == "K5_OPERATOR_LIVE_FAILURE=analytics_start_failure")
+                return "Packaged analytics could not start.";
+            if (line == "K5_OPERATOR_LIVE_FAILURE=unconfigured")
+                return "The installed live operator runtime is not configured.";
+            if (line == "K5_OPERATOR_LIVE_FAILURE=execution_failure")
+                return "Live operator execution failed before presentation.";
+            if (line == "K5_OPERATOR_LIVE_FAILURE=start_failure")
+                return "Live operator presentation could not start.";
+            if (line == "K5_OPERATOR_LIVE_FAILURE=assembly_failure")
+                return "Live operator assembly failed.";
+            if (line == "K5_OPERATOR_LIVE_FAILURE=cleanup_failure")
+                return "Live operator cleanup failed.";
+            if (line == "K5_OPERATOR_LIVE_FAILURE=launch_failure")
+                return "Live operator runtime failed.";
+            if (line == "K5_OPERATOR_LIVE_FAILURE=unknown")
+                return "Live operator request failed without a classified cause.";
             if (line.IndexOf("decoder", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 line.IndexOf("d3d11h264dec", StringComparison.OrdinalIgnoreCase) >= 0)
                 return DecoderFailure;
@@ -207,6 +226,8 @@ namespace K5VisionAlpha
                 if (String.IsNullOrWhiteSpace(e.Data)) return;
                 string line = e.Data;
                 // Fixed-status projection only; never display the raw URI, credentials or log.
+                if (line.StartsWith("K5_OPERATOR_LIVE_FAILURE=", StringComparison.Ordinal))
+                    failure = SelectRuntimeFailure(failure, line);
                 if (line == "K5 analytics disabled; video-only alpha acceptance selected.")
                 {
                     if (source.Length == 0)

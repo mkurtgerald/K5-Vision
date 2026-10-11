@@ -102,6 +102,27 @@ class OwnerGuiContract(unittest.TestCase):
         self.assertIn("K5-DECODER:", source)
         self.assertIn("changing the stream address alone may not resolve it", source)
 
+    def test_installed_operator_failure_class_is_bounded_and_source_free(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        launcher = (
+            ROOT / "scripts" / "windows-alpha" / "Start-K5VisionAlpha.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("K5_OPERATOR_LIVE_FAILURE=", launcher)
+        self.assertIn('$count -le 2048', launcher)
+        self.assertIn('$detail.Length -le 1024', launcher)
+        self.assertIn('$response.StatusCode -eq 503', launcher)
+        self.assertIn('throw "K5 Windows operator live request failed."', launcher)
+        self.assertNotIn('Write-Host $detail', launcher)
+        self.assertNotIn('Write-Host $body', launcher)
+        self.assertIn('line.StartsWith("K5_OPERATOR_LIVE_FAILURE="', source)
+        for code in (
+            "source_unavailable", "analytics_start_failure", "unconfigured",
+            "execution_failure", "start_failure", "assembly_failure",
+            "cleanup_failure", "launch_failure", "unknown",
+        ):
+            self.assertIn('K5_OPERATOR_LIVE_FAILURE=' + code, source)
+        self.assertNotIn("Status(line)", source)
+
     @unittest.skipUnless(sys.platform == "win32", "Requires real Windows C# compiler")
     def test_windows_child_analytics_mode_is_explicit_and_parent_unchanged(self):
         compiler = Path(os.environ["WINDIR"]) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
@@ -155,6 +176,12 @@ internal static class OwnerModeProbe
             string named = (string)failure.Invoke(null, new object[] {
                 "initial", "d3d11h264dec unavailable" });
             if (named != chosen) return 21;
+            string classed = (string)failure.Invoke(null, new object[] {
+                "initial", "K5_OPERATOR_LIVE_FAILURE=execution_failure" });
+            if (!classed.Contains("execution failed")) return 22;
+            if ((string)failure.Invoke(null, new object[] {
+                "initial", "K5_OPERATOR_LIVE_FAILURE=private-fixture-marker" }) != "initial")
+                return 23;
             Console.WriteLine("K5_OWNER_ANALYTICS_MODE_CONTRACT=passed");
             return 0;
         }
