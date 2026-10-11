@@ -150,6 +150,7 @@ def _launcher_failure(runtime: Path, name: str) -> str:
     __tracebackhide__ = True
     detail = "unavailable"
     reason = "unclassified"
+    line = 0
     try:
         path = runtime / name
         identity_state._regular_file(path)
@@ -163,11 +164,14 @@ def _launcher_failure(runtime: Path, name: str) -> str:
                 and document.get("result") == "failed"
                 and document.get("stage") in _LAUNCHER_STAGES
                 and document.get("reason") in _LAUNCHER_REASONS
+                and type(document.get("line")) is int
+                and 0 <= document["line"] <= 5000
                 and type(document.get("exit_code")) is int
                 and -(2**31) <= document["exit_code"] < 2**31
             ):
                 detail = document["stage"]
                 reason = document["reason"]
+                line = document["line"]
     except Exception:
         pass
     return (
@@ -175,6 +179,8 @@ def _launcher_failure(runtime: Path, name: str) -> str:
         + detail
         + "; fixed reason: "
         + reason
+        + "; public script line: "
+        + str(line)
         + ")"
     )
 

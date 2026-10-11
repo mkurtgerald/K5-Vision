@@ -21,7 +21,7 @@ $script:diagnosticReady = $false
 $script:diagnosticPath = $null
 
 function Write-K5LauncherDiagnostic {
-    param([int]$ExitCode, [string]$Reason = 'unclassified')
+    param([int]$ExitCode, [string]$Reason = 'unclassified', [int]$Line = 0)
     if (-not $script:diagnosticReady) { return }
     $stages = @('platform', 'python', 'private-state', 'runtime-installation',
         'venv-admission', 'venv-creation', 'venv-file', 'venv-version',
@@ -33,10 +33,11 @@ function Write-K5LauncherDiagnostic {
         'artifact-count', 'artifact-admission', 'cached-identity', 'archive-identity',
         'archive-contents', 'extracted-identity', 'license-identity')
     if ($Reason -cnotin $reasons) { $Reason = 'unclassified' }
+    if ($Line -lt 0 -or $Line -gt 5000) { $Line = 0 }
     $stream = $null
     try {
         $document = @{ schema_version = '1'; result = 'failed'; stage = $stage;
-            reason = $Reason; exit_code = $ExitCode }
+            reason = $Reason; line = $Line; exit_code = $ExitCode }
         $bytes = [Text.Encoding]::UTF8.GetBytes(($document | ConvertTo-Json -Compress))
         # The basename is fixed grammar and its admitted private parent already
         # exists. Create-new never follows or replaces an existing diagnostic.
@@ -347,7 +348,7 @@ if runtime.is_relative_to(project) or project.is_relative_to(runtime): raise Val
     }
     Write-Host ('K5 operator launch failed at ' + $stage + '. Existing identity and recordings were preserved.')
     $result = 1
-    Write-K5LauncherDiagnostic -ExitCode $result -Reason $reason
+    Write-K5LauncherDiagnostic -ExitCode $result -Reason $reason -Line $_.InvocationInfo.ScriptLineNumber
 } finally {
     if ($null -ne $launcherLock) { $launcherLock.Dispose() }
 }
