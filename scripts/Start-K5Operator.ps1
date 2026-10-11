@@ -144,6 +144,23 @@ function Get-K5InstalledManifest {
     return $text | ConvertFrom-Json
 }
 
+function Get-K5Sha256 {
+    param([string]$Path)
+    # Use .NET directly: the native 5.1 starter must not depend on hash-module
+    # autoload behavior inherited from a PowerShell 7 parent process.
+    $stream = $null
+    $algorithm = $null
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        if ($null -ne $algorithm) { $algorithm.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
 function Get-K5PinnedTool {
     param(
         [string]$Python, [string]$Helper, [string]$ToolsRoot,
@@ -174,8 +191,8 @@ function Get-K5PinnedTool {
     if (Test-Path -LiteralPath $target) {
         Assert-K5PrivateFile -Python $Python -Helper $Helper -Path $target
         Assert-K5PrivateFile -Python $Python -Helper $Helper -Path $license
-        if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant() -cne $artifact.executable_sha256 -or
-            (Get-FileHash -LiteralPath $license -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Manifest.license_sha256) {
+        if ((Get-K5Sha256 -Path $target) -cne $artifact.executable_sha256 -or
+            (Get-K5Sha256 -Path $license) -cne $Manifest.license_sha256) {
             throw 'Cached native tool identity mismatch.'
         }
         return $target
@@ -191,7 +208,7 @@ function Get-K5PinnedTool {
             [Net.ServicePointManager]::SecurityProtocol = $previousTls -bor [Net.SecurityProtocolType]::Tls12
             Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri $artifact.url -OutFile $archive
         } finally { [Net.ServicePointManager]::SecurityProtocol = $previousTls }
-        if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $artifact.sha256) {
+        if ((Get-K5Sha256 -Path $archive) -cne $artifact.sha256) {
             throw 'Native archive identity mismatch.'
         }
         $package = [IO.Compression.ZipFile]::OpenRead($archive)
@@ -207,13 +224,13 @@ function Get-K5PinnedTool {
         [IO.Compression.ZipFileExtensions]::ExtractToFile($licenseEntries[0], $licenseCandidate, $false)
         Assert-K5PrivateFile -Python $Python -Helper $Helper -Path $candidate
         Assert-K5PrivateFile -Python $Python -Helper $Helper -Path $licenseCandidate
-        if ((Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant() -cne $artifact.executable_sha256 -or
-            (Get-FileHash -LiteralPath $licenseCandidate -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Manifest.license_sha256) {
+        if ((Get-K5Sha256 -Path $candidate) -cne $artifact.executable_sha256 -or
+            (Get-K5Sha256 -Path $licenseCandidate) -cne $Manifest.license_sha256) {
             throw 'Extracted native tool identity mismatch.'
         }
         if (Test-Path -LiteralPath $license) {
             Assert-K5PrivateFile -Python $Python -Helper $Helper -Path $license
-            if ((Get-FileHash -LiteralPath $license -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Manifest.license_sha256) {
+            if ((Get-K5Sha256 -Path $license) -cne $Manifest.license_sha256) {
                 throw 'Existing native license identity mismatch.'
             }
         } else { [IO.File]::Move($licenseCandidate, $license) }
