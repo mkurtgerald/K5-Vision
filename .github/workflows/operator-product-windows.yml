@@ -162,44 +162,6 @@ jobs:
           "K5_DONOR_FFMPEG=$ffmpegExe" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           "K5_DONOR_FFPROBE=$ffprobeExe" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
 
-      - name: Run product regressions, Windows Job ownership and assembled acceptance
-        timeout-minutes: 6
-        shell: pwsh
-        run: |
-          python -m pytest tests/unit/test_mediamtx_provider.py tests/unit/test_operator_media_gateway.py tests/unit/test_operator_product_state.py tests/unit/test_operator_product_api.py tests/unit/test_operator_product_service.py tests/unit/test_operator_recording_storage.py tests/unit/test_operator_native_process.py tests/unit/test_operator_profile_lock.py tests/integration/test_operator_product_runtime.py --no-cov -s -o faulthandler_timeout=120 --junitxml=operator-product-native-windows.xml
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Verify assembled native Windows product receipt
-        id: qualification
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          [xml]$report = Get-Content -LiteralPath operator-product-native-windows.xml -Raw
-          $properties = @($report.SelectNodes("//property[@name='operator_product_runtime_receipt']"))
-          $cases = @($report.SelectNodes("//testcase[@name='test_assembled_operator_product_login_live_recording_logout_and_restart']"))
-          if ($properties.Count -ne 1 -or $cases.Count -ne 1 -or $cases[0].SelectSingleNode("skipped") -ne $null) {
-            throw "Assembled product acceptance did not execute and produce its receipt"
-          }
-          $receipt = $properties[0].GetAttribute("value") | ConvertFrom-Json
-          if ($receipt.platform -ne "Windows" -or $receipt.native_windows_execution -ne $true -or
-              $receipt.portable_ancestor_adjustment -ne $false -or $receipt.whole_product_restart_preserved -ne $true -or
-              $receipt.logout_revoked_cached_media -ne $true -or $receipt.session_invalid_after_restart -ne $true -or
-              $receipt.live_hls_media_received -ne $true -or $receipt.source_reconnected -ne $true -or
-              $receipt.playback_decoded_frames -le 0 -or $receipt.recording_spans -lt 3) {
-            throw "Native Windows assembled product receipt is incomplete"
-          }
-          Write-Host "Native Windows assembled product: login, camera enrollment, live HLS, recording and decoded playback passed"
-          Write-Host "Logout invalidated cached media; whole-product restart retained identity, camera and recording history"
-          @(
-            "Native Windows assembled operator product acceptance passed.",
-            "",
-            "Generated stream, actual K5 API, Caddy gateway and MediaMTX recorder were exercised together.",
-            "",
-            "Recording spans: $($receipt.recording_spans); decoded export frames: $($receipt.playback_decoded_frames).",
-            "",
-            "Browser decoding, real cameras and analytics acceptance require their own witnesses."
-          ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
-
       - name: Build project wheel for native launcher acceptance
         shell: pwsh
         run: |
@@ -243,6 +205,44 @@ jobs:
           }
           Write-Host "Native Windows PowerShell 5.1 launcher installed the wheel, started verified workers, authenticated and cleaned up"
           "Native PowerShell 5.1 launcher and installed-wheel acceptance passed." | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: Run product regressions, Windows Job ownership and assembled acceptance
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_mediamtx_provider.py tests/unit/test_operator_media_gateway.py tests/unit/test_operator_product_state.py tests/unit/test_operator_product_api.py tests/unit/test_operator_product_service.py tests/unit/test_operator_recording_storage.py tests/unit/test_operator_native_process.py tests/unit/test_operator_profile_lock.py tests/integration/test_operator_product_runtime.py --no-cov -s -o faulthandler_timeout=120 --junitxml=operator-product-native-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify assembled native Windows product receipt
+        id: qualification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          [xml]$report = Get-Content -LiteralPath operator-product-native-windows.xml -Raw
+          $properties = @($report.SelectNodes("//property[@name='operator_product_runtime_receipt']"))
+          $cases = @($report.SelectNodes("//testcase[@name='test_assembled_operator_product_login_live_recording_logout_and_restart']"))
+          if ($properties.Count -ne 1 -or $cases.Count -ne 1 -or $cases[0].SelectSingleNode("skipped") -ne $null) {
+            throw "Assembled product acceptance did not execute and produce its receipt"
+          }
+          $receipt = $properties[0].GetAttribute("value") | ConvertFrom-Json
+          if ($receipt.platform -ne "Windows" -or $receipt.native_windows_execution -ne $true -or
+              $receipt.portable_ancestor_adjustment -ne $false -or $receipt.whole_product_restart_preserved -ne $true -or
+              $receipt.logout_revoked_cached_media -ne $true -or $receipt.session_invalid_after_restart -ne $true -or
+              $receipt.live_hls_media_received -ne $true -or $receipt.source_reconnected -ne $true -or
+              $receipt.playback_decoded_frames -le 0 -or $receipt.recording_spans -lt 3) {
+            throw "Native Windows assembled product receipt is incomplete"
+          }
+          Write-Host "Native Windows assembled product: login, camera enrollment, live HLS, recording and decoded playback passed"
+          Write-Host "Logout invalidated cached media; whole-product restart retained identity, camera and recording history"
+          @(
+            "Native Windows assembled operator product acceptance passed.",
+            "",
+            "Generated stream, actual K5 API, Caddy gateway and MediaMTX recorder were exercised together.",
+            "",
+            "Recording spans: $($receipt.recording_spans); decoded export frames: $($receipt.playback_decoded_frames).",
+            "",
+            "Browser decoding, real cameras and analytics acceptance require their own witnesses."
+          ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       - name: Remove owned native development tool downloads
         if: always()

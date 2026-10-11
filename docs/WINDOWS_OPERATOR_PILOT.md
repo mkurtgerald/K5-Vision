@@ -30,8 +30,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Start-K5Operat
 ```
 
 The launcher creates a private per-user runtime, verifies the downloaded archive,
-executable and license hashes, and prompts for the first administrator username
-and password. Keep the PowerShell window open. The dashboard opens at
+executable and license hashes, and prompts for the password and confirmation for
+the first administrator, **`recovery-admin`**. Keep the PowerShell window open.
+The dashboard opens at
 `http://127.0.0.1:8000/operator/`; use that exact address if opening it yourself.
 If Python is not found automatically, pass `-PythonExecutable` with the full
 path to its `python.exe`. Use `-Port 8001` if port 8000 is already occupied.

@@ -35,6 +35,23 @@ pytestmark = pytest.mark.skipif(
     reason="Native launcher proof requires Windows and explicitly supplied wheel/tools",
 )
 _MODULES = ("cli.py", "operator_product.py", "operator_product_service.py")
+_LAUNCHER_STAGES = frozenset(
+    {
+        "platform",
+        "python",
+        "private-state",
+        "runtime-installation",
+        "venv-admission",
+        "venv-creation",
+        "venv-file",
+        "venv-version",
+        "pip-installation",
+        "native-workers",
+        "identity",
+        "recordings",
+        "operator",
+    }
+)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -107,6 +124,30 @@ def _digest(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024**2), b""):
             result.update(chunk)
     return result.hexdigest()
+
+
+def _launcher_failure(runtime: Path, name: str) -> str:
+    __tracebackhide__ = True
+    detail = "unavailable"
+    try:
+        path = runtime / name
+        identity_state._regular_file(path)
+        with path.open("rb") as source:
+            body = source.read(513)
+        if len(body) <= 512:
+            document = json.loads(body)
+            if (
+                isinstance(document, dict)
+                and document.get("schema_version") == "1"
+                and document.get("result") == "failed"
+                and document.get("stage") in _LAUNCHER_STAGES
+                and type(document.get("exit_code")) is int
+                and -(2**31) <= document["exit_code"] < 2**31
+            ):
+                detail = document["stage"]
+    except Exception:
+        pass
+    return "PowerShell launcher exited before readiness (fixed stage: " + detail + ")"
 
 
 def _cache_worker(runtime: Path, wheel: Path, name: str, supplied: Path) -> None:
@@ -218,6 +259,7 @@ def test_native_windows_powershell_launcher_installs_wheel_and_authenticates(
             reservation.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
+        diagnostic_name = "launcher-diagnostic-" + uuid4().hex + ".json"
         owned = OwnedNativeProcess(
             [
                 str(powershell),
@@ -238,13 +280,16 @@ def test_native_windows_powershell_launcher_installs_wheel_and_authenticates(
                 str(state),
                 "-Port",
                 str(port),
+                "-DiagnosticName",
+                diagnostic_name,
             ],
             cwd=project,
         )
         origin = f"http://127.0.0.1:{port}"
         deadline = time.monotonic() + 150
         while True:
-            _require(owned.poll() is None, "PowerShell launcher exited before readiness")
+            if owned.poll() is not None:
+                _require(False, _launcher_failure(runtime, diagnostic_name))
             status, body = _request(origin, "/api/v1/health")
             if status == 200 and _json(body).get("status") == "ok":
                 break

@@ -5,6 +5,7 @@ param(
     [string]$RuntimeRoot = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'K5VisionOperatorRuntime'),
     [string]$StateRoot = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'K5VisionOperatorState'),
     [ValidateRange(1024, 65535)][int]$Port = 8000,
+    [string]$DiagnosticName = '',
     [switch]$NoBrowser
 )
 
@@ -16,6 +17,30 @@ Set-StrictMode -Version Latest
 $stage = 'platform'
 $launcherLock = $null
 $result = 1
+$script:diagnosticReady = $false
+$script:diagnosticPath = $null
+
+function Write-K5LauncherDiagnostic {
+    param([int]$ExitCode)
+    if (-not $script:diagnosticReady) { return }
+    $stages = @('platform', 'python', 'private-state', 'runtime-installation',
+        'venv-admission', 'venv-creation', 'venv-file', 'venv-version',
+        'pip-installation', 'native-workers', 'identity', 'recordings', 'operator')
+    if ($stage -cnotin $stages) { return }
+    $stream = $null
+    try {
+        $document = @{ schema_version = '1'; result = 'failed'; stage = $stage; exit_code = $ExitCode }
+        $bytes = [Text.Encoding]::UTF8.GetBytes(($document | ConvertTo-Json -Compress))
+        # The basename is fixed grammar and its admitted private parent already
+        # exists. Create-new never follows or replaces an existing diagnostic.
+        $stream = [IO.File]::Open($script:diagnosticPath, [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } catch {
+        # This optional finite diagnostic cannot expose raw native/Python output.
+    } finally { if ($null -ne $stream) { $stream.Dispose() } }
+}
 
 function Invoke-K5PythonText {
     param([string]$Python, [string[]]$Arguments)
@@ -232,6 +257,13 @@ if runtime.is_relative_to(project) or project.is_relative_to(runtime): raise Val
 '@
     $null = Invoke-K5PythonText -Python $PythonExecutable -Arguments @('-I', '-B', '-c', $separation, $RuntimeRoot, $StateRoot, $project, $PackagePath)
     Assert-K5PrivateDirectory -Python $PythonExecutable -Helper $helper -Path $RuntimeRoot
+    if ($DiagnosticName) {
+        if ($DiagnosticName -cnotmatch '^launcher-diagnostic-[0-9a-f]{32}\.json$') {
+            throw 'Diagnostic basename refused.'
+        }
+        $script:diagnosticPath = Join-Path $RuntimeRoot $DiagnosticName
+        $script:diagnosticReady = $true
+    }
     Assert-K5PrivateDirectory -Python $PythonExecutable -Helper $helper -Path $StateRoot
     $lockPath = Join-Path $RuntimeRoot 'operator-launcher.lock'
     if (Test-Path -LiteralPath $lockPath) {
@@ -243,13 +275,19 @@ if runtime.is_relative_to(project) or project.is_relative_to(runtime): raise Val
     $venv = Join-Path $RuntimeRoot '.venv'
     $python = Join-Path $venv 'Scripts\python.exe'
     $venvExists = Test-Path -LiteralPath $venv
+    $stage = 'venv-admission'
     Assert-K5PrivateDirectory -Python $PythonExecutable -Helper $helper -Path $venv
     if (-not $venvExists) {
+        $stage = 'venv-creation'
         $null = Invoke-K5PythonText -Python $PythonExecutable -Arguments @('-I', '-B', '-m', 'venv', $venv)
     }
+    $stage = 'venv-file'
     Assert-K5PrivateFile -Python $PythonExecutable -Helper $helper -Path $python
+    $stage = 'venv-version'
     $null = Assert-K5Python -Python $python
+    $stage = 'venv-admission'
     Assert-K5PrivateDirectory -Python $python -Helper $helper -Path $venv
+    $stage = 'pip-installation'
     $null = Invoke-K5PythonText -Python $python -Arguments @('-I', '-B', '-m', 'pip', 'install', '--no-input', '--disable-pip-version-check', '--quiet', '--upgrade', $PackagePath)
     $stage = 'native-workers'
     Write-Host 'Preparing verified native Windows media workers...'
@@ -263,12 +301,13 @@ if runtime.is_relative_to(project) or project.is_relative_to(runtime): raise Val
     $stage = 'identity'
     $identity = Join-Path $StateRoot 'identity'
     if (-not (Test-Path -LiteralPath $identity)) {
-        Write-Host 'Create the local recovery administrator. The password stays off the command line.'
+        Write-Host 'Create the local recovery-admin account. The password stays off the command line.'
         & $python -I -B -m k5vision.cli setup-admin --identity-dir $identity
         if ($LASTEXITCODE -ne 0) { throw 'Recovery administrator setup incomplete.' }
     }
     # Existing or interrupted identity state is never reset or reinitialized.
     $recordings = Join-Path $StateRoot 'recordings'
+    $stage = 'recordings'
     Assert-K5PrivateDirectory -Python $python -Helper $helper -Path $recordings
     $stage = 'operator'
     Write-Host 'Starting the local operator. Keep this window open; Ctrl+C stops the pilot.'
@@ -276,10 +315,12 @@ if runtime.is_relative_to(project) or project.is_relative_to(runtime): raise Val
     if (-not $NoBrowser) { $arguments += '--open-browser' }
     & $python @arguments
     $result = $LASTEXITCODE
+    if ($result -ne 0) { Write-K5LauncherDiagnostic -ExitCode $result }
 } catch {
     # Never echo Python, pip, configuration or raw source errors into the owner flow.
     Write-Host ('K5 operator launch failed at ' + $stage + '. Existing identity and recordings were preserved.')
     $result = 1
+    Write-K5LauncherDiagnostic -ExitCode $result
 } finally {
     if ($null -ne $launcherLock) { $launcherLock.Dispose() }
 }
