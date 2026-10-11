@@ -284,8 +284,8 @@ def test_runtime_pin_matches_exact_tracked_git_blob_manifest():
     independent = hashlib.sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    assert len(manifest) == 137
-    assert capture.RUNTIME_REVISION == "70b24135a085c8bb1dca23253a3c25fef9e18164"
+    assert len(manifest) == 138
+    assert capture.RUNTIME_REVISION == "dce130837c79388d24cd1abbd26aa2054c3ccb82"
     assert independent == capture.RUNTIME_PAYLOAD_SHA256
 
 
@@ -297,6 +297,7 @@ def test_runtime_pin_matches_exact_tracked_git_blob_manifest():
         "media/windows_operator_playback_ui.py",
         "media/windows_operator_window_procedure.py",
         "media/analytics_detection_adapter.py",
+        "media/reviewed_h264_selection.py",
         "media/windows_operator_control.py",
         "media/windows_operator_history_control.py",
     ],
@@ -315,6 +316,7 @@ def test_runtime_mutation_cannot_be_admitted_by_rebinding_caller_expectations(bu
 @pytest.mark.parametrize(
     "previous_payload",
     [
+        "826ffb22491b3052d22670f7c60fae22811b7d92f0ab0f1d5fab89ac49b19087",
         "c755ac54055c3d36ca12da20089f349b76477c7f1757c88b2cda9751160de92e",
         "f72765e7abf3c38a42285fd6cb26f46690e8b2321c600f2ddb5d5bc56eb2f3ec",
         "6b03a5168a55db435ab7b3b2272220b0bc0d7e53c2bca029760d3526d58da751",

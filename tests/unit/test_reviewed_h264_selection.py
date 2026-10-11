@@ -74,9 +74,7 @@ def test_reviewed_software_selected_and_native_references_released(admitted, cap
     result = selection.select_decoder(admitted.core, admitted.root, allow_reviewed_software=True)
     assert result == selection.SOFTWARE
     assert [call.args[0] for call in admitted.core.gst_object_unref.call_args_list] == [33, 22]
-    assert capsys.readouterr().out == (
-        "K5 decoder selected: reviewed-software-h264 (engineering build)\n"
-    )
+    assert capsys.readouterr().out == "K5 decoder selected: reviewed-software-h264 (engineering build)\n"
 
 
 @pytest.mark.parametrize("index", range(4))
