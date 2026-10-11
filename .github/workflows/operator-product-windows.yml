@@ -177,7 +177,7 @@ jobs:
 
       - name: Run real native PowerShell launcher acceptance
         id: launcher_acceptance
-        timeout-minutes: 4
+        timeout-minutes: 6
         shell: pwsh
         run: |
           python -m pytest tests/integration/test_operator_windows_launcher.py --no-cov -s -o faulthandler_timeout=120 --junitxml=operator-launcher-native-windows.xml
@@ -203,8 +203,26 @@ jobs:
               $receipt.worker_ready -ne $true -or $receipt.owned_tree_cleanup -ne $true) {
             throw "Native Windows PowerShell launcher receipt is incomplete"
           }
+          $freshProperties = @($report.SelectNodes("//property[@name='operator_windows_fresh_launcher_receipt']"))
+          $freshCases = @($report.SelectNodes("//testcase[@name='test_native_windows_powershell_launcher_downloads_workers_and_authenticates']"))
+          if ($freshProperties.Count -ne 1 -or $freshCases.Count -ne 1 -or
+              $freshCases[0].SelectSingleNode("skipped") -ne $null) {
+            throw "Fresh native launcher acceptance did not execute and produce its receipt"
+          }
+          $freshReceipt = $freshProperties[0].GetAttribute("value") | ConvertFrom-Json
+          if ($freshReceipt.schema_version -ne "1" -or $freshReceipt.platform -ne "Windows" -or
+              $freshReceipt.native_windows_execution -ne $true -or $freshReceipt.powershell_version -notlike "5.1*" -or
+              $freshReceipt.preprovisioned_identity -ne $true -or $freshReceipt.verified_cached_workers -ne $false -or
+              $freshReceipt.cached -ne $false -or $freshReceipt.downloaded_workers -ne $true -or
+              $freshReceipt.installed_worker_digests -ne $true -or $freshReceipt.wheel_install -ne $true -or
+              $freshReceipt.isolated_wheel_import -ne $true -or $freshReceipt.health -ne $true -or
+              $freshReceipt.administrator_login -ne $true -or $freshReceipt.worker_ready -ne $true -or
+              $freshReceipt.owned_tree_cleanup -ne $true) {
+            throw "Fresh native Windows PowerShell launcher receipt is incomplete"
+          }
           Write-Host "Native Windows PowerShell 5.1 launcher installed the wheel, started verified workers, authenticated and cleaned up"
-          "Native PowerShell 5.1 launcher and installed-wheel acceptance passed." | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          Write-Host "Fresh native launcher downloaded and verified both official worker releases from an empty cache"
+          "Cached and empty-cache native PowerShell 5.1 launcher and installed-wheel acceptance passed." | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       - name: Run product regressions, Windows Job ownership and assembled acceptance
         timeout-minutes: 6

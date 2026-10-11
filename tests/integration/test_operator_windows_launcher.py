@@ -1,4 +1,4 @@
-"""Opt-in real PowerShell 5.1 launcher proof on an isolated Windows runner.
+"""Opt-in cached and fresh PowerShell 5.1 launcher proofs on Windows.
 
 Supplied wheels/tools are test inputs. Passwords stay in memory and the local
 login request body; no private output, source, path or credential is evidence.
@@ -185,13 +185,18 @@ def _launcher_failure(runtime: Path, name: str) -> str:
     )
 
 
-def _cache_worker(runtime: Path, wheel: Path, name: str, supplied: Path) -> None:
+def _wheel_worker(wheel: Path, name: str) -> tuple[dict, dict]:
     __tracebackhide__ = True
     with zipfile.ZipFile(wheel) as package:
         manifest = json.loads(package.read(f"k5vision/data/{name}-donor-manifest.json"))
     artifacts = [item for item in manifest["artifacts"] if item["platform"] == "windows_amd64"]
     _require(len(artifacts) == 1, "Wheel Windows worker identity was ambiguous")
-    artifact = artifacts[0]
+    return manifest, artifacts[0]
+
+
+def _cache_worker(runtime: Path, wheel: Path, name: str, supplied: Path) -> None:
+    __tracebackhide__ = True
+    manifest, artifact = _wheel_worker(wheel, name)
     _require(
         _digest(supplied) == artifact["executable_sha256"]
         and supplied.stat().st_size == artifact["executable_bytes"],
@@ -208,6 +213,30 @@ def _cache_worker(runtime: Path, wheel: Path, name: str, supplied: Path) -> None
     _private_directory(cache)
     _copy_private(supplied, cache / artifact["executable"])
     _copy_private(license_path, cache / "LICENSE")
+
+
+def _verify_installed_workers(runtime: Path, wheel: Path) -> None:
+    __tracebackhide__ = True
+    expected = set()
+    for name in ("mediamtx", "caddy"):
+        manifest, artifact = _wheel_worker(wheel, name)
+        cache = runtime / "tools" / manifest["component"] / manifest["version"]
+        identity_state._checked_path(cache)
+        identity_state._windows_admission(cache, private=True, directory=True)
+        executable, license_path = cache / artifact["executable"], cache / "LICENSE"
+        info = identity_state._regular_file(executable)
+        identity_state._regular_file(license_path)
+        _require(
+            info.st_size == artifact["executable_bytes"]
+            and _digest(executable) == artifact["executable_sha256"]
+            and _digest(license_path) == manifest["license_sha256"],
+            "Installed native worker or license identity was refused",
+        )
+        expected.update((executable, license_path))
+    _require(
+        {path for path in (runtime / "tools").rglob("*") if path.is_file()} == expected,
+        "Installed native tools retained unexpected extraction files",
+    )
 
 
 def _installed_wheel_import(runtime: Path, wheel: Path) -> None:
@@ -235,9 +264,7 @@ def _installed_wheel_import(runtime: Path, wheel: Path) -> None:
     _require(result.returncode == 0, "Starter imported outside its installed wheel runtime")
 
 
-def test_native_windows_powershell_launcher_installs_wheel_and_authenticates(
-    record_testsuite_property,
-) -> None:
+def _run_launcher(*, precache: bool) -> dict:
     __tracebackhide__ = True
     _require(
         sys.platform == "win32"
@@ -285,11 +312,19 @@ def test_native_windows_powershell_launcher_installs_wheel_and_authenticates(
         identity = identity_state.initialize_identity_state(
             state / "identity", username=username, password=password
         )
-        for name, environment in (
-            ("mediamtx", "K5_MEDIAMTX_DONOR_EXE"),
-            ("caddy", "K5_CADDY_DONOR_EXE"),
-        ):
-            _cache_worker(runtime, wheel, name, Path(os.environ[environment]).resolve(strict=True))
+        if precache:
+            for name, environment in (
+                ("mediamtx", "K5_MEDIAMTX_DONOR_EXE"),
+                ("caddy", "K5_CADDY_DONOR_EXE"),
+            ):
+                _cache_worker(
+                    runtime, wheel, name, Path(os.environ[environment]).resolve(strict=True)
+                )
+        else:
+            _require(
+                not any((runtime / "tools").iterdir()),
+                "Fresh launcher proof requires an empty native tool cache",
+            )
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
             reservation.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             reservation.bind(("127.0.0.1", 0))
@@ -321,7 +356,7 @@ def test_native_windows_powershell_launcher_installs_wheel_and_authenticates(
             cwd=project,
         )
         origin = f"http://127.0.0.1:{port}"
-        deadline = time.monotonic() + 150
+        deadline = time.monotonic() + (150 if precache else 180)
         while True:
             if owned.poll() is not None:
                 _require(False, _launcher_failure(runtime, diagnostic_name))
@@ -350,6 +385,7 @@ def test_native_windows_powershell_launcher_installs_wheel_and_authenticates(
             "Installed starter native workers were not ready",
         )
         _installed_wheel_import(runtime, wheel)
+        _verify_installed_workers(runtime, wheel)
         _require(
             identity_state.load_identity_state(identity.directory).site_id == identity.site_id,
             "Starter changed its preprovisioned durable identity",
@@ -374,7 +410,7 @@ def test_native_windows_powershell_launcher_installs_wheel_and_authenticates(
         "native_windows_execution": True,
         "powershell_version": "5.1",
         "preprovisioned_identity": True,
-        "verified_cached_workers": True,
+        "verified_cached_workers": precache,
         "wheel_install": True,
         "isolated_wheel_import": True,
         "health": True,
@@ -385,6 +421,26 @@ def test_native_windows_powershell_launcher_installs_wheel_and_authenticates(
         "browser_acceptance": False,
         "analytics_acceptance": False,
     }
+    if not precache:
+        receipt.update(cached=False, downloaded_workers=True, installed_worker_digests=True)
+    return receipt
+
+
+def test_native_windows_powershell_launcher_installs_wheel_and_authenticates(
+    record_testsuite_property,
+) -> None:
+    __tracebackhide__ = True
+    receipt = _run_launcher(precache=True)
     record_testsuite_property(
         "operator_windows_launcher_receipt", json.dumps(receipt, sort_keys=True)
+    )
+
+
+def test_native_windows_powershell_launcher_downloads_workers_and_authenticates(
+    record_testsuite_property,
+) -> None:
+    __tracebackhide__ = True
+    receipt = _run_launcher(precache=False)
+    record_testsuite_property(
+        "operator_windows_fresh_launcher_receipt", json.dumps(receipt, sort_keys=True)
     )
