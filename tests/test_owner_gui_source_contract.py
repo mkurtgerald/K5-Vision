@@ -90,6 +90,18 @@ class OwnerGuiContract(unittest.TestCase):
             source,
         )
 
+    def test_decoder_failure_has_a_fixed_gui_message_and_priority(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertIn("failure = SelectRuntimeFailure(failure, e.Data);", source)
+        helper = source.split("private static string SelectRuntimeFailure", 1)[1].split(
+            "private void Status", 1
+        )[0]
+        self.assertIn("previous == DecoderFailure", helper)
+        self.assertLess(helper.index('"decoder"'), helper.index('"RTSP"'))
+        self.assertNotIn("return line;", helper)
+        self.assertIn("K5-DECODER:", source)
+        self.assertIn("changing the stream address alone may not resolve it", source)
+
     @unittest.skipUnless(sys.platform == "win32", "Requires real Windows C# compiler")
     def test_windows_child_analytics_mode_is_explicit_and_parent_unchanged(self):
         compiler = Path(os.environ["WINDIR"]) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
@@ -123,6 +135,24 @@ internal static class OwnerModeProbe
             if (child.EnvironmentVariables.ContainsKey("K5_ANALYTICS_CONFIG")) return 13;
             if (Environment.GetEnvironmentVariable("K5_ANALYTICS_CONFIG") !=
                 "untrusted-inherited-config") return 14;
+            MethodInfo failure = launcher.GetMethod("SelectRuntimeFailure",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            if (failure == null) return 16;
+            string chosen = (string)failure.Invoke(null, new object[] {
+                "initial", "GStreamer RTSP DECODER failed private-fixture-marker" });
+            if (!chosen.StartsWith("K5-DECODER:", StringComparison.Ordinal) ||
+                chosen.Contains("private-fixture-marker")) return 17;
+            foreach (string line in new string[] { "RTSP failed", "health failed", "", null })
+            {
+                if ((string)failure.Invoke(null, new object[] { chosen, line }) != chosen)
+                    return 18;
+            }
+            if ((string)failure.Invoke(null, new object[] { "initial", "unknown private-fixture-marker" })
+                != "initial") return 19;
+            string reset = (string)failure.Invoke(null, new object[] { "new test", "health failed" });
+            if (reset == chosen || !reset.Contains("health")) return 20;
+            string named = (string)failure.Invoke(null, new object[] { "initial", "d3d11h264dec unavailable" });
+            if (named != chosen) return 21;
             Console.WriteLine("K5_OWNER_ANALYTICS_MODE_CONTRACT=passed");
             return 0;
         }

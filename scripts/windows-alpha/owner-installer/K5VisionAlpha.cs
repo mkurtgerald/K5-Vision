@@ -105,6 +105,29 @@ namespace K5VisionAlpha
             return builder.ToString();
         }
 
+        private const string DecoderFailure =
+            "K5-DECODER: Video decoder failed. This build may not support the available graphics/runtime. " +
+            "A corrected K5 installer may be required; changing the stream address alone may not resolve it.";
+
+        private static string SelectRuntimeFailure(string previous, string line)
+        {
+            // Preserve a specific decoder failure across later generic error lines.
+            // Return fixed GUI messages only, never any part of a native diagnostic.
+            if (previous == DecoderFailure || String.IsNullOrWhiteSpace(line)) return previous;
+            if (line.IndexOf("decoder", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                line.IndexOf("d3d11h264dec", StringComparison.OrdinalIgnoreCase) >= 0)
+                return DecoderFailure;
+            if (line.IndexOf("GStreamer", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "GStreamer runtime validation failed; repair the installation.";
+            if (line.IndexOf("RTSP", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "The RTSP test source could not be decoded or validated.";
+            if (line.IndexOf("analytics", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Analytics did not meet the Stage-One acceptance gate.";
+            if (line.IndexOf("health", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "The local K5 service did not pass its health check.";
+            return previous;
+        }
+
         private void Status(string message)
         {
             if (IsDisposed || Disposing) return;
@@ -214,15 +237,7 @@ namespace K5VisionAlpha
             };
             active.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
             {
-                if (String.IsNullOrEmpty(e.Data)) return;
-                if (e.Data.IndexOf("GStreamer", StringComparison.OrdinalIgnoreCase) >= 0)
-                    failure = "GStreamer runtime validation failed; repair the installation.";
-                else if (e.Data.IndexOf("RTSP", StringComparison.OrdinalIgnoreCase) >= 0)
-                    failure = "The RTSP test source could not be decoded or validated.";
-                else if (e.Data.IndexOf("analytics", StringComparison.OrdinalIgnoreCase) >= 0)
-                    failure = "Analytics did not meet the Stage-One acceptance gate.";
-                else if (e.Data.IndexOf("health", StringComparison.OrdinalIgnoreCase) >= 0)
-                    failure = "The local K5 service did not pass its health check.";
+                failure = SelectRuntimeFailure(failure, e.Data);
             };
             active.Exited += delegate(object s, EventArgs e)
             {
