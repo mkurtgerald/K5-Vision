@@ -1,0 +1,26 @@
+{
+  "schema_version": "1",
+  "component": "MediaMTX",
+  "version": "v1.21.2",
+  "source": "https://github.com/bluenviron/mediamtx",
+  "source_commit": "914e39535ece709919ac325aaeed98d394ed9093",
+  "license": "MIT",
+  "license_sha256": "ecae73b0a23185a35a1222edc0aae5245bb9739420bad0125b0c42e935301a80",
+  "bundled": false,
+  "artifacts": [
+    {
+      "platform": "windows_amd64",
+      "use": "native-target-evaluation",
+      "filename": "mediamtx_v1.21.2_windows_amd64.zip",
+      "sha256": "a84224f5a490855684e62ba6fb71e80ea2a5e16aed61883bb58380290e93e467",
+      "url": "https://github.com/bluenviron/mediamtx/releases/download/v1.21.2/mediamtx_v1.21.2_windows_amd64.zip"
+    },
+    {
+      "platform": "linux_amd64",
+      "use": "portable-regression-only",
+      "filename": "mediamtx_v1.21.2_linux_amd64.tar.gz",
+      "sha256": "121be6e00397e473a95d83c75f4fcd3819a6af3b0e1a50889cba43ab4fab6a27",
+      "url": "https://github.com/bluenviron/mediamtx/releases/download/v1.21.2/mediamtx_v1.21.2_linux_amd64.tar.gz"
+    }
+  ]
+}
