@@ -95,7 +95,7 @@ class _DirectRtspFrameBackend(_PresentationCtypesBackend):  # pragma: no cover
             "! video/x-raw,format=BGRx "
             "! appsink name=k5sink sync=false max-buffers=4 drop=true"
         ).encode()
-        pipeline = self._core.gst_parse_launch(description, None)
+        pipeline = self._core.gst_parse_launch_full(description, None, 1, None)
         if not pipeline:
             raise NativePlaybackDecoderError(
                 NativePlaybackDecoderErrorCode.NATIVE_FAILURE,

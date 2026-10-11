@@ -108,8 +108,10 @@ class _CtypesRtpPullBackend:  # pragma: no cover
             raise RuntimeError("reviewed GStreamer runtime is unavailable")
         core.gst_init_check.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
         core.gst_init_check.restype = ctypes.c_int
-        core.gst_parse_launch.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
-        core.gst_parse_launch.restype = ctypes.c_void_p
+        core.gst_parse_launch_full.argtypes = [
+            ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p
+        ]
+        core.gst_parse_launch_full.restype = ctypes.c_void_p
         core.gst_bin_get_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         core.gst_bin_get_by_name.restype = ctypes.c_void_p
         core.gst_element_set_state.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -152,7 +154,7 @@ class _CtypesRtpPullBackend:  # pragma: no cover
             "! queue max-size-buffers=16 max-size-bytes=0 max-size-time=0 leaky=downstream "
             "! appsink name=k5sink sync=false max-buffers=16 drop=true"
         ).encode()
-        pipeline = core.gst_parse_launch(description, None)
+        pipeline = core.gst_parse_launch_full(description, None, 1, None)
         if not pipeline:
             raise RuntimeError("direct RTSP RTP pipeline could not be created")
         self._pipeline = ctypes.c_void_p(pipeline)

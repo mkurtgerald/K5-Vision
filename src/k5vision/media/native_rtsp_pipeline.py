@@ -108,8 +108,10 @@ class NativeRtspPipeline:
             raise NativeRtspPipelineUnavailable("reviewed GStreamer runtime is unavailable")
         core.gst_init_check.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
         core.gst_init_check.restype = ctypes.c_int
-        core.gst_parse_launch.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
-        core.gst_parse_launch.restype = ctypes.c_void_p
+        core.gst_parse_launch_full.argtypes = [
+            ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p
+        ]
+        core.gst_parse_launch_full.restype = ctypes.c_void_p
         core.gst_element_set_state.argtypes = [ctypes.c_void_p, ctypes.c_int]
         core.gst_element_set_state.restype = ctypes.c_int
         core.gst_element_get_state.argtypes = [
@@ -151,7 +153,7 @@ class NativeRtspPipeline:
         core = self._core
         if core is None or not core.gst_init_check(None, None, None):
             raise NativeRtspPipelineError("native GStreamer initialization failed")
-        pipeline = core.gst_parse_launch(description.encode("utf-8"), None)
+        pipeline = core.gst_parse_launch_full(description.encode("utf-8"), None, 1, None)
         if not pipeline:
             raise NativeRtspPipelineError("native GStreamer pipeline could not be created")
         self._pipeline = ctypes.c_void_p(pipeline)

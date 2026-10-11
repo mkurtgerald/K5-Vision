@@ -162,8 +162,10 @@ class _CtypesGStreamerBackend:
     def _bind_signatures(self) -> None:
         self._core.gst_init_check.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
         self._core.gst_init_check.restype = ctypes.c_int
-        self._core.gst_parse_launch.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
-        self._core.gst_parse_launch.restype = ctypes.c_void_p
+        self._core.gst_parse_launch_full.argtypes = [
+            ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p
+        ]
+        self._core.gst_parse_launch_full.restype = ctypes.c_void_p
         self._core.gst_bin_get_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         self._core.gst_bin_get_by_name.restype = ctypes.c_void_p
         self._core.gst_element_set_state.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -220,7 +222,7 @@ class _CtypesGStreamerBackend:
             "! video/x-raw,format=BGRx "
             "! appsink name=k5sink sync=false max-buffers=4 drop=true"
         ).encode("ascii")
-        pipeline = self._core.gst_parse_launch(description, None)
+        pipeline = self._core.gst_parse_launch_full(description, None, 1, None)
         if not pipeline:
             raise NativePlaybackDecoderError(
                 NativePlaybackDecoderErrorCode.NATIVE_FAILURE,
