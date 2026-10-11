@@ -125,7 +125,15 @@ async def _listeners_ready(ports: tuple[int, ...]) -> bool:
         except (OSError, TimeoutError):
             return False
         writer.close()
-        await writer.wait_closed()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), 0.5)
+        except (OSError, TimeoutError):
+            # Connecting has already established listener readiness. Force
+            # transport cleanup if Windows cannot finish an orderly close.
+            try:
+                writer.transport.abort()
+            except (OSError, RuntimeError):
+                pass
     return True
 
 
@@ -140,9 +148,14 @@ async def _eventually(
     while time.monotonic() < deadline:
         assert all(process.poll() is None for process in processes), label + ": worker exited"
         try:
-            result = await condition()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            result = await asyncio.wait_for(condition(), remaining)
             if result:
                 return result
+        except TimeoutError:
+            break
         except MediaWorkerError as error:
             if error.code not in {MediaWorkerErrorCode.UNAVAILABLE, MediaWorkerErrorCode.TIMEOUT}:
                 raise
@@ -189,11 +202,20 @@ def _download(
     ).decode("ascii")
     request = Request(origin + "/get?" + query, headers={"Authorization": "Basic " + token})
     opener = build_opener(ProxyHandler({}), _NoRedirect())
+    deadline = time.monotonic() + 15
     try:
-        with opener.open(request, timeout=15) as response:
+        with opener.open(request, timeout=3) as response:
             assert response.status == 200
             assert response.headers.get_content_type() == "video/mp4"
-            payload = response.read(_MAX_PLAYBACK_BYTES + 1)
+            payload = bytearray()
+            while len(payload) <= _MAX_PLAYBACK_BYTES:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError
+                remaining = _MAX_PLAYBACK_BYTES + 1 - len(payload)
+                chunk = response.read1(min(65_536, remaining))
+                if not chunk:
+                    break
+                payload.extend(chunk)
     except OSError:
         raise AssertionError("Authenticated generated playback download failed") from None
     assert 0 < len(payload) <= _MAX_PLAYBACK_BYTES, "Generated playback exceeded its byte limit"
@@ -237,6 +259,7 @@ def _decoded_frames(ffprobe: Path, video: Path) -> int:
 def test_native_mediamtx_records_reconnects_and_restores_playback(
     tmp_path, record_testsuite_property
 ) -> None:
+    print("Native donor phase: executable version admission", flush=True)
     mediamtx, ffmpeg, ffprobe = (_tool(name) for name in _TOOLS)
     version = subprocess.run(
         [str(mediamtx), "--version"],
@@ -253,6 +276,7 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
     recording_directory = directory / "recordings with spaces"
     recording_directory.mkdir(mode=0o700)
     video = directory / "generated moving fixture.mp4"
+    print("Native donor phase: generate bounded H264 fixture", flush=True)
     generated = subprocess.run(
         [
             str(ffmpeg),
@@ -365,6 +389,7 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
         )
         for listener in reservations:
             listener.close()
+        print("Native donor phase: start owned private workers", flush=True)
         upstream = _start([str(mediamtx), str(upstream_config)], directory)
         processes.append(upstream)
         target_env = {**os.environ, "TZ": "UTC"} if sys.platform == "linux" else None
@@ -404,6 +429,7 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
 
         async def scenario() -> None:
             nonlocal target
+            print("Native donor phase: listener and API readiness", flush=True)
             await _eventually(
                 lambda: _listeners_ready((upstream_port, api_port, playback_port)),
                 label="Private worker listeners",
@@ -421,6 +447,7 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
                 playback_origin + "/list?" + urlencode({"path": binding.path_name})
             )
             receipt["anonymous_api_status"] = receipt["anonymous_playback_status"] = 401
+            print("Native donor phase: unauthorized requests rejected", flush=True)
 
             async def available() -> bool:
                 state = await provider.path_state(binding)
@@ -435,6 +462,7 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
                 return not (await provider.path_state(binding)).available
 
             first = publish()
+            print("Native donor phase: first continuous pull and recording", flush=True)
             await _eventually(
                 available, label="Continuous RTSP pull", processes=(upstream, target, first)
             )
@@ -444,6 +472,7 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
             )
             await asyncio.sleep(5.1)
             second = publish()
+            print("Native donor phase: interrupted source reconnect", flush=True)
             await _eventually(
                 available, label="Automatic RTSP reconnect", processes=(upstream, target, second)
             )
@@ -453,6 +482,9 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
                 unavailable, label="Recording finalization", processes=(upstream, target)
             )
             await asyncio.sleep(0.3)
+            print(
+                "Native donor phase: closed recording inventory and independent decode", flush=True
+            )
             recordings = await provider.recordings(binding)
             spans = await provider.playback_spans(binding)
             assert len(recordings) >= 3
@@ -471,6 +503,7 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
             # Source has ended before termination, including on Windows where
             # Popen.terminate uses TerminateProcess rather than a Unix signal.
             _stop_owned(target)
+            print("Native donor phase: restart and restore recording inventory", flush=True)
             # Exercise process-local timezone changes on Linux. This never
             # changes the Windows OS timezone or claims Windows TZ acceptance.
             restart_env = {**os.environ, "TZ": "Europe/Berlin"} if sys.platform == "linux" else None
@@ -486,6 +519,7 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
             receipt["restart_inventory_preserved"] = True
             receipt["time_zone_restart_regression"] = sys.platform == "linux"
             decoded = []
+            print("Native donor phase: authenticated playback download and decode", flush=True)
             for index, span in enumerate(spans):
                 destination = directory / f"authenticated playback {index}.mp4"
                 await asyncio.to_thread(
@@ -501,6 +535,7 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
         _private_write(directory / "source-free receipt.json", document + "\n")
         record_testsuite_property("native_donor_runtime_receipt", document)
     finally:
+        print("Native donor phase: reap owned fixture processes", flush=True)
         for listener in reservations:
             listener.close()
         cleanup_failures = 0

@@ -122,9 +122,10 @@ jobs:
           "K5_DONOR_FFPROBE=$ffprobeExe" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
 
       - name: Run provider regressions and actual native donor acceptance
+        timeout-minutes: 5
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_mediamtx_provider.py tests/integration/test_mediamtx_donor_runtime.py --no-cov --junitxml=donor-media-native-windows.xml
+          python -m pytest tests/unit/test_mediamtx_provider.py tests/integration/test_mediamtx_donor_runtime.py --no-cov -vv -s -o faulthandler_timeout=60 --junitxml=donor-media-native-windows.xml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify actual Windows receipt
