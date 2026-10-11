@@ -47,9 +47,29 @@ _LAUNCHER_STAGES = frozenset(
         "venv-version",
         "pip-installation",
         "native-workers",
+        "worker-assembly",
+        "tools-admission",
+        "media-manifest",
+        "gateway-manifest",
+        "media-cache",
+        "gateway-cache",
         "identity",
         "recordings",
         "operator",
+    }
+)
+_LAUNCHER_REASONS = frozenset(
+    {
+        "unclassified",
+        "python-operation",
+        "manifest-admission",
+        "artifact-count",
+        "artifact-admission",
+        "cached-identity",
+        "archive-identity",
+        "archive-contents",
+        "extracted-identity",
+        "license-identity",
     }
 )
 
@@ -129,6 +149,7 @@ def _digest(path: Path) -> str:
 def _launcher_failure(runtime: Path, name: str) -> str:
     __tracebackhide__ = True
     detail = "unavailable"
+    reason = "unclassified"
     try:
         path = runtime / name
         identity_state._regular_file(path)
@@ -141,13 +162,21 @@ def _launcher_failure(runtime: Path, name: str) -> str:
                 and document.get("schema_version") == "1"
                 and document.get("result") == "failed"
                 and document.get("stage") in _LAUNCHER_STAGES
+                and document.get("reason") in _LAUNCHER_REASONS
                 and type(document.get("exit_code")) is int
                 and -(2**31) <= document["exit_code"] < 2**31
             ):
                 detail = document["stage"]
+                reason = document["reason"]
     except Exception:
         pass
-    return "PowerShell launcher exited before readiness (fixed stage: " + detail + ")"
+    return (
+        "PowerShell launcher exited before readiness (fixed stage: "
+        + detail
+        + "; fixed reason: "
+        + reason
+        + ")"
+    )
 
 
 def _cache_worker(runtime: Path, wheel: Path, name: str, supplied: Path) -> None:

@@ -108,7 +108,7 @@ class _Harness:
 
 
 @pytest.fixture
-def product(tmp_path, monkeypatch):
+def product(tmp_path, monkeypatch, request):
     # Managed execution presents the two system ancestors as nobody-owned;
     # retain actual ownership and privacy checks for every fixture component.
     if os.name == "posix":
@@ -139,8 +139,9 @@ def product(tmp_path, monkeypatch):
     app.state.device_registry = registry
     app.state.user_registry = users
     app.state.user_session_manager = sessions
-    install_operator_product_api(app, cameras=cameras, service=service, public_port=8080)
-    with TestClient(app, base_url="http://127.0.0.1:8080") as client:
+    public_port = getattr(request, "param", 8080)
+    install_operator_product_api(app, cameras=cameras, service=service, public_port=public_port)
+    with TestClient(app, base_url=f"http://127.0.0.1:{public_port}") as client:
         yield _Harness(client, app, cameras, service, registry, users, sessions, admin, token)
     cameras.close()
     registry.close()
@@ -278,6 +279,24 @@ def test_logout_can_clear_revoked_media_cookie_but_cross_origin_cannot(product):
         headers=product.media_headers(f"/media/live/{path}/index.m3u8"),
     )
     assert denied.status_code == 401
+
+
+@pytest.mark.parametrize("product,scheme", [(80, "http"), (443, "https")], indirect=["product"])
+def test_media_session_accepts_omitted_default_origin_port_with_human_auth(product, scheme):
+    device_id = product.enroll()
+    route = f"/api/v1/operator/cameras/{device_id}/media-session"
+    origin = f"{scheme}://127.0.0.1"
+    denied = product.client.post(route, headers={"Origin": origin})
+    assert denied.status_code == 401
+    issued = product.client.post(route, headers={**product.headers, "Origin": origin})
+    assert issued.status_code == 200
+    assert "HttpOnly" in issued.headers["set-cookie"]
+    for port in (0, 8080):
+        wrong_port = product.client.post(
+            route, headers={**product.headers, "Origin": origin + f":{port}"}
+        )
+        assert wrong_port.status_code == 403
+        assert "set-cookie" not in wrong_port.headers
 
 
 def test_logout_revokes_cookie_and_durable_disable_and_role_changes_take_effect(product):

@@ -21,15 +21,22 @@ $script:diagnosticReady = $false
 $script:diagnosticPath = $null
 
 function Write-K5LauncherDiagnostic {
-    param([int]$ExitCode)
+    param([int]$ExitCode, [string]$Reason = 'unclassified')
     if (-not $script:diagnosticReady) { return }
     $stages = @('platform', 'python', 'private-state', 'runtime-installation',
         'venv-admission', 'venv-creation', 'venv-file', 'venv-version',
-        'pip-installation', 'native-workers', 'identity', 'recordings', 'operator')
+        'pip-installation', 'native-workers', 'worker-assembly', 'tools-admission',
+        'media-manifest', 'gateway-manifest', 'media-cache', 'gateway-cache',
+        'identity', 'recordings', 'operator')
     if ($stage -cnotin $stages) { return }
+    $reasons = @('unclassified', 'python-operation', 'manifest-admission',
+        'artifact-count', 'artifact-admission', 'cached-identity', 'archive-identity',
+        'archive-contents', 'extracted-identity', 'license-identity')
+    if ($Reason -cnotin $reasons) { $Reason = 'unclassified' }
     $stream = $null
     try {
-        $document = @{ schema_version = '1'; result = 'failed'; stage = $stage; exit_code = $ExitCode }
+        $document = @{ schema_version = '1'; result = 'failed'; stage = $stage;
+            reason = $Reason; exit_code = $ExitCode }
         $bytes = [Text.Encoding]::UTF8.GetBytes(($document | ConvertTo-Json -Compress))
         # The basename is fixed grammar and its admitted private parent already
         # exists. Create-new never follows or replaces an existing diagnostic.
@@ -291,12 +298,18 @@ if runtime.is_relative_to(project) or project.is_relative_to(runtime): raise Val
     $null = Invoke-K5PythonText -Python $python -Arguments @('-I', '-B', '-m', 'pip', 'install', '--no-input', '--disable-pip-version-check', '--quiet', '--upgrade', $PackagePath)
     $stage = 'native-workers'
     Write-Host 'Preparing verified native Windows media workers...'
+    $stage = 'worker-assembly'
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $tools = Join-Path $RuntimeRoot 'tools'
+    $stage = 'tools-admission'
     Assert-K5PrivateDirectory -Python $python -Helper $helper -Path $tools
+    $stage = 'media-manifest'
     $mediaManifest = Get-K5InstalledManifest -Python $python -Name 'mediamtx-donor-manifest.json'
+    $stage = 'gateway-manifest'
     $gatewayManifest = Get-K5InstalledManifest -Python $python -Name 'caddy-donor-manifest.json'
+    $stage = 'media-cache'
     $media = Get-K5PinnedTool -Python $python -Helper $helper -ToolsRoot $tools -Manifest $mediaManifest -Component 'MediaMTX' -Repository 'bluenviron/mediamtx' -Executable 'mediamtx.exe'
+    $stage = 'gateway-cache'
     $gateway = Get-K5PinnedTool -Python $python -Helper $helper -ToolsRoot $tools -Manifest $gatewayManifest -Component 'Caddy' -Repository 'caddyserver/caddy' -Executable 'caddy.exe'
     $stage = 'identity'
     $identity = Join-Path $StateRoot 'identity'
@@ -318,9 +331,23 @@ if runtime.is_relative_to(project) or project.is_relative_to(runtime): raise Val
     if ($result -ne 0) { Write-K5LauncherDiagnostic -ExitCode $result }
 } catch {
     # Never echo Python, pip, configuration or raw source errors into the owner flow.
+    # Only exact messages thrown by our own helpers map to public finite codes.
+    # Native, library and unrecognized exception text is discarded.
+    $reason = switch -CaseSensitive -Exact ($_.Exception.Message) {
+        'K5 Python operation failed.' { 'python-operation' }
+        'Native tool manifest admission failed.' { 'manifest-admission' }
+        'Exactly one Windows artifact required.' { 'artifact-count' }
+        'Native tool artifact admission failed.' { 'artifact-admission' }
+        'Cached native tool identity mismatch.' { 'cached-identity' }
+        'Native archive identity mismatch.' { 'archive-identity' }
+        'Native archive contents refused.' { 'archive-contents' }
+        'Extracted native tool identity mismatch.' { 'extracted-identity' }
+        'Existing native license identity mismatch.' { 'license-identity' }
+        default { 'unclassified' }
+    }
     Write-Host ('K5 operator launch failed at ' + $stage + '. Existing identity and recordings were preserved.')
     $result = 1
-    Write-K5LauncherDiagnostic -ExitCode $result
+    Write-K5LauncherDiagnostic -ExitCode $result -Reason $reason
 } finally {
     if ($null -ne $launcherLock) { $launcherLock.Dispose() }
 }

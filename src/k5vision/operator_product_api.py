@@ -277,10 +277,13 @@ def install_operator_product_api(
             origin = urlsplit(values[0])
             host = origin.hostname
             loopback = host == "localhost" or ipaddress.ip_address(host or "").is_loopback
+            origin_port = origin.port
+            if origin_port is None:
+                origin_port = 80 if origin.scheme == "http" else 443
             valid = (
                 origin.scheme in {"http", "https"}
                 and loopback
-                and origin.port == public_port
+                and origin_port == public_port
                 and not origin.username
                 and not origin.password
                 and not origin.path
