@@ -1,0 +1,333 @@
+"""Protected, site-owned camera sources for the installed operator product.
+
+Canonical device metadata remains in DeviceRegistry. Recoverable camera source
+credentials live only in this separate private store beneath an admitted identity
+directory. No source URI is included in diagnostic messages or representations.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import threading
+import weakref
+from pathlib import Path
+from uuid import UUID
+
+from k5vision import identity_state
+from k5vision.domain.devices import Device
+from k5vision.media.mediamtx_config import MediaMTXSource
+from k5vision.media.mediamtx_provider import MediaMTXBinding
+from k5vision.services.device_registry import DeviceRegistry
+
+MAX_OPERATOR_CAMERAS = 64
+_DATABASE = "operator-cameras.sqlite3"
+_MAX_DEVICE_JSON_BYTES = 32_768
+_STORE_LOCKS_GUARD = threading.Lock()
+_STORE_LOCKS: weakref.WeakValueDictionary[tuple[int, int, str], threading.RLock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+class OperatorCameraStoreError(RuntimeError):
+    """Private source state is absent, inconsistent or unavailable."""
+
+
+class OperatorCameraCapacityError(OperatorCameraStoreError):
+    """The bounded private source store cannot accept another camera."""
+
+
+def _device_json(device: Device) -> str:
+    value = device.model_dump(mode="json")
+    value["protocols"] = sorted(value["protocols"])
+    value["tags"] = sorted(value["tags"])
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _store_lock(root_identity: os.stat_result, site_id: str) -> threading.RLock:
+    """Serialize custody checks and SQLite writes for an admitted in-process store.
+
+    SQLite deletes its volatile journal during COMMIT. An independent admission
+    probe must not overlap another store instance's journal lifecycle. The product
+    profile lease separately excludes another product process; SQLite retains its
+    transaction locks as well. Weak values retain no unused installation inventory.
+    """
+    key = (root_identity.st_dev, root_identity.st_ino, site_id)
+    with _STORE_LOCKS_GUARD:
+        lock = _STORE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _STORE_LOCKS[key] = lock
+        return lock
+
+
+class OperatorCameraStore:
+    """Persist at most 64 private sources with atomic SQLite transactions.
+
+    The root must already contain a complete identity installation. Passing the
+    application's existing registry additionally checks that every stored source
+    still belongs to an enrolled device; this class never creates a device registry.
+    Existing corrupt/partial databases are refused rather than repaired or reset.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        site_id: str,
+        *,
+        registry: DeviceRegistry | None = None,
+    ) -> None:
+        self._connection: sqlite3.Connection | None = None
+        self._closed = False
+        self._registry = registry
+        failed = False
+        connection = None
+        try:
+            if not isinstance(root, Path):
+                raise ValueError
+            state = identity_state.load_identity_state(root)
+            if state.site_id != site_id:
+                raise ValueError
+            if registry is not None and (
+                not isinstance(registry, DeviceRegistry) or registry.site_id != site_id
+            ):
+                raise ValueError
+            self._root = state.directory
+            self._site_id = state.site_id
+            self._root_identity = self._root.lstat()
+            self._lock = _store_lock(self._root_identity, self._site_id)
+            self._database = self._root / _DATABASE
+            with self._lock:
+                self._admit_root()
+                created = False
+                try:
+                    descriptor = os.open(
+                        self._database,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                    )
+                except FileExistsError:
+                    pass
+                else:
+                    os.close(descriptor)
+                    created = True
+                self._database_identity = self._private_file(self._database)
+                self._admit_files()
+                connection = sqlite3.connect(
+                    self._database.as_uri() + "?mode=rw",
+                    uri=True,
+                    timeout=3.0,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA synchronous = FULL")
+                if created:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        "CREATE TABLE source_state "
+                        "(schema_version INTEGER NOT NULL, site_id TEXT NOT NULL)"
+                    )
+                    connection.execute("INSERT INTO source_state VALUES (?, ?)", (1, self._site_id))
+                    connection.execute(
+                        """CREATE TABLE camera_sources (
+                            device_id TEXT PRIMARY KEY,
+                            device_json TEXT NOT NULL,
+                            source_uri TEXT NOT NULL
+                        )"""
+                    )
+                    connection.execute("COMMIT")
+                self._admit_files()
+                self._read_sources(connection)
+                self._connection = connection
+        except Exception:
+            failed = True
+            if connection is not None:
+                with self._lock:
+                    connection.close()
+        if failed:
+            self._closed = True
+            raise OperatorCameraStoreError("Private camera state admission failed")
+
+    @staticmethod
+    def _private_file(path: Path) -> os.stat_result:
+        info = identity_state._regular_file(path)
+        if os.name == "posix" and (info.st_uid != os.geteuid() or info.st_mode & 0o077):
+            raise identity_state.IdentityStateError("Camera state file must be private")
+        return info
+
+    def _admit_root(self) -> None:
+        identity_state._same_directory(self._root, self._root_identity)
+        state = identity_state.load_identity_state(self._root)
+        if state.site_id != self._site_id:
+            raise identity_state.IdentityStateError("Camera state belongs to a different site")
+
+    def _admit_files(self) -> None:
+        current = self._private_file(self._database)
+        if (current.st_dev, current.st_ino) != (
+            self._database_identity.st_dev,
+            self._database_identity.st_ino,
+        ):
+            raise identity_state.IdentityStateError("Camera state changed during use")
+        for suffix in ("-journal", "-wal", "-shm"):
+            sidecar = Path(str(self._database) + suffix)
+            try:
+                sidecar.lstat()
+            except FileNotFoundError:
+                continue
+            self._private_file(sidecar)
+
+    def _admit(self) -> sqlite3.Connection:
+        failed = False
+        try:
+            if self._closed or self._connection is None:
+                raise ValueError
+            self._admit_root()
+            self._admit_files()
+        except Exception:
+            failed = True
+        if failed:
+            raise OperatorCameraStoreError("Private camera state is unavailable")
+        return self._connection
+
+    def _source(self, device: Device, source_uri: str) -> MediaMTXSource:
+        failed = False
+        try:
+            if not isinstance(device, Device):
+                raise ValueError
+            # Device models are mutable; store and return an independent copy.
+            admitted = Device.model_validate(device.model_dump(mode="json"))
+            source = MediaMTXSource(
+                MediaMTXBinding(self._site_id, admitted.id), admitted, source_uri
+            )
+            if len(_device_json(admitted).encode("utf-8")) > _MAX_DEVICE_JSON_BYTES:
+                raise ValueError
+            if self._registry is not None:
+                enrolled = self._registry.get(admitted.id)
+                if enrolled is None or enrolled.model_dump() != admitted.model_dump():
+                    raise ValueError
+        except Exception:
+            failed = True
+        if failed:
+            raise OperatorCameraStoreError("Camera source selection is invalid")
+        return source
+
+    def _read_sources(self, connection: sqlite3.Connection) -> tuple[MediaMTXSource, ...]:
+        failed = False
+        try:
+            states = connection.execute("SELECT * FROM source_state LIMIT 2").fetchall()
+            if (
+                len(states) != 1
+                or type(states[0]["schema_version"]) is not int
+                or states[0]["schema_version"] != 1
+                or states[0]["site_id"] != self._site_id
+            ):
+                raise ValueError
+            rows = connection.execute(
+                "SELECT * FROM camera_sources ORDER BY device_id LIMIT ?",
+                (MAX_OPERATOR_CAMERAS + 1,),
+            ).fetchall()
+            if len(rows) > MAX_OPERATOR_CAMERAS:
+                raise ValueError
+            sources = []
+            for row in rows:
+                device_json = row["device_json"]
+                if (
+                    not isinstance(device_json, str)
+                    or len(device_json.encode("utf-8")) > _MAX_DEVICE_JSON_BYTES
+                ):
+                    raise ValueError
+                value = json.loads(device_json, object_pairs_hook=identity_state._unique_object)
+                device = Device.model_validate(value)
+                if str(device.id) != row["device_id"]:
+                    raise ValueError
+                sources.append(self._source(device, row["source_uri"]))
+            result = tuple(sources)
+        except Exception:
+            failed = True
+        if failed:
+            raise OperatorCameraStoreError("Private camera source state is invalid")
+        return result
+
+    def list_sources(self) -> tuple[MediaMTXSource, ...]:
+        """Return admitted execution sources only to the private application runtime."""
+        with self._lock:
+            return self._read_sources(self._admit())
+
+    def get(self, device_id: UUID) -> MediaMTXSource | None:
+        """Select one private source by its enrolled UUID."""
+        if not isinstance(device_id, UUID):
+            raise OperatorCameraStoreError("Camera selection is invalid")
+        return next(
+            (source for source in self.list_sources() if source.binding.device_id == device_id),
+            None,
+        )
+
+    @staticmethod
+    def _rollback(connection: sqlite3.Connection) -> None:
+        try:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
+    def upsert(self, device: Device, source_uri: str) -> MediaMTXSource:
+        """Atomically create or replace one admitted camera's private source."""
+        failure = None
+        with self._lock:
+            connection = self._admit()
+            source = self._source(device, source_uri)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                existing = self._read_sources(connection)
+                if (
+                    source.binding.device_id not in {item.binding.device_id for item in existing}
+                    and len(existing) >= MAX_OPERATOR_CAMERAS
+                ):
+                    raise OperatorCameraCapacityError
+                connection.execute(
+                    """INSERT INTO camera_sources (device_id, device_json, source_uri)
+                        VALUES (?, ?, ?) ON CONFLICT(device_id) DO UPDATE
+                        SET device_json = excluded.device_json, source_uri = excluded.source_uri""",
+                    (str(source.device.id), _device_json(source.device), source.source_uri),
+                )
+                connection.execute("COMMIT")
+            except OperatorCameraCapacityError:
+                failure = OperatorCameraCapacityError
+                self._rollback(connection)
+            except Exception:
+                failure = OperatorCameraStoreError
+                self._rollback(connection)
+        if failure is not None:
+            raise failure("Private camera update failed")
+        return source
+
+    def remove(self, device_id: UUID) -> None:
+        """Remove one source transactionally; absence is an idempotent success."""
+        if not isinstance(device_id, UUID):
+            raise OperatorCameraStoreError("Camera selection is invalid")
+        failed = False
+        with self._lock:
+            connection = self._admit()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._read_sources(connection)
+                connection.execute(
+                    "DELETE FROM camera_sources WHERE device_id = ?", (str(device_id),)
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                failed = True
+                self._rollback(connection)
+        if failed:
+            raise OperatorCameraStoreError("Private camera removal failed")
+
+    def close(self) -> None:
+        """Close the owned handle without deleting persistent configuration."""
+        with self._lock:
+            connection = self._connection
+            self._connection = None
+            self._closed = True
+            if connection is not None:
+                connection.close()

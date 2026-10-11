@@ -1,0 +1,41 @@
+{
+  "schema_version": "1",
+  "component": "Caddy",
+  "version": "v2.11.7",
+  "source": "https://github.com/caddyserver/caddy",
+  "source_commit": "72dd0fb067f6d7826c7f79907670ba4a713bfe37",
+  "license": "Apache-2.0",
+  "license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+  "bundled": false,
+  "checksums": {
+    "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_checksums.txt",
+    "algorithm": "sha512",
+    "sha256": "5d27b76b95f496638d79208c55250317b8755fd9e90005f7466aa32956944a90"
+  },
+  "artifacts": [
+    {
+      "platform": "windows_amd64",
+      "use": "native-target-pilot",
+      "filename": "caddy_2.11.7_windows_amd64.zip",
+      "sha256": "0a1edc0b799512051c57071ce0e798d3f2cf67dc98171366f1d2b326072e3b06",
+      "sha512": "c308154504e53755958ffc62d8a2657ab17eefd6dd25c45dbb2c3d93d29519971f77ca652f7d0f2bcb7f980b9ba3822478865e29969d0272d7613550a43152b1",
+      "size_bytes": 18479498,
+      "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_windows_amd64.zip",
+      "executable": "caddy.exe",
+      "executable_sha256": "5f93a9bd555f3aac9d33af2756ba14b3519d8cca4ffd55256bdaeab444c9db2a",
+      "executable_bytes": 53159936
+    },
+    {
+      "platform": "linux_amd64",
+      "use": "portable-regression-only",
+      "filename": "caddy_2.11.7_linux_amd64.tar.gz",
+      "sha256": "727b91701a392de6ebc5027509f548bf39979e5216340d0faed8fa5e69c84f8b",
+      "sha512": "a7a433a1b133efc3c8d10eb0b99d52a24b5ef5c322dc77f5282182b1c0402139ab83f3a99f0c52409df77d20123fb0b523edad8a66d8f5e49136197bf61ef0e7",
+      "size_bytes": 18113754,
+      "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_amd64.tar.gz",
+      "executable": "caddy",
+      "executable_sha256": "678ade3bfc088749c81a681adc603333ee0bb023b6a6cfe3c0f58bef8ff854e9",
+      "executable_bytes": 51953826
+    }
+  ]
+}

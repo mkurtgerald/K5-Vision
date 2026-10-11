@@ -100,6 +100,7 @@ def generate_mediamtx_configuration(
     segment_seconds: int = 60,
     retention_seconds: int = 86_400,
     max_readers: int = 16,
+    allow_empty: bool = False,
 ) -> str:
     """Return deterministic private config, with no anonymous or wildcard paths.
 
@@ -122,7 +123,8 @@ def generate_mediamtx_configuration(
         or not segment_seconds <= retention_seconds <= 30 * 24 * 60 * 60
         or type(max_readers) is not int
         or not 1 <= max_readers <= 64
-        or not 1 <= len(sources) <= 64
+        or type(allow_empty) is not bool
+        or not (0 if allow_empty else 1) <= len(sources) <= 64
     ):
         raise ValueError("media recording and capacity bounds are invalid")
     recording_path = _recording_directory(recording_directory)

@@ -21,6 +21,22 @@ K5 Vision uses a reviewed external GStreamer runtime surface for RTSP/RTP media 
 
 K5 Vision depends on psutil for cross-platform process resource observation and bounded process cleanup. psutil is distributed under the BSD-3-Clause license and remains copyright its upstream authors and contributors. Preserve the applicable upstream license and copyright notice when redistributing the dependency. The Stage 03 review record is maintained in `docs/STAGE_03_DEPENDENCY_REVIEW.md`.
 
+### Caddy native operator media gateway pilot
+
+The per-user native Windows pilot downloads the official Caddy `v2.11.7`
+executable from `caddyserver/caddy`, source commit
+`72dd0fb067f6d7826c7f79907670ba4a713bfe37`. Caddy is copyright 2015 Matthew
+Holt and The Caddy Authors and distributed under Apache-2.0. Its complete
+unchanged license is preserved at `third_party/licenses/Caddy-Apache-2.0.txt`.
+
+Caddy implementation source and executables are not bundled by this change.
+Preserve applicable upstream/module notices before redistributing a binary;
+official target SBOMs are available with the release. K5's surrounding source
+license does not restrict the rights granted by Apache-2.0. Download checksums,
+executable identities and provenance are in
+`src/k5vision/data/caddy-donor-manifest.json`. Native product qualification and
+commercial binary redistribution review remain separate from this pilot.
+
 ### MediaMTX continuous-media worker evaluation
 
 The opt-in media adapter evaluates MediaMTX `v1.21.2` from
