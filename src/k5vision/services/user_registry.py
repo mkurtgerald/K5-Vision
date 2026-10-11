@@ -92,6 +92,27 @@ class UserRegistry:
         self._connection: sqlite3.Connection | None = None
         self._open()
 
+    @property
+    def site_id(self) -> str:
+        """The immutable authority scope used by every account lookup."""
+        return self._site_id
+
+    def get(self, user_id: UUID) -> UserAccount | None:
+        """Read current authority-bearing metadata within this registry's site."""
+        with self._lock:
+            connection = self._require_connection()
+            try:
+                row = connection.execute(
+                    """
+                    SELECT id, username, display_name, role, enabled
+                    FROM users WHERE site_id = ? AND id = ?
+                    """,
+                    (self._site_id, str(user_id)),
+                ).fetchone()
+            except sqlite3.Error:
+                raise UserRegistryStorageError("user registry read failed") from None
+        return None if row is None else self._decode_user(row)
+
     def _open(self) -> None:
         connection: sqlite3.Connection | None = None
         try:
