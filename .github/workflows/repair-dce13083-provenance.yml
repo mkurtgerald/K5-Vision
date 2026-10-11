@@ -32,15 +32,15 @@ jobs:
           import subprocess
           import urllib.request
 
-          # One fixed reviewed source, not an automatic future-runtime admission.
-          # Creates Git objects only. Branch advancement remains a separate guarded
-          # owner-authorized connector action after the complete diff is inspected.
+          # One immutable reviewed source, never automatic future-runtime admission.
+          # The fingerprint is derived from verified Git bytes, not a copied log.
+          # No branch is updated here: the resulting diff requires separate review.
           REPO = 'mkurtgerald/K5-Vision'
           BRANCH = 'fix/transactional-alpha-upgrade-20261003'
           SOURCE = 'dce130837c79388d24cd1abbd26aa2054c3ccb82'
+          PREPARATION = '6441462c417fa9cabeaf005db5cd8ae9e289b876'
           OLD_REVISION = '70b24135a085c8bb1dca23253a3c25fef9e18164'
           OLD_DIGEST = '826ffb22491b3052d22670f7c60fae22811b7d92f0ab0f1d5fab89ac49b19087'
-          DIGEST = '36a5aaffc1a8863fadce74b8ddca606763a4d67d6f7c8dc34387d9511f338729c'
           SELF = '.github/workflows/repair-dce13083-provenance.yml'
           assert os.environ['GITHUB_REPOSITORY'] == REPO
           assert os.environ['GITHUB_REF'] == 'refs/heads/' + BRANCH
@@ -63,7 +63,9 @@ jobs:
               assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == oid.decode()
               manifest[name.decode().removeprefix('src/')] = hashlib.sha256(data).hexdigest()
           assert len(manifest) == 138
-          assert hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest() == DIGEST
+          digest = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+          print('K5_REPAIR_VERIFIED_SOURCE=' + SOURCE)
+          print('K5_REPAIR_VERIFIED_PAYLOAD_SHA256=' + digest)
           def api(path, body=None):
               assert path.startswith(('/git/', '/commits/'))
               request = urllib.request.Request(
@@ -78,38 +80,38 @@ jobs:
                   return json.load(response)
           assert api('/git/ref/heads/' + BRANCH)['object']['sha'] == parent
           parent_info = api('/git/commits/' + parent)
-          assert [item['sha'] for item in parent_info['parents']] == [SOURCE]
-          expected = {
-              'scripts/capture_installer_wheel_provenance.py': '8d64007b106f88c26a1e7f06f94bd6225d26a61c',
-              'tests/test_capture_installer_wheel_provenance.py': '34e3825ec8457e0408ba91e080a50fe0d766b47d',
-              'tests/unit/test_reviewed_h264_selection.py': '7b15c7b7f943e780c44ec7800e4e057e8d2031a5',
-          }
+          assert [item['sha'] for item in parent_info['parents']] == [PREPARATION]
+          assert [item['sha'] for item in api('/git/commits/' + PREPARATION)['parents']] == [SOURCE]
+          paths = (
+              'scripts/capture_installer_wheel_provenance.py',
+              'tests/test_capture_installer_wheel_provenance.py',
+              'tests/unit/test_reviewed_h264_selection.py',
+          )
           contents = {}
-          for path, oid in expected.items():
-              raw = read_git('show', SOURCE + ':' + path)
+          for path in paths:
+              oid = read_git('rev-parse', SOURCE + ':' + path).decode().strip()
+              raw = read_git('cat-file', 'blob', oid)
               assert hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest() == oid
               contents[path] = raw.decode('utf-8')
           def replace_once(path, old, new):
-              assert contents[path].count(old) == 1, 'Reviewed replacement context changed'
+              assert contents[path].count(old) == 1, 'Reviewed replacement context changed: ' + path
               contents[path] = contents[path].replace(old, new)
-          capture = 'scripts/capture_installer_wheel_provenance.py'
-          test = 'tests/test_capture_installer_wheel_provenance.py'
+          capture, test, formatting = paths
           replace_once(capture, 'RUNTIME_REVISION = "' + OLD_REVISION + '"', 'RUNTIME_REVISION = "' + SOURCE + '"')
-          replace_once(capture, 'RUNTIME_PAYLOAD_SHA256 = "' + OLD_DIGEST + '"', 'RUNTIME_PAYLOAD_SHA256 = "' + DIGEST + '"')
+          replace_once(capture, 'RUNTIME_PAYLOAD_SHA256 = "' + OLD_DIGEST + '"', 'RUNTIME_PAYLOAD_SHA256 = "' + digest + '"')
           replace_once(capture, '# Re-attested from the 137 exact tracked src/k5vision blobs at 70b24135.', '# Re-attested from the 138 exact tracked src/k5vision blobs at dce13083.')
           replace_once(capture, 'diagnostics.enter("runtime_payload", expected=137, observed=len(payload_hashes))', 'diagnostics.enter("runtime_payload", expected=138, observed=len(payload_hashes))')
           replace_once(test, 'assert len(manifest) == 137', 'assert len(manifest) == 138')
           replace_once(test, 'assert capture.RUNTIME_REVISION == "' + OLD_REVISION + '"', 'assert capture.RUNTIME_REVISION == "' + SOURCE + '"')
           replace_once(test, '        "media/analytics_detection_adapter.py",', '        "media/analytics_detection_adapter.py",\n        "media/reviewed_h264_selection.py",')
           replace_once(test, '    "previous_payload",\n    [', '    "previous_payload",\n    [\n        "' + OLD_DIGEST + '",')
-          formatting = 'tests/unit/test_reviewed_h264_selection.py'
           replace_once(formatting,
               '    assert capsys.readouterr().out == (\n        "K5 decoder selected: reviewed-software-h264 (engineering build)\\n"\n    )',
               '    assert capsys.readouterr().out == "K5 decoder selected: reviewed-software-h264 (engineering build)\\n"')
           for path, content in contents.items():
               compile(content, path, 'exec')
-          # Remove this one-shot editor in its own resulting commit. No recurring
-          # writer, new execution lane or permanent write-enabled workflow remains.
+          # Remove this temporary editor in its own resulting commit.
+          # No recurring writer or permanent write-enabled workflow remains.
           edits = [{'path': path, 'mode': '100644', 'type': 'blob', 'content': content}
                    for path, content in contents.items()]
           edits.append({'path': SELF, 'mode': '100644', 'type': 'blob', 'sha': None})
@@ -119,7 +121,7 @@ jobs:
           assert api('/git/ref/heads/' + BRANCH)['object']['sha'] == parent
           print('K5_REPAIR_SOURCE=' + SOURCE)
           print('K5_REPAIR_RUNTIME_FILES=138')
-          print('K5_REPAIR_RUNTIME_SHA256=' + DIGEST)
+          print('K5_REPAIR_RUNTIME_SHA256=' + digest)
           print('K5_REPAIR_DETACHED_COMMIT=' + commit['sha'])
           print('K5_REPAIR_BRANCH_UPDATED=0')
           print('K5_REPAIR_PRODUCT_ACCEPTANCE=not_proven')
