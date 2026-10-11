@@ -14,6 +14,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Acquire and install byte-bound existing engineering setup
+        id: install
         shell: powershell
         timeout-minutes: 24
         env:
@@ -21,32 +22,44 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
+          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted') { throw 'Isolated hosted runner required.' }
           $headers = @{ Authorization = "Bearer $env:GH_READ_TOKEN"; Accept = 'application/vnd.github+json' }
           $zip = Join-Path $env:RUNNER_TEMP 'diag-setup.zip'
-          Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Headers $headers -Uri 'https://api.github.com/repos/mkurtgerald/K5-Vision/actions/artifacts/11683221888/zip' -OutFile $zip
-          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne '4bfd043b2e7694e52a942712b7f25c41e49f20b2e0250cecebc7c476d8ce04ab') { throw 'Artifact identity mismatch.' }
+          Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Headers $headers -Uri 'https://api.github.com/repos/mkurtgerald/K5-Vision/actions/artifacts/11702177807/zip' -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'ca581625d82ce0abebd23f632702a4002f0a05dea813bf76579b5affbbcb607e') { throw 'Artifact identity mismatch.' }
           $directory = Join-Path $env:RUNNER_TEMP 'diag-setup'
           Expand-Archive -LiteralPath $zip -DestinationPath $directory
-          $setup = Join-Path $directory 'K5VisionAlpha-Setup-887051738890ca2c0e34431bd707fe302654747e.exe'
-          if ((Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant() -cne '5d78b0e464fee40f482fed97ce31c66f4df457b87f023cd3bcaf5ec06d9c19fb') { throw 'Executable identity mismatch.' }
+          $setup = Join-Path $directory 'K5VisionAlpha-Setup-70b24135a085c8bb1dca23253a3c25fef9e18164.exe'
+          if ((Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant() -cne '78a677e6ee31734999e1d8a402ac6129cf66d59976890e017de89b71536553b0') { throw 'Executable identity mismatch.' }
           $root = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha'
           if (Test-Path -LiteralPath $root) { throw 'Fresh isolated installation required.' }
+          # Cleanup is permitted only after this run admitted an absent install root.
+          'owned_install=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
           $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait
           if ($p.ExitCode -ne 0) { throw 'Exact setup installation failed.' }
           Write-Host 'K5_RUNTIME_DIAG_INSTALL=passed'
       - name: Diagnose exact installed launcher and decoder with source-free projection
-        shell: python
+        shell: powershell
         timeout-minutes: 4
         run: |
+          $ErrorActionPreference = 'Stop'
+          # Use the installer-owned interpreter, not PATH or the Windows Store alias.
+          $python = Join-Path $env:LOCALAPPDATA 'K5VisionAlpha\python312\python.exe'
+          if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'Packaged diagnostic interpreter missing.' }
+          $diagnostic = @'
           import base64
           import os
           import pathlib
           import re
           import subprocess
+          import sys
           import threading
           root = pathlib.Path(os.environ['LOCALAPPDATA']) / 'K5VisionAlpha'
-          assert (root / 'k5-revision.txt').read_text().strip() == '887051738890ca2c0e34431bd707fe302654747e'
+          assert (root / 'k5-revision.txt').read_text().strip() == '70b24135a085c8bb1dca23253a3c25fef9e18164'
           assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert pathlib.Path(sys.executable).resolve() == (root / 'python312/python.exe').resolve()
+          assert sys.flags.isolated == 1 and sys.version_info[:3] == (3, 12, 10)
+          print('K5_RUNTIME_DIAG_PYTHON=packaged')
           def capture(arguments, timeout, environment):
               process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=environment, creationflags=subprocess.CREATE_NO_WINDOW)
               buffers = [bytearray(), bytearray()]
@@ -113,10 +126,13 @@ jobs:
                   print(line)
           print('K5_RUNTIME_DIAG_WRAPPER_EXIT=' + str(code))
           print('K5_OWNER_PUBLIC_ACCEPTANCE=not_proven')
-          if code != 0 or 'K5_RUNTIME_DIAG_LAUNCH=' not in output:
+          if code != 0 or 'K5_RUNTIME_DIAG_LAUNCH=passed' not in output.splitlines():
               raise SystemExit(1)
+          '@
+          $diagnostic | & $python -I -B -
+          if ($LASTEXITCODE -ne 0) { throw 'Installed runtime diagnosis did not pass; see fixed diagnostic codes.' }
       - name: Remove only owned installed application
-        if: always()
+        if: always() && steps.install.outputs.owned_install == 'true'
         shell: powershell
         timeout-minutes: 2
         run: |
