@@ -147,11 +147,13 @@ internal static class OwnerModeProbe
                 if ((string)failure.Invoke(null, new object[] { chosen, line }) != chosen)
                     return 18;
             }
-            if ((string)failure.Invoke(null, new object[] { "initial", "unknown private-fixture-marker" })
-                != "initial") return 19;
-            string reset = (string)failure.Invoke(null, new object[] { "new test", "health failed" });
+            if ((string)failure.Invoke(null, new object[] {
+                "initial", "unknown private-fixture-marker" }) != "initial") return 19;
+            string reset = (string)failure.Invoke(null, new object[] {
+                "new test", "health failed" });
             if (reset == chosen || !reset.Contains("health")) return 20;
-            string named = (string)failure.Invoke(null, new object[] { "initial", "d3d11h264dec unavailable" });
+            string named = (string)failure.Invoke(null, new object[] {
+                "initial", "d3d11h264dec unavailable" });
             if (named != chosen) return 21;
             Console.WriteLine("K5_OWNER_ANALYTICS_MODE_CONTRACT=passed");
             return 0;
