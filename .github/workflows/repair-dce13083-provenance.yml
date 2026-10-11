@@ -1,0 +1,125 @@
+name: Exact decoder provenance repair
+on:
+  push:
+    branches: [fix/transactional-alpha-upgrade-20261003]
+    paths: [.github/workflows/repair-dce13083-provenance.yml]
+permissions:
+  contents: read
+jobs:
+  prepare-reviewed-repair:
+    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: dce130837c79388d24cd1abbd26aa2054c3ccb82
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12.10'
+      - name: Verify fixed reviewed source and prepare detached repair commit only
+        shell: python
+        env:
+          REPAIR_TOKEN: ${{ github.token }}
+        run: |
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+
+          # One fixed reviewed source, not an automatic future-runtime admission.
+          # Creates Git objects only. Branch advancement remains a separate guarded
+          # owner-authorized connector action after the complete diff is inspected.
+          REPO = 'mkurtgerald/K5-Vision'
+          BRANCH = 'fix/transactional-alpha-upgrade-20261003'
+          SOURCE = 'dce130837c79388d24cd1abbd26aa2054c3ccb82'
+          OLD_REVISION = '70b24135a085c8bb1dca23253a3c25fef9e18164'
+          OLD_DIGEST = '826ffb22491b3052d22670f7c60fae22811b7d92f0ab0f1d5fab89ac49b19087'
+          DIGEST = '36a5aaffc1a8863fadce74b8ddca606763a4d67d6f7c8dc34387d9511f338729c'
+          SELF = '.github/workflows/repair-dce13083-provenance.yml'
+          assert os.environ['GITHUB_REPOSITORY'] == REPO
+          assert os.environ['GITHUB_REF'] == 'refs/heads/' + BRANCH
+          assert os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted'
+          parent = os.environ['GITHUB_SHA']
+          assert re.fullmatch('[0-9a-f]{40}', parent)
+          git = ['git', '--no-replace-objects', '--no-lazy-fetch', '-c', 'protocol.allow=never']
+          def read_git(*args):
+              return subprocess.check_output(git + list(args), timeout=20)
+          assert read_git('rev-parse', 'HEAD').decode().strip() == SOURCE
+          entries = read_git('ls-tree', '-r', '-z', SOURCE, '--', 'src/k5vision').split(b'\0')
+          manifest = {}
+          for entry in entries:
+              if not entry:
+                  continue
+              meta, name = entry.split(b'\t', 1)
+              mode, kind, oid = meta.split()
+              assert mode == b'100644' and kind == b'blob'
+              data = read_git('cat-file', 'blob', oid.decode())
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == oid.decode()
+              manifest[name.decode().removeprefix('src/')] = hashlib.sha256(data).hexdigest()
+          assert len(manifest) == 138
+          assert hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest() == DIGEST
+          def api(path, body=None):
+              assert path.startswith(('/git/', '/commits/'))
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/' + REPO + path,
+                  data=None if body is None else json.dumps(body).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['REPAIR_TOKEN'],
+                           'Accept': 'application/vnd.github+json',
+                           'Content-Type': 'application/json',
+                           'X-GitHub-Api-Version': '2022-11-28'},
+                  method='GET' if body is None else 'POST')
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+          assert api('/git/ref/heads/' + BRANCH)['object']['sha'] == parent
+          parent_info = api('/git/commits/' + parent)
+          assert [item['sha'] for item in parent_info['parents']] == [SOURCE]
+          expected = {
+              'scripts/capture_installer_wheel_provenance.py': '8d64007b106f88c26a1e7f06f94bd6225d26a61c',
+              'tests/test_capture_installer_wheel_provenance.py': '34e3825ec8457e0408ba91e080a50fe0d766b47d',
+              'tests/unit/test_reviewed_h264_selection.py': '7b15c7b7f943e780c44ec7800e4e057e8d2031a5',
+          }
+          contents = {}
+          for path, oid in expected.items():
+              raw = read_git('show', SOURCE + ':' + path)
+              assert hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest() == oid
+              contents[path] = raw.decode('utf-8')
+          def replace_once(path, old, new):
+              assert contents[path].count(old) == 1, 'Reviewed replacement context changed'
+              contents[path] = contents[path].replace(old, new)
+          capture = 'scripts/capture_installer_wheel_provenance.py'
+          test = 'tests/test_capture_installer_wheel_provenance.py'
+          replace_once(capture, 'RUNTIME_REVISION = "' + OLD_REVISION + '"', 'RUNTIME_REVISION = "' + SOURCE + '"')
+          replace_once(capture, 'RUNTIME_PAYLOAD_SHA256 = "' + OLD_DIGEST + '"', 'RUNTIME_PAYLOAD_SHA256 = "' + DIGEST + '"')
+          replace_once(capture, '# Re-attested from the 137 exact tracked src/k5vision blobs at 70b24135.', '# Re-attested from the 138 exact tracked src/k5vision blobs at dce13083.')
+          replace_once(capture, 'diagnostics.enter("runtime_payload", expected=137, observed=len(payload_hashes))', 'diagnostics.enter("runtime_payload", expected=138, observed=len(payload_hashes))')
+          replace_once(test, 'assert len(manifest) == 137', 'assert len(manifest) == 138')
+          replace_once(test, 'assert capture.RUNTIME_REVISION == "' + OLD_REVISION + '"', 'assert capture.RUNTIME_REVISION == "' + SOURCE + '"')
+          replace_once(test, '        "media/analytics_detection_adapter.py",', '        "media/analytics_detection_adapter.py",\n        "media/reviewed_h264_selection.py",')
+          replace_once(test, '    "previous_payload",\n    [', '    "previous_payload",\n    [\n        "' + OLD_DIGEST + '",')
+          formatting = 'tests/unit/test_reviewed_h264_selection.py'
+          replace_once(formatting,
+              '    assert capsys.readouterr().out == (\n        "K5 decoder selected: reviewed-software-h264 (engineering build)\\n"\n    )',
+              '    assert capsys.readouterr().out == "K5 decoder selected: reviewed-software-h264 (engineering build)\\n"')
+          for path, content in contents.items():
+              compile(content, path, 'exec')
+          # Remove this one-shot editor in its own resulting commit. No recurring
+          # writer, new execution lane or permanent write-enabled workflow remains.
+          edits = [{'path': path, 'mode': '100644', 'type': 'blob', 'content': content}
+                   for path, content in contents.items()]
+          edits.append({'path': SELF, 'mode': '100644', 'type': 'blob', 'sha': None})
+          tree = api('/git/trees', {'base_tree': parent_info['tree']['sha'], 'tree': edits})
+          commit = api('/git/commits', {'message': 'Bind reviewed decoder source identity and preserve mutation rejection tests',
+                                       'tree': tree['sha'], 'parents': [parent]})
+          assert api('/git/ref/heads/' + BRANCH)['object']['sha'] == parent
+          print('K5_REPAIR_SOURCE=' + SOURCE)
+          print('K5_REPAIR_RUNTIME_FILES=138')
+          print('K5_REPAIR_RUNTIME_SHA256=' + DIGEST)
+          print('K5_REPAIR_DETACHED_COMMIT=' + commit['sha'])
+          print('K5_REPAIR_BRANCH_UPDATED=0')
+          print('K5_REPAIR_PRODUCT_ACCEPTANCE=not_proven')
