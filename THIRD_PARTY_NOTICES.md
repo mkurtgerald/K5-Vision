@@ -21,6 +21,20 @@ K5 Vision uses a reviewed external GStreamer runtime surface for RTSP/RTP media 
 
 K5 Vision depends on psutil for cross-platform process resource observation and bounded process cleanup. psutil is distributed under the BSD-3-Clause license and remains copyright its upstream authors and contributors. Preserve the applicable upstream license and copyright notice when redistributing the dependency. The Stage 03 review record is maintained in `docs/STAGE_03_DEPENDENCY_REVIEW.md`.
 
+### MediaMTX continuous-media worker evaluation
+
+The opt-in media adapter evaluates MediaMTX `v1.21.2` from
+`bluenviron/mediamtx`, commit `914e39535ece709919ac325aaeed98d394ed9093`.
+MediaMTX is copyright (c) 2019 aler9 and distributed under the MIT License.
+The full unchanged license is preserved at
+`third_party/licenses/MediaMTX-MIT.txt`.
+
+No MediaMTX implementation source or executable is bundled by this change.
+Preserve this notice and the applicable transitive module notices when shipping
+the reviewed native executable. K5's surrounding source license does not
+restrict rights granted by the upstream MIT license. Native binary review and
+target Windows acceptance remain separate from the source/API evaluation.
+
 ## Notice rule
 
 When third-party material requiring attribution or reproduction of license text is incorporated or distributed with K5 Vision, add the required notice here or include the complete upstream notice in a clearly identified file under a third-party notices directory before release.
