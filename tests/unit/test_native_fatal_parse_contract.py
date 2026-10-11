@@ -2,6 +2,7 @@
 
 No camera source, network, samples or media retention is involved.
 """
+
 from __future__ import annotations
 
 import ctypes
@@ -51,7 +52,10 @@ def test_native_parser_rejects_incomplete_pipeline() -> None:
     core.gst_parse_launch.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
     core.gst_parse_launch.restype = ctypes.c_void_p
     core.gst_parse_launch_full.argtypes = [
-        ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
     ]
     core.gst_parse_launch_full.restype = ctypes.c_void_p
     core.gst_object_unref.argtypes = [ctypes.c_void_p]

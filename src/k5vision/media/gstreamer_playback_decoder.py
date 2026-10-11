@@ -163,7 +163,10 @@ class _CtypesGStreamerBackend:
         self._core.gst_init_check.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
         self._core.gst_init_check.restype = ctypes.c_int
         self._core.gst_parse_launch_full.argtypes = [
-            ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
         ]
         self._core.gst_parse_launch_full.restype = ctypes.c_void_p
         self._core.gst_bin_get_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
