@@ -104,23 +104,29 @@ class OwnerGuiContract(unittest.TestCase):
 
     def test_installed_operator_failure_class_is_bounded_and_source_free(self):
         source = SOURCE.read_text(encoding="utf-8")
-        launcher = (
-            ROOT / "scripts" / "windows-alpha" / "Start-K5VisionAlpha.ps1"
-        ).read_text(encoding="utf-8")
+        launcher = (ROOT / "scripts" / "windows-alpha" / "Start-K5VisionAlpha.ps1").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("K5_OPERATOR_LIVE_FAILURE=", launcher)
-        self.assertIn('$count -le 2048', launcher)
-        self.assertIn('$detail.Length -le 1024', launcher)
-        self.assertIn('$response.StatusCode -eq 503', launcher)
+        self.assertIn("$count -le 2048", launcher)
+        self.assertIn("$detail.Length -le 1024", launcher)
+        self.assertIn("$response.StatusCode -eq 503", launcher)
         self.assertIn('throw "K5 Windows operator live request failed."', launcher)
-        self.assertNotIn('Write-Host $detail', launcher)
-        self.assertNotIn('Write-Host $body', launcher)
+        self.assertNotIn("Write-Host $detail", launcher)
+        self.assertNotIn("Write-Host $body", launcher)
         self.assertIn('line.StartsWith("K5_OPERATOR_LIVE_FAILURE="', source)
         for code in (
-            "source_unavailable", "analytics_start_failure", "unconfigured",
-            "execution_failure", "start_failure", "assembly_failure",
-            "cleanup_failure", "launch_failure", "unknown",
+            "source_unavailable",
+            "analytics_start_failure",
+            "unconfigured",
+            "execution_failure",
+            "start_failure",
+            "assembly_failure",
+            "cleanup_failure",
+            "launch_failure",
+            "unknown",
         ):
-            self.assertIn('K5_OPERATOR_LIVE_FAILURE=' + code, source)
+            self.assertIn("K5_OPERATOR_LIVE_FAILURE=" + code, source)
         self.assertNotIn("Status(line)", source)
 
     @unittest.skipUnless(sys.platform == "win32", "Requires real Windows C# compiler")
