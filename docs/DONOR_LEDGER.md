@@ -143,3 +143,34 @@ Package dependencies declared in `pyproject.toml` are dependencies, not automati
   recording-segment and playback-span contracts. Any upstream upgrade or
   installed-default switch requires a new immutable artifact review and native
   acceptance. Existing framed-RTP recordings retain their existing reader.
+
+## FFmpeg/ffprobe native Windows development fixtures
+
+- **Source:** FFmpeg.org-recommended Gyan builds;
+  https://github.com/GyanD/codexffmpeg/releases/tag/9.0.2
+- **Version/artifact:** `9.0.2`, `ffmpeg-9.0.2-essentials_build.zip`
+- **License/copyright:** GPL-3.0-or-later; FFmpeg upstream developers and
+  separately attributed build dependencies. The archive preserves its GPL
+  license and README; no upstream license is replaced.
+- **K5 files affected:** `.github/workflows/donor-media-windows.yml`,
+  `src/k5vision/data/mediamtx-donor-test-tools.json` and development notices.
+- **Integration/modifications:** external native development executables,
+  invoked only as separate fixture-generation and decoding processes;
+  unmodified binaries, no source import or linking.
+- **Purpose:** generated H.264 and independent decoded-frame verification in
+  the isolated native Windows donor acceptance. Not a product runtime dependency.
+- **Review conclusion:** reviewed GPL development execution without
+  redistribution. No tool/archive is bundled or uploaded as evidence. This
+  scope does not approve incorporation or redistribution in a product installer.
+  The build enables GPL/version3/libx264 and has no `--enable-nonfree` setting.
+- **Required notices:** retain the supplied archive license/attributions while
+  using these external tools; any later redistribution requires a separate
+  dependency review and fulfillment of its source/notice obligations.
+- **Reviewed by/on:** automated upstream metadata, exact archive and PE amd64
+  identity inspection, 2026-10-11; no legal sign-off is claimed.
+- **Integrity:** archive SHA-256
+  `60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba`,
+  matching both GitHub release-asset digest and Gyan's versioned checksum.
+  Full source/artifact references are in the test-tool manifest.
+- **Replacement:** supply separately admitted fixture tools; this does not
+  change the K5/MediaMTX runtime or the normalized provider contract.

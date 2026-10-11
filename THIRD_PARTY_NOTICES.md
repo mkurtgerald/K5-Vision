@@ -35,6 +35,18 @@ the reviewed native executable. K5's surrounding source license does not
 restrict rights granted by the upstream MIT license. Native binary review and
 target Windows acceptance remain separate from the source/API evaluation.
 
+### FFmpeg/ffprobe donor acceptance tools
+
+The native Windows donor acceptance job downloads the pinned Gyan FFmpeg 9.0.2
+essentials build, under GPL-3.0-or-later, for separate-process synthetic-media
+generation and decoding. FFmpeg remains copyright its upstream developers;
+retain the licenses provided in the external archive during its use.
+
+These tools are development fixtures, not product runtime dependencies. Their
+executables and archives are not incorporated, bundled or uploaded by K5. This
+development-use review grants no product redistribution approval. Provenance
+and the checksum are in `src/k5vision/data/mediamtx-donor-test-tools.json`.
+
 ## Notice rule
 
 When third-party material requiring attribution or reproduction of license text is incorporated or distributed with K5 Vision, add the required notice here or include the complete upstream notice in a clearly identified file under a third-party notices directory before release.

@@ -1,0 +1,184 @@
+name: Native Windows Donor Media
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/donor-media-windows.yml
+      - src/k5vision/media/mediamtx_provider.py
+      - src/k5vision/media/mediamtx_config.py
+      - src/k5vision/data/mediamtx-donor-manifest.json
+      - src/k5vision/data/mediamtx-donor-test-tools.json
+      - tests/unit/test_mediamtx_provider.py
+      - tests/integration/test_mediamtx_donor_runtime.py
+      - pyproject.toml
+
+permissions:
+  contents: read
+
+jobs:
+  native-donor-media:
+    runs-on: windows-2025
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install project and development dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
+          python -m pip install -e ".[dev]"
+          if ($LASTEXITCODE -ne 0) { throw "Project development installation failed" }
+
+      - name: Verify and provision pinned native development tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $mediaManifest = Get-Content -LiteralPath src/k5vision/data/mediamtx-donor-manifest.json -Raw | ConvertFrom-Json
+          $mediaArtifacts = @($mediaManifest.artifacts | Where-Object { $_.platform -eq "windows_amd64" })
+          if ($mediaArtifacts.Count -ne 1) { throw "Expected one pinned native Windows MediaMTX archive" }
+          $mediaArtifact = $mediaArtifacts[0]
+          $testTools = Get-Content -LiteralPath src/k5vision/data/mediamtx-donor-test-tools.json -Raw | ConvertFrom-Json
+          foreach ($field in @("url", "sha256", "version", "license", "source")) {
+            if ([string]::IsNullOrWhiteSpace([string]$testTools.$field)) {
+              throw "Development tool manifest is incomplete"
+            }
+          }
+          $toolRoot = Join-Path $env:RUNNER_TEMP ("K5 donor development tools " + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $toolRoot | Out-Null
+          "K5_DONOR_TOOL_ROOT=$toolRoot" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+
+          function Get-VerifiedArchive {
+            param([string]$Url, [string]$ExpectedHash, [string]$Archive, [string]$Destination)
+            if ($Url -notmatch '^https://[^\s]+$' -or $ExpectedHash -notmatch '^[a-fA-F0-9]{64}$') {
+              throw "Native tool archive identity is invalid"
+            }
+            Invoke-WebRequest -Uri $Url -OutFile $Archive -TimeoutSec 180
+            $actualHash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
+            if (-not [string]::Equals($actualHash, $ExpectedHash, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Native tool archive SHA256 mismatch"
+            }
+            Expand-Archive -LiteralPath $Archive -DestinationPath $Destination
+          }
+
+          $mediaDirectory = Join-Path $toolRoot "MediaMTX"
+          $ffmpegDirectory = Join-Path $toolRoot "FFmpeg development only"
+          Get-VerifiedArchive -Url $mediaArtifact.url -ExpectedHash $mediaArtifact.sha256 -Archive (Join-Path $toolRoot "mediamtx.zip") -Destination $mediaDirectory
+          Get-VerifiedArchive -Url $testTools.url -ExpectedHash $testTools.sha256 -Archive (Join-Path $toolRoot "ffmpeg.zip") -Destination $ffmpegDirectory
+
+          function Get-SingleExecutable {
+            param([string]$Directory, [string]$Name)
+            $executables = @(Get-ChildItem -LiteralPath $Directory -Filter $Name -File -Recurse)
+            if ($executables.Count -ne 1) { throw "Expected exactly one supplied native executable" }
+            return $executables[0].FullName
+          }
+          $mediaExe = Get-SingleExecutable -Directory $mediaDirectory -Name "mediamtx.exe"
+          $ffmpegExe = Get-SingleExecutable -Directory $ffmpegDirectory -Name "ffmpeg.exe"
+          $ffprobeExe = Get-SingleExecutable -Directory $ffmpegDirectory -Name "ffprobe.exe"
+
+          # Only verified archives have been extracted; execute nothing from an
+          # archive until its immutable SHA256 identity has been admitted.
+          $mediaVersion = @(& $mediaExe --version)
+          if ($LASTEXITCODE -ne 0 -or $mediaVersion.Count -ne 1 -or $mediaVersion[0].Trim() -ne $mediaManifest.version) {
+            throw "Native MediaMTX version does not match its manifest"
+          }
+          $ffmpegVersion = @(& $ffmpegExe -version)
+          if ($LASTEXITCODE -ne 0 -or $ffmpegVersion.Count -eq 0) { throw "FFmpeg development provenance failed" }
+          $ffprobeVersion = @(& $ffprobeExe -version)
+          if ($LASTEXITCODE -ne 0 -or $ffprobeVersion.Count -eq 0) { throw "ffprobe development provenance failed" }
+          $expectedVersion = [regex]::Escape([string]$testTools.version)
+          if ($ffmpegVersion[0] -notmatch "^ffmpeg version n?$expectedVersion(?:[-\s]|$)" -or
+              $ffprobeVersion[0] -notmatch "^ffprobe version n?$expectedVersion(?:[-\s]|$)") {
+            throw "FFmpeg development tool version does not match its manifest"
+          }
+          $buildConfiguration = @(& $ffmpegExe -buildconf 2>&1 | ForEach-Object { $_.ToString() }) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg development build provenance failed" }
+          foreach ($flag in @("--enable-libx264", "--enable-gpl", "--enable-version3")) {
+            if (-not $buildConfiguration.Contains($flag)) { throw "FFmpeg development build is missing an admitted feature" }
+          }
+          if ($buildConfiguration.Contains("--enable-nonfree")) { throw "Nonfree FFmpeg development build is not admitted" }
+          Write-Host "MediaMTX native Windows: $($mediaVersion[0])"
+          Write-Host "FFmpeg development tool: $($ffmpegVersion[0])"
+          Write-Host "ffprobe development tool: $($ffprobeVersion[0])"
+          Write-Host "FFmpeg development build verified: libx264, GPL, version3; nonfree disabled"
+          Write-Host "Development tool license: $($testTools.license)"
+          Write-Host "Development tool source: $($testTools.source)"
+          "K5_MEDIAMTX_DONOR_EXE=$mediaExe" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DONOR_FFMPEG=$ffmpegExe" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DONOR_FFPROBE=$ffprobeExe" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+
+      - name: Run provider regressions and actual native donor acceptance
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_mediamtx_provider.py tests/integration/test_mediamtx_donor_runtime.py --no-cov --junitxml=donor-media-native-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify actual Windows receipt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          [xml]$report = Get-Content -LiteralPath donor-media-native-windows.xml -Raw
+          $properties = @($report.SelectNodes("//property[@name='native_donor_runtime_receipt']"))
+          if ($properties.Count -ne 1 -or @($report.SelectNodes("//testcase/skipped")).Count -ne 0) {
+            throw "Native donor acceptance did not produce one executed receipt"
+          }
+          $receipt = $properties[0].GetAttribute("value") | ConvertFrom-Json
+          if ($receipt.platform -ne "Windows" -or $receipt.native_windows_execution -ne $true -or
+              $receipt.restart_inventory_preserved -ne $true -or $receipt.source_reconnected -ne $true -or
+              $receipt.anonymous_api_status -ne 401 -or $receipt.anonymous_playback_status -ne 401) {
+            throw "Native Windows generated-media acceptance receipt is incomplete"
+          }
+          Write-Host "Native Windows generated-media acceptance passed: $($receipt.version)"
+          Write-Host "Recorded segments: $($receipt.recording_segments); playable spans: $($receipt.playback_spans)"
+          Write-Host "Decoded playback frame counts: $($receipt.playback_decoded_frames_after_restart -join ', ')"
+          @(
+            "Native Windows generated-media donor acceptance passed.",
+            "",
+            "MediaMTX: $($receipt.version)",
+            "",
+            "Recording segments: $($receipt.recording_segments); playback spans: $($receipt.playback_spans).",
+            "",
+            "Generated-media proof covers authentication, reconnect, recording, restart and decoded playback.",
+            "",
+            "Real-camera, browser and analytics acceptance remain separate."
+          ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: Remove owned native development tool downloads
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrEmpty($env:K5_DONOR_TOOL_ROOT)) { exit 0 }
+          $toolRoot = [IO.Path]::GetFullPath($env:K5_DONOR_TOOL_ROOT)
+          $expectedParent = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar)
+          $actualParent = [IO.Directory]::GetParent($toolRoot).FullName
+          if (-not [string]::Equals($actualParent, $expectedParent, [StringComparison]::OrdinalIgnoreCase) -or
+              [IO.Path]::GetFileName($toolRoot) -notmatch '^K5 donor development tools [a-f0-9]{32}$') {
+            throw "Native tool cleanup path is outside its owned temporary directory"
+          }
+          if (Test-Path -LiteralPath $toolRoot) {
+            Remove-Item -LiteralPath $toolRoot -Recurse -Force
+          }
+
+      - name: Upload JUnit evidence only
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: donor-media-native-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: donor-media-native-windows.xml
+          if-no-files-found: warn
+          retention-days: 7

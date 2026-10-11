@@ -91,6 +91,13 @@ components remain optional donor candidates, not dependencies of this boundary.
 
 ## Acceptance
 
+The isolated `donor-media-windows.yml` PR workflow executes this acceptance on
+the native hosted Windows runner. It verifies the MediaMTX archive identity and
+uses separately pinned FFmpeg/ffprobe development fixtures to generate and
+decode synthetic media. The uploaded JUnit receipt must report Windows, native
+execution and zero skips. This qualifies the tested donor boundary, not an
+installed K5 product or a physical camera.
+
 `tests/integration/test_mediamtx_donor_runtime.py` is opt-in. Supply an admitted
 MediaMTX executable and development-only FFmpeg/ffprobe tools; the test never
 downloads binaries or connects to a real camera. For native Windows:
@@ -127,6 +134,12 @@ Windows binary and its transitive module notices before redistribution. No new
 model, hosted service, paid NVR plugin or copied detector source is adopted here.
 That binary review includes the embedded hls.js v1.7.3 assets, not only Go
 module dependencies.
+
+The Windows acceptance's external FFmpeg/ffprobe fixtures are Gyan release
+9.0.2, identified in `mediamtx-donor-test-tools.json`. Their GPL terms are
+reviewed for separate-process development execution only. They are not bundled,
+uploaded as evidence or used by the product runtime. This review does not
+approve their redistribution in a product installer.
 
 The integration is opt-in and leaves existing installation pins unchanged. A
 replacement media worker must implement the same normalized K5 read contracts;
