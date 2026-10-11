@@ -17,6 +17,10 @@ from typing import Protocol
 from pydantic import BaseModel, ConfigDict, Field
 
 from k5vision.media.playback_decode import DecodedVideoFrame
+from k5vision.media.reviewed_h264_selection import (
+    DecoderSelectionError,
+    select_decoder,
+)
 from k5vision.media.rtp_delivery import is_rtp_v2
 
 _MAX_PACKET_BYTES = 65_535
@@ -148,6 +152,19 @@ class _CtypesGStreamerBackend:
             self._source = ctypes.c_void_p()
             self._sink = ctypes.c_void_p()
             self._closed = False
+            if not self._core.gst_init_check(None, None, None):
+                raise NativePlaybackDecoderError(
+                    NativePlaybackDecoderErrorCode.NATIVE_FAILURE,
+                    "native decoder initialization failed",
+                )
+            try:
+                choice = select_decoder(self._core, root, allow_reviewed_software=True)
+            except DecoderSelectionError:
+                raise NativePlaybackDecoderError(
+                    NativePlaybackDecoderErrorCode.NATIVE_FAILURE,
+                    "native decoder unavailable or unreviewed",
+                ) from None
+            self._decoder_element = choice
             self._build_pipeline(payload_type)
         except NativePlaybackDecoderError:
             self._close_dll_directory()
@@ -217,11 +234,12 @@ class _CtypesGStreamerBackend:
                 NativePlaybackDecoderErrorCode.NATIVE_FAILURE,
                 "native decoder initialization failed",
             )
+        decoder = getattr(self, "_decoder_element", "d3d11h264dec")
         description = (
             "appsrc name=k5src is-live=false block=true format=time "
             f"caps=application/x-rtp,media=video,encoding-name=H264,"
             f"clock-rate=90000,payload={payload_type} "
-            "! rtph264depay ! h264parse ! d3d11h264dec ! videoconvert "
+            f"! rtph264depay ! h264parse ! {decoder} ! videoconvert "
             "! video/x-raw,format=BGRx "
             "! appsink name=k5sink sync=false max-buffers=4 drop=true"
         ).encode("ascii")
