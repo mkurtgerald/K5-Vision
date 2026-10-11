@@ -160,6 +160,7 @@ def test_fixed_get_routes_normalize_and_do_not_return_source_material() -> None:
         (b'{"version":"v1.21.2","started":NaN}', MediaWorkerErrorCode.INVALID_RESPONSE),
         (b"x" * 262_145, MediaWorkerErrorCode.INVALID_RESPONSE),
     ],
+    ids=["version-mismatch", "naive-time", "duplicate-key", "non-finite", "oversized-body"],
 )
 def test_version_and_response_admission_fail_closed(body, expected) -> None:
     async def scenario():
