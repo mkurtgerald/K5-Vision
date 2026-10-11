@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -149,6 +150,59 @@ def test_two_store_connections_preserve_concurrent_atomic_updates(identity) -> N
             store.close()
 
 
+def test_volatile_journal_commits_before_another_store_admits_files(identity, monkeypatch) -> None:
+    writer = OperatorCameraStore(identity.directory, identity.site_id)
+    reader = OperatorCameraStore(identity.directory, identity.site_id)
+    commit_started = threading.Event()
+    finish_commit = threading.Event()
+    reader_started = threading.Event()
+    reader_admitting = threading.Event()
+    journal_observed = threading.Event()
+    journal = Path(str(_database(identity)) + "-journal")
+
+    def hold_commit(statement):
+        if statement == "COMMIT":
+            if journal.exists():
+                journal_observed.set()
+            commit_started.set()
+            finish_commit.wait(5)
+
+    original_admit = reader._admit_files
+
+    def observed_admit():
+        reader_admitting.set()
+        return original_admit()
+
+    def read():
+        reader_started.set()
+        return reader.list_sources()
+
+    writer._connection.set_trace_callback(hold_commit)
+    monkeypatch.setattr(reader, "_admit_files", observed_admit)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            write_future = executor.submit(writer.upsert, _device(), _uri(_device()))
+            try:
+                assert commit_started.wait(5)
+                assert journal_observed.is_set()
+                read_future = executor.submit(read)
+                assert reader_started.wait(5)
+                # The real journal exists until the writer is allowed to COMMIT.
+                # Its deletion cannot occur between the reader's stat/ACL probes.
+                assert not reader_admitting.wait(0.05)
+            finally:
+                finish_commit.set()
+            committed = write_future.result(timeout=5)
+            assert read_future.result(timeout=5) == (committed,)
+            assert not journal.exists()
+            assert reader_admitting.is_set()
+    finally:
+        finish_commit.set()
+        writer._connection.set_trace_callback(None)
+        writer.close()
+        reader.close()
+
+
 def test_failed_transaction_keeps_previous_source_and_has_no_raw_error_context(identity) -> None:
     store = OperatorCameraStore(identity.directory, identity.site_id)
     device = _device()
@@ -256,17 +310,42 @@ def test_existing_empty_or_non_database_file_is_not_adopted(identity) -> None:
 
 def test_missing_or_replaced_database_is_never_silently_recreated(identity, tmp_path) -> None:
     store = OperatorCameraStore(identity.directory, identity.site_id)
+    source = store.upsert(_device(), _uri(_device()))
     database = _database(identity)
     moved = tmp_path / "preserved.sqlite3"
-    database.rename(moved)
+    if os.name == "nt":
+        # SQLite's Windows handle refuses deletion/rename while it owns the DB.
+        # Verify this real protection and unchanged access rather than forcing a
+        # POSIX-only replacement operation through a live Windows handle.
+        before = database.read_bytes()
+        with pytest.raises(OSError) as blocked:
+            database.rename(moved)
+        assert blocked.value.winerror == 32
+        assert database.exists() and not moved.exists()
+        assert database.read_bytes() == before
+        assert store.list_sources() == (source,)
+        store.close()
+        database.rename(moved)
+        database.write_bytes(moved.read_bytes())
+        database.chmod(0o600)
+    else:
+        database.rename(moved)
+        with pytest.raises(OperatorCameraStoreError):
+            store.list_sources()
+        assert not database.exists()
+        database.write_bytes(moved.read_bytes())
+        database.chmod(0o600)
+        with pytest.raises(OperatorCameraStoreError):
+            store.list_sources()
+        store.close()
+
+    # After handle closure either OS permits replacement. Startup must still
+    # refuse a valid SQLite replacement belonging to another identity site.
+    _change(identity, "UPDATE source_state SET site_id = 'foreign-site'")
+    before_reopen = database.read_bytes()
     with pytest.raises(OperatorCameraStoreError):
-        store.list_sources()
-    assert not database.exists()
-    database.write_bytes(moved.read_bytes())
-    database.chmod(0o600)
-    with pytest.raises(OperatorCameraStoreError):
-        store.list_sources()
-    store.close()
+        OperatorCameraStore(identity.directory, identity.site_id)
+    assert database.read_bytes() == before_reopen
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX mode admission")

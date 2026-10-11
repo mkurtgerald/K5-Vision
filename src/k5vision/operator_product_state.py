@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 import threading
+import weakref
 from pathlib import Path
 from uuid import UUID
 
@@ -23,6 +24,10 @@ from k5vision.services.device_registry import DeviceRegistry
 MAX_OPERATOR_CAMERAS = 64
 _DATABASE = "operator-cameras.sqlite3"
 _MAX_DEVICE_JSON_BYTES = 32_768
+_STORE_LOCKS_GUARD = threading.Lock()
+_STORE_LOCKS: weakref.WeakValueDictionary[tuple[int, int, str], threading.RLock] = (
+    weakref.WeakValueDictionary()
+)
 
 
 class OperatorCameraStoreError(RuntimeError):
@@ -38,6 +43,23 @@ def _device_json(device: Device) -> str:
     value["protocols"] = sorted(value["protocols"])
     value["tags"] = sorted(value["tags"])
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _store_lock(root_identity: os.stat_result, site_id: str) -> threading.RLock:
+    """Serialize custody checks and SQLite writes for an admitted in-process store.
+
+    SQLite deletes its volatile journal during COMMIT. An independent admission
+    probe must not overlap another store instance's journal lifecycle. The product
+    profile lease separately excludes another product process; SQLite retains its
+    transaction locks as well. Weak values retain no unused installation inventory.
+    """
+    key = (root_identity.st_dev, root_identity.st_ino, site_id)
+    with _STORE_LOCKS_GUARD:
+        lock = _STORE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _STORE_LOCKS[key] = lock
+        return lock
 
 
 class OperatorCameraStore:
@@ -56,7 +78,6 @@ class OperatorCameraStore:
         *,
         registry: DeviceRegistry | None = None,
     ) -> None:
-        self._lock = threading.RLock()
         self._connection: sqlite3.Connection | None = None
         self._closed = False
         self._registry = registry
@@ -75,53 +96,56 @@ class OperatorCameraStore:
             self._root = state.directory
             self._site_id = state.site_id
             self._root_identity = self._root.lstat()
+            self._lock = _store_lock(self._root_identity, self._site_id)
             self._database = self._root / _DATABASE
-            self._admit_root()
-            created = False
-            try:
-                descriptor = os.open(
-                    self._database,
-                    os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
+            with self._lock:
+                self._admit_root()
+                created = False
+                try:
+                    descriptor = os.open(
+                        self._database,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                    )
+                except FileExistsError:
+                    pass
+                else:
+                    os.close(descriptor)
+                    created = True
+                self._database_identity = self._private_file(self._database)
+                self._admit_files()
+                connection = sqlite3.connect(
+                    self._database.as_uri() + "?mode=rw",
+                    uri=True,
+                    timeout=3.0,
+                    isolation_level=None,
+                    check_same_thread=False,
                 )
-            except FileExistsError:
-                pass
-            else:
-                os.close(descriptor)
-                created = True
-            self._database_identity = self._private_file(self._database)
-            self._admit_files()
-            connection = sqlite3.connect(
-                self._database.as_uri() + "?mode=rw",
-                uri=True,
-                timeout=3.0,
-                isolation_level=None,
-                check_same_thread=False,
-            )
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA synchronous = FULL")
-            if created:
-                connection.execute("BEGIN IMMEDIATE")
-                connection.execute(
-                    "CREATE TABLE source_state "
-                    "(schema_version INTEGER NOT NULL, site_id TEXT NOT NULL)"
-                )
-                connection.execute("INSERT INTO source_state VALUES (?, ?)", (1, self._site_id))
-                connection.execute(
-                    """CREATE TABLE camera_sources (
-                        device_id TEXT PRIMARY KEY,
-                        device_json TEXT NOT NULL,
-                        source_uri TEXT NOT NULL
-                    )"""
-                )
-                connection.execute("COMMIT")
-            self._admit_files()
-            self._read_sources(connection)
-            self._connection = connection
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA synchronous = FULL")
+                if created:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        "CREATE TABLE source_state "
+                        "(schema_version INTEGER NOT NULL, site_id TEXT NOT NULL)"
+                    )
+                    connection.execute("INSERT INTO source_state VALUES (?, ?)", (1, self._site_id))
+                    connection.execute(
+                        """CREATE TABLE camera_sources (
+                            device_id TEXT PRIMARY KEY,
+                            device_json TEXT NOT NULL,
+                            source_uri TEXT NOT NULL
+                        )"""
+                    )
+                    connection.execute("COMMIT")
+                self._admit_files()
+                self._read_sources(connection)
+                self._connection = connection
         except Exception:
             failed = True
             if connection is not None:
-                connection.close()
+                with self._lock:
+                    connection.close()
         if failed:
             self._closed = True
             raise OperatorCameraStoreError("Private camera state admission failed")
