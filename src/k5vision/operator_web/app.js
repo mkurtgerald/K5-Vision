@@ -14,7 +14,7 @@
     hls: null, nativeLive: false, hlsScript: null, retryTimer: null, retryCount: 0,
     pollTimer: null, expiryTimer: null, selectionController: null,
     spans: [], selectedSpan: null, historyEpoch: 0, historyRolling: true, signingOut: false,
-    dialogMode: "add",
+    dialogMode: "add", dialogEpoch: 0, dialogController: null,
   };
 
   class ApiError extends Error {
@@ -137,11 +137,7 @@
     $("workspace").hidden = true;
     $("sign-in").hidden = false;
     $("password").value = "";
-    $("add-camera-form").reset();
-    $("new-camera-name").readOnly = false;
-    $("new-camera-host").readOnly = false;
-    state.dialogMode = "add";
-    if ($("add-camera-dialog").open) $("add-camera-dialog").close();
+    closeAddCamera();
     $("camera-list").replaceChildren();
     $("history-list").replaceChildren();
     $("camera-search").value = "";
@@ -691,13 +687,24 @@
   $("playback-video").addEventListener("playing", () => message("playback-message", "Recorded video · Select a new start time to seek to another point."));
   $("playback-video").addEventListener("error", () => { if (state.token && state.selectedSpan) message("playback-message", "Playback is unavailable. Refresh history or select another interval.", true); });
 
-  function closeAddCamera() { $("new-camera-source").value = ""; $("add-camera-dialog").close(); }
+  function resetCameraSetup() {
+    state.dialogController?.abort();
+    state.dialogController = null;
+    $("add-camera-form").reset();
+    $("new-camera-name").readOnly = false;
+    $("new-camera-host").readOnly = false;
+    $("save-camera").disabled = false;
+    state.dialogMode = "add";
+  }
+  function closeAddCamera() { resetCameraSetup(); $("add-camera-dialog").close(); }
   function openCameraSetup(mode) {
     if (state.account?.role !== "administrator") return;
     const camera = mode === "update" ? currentCamera() : null;
     if (mode === "update" && !camera) return;
+    resetCameraSetup();
+    state.dialogEpoch += 1;
     state.dialogMode = mode;
-    $("add-camera-form").reset(); message("add-camera-message", "");
+    message("add-camera-message", "");
     $("new-camera-name").readOnly = mode === "update";
     $("new-camera-host").readOnly = mode === "update";
     $("add-camera-title").textContent = mode === "update" ? "Update camera source" : "Add a camera";
@@ -716,41 +723,52 @@
   $("update-source-button").addEventListener("click", () => openCameraSetup("update"));
   $("close-add-camera").addEventListener("click", closeAddCamera);
   $("cancel-add-camera").addEventListener("click", closeAddCamera);
+  $("add-camera-dialog").addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeAddCamera();
+  });
   $("add-camera-dialog").addEventListener("close", () => {
-    $("add-camera-form").reset();
-    $("new-camera-name").readOnly = false;
-    $("new-camera-host").readOnly = false;
-    state.dialogMode = "add";
+    // Native close events are queued and may arrive after a new dialog opens.
+    if (!$("add-camera-dialog").open) resetCameraSetup();
   });
   $("add-camera-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (state.account?.role !== "administrator") return;
+    if (state.account?.role !== "administrator" || !$("add-camera-dialog").open || state.dialogController) return;
     const epoch = state.sessionEpoch;
+    const dialogEpoch = state.dialogEpoch;
+    const controller = new AbortController();
+    state.dialogController = controller;
+    const isCurrent = () => epoch === state.sessionEpoch && dialogEpoch === state.dialogEpoch
+      && state.dialogController === controller && $("add-camera-dialog").open;
     const updating = state.dialogMode === "update";
     const camera = { name: $("new-camera-name").value.trim(), host: $("new-camera-host").value.trim(), source_uri: $("new-camera-source").value.trim() };
     $("new-camera-source").value = "";
     $("save-camera").disabled = true;
     message("add-camera-message", updating ? "Updating source and reconnecting…" : "Saving camera and connecting…");
     try {
-      const created = await request("/api/v1/operator/cameras", { method: "POST", body: camera });
-      if (epoch !== state.sessionEpoch) return;
+      const created = await request("/api/v1/operator/cameras", { method: "POST", body: camera, signal: controller.signal });
+      if (!isCurrent()) return;
       closeAddCamera();
       notice(updating
         ? "Camera source updated. Live video and recording will reconnect."
         : "Camera saved. The live connection and recording status will update as it connects.");
       await refreshCameras();
+      if (epoch !== state.sessionEpoch || dialogEpoch !== state.dialogEpoch) return;
       const deviceId = created.device_id || created.camera?.device_id;
       if (deviceId) await selectCamera(deviceId);
     } catch (error) {
-      if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
+      if (error.name === "AbortError" || !isCurrent()) return;
       message("add-camera-message", error.status === 422
         ? "Check the camera IP address and RTSP stream. Enter the stream address again to retry."
         : error.status === 409 ? "This camera is already configured. Refresh the camera list."
           : apiMessage(error, "Camera setup failed. Enter the stream address again and retry."), true);
     } finally {
       camera.source_uri = "";
-      $("new-camera-source").value = "";
-      $("save-camera").disabled = false;
+      if (isCurrent()) {
+        state.dialogController = null;
+        $("new-camera-source").value = "";
+        $("save-camera").disabled = false;
+      }
     }
   });
 
