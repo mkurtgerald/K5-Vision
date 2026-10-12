@@ -1088,6 +1088,50 @@ class ReviewRegressionTests(unittest.TestCase):
             ):
                 guard.verify_source(state)
 
+    def test_pinned_editable_hook_requires_exact_name_and_source_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            prefix = work / "venv"
+            site = prefix / "Lib/site-packages"
+            metadata = site / "k5_vision-0.1.0.dist-info"
+            metadata.mkdir(parents=True)
+            (prefix / "Scripts").mkdir()
+            (prefix / "pyvenv.cfg").write_text("inert mock configuration")
+            (metadata / "METADATA").write_text("Name: k5-vision\nVersion: 0.1.0\n")
+            hook = site / "_editable_impl_k5_vision.pth"
+            expected = str(guard.ROOT / "src")
+            hook.write_text(expected)
+            original = guard.load_json
+
+            def load(path):
+                return (
+                    {"wheels": []} if path.name == "windows-hosted-profile.json" else original(path)
+                )
+
+            with (
+                patch.dict(guard.os.environ, {"K5_QUAL_ROOT": str(work)}),
+                patch.object(guard, "load_json", side_effect=load),
+            ):
+                guard.verify_environment(prefix)
+                for content in (str(work / "other"), "import malicious_hook", expected + "\nother"):
+                    hook.write_text(content)
+                    with (
+                        self.subTest(content=content),
+                        self.assertRaisesRegex(guard.Refusal, "project_editable_path"),
+                    ):
+                        guard.verify_environment(prefix)
+                hook.write_text(expected)
+                for name in ("_k5_vision.pth", "unexpected.pth", "_editable_impl_k5_vision.py"):
+                    extra = site / name
+                    extra.write_text(expected)
+                    with (
+                        self.subTest(name=name),
+                        self.assertRaisesRegex(guard.Refusal, "dependency_extra_file"),
+                    ):
+                        guard.verify_environment(prefix)
+                    extra.unlink()
+                guard.verify_environment(prefix)
+
     def test_wheel_bytes_and_extra_startup_hook_are_authenticated(self):
         import zipfile
 

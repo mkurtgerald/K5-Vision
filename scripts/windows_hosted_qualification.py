@@ -825,7 +825,9 @@ def verify_environment(prefix):
                 "project_metadata",
             )
             continue
-        if project and not runtime_only and relative == "_k5_vision.pth":
+        # The admitted editables 0.6 backend emits this exact path-only hook.
+        # Other editable names and executable startup hooks remain unadmitted.
+        if project and not runtime_only and relative == "_editable_impl_k5_vision.pth":
             need(path.read_text().strip() == str(ROOT / "src"), "project_editable_path")
             continue
         if project and runtime_only and relative.startswith("k5vision/"):
