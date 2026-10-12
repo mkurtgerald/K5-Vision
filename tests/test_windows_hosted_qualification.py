@@ -210,7 +210,7 @@ class AdapterTests(unittest.TestCase):
     def test_membership_race_fails_closed(self):
         owner = self.make()
         self.native.fail = "membership"
-        with self.assertRaisesRegex(ResourceFailure, "membership"):
+        with self.assertRaisesRegex(ResourceFailure, "final_survivor_missing"):
             owner.sample()
 
     def test_pid_reuse_fails_closed(self):
@@ -225,7 +225,7 @@ class AdapterTests(unittest.TestCase):
     def test_signaled_process_still_in_final_membership_fails_closed(self):
         owner = self.make()
         self.native.identities[11] = (101, 222)
-        with self.assertRaisesRegex(ResourceFailure, "membership_changed"):
+        with self.assertRaisesRegex(ResourceFailure, "departed_member_still_listed"):
             owner.sample()
 
     def test_sampled_rss_ceiling(self):
@@ -295,7 +295,7 @@ class AdapterTests(unittest.TestCase):
     def test_over_active_cap_denied(self):
         owner = self.make()
         self.native.pids = set(range(1, 34))
-        with self.assertRaisesRegex(ResourceFailure, "membership"):
+        with self.assertRaisesRegex(ResourceFailure, "initial_members_exceed_limit"):
             owner.sample()
 
     def test_fixed_width_windows_layout_x64(self):
@@ -406,7 +406,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
             return original(job)
 
         self.native.members = members
-        with self.assertRaisesRegex(ResourceFailure, "membership_changed"):
+        with self.assertRaisesRegex(ResourceFailure, "final_survivor_missing"):
             owner.sample()
         self.assertEqual(len(calls), 2)
         self.assertTrue(self.job.drained)
@@ -423,7 +423,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
             return original(handle)
 
         self.native.identity = identity
-        with self.assertRaisesRegex(ResourceFailure, "membership_changed"):
+        with self.assertRaisesRegex(ResourceFailure, "final_survivor_signaled"):
             owner.sample()
         self.assertEqual(self.native.read_count, 2)
 
@@ -448,7 +448,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
             return rows
 
         calls = self.during_listeners(changed)
-        with self.assertRaisesRegex(ResourceFailure, "membership_changed"):
+        with self.assertRaisesRegex(ResourceFailure, "final_survivor_missing"):
             owner.sample()
         self.assertEqual(len(calls), 1)
 
@@ -468,7 +468,10 @@ class StableSnapshotFakeTests(unittest.TestCase):
                     return rows
 
                 calls = self.during_listeners(changed)
-                with self.assertRaisesRegex(ResourceFailure, "membership_changed"):
+                category = (
+                    "sample_birth_count_changed" if total_increase else "final_member_set_expanded"
+                )
+                with self.assertRaisesRegex(ResourceFailure, category):
                     owner.sample()
                 self.assertEqual(len(calls), 1)
 
@@ -486,7 +489,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
         calls = self.during_listeners(
             lambda number, rows: (self.expire() if number == 1 else None) or rows
         )
-        with self.assertRaisesRegex(ResourceFailure, "membership_changed"):
+        with self.assertRaisesRegex(ResourceFailure, "retry_member_set_expanded"):
             owner.sample()
         self.assertEqual(len(calls), 1)
 
@@ -656,6 +659,117 @@ class StableSnapshotFakeTests(unittest.TestCase):
         self.assertEqual(sample["cpu_seconds"], 2.5)
         with self.assertRaisesRegex(guard.Refusal, "cpu_limit"):
             guard.admit_sample(sample, previous_cpu=898)
+
+
+class MembershipPredicateFakeTests(unittest.TestCase):
+    """Diagnostic labels only; every old false predicate must still refuse."""
+
+    make = AdapterTests.make
+    expire = StableSnapshotFakeTests.expire
+    during_listeners = StableSnapshotFakeTests.during_listeners
+
+    def configure(self, category):
+        owner = self.make()
+        original_accounting = self.native.accounting
+        original_identity = self.native.identity
+        identity_reads = {}
+
+        def accounting(job):
+            read = self.native.read_count + 1
+            if read == 3:
+                if category == "retry_birth_count_changed":
+                    self.native.total = self.job.total_processes = 3
+                elif category == "retry_member_set_expanded":
+                    self.native.pids.add(13)
+                elif category == "departure_handle_missing":
+                    # Deliberately corrupt fake evidence to cover a defensive leaf;
+                    # normal source control flow does not discard retained handles.
+                    del owner.handles[11]
+                elif category == "departure_not_signaled":
+                    self.native.identities[11] = (101, False)
+            total, active, cpu = original_accounting(job)
+            if category == "initial_active_count_mismatch" and read == 1:
+                active -= 1
+            if category == "final_active_count_mismatch" and read == 2:
+                active -= 1
+            return total, active, cpu
+
+        def identity(handle):
+            identity_reads[handle] = identity_reads.get(handle, 0) + 1
+            if (
+                category == "final_survivor_signaled"
+                and handle == 11
+                and identity_reads[handle] == 3
+            ):
+                self.expire(handle)
+            return original_identity(handle)
+
+        def changed(number, rows):
+            if number != 1:
+                return rows
+            if category in {
+                "retry_birth_count_changed",
+                "retry_member_set_expanded",
+                "departure_handle_missing",
+                "departure_not_signaled",
+            }:
+                self.expire()
+            elif category == "sample_birth_count_changed":
+                self.native.total = self.job.total_processes = 3
+            elif category == "final_member_set_expanded":
+                self.native.pids = {12, 13}
+            elif category == "departed_member_still_listed":
+                self.native.identities[11] = (101, True)
+            elif category == "final_survivor_missing":
+                self.native.pids.remove(11)
+            return rows
+
+        self.native.accounting = accounting
+        self.native.identity = identity
+        self.during_listeners(changed)
+        if category == "initial_members_exceed_limit":
+            self.native.pids = set(range(1, 34))
+            self.native.total = self.job.total_processes = 33
+        return owner
+
+    def test_each_fixed_membership_predicate_category_is_distinct_and_source_free(self):
+        categories = (
+            "initial_active_count_mismatch",
+            "initial_members_exceed_limit",
+            "retry_birth_count_changed",
+            "retry_member_set_expanded",
+            "departure_handle_missing",
+            "departure_not_signaled",
+            "sample_birth_count_changed",
+            "final_member_set_expanded",
+            "departed_member_still_listed",
+            "final_survivor_missing",
+            "final_active_count_mismatch",
+            "final_survivor_signaled",
+        )
+        self.assertEqual(len(set(categories)), 12)
+        for category in categories:
+            with self.subTest(category=category):
+                owner = self.configure(category)
+                with self.assertRaises(ResourceFailure) as refused:
+                    owner.sample()
+                self.assertEqual(str(refused.exception), category)
+                self.assertRegex(str(refused.exception), r"\A[a-z_]{1,64}\Z")
+                self.assertTrue(owner.failed and owner.cleanup_complete and self.job.drained)
+
+    def test_survivor_equality_decomposition_is_logically_identical(self):
+        subsets = [{value for value in range(4) if bits & (1 << value)} for bits in range(16)]
+        for members in subsets:
+            for departed in subsets:
+                for survivors in subsets:
+                    with self.subTest(members=members, departed=departed, survivors=survivors):
+                        original = survivors == members - departed
+                        diagnostic = (
+                            survivors <= members
+                            and not survivors & departed
+                            and members - departed <= survivors
+                        )
+                        self.assertEqual(diagnostic, original)
 
 
 class NativeBoundaryFakeTests(unittest.TestCase):

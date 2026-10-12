@@ -1658,17 +1658,18 @@ class QualificationResources:
             fresh()
             before = accounting()
             members = self.native.members(self.job)
-            resource_need(before[1] == len(members) <= ACTIVE_LIMIT, "membership_changed")
+            resource_need(before[1] == len(members), "initial_active_count_mismatch")
+            resource_need(len(members) <= ACTIVE_LIMIT, "initial_members_exceed_limit")
             if initial_members is None:
                 initial_members, sample_total = set(members), before[0]
                 remaining_members = set(members)
-            resource_need(
-                before[0] == sample_total and members <= remaining_members, "membership_changed"
-            )
+            resource_need(before[0] == sample_total, "retry_birth_count_changed")
+            resource_need(members <= remaining_members, "retry_member_set_expanded")
             # Between attempts, a previously retained survivor may also exit.
             # Every absence still needs exact identity, ownership and signal proof.
             for pid in initial_members - members:
-                resource_need(pid in self.handles and exited(pid), "membership_changed")
+                resource_need(pid in self.handles, "departure_handle_missing")
+                resource_need(exited(pid), "departure_not_signaled")
             departed, attempt_rss = set(), 0
             for pid in sorted(members):
                 if pid not in self.handles:
@@ -1693,14 +1694,15 @@ class QualificationResources:
                     departed.add(pid)
             after = accounting()
             survivors = self.native.members(self.job)
-            resource_need(
-                after[0] == sample_total
-                and survivors == members - departed
-                and after[1] == len(survivors),
-                "membership_changed",
-            )
+            resource_need(after[0] == sample_total, "sample_birth_count_changed")
+            # These three predicates are exactly the prior survivor-set equality.
+            # Fixed categories identify the failed proof without exposing identities.
+            resource_need(survivors <= members, "final_member_set_expanded")
+            resource_need(not survivors & departed, "departed_member_still_listed")
+            resource_need(members - departed <= survivors, "final_survivor_missing")
+            resource_need(after[1] == len(survivors), "final_active_count_mismatch")
             for pid in survivors:
-                resource_need(not exited(pid), "membership_changed")
+                resource_need(not exited(pid), "final_survivor_signaled")
             fresh()
             if not departed:
                 break
