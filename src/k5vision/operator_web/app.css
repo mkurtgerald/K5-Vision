@@ -178,3 +178,7 @@ dialog::backdrop { background: #05080ebd; backdrop-filter: blur(5px); }
   .day-picker { flex-wrap: wrap; }
   .video-footer { flex-wrap: wrap; }
 }
+
+.analyzed-panel { margin: 1rem 0; padding: 1rem; border: 1px solid var(--border, #344054); border-radius: 12px; }
+#sample-canvas { display: block; max-width: 100%; height: auto; background: #111; }
+#sample-canvas[hidden] { display: none; }

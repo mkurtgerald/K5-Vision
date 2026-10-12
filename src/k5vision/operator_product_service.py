@@ -12,6 +12,7 @@ import stat
 import time
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import ProxyHandler, Request, build_opener
 
 from k5vision.identity_state import _checked_path, _regular_file, _windows_admission
@@ -146,8 +147,35 @@ class OperatorProductService:
         self._needs_reconcile = False
         self._spawns: set[asyncio.Task] = set()
         self._storage = None
+        self.analytics_generation = 0
+        self.analytics_invalidator = None
         self._media_file = self.state_root / "operator-mediamtx.json"
         self._gateway_file = self.state_root / "operator-gateway.json"
+
+    def _invalidate_analytics(self) -> None:
+        self.analytics_generation += 1
+        if self.analytics_invalidator is not None:
+            self.analytics_invalidator()
+
+    def analytics_selection(self, source: MediaMTXSource) -> tuple[int, str]:
+        """Resolve only the currently applied server-owned numeric-loopback read path."""
+        if (
+            self.status() not in {"ready", "disk_full"}
+            or self._needs_reconcile
+            or self._closing
+            or source not in self._sources
+            or source.binding.site_id != self.site_id
+            or source.binding.path_name not in self._paths
+        ):
+            raise OperatorProductError("Analyzed sample source unavailable")
+        port = self.ports["rtsp_port"]
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise OperatorProductError("Analyzed sample source unavailable")
+        user = quote(self.credentials.username, safe="")
+        password = quote(self.credentials.password, safe="")
+        return self.analytics_generation, (
+            f"rtsp://{user}:{password}@127.0.0.1:{port}/{source.binding.path_name}"
+        )
 
     def _configuration(self, sources: tuple[MediaMTXSource, ...]) -> dict:
         config = json.loads(
@@ -241,6 +269,7 @@ class OperatorProductService:
         )
 
     async def start(self, sources: tuple[MediaMTXSource, ...]) -> None:
+        self._invalidate_analytics()
         try:
             from k5vision.operator_recording_storage import RecordingStorage
 
@@ -289,6 +318,7 @@ class OperatorProductService:
 
     async def apply_sources(self, sources: tuple[MediaMTXSource, ...]) -> None:
         async with self._lock:
+            self._invalidate_analytics()
             config = self._configuration(tuple(sources))
             self._sources = tuple(sources)
             self._needs_reconcile = True
@@ -323,6 +353,7 @@ class OperatorProductService:
                         or self._media.poll() is not None
                         or self._needs_reconcile
                     ):
+                        self._invalidate_analytics()
                         self._ready = False
                         if self._media is not None:
                             await asyncio.to_thread(self._media.stop)
@@ -360,6 +391,7 @@ class OperatorProductService:
                 await asyncio.sleep(3)
 
     async def stop(self) -> None:
+        self._invalidate_analytics()
         self._closing = True
         self._ready = False
         task = self._task

@@ -14,7 +14,9 @@
     hls: null, nativeLive: false, hlsScript: null, retryTimer: null, retryCount: 0,
     pollTimer: null, expiryTimer: null, selectionController: null,
     spans: [], selectedSpan: null, historyEpoch: 0, historyRolling: true, signingOut: false,
-    dialogMode: "add",
+    sampleEpoch: 0, sampleTimer: null, sampleExpiryTimer: null, sampleController: null, sampleBusy: false,
+    sampleGeneration: null,
+    dialogMode: "add", dialogEpoch: 0, dialogController: null,
   };
 
   class ApiError extends Error {
@@ -49,7 +51,7 @@
     const token = state.token;
     state.requests.add(controller);
     try {
-      const headers = { Accept: "application/json" };
+      const headers = { Accept: options.sample ? "application/octet-stream, application/json" : "application/json" };
       if (token) headers.Authorization = `Bearer ${token}`;
       if (options.body !== undefined) headers["Content-Type"] = "application/json";
       const response = await fetch(path, {
@@ -64,10 +66,140 @@
         throw new ApiError(response.status);
       }
       if (response.status === 204) return null;
+      if (options.sample && response.headers.get("content-type") === "application/octet-stream") {
+        return await readSampleResponse(response, options.ticket);
+      }
       return await response.json();
     } finally {
       state.requests.delete(controller);
     }
+  }
+
+  function clearSample(text = "Request one analyzed sample when available.") {
+    state.sampleEpoch += 1;
+    clearTimeout(state.sampleTimer); clearTimeout(state.sampleExpiryTimer);
+    state.sampleTimer = state.sampleExpiryTimer = null;
+    state.sampleController?.abort(); state.sampleController = null;
+    state.sampleBusy = false; state.sampleGeneration = null;
+    const canvas = $("sample-canvas");
+    canvas.width = canvas.height = 0; canvas.hidden = true;
+    message("sample-message", text);
+    $("request-sample").disabled = !state.token || currentCamera()?.analytics_status !== "sample_available";
+  }
+
+  async function readSampleResponse(response, ticket) {
+    function integer(name, min, max) {
+      const text = response.headers.get(name);
+      if (typeof text !== "string" || !/^[0-9]{1,8}$/.test(text)) throw new ApiError(503);
+      const value = Number(text);
+      if (!Number.isSafeInteger(value) || value < min || value > max) throw new ApiError(503);
+      return value;
+    }
+    const width = integer("x-k5-sample-width", 1, 16384);
+    const height = integer("x-k5-sample-height", 1, 16384);
+    const stride = integer("x-k5-sample-stride", width * 4, 16 * 1024 * 1024);
+    const length = integer("content-length", 1, 16 * 1024 * 1024);
+    const expires = integer("x-k5-sample-expires", 0, 60);
+    const boxes = integer("x-k5-sample-boxes", 0, 128);
+    const received = response.headers.get("x-k5-sample-received");
+    if (length !== height * stride || response.headers.get("x-k5-sample-ticket") !== ticket ||
+        response.headers.get("x-k5-sample-format") !== "BGRx" || typeof received !== "string" ||
+        received.length > 40 || !Number.isFinite(Date.parse(received))) throw new ApiError(503);
+    const pixels = new Uint8Array(length);
+    const reader = response.body.getReader();
+    let offset = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!(value instanceof Uint8Array) || value.length > length - offset) throw new ApiError(503);
+        pixels.set(value, offset); offset += value.length;
+      }
+      if (offset !== length) throw new ApiError(503);
+    } catch (error) {
+      await reader.cancel().catch(() => null);
+      throw error;
+    } finally { reader.releaseLock(); }
+    return { status: "ready", width, height, stride_bytes: stride, pixels,
+      pixel_format: "BGRx", rendered_boxes: boxes, received_at: received, expires_in_seconds: expires };
+  }
+
+  function paintSample(data) {
+    const { width, height, stride_bytes: stride, pixels: bytes } = data;
+    const limit = 16 * 1024 * 1024;
+    if (![width, height, stride].every(Number.isSafeInteger) || width < 1 || height < 1 ||
+        width > 16384 || height > 16384 || stride < width * 4 || stride * height > limit ||
+        data.pixel_format !== "BGRx" || !(bytes instanceof Uint8Array) ||
+        bytes.length !== stride * height ||
+        !Number.isSafeInteger(data.rendered_boxes) || data.rendered_boxes < 0 || data.rendered_boxes > 128 ||
+        typeof data.received_at !== "string" || !Number.isFinite(Date.parse(data.received_at))) throw new ApiError(503);
+    const canvas = $("sample-canvas");
+    canvas.width = width; canvas.height = height;
+    const context = canvas.getContext("2d");
+    const image = context.createImageData(width, height);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const input = y * stride + x * 4, output = (y * width + x) * 4;
+        image.data[output] = bytes[input + 2];
+        image.data[output + 1] = bytes[input + 1];
+        image.data[output + 2] = bytes[input];
+        image.data[output + 3] = 255;
+      }
+    }
+    context.putImageData(image, 0, 0); canvas.hidden = false;
+    message("sample-message", `Analyzed sample · ${data.rendered_boxes} boxes · Server received ${data.received_at}. Expires shortly.`);
+  }
+
+  async function requestSample() {
+    const camera = currentCamera();
+    if (state.sampleBusy || !state.token || state.signingOut || camera?.analytics_status !== "sample_available") return;
+    clearSample("Analyzing one sample…");
+    state.sampleBusy = true; $("request-sample").disabled = true;
+    state.sampleGeneration = camera.analytics_generation;
+    state.sampleController = new AbortController();
+    const epoch = state.sampleEpoch, session = state.sessionEpoch, selection = state.selectionEpoch;
+    const signal = state.sampleController.signal;
+    const deadline = performance.now() + 60000;
+    const current = () => epoch === state.sampleEpoch && session === state.sessionEpoch &&
+      selection === state.selectionEpoch && state.token && !state.signingOut;
+    const base = `/api/v1/operator/cameras/${encodeURIComponent(camera.device_id)}/analytics-samples`;
+    function expiry(seconds) {
+      if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 60) throw new ApiError(410);
+      const remaining = Math.min(seconds * 1000, deadline - performance.now());
+      if (remaining <= 0) throw new ApiError(410);
+      clearTimeout(state.sampleExpiryTimer);
+      state.sampleExpiryTimer = setTimeout(() => {
+        if (current()) clearSample("Analyzed sample expired. Request another sample when ready.");
+      }, remaining);
+    }
+    function failed(error) {
+      if (!current()) return;
+      const value = error.status === 409 ? "Another analyzed sample is running. No request was queued."
+        : error.status === 410 ? "Analyzed sample expired."
+          : "Analyzed sample unavailable. Required local analytics and decoder prerequisites may be missing.";
+      clearSample(value);
+    }
+    try {
+      expiry(60);
+      const admitted = await request(base, { method: "POST", signal });
+      if (!current()) return;
+      if (admitted.status !== "pending" || !/^[A-Za-z0-9_-]{32}$/.test(admitted.ticket)) throw new ApiError(503);
+      expiry(admitted.expires_in_seconds);
+      async function poll() {
+        try {
+          const data = await request(`${base}/${admitted.ticket}`, { signal, sample: true, ticket: admitted.ticket });
+          if (!current()) return;
+          expiry(data.expires_in_seconds);
+          if (data.status === "pending") {
+            state.sampleTimer = setTimeout(() => { if (current()) void poll(); }, 1000);
+          } else if (data.status === "ready") {
+            paintSample(data); state.sampleBusy = false;
+            $("request-sample").disabled = currentCamera()?.analytics_status !== "sample_available";
+          } else throw new ApiError(503);
+        } catch (error) { failed(error); }
+      }
+      await poll();
+    } catch (error) { failed(error); }
   }
 
   function currentCamera() {
@@ -114,6 +246,7 @@
   }
 
   function clearWorkspace(reason = "") {
+    clearSample();
     state.sessionEpoch += 1;
     state.selectionEpoch += 1;
     state.historyEpoch += 1;
@@ -137,11 +270,7 @@
     $("workspace").hidden = true;
     $("sign-in").hidden = false;
     $("password").value = "";
-    $("add-camera-form").reset();
-    $("new-camera-name").readOnly = false;
-    $("new-camera-host").readOnly = false;
-    state.dialogMode = "add";
-    if ($("add-camera-dialog").open) $("add-camera-dialog").close();
+    closeAddCamera();
     $("camera-list").replaceChildren();
     $("history-list").replaceChildren();
     $("camera-search").value = "";
@@ -170,6 +299,7 @@
   async function signOut() {
     if (state.signingOut) return;
     state.signingOut = true;
+    clearSample();
     const token = state.token;
     state.sessionEpoch += 1;
     state.selectionEpoch += 1;
@@ -247,14 +377,15 @@
       const status = statusDetails(camera);
       $("connection-badge").textContent = status.text;
       $("connection-badge").className = `status-badge ${status.style}`;
-      $("analytics-state").textContent = camera.analytics_status === "active"
-        ? "Person detection active" : camera.analytics_status === "unavailable"
-          ? "Person detection unavailable" : "Person detection not configured";
+      $("analytics-state").textContent = camera.analytics_status === "sample_available"
+        ? "Single analyzed samples available" : camera.analytics_status === "busy"
+          ? "An analyzed sample is running" : "Analyzed samples unavailable";
       if (status.style === "offline" && state.view === "live" && state.media) {
         livePlaceholder("Camera disconnected", "Live video will return when the camera reconnects. Recording history is still available.", true);
         message("live-state", "Camera disconnected");
       }
     } else $("analytics-state").textContent = "";
+    $("request-sample").disabled = state.sampleBusy || !camera || camera.analytics_status !== "sample_available";
   }
 
   function renderWorkerStatus() {
@@ -275,10 +406,14 @@
       state.workerStatus = ["ready", "unavailable", "disk_full"].includes(data.worker_status) ? data.worker_status : "ready";
       renderWorkerStatus();
       state.cameras = data.cameras.filter((camera) => camera && typeof camera.device_id === "string" && typeof camera.name === "string");
+      if (state.sampleGeneration !== null && (currentCamera()?.analytics_generation !== state.sampleGeneration || state.workerStatus === "unavailable")) {
+        clearSample("Camera source changed. Request a new sample.");
+      }
       renderCameras();
       if (state.selected && !currentCamera()) {
         state.selectionEpoch += 1;
         state.selectionController?.abort();
+        clearSample();
         stopLive(); stopPlayback();
         state.selected = null; state.media = null;
         resetHistory(); renderCameras();
@@ -287,6 +422,7 @@
       if (selectFirst && !state.selected && state.cameras.length) await selectCamera(state.cameras[0].device_id);
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
+      clearSample("Camera state is unavailable. Request a new sample after it recovers.");
       $("camera-list-message").textContent = apiMessage(error, "Camera list unavailable. Select refresh to try again.");
     }
   }
@@ -309,6 +445,7 @@
 
   async function selectCamera(deviceId) {
     if (!state.token || state.signingOut) return;
+    clearSample();
     state.selectionController?.abort();
     state.selectionController = new AbortController();
     const epoch = ++state.selectionEpoch;
@@ -422,6 +559,7 @@
 
   function setView(view) {
     if (state.view === view) return;
+    clearSample();
     state.view = view;
     $("live-panel").hidden = view !== "live";
     $("history-panel").hidden = view !== "history";
@@ -655,6 +793,9 @@
   $("sign-out-button").addEventListener("click", () => void signOut());
   $("refresh-cameras").addEventListener("click", () => void refreshCameras(true));
   $("camera-search").addEventListener("input", renderCameras);
+  window.addEventListener("pagehide", () => clearSample());
+  $("request-sample").addEventListener("click", () => void requestSample());
+  $("clear-sample").addEventListener("click", () => clearSample("Sample cleared. Native work may still be finishing."));
   $("live-tab").addEventListener("click", () => setView("live"));
   $("history-tab").addEventListener("click", () => setView("history"));
   $("retry-live").addEventListener("click", () => { if (state.selected) void selectCamera(state.selected); });
@@ -691,13 +832,24 @@
   $("playback-video").addEventListener("playing", () => message("playback-message", "Recorded video · Select a new start time to seek to another point."));
   $("playback-video").addEventListener("error", () => { if (state.token && state.selectedSpan) message("playback-message", "Playback is unavailable. Refresh history or select another interval.", true); });
 
-  function closeAddCamera() { $("new-camera-source").value = ""; $("add-camera-dialog").close(); }
+  function resetCameraSetup() {
+    state.dialogController?.abort();
+    state.dialogController = null;
+    $("add-camera-form").reset();
+    $("new-camera-name").readOnly = false;
+    $("new-camera-host").readOnly = false;
+    $("save-camera").disabled = false;
+    state.dialogMode = "add";
+  }
+  function closeAddCamera() { resetCameraSetup(); $("add-camera-dialog").close(); }
   function openCameraSetup(mode) {
     if (state.account?.role !== "administrator") return;
     const camera = mode === "update" ? currentCamera() : null;
     if (mode === "update" && !camera) return;
+    resetCameraSetup();
+    state.dialogEpoch += 1;
     state.dialogMode = mode;
-    $("add-camera-form").reset(); message("add-camera-message", "");
+    message("add-camera-message", "");
     $("new-camera-name").readOnly = mode === "update";
     $("new-camera-host").readOnly = mode === "update";
     $("add-camera-title").textContent = mode === "update" ? "Update camera source" : "Add a camera";
@@ -716,41 +868,53 @@
   $("update-source-button").addEventListener("click", () => openCameraSetup("update"));
   $("close-add-camera").addEventListener("click", closeAddCamera);
   $("cancel-add-camera").addEventListener("click", closeAddCamera);
+  $("add-camera-dialog").addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeAddCamera();
+  });
   $("add-camera-dialog").addEventListener("close", () => {
-    $("add-camera-form").reset();
-    $("new-camera-name").readOnly = false;
-    $("new-camera-host").readOnly = false;
-    state.dialogMode = "add";
+    // Native close events are queued and may arrive after a new dialog opens.
+    if (!$("add-camera-dialog").open) resetCameraSetup();
   });
   $("add-camera-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (state.account?.role !== "administrator") return;
+    clearSample("Camera configuration is changing. Request a new sample afterward.");
+    if (state.account?.role !== "administrator" || !$("add-camera-dialog").open || state.dialogController) return;
     const epoch = state.sessionEpoch;
+    const dialogEpoch = state.dialogEpoch;
+    const controller = new AbortController();
+    state.dialogController = controller;
+    const isCurrent = () => epoch === state.sessionEpoch && dialogEpoch === state.dialogEpoch
+      && state.dialogController === controller && $("add-camera-dialog").open;
     const updating = state.dialogMode === "update";
     const camera = { name: $("new-camera-name").value.trim(), host: $("new-camera-host").value.trim(), source_uri: $("new-camera-source").value.trim() };
     $("new-camera-source").value = "";
     $("save-camera").disabled = true;
     message("add-camera-message", updating ? "Updating source and reconnecting…" : "Saving camera and connecting…");
     try {
-      const created = await request("/api/v1/operator/cameras", { method: "POST", body: camera });
-      if (epoch !== state.sessionEpoch) return;
+      const created = await request("/api/v1/operator/cameras", { method: "POST", body: camera, signal: controller.signal });
+      if (!isCurrent()) return;
       closeAddCamera();
       notice(updating
         ? "Camera source updated. Live video and recording will reconnect."
         : "Camera saved. The live connection and recording status will update as it connects.");
       await refreshCameras();
+      if (epoch !== state.sessionEpoch || dialogEpoch !== state.dialogEpoch) return;
       const deviceId = created.device_id || created.camera?.device_id;
       if (deviceId) await selectCamera(deviceId);
     } catch (error) {
-      if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
+      if (error.name === "AbortError" || !isCurrent()) return;
       message("add-camera-message", error.status === 422
         ? "Check the camera IP address and RTSP stream. Enter the stream address again to retry."
         : error.status === 409 ? "This camera is already configured. Refresh the camera list."
           : apiMessage(error, "Camera setup failed. Enter the stream address again and retry."), true);
     } finally {
       camera.source_uri = "";
-      $("new-camera-source").value = "";
-      $("save-camera").disabled = false;
+      if (isCurrent()) {
+        state.dialogController = null;
+        $("new-camera-source").value = "";
+        $("save-camera").disabled = false;
+      }
     }
   });
 

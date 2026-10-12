@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import threading
 import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,10 +13,31 @@ import uvicorn
 
 from k5vision.identity_state import load_identity_state
 from k5vision.main import create_app
+from k5vision.operator_product_analytics import configured_sample_coordinator
 from k5vision.operator_product_api import install_operator_product_api
 from k5vision.operator_product_service import OperatorProductError, OperatorProductService
 from k5vision.operator_product_state import OperatorCameraStore
 from k5vision.operator_profile_lock import OperatorProfileLock
+
+# Keep active and unresolved leases reachable independently of application GC.
+# Admission reserves a slot before lock acquisition, so failures cannot overflow
+# this bound. No finalizer closes an unresolved lease; process exit is recovery.
+_PRODUCT_LEASE_LIMIT = 64
+_PRODUCT_LEASES: dict[int, OperatorProfileLock] = {}
+_PRODUCT_LEASE_GUARD = threading.Lock()
+
+
+def _own_product_lease(lease: OperatorProfileLock) -> None:
+    with _PRODUCT_LEASE_GUARD:
+        if id(lease) in _PRODUCT_LEASES or len(_PRODUCT_LEASES) >= _PRODUCT_LEASE_LIMIT:
+            raise OperatorProductError("Operator profile ownership capacity unavailable")
+        _PRODUCT_LEASES[id(lease)] = lease
+
+
+def _release_product_lease(lease: OperatorProfileLock) -> None:
+    lease.close()
+    with _PRODUCT_LEASE_GUARD:
+        _PRODUCT_LEASES.pop(id(lease), None)
 
 
 def create_operator_product_app(
@@ -36,8 +58,14 @@ def create_operator_product_app(
     cameras = OperatorCameraStore(
         identity.directory, identity.site_id, registry=application.state.device_registry
     )
+    analytics = configured_sample_coordinator()
+    service.analytics_invalidator = analytics.invalidate
     install_operator_product_api(
-        application, cameras=cameras, service=service, public_port=service.public_port
+        application,
+        cameras=cameras,
+        service=service,
+        public_port=service.public_port,
+        analytics=analytics,
     )
     previous_lifespan = application.router.lifespan_context
     profile_lock = OperatorProfileLock(identity.directory)
@@ -45,8 +73,14 @@ def create_operator_product_app(
     @asynccontextmanager
     async def lifespan(app):
         async with previous_lifespan(app):
+            retain_profile = False
+            profile_acquired = False
+            lease_reserved = False
             try:
+                _own_product_lease(profile_lock)
+                lease_reserved = True
                 profile_lock.acquire()
+                profile_acquired = True
                 await service.start(cameras.list_sources())
                 if open_browser:
                     asyncio.get_running_loop().call_later(
@@ -54,15 +88,37 @@ def create_operator_product_app(
                     )
                 yield
             finally:
+                cleanup_error = None
+                try:
+                    await analytics.aclose()
+                except BaseException as exc:
+                    # Coordinator cancellation is propagated only after its drain.
+                    if not isinstance(exc, asyncio.CancelledError):
+                        retain_profile = profile_acquired
+                    cleanup_error = exc
                 try:
                     await service.stop()
-                finally:
+                except BaseException as exc:
+                    # A failed or interrupted native stop cannot release exclusivity.
+                    retain_profile = profile_acquired
+                    cleanup_error = exc
+                try:
+                    cameras.close()
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                if lease_reserved and not retain_profile:
                     try:
-                        cameras.close()
-                    finally:
-                        profile_lock.close()
+                        _release_product_lease(profile_lock)
+                    except BaseException as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                if cleanup_error is not None:
+                    raise cleanup_error from None
 
     application.router.lifespan_context = lifespan
+    application.state.operator_profile_lock = profile_lock
+    application.state.operator_product_analytics = analytics
     application.state.operator_product_service = service
     application.state.operator_camera_store = cameras
     return application
