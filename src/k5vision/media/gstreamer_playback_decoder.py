@@ -127,6 +127,11 @@ class _CtypesGStreamerBackend:
             )
 
         self._dll_directory = None
+        self._pipeline = ctypes.c_void_p()
+        self._source = ctypes.c_void_p()
+        self._sink = ctypes.c_void_p()
+        self._closed = False
+        self._cleanup_failed = False
         add_dll_directory = getattr(os, "add_dll_directory", None)
         if callable(add_dll_directory):
             try:
@@ -137,6 +142,8 @@ class _CtypesGStreamerBackend:
                     "native decoder runtime is unavailable",
                 ) from None
 
+        initialized = False
+        self._initializing = True
         try:
             self._core = loader(str(_find_runtime_library(bin_root, _CORE_FILENAMES)))
             self._app = loader(str(_find_runtime_library(bin_root, _APP_FILENAMES)))
@@ -144,20 +151,23 @@ class _CtypesGStreamerBackend:
             self._max_frame_bytes = max_frame_bytes
             self._max_frames_per_push = max_frames_per_push
             self._pull_timeout_ns = pull_timeout_ms * 1_000_000
-            self._pipeline = ctypes.c_void_p()
-            self._source = ctypes.c_void_p()
-            self._sink = ctypes.c_void_p()
-            self._closed = False
             self._build_pipeline(payload_type)
+            initialized = True
         except NativePlaybackDecoderError:
-            self._close_dll_directory()
             raise
         except (AttributeError, OSError, ValueError, TypeError):
-            self._close_dll_directory()
             raise NativePlaybackDecoderError(
                 NativePlaybackDecoderErrorCode.NATIVE_FAILURE,
                 "native decoder initialization failed",
             ) from None
+        finally:
+            if not initialized:
+                try:
+                    self.close()
+                except Exception:
+                    # Teardown must not replace the primary initialization failure.
+                    pass
+            self._initializing = False
 
     def _bind_signatures(self) -> None:
         self._core.gst_init_check.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
@@ -227,19 +237,15 @@ class _CtypesGStreamerBackend:
                 "native decoder pipeline could not be created",
             )
         self._pipeline = ctypes.c_void_p(pipeline)
-        source = self._core.gst_bin_get_by_name(self._pipeline, b"k5src")
-        sink = self._core.gst_bin_get_by_name(self._pipeline, b"k5sink")
-        if not source or not sink:
-            self.close()
+        self._source = ctypes.c_void_p(self._core.gst_bin_get_by_name(self._pipeline, b"k5src"))
+        self._sink = ctypes.c_void_p(self._core.gst_bin_get_by_name(self._pipeline, b"k5sink"))
+        if not self._source or not self._sink:
             raise NativePlaybackDecoderError(
                 NativePlaybackDecoderErrorCode.NATIVE_FAILURE,
                 "native decoder endpoints are unavailable",
             )
-        self._source = ctypes.c_void_p(source)
-        self._sink = ctypes.c_void_p(sink)
         state_result = self._core.gst_element_set_state(self._pipeline, _GST_STATE_PLAYING)
         if state_result == _GST_STATE_CHANGE_FAILURE:
-            self.close()
             raise NativePlaybackDecoderError(
                 NativePlaybackDecoderErrorCode.NATIVE_FAILURE,
                 "native decoder pipeline failed to start",
@@ -343,11 +349,21 @@ class _CtypesGStreamerBackend:
         if handle is not None:
             try:
                 handle.close()
-            except OSError:
-                pass
+            except Exception:
+                raise NativePlaybackDecoderError(
+                    NativePlaybackDecoderErrorCode.NATIVE_FAILURE,
+                    "native decoder cleanup failed",
+                ) from None
 
     def close(self) -> None:
         if getattr(self, "_closed", True):
+            if getattr(self, "_cleanup_failed", False) and not getattr(
+                self, "_initializing", False
+            ):
+                raise NativePlaybackDecoderError(
+                    NativePlaybackDecoderErrorCode.NATIVE_FAILURE,
+                    "native decoder cleanup failed",
+                ) from None
             self._close_dll_directory()
             return
         self._closed = True
@@ -357,18 +373,30 @@ class _CtypesGStreamerBackend:
         self._pipeline = ctypes.c_void_p()
         self._source = ctypes.c_void_p()
         self._sink = ctypes.c_void_p()
+        failed = False
         if pipeline:
             try:
-                self._core.gst_element_set_state(pipeline, _GST_STATE_NULL)
-            except (AttributeError, OSError, ValueError):
-                pass
+                result = self._core.gst_element_set_state(pipeline, _GST_STATE_NULL)
+                failed = result == _GST_STATE_CHANGE_FAILURE
+            except Exception:
+                failed = True
         for item in (source, sink, pipeline):
             if item:
                 try:
                     self._core.gst_object_unref(item)
-                except (AttributeError, OSError, ValueError):
-                    pass
-        self._close_dll_directory()
+                except Exception:
+                    failed = True
+        try:
+            self._close_dll_directory()
+        except NativePlaybackDecoderError:
+            failed = True
+        self._cleanup_failed = failed
+        # Subclass builders may close before raising their own startup failure.
+        if failed and not getattr(self, "_initializing", False):
+            raise NativePlaybackDecoderError(
+                NativePlaybackDecoderErrorCode.NATIVE_FAILURE,
+                "native decoder cleanup failed",
+            ) from None
 
 
 class GStreamerNativePlaybackDecoder:
