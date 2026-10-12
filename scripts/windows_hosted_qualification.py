@@ -439,6 +439,9 @@ def run_owned(arguments, *, cwd, env, work, state, seconds):
     except BaseException as error:
         original = error
     finally:
+        # A refused or incomplete sample may still have observed a higher RSS.
+        # Preserve that evidence even when admission or cleanup subsequently fails.
+        state["peak_rss_bytes"] = max(state["peak_rss_bytes"], resources.observed_peak_rss_bytes)
         try:
             if owned is not None:
                 owned.close()
@@ -1186,6 +1189,7 @@ COMMIT_LIMIT = 3 * GIB
 ACTIVE_LIMIT = 32
 SAMPLE_INTERVAL = 0.250
 STALE_SECONDS = 1.0
+MAX_SAMPLE_ATTEMPTS = 3
 MAX_RETAINED_BIRTHS = 4096  # Evidence storage bound, not an active-process limit.
 U32, U64, SIZE, HANDLE = c.c_uint32, c.c_uint64, c.c_size_t, c.c_void_p
 
@@ -1331,6 +1335,7 @@ class NativeMetrics:
             "IsProcessInJob": ([HANDLE, HANDLE, c.POINTER(c.c_int32)], c.c_int32),
             "OpenProcess": ([U32, c.c_int32, U32], HANDLE),
             "GetProcessTimes": ([HANDLE] + [c.c_void_p] * 4, c.c_int32),
+            "WaitForSingleObject": ([HANDLE, U32], U32),
             "K32GetProcessMemoryInfo": ([HANDLE, c.c_void_p, U32], c.c_int32),
             "GetSystemTimes": ([c.c_void_p] * 3, c.c_int32),
             "GlobalMemoryStatusEx": ([c.c_void_p], c.c_int32),
@@ -1419,13 +1424,15 @@ class NativeMetrics:
         return set(result)
 
     def open_member(self, pid, job):
-        # QUERY_INFORMATION | VM_READ. No terminate, write, injection or all-access.
-        handle = self.k.OpenProcess(0x0400 | 0x0010, False, pid)
+        # QUERY_INFORMATION | VM_READ | SYNCHRONIZE, for zero-time state reads only.
+        # No terminate, write, injection or all-access rights.
+        handle = self.k.OpenProcess(0x0400 | 0x0010 | 0x00100000, False, pid)
         resource_need(handle)
         try:
             resource_need(self.belongs(handle, job), "ownership_unproven")
-            birth, exited = self.identity(handle)
-            resource_need(exited == 0, "membership_changed")
+            birth, _ = self.identity(handle)
+            # A proven owned process may exit after the membership read. Keep its
+            # handle until Job drain; the sampler must reconcile its departure.
             return handle, birth
         except BaseException:
             self.close_handle(handle)
@@ -1439,7 +1446,11 @@ class NativeMetrics:
             )
         )
         resource_need(birth.value > 0)
-        return birth.value, exit_time.value
+        # GetProcessTimes leaves exit_time undefined while the process is live.
+        # Only the retained process object's signal state proves termination.
+        state = self.k.WaitForSingleObject(handle, 0)
+        resource_need(state in (0, 258), "process_wait_failed")
+        return birth.value, state == 0
 
     def rss(self, handle):
         value = MemoryCounters()
@@ -1534,10 +1545,11 @@ class QualificationResources:
         self.job = None
         self.closed = self.failed = False
         self.cleanup_complete = False
+        self.observed_peak_rss_bytes = 0
         self.final_cpu_seconds = self.final_active = self.final_total = None
         self.handles = {}  # pid -> (read-only process handle, creation FILETIME)
         self.observed_listeners = set()
-        self.last_start = self.last_cpu = None
+        self.last_start = self.last_cpu = self.last_total = None
         self.host_seed_at = clock()
         self.host_seed = self.native.host(disk_root)[2]
 
@@ -1580,6 +1592,7 @@ class QualificationResources:
                 resource_need(
                     owner.final_cpu_seconds >= 0
                     and (owner.last_cpu is None or owner.final_cpu_seconds >= owner.last_cpu)
+                    and (owner.last_total is None or owner.final_total >= owner.last_total)
                 )
                 return state
 
@@ -1617,36 +1630,85 @@ class QualificationResources:
             resource_need(0 < started - self.last_start <= STALE_SECONDS, "resource_evidence_stale")
         resource_need(0 < started - self.host_seed_at <= STALE_SECONDS, "host_cpu_evidence_stale")
         self.native.parent_outside(self.job)
-        before = self.native.accounting(self.job)
-        members = self.native.members(self.job)
-        resource_need(before[1] == len(members) <= ACTIVE_LIMIT, "membership_changed")
-        rss = 0
-        for pid in sorted(members):
-            if pid not in self.handles:
-                resource_need(len(self.handles) < MAX_RETAINED_BIRTHS, "birth_evidence_limit")
-                self.handles[pid] = self.native.open_member(pid, self.job)
+
+        def fresh():
+            resource_need(0 <= self.clock() - started <= STALE_SECONDS, "resource_evidence_stale")
+
+        def accounting():
+            observed = self.native.accounting(self.job)
+            resource_need(
+                (self.last_cpu is None or observed[2] >= self.last_cpu)
+                and (self.last_total is None or observed[0] >= self.last_total)
+            )
+            # Preserve every cumulative observation, including discarded attempts,
+            # so final Job drain must also account for the exited children.
+            self.last_total, self.last_cpu = observed[0], observed[2]
+            return observed
+
+        def exited(pid):
             handle, birth = self.handles[pid]
             resource_need(self.native.belongs(handle, self.job), "ownership_unproven")
-            actual, exited = self.native.identity(handle)
-            resource_need(actual == birth and not exited, "pid_reuse_or_exit")
-            rss += self.native.rss(handle)
-        listeners = self.native.listeners(members)
-        # Recheck every retained current handle after the listener and RSS reads.
-        for pid in members:
-            handle, birth = self.handles[pid]
-            actual, exited = self.native.identity(handle)
+            actual, signaled = self.native.identity(handle)
+            resource_need(actual == birth, "pid_reuse_or_exit")
+            return signaled
+
+        rss, listeners = 0, set()
+        initial_members = remaining_members = sample_total = None
+        for attempt in range(MAX_SAMPLE_ATTEMPTS):
+            fresh()
+            before = accounting()
+            members = self.native.members(self.job)
+            resource_need(before[1] == len(members) <= ACTIVE_LIMIT, "membership_changed")
+            if initial_members is None:
+                initial_members, sample_total = set(members), before[0]
+                remaining_members = set(members)
             resource_need(
-                actual == birth and not exited and self.native.belongs(handle, self.job),
-                "pid_reuse_or_exit",
+                before[0] == sample_total and members <= remaining_members, "membership_changed"
             )
-        after = self.native.accounting(self.job)
-        resource_need(
-            self.native.members(self.job) == members and before[:2] == after[:2],
-            "membership_changed",
-        )
-        resource_need(
-            after[2] >= before[2] and (self.last_cpu is None or after[2] >= self.last_cpu)
-        )
+            # Between attempts, a previously retained survivor may also exit.
+            # Every absence still needs exact identity, ownership and signal proof.
+            for pid in initial_members - members:
+                resource_need(pid in self.handles and exited(pid), "membership_changed")
+            departed, attempt_rss = set(), 0
+            for pid in sorted(members):
+                if pid not in self.handles:
+                    resource_need(len(self.handles) < MAX_RETAINED_BIRTHS, "birth_evidence_limit")
+                    self.handles[pid] = self.native.open_member(pid, self.job)
+                if exited(pid):
+                    departed.add(pid)
+                else:
+                    # An RSS API failure remains fatal even if the process exits.
+                    attempt_rss += self.native.rss(self.handles[pid][0])
+                    self.observed_peak_rss_bytes = max(self.observed_peak_rss_bytes, attempt_rss)
+                    resource_need(attempt_rss <= RSS_LIMIT, "owned_rss_exceeded")
+            rss = max(rss, attempt_rss)
+            # Include departing PIDs and keep all evidence from discarded attempts.
+            listeners.update(self.native.listeners(initial_members))
+            self.observed_listeners.update(listeners)
+            resource_need(len(self.observed_listeners) <= 4096, "listener_evidence_limit")
+            for pid in members:
+                signaled = exited(pid)
+                resource_need(pid not in departed or signaled, "pid_reuse_or_exit")
+                if signaled:
+                    departed.add(pid)
+            after = accounting()
+            survivors = self.native.members(self.job)
+            resource_need(
+                after[0] == sample_total
+                and survivors == members - departed
+                and after[1] == len(survivors),
+                "membership_changed",
+            )
+            for pid in survivors:
+                resource_need(not exited(pid), "membership_changed")
+            fresh()
+            if not departed:
+                break
+            # Only proved departures are retryable. No API errors, new births,
+            # unknown identities or missing evidence reach this branch. Require a
+            # stable final snapshot within the original deadline, never a mixed one.
+            resource_need(attempt + 1 < MAX_SAMPLE_ATTEMPTS, "resource_evidence_unstable")
+            remaining_members = survivors
         available, total, times, disk = self.native.host(self.disk_root)
         delta = tuple(b - a for a, b in zip(self.host_seed, times, strict=True))
         elapsed = delta[1] + delta[2]  # GetSystemTimes kernel includes idle.
@@ -1668,8 +1730,6 @@ class QualificationResources:
             disk,
             len(listeners),
         )
-        self.observed_listeners.update(listeners)
-        resource_need(len(self.observed_listeners) <= 4096, "listener_evidence_limit")
         self.last_start, self.last_cpu = started, after[2]
         self.host_seed, self.host_seed_at = times, measured
         return snapshot

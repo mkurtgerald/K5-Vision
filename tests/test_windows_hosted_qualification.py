@@ -51,7 +51,7 @@ class FakeJob:
             total_user_time=20_000_000,
             total_kernel_time=10_000_000,
             active_processes=0,
-            total_processes=2,
+            total_processes=getattr(self, "total_processes", 2),
         )
 
     def close(self):
@@ -65,6 +65,7 @@ class FakeNative:
         self.identities = {11: (101, 0), 12: (102, 0)}
         self.rss_each = 100
         self.cpu = 1.5
+        self.total = 2
         self.times = 0
         self.closed_handles = []
         self.configured = False
@@ -86,7 +87,7 @@ class FakeNative:
         if self.fail == "accounting":
             raise ResourceFailure("resource_evidence_unavailable")
         self.read_count += 1
-        return (2, len(self.pids), self.cpu)
+        return (self.total, len(self.pids), self.cpu)
 
     def members(self, job):
         if self.fail == "membership" and self.read_count > 1:
@@ -221,10 +222,10 @@ class AdapterTests(unittest.TestCase):
             owner.sample()
         self.assertTrue(self.job.drained)
 
-    def test_process_exit_race_fails_closed(self):
+    def test_signaled_process_still_in_final_membership_fails_closed(self):
         owner = self.make()
         self.native.identities[11] = (101, 222)
-        with self.assertRaisesRegex(ResourceFailure, "pid_reuse"):
+        with self.assertRaisesRegex(ResourceFailure, "membership_changed"):
             owner.sample()
 
     def test_sampled_rss_ceiling(self):
@@ -313,9 +314,414 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(callable(NativeMetrics))
 
 
+class StableSnapshotFakeTests(unittest.TestCase):
+    """All lifecycle changes are scripted fake observations; no native processes."""
+
+    make = AdapterTests.make
+
+    def expire(self, pid=11):
+        birth, _ = self.native.identities[pid]
+        self.native.identities[pid] = (birth, True)
+        self.native.pids.remove(pid)
+
+    def during_listeners(self, callback):
+        original = self.native.listeners
+        calls = []
+
+        def listeners(pids):
+            rows = original(pids)
+            if not self.job.drained:
+                calls.append(set(pids))
+                return callback(len(calls), rows)
+            return rows
+
+        self.native.listeners = listeners
+        return calls
+
+    def test_exit_before_rss_requires_absence_and_then_stable_snapshot(self):
+        owner = self.make()
+        original = self.native.open_member
+
+        def opened(pid, job):
+            value = original(pid, job)
+            if pid == 11:
+                self.expire(pid)
+            return value
+
+        self.native.open_member = opened
+        snapshot = owner.sample()
+        self.assertEqual((snapshot.active_processes, snapshot.rss_bytes), (1, 100))
+        self.assertEqual(self.native.read_count, 4)
+        self.assertEqual(set(owner.handles), {11, 12})
+        self.assertEqual(self.native.closed_handles, [])
+        owner.close()
+        self.assertEqual(self.native.closed_handles, [11, 12])
+
+    def test_exit_during_rss_preserves_observed_high_water(self):
+        owner = self.make()
+        original = self.native.rss
+
+        def rss(handle):
+            result = original(handle)
+            if handle == 11:
+                self.expire(handle)
+            return result
+
+        self.native.rss = rss
+        snapshot = owner.sample()
+        self.assertEqual((snapshot.active_processes, snapshot.rss_bytes), (1, 200))
+        self.assertEqual(self.native.read_count, 4)
+
+    def test_exit_after_listener_read_preserves_listener_union_and_cumulative_cpu(self):
+        owner = self.make()
+        row = (11, 2, b"\x7f\0\0\1", 9000)
+
+        def changed(number, rows):
+            if number == 1:
+                self.expire()
+                self.native.cpu = 2.5
+                return {row}
+            return set()
+
+        calls = self.during_listeners(changed)
+        snapshot = owner.sample()
+        self.assertEqual(snapshot.rss_bytes, 200)
+        self.assertEqual(snapshot.owned_loopback_listeners, 1)
+        self.assertEqual(snapshot.job_cpu_seconds, 2.5)
+        self.assertEqual(snapshot.total_births, 2)
+        self.assertEqual(owner.observed_listeners, {row})
+        self.assertEqual(calls, [{11, 12}, {11, 12}])
+        owner.close()
+        self.assertEqual(owner.final_cpu_seconds, 3)
+
+    def test_exit_after_identity_pass_is_not_an_unproved_retry(self):
+        owner = self.make()
+        original = self.native.members
+        calls = []
+
+        def members(job):
+            calls.append(1)
+            if len(calls) == 2:
+                self.expire()
+            return original(job)
+
+        self.native.members = members
+        with self.assertRaisesRegex(ResourceFailure, "membership_changed"):
+            owner.sample()
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(self.job.drained)
+
+    def test_survivor_exit_during_final_state_recheck_refuses(self):
+        owner = self.make()
+        original = self.native.identity
+        reads = {11: 0, 12: 0}
+
+        def identity(handle):
+            reads[handle] += 1
+            if handle == 11 and reads[handle] == 3:
+                self.expire(handle)
+            return original(handle)
+
+        self.native.identity = identity
+        with self.assertRaisesRegex(ResourceFailure, "membership_changed"):
+            owner.sample()
+        self.assertEqual(self.native.read_count, 2)
+
+    def test_changed_creation_on_signaled_handle_never_retries(self):
+        owner = self.make()
+
+        def changed(number, rows):
+            self.expire()
+            self.native.identities[11] = (999, True)
+            return rows
+
+        calls = self.during_listeners(changed)
+        with self.assertRaisesRegex(ResourceFailure, "pid_reuse"):
+            owner.sample()
+        self.assertEqual(len(calls), 1)
+
+    def test_unexplained_departure_never_retries(self):
+        owner = self.make()
+
+        def changed(number, rows):
+            self.native.pids.remove(11)
+            return rows
+
+        calls = self.during_listeners(changed)
+        with self.assertRaisesRegex(ResourceFailure, "membership_changed"):
+            owner.sample()
+        self.assertEqual(len(calls), 1)
+
+    def test_new_birth_or_unknown_member_never_retries(self):
+        for total_increase, new_pid in ((True, False), (False, True), (True, True)):
+            with self.subTest(total_increase=total_increase, new_pid=new_pid):
+                owner = self.make()
+
+                def changed(number, rows, total_increase=total_increase, new_pid=new_pid):
+                    self.expire()
+                    if total_increase:
+                        self.native.total = 3
+                        self.job.total_processes = 3
+                    if new_pid:
+                        self.native.pids.add(13)
+                        self.native.identities[13] = (103, False)
+                    return rows
+
+                calls = self.during_listeners(changed)
+                with self.assertRaisesRegex(ResourceFailure, "membership_changed"):
+                    owner.sample()
+                self.assertEqual(len(calls), 1)
+
+    def test_reappearing_proved_departure_never_retries(self):
+        owner = self.make()
+        original = self.native.accounting
+
+        def accounting(job):
+            if self.native.read_count == 2:
+                self.native.pids.add(11)
+                self.native.identities[11] = (101, False)
+            return original(job)
+
+        self.native.accounting = accounting
+        calls = self.during_listeners(
+            lambda number, rows: (self.expire() if number == 1 else None) or rows
+        )
+        with self.assertRaisesRegex(ResourceFailure, "membership_changed"):
+            owner.sample()
+        self.assertEqual(len(calls), 1)
+
+    def test_three_changing_attempts_exhaust_without_returning_mixed_snapshot(self):
+        owner = self.make()
+        self.native.pids.add(13)
+        self.native.identities[13] = (103, False)
+        self.native.total = self.job.total_processes = 3
+
+        def changed(number, rows):
+            self.expire(10 + number)
+            return rows
+
+        calls = self.during_listeners(changed)
+        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unstable"):
+            owner.sample()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.native.read_count, 6)
+        self.assertTrue(owner.cleanup_complete)
+
+    def test_original_deadline_is_not_reset_between_attempts(self):
+        owner = self.make()
+
+        def changed(number, rows):
+            self.clock.value += 0.6 if number == 1 else 0.5
+            if number == 1:
+                self.expire()
+            return rows
+
+        calls = self.during_listeners(changed)
+        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_stale"):
+            owner.sample()
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(self.job.drained)
+
+    def test_rss_api_error_during_exit_is_fatal_without_retry(self):
+        owner = self.make()
+        reads = []
+
+        def rss(handle):
+            reads.append(handle)
+            self.expire(handle)
+            raise ResourceFailure("resource_evidence_unavailable")
+
+        self.native.rss = rss
+        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unavailable"):
+            owner.sample()
+        self.assertEqual(reads, [11])
+        self.assertEqual(self.native.read_count, 1)
+
+    def test_api_failure_after_proved_departure_is_not_retried(self):
+        owner = self.make()
+
+        def changed(number, rows):
+            self.expire()
+            raise ResourceFailure("process_wait_failed")
+
+        calls = self.during_listeners(changed)
+        with self.assertRaisesRegex(ResourceFailure, "process_wait_failed"):
+            owner.sample()
+        self.assertEqual(len(calls), 1)
+
+    def test_discarded_attempt_cannot_hide_rss_limit(self):
+        owner = self.make()
+        self.native.rss_each = GIB + 1
+        original = self.native.rss
+
+        def rss(handle):
+            value = original(handle)
+            if handle == 12:
+                self.expire(handle)
+            return value
+
+        self.native.rss = rss
+        with self.assertRaisesRegex(ResourceFailure, "owned_rss_exceeded"):
+            owner.sample()
+        self.assertEqual(self.native.read_count, 1)
+        self.assertEqual(owner.observed_peak_rss_bytes, 2 * GIB + 2)
+
+    def test_failed_retry_preserves_prior_attempt_peak(self):
+        owner = self.make()
+        self.native.rss_each = 300
+        original = self.native.rss
+        reads = []
+
+        def rss(handle):
+            reads.append(handle)
+            if len(reads) == 3:
+                raise ResourceFailure("resource_evidence_unavailable")
+            return original(handle)
+
+        self.native.rss = rss
+        self.during_listeners(lambda number, rows: (self.expire() if number == 1 else None) or rows)
+        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unavailable"):
+            owner.sample()
+        self.assertEqual(owner.observed_peak_rss_bytes, 600)
+        self.assertTrue(owner.cleanup_complete)
+
+    def test_observed_peak_never_decreases_across_samples(self):
+        owner = self.make()
+        self.assertEqual(owner.sample().rss_bytes, 200)
+        self.clock.value += 0.25
+        self.native.rss_each = 25
+        self.assertEqual(owner.sample().rss_bytes, 50)
+        self.assertEqual(owner.observed_peak_rss_bytes, 200)
+
+    def test_discarded_attempt_listener_union_limit_is_preserved(self):
+        owner = self.make()
+
+        def changed(number, rows):
+            if number == 1:
+                self.expire()
+                return {(11, 2, b"\x7f\0\0\1", port) for port in range(1, 4097)}
+            return {(12, 2, b"\x7f\0\0\1", 5000)}
+
+        calls = self.during_listeners(changed)
+        with self.assertRaisesRegex(ResourceFailure, "listener_evidence_limit"):
+            owner.sample()
+        self.assertEqual(len(calls), 2)
+
+    def test_departing_process_nonloopback_listener_is_not_retryable(self):
+        owner = self.make()
+
+        def changed(number, rows):
+            self.expire()
+            raise ResourceFailure("owned_listener_not_loopback")
+
+        calls = self.during_listeners(changed)
+        with self.assertRaisesRegex(ResourceFailure, "owned_listener_not_loopback"):
+            owner.sample()
+        self.assertEqual(len(calls), 1)
+
+    def test_cpu_regression_after_discarded_attempt_is_fatal(self):
+        owner = self.make()
+        original = self.native.accounting
+
+        def accounting(job):
+            if self.native.read_count == 2:
+                self.native.cpu = 2.0
+            return original(job)
+
+        self.native.accounting = accounting
+
+        def changed(number, rows):
+            self.expire()
+            self.native.cpu = 2.5
+            return rows
+
+        calls = self.during_listeners(changed)
+        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unavailable"):
+            owner.sample()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(owner.last_cpu, 2.5)
+
+    def test_cumulative_cpu_limit_survives_reconciled_departure(self):
+        owner = self.make()
+
+        def changed(number, rows):
+            if number == 1:
+                self.expire()
+                self.native.cpu = 2.5
+            return rows
+
+        self.during_listeners(changed)
+        with patch.object(guard.time, "monotonic", self.clock):
+            sample = guard.sample_values(owner)
+        self.assertEqual(sample["cpu_seconds"], 2.5)
+        with self.assertRaisesRegex(guard.Refusal, "cpu_limit"):
+            guard.admit_sample(sample, previous_cpu=898)
+
+
 class NativeBoundaryFakeTests(unittest.TestCase):
     def native(self):
         return NativeMetrics.__new__(NativeMetrics)
+
+    def process_native(self, *, wait=258, exit_time=987654321):
+        native = self.native()
+        calls = []
+
+        def times(handle, birth, exited, kernel, user):
+            for pointer, value in ((birth, 101), (exited, exit_time), (kernel, 0), (user, 0)):
+                ctypes.cast(pointer, ctypes.POINTER(guard.U64))[0] = value
+            return 1
+
+        def wait_for(handle, timeout):
+            calls.append((handle, timeout))
+            return wait
+
+        native.k = types.SimpleNamespace(GetProcessTimes=times, WaitForSingleObject=wait_for)
+        return native, calls
+
+    def test_live_state_uses_zero_time_wait_not_undefined_exit_filetime(self):
+        for undefined_exit in (0, 987654321, 2**64 - 1):
+            with self.subTest(exit_time=undefined_exit):
+                native, calls = self.process_native(exit_time=undefined_exit)
+                self.assertEqual(native.identity(77), (101, False))
+                self.assertEqual(calls, [(77, 0)])
+
+    def test_signaled_process_uses_zero_time_wait(self):
+        native, calls = self.process_native(wait=0)
+        self.assertEqual(native.identity(77), (101, True))
+        self.assertEqual(calls, [(77, 0)])
+
+    def test_failed_or_unexpected_process_wait_fails_closed(self):
+        for status in (0xFFFFFFFF, 0x80, 1, 259):
+            with self.subTest(status=status):
+                native, calls = self.process_native(wait=status)
+                with self.assertRaisesRegex(ResourceFailure, "process_wait_failed"):
+                    native.identity(77)
+                self.assertEqual(calls, [(77, 0)])
+
+    def test_open_member_only_adds_synchronize_and_retains_proven_exited_handle(self):
+        for wait in (0, 258):
+            with self.subTest(wait=wait):
+                native, waits = self.process_native(wait=wait)
+                opened = []
+                native.k.OpenProcess = lambda rights, inherit, pid, opened=opened: (
+                    opened.append((rights, inherit, pid)) or 77
+                )
+                native.belongs = lambda handle, job: handle == 77
+                native.close_handle = lambda handle: self.fail("Proven handle must be retained")
+                self.assertEqual(native.open_member(11, object()), (77, 101))
+                self.assertEqual(opened, [(0x00100410, False, 11)])
+                self.assertEqual(waits, [(77, 0)])
+
+    def test_open_member_wait_failure_closes_new_handle_and_refuses(self):
+        native, waits = self.process_native(wait=0xFFFFFFFF)
+        native.k.OpenProcess = lambda rights, inherit, pid: 77
+        native.belongs = lambda handle, job: True
+        closed = []
+        native.close_handle = closed.append
+        with self.assertRaisesRegex(ResourceFailure, "process_wait_failed"):
+            native.open_member(11, object())
+        self.assertEqual(closed, [77])
+        self.assertEqual(waits, [(77, 0)])
 
     def test_job_backstops_set_and_read_back(self):
         COMMIT_LIMIT, ACTIVE_LIMIT = guard.COMMIT_LIMIT, guard.ACTIVE_LIMIT
@@ -738,6 +1144,7 @@ class QualificationPolicyTests(unittest.TestCase):
                 self.final_cpu_seconds = 3
                 self.final_active = 0
                 self.cleanup_complete = True
+                self.observed_peak_rss_bytes = 0
 
             def job_factory(self):
                 return object()
@@ -746,6 +1153,7 @@ class QualificationPolicyTests(unittest.TestCase):
                 if clock[0] - self.last_sample_at < 0.25:
                     raise AssertionError("host CPU sample has zero accounting interval")
                 self.last_sample_at = clock[0]
+                self.observed_peak_rss_bytes = max(self.observed_peak_rss_bytes, 100)
                 return types.SimpleNamespace(
                     started_at=time.monotonic(),
                     host_total_bytes=8 * GIB,
@@ -796,6 +1204,75 @@ class QualificationPolicyTests(unittest.TestCase):
                 )
             self.assertEqual(state["cpu_seconds"], 5)
             self.assertFalse(state["pending_payload"])
+
+    def test_run_owned_preserves_peak_when_sampling_admission_or_cleanup_fails(self):
+        for failure in ("sampling", "admission", "cleanup"):
+            for previous_peak in (100, 4 * GIB):
+                with self.subTest(failure=failure, previous_peak=previous_peak):
+                    observed_peak = 2 * GIB + 1 if failure == "admission" else 700
+                    instances = []
+
+                    class Resources:
+                        def __init__(self, *args, instances=instances):
+                            instances.append(self)
+                            self.observed_peak_rss_bytes = 0
+                            self.final_cpu_seconds = 1
+                            self.final_active = 0
+                            self.cleanup_complete = True
+
+                        def job_factory(self):
+                            return object()
+
+                        def close(self, failure=failure):
+                            if failure == "cleanup":
+                                self.cleanup_complete = False
+                                raise ResourceFailure("owned_job_cleanup_failed")
+
+                    class Owned:
+                        def __init__(self, *args, instances=instances, **kwargs):
+                            instances[-1].before_release(instances[-1])
+                            self.process = types.SimpleNamespace(poll=lambda: 0, returncode=0)
+
+                        def close(self):
+                            pass
+
+                    def sample(resources, failure=failure, observed_peak=observed_peak):
+                        resources.observed_peak_rss_bytes = max(
+                            resources.observed_peak_rss_bytes, observed_peak
+                        )
+                        if failure == "sampling":
+                            raise ResourceFailure("resource_evidence_unavailable")
+                        result = self.sample()
+                        result["rss_bytes"] = observed_peak
+                        return result
+
+                    with tempfile.TemporaryDirectory() as temporary:
+                        state = dict(
+                            cpu_seconds=0,
+                            peak_rss_bytes=previous_peak,
+                            started_at=time.time(),
+                            all_owned_cleanup=True,
+                        )
+                        with (
+                            patch.object(guard, "QualificationResources", Resources),
+                            patch.object(
+                                guard,
+                                "common_module",
+                                return_value=types.SimpleNamespace(OwnedProcess=Owned),
+                            ),
+                            patch.object(guard, "sample_values", side_effect=sample),
+                            patch.object(guard.time, "sleep"),
+                            self.assertRaises((ResourceFailure, guard.Refusal)),
+                        ):
+                            guard.run_owned(
+                                ["never-executed"],
+                                cwd=ROOT,
+                                env={},
+                                work=Path(temporary),
+                                state=state,
+                                seconds=1,
+                            )
+                        self.assertEqual(state["peak_rss_bytes"], max(previous_peak, observed_peak))
 
 
 class CacheBootstrapTests(unittest.TestCase):
