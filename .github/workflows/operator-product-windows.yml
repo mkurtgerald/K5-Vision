@@ -58,6 +58,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+          if ($env:RUNNER_TEMP -match "['`r`n]" -or $env:RUNNER_TEMP -match '[\x00-\x1f]') { throw "Runner temporary path cannot be represented safely." }
           if ($env:RUNNER_TOOL_CACHE -notmatch '^[A-Za-z]:\\') { throw "Hosted toolcache must be a local absolute path." }
           $cacheRoot = [IO.Path]::GetFullPath($env:RUNNER_TOOL_CACHE)
           $bootstrapRoot = Join-Path $cacheRoot "Python\3.12.10\x64"
@@ -109,7 +110,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Isolated hosted qualification preparation failed." }
 
       - name: Install project and development dependencies
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 1 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 1 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           python -m pip install --upgrade pip
@@ -118,7 +119,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Project development installation failed" }
 
       - name: Verify and provision pinned native development tools
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 2 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 2 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           $mediaManifest = Get-Content -LiteralPath src/k5vision/data/mediamtx-donor-manifest.json -Raw | ConvertFrom-Json
@@ -217,7 +218,7 @@ jobs:
           "K5_DONOR_FFPROBE=$ffprobeExe" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
 
       - name: Build project wheel for native launcher acceptance
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 3 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 3 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           $wheelDirectory = Join-Path $env:GITHUB_WORKSPACE "operator-pilot-wheel"
@@ -232,14 +233,14 @@ jobs:
       - name: Run real native PowerShell launcher acceptance
         id: launcher_acceptance
         timeout-minutes: 6
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 4 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 4 '{0}'; exit $LASTEXITCODE"
         run: |
           python -m pytest tests/integration/test_operator_windows_launcher.py --no-cov -s -o faulthandler_timeout=120 --junitxml=operator-launcher-native-windows.xml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify native launcher acceptance receipt
         id: launcher_qualification
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 5 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 5 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           [xml]$report = Get-Content -LiteralPath operator-launcher-native-windows.xml -Raw
@@ -280,14 +281,14 @@ jobs:
 
       - name: Run product regressions, Windows Job ownership and assembled acceptance
         timeout-minutes: 6
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 6 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 6 '{0}'; exit $LASTEXITCODE"
         run: |
           python -m pytest tests/unit/test_mediamtx_provider.py tests/unit/test_operator_media_gateway.py tests/unit/test_operator_product_state.py tests/unit/test_operator_product_api.py tests/unit/test_operator_product_service.py tests/unit/test_operator_recording_storage.py tests/unit/test_operator_native_process.py tests/unit/test_operator_profile_lock.py tests/integration/test_operator_product_runtime.py --no-cov -s -o faulthandler_timeout=120 --junitxml=operator-product-native-windows.xml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify assembled native Windows product receipt
         id: qualification
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 7 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 7 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           [xml]$report = Get-Content -LiteralPath operator-product-native-windows.xml -Raw
@@ -318,7 +319,7 @@ jobs:
 
       - name: Remove owned native development tool downloads
         if: always()
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 8 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 8 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           if ([string]::IsNullOrEmpty($env:K5_DONOR_TOOL_ROOT)) { exit 0 }
@@ -335,7 +336,7 @@ jobs:
 
       - name: Build runnable Windows pilot package
         if: success() && steps.qualification.outcome == 'success' && steps.launcher_qualification.outcome == 'success'
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 9 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile operator --step 9 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           $pilotRoot = Join-Path $env:GITHUB_WORKSPACE "windows-operator-pilot"

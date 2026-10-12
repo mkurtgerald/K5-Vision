@@ -97,6 +97,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+          if ($env:RUNNER_TEMP -match "['`r`n]" -or $env:RUNNER_TEMP -match '[\x00-\x1f]') { throw "Runner temporary path cannot be represented safely." }
           if ($env:RUNNER_TOOL_CACHE -notmatch '^[A-Za-z]:\\') { throw "Hosted toolcache must be a local absolute path." }
           $cacheRoot = [IO.Path]::GetFullPath($env:RUNNER_TOOL_CACHE)
           $bootstrapRoot = Join-Path $cacheRoot "Python\3.12.10\x64"
@@ -148,7 +149,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Isolated hosted qualification preparation failed." }
 
       - name: Parse Windows alpha PowerShell
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 1 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 1 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           $failed = $false
@@ -168,7 +169,7 @@ jobs:
           if ($failed) { throw "Windows alpha PowerShell parse failed." }
 
       - name: Install targeted test dependencies
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 2 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 2 '{0}'; exit $LASTEXITCODE"
         run: |
           python -m pip install --upgrade pip
           if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }
@@ -176,7 +177,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }
 
       - name: Verify clean Windows alpha runtime dependency install
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 3 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 3 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           $probe = Join-Path $env:RUNNER_TEMP "k5-alpha-runtime-probe"
@@ -195,12 +196,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }
 
       - name: Run Windows alpha boundary regressions
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 4 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 4 '{0}'; exit $LASTEXITCODE"
         run: |
           pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py tests/test_app_resource_lifetime.py tests/test_windows_alpha_analytics.py tests/test_cli.py tests/test_installed_alpha_facade_witness.py -q --no-cov
 
       - name: Qualify Windows local recovery identity
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 5 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 5 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           $probe = Join-Path $env:RUNNER_TEMP "k5-alpha-runtime-probe"
@@ -239,7 +240,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Windows local recovery identity qualification failed." }
 
       - name: Verify exact candidate workflow and owned Windows relay boundary
-        shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 6 "{0}"
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 6 '{0}'; exit $LASTEXITCODE"
         env:
           K5_SETUP_PYTHON: ${{ steps.runtime_python.outputs.python-path }}
         run: |

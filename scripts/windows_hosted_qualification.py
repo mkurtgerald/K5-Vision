@@ -110,12 +110,13 @@ def admitted_body(profile, step, generated, runner_temp):
     generated = ordinary(generated)
     need(
         generated.parent == ordinary(runner_temp, directory=True)
-        and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", generated.name)
+        and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", generated.stem)
+        and generated.suffix == ".ps1"
         and generated.stat().st_size <= 1024**2,
         "step_path",
     )
     actual = canonical_body(generated.read_text(encoding="utf-8-sig"))
-    need(actual == expected[step]["body"], "step_body")
+    need(actual == POWERSHELL_PREFIX + expected[step]["body"] + POWERSHELL_SUFFIX, "step_body")
     need("scripts/windows_hosted_qualification.py" not in actual, "nested_guard")
     return expected[step]
 
@@ -1123,7 +1124,8 @@ def finish(profile):
         "owned_listeners": 0,
         "stage_count": len(state["finished_steps"]),
         "execution_boundary": (
-            "owned step payloads only; bootstrap supervisor and transport excluded"
+            "owned step payloads only; read-only selector, PowerShell launcher, "
+            "supervisor and transport excluded"
         ),
     }
     path = ROOT / f"hosted-{profile}-qualification.json"

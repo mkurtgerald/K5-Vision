@@ -587,8 +587,9 @@ class QualificationPolicyTests(unittest.TestCase):
         steps = guard.workflow_steps((ROOT / guard.PROFILES["alpha"]).read_text())
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            path = root / "11111111-2222-3333-4444-555555555555"
-            path.write_bytes(steps[1]["body"].replace("\n", "\r\n").encode())
+            path = root / "11111111-2222-3333-4444-555555555555.ps1"
+            wrapped = guard.POWERSHELL_PREFIX + steps[1]["body"] + guard.POWERSHELL_SUFFIX
+            path.write_bytes(wrapped.replace("\n", "\r\n").encode())
             self.assertEqual(guard.admitted_body("alpha", 1, path, root)["name"], steps[1]["name"])
             path.write_text(steps[1]["body"] + "Write-Output extra\n")
             with self.assertRaisesRegex(guard.Refusal, "step_body"):
@@ -597,6 +598,48 @@ class QualificationPolicyTests(unittest.TestCase):
                 guard.admitted_body("alpha", -1, path, root)
             with self.assertRaises(guard.Refusal):
                 guard.admitted_body("alpha", 999, path, root)
+
+    def test_shell_fields_obey_authoritative_literal_string_schema(self):
+        # actions/runner5f0b3ddc workflow schema blobc51b9f66e995edea6896f7c18b3337e2271d0942:
+        # run-step.shell -> non-empty-string, no context on this field or its ancestors.
+        schema = {"string": {"require-non-empty": True}}
+        self.assertNotIn("context", schema)
+
+        def admitted(value):
+            return isinstance(value, str) and bool(value) and "${{" not in value
+
+        self.assertFalse(admitted("${{ env.K5_BOOTSTRAP_PYTHON }} -I guard.py"))
+        for workflow in guard.PROFILES.values():
+            for line in (ROOT / workflow).read_text().splitlines():
+                if line.strip().startswith("shell:"):
+                    self.assertTrue(admitted(line.split("shell:", 1)[1].strip()), line)
+
+    def test_literal_launcher_format_and_materialization(self):
+        for profile, workflow in guard.PROFILES.items():
+            text = (ROOT / workflow).read_text()
+            shells = [
+                line.strip().split("shell: ", 1)[1]
+                for line in text.splitlines()
+                if "shell: powershell -NoProfile -NonInteractive -Command" in line
+            ]
+            self.assertEqual(len(shells), 6 if profile == "alpha" else 9)
+            for index, shell in enumerate(shells, 1):
+                path = "C:\\runner temp\\11111111-2222-3333-4444-555555555555.ps1"
+                # Runner uses C# string.Format: literal scriptblock braces must be doubled.
+                materialized = shell.format(path)
+                self.assertNotIn("{{", materialized)
+                self.assertIn("{ throw 'Cached bootstrap changed' }", materialized)
+                self.assertIn(f"--profile {profile} --step {index} '{path}'", materialized)
+                self.assertEqual(materialized.count(path), 1)
+                self.assertNotIn(". '" + path, materialized)
+                self.assertIn("& $env:K5_BOOTSTRAP_PYTHON -I -B -S", materialized)
+                self.assertIn("Get-FileHash", materialized)
+                self.assertLess(
+                    materialized.index("Get-FileHash"),
+                    materialized.index("& $env:K5_BOOTSTRAP_PYTHON"),
+                )
+                self.assertTrue(materialized.endswith('exit $LASTEXITCODE"'))
+            self.assertIn("Runner temporary path cannot be represented safely", text)
 
     def test_original_executable_bodies_are_preserved(self):
         profile = guard.load_json(ROOT / "scripts/qualification/windows-hosted-profile.json")
@@ -622,12 +665,12 @@ class QualificationPolicyTests(unittest.TestCase):
             self.assertIn("timeout-minutes: 15", text)
             self.assertIn("Python\\3.12.10\\x64", text)
             self.assertNotIn("actions/setup-python@", text)
-            self.assertIn("shell: ${{ env.K5_BOOTSTRAP_PYTHON }} -I -B -S", text)
+            self.assertIn("shell: powershell -NoProfile -NonInteractive -Command", text)
             self.assertNotIn("cache: pip", text)
             for index, row in enumerate(guard.workflow_steps(text)):
                 if "scripts/windows_hosted_qualification.py" in row["body"]:
                     continue
-                self.assertIn(f'--profile {kind} --step {index} "{{0}}"', text)
+                self.assertIn(f"--profile {kind} --step {index} '{{0}}'", text)
 
     def test_powershell_wrappers_and_dot_sourcing_are_explicit(self):
         self.assertEqual(guard.POWERSHELL_PREFIX, "$ErrorActionPreference = 'stop'\n")
