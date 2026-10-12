@@ -133,6 +133,22 @@ namespace K5VisionAlpha
                 return "Live operator runtime failed.";
             if (line == "K5_OPERATOR_LIVE_FAILURE=unknown")
                 return "Live operator request failed without a classified cause.";
+            if (line == "K5_OPERATOR_RECEIPT_FAILURE=frames_missing")
+                return "The RTSP stream produced no accepted decoded frames.";
+            if (line == "K5_OPERATOR_RECEIPT_FAILURE=presentations_missing")
+                return "No visible operator presentation was confirmed.";
+            if (line == "K5_OPERATOR_RECEIPT_FAILURE=analytics_disabled")
+                return "Packaged analytics was not enabled for the public test.";
+            if (line == "K5_OPERATOR_RECEIPT_FAILURE=submissions_missing")
+                return "No analytics submissions were confirmed.";
+            if (line == "K5_OPERATOR_RECEIPT_FAILURE=completions_missing")
+                return "No analytics completions were confirmed.";
+            if (line == "K5_OPERATOR_RECEIPT_FAILURE=boxes_missing")
+                return "No tracked detection boxes were rendered.";
+            if (line == "K5_OPERATOR_RECEIPT_FAILURE=analytics_failures")
+                return "Analytics reported one or more failures.";
+            if (line == "K5_OPERATOR_RECEIPT_FAILURE=invalid_receipt")
+                return "The operator returned an incomplete or invalid acceptance receipt.";
             if (line.IndexOf("decoder", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 line.IndexOf("d3d11h264dec", StringComparison.OrdinalIgnoreCase) >= 0)
                 return DecoderFailure;
@@ -226,7 +242,8 @@ namespace K5VisionAlpha
                 if (String.IsNullOrWhiteSpace(e.Data)) return;
                 string line = e.Data;
                 // Fixed-status projection only; never display the raw URI, credentials or log.
-                if (line.StartsWith("K5_OPERATOR_LIVE_FAILURE=", StringComparison.Ordinal))
+                if (line.StartsWith("K5_OPERATOR_LIVE_FAILURE=", StringComparison.Ordinal) ||
+                    line.StartsWith("K5_OPERATOR_RECEIPT_FAILURE=", StringComparison.Ordinal))
                     failure = SelectRuntimeFailure(failure, line);
                 if (line == "K5 analytics disabled; video-only alpha acceptance selected.")
                 {

@@ -143,6 +143,51 @@ function Test-K5AlphaOperatorReceipt([object]$Receipt, [bool]$AnalyticsRequired)
     return $true
 }
 
+
+function Get-K5AlphaOperatorReceiptFailureClass([object]$Receipt, [bool]$AnalyticsRequired) {
+    # Never print the receipt or any source, only one fixed error identifier.
+    if ($null -eq $Receipt) { return "invalid_receipt" }
+    $fields = @($Receipt.PSObject.Properties.Name)
+    if ("completed" -cnotin $fields -or $Receipt.completed -isnot [bool] -or
+        -not $Receipt.completed) { return "invalid_receipt" }
+    $required = @(
+        @{ Name = "delivered_frames"; Failure = "frames_missing" },
+        @{ Name = "presentations"; Failure = "presentations_missing" }
+    )
+    if ($AnalyticsRequired) {
+        if ("analytics_enabled" -cnotin $fields -or $Receipt.analytics_enabled -isnot [bool]) {
+            return "invalid_receipt"
+        }
+        if (-not $Receipt.analytics_enabled) { return "analytics_disabled" }
+        $required += @(
+            @{ Name = "analytics_provider_submissions"; Failure = "submissions_missing" },
+            @{ Name = "analytics_provider_completions"; Failure = "completions_missing" },
+            @{ Name = "analytics_rendered_boxes"; Failure = "boxes_missing" }
+        )
+    }
+    foreach ($item in $required) {
+        $name = [string]$item.Name
+        if ($name -cnotin $fields) { return "invalid_receipt" }
+        $counter = $Receipt.$name
+        if (($counter -isnot [int] -and $counter -isnot [long]) -or $counter -lt 0) {
+            return "invalid_receipt"
+        }
+        if ($counter -eq 0) { return [string]$item.Failure }
+    }
+    if ($AnalyticsRequired) {
+        if ("analytics_failures" -cnotin $fields) { return "invalid_receipt" }
+        $failed = $Receipt.analytics_failures
+        if (($failed -isnot [int] -and $failed -isnot [long]) -or $failed -lt 0) {
+            return "invalid_receipt"
+        }
+        if ($failed -gt 0) { return "analytics_failures" }
+        if ($Receipt.analytics_provider_completions -gt $Receipt.analytics_provider_submissions) {
+            return "invalid_receipt"
+        }
+    }
+    return "invalid_receipt"
+}
+
 $python = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 $versionRecord = Join-Path $PSScriptRoot "gstreamer-version.txt"
 if (-not (Test-Path -LiteralPath $python)) { throw "Run Install-K5VisionAlpha.ps1 first." }
@@ -774,6 +819,8 @@ try {
         throw "K5 Windows operator live request failed."
     }
     if (-not (Test-K5AlphaOperatorReceipt -Receipt $receipt -AnalyticsRequired $analyticsRequired)) {
+        $receiptFailureClass = Get-K5AlphaOperatorReceiptFailureClass -Receipt $receipt -AnalyticsRequired $analyticsRequired
+        Write-Host ("K5_OPERATOR_RECEIPT_FAILURE=" + $receiptFailureClass)
         throw "K5 Windows operator alpha test did not complete the selected acceptance checks."
     }
     if ($analyticsRequired) {

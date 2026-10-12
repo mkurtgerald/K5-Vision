@@ -129,6 +129,33 @@ class OwnerGuiContract(unittest.TestCase):
             self.assertIn("K5_OPERATOR_LIVE_FAILURE=" + code, source)
         self.assertNotIn("Status(line)", source)
 
+    def test_operator_receipt_failure_is_source_free_and_does_not_weaken_gates(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        launcher = (ROOT / "scripts" / "windows-alpha" / "Start-K5VisionAlpha.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("function Get-K5AlphaOperatorReceiptFailureClass", launcher)
+        self.assertIn("Test-K5AlphaOperatorReceipt -Receipt $receipt", launcher)
+        self.assertIn("K5_OPERATOR_RECEIPT_FAILURE=", launcher)
+        self.assertNotIn("Write-Host $receipt", launcher)
+        self.assertNotIn("Write-Host $receiptFailureClass", launcher)
+        self.assertIn('line.StartsWith("K5_OPERATOR_RECEIPT_FAILURE="', source)
+        for code in (
+            "frames_missing",
+            "presentations_missing",
+            "analytics_disabled",
+            "submissions_missing",
+            "completions_missing",
+            "boxes_missing",
+            "analytics_failures",
+            "invalid_receipt",
+        ):
+            self.assertIn("K5_OPERATOR_RECEIPT_FAILURE=" + code, source)
+            if code.endswith("_missing"):
+                self.assertIn('Failure = "' + code + '"', launcher)
+        self.assertIn("previous == DecoderFailure", source)
+        self.assertIn("bool full = source.Length > 0 && video && analyticsEvidence && boxesEvidence;", source)
+
     @unittest.skipUnless(sys.platform == "win32", "Requires real Windows C# compiler")
     def test_windows_child_analytics_mode_is_explicit_and_parent_unchanged(self):
         compiler = Path(os.environ["WINDIR"]) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
@@ -188,6 +215,15 @@ internal static class OwnerModeProbe
             if ((string)failure.Invoke(null, new object[] {
                 "initial", "K5_OPERATOR_LIVE_FAILURE=private-fixture-marker" }) != "initial")
                 return 23;
+            string missing = (string)failure.Invoke(null, new object[] {
+                "initial", "K5_OPERATOR_RECEIPT_FAILURE=boxes_missing" });
+            if (!missing.Contains("detection boxes")) return 24;
+            if ((string)failure.Invoke(null, new object[] {
+                "initial", "K5_OPERATOR_RECEIPT_FAILURE=untrusted-fixture-marker" }) != "initial")
+                return 25;
+            if ((string)failure.Invoke(null, new object[] {
+                chosen, "K5_OPERATOR_RECEIPT_FAILURE=boxes_missing" }) != chosen)
+                return 26;
             Console.WriteLine("K5_OWNER_ANALYTICS_MODE_CONTRACT=passed");
             return 0;
         }
