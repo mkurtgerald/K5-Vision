@@ -154,7 +154,10 @@ class OwnerGuiContract(unittest.TestCase):
             if code.endswith("_missing"):
                 self.assertIn('Failure = "' + code + '"', launcher)
         self.assertIn("previous == DecoderFailure", source)
-        self.assertIn("bool full = source.Length > 0 && video && analyticsEvidence && boxesEvidence;", source)
+        self.assertIn(
+            "bool full = source.Length > 0 && video && analyticsEvidence && boxesEvidence;",
+            source,
+        )
 
     @unittest.skipUnless(sys.platform == "win32", "Requires real Windows C# compiler")
     def test_windows_child_analytics_mode_is_explicit_and_parent_unchanged(self):
@@ -224,6 +227,30 @@ internal static class OwnerModeProbe
             if ((string)failure.Invoke(null, new object[] {
                 chosen, "K5_OPERATOR_RECEIPT_FAILURE=boxes_missing" }) != chosen)
                 return 26;
+            // Verify every fixed, source-free receipt diagnosis in compiled GUI.
+            // These are failures only: no successful receipt is simulated.
+            string[,] receiptCases = new string[,] {
+                { "frames_missing", "The RTSP stream produced no accepted decoded frames." },
+                { "presentations_missing", "No visible operator presentation was confirmed." },
+                { "analytics_disabled", "Packaged analytics was not enabled for the public test." },
+                { "submissions_missing", "No analytics submissions were confirmed." },
+                { "completions_missing", "No analytics completions were confirmed." },
+                { "boxes_missing", "No tracked detection boxes were rendered." },
+                { "analytics_failures", "Analytics reported one or more failures." },
+                { "invalid_receipt", "The operator returned an incomplete or invalid acceptance receipt." }
+            };
+            for (int n = 0; n < receiptCases.GetLength(0); n++)
+            {
+                string token = "K5_OPERATOR_RECEIPT_FAILURE=" + receiptCases[n, 0];
+                string projected = (string)failure.Invoke(null, new object[] { "initial", token });
+                if (projected != receiptCases[n, 1]) return 27;
+                string tampered = (string)failure.Invoke(null, new object[] {
+                    "initial", token + " private-fixture-marker" });
+                if (tampered == projected || tampered.Contains("private-fixture-marker"))
+                    return 28;
+                if ((string)failure.Invoke(null, new object[] { chosen, token }) != chosen)
+                    return 29;
+            }
             Console.WriteLine("K5_OWNER_ANALYTICS_MODE_CONTRACT=passed");
             return 0;
         }
