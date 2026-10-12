@@ -224,6 +224,8 @@ class AdapterTests(unittest.TestCase):
 
     def test_signaled_process_still_in_final_membership_fails_closed(self):
         owner = self.make()
+        owner.sample()
+        self.clock.value += 0.25
         self.native.identities[11] = (101, 222)
         with self.assertRaisesRegex(ResourceFailure, "departed_member_still_listed"):
             owner.sample()
@@ -319,6 +321,13 @@ class StableSnapshotFakeTests(unittest.TestCase):
 
     make = AdapterTests.make
 
+    def make_witnessed(self):
+        owner = self.make()
+        owner.sample()
+        self.clock.value += 0.25
+        self.native.read_count = 0
+        return owner
+
     def expire(self, pid=11):
         birth, _ = self.native.identities[pid]
         self.native.identities[pid] = (birth, True)
@@ -338,7 +347,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
         self.native.listeners = listeners
         return calls
 
-    def test_exit_before_rss_requires_absence_and_then_stable_snapshot(self):
+    def test_newly_discovered_exit_before_rss_now_refuses_missing_live_evidence(self):
         owner = self.make()
         original = self.native.open_member
 
@@ -349,16 +358,33 @@ class StableSnapshotFakeTests(unittest.TestCase):
             return value
 
         self.native.open_member = opened
+        with self.assertRaisesRegex(ResourceFailure, "new_birth_already_exited"):
+            owner.sample()
+        self.assertEqual(owner.witnessed_births, set())
+        self.assertTrue(owner.cleanup_complete)
+
+    def test_previously_witnessed_exit_before_rss_can_stabilize(self):
+        owner = self.make_witnessed()
+        original = self.native.identity
+        first = True
+
+        def identity(handle):
+            nonlocal first
+            if handle == 11 and first:
+                first = False
+                self.expire(handle)
+            return original(handle)
+
+        self.native.identity = identity
         snapshot = owner.sample()
         self.assertEqual((snapshot.active_processes, snapshot.rss_bytes), (1, 100))
         self.assertEqual(self.native.read_count, 4)
         self.assertEqual(set(owner.handles), {11, 12})
-        self.assertEqual(self.native.closed_handles, [])
         owner.close()
         self.assertEqual(self.native.closed_handles, [11, 12])
 
     def test_exit_during_rss_preserves_observed_high_water(self):
-        owner = self.make()
+        owner = self.make_witnessed()
         original = self.native.rss
 
         def rss(handle):
@@ -373,7 +399,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
         self.assertEqual(self.native.read_count, 4)
 
     def test_exit_after_listener_read_preserves_listener_union_and_cumulative_cpu(self):
-        owner = self.make()
+        owner = self.make_witnessed()
         row = (11, 2, b"\x7f\0\0\1", 9000)
 
         def changed(number, rows):
@@ -452,10 +478,10 @@ class StableSnapshotFakeTests(unittest.TestCase):
             owner.sample()
         self.assertEqual(len(calls), 1)
 
-    def test_new_birth_or_unknown_member_never_retries(self):
-        for total_increase, new_pid in ((True, False), (False, True), (True, True)):
+    def test_unmatched_birth_or_unknown_member_never_retries(self):
+        for total_increase, new_pid in ((True, False), (False, True)):
             with self.subTest(total_increase=total_increase, new_pid=new_pid):
-                owner = self.make()
+                owner = self.make_witnessed()
 
                 def changed(number, rows, total_increase=total_increase, new_pid=new_pid):
                     self.expire()
@@ -468,15 +494,12 @@ class StableSnapshotFakeTests(unittest.TestCase):
                     return rows
 
                 calls = self.during_listeners(changed)
-                category = (
-                    "sample_birth_count_changed" if total_increase else "final_member_set_expanded"
-                )
-                with self.assertRaisesRegex(ResourceFailure, category):
+                with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
                     owner.sample()
                 self.assertEqual(len(calls), 1)
 
     def test_reappearing_proved_departure_never_retries(self):
-        owner = self.make()
+        owner = self.make_witnessed()
         original = self.native.accounting
 
         def accounting(job):
@@ -498,6 +521,9 @@ class StableSnapshotFakeTests(unittest.TestCase):
         self.native.pids.add(13)
         self.native.identities[13] = (103, False)
         self.native.total = self.job.total_processes = 3
+        owner.sample()
+        self.clock.value += 0.25
+        self.native.read_count = 0
 
         def changed(number, rows):
             self.expire(10 + number)
@@ -511,7 +537,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
         self.assertTrue(owner.cleanup_complete)
 
     def test_original_deadline_is_not_reset_between_attempts(self):
-        owner = self.make()
+        owner = self.make_witnessed()
 
         def changed(number, rows):
             self.clock.value += 0.6 if number == 1 else 0.5
@@ -570,7 +596,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
         self.assertEqual(owner.observed_peak_rss_bytes, 2 * GIB + 2)
 
     def test_failed_retry_preserves_prior_attempt_peak(self):
-        owner = self.make()
+        owner = self.make_witnessed()
         self.native.rss_each = 300
         original = self.native.rss
         reads = []
@@ -597,7 +623,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
         self.assertEqual(owner.observed_peak_rss_bytes, 200)
 
     def test_discarded_attempt_listener_union_limit_is_preserved(self):
-        owner = self.make()
+        owner = self.make_witnessed()
 
         def changed(number, rows):
             if number == 1:
@@ -623,7 +649,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_cpu_regression_after_discarded_attempt_is_fatal(self):
-        owner = self.make()
+        owner = self.make_witnessed()
         original = self.native.accounting
 
         def accounting(job):
@@ -645,7 +671,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
         self.assertEqual(owner.last_cpu, 2.5)
 
     def test_cumulative_cpu_limit_survives_reconciled_departure(self):
-        owner = self.make()
+        owner = self.make_witnessed()
 
         def changed(number, rows):
             if number == 1:
@@ -661,15 +687,367 @@ class StableSnapshotFakeTests(unittest.TestCase):
             guard.admit_sample(sample, previous_cpu=898)
 
 
+class BirthLedgerFakeTests(unittest.TestCase):
+    """Lifetime association counts require actual, completed live observations."""
+
+    make = AdapterTests.make
+    make_witnessed = StableSnapshotFakeTests.make_witnessed
+    expire = StableSnapshotFakeTests.expire
+    during_listeners = StableSnapshotFakeTests.during_listeners
+
+    def birth(self, pid=13, birth=103):
+        self.native.pids.add(pid)
+        self.native.identities[pid] = (birth, False)
+        self.native.total += 1
+        self.job.total_processes = self.native.total
+
+    def test_initial_empty_job_and_then_live_root_are_fully_charged(self):
+        owner = self.make()
+        self.native.pids = set()
+        self.native.total = self.job.total_processes = 0
+        self.assertEqual(owner.sample().total_births, 0)
+        self.assertEqual(owner.witnessed_births, set())
+        self.clock.value += 0.25
+        self.birth(11, 101)
+        snapshot = owner.sample()
+        self.assertEqual(snapshot.total_births, 1)
+        self.assertEqual(owner.witnessed_births, {(11, 101)})
+        owner.close()
+        self.assertTrue(owner.birth_evidence_complete and owner.cleanup_complete)
+
+    def test_matched_live_birth_between_polls_is_fully_observed(self):
+        owner = self.make_witnessed()
+        self.birth()
+        snapshot = owner.sample()
+        self.assertEqual(snapshot.total_births, 3)
+        self.assertEqual(snapshot.active_processes, 3)
+        self.assertEqual(owner.witnessed_births, {(11, 101), (12, 102), (13, 103)})
+        self.assertEqual(self.native.read_count, 2)
+
+    def test_closing_live_birth_needs_rss_listeners_and_stable_resample(self):
+        owner = self.make_witnessed()
+        observed_rss = []
+        original_rss = self.native.rss
+
+        def rss(handle):
+            observed_rss.append(handle)
+            return original_rss(handle)
+
+        def changed(number, rows):
+            if number == 1:
+                self.birth()
+            elif number == 2:
+                self.assertIn(13, observed_rss)
+                self.assertNotIn((13, 103), owner.witnessed_births)
+                return {(13, 2, b"\x7f\0\0\1", 9000)}
+            return rows
+
+        self.native.rss = rss
+        calls = self.during_listeners(changed)
+        snapshot = owner.sample()
+        self.assertEqual(self.native.read_count, 4)
+        self.assertEqual(calls, [{11, 12}, {11, 12, 13}, {11, 12, 13}])
+        self.assertEqual(snapshot.rss_bytes, 300)
+        self.assertEqual(snapshot.owned_loopback_listeners, 1)
+        self.assertEqual(snapshot.total_births, len(owner.witnessed_births))
+        self.assertIn((13, 103), owner.witnessed_births)
+
+    def test_two_matched_arrivals_then_third_stable_pass_succeed(self):
+        owner = self.make_witnessed()
+
+        def changed(number, rows):
+            if number in (1, 3):
+                self.birth(13 if number == 1 else 14, 103 if number == 1 else 104)
+            return rows
+
+        calls = self.during_listeners(changed)
+        snapshot = owner.sample()
+        self.assertEqual((len(calls), self.native.read_count), (5, 6))
+        self.assertEqual(snapshot.rss_bytes, 400)
+        self.assertEqual(snapshot.total_births, 4)
+        self.assertEqual(len(owner.witnessed_births), 4)
+
+    def test_third_arrival_pass_cannot_succeed_without_stable_final_pass(self):
+        owner = self.make_witnessed()
+
+        def changed(number, rows):
+            if number % 2:
+                pid = 13 + number // 2
+                self.birth(pid, pid + 90)
+            return rows
+
+        calls = self.during_listeners(changed)
+        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unstable"):
+            owner.sample()
+        self.assertEqual((len(calls), self.native.read_count), (6, 6))
+        self.assertEqual(len(owner.witnessed_births), 5)
+        self.assertTrue(owner.cleanup_complete and owner.birth_evidence_complete)
+
+    def test_birth_wholly_between_polls_cannot_disappear_into_last_total(self):
+        owner = self.make_witnessed()
+        self.native.total = self.job.total_processes = 3
+        with self.assertRaisesRegex(ResourceFailure, "initial_birth_evidence_gap"):
+            owner.sample()
+        self.assertEqual(owner.last_total, 3)
+        self.assertEqual(len(owner.witnessed_births), 2)
+        self.assertTrue(owner.cleanup_complete)
+        self.assertFalse(owner.birth_evidence_complete)
+
+    def test_live_birth_cannot_mask_another_unseen_or_refused_association(self):
+        owner = self.make_witnessed()
+        self.birth()
+        self.native.total = self.job.total_processes = 4
+        with self.assertRaisesRegex(ResourceFailure, "initial_birth_evidence_gap"):
+            owner.sample()
+        self.assertNotIn((13, 103), owner.witnessed_births)
+        self.assertTrue(owner.cleanup_complete)
+
+    def test_unmatched_closing_count_cannot_be_charged_to_cpu(self):
+        owner = self.make_witnessed()
+
+        def changed(number, rows):
+            self.native.total = self.job.total_processes = 3
+            self.native.cpu = 2.5
+            return rows
+
+        calls = self.during_listeners(changed)
+        with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
+            owner.sample()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(owner.last_cpu, 2.5)
+        self.assertTrue(owner.cleanup_complete)
+        self.assertFalse(owner.birth_evidence_complete)
+
+    def test_newly_discovered_signaled_handle_is_not_a_completed_ledger_entry(self):
+        owner = self.make_witnessed()
+        self.birth()
+        self.native.identities[13] = (103, True)
+        with self.assertRaisesRegex(ResourceFailure, "new_birth_already_exited"):
+            owner.sample()
+        self.assertNotIn((13, 103), owner.witnessed_births)
+        self.assertIn(13, self.native.closed_handles)
+        self.assertTrue(owner.cleanup_complete)
+
+    def test_new_birth_exiting_after_rss_before_listener_completion_refuses(self):
+        owner = self.make_witnessed()
+        self.birth()
+        original = self.native.rss
+
+        def rss(handle):
+            value = original(handle)
+            if handle == 13:
+                self.expire(handle)
+            return value
+
+        self.native.rss = rss
+        with self.assertRaisesRegex(ResourceFailure, "new_birth_observation_incomplete"):
+            owner.sample()
+        self.assertNotIn((13, 103), owner.witnessed_births)
+        self.assertEqual(owner.observed_peak_rss_bytes, 300)
+
+    def test_new_birth_rss_failure_does_not_count_retained_handle(self):
+        owner = self.make_witnessed()
+        self.birth()
+        original = self.native.rss
+
+        def rss(handle):
+            if handle == 13:
+                raise ResourceFailure("resource_evidence_unavailable")
+            return original(handle)
+
+        self.native.rss = rss
+        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unavailable"):
+            owner.sample()
+        self.assertNotIn((13, 103), owner.witnessed_births)
+        self.assertTrue(owner.cleanup_complete)
+        self.assertEqual(owner.terminal_evidence_failure, "unwitnessed_birth_at_drain")
+
+    def test_new_birth_listener_failure_does_not_count_retained_handle(self):
+        owner = self.make_witnessed()
+        self.birth()
+        self.native.fail = "listener"
+        with self.assertRaisesRegex(ResourceFailure, "owned_listener_not_loopback"):
+            owner.sample()
+        self.assertNotIn((13, 103), owner.witnessed_births)
+        self.assertTrue(owner.cleanup_complete)
+
+    def test_closing_birth_ownership_failure_keeps_precise_refusal(self):
+        owner = self.make_witnessed()
+        original = self.native.belongs
+
+        def belongs(handle, job):
+            return handle != 13 and original(handle, job)
+
+        self.native.belongs = belongs
+        self.during_listeners(lambda number, rows: (self.birth() if number == 1 else None) or rows)
+        with self.assertRaisesRegex(ResourceFailure, "ownership_unproven"):
+            owner.sample()
+        self.assertTrue(owner.cleanup_complete)
+        self.assertFalse(owner.birth_evidence_complete)
+        self.assertEqual(owner.terminal_evidence_failure, "unwitnessed_birth_at_drain")
+
+    def test_new_birth_changed_identity_is_never_charged(self):
+        owner = self.make_witnessed()
+        self.birth()
+
+        def changed(number, rows):
+            self.native.identities[13] = (999, False)
+            return rows
+
+        self.during_listeners(changed)
+        with self.assertRaisesRegex(ResourceFailure, "pid_reuse_or_exit"):
+            owner.sample()
+        self.assertNotIn((13, 103), owner.witnessed_births)
+
+    def test_distinct_pids_with_same_creation_filetime_are_separate_births(self):
+        owner = self.make_witnessed()
+        self.birth(13, 101)
+        snapshot = owner.sample()
+        self.assertEqual(snapshot.total_births, 3)
+        self.assertIn((11, 101), owner.witnessed_births)
+        self.assertIn((13, 101), owner.witnessed_births)
+
+    def test_newcomer_rss_adds_conservatively_to_prior_sum_before_cap(self):
+        owner = self.make_witnessed()
+        self.native.rss = lambda handle: 300_000_000 if handle == 13 else 950_000_000
+        self.during_listeners(lambda number, rows: (self.birth() if number == 1 else None) or rows)
+        with self.assertRaisesRegex(ResourceFailure, "owned_rss_exceeded"):
+            owner.sample()
+        self.assertEqual(owner.observed_peak_rss_bytes, 2_200_000_000)
+        self.assertNotIn((13, 103), owner.witnessed_births)
+
+    def test_birth_acquisition_does_not_reset_original_deadline(self):
+        owner = self.make_witnessed()
+
+        def changed(number, rows):
+            self.clock.value += 0.6
+            if number == 1:
+                self.birth()
+            return rows
+
+        calls = self.during_listeners(changed)
+        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_stale"):
+            owner.sample()
+        self.assertEqual(len(calls), 2)
+
+    def test_terminal_unknown_birth_records_refusal_but_cleanup_stays_true(self):
+        owner = self.make_witnessed()
+        self.job.total_processes = 3
+        for _ in range(2):
+            owner.close()
+        self.assertTrue(owner.closed and owner.failed and owner.cleanup_complete)
+        self.assertEqual(owner.final_active, 0)
+        self.assertFalse(owner.birth_evidence_complete)
+        self.assertEqual(owner.terminal_evidence_failure, "unwitnessed_birth_at_drain")
+        self.assertEqual(self.native.closed_handles, [11, 12])
+
+    def test_job_cleanup_records_terminal_gap_for_outer_evidence_check(self):
+        owner = self.make_witnessed()
+        self.job.total_processes = 3
+        self.job.close()
+        self.assertTrue(owner.cleanup_complete)
+        self.assertEqual(owner.terminal_evidence_failure, "unwitnessed_birth_at_drain")
+        owner.close()
+
+    def test_run_owned_terminal_gap_preserves_cleanup_metrics_and_prior_error(self):
+        implementation = guard.QualificationResources
+        for sample_failure in (False, True):
+            for prior_peak in (0, 1000):
+                with self.subTest(sample_failure=sample_failure, prior_peak=prior_peak):
+                    clock, native, instances = Clock(), FakeNative(), []
+                    original_host = native.host
+
+                    def host(disk, original_host=original_host):
+                        available, total, times, free = original_host(disk)
+                        return available, total, (times[0] * 2, times[1], times[2]), free
+
+                    native.host = host
+
+                    def belongs(handle, job, native=native, sample_failure=sample_failure):
+                        return not (sample_failure and native.read_count >= 5)
+
+                    native.belongs = belongs
+
+                    def resources(common, disk, clock=clock, native=native, instances=instances):
+                        owner = implementation(
+                            common, disk, clock=clock, native_factory=lambda: native
+                        )
+                        instances.append(owner)
+                        return owner
+
+                    class Owned:
+                        def __init__(self, *args, **kwargs):
+                            self.job = kwargs["job_factory"]()
+                            self.job.assign("fake-root")
+                            self.process = types.SimpleNamespace(poll=lambda: 0, returncode=0)
+                            # The process census never observes this third lifetime
+                            # association. Only terminal Job accounting reveals it.
+                            self.job.total_processes = 3
+
+                        def close(self):
+                            try:
+                                self.job.close()
+                            except BaseException:
+                                # Match the common owner: actual close errors become
+                                # cleanup errors. Evidence-only gaps must not raise here.
+                                raise RuntimeError("wrapped_cleanup_failure") from None
+
+                    with tempfile.TemporaryDirectory() as temporary:
+                        state = dict(
+                            cpu_seconds=2,
+                            peak_rss_bytes=prior_peak,
+                            started_at=time.time(),
+                            all_owned_cleanup=True,
+                        )
+                        category = (
+                            "ownership_unproven" if sample_failure else "unwitnessed_birth_at_drain"
+                        )
+                        with (
+                            patch.object(guard, "QualificationResources", side_effect=resources),
+                            patch.object(
+                                guard,
+                                "common_module",
+                                return_value=types.SimpleNamespace(
+                                    WindowsJob=FakeJob, OwnedProcess=Owned
+                                ),
+                            ),
+                            patch.object(guard.time, "monotonic", clock),
+                            patch.object(
+                                guard.time,
+                                "sleep",
+                                side_effect=lambda delta, clock=clock: setattr(
+                                    clock, "value", clock.value + delta
+                                ),
+                            ),
+                            self.assertRaisesRegex(ResourceFailure, category),
+                        ):
+                            guard.run_owned(
+                                ["never-executed"],
+                                cwd=ROOT,
+                                env={},
+                                work=Path(temporary),
+                                state=state,
+                                seconds=1,
+                            )
+                    owner = instances[0]
+                    self.assertTrue(owner.cleanup_complete and state["all_owned_cleanup"])
+                    self.assertFalse(owner.birth_evidence_complete or state["pending_payload"])
+                    self.assertEqual(owner.final_active, 0)
+                    self.assertEqual(state["cpu_seconds"], 5)
+                    self.assertEqual(state["peak_rss_bytes"], max(prior_peak, 200))
+                    self.assertEqual(native.closed_handles, [11, 12])
+
+
 class MembershipPredicateFakeTests(unittest.TestCase):
-    """Diagnostic labels only; every old false predicate must still refuse."""
+    """Fixed categories for retained gates under explicit birth reconciliation."""
 
     make = AdapterTests.make
     expire = StableSnapshotFakeTests.expire
     during_listeners = StableSnapshotFakeTests.during_listeners
+    make_witnessed = StableSnapshotFakeTests.make_witnessed
 
     def configure(self, category):
-        owner = self.make()
+        owner = self.make_witnessed()
         original_accounting = self.native.accounting
         original_identity = self.native.identity
         identity_reads = {}
@@ -677,10 +1055,10 @@ class MembershipPredicateFakeTests(unittest.TestCase):
         def accounting(job):
             read = self.native.read_count + 1
             if read == 3:
-                if category == "retry_birth_count_changed":
+                if category == "initial_birth_evidence_gap":
                     self.native.total = self.job.total_processes = 3
                 elif category == "retry_member_set_expanded":
-                    self.native.pids.add(13)
+                    self.native.pids.add(11)
                 elif category == "departure_handle_missing":
                     # Deliberately corrupt fake evidence to cover a defensive leaf;
                     # normal source control flow does not discard retained handles.
@@ -708,16 +1086,14 @@ class MembershipPredicateFakeTests(unittest.TestCase):
             if number != 1:
                 return rows
             if category in {
-                "retry_birth_count_changed",
+                "initial_birth_evidence_gap",
                 "retry_member_set_expanded",
                 "departure_handle_missing",
                 "departure_not_signaled",
             }:
                 self.expire()
-            elif category == "sample_birth_count_changed":
+            elif category == "final_birth_evidence_gap":
                 self.native.total = self.job.total_processes = 3
-            elif category == "final_member_set_expanded":
-                self.native.pids = {12, 13}
             elif category == "departed_member_still_listed":
                 self.native.identities[11] = (101, True)
             elif category == "final_survivor_missing":
@@ -736,18 +1112,17 @@ class MembershipPredicateFakeTests(unittest.TestCase):
         categories = (
             "initial_active_count_mismatch",
             "initial_members_exceed_limit",
-            "retry_birth_count_changed",
+            "initial_birth_evidence_gap",
             "retry_member_set_expanded",
             "departure_handle_missing",
             "departure_not_signaled",
-            "sample_birth_count_changed",
-            "final_member_set_expanded",
+            "final_birth_evidence_gap",
             "departed_member_still_listed",
             "final_survivor_missing",
             "final_active_count_mismatch",
             "final_survivor_signaled",
         )
-        self.assertEqual(len(set(categories)), 12)
+        self.assertEqual(len(set(categories)), 11)
         for category in categories:
             with self.subTest(category=category):
                 owner = self.configure(category)
@@ -1161,22 +1536,61 @@ class QualificationPolicyTests(unittest.TestCase):
                 self.assertTrue(materialized.endswith('exit $LASTEXITCODE"'))
             self.assertIn("Runner temporary path cannot be represented safely", text)
 
+    def assert_original_body(self, kind, original, body):
+        check = 'if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }\n'
+        if kind == "alpha" and original["name"] in {
+            "Install targeted test dependencies",
+            "Verify clean Windows alpha runtime dependency install",
+        }:
+            body = body.replace(check, "")
+        if kind == "alpha" and original["name"] == "Run Windows alpha boundary regressions":
+            suffix = " -o verbosity_test_cases=1\n"
+            self.assertEqual(body.count("verbosity_test_cases"), 1)
+            self.assertTrue(body.endswith(suffix))
+            body = body[: -len(suffix)] + "\n"
+        else:
+            self.assertNotIn("verbosity_test_cases", body)
+        self.assertEqual(hashlib.sha256(body.encode()).hexdigest(), original["body_sha256"])
+
     def test_original_executable_bodies_are_preserved(self):
         profile = guard.load_json(ROOT / "scripts/qualification/windows-hosted-profile.json")
-        check = 'if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }\n'
         for kind, workflow in guard.PROFILES.items():
             steps = {r["name"]: r for r in guard.workflow_steps((ROOT / workflow).read_text())}
             for original in profile["original_steps"][kind]:
                 row = steps[original["name"]]
-                body = row["body"]
-                if kind == "alpha" and original["name"] in {
-                    "Install targeted test dependencies",
-                    "Verify clean Windows alpha runtime dependency install",
-                }:
-                    body = body.replace(check, "")
-                self.assertEqual(hashlib.sha256(body.encode()).hexdigest(), original["body_sha256"])
+                self.assert_original_body(kind, original, row["body"])
                 self.assertEqual(row["timeout"], original["timeout"])
                 self.assertEqual(row["always"], original["always"])
+
+    def test_boundary_logging_allowance_rejects_other_body_changes(self):
+        profile = guard.load_json(ROOT / "scripts/qualification/windows-hosted-profile.json")
+        original = next(
+            row
+            for row in profile["original_steps"]["alpha"]
+            if row["name"] == "Run Windows alpha boundary regressions"
+        )
+        body = next(
+            row["body"]
+            for row in guard.workflow_steps((ROOT / guard.PROFILES["alpha"]).read_text())
+            if row["name"] == original["name"]
+        )
+        for changed in (
+            body.replace("tests/test_cli.py ", ""),
+            body.replace("pytest ", "pytest --maxfail=1 ", 1),
+            body.replace(" -q ", " -s ", 1),
+            "Write-Output 'extra command'\n" + body,
+            body.replace(" -o verbosity_test_cases=1", " -o verbosity_test_cases=1" * 2),
+            body.replace("verbosity_test_cases=1", "verbosity_test_cases=2"),
+            body.replace(" -o verbosity_test_cases=1", ""),
+            body.replace(" -o verbosity_test_cases=1", "").replace(
+                "pytest ", "pytest -o verbosity_test_cases=1 ", 1
+            ),
+        ):
+            with self.subTest(body=changed), self.assertRaises(AssertionError):
+                self.assert_original_body("alpha", original, changed)
+        for kind, name in (("operator", original["name"]), ("alpha", "Another step")):
+            with self.subTest(kind=kind, name=name), self.assertRaises(AssertionError):
+                self.assert_original_body(kind, {**original, "name": name}, body)
 
     def test_workflows_have_one_real_guard_per_original_run_step(self):
         for kind, workflow in guard.PROFILES.items():
@@ -1259,6 +1673,7 @@ class QualificationPolicyTests(unittest.TestCase):
                 self.final_active = 0
                 self.cleanup_complete = True
                 self.observed_peak_rss_bytes = 0
+                self.terminal_evidence_failure = None
 
             def job_factory(self):
                 return object()
@@ -1330,6 +1745,7 @@ class QualificationPolicyTests(unittest.TestCase):
                         def __init__(self, *args, instances=instances):
                             instances.append(self)
                             self.observed_peak_rss_bytes = 0
+                            self.terminal_evidence_failure = None
                             self.final_cpu_seconds = 1
                             self.final_active = 0
                             self.cleanup_complete = True

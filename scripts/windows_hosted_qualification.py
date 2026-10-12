@@ -459,6 +459,8 @@ def run_owned(arguments, *, cwd, env, work, state, seconds):
             state["pending_payload"] = False
         if state["cpu_seconds"] > 900:
             original = Refusal("cpu_limit")
+        if original is None and resources.terminal_evidence_failure is not None:
+            original = ResourceFailure(resources.terminal_evidence_failure)
     if original is not None:
         raise original
 
@@ -1548,6 +1550,11 @@ class QualificationResources:
         self.observed_peak_rss_bytes = 0
         self.final_cpu_seconds = self.final_active = self.final_total = None
         self.handles = {}  # pid -> (read-only process handle, creation FILETIME)
+        # A handle alone is not resource evidence. Only complete live identity,
+        # RSS and listener observations can charge a lifetime Job association.
+        self.witnessed_births = set()  # (pid, creation FILETIME), retained through drain.
+        self.birth_evidence_complete = False
+        self.terminal_evidence_failure = None
         self.observed_listeners = set()
         self.last_start = self.last_cpu = self.last_total = None
         self.host_seed_at = clock()
@@ -1653,62 +1660,100 @@ class QualificationResources:
             return signaled
 
         rss, listeners = 0, set()
-        initial_members = remaining_members = sample_total = None
-        for attempt in range(MAX_SAMPLE_ATTEMPTS):
-            fresh()
-            before = accounting()
-            members = self.native.members(self.job)
-            resource_need(before[1] == len(members), "initial_active_count_mismatch")
-            resource_need(len(members) <= ACTIVE_LIMIT, "initial_members_exceed_limit")
-            if initial_members is None:
-                initial_members, sample_total = set(members), before[0]
-                remaining_members = set(members)
-            resource_need(before[0] == sample_total, "retry_birth_count_changed")
-            resource_need(members <= remaining_members, "retry_member_set_expanded")
-            # Between attempts, a previously retained survivor may also exit.
-            # Every absence still needs exact identity, ownership and signal proof.
-            for pid in initial_members - members:
-                resource_need(pid in self.handles, "departure_handle_missing")
-                resource_need(exited(pid), "departure_not_signaled")
-            departed, attempt_rss = set(), 0
+
+        def witnessed(pid):
+            return pid in self.handles and (pid, self.handles[pid][1]) in self.witnessed_births
+
+        def audit(members, *, prior_rss=0):
+            nonlocal rss
+            departed, new_births, attempt_rss = set(), set(), prior_rss
             for pid in sorted(members):
                 if pid not in self.handles:
                     resource_need(len(self.handles) < MAX_RETAINED_BIRTHS, "birth_evidence_limit")
                     self.handles[pid] = self.native.open_member(pid, self.job)
-                if exited(pid):
+                known = witnessed(pid)
+                signaled = exited(pid)
+                resource_need(known or not signaled, "new_birth_already_exited")
+                if signaled:
                     departed.add(pid)
                 else:
-                    # An RSS API failure remains fatal even if the process exits.
+                    # API errors are fatal; CPU/commit cannot replace live RSS.
                     attempt_rss += self.native.rss(self.handles[pid][0])
                     self.observed_peak_rss_bytes = max(self.observed_peak_rss_bytes, attempt_rss)
                     resource_need(attempt_rss <= RSS_LIMIT, "owned_rss_exceeded")
+                    if not known:
+                        new_births.add(pid)
             rss = max(rss, attempt_rss)
-            # Include departing PIDs and keep all evidence from discarded attempts.
-            listeners.update(self.native.listeners(initial_members))
+            # All retained PIDs are still bound by their exact process handles.
+            # Include departures and preserve evidence from every acquisition pass.
+            listeners.update(self.native.listeners(set(self.handles)))
             self.observed_listeners.update(listeners)
             resource_need(len(self.observed_listeners) <= 4096, "listener_evidence_limit")
+            completed = set()
             for pid in members:
                 signaled = exited(pid)
                 resource_need(pid not in departed or signaled, "pid_reuse_or_exit")
+                resource_need(
+                    pid not in new_births or not signaled, "new_birth_observation_incomplete"
+                )
                 if signaled:
                     departed.add(pid)
+                elif pid in new_births:
+                    completed.add((pid, self.handles[pid][1]))
+            # Never promote a partially measured or already-exited new handle.
+            self.witnessed_births.update(completed)
+            return departed, attempt_rss
+
+        remaining_members = None
+        for attempt in range(MAX_SAMPLE_ATTEMPTS):
+            fresh()
+            before = accounting()
+            members = self.native.members(self.job)
+            for pid, birth in self.witnessed_births:
+                resource_need(pid in self.handles, "departure_handle_missing")
+                resource_need(self.handles[pid][1] == birth, "pid_reuse_or_exit")
+            resource_need(before[1] == len(members), "initial_active_count_mismatch")
+            resource_need(len(members) <= ACTIVE_LIMIT, "initial_members_exceed_limit")
+            if remaining_members is not None:
+                # Previously departed PIDs cannot reappear under retained handles.
+                resource_need(
+                    not (members - remaining_members) & self.handles.keys(),
+                    "retry_member_set_expanded",
+                )
+            for pid in self.handles.keys() - members:
+                resource_need(exited(pid), "departure_not_signaled")
+            unobserved = {pid for pid in members if not witnessed(pid)}
+            resource_need(
+                before[0] - len(self.witnessed_births) == len(unobserved),
+                "initial_birth_evidence_gap",
+            )
+            departed, attempt_rss = audit(members)
             after = accounting()
             survivors = self.native.members(self.job)
-            resource_need(after[0] == sample_total, "sample_birth_count_changed")
-            # These three predicates are exactly the prior survivor-set equality.
-            # Fixed categories identify the failed proof without exposing identities.
-            resource_need(survivors <= members, "final_member_set_expanded")
+            newcomers = survivors - members
             resource_need(not survivors & departed, "departed_member_still_listed")
             resource_need(members - departed <= survivors, "final_survivor_missing")
             resource_need(after[1] == len(survivors), "final_active_count_mismatch")
-            for pid in survivors:
+            resource_need(
+                after[0] - len(self.witnessed_births) == len(newcomers),
+                "final_birth_evidence_gap",
+            )
+            resource_need(not newcomers & self.handles.keys(), "new_birth_identity_reappeared")
+            for pid in survivors - newcomers:
                 resource_need(not exited(pid), "final_survivor_signaled")
+            if newcomers:
+                # Charge every counter increment with full live evidence before
+                # retrying. Add to the earlier sum conservatively; a later smaller
+                # census cannot erase observed resident memory or listener evidence.
+                new_departures, _ = audit(newcomers, prior_rss=attempt_rss)
+                resource_need(not new_departures, "new_birth_observation_incomplete")
             fresh()
-            if not departed:
+            if not departed and not newcomers:
+                resource_need(after[0] == before[0], "sample_birth_count_changed")
+                resource_need(after[0] == len(self.witnessed_births), "final_birth_evidence_gap")
                 break
-            # Only proved departures are retryable. No API errors, new births,
-            # unknown identities or missing evidence reach this branch. Require a
-            # stable final snapshot within the original deadline, never a mixed one.
+            # Only fully witnessed arrivals or proved departures are retryable.
+            # Never reset lifetime count gaps or the original acquisition deadline.
             resource_need(attempt + 1 < MAX_SAMPLE_ATTEMPTS, "resource_evidence_unstable")
             remaining_members = survivors
         available, total, times, disk = self.native.host(self.disk_root)
@@ -1773,6 +1818,13 @@ class QualificationResources:
         if failures:
             self.failed = True
             raise ResourceFailure(failures[0])
+        self.birth_evidence_complete = self.final_total == len(self.witnessed_births)
+        if self.job is not None and not self.birth_evidence_complete:
+            # Actual cleanup can succeed while qualification evidence is incomplete.
+            # Close remains cleanup-only; run_owned preserves earlier precise errors
+            # and checks this category before allowing a would-be successful stage.
+            self.failed = True
+            self.terminal_evidence_failure = "unwitnessed_birth_at_drain"
 
 
 if __name__ == "__main__":
