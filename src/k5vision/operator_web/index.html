@@ -66,6 +66,13 @@
             <div class="video-footer"><span id="live-state" role="status" aria-live="polite">No camera selected</span><button id="play-live" class="button quiet" type="button" hidden>Play live video</button><span id="analytics-state" class="muted"></span></div>
           </section>
 
+          <section id="analyzed-panel" class="analyzed-panel" aria-label="Analyzed sample">
+            <div class="section-heading"><h2>Analyzed sample</h2><div><button id="request-sample" class="button secondary" type="button" disabled>Analyze one sample</button><button id="clear-sample" class="button quiet" type="button">Clear sample</button></div></div>
+            <p class="muted">One sampled frame with person-detection boxes. Separate from live video; never a continuous live overlay.</p>
+            <p id="sample-message" role="status" aria-live="polite">Select a camera to check sample availability.</p>
+            <canvas id="sample-canvas" aria-label="Analyzed sampled frame" hidden></canvas>
+          </section>
+
           <section id="history-panel" aria-label="Recording history" hidden>
             <div class="history-toolbar">
               <div class="history-toolbar-title"><h2>Recording history</h2><p class="muted">Available video and gaps · All times UTC</p></div>

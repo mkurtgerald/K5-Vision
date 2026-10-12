@@ -26,6 +26,7 @@ from k5vision.media.mediamtx_provider import (
     MediaWorkerError,
     MediaWorkerErrorCode,
 )
+from k5vision.operator_product_analytics import SampleError, SampleOwner, session_digest
 from k5vision.operator_product_state import OperatorCameraCapacityError
 from k5vision.services.device_registry import (
     DeviceRegistryCapacityError,
@@ -120,6 +121,26 @@ class _BoundedProductBody:
             return await receive()
 
         await self.app(scope, replay, send)
+
+
+class _InvalidateAnalyzedLogout:
+    """Revoke transient pixels on logout, even if its HTTP waiter disconnects."""
+
+    def __init__(self, app: ASGIApp, analytics) -> None:
+        self.app, self.analytics = app, analytics
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] == "http"
+            and scope.get("path") in {"/api/v1/auth/logout", _PREFIX + "/media-session"}
+            and scope.get("method") in {"POST", "DELETE"}
+        ):
+            values = [v for k, v in scope.get("headers", ()) if k == b"authorization"]
+            if len(values) == 1 and len(values[0]) <= 135:
+                scheme, _, token = values[0].decode("latin1").partition(" ")
+                if scheme.lower() == "bearer":
+                    self.analytics.invalidate_session(session_digest(token))
+        await self.app(scope, receive, send)
 
 
 class _CameraEnrollment(BaseModel):
@@ -237,6 +258,8 @@ def install_operator_product_api(
     mutations = asyncio.Lock()
     seen_live: set[UUID] = set()
     app.add_middleware(_BoundedProductBody)
+    if analytics is not None:
+        app.add_middleware(_InvalidateAnalyzedLogout, analytics=analytics)
     previous_validation_handler = app.exception_handlers.get(
         RequestValidationError, request_validation_exception_handler
     )
@@ -250,12 +273,16 @@ def install_operator_product_api(
     async def authenticate(token: str) -> tuple[UserAccount, str]:
         principal = await sessions.resolve(token)
         if principal is None:
+            if analytics is not None:
+                analytics.invalidate_session(session_digest(token))
             raise _unauthorized()
         try:
             current = users.get(principal.id)
         except UserRegistryStorageError:
             raise HTTPException(503, "Operator identity unavailable") from None
         if current is None or not current.enabled or current.role not in _READ_ROLES:
+            if analytics is not None:
+                analytics.invalidate_session(session_digest(token))
             raise _unauthorized()
         return current, token
 
@@ -330,8 +357,10 @@ def install_operator_product_api(
             "host": str(source.device.host),
             "status": "unavailable",
             "recording": False,
-            "analytics_status": "disabled",
+            "analytics_status": analytics.status() if analytics is not None else "disabled",
         }
+        if analytics is not None:
+            result["analytics_generation"] = service.analytics_generation
         if service.status() not in {"ready", "disk_full"}:
             return result
         try:
@@ -367,6 +396,91 @@ def install_operator_product_api(
             "worker_status": service.status(),
         }
 
+    def sample_owner(source, session) -> tuple[SampleOwner, str]:
+        if analytics is None:
+            raise HTTPException(503, "Analyzed sample unavailable")
+        try:
+            generation, uri = service.analytics_selection(source)
+        except (RuntimeError, ValueError, OSError):
+            analytics.invalidate()
+            raise HTTPException(503, "Analyzed sample source unavailable") from None
+        return SampleOwner(
+            str(session[0].id),
+            session_digest(session[1]),
+            str(source.binding.device_id),
+            generation,
+        ), uri
+
+    @app.post(
+        _PREFIX + "/cameras/{device_id}/analytics-samples", status_code=202, tags=["operator"]
+    )
+    async def start_analyzed_sample(
+        device_id: UUID,
+        request: Request,
+        response: Response,
+        session: tuple[UserAccount, str] = read_session,
+    ):
+        admit_origin(request)
+        # No arbitrary source, pixels, provider options or queued operations.
+        if request.url.query or await request.body():
+            raise HTTPException(422, "Invalid analyzed sample request")
+        source = selection(device_id)
+        owner, uri = sample_owner(source, session)
+
+        async def still_current():
+            try:
+                current_session = await authenticate(session[1])
+                current_source = selection(device_id)
+                current_owner, _ = sample_owner(current_source, current_session)
+                return current_owner == owner and current_source == source
+            except (HTTPException, RuntimeError, ValueError, OSError):
+                return False
+
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            return analytics.admit(owner, uri, still_current=still_current)
+        except SampleError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from None
+
+    @app.get(_PREFIX + "/cameras/{device_id}/analytics-samples/{ticket}", tags=["operator"])
+    async def poll_analyzed_sample(
+        device_id: UUID,
+        ticket: str,
+        request: Request,
+        response: Response,
+        session: tuple[UserAccount, str] = read_session,
+    ):
+        if (
+            request.url.query
+            or len(ticket) != 32
+            or re.fullmatch(r"[A-Za-z0-9_-]+", ticket) is None
+        ):
+            raise HTTPException(404, "Analyzed sample not found")
+        owner, _uri = sample_owner(selection(device_id), session)
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            result = analytics.poll(ticket, owner)
+            if result["status"] == "ready":
+                return Response(
+                    result["pixels"],
+                    media_type="application/octet-stream",
+                    headers={
+                        "Cache-Control": "no-store",
+                        "X-Content-Type-Options": "nosniff",
+                        "X-K5-Sample-Ticket": ticket,
+                        "X-K5-Sample-Width": str(result["width"]),
+                        "X-K5-Sample-Height": str(result["height"]),
+                        "X-K5-Sample-Stride": str(result["stride_bytes"]),
+                        "X-K5-Sample-Format": result["pixel_format"],
+                        "X-K5-Sample-Boxes": str(result["rendered_boxes"]),
+                        "X-K5-Sample-Received": result["received_at"],
+                        "X-K5-Sample-Expires": str(result["expires_in_seconds"]),
+                    },
+                )
+            return result
+        except SampleError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from None
+
     @app.post(_PREFIX + "/cameras", status_code=201, tags=["operator"])
     async def enroll_camera(
         payload: _CameraEnrollment, _session: tuple[UserAccount, str] = admin_session
@@ -382,6 +496,8 @@ def install_operator_product_api(
         except ValueError:
             raise HTTPException(422, "Invalid camera selection") from None
         async with mutations:
+            if analytics is not None:
+                analytics.invalidate()
             try:
                 existing = selections()
                 if len(existing) >= 64 and not any(
@@ -406,6 +522,8 @@ def install_operator_product_api(
     @app.delete(_PREFIX + "/cameras/{device_id}", status_code=204, tags=["operator"])
     async def remove_camera(device_id: UUID, _session: tuple[UserAccount, str] = admin_session):
         async with mutations:
+            if analytics is not None:
+                analytics.invalidate()
             selection(device_id)
             try:
                 cameras.remove(device_id)

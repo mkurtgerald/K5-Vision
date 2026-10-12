@@ -494,7 +494,20 @@ def test_product_shutdown_closes_camera_store_even_when_native_cleanup_fails(
             pass
     assert calls == [("start", ()), ("stop", ())]
     assert app.state.operator_camera_store.closed
-    _assert_profile_lease_available(tmp_path / "identity")
+    # Incomplete native stop must retain exclusivity, despite store cleanup.
+    import k5vision.operator_product as product_module
+
+    lease = OperatorProfileLock(tmp_path / "identity")
+    try:
+        for _ in range(2):
+            with pytest.raises(OperatorProfileLockError):
+                lease.acquire()
+        assert app.state.operator_profile_lock in product_module._PRODUCT_LEASES.values()
+    finally:
+        lease.close()
+        # Test-only disposal: the service above is a mock with no native worker.
+        retained = product_module._PRODUCT_LEASES.pop(id(app.state.operator_profile_lock))
+        retained.close()
 
 
 def test_product_startup_failure_closes_camera_store_and_attempts_native_cleanup(
