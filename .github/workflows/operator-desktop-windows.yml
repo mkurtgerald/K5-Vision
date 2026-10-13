@@ -54,7 +54,7 @@ jobs:
       - name: Verify desktop setup and process ownership on Windows
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_desktop_setup.py tests/unit/test_desktop_payload.py tests/unit/test_operator_native_process.py -o addopts= --no-cov
+          python -m pytest tests/unit/test_desktop_setup.py tests/unit/test_desktop_payload.py tests/unit/test_operator_native_process.py tests/unit/test_operator_product_service.py -o addopts= --no-cov
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Provision immutable native acceptance tools
         uses: ./.github/actions/provision-operator-tools

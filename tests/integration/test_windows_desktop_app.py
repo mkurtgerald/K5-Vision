@@ -372,6 +372,32 @@ def _recording_bytes(profile):
     return sum(path.stat().st_size for path in (profile / "recordings").rglob("*.mp4"))
 
 
+def _tray_recording(client, profile, camera_id, before, diagnostic):
+    """Require a connected recording source and new bytes while both UIs are closed."""
+    status, body, _ = client.get("/api/v1/operator/cameras")
+    camera_status, camera_recording = "unavailable", False
+    if status == 200:
+        payload = json.loads(body)
+        for camera in payload.get("cameras", []):
+            if camera.get("device_id") == camera_id:
+                value = camera.get("status")
+                camera_status = (
+                    value if value in {"live", "disconnected", "connecting"} else "unavailable"
+                )
+                camera_recording = camera.get("recording") is True
+                break
+    files = list((profile / "recordings").rglob("*.mp4"))
+    after = sum(path.stat().st_size for path in files)
+    diagnostic.update(
+        camera_status=camera_status,
+        camera_recording=camera_recording,
+        recording_file_count=len(files),
+        recording_bytes_before=before,
+        recording_bytes_after=after,
+    )
+    return camera_status == "live" and camera_recording and after > before
+
+
 def _healthy(client, diagnostic):
     """A normal startup 503 means not ready; strict API assertions follow readiness."""
     status, body, _ = client.get("/api/v1/health")
@@ -420,6 +446,8 @@ def _generate_fixture(parent, media, ffmpeg, upstream_port, helpers):
             "lavfi",
             "-i",
             "color=c=red:size=320x240:rate=15",
+            "-vf",
+            "noise=alls=8:allf=t+u",
             "-t",
             "2",
             "-an",
@@ -540,6 +568,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     form = None
     stage, failure, cleanup_failed = "installer", None, False
     readiness_diagnostic = {"health_http_status": 0}
+    recording_diagnostic = {}
     receipt = {
         "schema_version": "1",
         "platform": platform.system(),
@@ -646,21 +675,27 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["live_decoded_frames"] = browser_helpers._decoded_color(page, "live-video", "red")
         receipt["actual_edge_login_enrollment_live"] = True
         _wait(lambda: _recording_bytes(profile) > 0, "Desktop recording bytes", process=app)
-        stage = "browser_close_and_tray_recording"
+        stage = "browser_closing"
         context.close()
         context = None
         browser.close()
         browser = None
+        stage = "window_closing_to_tray"
         api.close(form)
         _wait(lambda: not api.api.IsWindowVisible(form), "Close hides desktop to tray", process=app)
+        receipt["close_hides_to_tray"] = True
+        stage = "tray_recording_growth"
         before = _recording_bytes(profile)
         _wait(
-            lambda: _recording_bytes(profile) > before,
+            lambda: _tray_recording(client, profile, camera_id, before, recording_diagnostic),
             "Recording continues with browser and desktop window closed",
             process=app,
             timeout=15,
         )
-        receipt["close_hides_to_tray"] = True
+        receipt["recording_bytes_before_tray"] = before
+        receipt["recording_bytes_after_tray"] = recording_diagnostic["recording_bytes_after"]
+        receipt["tray_camera_status"] = recording_diagnostic["camera_status"]
+        receipt["tray_camera_recording"] = recording_diagnostic["camera_recording"]
         receipt["recording_continues_after_browser_and_window_close"] = True
         stage = "double_click_reopens_existing_instance"
         previous_python_pids = {
@@ -780,6 +815,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "cleanup_failed": cleanup_failed,
             "desktop_status": desktop_status,
             **readiness_diagnostic,
+            **recording_diagnostic,
         }
         record_testsuite_property(
             "desktop_windows_diagnostic", json.dumps(diagnostic, sort_keys=True)
