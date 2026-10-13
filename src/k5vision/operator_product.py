@@ -6,6 +6,7 @@ import asyncio
 import os
 import socket
 import webbrowser
+from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
@@ -20,7 +21,11 @@ from k5vision.operator_profile_lock import OperatorProfileLock
 
 
 def create_operator_product_app(
-    *, identity_directory: Path, service: OperatorProductService, open_browser: bool = False
+    *,
+    identity_directory: Path,
+    service: OperatorProductService,
+    open_browser: bool = False,
+    ready_callback: Callable[[], None] | None = None,
 ):
     identity = load_identity_state(identity_directory)
     if identity.site_id != service.site_id:
@@ -86,6 +91,8 @@ def create_operator_product_app(
                     asyncio.get_running_loop().call_later(
                         0.5, webbrowser.open, f"http://127.0.0.1:{service.public_port}/operator/"
                     )
+                if ready_callback is not None:
+                    ready_callback()
                 yield
             finally:
                 try:
@@ -122,6 +129,8 @@ def run_operator_product(
     port: int = 8000,
     open_browser: bool = False,
     recording_limit_gb: int = 20,
+    shutdown_requested: Callable[[], bool] | None = None,
+    ready_callback: Callable[[], None] | None = None,
 ) -> None:
     """Serve only numeric loopback, retaining the control socket until bind."""
     if not 1 <= port <= 65535 or not 1 <= recording_limit_gb <= 4096:
@@ -157,7 +166,10 @@ def run_operator_product(
             max_recording_bytes=recording_limit_gb * 1024**3,
         )
         application = create_operator_product_app(
-            identity_directory=identity.directory, service=service, open_browser=open_browser
+            identity_directory=identity.directory,
+            service=service,
+            open_browser=open_browser,
+            ready_callback=ready_callback,
         )
         config = uvicorn.Config(
             application,
@@ -169,7 +181,40 @@ def run_operator_product(
         )
         print(f"K5 Vision operator: http://127.0.0.1:{public_port}/operator/")
         print("Recording continues while the browser is closed. Ctrl+C stops the application.")
-        asyncio.run(uvicorn.Server(config).serve(sockets=[control_socket]))
+        asyncio.run(
+            _serve_with_shutdown(
+                uvicorn.Server(config),
+                sockets=[control_socket],
+                shutdown_requested=shutdown_requested,
+            )
+        )
     finally:
         for listener in reservations:
             listener.close()
+
+
+async def _serve_with_shutdown(
+    server: uvicorn.Server,
+    *,
+    sockets: list[socket.socket],
+    shutdown_requested: Callable[[], bool] | None,
+) -> None:
+    """Let a GUI owner request the same graceful lifespan cleanup as Ctrl+C."""
+    watcher = None
+    if shutdown_requested is not None:
+
+        async def watch_owner():
+            while not server.should_exit:
+                if shutdown_requested():
+                    server.should_exit = True
+                    return
+                await asyncio.sleep(0.1)
+
+        watcher = asyncio.create_task(watch_owner(), name="operator-desktop-owner-lifetime")
+    try:
+        await server.serve(sockets=sockets)
+    finally:
+        if watcher is not None:
+            watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await watcher

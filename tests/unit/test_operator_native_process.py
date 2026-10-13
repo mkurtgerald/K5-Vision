@@ -204,7 +204,7 @@ def test_windows_assigns_isolated_relay_before_opening_native_gate(tmp_path: Pat
     assert relay[5:] == ["--relay", *arguments]
     assert options["stdin"] == subprocess.PIPE
     assert options["stdout"] == options["stderr"] == subprocess.DEVNULL
-    assert options["creationflags"] == native._CREATE_NEW_PROCESS_GROUP
+    assert options["creationflags"] == native._CREATE_NEW_PROCESS_GROUP | native._CREATE_NO_WINDOW
     assert events[2:5] == ["assign", ("gate", native._START_GATE), "gate_closed"]
     assert owned.pid == 123
     owned.stop()
@@ -250,6 +250,28 @@ def test_relay_never_spawns_native_child_without_exact_gate(monkeypatch, gate: b
     assert native._relay([sys.executable]) == 1
 
 
+def test_relay_starts_admitted_native_child_without_a_console(monkeypatch) -> None:
+    options = {}
+
+    class Process:
+        def __init__(self, arguments, **kwargs):
+            assert arguments == [sys.executable]
+            options.update(kwargs)
+
+        def wait(self):
+            return 37
+
+    monkeypatch.setattr(native, "_WINDOWS", True)
+    monkeypatch.setattr(native.sys, "stdin", io.TextIOWrapper(io.BytesIO(native._START_GATE)))
+    monkeypatch.setattr(native.signal, "SIGBREAK", 21, raising=False)
+    monkeypatch.setattr(native.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(native.subprocess, "Popen", Process)
+    assert native._relay([sys.executable]) == 37
+    assert options["creationflags"] == native._CREATE_NO_WINDOW
+    assert options["stdin"] == options["stdout"] == options["stderr"] == subprocess.DEVNULL
+    assert options["close_fds"] is True
+
+
 def test_native_arguments_refuse_source_urls_before_any_launch(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         native.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("native child started")
@@ -270,7 +292,8 @@ def test_windows_job_owns_native_child_and_descendant(tmp_path: Path) -> None:
     )
     script = tmp_path / "service.py"
     script.write_text(
-        "import json, os, signal, subprocess, sys, time\nfrom pathlib import Path\n"
+        "import ctypes, json, os, signal, subprocess, sys, time\nfrom pathlib import Path\n"
+        "assert not ctypes.windll.kernel32.GetConsoleWindow()\n"
         "signal.signal(signal.SIGBREAK, signal.SIG_IGN)\n"
         "child = subprocess.Popen([sys.executable, '-I', '-B', '-S', sys.argv[1]])\n"
         "Path(sys.argv[2]).write_text(json.dumps({'native': os.getpid(), 'child': child.pid}))\n"
