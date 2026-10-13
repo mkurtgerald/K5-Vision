@@ -277,7 +277,24 @@ try:
     # file on each start; it dispatches fixed script/argv with no Invoke-Expression.
     verifier=r'''import hashlib,importlib.util,json,re,stat,sys
 from pathlib import Path
-root=Path(sys.argv[1]);helper=root/'windows_identity_security.py'
+root=Path(sys.argv[1]);helper=root/'windows_identity_security.py';phase='bootstrap';private_ready=False
+diagnostic_name='' if sys.argv[3]=='none' else sys.argv[3]
+if diagnostic_name and not re.fullmatch(r'installed-launcher-diagnostic-[0-9a-f]{32}\.json',diagnostic_name): raise ValueError('Diagnostic basename refused')
+def diagnostic(kind,error,trace):
+ line=0
+ while trace is not None:
+  if trace.tb_frame.f_code.co_filename=='<string>': line=trace.tb_lineno
+  trace=trace.tb_next
+ reason='other'
+ if kind.__module__=='k5_installed_security' and kind.__name__=='WindowsIdentitySecurityError': reason='private-boundary'
+ elif kind is ValueError: reason='python-validation'
+ elif issubclass(kind,OSError): reason='file-operation'
+ if private_ready and diagnostic_name and 1<=line<=1000:
+  try:
+   with (root/diagnostic_name).open('xb') as stream:
+    stream.write(json.dumps({'schema_version':'1','stage':phase,'line':line,'reason':reason}).encode())
+  except Exception: pass
+sys.excepthook=diagnostic
 for p in reversed((helper,*helper.parents)):
  i=p.lstat()
  if stat.S_ISLNK(i.st_mode) or getattr(i,'st_file_attributes',0)&0x400: raise ValueError('Linked install refused')
@@ -297,42 +314,72 @@ def document(path):
  admit(path)
  if path.stat().st_size>65536: raise ValueError('Metadata budget exceeded')
  return json.loads(path.read_text(encoding='utf-8'))
-admit(helper)
+phase='private-bootstrap'
+admit(helper);private_ready=True
+phase='active-settings'
 active=document(root/'active.json')
 if set(active)!={'schema_version','release','python','runtime','state','port','recording_limit_gb'} or active['schema_version']!='1' or not re.fullmatch('[0-9a-f]{64}',active['release']) or active['python']!=sys.executable or type(active['port']) is not int or not 1024<=active['port']<=65535 or type(active['recording_limit_gb']) is not int or not 1<=active['recording_limit_gb']<=4096: raise ValueError('Installed settings refused')
+phase='release-manifest'
 release=root/'releases'/active['release'];manifest=document(release/'release.json')
 if hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()).hexdigest()!=active['release'] or set(manifest)!={'schema_version','files'} or manifest['schema_version']!='1': raise ValueError('Release identity refused')
+phase='release-files'
 for name,value in manifest['files'].items():
  path=Path(name)
  if path.is_absolute() or '..' in path.parts or not re.fullmatch('[0-9a-f]{64}',value): raise ValueError('Manifest path refused')
  admitted=release/path;admit(admitted)
  with admitted.open('rb') as stream:
   if hashlib.file_digest(stream,'sha256').hexdigest()!=value: raise ValueError('Release file identity refused')
+phase='wheel-admission'
 wheels=[name for name in manifest['files'] if re.fullmatch(r'dist/k5_vision-[0-9A-Za-z_.+]+-py3-none-any\.whl',name)]
 if len(wheels)!=1: raise ValueError('Installed wheel identity refused')
 active['starter']=str(release/'scripts/Start-K5Operator.ps1');active['wheel']=str(release/wheels[0]);print(json.dumps(active,ensure_ascii=True))'''
     import base64
     encoded=base64.b64encode(verifier.encode()).decode();python_literal=sys.executable.replace("'","''")
     helper_hash=manifest['files']['src/k5vision/windows_identity_security.py']
-    wrapper="""[CmdletBinding()]
-param([switch]$NoBrowser)
+    wrapper=r"""[CmdletBinding()]
+param([switch]$NoBrowser, [string]$DiagnosticName = '')
 $ErrorActionPreference = 'Stop'
+$stage = 'verification'
+$privateReady = $false
 try {
     $encoded = '%s'
     $python = '%s'
+    $diagnosticArgument = 'none'
+    if ($DiagnosticName) { $diagnosticArgument = $DiagnosticName }
     $previous = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $output = @(& $python -I -B -c "exec(__import__('base64').b64decode('$encoded'))" $PSScriptRoot '%s' 2>&1)
+        $output = @(& $python -I -B -c "exec(__import__('base64').b64decode('$encoded'))" $PSScriptRoot '%s' $diagnosticArgument 2>&1)
         $result = $LASTEXITCODE
     } finally { $ErrorActionPreference = $previous }
     if ($result -ne 0) { throw 'Installed package admission failed.' }
+    $privateReady = $true
+    $stage = 'settings-parsing'
     $settings = ($output -join "`n") | ConvertFrom-Json
     $arguments = @('-PackagePath', $settings.wheel, '-PythonExecutable', $python, '-RuntimeRoot', $settings.runtime, '-StateRoot', $settings.state, '-Port', [string]$settings.port, '-RecordingLimitGb', [string]$settings.recording_limit_gb)
     if ($NoBrowser) { $arguments += '-NoBrowser' }
+    if ($DiagnosticName) {
+        if ($DiagnosticName -cnotmatch '^installed-launcher-diagnostic-[0-9a-f]{32}\.json$') { throw 'Diagnostic basename refused.' }
+        $arguments += @('-DiagnosticName', ('launcher-diagnostic-' + $DiagnosticName.Substring(30)))
+    }
+    $stage = 'starter-dispatch'
     & $settings.starter @arguments
     exit $LASTEXITCODE
-} catch { Write-Host 'K5 operator could not start. Reinstall the reviewed package; existing identity and recordings were preserved.'; exit 1 }
+} catch {
+    if ($privateReady -and $DiagnosticName -cmatch '^installed-launcher-diagnostic-[0-9a-f]{32}\.json$') {
+        $stream = $null
+        try {
+            $line = $_.InvocationInfo.ScriptLineNumber
+            if ($line -lt 1 -or $line -gt 1000) { $line = 0 }
+            $document = @{schema_version='1'; stage=$stage; line=$line; reason='powershell-operation'}
+            $bytes = [Text.Encoding]::UTF8.GetBytes(($document | ConvertTo-Json -Compress))
+            $stream = [IO.File]::Open((Join-Path $PSScriptRoot $DiagnosticName),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+            $stream.Write($bytes,0,$bytes.Length)
+        } catch { } finally { if ($null -ne $stream) { $stream.Dispose() } }
+    }
+    Write-Host 'K5 operator could not start. Reinstall the reviewed package; existing identity and recordings were preserved.'
+    exit 1
+}
 """%(encoded,python_literal,helper_hash)
     phase='release-commit'
     for name in ('windows_identity_security.py','Start-K5Operator.ps1','Uninstall-K5Operator.ps1','active.json'):

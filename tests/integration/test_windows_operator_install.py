@@ -344,6 +344,93 @@ def _request(origin: str, route: str, data: dict | None = None) -> tuple[int, di
         return 0, {}
 
 
+def _installed_failure(install: Path, runtime: Path, name: str) -> str:
+    __tracebackhide__ = True
+    candidates = (
+        (
+            install / name,
+            {
+                "bootstrap",
+                "private-bootstrap",
+                "active-settings",
+                "release-manifest",
+                "release-files",
+                "wheel-admission",
+                "verification",
+                "settings-parsing",
+                "starter-dispatch",
+            },
+        ),
+        (
+            runtime / ("launcher-diagnostic-" + name[30:]),
+            {
+                "platform",
+                "python",
+                "private-state",
+                "runtime-installation",
+                "venv-admission",
+                "venv-creation",
+                "venv-file",
+                "venv-version",
+                "pip-installation",
+                "native-workers",
+                "worker-assembly",
+                "tools-admission",
+                "media-manifest",
+                "gateway-manifest",
+                "media-cache",
+                "gateway-cache",
+                "identity",
+                "recordings",
+                "operator",
+            },
+        ),
+    )
+    reasons = {
+        "private-boundary",
+        "python-validation",
+        "file-operation",
+        "other",
+        "powershell-operation",
+        "unclassified",
+        "python-operation",
+        "manifest-admission",
+        "artifact-count",
+        "artifact-admission",
+        "cached-identity",
+        "archive-identity",
+        "archive-contents",
+        "extracted-identity",
+        "license-identity",
+    }
+    for path, stages in candidates:
+        try:
+            identity_state._regular_file(path)
+            with path.open("rb") as source:
+                body = source.read(1025)
+            if len(body) > 1024:
+                continue
+            detail = json.loads(body)
+            if (
+                detail.get("schema_version") == "1"
+                and detail.get("stage") in stages
+                and detail.get("reason") in reasons
+                and type(detail.get("line")) is int
+                and 0 <= detail["line"] <= 5000
+            ):
+                return (
+                    "fixed stage "
+                    + detail["stage"]
+                    + " public-line "
+                    + str(detail["line"])
+                    + " reason "
+                    + detail["reason"]
+                )
+        except Exception:
+            pass
+    return "fixed diagnostic unavailable"
+
+
 def test_native_windows_installed_operator_lifecycle(
     record_testsuite_property, monkeypatch
 ) -> None:
@@ -485,6 +572,7 @@ def test_native_windows_installed_operator_lifecycle(
             len(list((install / "releases").iterdir())) == 1, "Repeat install duplicated release"
         )
 
+        diagnostic_name = "installed-launcher-diagnostic-" + uuid4().hex + ".json"
         owned = OwnedNativeProcess(
             [
                 str(powershell),
@@ -495,13 +583,20 @@ def test_native_windows_installed_operator_lifecycle(
                 "-File",
                 str(install / "Start-K5Operator.ps1"),
                 "-NoBrowser",
+                "-DiagnosticName",
+                diagnostic_name,
             ],
             cwd=parent,
         )
         origin = f"http://127.0.0.1:{port}"
         deadline = time.monotonic() + 150
         while True:
-            _require(owned.poll() is None, "Installed wrapper exited before readiness")
+            if owned.poll() is not None:
+                _require(
+                    False,
+                    "Installed wrapper exited: "
+                    + _installed_failure(install, runtime, diagnostic_name),
+                )
             status, body = _request(origin, "/api/v1/health")
             if status == 200 and body.get("status") == "ok":
                 break
@@ -548,6 +643,7 @@ def test_native_windows_installed_operator_lifecycle(
         # This actual child process inherits no-index; environment restoration
         # does not alter its snapshot. Cached dependencies must suffice while
         # the local same-version K5 wheel still updates its installed code.
+        diagnostic_name = "installed-launcher-diagnostic-" + uuid4().hex + ".json"
         with monkeypatch.context() as startup_environment:
             startup_environment.setenv("PIP_NO_INDEX", "1")
             owned = OwnedNativeProcess(
@@ -560,12 +656,19 @@ def test_native_windows_installed_operator_lifecycle(
                     "-File",
                     str(install / "Start-K5Operator.ps1"),
                     "-NoBrowser",
+                    "-DiagnosticName",
+                    diagnostic_name,
                 ],
                 cwd=parent,
             )
         deadline = time.monotonic() + 150
         while True:
-            _require(owned.poll() is None, "Upgraded wrapper exited before readiness")
+            if owned.poll() is not None:
+                _require(
+                    False,
+                    "Upgraded wrapper exited: "
+                    + _installed_failure(install, runtime, diagnostic_name),
+                )
             status, body = _request(origin, "/api/v1/health")
             if status == 200 and body.get("status") == "ok":
                 break
