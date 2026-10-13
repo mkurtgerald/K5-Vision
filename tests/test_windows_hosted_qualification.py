@@ -222,7 +222,7 @@ class AdapterTests(unittest.TestCase):
     def test_membership_race_fails_closed(self):
         owner = self.make()
         self.native.fail = "membership"
-        with self.assertRaisesRegex(ResourceFailure, "final_survivor_missing"):
+        with self.assertRaisesRegex(ResourceFailure, "initial_active_count_mismatch"):
             owner.sample()
 
     def test_pid_reuse_fails_closed(self):
@@ -484,17 +484,17 @@ class StableSnapshotFakeTests(unittest.TestCase):
             owner.sample()
         self.assertEqual(len(calls), 1)
 
-    def test_unexplained_departure_never_retries(self):
+    def test_permanent_unexplained_departure_exhausts_without_success(self):
         owner = self.make()
 
         def changed(number, rows):
-            self.native.pids.remove(11)
+            self.native.pids.discard(11)
             return rows
 
         calls = self.during_listeners(changed)
         with self.assertRaisesRegex(ResourceFailure, "final_survivor_missing"):
             owner.sample()
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 8)
 
     def test_unobserved_birth_is_disclosed_but_current_member_requires_count_conservation(self):
         for total_increase, new_pid in ((True, False), (False, True)):
@@ -3041,6 +3041,384 @@ class SampledCurrentCensusTests(unittest.TestCase):
         self.assertIs(state["pending_payload"], True)
 
 
+class PendingOmissionTests(unittest.TestCase):
+    make = AdapterTests.make
+    make_witnessed = StableSnapshotFakeTests.make_witnessed
+    birth = BirthLedgerFakeTests.birth
+
+    def omitted(self, *, initial=False, signal_read=None, previously_witnessed=True):
+        owner = self.make_witnessed() if previously_witnessed else self.make()
+        original_members, original_rss = self.native.members, self.native.rss
+        events = {"members": 0, "rss": [], "listeners": []}
+        original_listeners = self.native.listeners
+
+        def members(job):
+            events["members"] += 1
+            if events["members"] == (1 if initial else 2):
+                self.native.pids.remove(11)
+            if events["members"] == signal_read:
+                self.native.identities[11] = (101, True)
+            return original_members(job)
+
+        def rss(handle):
+            events["rss"].append((events["members"], handle))
+            return original_rss(handle)
+
+        def listeners(pids):
+            if not self.job.drained:
+                events["listeners"].append(set(pids))
+            return original_listeners(pids)
+
+        self.native.members, self.native.rss, self.native.listeners = members, rss, listeners
+        return owner, events
+
+    def test_initial_and_closing_pending_omission_need_signal_then_fresh_stable_pass(self):
+        for initial in (False, True):
+            with self.subTest(initial=initial):
+                owner, events = self.omitted(initial=initial, signal_read=3)
+                snapshot = owner.sample()
+                self.assertEqual((events["members"], snapshot.active_processes), (6, 1))
+                self.assertEqual(snapshot.rss_bytes, 200)
+                self.assertIn((11, 101), owner.absent_births)
+                self.assertEqual(owner.incomplete_exit_births, set())
+                self.assertEqual(len(owner.witnessed_births), 2)
+                owner.close()
+                state = association_state()
+                guard.accumulate_associations(state, owner)
+                self.assertEqual(state, association_state(2, 2))
+
+    def test_signal_immediately_after_false_read_is_deferred_without_accepting_that_attempt(self):
+        for initial in (False, True):
+            with self.subTest(initial=initial):
+                owner, events = self.omitted(initial=initial)
+                original = self.native.identity
+                fired = []
+
+                def identity(
+                    handle, original=original, fired=fired, initial=initial, events=events
+                ):
+                    value = original(handle)
+                    if handle == 11 and events["members"] == (1 if initial else 2) and not fired:
+                        fired.append(True)
+                        self.native.identities[11] = (101, True)
+                    return value
+
+                self.native.identity = identity
+                snapshot = owner.sample()
+                self.assertEqual(fired, [True])
+                self.assertEqual(snapshot.active_processes, 1)
+                self.assertEqual(events["members"], 4 if initial else 6)
+                self.assertIn((11, 101), owner.absent_births)
+
+    def test_pending_signal_during_rss_or_listener_read_requires_subsequent_stability(self):
+        for initial in (False, True):
+            for method in ("rss", "listeners"):
+                with self.subTest(initial=initial, method=method):
+                    owner, events = self.omitted(initial=initial)
+                    original = getattr(self.native, method)
+                    fired = []
+
+                    def signal(
+                        *args,
+                        original=original,
+                        fired=fired,
+                        initial=initial,
+                        events=events,
+                        owner=owner,
+                    ):
+                        value = original(*args)
+                        if events["members"] == (1 if initial else 3) and not fired:
+                            self.assertNotIn((11, 101), owner.absent_births)
+                            fired.append(True)
+                            self.native.identities[11] = (101, True)
+                        return value
+
+                    setattr(self.native, method, signal)
+                    snapshot = owner.sample()
+                    self.assertEqual(snapshot.active_processes, 1)
+                    self.assertEqual(events["members"], 4 if initial else 6)
+                    self.assertEqual(owner.observed_peak_rss_bytes, 200)
+
+    def test_permanently_missing_live_handle_is_audited_once_per_attempt_and_never_accepted(self):
+        for initial, category in (
+            (True, "departure_not_signaled"),
+            (False, "final_survivor_missing"),
+        ):
+            with self.subTest(initial=initial):
+                owner, events = self.omitted(initial=initial)
+                self.native.rss_each = 3 * GIB // 4
+                with self.assertRaisesRegex(ResourceFailure, category):
+                    owner.sample()
+                self.assertEqual(events["members"], 16)
+                self.assertEqual([handle for _, handle in events["rss"]].count(11), 8)
+                self.assertEqual([handle for _, handle in events["rss"]].count(12), 8)
+                self.assertEqual(events["listeners"], [{11, 12}] * 8)
+                self.assertEqual(owner.observed_peak_rss_bytes, 3 * GIB // 2)
+                self.assertNotIn((11, 101), owner.absent_births)
+                self.assertTrue(owner.failed and owner.cleanup_complete)
+
+    def test_resolving_on_seventh_attempt_allows_eighth_but_eighth_resolution_cannot_return(self):
+        for signal_read in (13, 15):
+            with self.subTest(signal_read=signal_read):
+                owner, events = self.omitted(signal_read=signal_read)
+                if signal_read == 13:
+                    self.assertEqual(owner.sample().active_processes, 1)
+                else:
+                    with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unstable"):
+                        owner.sample()
+                self.assertEqual(events["members"], 16)
+                self.assertIn((11, 101), owner.absent_births)
+
+    def test_pending_reappearance_on_each_next_census_refuses_even_same_live_identity(self):
+        for initial in (False, True):
+            for reappear in (2, 3) if initial else (3, 4):
+                for reused in (False, True):
+                    with self.subTest(initial=initial, reappear=reappear, reused=reused):
+                        owner, events = self.omitted(initial=initial)
+                        original = self.native.members
+
+                        def members(
+                            job, original=original, reappear=reappear, reused=reused, events=events
+                        ):
+                            if events["members"] + 1 == reappear:
+                                self.native.pids.add(11)
+                                if reused:
+                                    self.native.identities[11] = (999, False)
+                            return original(job)
+
+                        self.native.members = members
+                        with self.assertRaisesRegex(ResourceFailure, "retry_member_set_expanded"):
+                            owner.sample()
+                        self.assertEqual(events["members"], reappear)
+                        self.assertTrue(owner.cleanup_complete)
+
+    def test_pending_api_identity_or_ownership_failure_never_waits_for_later_signal(self):
+        for initial in (False, True):
+            for method, category in (
+                ("identity", "process_wait_failed"),
+                ("belongs", "ownership_unproven"),
+                ("rss", "resource_evidence_unavailable"),
+                ("listeners", "owned_listener_not_loopback"),
+            ):
+                with self.subTest(initial=initial, method=method):
+                    owner, events = self.omitted(initial=initial)
+                    original = getattr(self.native, method)
+                    failures = []
+
+                    def failed(
+                        *args,
+                        original=original,
+                        method=method,
+                        category=category,
+                        initial=initial,
+                        events=events,
+                        failures=failures,
+                    ):
+                        if not self.job.drained and events["members"] >= (1 if initial else 3):
+                            if method == "listeners" or args[0] == 11:
+                                failures.append(True)
+                                raise ResourceFailure(category)
+                        return original(*args)
+
+                    setattr(self.native, method, failed)
+                    with self.assertRaisesRegex(ResourceFailure, category):
+                        owner.sample()
+                    self.assertEqual(failures, [True])
+                    self.assertNotIn((11, 101), owner.absent_births)
+                    self.assertTrue(owner.cleanup_complete)
+
+    def test_pending_handle_rss_and_listener_caps_remain_fatal_with_evidence_preserved(self):
+        for resource in ("rss", "listeners"):
+            with self.subTest(resource=resource):
+                owner, events = self.omitted()
+                if resource == "rss":
+                    original = self.native.rss
+
+                    def rss(handle, original=original, events=events):
+                        return GIB + 1 if events["members"] >= 3 else original(handle)
+
+                    self.native.rss = rss
+                    category = "owned_rss_exceeded"
+                else:
+                    original = self.native.listeners
+
+                    def listeners(pids, original=original, events=events):
+                        rows = original(pids)
+                        if not self.job.drained and events["members"] >= 3:
+                            return {(11, 2, b"\x7f\0\0\1", port) for port in range(1, 4098)}
+                        return rows
+
+                    self.native.listeners = listeners
+                    category = "listener_evidence_limit"
+                with self.assertRaisesRegex(ResourceFailure, category):
+                    owner.sample()
+                if resource == "rss":
+                    self.assertEqual(owner.observed_peak_rss_bytes, 2 * GIB + 2)
+                else:
+                    self.assertEqual(len(owner.observed_listeners), 4097)
+                self.assertTrue(owner.cleanup_complete)
+
+    def test_combined_visible_and_pending_live_set_must_fit_active_cap_at_both_censuses(self):
+        for initial, category in (
+            (True, "initial_members_exceed_limit"),
+            (False, "final_members_exceed_limit"),
+        ):
+            with self.subTest(initial=initial):
+                owner = self.make()
+                self.native.pids = set(range(11, 43))
+                self.native.identities = {pid: (pid + 90, False) for pid in self.native.pids}
+                self.native.total = self.job.total_processes = 32
+                owner.sample()
+                self.clock.value += 0.25
+                original = self.native.members
+                calls = []
+
+                def members(job, original=original, calls=calls, initial=initial):
+                    calls.append(True)
+                    if len(calls) == (1 if initial else 2):
+                        self.native.pids.remove(11)
+                        self.birth(43, 133)
+                    return original(job)
+
+                self.native.members = members
+                with self.assertRaisesRegex(ResourceFailure, category):
+                    owner.sample()
+                self.assertEqual(len(self.native.pids), 32)
+                self.assertEqual(len(calls), 1 if initial else 2)
+                self.assertTrue(owner.cleanup_complete)
+
+    def test_visible_newcomer_is_fully_audited_while_other_identity_is_pending(self):
+        for foreign in (False, True):
+            with self.subTest(foreign=foreign):
+                owner, events = self.omitted(signal_read=5)
+                original_members, original_belongs = self.native.members, self.native.belongs
+
+                def members(job, original_members=original_members, events=events):
+                    if events["members"] == 2:
+                        self.birth()
+                    return original_members(job)
+
+                self.native.members = members
+                self.native.belongs = (
+                    lambda handle, job, foreign=foreign, original_belongs=original_belongs: (
+                        not (foreign and handle == 13) and original_belongs(handle, job)
+                    )
+                )
+                if foreign:
+                    with self.assertRaisesRegex(ResourceFailure, "ownership_unproven"):
+                        owner.sample()
+                    self.assertNotIn((13, 103), owner.witnessed_births)
+                else:
+                    snapshot = owner.sample()
+                    self.assertEqual((snapshot.active_processes, snapshot.rss_bytes), (2, 300))
+                    self.assertIn((13, 103), owner.witnessed_births)
+                    self.assertEqual(events["members"], 8)
+
+    def test_previously_proved_terminal_identity_cannot_revive_into_pending_state(self):
+        for incomplete in (False, True):
+            with self.subTest(incomplete=incomplete):
+                case = ProvenExitTimingTests()
+                owner, _ = case.timeline("rss" if incomplete else "post_listener_return")
+                owner.sample()
+                case.clock.value += 0.25
+                case.native.identities[13] = (103, False)
+                with self.assertRaisesRegex(ResourceFailure, "pid_reuse_or_exit"):
+                    owner.sample()
+                self.assertTrue(owner.cleanup_complete)
+
+    def test_signaled_still_listed_object_cannot_revive_when_later_omitted(self):
+        owner, events = self.omitted()
+        original_listeners, original_members = self.native.listeners, self.native.members
+
+        def listeners(pids):
+            rows = original_listeners(pids)
+            if not self.job.drained and events["members"] == 1:
+                self.native.identities[12] = (102, True)
+            return rows
+
+        def members(job):
+            if events["members"] == 2:
+                self.native.pids.remove(12)
+                self.native.identities[12] = (102, False)
+            return original_members(job)
+
+        self.native.listeners, self.native.members = listeners, members
+        with self.assertRaisesRegex(ResourceFailure, "pid_reuse_or_exit"):
+            owner.sample()
+        self.assertEqual(events["members"], 3)
+
+    def test_pending_resolution_does_not_reset_inclusive_deadline(self):
+        for duration in (1.0, 1.0 + 2**-10):
+            with self.subTest(duration=duration):
+                owner, events = self.omitted(signal_read=3)
+                started = self.clock.value
+                original = self.native.members
+
+                def members(
+                    job, original=original, duration=duration, started=started, events=events
+                ):
+                    value = original(job)
+                    if events["members"] == 5:
+                        self.clock.value = started + duration
+                    return value
+
+                self.native.members = members
+                if duration == 1:
+                    snapshot = owner.sample()
+                    self.assertEqual(snapshot.measured_at - snapshot.started_at, 1)
+                else:
+                    with self.assertRaisesRegex(ResourceFailure, "resource_evidence_stale"):
+                        owner.sample()
+                self.assertEqual(events["members"], 6)
+
+    def test_newly_witnessed_closing_omission_requires_same_pending_exit_proof(self):
+        owner, events = self.omitted(signal_read=3, previously_witnessed=False)
+        self.assertEqual(owner.witnessed_births, set())
+        snapshot = owner.sample()
+        self.assertEqual((snapshot.active_processes, events["members"]), (1, 6))
+        self.assertEqual(owner.witnessed_births, {(11, 101), (12, 102)})
+        self.assertEqual(owner.absent_births, {(11, 101)})
+        self.assertEqual(owner.incomplete_exit_births, set())
+
+    def test_pending_retry_observations_preserve_rss_peak_and_endpoint_union(self):
+        owner, events = self.omitted(signal_read=5)
+        original_rss, original_listeners = self.native.rss, self.native.listeners
+        row = (11, 2, b"\x7f\0\0\1", 9000)
+
+        def rss(handle):
+            value = original_rss(handle)
+            return 300 if handle == 11 and events["members"] == 3 else value
+
+        def listeners(pids):
+            rows = original_listeners(pids)
+            return rows | {row} if not self.job.drained and events["members"] == 3 else rows
+
+        self.native.rss, self.native.listeners = rss, listeners
+        snapshot = owner.sample()
+        self.assertEqual((snapshot.active_processes, snapshot.rss_bytes), (1, 400))
+        self.assertEqual(snapshot.owned_loopback_listeners, 1)
+        self.assertEqual(owner.observed_peak_rss_bytes, 400)
+        self.assertEqual(owner.observed_listeners, {row})
+        self.assertEqual(events["members"], 8)
+        owner.close()
+        self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
+
+    def test_pending_exhaustion_never_masks_cleanup_failure_or_loses_recovered_counts(self):
+        owner, events = self.omitted()
+        self.native.fail = "listener_cleanup"
+        with self.assertRaisesRegex(ResourceFailure, "owned_listener_cleanup_failed"):
+            owner.sample()
+        self.assertEqual(events["members"], 16)
+        self.assertFalse(owner.cleanup_complete)
+        self.assertTrue(owner.association_counts_complete)
+        state = association_state(8, 3)
+        guard.accumulate_associations(state, owner)
+        self.assertEqual(state, association_state(10, 5))
+        with self.assertRaisesRegex(ResourceFailure, "owned_job_cleanup_failed"):
+            owner.close()
+        self.assertEqual(state, association_state(10, 5))
+
+
 class MembershipPredicateFakeTests(unittest.TestCase):
     """Fixed categories for retained gates under explicit birth reconciliation."""
 
@@ -3089,7 +3467,6 @@ class MembershipPredicateFakeTests(unittest.TestCase):
             if category in {
                 "retry_member_set_expanded",
                 "departure_handle_missing",
-                "departure_not_signaled",
             }:
                 self.expire()
             elif category == "departed_member_still_listed":
@@ -3107,6 +3484,8 @@ class MembershipPredicateFakeTests(unittest.TestCase):
         elif category == "association_count_underflow":
             self.native.pids.add(13)
             self.native.identities[13] = (103, False)
+        elif category == "departure_not_signaled":
+            self.native.pids.remove(11)
         return owner
 
     def test_each_fixed_membership_predicate_category_is_distinct_and_source_free(self):

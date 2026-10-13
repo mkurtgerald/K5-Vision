@@ -1714,6 +1714,8 @@ class QualificationResources:
             resource_need(0 < started - self.last_start <= STALE_SECONDS, "resource_evidence_stale")
         resource_need(0 < started - self.host_seed_at <= STALE_SECONDS, "host_cpu_evidence_stale")
         self.native.parent_outside(self.job)
+        pending_missing = {}  # Retained PID -> fixed refusal category if it never signals.
+        signaled_births = set()
 
         def fresh():
             resource_need(0 <= self.clock() - started <= STALE_SECONDS, "resource_evidence_stale")
@@ -1734,6 +1736,18 @@ class QualificationResources:
             resource_need(self.native.belongs(handle, self.job), "ownership_unproven")
             actual, signaled = self.native.identity(handle)
             resource_need(actual == birth, "pid_reuse_or_exit")
+            identity = (pid, birth)
+            resource_need(
+                signaled
+                or (
+                    identity not in self.incomplete_exit_births
+                    and identity not in self.absent_births
+                    and identity not in signaled_births
+                ),
+                "pid_reuse_or_exit",
+            )
+            if signaled:
+                signaled_births.add(identity)
             return signaled
 
         def open_member(pid):
@@ -1767,7 +1781,8 @@ class QualificationResources:
                 not any(
                     pid in self.handles and (pid, self.handles[pid][1]) in self.absent_births
                     for pid in members
-                ),
+                )
+                and not members & pending_missing.keys(),
                 "retry_member_set_expanded",
             )
 
@@ -1782,7 +1797,7 @@ class QualificationResources:
             )
             return self.witnessed_births | self.incomplete_exit_births
 
-        def audit(members, *, prior_rss=0):
+        def audit(members, *, prior_rss=0, omitted=frozenset()):
             nonlocal rss
             departed, new_births, attempt_rss = set(), set(), prior_rss
             for pid in sorted(members):
@@ -1796,7 +1811,8 @@ class QualificationResources:
                     "pid_reuse_or_exit",
                 )
                 if signaled:
-                    listed_exit(pid)
+                    if pid not in omitted:
+                        listed_exit(pid)
                     departed.add(pid)
                 else:
                     # API errors are fatal; CPU/commit cannot replace live RSS.
@@ -1842,10 +1858,24 @@ class QualificationResources:
                     not (members - remaining_members) & self.handles.keys(),
                     "retry_member_set_expanded",
                 )
+            resolved = set()
             for pid in self.handles.keys() - members:
-                resource_need(exited(pid), "departure_not_signaled")
+                if exited(pid):
+                    self.absent_births.add((pid, self.handles[pid][1]))
+                    if pid in pending_missing:
+                        pending_missing.pop(pid)
+                        resolved.add(pid)
+                else:
+                    pending_missing.setdefault(pid, "departure_not_signaled")
+            # An omitted nonsignaled retained object is still potentially live.
+            # Audit it once alongside visible members, including its RSS/endpoints.
+            audit_members = members | pending_missing.keys()
+            resource_need(len(audit_members) <= ACTIVE_LIMIT, "initial_members_exceed_limit")
+            departed, attempt_rss = audit(audit_members, omitted=pending_missing.keys())
+            for pid in departed & pending_missing.keys():
                 self.absent_births.add((pid, self.handles[pid][1]))
-            departed, attempt_rss = audit(members)
+                pending_missing.pop(pid)
+            departed.update(resolved)
             after = accounting()
             survivors = self.native.members(self.job)
             newcomers = survivors - members
@@ -1854,13 +1884,19 @@ class QualificationResources:
             for pid in departed_still_listed:
                 listed_exit(pid)
             for pid in members - departed - survivors:
-                # A fully audited member may exit before the closing census.
-                # Only its retained same-object owned exit can explain absence.
-                resource_need(witnessed(pid) and exited(pid), "final_survivor_missing")
-                departed.add(pid)
-            for pid in members - survivors:
+                resource_need(witnessed(pid), "final_survivor_missing")
+                if exited(pid):
+                    departed.add(pid)
+                else:
+                    # Already RSS-audited this pass; include it in the next pass
+                    # without double-charging the same object's working set.
+                    pending_missing.setdefault(pid, "final_survivor_missing")
+            for pid in members - survivors - pending_missing.keys():
                 self.absent_births.add((pid, self.handles[pid][1]))
-            resource_need(len(survivors) <= ACTIVE_LIMIT, "final_members_exceed_limit")
+            resource_need(
+                len(survivors | pending_missing.keys()) <= ACTIVE_LIMIT,
+                "final_members_exceed_limit",
+            )
             resource_need(not newcomers & self.handles.keys(), "new_birth_identity_reappeared")
             final_signaled = set()
             for pid in survivors - newcomers - departed:
@@ -1876,7 +1912,7 @@ class QualificationResources:
                 departed.update(new_departures)
             fresh()
             counts_match = before[1] == len(members) and after[1] == len(survivors)
-            if not departed and not newcomers and counts_match:
+            if not pending_missing and not departed and not newcomers and counts_match:
                 # Historical associations need not have complete live samples.
                 # They remain disclosed gaps, never invented identity evidence.
                 resource_need(after[0] >= len(classified_births()), "association_count_underflow")
@@ -1890,6 +1926,12 @@ class QualificationResources:
                 resource_need(after[1] == len(survivors), "final_active_count_mismatch")
                 resource_need(not departed_still_listed, "departed_member_still_listed")
                 resource_need(not final_signaled, "final_survivor_signaled")
+                resource_need(
+                    not pending_missing,
+                    "departure_not_signaled"
+                    if "departure_not_signaled" in pending_missing.values()
+                    else "final_survivor_missing",
+                )
                 raise ResourceFailure("resource_evidence_unstable")
             # Signaled is not absent: retain every PID from the actual census
             # until a later membership read omits it with exact owned exit proof.
