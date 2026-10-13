@@ -26,7 +26,7 @@ try {
     if (-not [IO.Path]::IsPathRooted($python) -or -not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'Installed interpreter required.' }
     $paths = @(
         (Join-Path ([Environment]::GetFolderPath('Programs', 'DoNotVerify')) 'K5 Vision Operator.lnk'),
-        (Join-Path ([Environment]::GetFolderPath('Desktop', 'DoNotVerify')) 'K5 Vision Operator.lnk'),
+        (Join-Path ([Environment]::GetFolderPath('DesktopDirectory', 'DoNotVerify')) 'K5 Vision Operator.lnk'),
         (Join-Path ([Environment]::GetFolderPath('Startup', 'DoNotVerify')) 'K5 Vision Operator.lnk')
     )
     $powershell = Join-Path $env:SYSTEMROOT 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -71,6 +71,22 @@ def load(path):
  admit(path)
  if path.stat().st_size>65536: raise ValueError('Metadata budget exceeded')
  return json.loads(path.read_text(encoding='utf-8'))
+def admit_shortcut(path):
+ ordinary(path);security.check_windows_volume(path)
+ native=security._NativeSecurity();current=native.current_user()
+ trusted={current,security._ADMINISTRATORS,security._SYSTEM}
+ if native.trusted_installer(): trusted.add(security._TRUSTED_INSTALLER)
+ for component in reversed((path,*path.parents)):
+  security.check_windows_security(component,private=False)
+  if component not in (path,path.parent): continue
+  owner,entries=native.descriptor(str(component))
+  for entry in entries:
+   if entry.kind!=0: continue
+   sid=entry.sid
+   if sid==security._OWNER_RIGHTS: sid=owner
+   elif sid==security._CREATOR_OWNER and entry.flags&0x08: sid=current
+   if sid not in trusted and security._expanded_mask(entry.mask)&(security._ANCESTOR_MUTATION|0x06):
+    raise ValueError('Foreign shortcut write refused')
 admit(helper);admit(root,True)
 active=load(root/'active.json')
 if active.get('schema_version')!='1' or active.get('python')!=sys.executable or not re.fullmatch('[0-9a-f]{64}',active.get('release','')):
@@ -113,7 +129,7 @@ try:
   directories.append(release)
  for path in root.iterdir():
   if path.name!='releases': admit(path)
- for path in shortcuts: admit(path)
+ for path in shortcuts: admit_shortcut(path)
  # Admission of all deletions finishes before deleting any file. Profiles remain.
  for path in shortcuts: path.unlink()
  for path in files: path.unlink()

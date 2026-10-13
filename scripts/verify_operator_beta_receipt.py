@@ -61,7 +61,8 @@ _TRUE = {
         "live_upgrade_uninstall_refused owned_tree_cleanup stopped_upgrade "
         "prior_release_preserved changed_release_refused unknown_content_refused "
         "uninstall_preserves_profile same_version_wheel_upgrade bootstrap_identity_refused "
-        "foreign_writable_tree_refused cached_runtime_no_index"
+        "foreign_writable_tree_refused cached_runtime_no_index readonly_foreign_shortcut_accepted "
+        "foreign_write_shortcut_refused"
     ).split(),
     "browser": (
         "ui_login ui_two_camera_enrollment simultaneous_recording camera_switch_pixel_isolation "
@@ -141,6 +142,7 @@ def verify(lane: str, path: Path) -> list[dict]:
             _require(1 <= receipt.get("person_boxes", 0) <= 32)
             _require(receipt.get("displayed_frame_matching_fraction", 0) >= 0.90)
             _require(receipt.get("box_overlay_pixels", 0) >= 100)
+            _require(receipt.get("box_added_overlay_pixels", 0) >= 100)
             _require(receipt.get("live_decoded_frames", 0) >= 4)
             _require(receipt.get("recorded_playback_decoded_frames", 0) > 0)
             _require(0 < receipt.get("duration_seconds", 0) < 90)

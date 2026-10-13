@@ -14,7 +14,7 @@
     hls: null, nativeLive: false, hlsScript: null, retryTimer: null, retryCount: 0,
     pollTimer: null, expiryTimer: null, selectionController: null,
     spans: [], selectedSpan: null, historyEpoch: 0, historyRolling: true, signingOut: false,
-    dialogMode: "add", diagnostics: null, statusUnavailable: false,
+    dialogMode: "add", cameraSetupEpoch: 0, diagnostics: null, statusUnavailable: false,
     removeTarget: null, removing: false,
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
     personFrameId: 0,
@@ -151,6 +151,7 @@
     $("new-camera-name").readOnly = false;
     $("new-camera-host").readOnly = false;
     state.dialogMode = "add";
+    state.cameraSetupEpoch += 1;
     if ($("add-camera-dialog").open) $("add-camera-dialog").close();
     for (const id of ["remove-camera-dialog", "connection-help-dialog"]) {
       if ($(id).open) $(id).close();
@@ -904,6 +905,7 @@
     const camera = mode === "update" ? currentCamera() : null;
     if (mode === "update" && !camera) return;
     if (mode === "update") stopPersonView();
+    state.cameraSetupEpoch += 1;
     state.dialogMode = mode;
     $("add-camera-form").reset(); message("add-camera-message", "");
     $("new-camera-name").readOnly = mode === "update";
@@ -913,6 +915,7 @@
       ? "Changing the stream address reconnects live video and recording. The current address is kept private."
       : "Connect an RTSP camera to live view and continuous recording.";
     $("save-camera").textContent = mode === "update" ? "Update source" : "Connect camera";
+    $("save-camera").disabled = false;
     if (camera) {
       $("new-camera-name").value = camera.name;
       $("new-camera-host").value = camera.host;
@@ -925,6 +928,7 @@
   $("close-add-camera").addEventListener("click", closeAddCamera);
   $("cancel-add-camera").addEventListener("click", closeAddCamera);
   $("add-camera-dialog").addEventListener("close", () => {
+    if ($("add-camera-dialog").open) return;
     $("add-camera-form").reset();
     $("new-camera-name").readOnly = false;
     $("new-camera-host").readOnly = false;
@@ -932,8 +936,9 @@
   });
   $("add-camera-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (state.account?.role !== "administrator") return;
+    if (state.account?.role !== "administrator" || $("save-camera").disabled) return;
     const epoch = state.sessionEpoch;
+    const setupEpoch = state.cameraSetupEpoch;
     const updating = state.dialogMode === "update";
     const camera = { name: $("new-camera-name").value.trim(), host: $("new-camera-host").value.trim(), source_uri: $("new-camera-source").value.trim() };
     $("new-camera-source").value = "";
@@ -942,23 +947,27 @@
     try {
       const created = await request("/api/v1/operator/cameras", { method: "POST", body: camera });
       if (epoch !== state.sessionEpoch) return;
-      closeAddCamera();
-      notice(updating
-        ? "Camera source updated. Live video and recording will reconnect."
-        : "Camera saved. The live connection and recording status will update as it connects.");
+      if (setupEpoch === state.cameraSetupEpoch) {
+        closeAddCamera();
+        notice(updating
+          ? "Camera source updated. Live video and recording will reconnect."
+          : "Camera saved. The live connection and recording status will update as it connects.");
+      }
       await refreshCameras();
       const deviceId = created.device_id || created.camera?.device_id;
-      if (deviceId) await selectCamera(deviceId);
+      if (deviceId && setupEpoch === state.cameraSetupEpoch) await selectCamera(deviceId);
     } catch (error) {
-      if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
+      if (error.name === "AbortError" || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       message("add-camera-message", error.status === 422
         ? "Check the camera IP address and RTSP stream. Enter the stream address again to retry."
         : error.status === 409 ? "This camera is already configured. Refresh the camera list."
           : apiMessage(error, "Camera setup failed. Enter the stream address again and retry."), true);
     } finally {
       camera.source_uri = "";
-      $("new-camera-source").value = "";
-      $("save-camera").disabled = false;
+      // Submitted credentials were cleared before the request. Completion may
+      // belong to an earlier dialog while the next camera is already being set
+      // up, so it must not clear or enable controls owned by that new dialog.
+      if (epoch === state.sessionEpoch && setupEpoch === state.cameraSetupEpoch) $("save-camera").disabled = false;
     }
   });
 

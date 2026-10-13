@@ -248,7 +248,7 @@ def _run_script(powershell: Path, script: Path, arguments: list[str]) -> tuple[i
 def _shortcut_paths(powershell: Path) -> list[Path]:
     __tracebackhide__ = True
     code = (
-        "$paths=@('Programs','Desktop','Startup') | ForEach-Object { "
+        "$paths=@('Programs','DesktopDirectory','Startup') | ForEach-Object { "
         "[IO.Path]::Combine([Environment]::GetFolderPath($_,'DoNotVerify'),"
         "'K5 Vision Operator.lnk') }; "
         "$json=$paths | ConvertTo-Json -Compress; "
@@ -307,10 +307,11 @@ def _make_foreign_shortcut(powershell: Path, parent: Path, path: Path) -> None:
         script.unlink()
 
 
-def _foreign_access(path: Path, *, grant: bool) -> None:
+def _foreign_access(path: Path, *, grant: bool, permission: str = "F") -> None:
     __tracebackhide__ = True
     executable = Path(os.environ["SYSTEMROOT"]) / "System32/icacls.exe"
-    arguments = ["/grant", "*S-1-1-0:(OI)(CI)F"] if grant else ["/remove:g", "*S-1-1-0"]
+    access = "*S-1-1-0:(OI)(CI)F" if permission == "F" else "*S-1-1-0:" + permission
+    arguments = ["/grant", access] if grant else ["/remove:g", "*S-1-1-0"]
     result = subprocess.run(
         [str(executable), str(path), *arguments],
         stdout=subprocess.DEVNULL,
@@ -452,6 +453,28 @@ def test_native_windows_installed_operator_lifecycle(
         )
         release = _json(install / "active.json")["release"]
         _verify_shortcuts(powershell, install, shortcuts)
+        # Nonsecret shortcuts may be readable by another local user, while even
+        # a foreign WRITE_DATA-only grant must fail before release/deletion.
+        _foreign_access(shortcuts[1], grant=True, permission="(R)")
+        try:
+            result, stage = _run_script(powershell, installer, arguments)
+            _require(result == 0, "Readonly foreign shortcut admission failed at " + stage)
+        finally:
+            _foreign_access(shortcuts[1], grant=False)
+        _foreign_access(shortcuts[1], grant=True, permission="(WD)")
+        try:
+            result, _ = _run_script(powershell, installer, arguments)
+            _require(
+                result != 0 and (install / "active.json").read_bytes() == active,
+                "Installer accepted foreign-write shortcut bytes",
+            )
+            result, _ = _run_script(powershell, install / "Uninstall-K5Operator.ps1", [])
+            _require(
+                result != 0 and shortcuts[1].exists(),
+                "Uninstaller accepted foreign-write shortcut bytes",
+            )
+        finally:
+            _foreign_access(shortcuts[1], grant=False)
         result, stage = _run_script(powershell, installer, arguments)
         _require(result == 0, "Repeat native installer failed at " + stage)
         _require(
@@ -617,6 +640,7 @@ def test_native_windows_installed_operator_lifecycle(
         result, _ = _run_script(powershell, install / "Uninstall-K5Operator.ps1", [])
         _require(result != 0 and unknown.exists(), "Uninstall deleted unknown application content")
         unknown.unlink()
+        _foreign_access(shortcuts[1], grant=True, permission="(R)")
         result, _ = _run_script(powershell, install / "Uninstall-K5Operator.ps1", [])
         _require(result == 0 and not install.exists(), "Native application uninstall failed")
         _require(not any(path.exists() for path in shortcuts), "Owned shortcuts survived uninstall")
@@ -652,6 +676,8 @@ def test_native_windows_installed_operator_lifecycle(
                 "start_desktop_logon_shortcuts": True,
                 "repeat_install": True,
                 "foreign_shortcut_refused": True,
+                "readonly_foreign_shortcut_accepted": True,
+                "foreign_write_shortcut_refused": True,
                 "bootstrap_identity_refused": True,
                 "foreign_writable_tree_refused": True,
                 "recording_limit_persisted": True,

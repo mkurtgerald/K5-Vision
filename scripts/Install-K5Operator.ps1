@@ -82,7 +82,7 @@ try {
     $PythonExecutable = (Invoke-K5InstallPython -Code $probe -Arguments @()) | ConvertFrom-Json
     $stage = 'package-and-private-paths'
     $programs = Join-Path ([Environment]::GetFolderPath('Programs', 'DoNotVerify')) 'K5 Vision Operator.lnk'
-    $desktop = Join-Path ([Environment]::GetFolderPath('Desktop', 'DoNotVerify')) 'K5 Vision Operator.lnk'
+    $desktop = Join-Path ([Environment]::GetFolderPath('DesktopDirectory', 'DoNotVerify')) 'K5 Vision Operator.lnk'
     $startup = Join-Path ([Environment]::GetFolderPath('Startup', 'DoNotVerify')) 'K5 Vision Operator.lnk'
     $powershell = Join-Path $env:SYSTEMROOT 'System32\WindowsPowerShell\v1.0\powershell.exe'
     # The helper is the unchanged pilot stdlib-only admission implementation.
@@ -146,6 +146,27 @@ def directory(path):
     if not path.exists():
         directory(path.parent);path.mkdir(mode=0o700)
     admit(path,'dir')
+def admit_shortcut(path,kind):
+    # Shortcuts contain only public dispatch arguments. Foreign reads are safe;
+    # foreign writes to their bytes or future inherited files remain refused.
+    ordinary(path,kind);security.check_windows_volume(path)
+    native=security._NativeSecurity();current=native.current_user()
+    trusted={current,security._ADMINISTRATORS,security._SYSTEM}
+    if native.trusted_installer(): trusted.add(security._TRUSTED_INSTALLER)
+    for component in reversed((path,*path.parents)):
+        security.check_windows_security(component,private=False)
+        if component not in (path,path.parent): continue
+        owner,entries=native.descriptor(str(component))
+        for entry in entries:
+            if entry.kind!=0: continue
+            sid=entry.sid
+            if sid==security._OWNER_RIGHTS: sid=owner
+            elif sid==security._CREATOR_OWNER and entry.flags&0x08: sid=current
+            if sid not in trusted and security._expanded_mask(entry.mask)&(security._ANCESTOR_MUTATION|0x06):
+                raise ValueError('Foreign shortcut write refused')
+def shortcut_directory(path):
+    if not path.exists(): shortcut_directory(path.parent);path.mkdir(mode=0o700)
+    admit_shortcut(path,'dir')
 def read_json(path):
     admit(path,'file')
     if path.stat().st_size>65536: raise ValueError('Metadata budget exceeded')
@@ -174,8 +195,8 @@ for path in (runtime,state):
 phase='shortcut-admission'
 for index,path in enumerate(shortcuts):
     phase='shortcut-slot-'+str(index)
-    directory(path.parent)
-    if path.exists(): admit(path,'file')
+    shortcut_directory(path.parent)
+    if path.exists(): admit_shortcut(path,'file')
 if logon:
     phase='identity-admission'
     # Initial account creation belongs to an interactive first launch. Startup

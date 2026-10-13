@@ -168,6 +168,161 @@ def _assert_no_browser_storage(page):
     )
 
 
+def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
+    """Delay only the previous selection to reproduce the real enrollment race.
+
+    This browser behavior regression uses intercepted responses. It supplements
+    the independent real two-camera fixture; it is not native media acceptance.
+    """
+    __tracebackhide__ = True
+    browser_api = pytest.importorskip("playwright.sync_api")
+    channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
+    assets = Path(__file__).parents[2] / "src" / "k5vision" / "operator_web"
+    cameras, submitted, pending = [], [], []
+    account = {"username": "fixture-admin", "display_name": "Fixture", "role": "administrator"}
+    sources = ("rtsp://127.0.0.1/generated", "rtsp://127.0.0.2/generated")
+    identifiers = ("8643f7a8-4a09-4ec0-bf35-15fd728cf001", "8643f7a8-4a09-4ec0-bf35-15fd728cf002")
+    playwright = browser = context = None
+    failed = False
+    try:
+        playwright = browser_api.sync_playwright().start()
+        browser = playwright.chromium.launch(channel=channel, headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+        page.set_default_timeout(10_000)
+
+        def intercept(route):
+            path = urlsplit(route.request.url).path
+            data = {}
+            status = 200
+            if path.startswith("/operator/"):
+                name = path.rsplit("/", 1)[1] or "index.html"
+                content_type = {
+                    "index.html": "text/html",
+                    "app.js": "application/javascript",
+                    "app.css": "text/css",
+                }[name]
+                route.fulfill(
+                    status=200, content_type=content_type, body=(assets / name).read_text()
+                )
+                return
+            if path == "/media/hls.js":
+                route.fulfill(
+                    status=200,
+                    content_type="application/javascript",
+                    body="window.Hls = {isSupported: () => false};",
+                )
+                return
+            if path == "/api/v1/auth/login":
+                data = {
+                    "session_token": "camera-dialog-fixture-session-token-000000",
+                    "account": account,
+                    "expires_at": "2030-01-01T00:00:00Z",
+                }
+            elif path == "/api/v1/auth/me":
+                data = account
+            elif path == "/api/v1/operator/status":
+                data = {
+                    "worker_status": "ready",
+                    "max_recording_bytes": 20 * 1024**3,
+                    "storage": None,
+                }
+            elif path == "/api/v1/operator/cameras":
+                if route.request.method == "POST":
+                    payload = route.request.post_data_json
+                    submitted.append(payload["source_uri"])
+                    data = {
+                        "device_id": identifiers[len(cameras)],
+                        "name": payload["name"],
+                        "host": payload["host"],
+                        "status": "connecting",
+                        "recording": False,
+                        "analytics_status": "disabled",
+                    }
+                    cameras.append(data)
+                    status = 201
+                else:
+                    data = {"cameras": cameras, "worker_status": "ready"}
+            elif path.endswith("/media-session"):
+                if identifiers[0] in path and not pending:
+                    pending.append(route)
+                    return
+                data = {
+                    "live_url": "/media/live/k5_" + "a" * 64 + "/index.m3u8",
+                    "playback_url": "/media/playback?path=k5_" + "a" * 64,
+                }
+            else:
+                status = 404
+            route.fulfill(status=status, content_type="application/json", body=json.dumps(data))
+
+        page.route("**/*", intercept)
+        page.goto("http://127.0.0.1:8000/operator/")
+        page.locator("#username").fill("fixture-admin")
+        page.locator("#password").fill("fixture-browser-password")
+        page.locator("#sign-in-button").click()
+        page.locator("#workspace").wait_for(state="visible")
+        page.locator("#add-camera-button").click()
+        page.locator("#new-camera-name").fill("First generated camera")
+        page.locator("#new-camera-host").fill("127.0.0.1")
+        page.locator("#new-camera-source").fill(sources[0])
+        page.locator("#save-camera").click()
+        page.locator("#add-camera-dialog").wait_for(state="hidden")
+        deadline = time.monotonic() + 5
+        while not pending and time.monotonic() < deadline:
+            page.wait_for_timeout(10)
+        _require(bool(pending), "Previous camera selection was not held for the overlap regression")
+        page.locator("#add-camera-button").click()
+        page.locator("#new-camera-name").fill("Second generated camera")
+        page.locator("#new-camera-host").fill("127.0.0.2")
+        page.locator("#new-camera-source").fill(sources[1])
+        pending[0].fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "live_url": "/media/live/k5_" + "a" * 64 + "/index.m3u8",
+                    "playback_url": "/media/playback?path=k5_" + "a" * 64,
+                }
+            ),
+        )
+        page.wait_for_function("() => window.Hls !== undefined")
+        _require(
+            page.locator("#new-camera-source").input_value() == sources[1],
+            "Previous camera completion erased the next dialog's required stream address",
+        )
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST"
+                and response.url.endswith("/api/v1/operator/cameras")
+            )
+        ) as second:
+            page.locator("#save-camera").click()
+        _require(second.value.status == 201, "The second dialog did not enroll through the UI")
+        page.locator("#add-camera-dialog").wait_for(state="hidden")
+        _require(
+            submitted == list(sources), "Dialog submissions did not preserve independent sources"
+        )
+        _assert_no_browser_storage(page)
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        cleanup_failed = False
+        for resource in (context, browser):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    cleanup_failed = True
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                cleanup_failed = True
+        if not failed:
+            _require(not cleanup_failed, "Overlap regression browser cleanup failed")
+
+
 def test_real_browser_two_camera_live_history_playback_and_logout(
     tmp_path, monkeypatch, record_testsuite_property
 ):
@@ -261,6 +416,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
     script_errors = []
     request_failures = {}
     request_counts, response_counts, browser_capabilities = {}, {}, {}
+    enrollment_index = 0
     started = time.monotonic()
     receipt = {
         "schema_version": "1",
@@ -411,11 +567,14 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         receipt["ui_service_storage_status"] = True
         camera_ids = []
         for (name, host, _), source in zip(_CAMERAS, sources, strict=True):
-            stage = "camera_enrollment"
+            enrollment_index += 1
+            stage = "camera_enrollment_open"
             page.locator("#add-camera-button").click()
+            stage = "camera_enrollment_fill"
             page.locator("#new-camera-name").fill(name)
             page.locator("#new-camera-host").fill(host)
             page.locator("#new-camera-source").fill(source)
+            stage = "camera_enrollment_response"
             with page.expect_response(
                 lambda response: (
                     response.request.method == "POST"
@@ -430,6 +589,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                 "Camera API exposed execution-only source material",
             )
             camera_ids.append(camera["device_id"])
+            stage = "camera_enrollment_close"
             page.locator("#add-camera-dialog").wait_for(state="hidden")
         _require(len(set(camera_ids)) == 2, "Distinct generated cameras were merged")
         receipt["ui_two_camera_enrollment"] = True
@@ -701,6 +861,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             "request_counts": request_counts,
             "response_counts": response_counts,
             "browser_capabilities": browser_capabilities,
+            "enrollment_index": enrollment_index,
             "cleanup_failure_codes": cleanup_failures,
             "product_thread_alive": bool(product and product.thread.is_alive()),
             "product_thread_failed": bool(product and product.failed),

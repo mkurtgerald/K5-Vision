@@ -54,6 +54,10 @@ and `-StateRoot` support separate private absolute directories. Repeat installs
 must retain the same runtime and state paths. Existing permissions are inspected
 and never widened or repaired. A conflicting Start/Desktop/Startup shortcut is
 refused, so another installation's entry is not overwritten.
+Start/Desktop/Startup shortcuts contain public launch arguments and may allow
+other local users to read them. Foreign writes to those shortcuts are refused;
+application releases, runtime, accounts and recordings retain their private
+directory requirements.
 
 ## Optional start when this user signs in
 

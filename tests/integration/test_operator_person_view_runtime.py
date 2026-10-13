@@ -467,18 +467,27 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
             """(canvas, encoded) => {
             const expected = atob(encoded);
             const width = canvas.width, height = canvas.height;
-            if (!width || !height) return {width, height, matching: 0, overlay: 0};
+            if (!width || !height) return {width, height, matching: 0, added_overlay: 0};
             const shown = canvas.getContext('2d').getImageData(0, 0, width, height).data;
-            let matching = 0, overlay = 0;
+            let matching = 0, addedOverlay = 0;
             for (let index = 0; index < shown.length; index += 4) {
               if (Math.max(
                 Math.abs(shown[index] - expected.charCodeAt(index + 2)),
                 Math.abs(shown[index + 1] - expected.charCodeAt(index + 1)),
                 Math.abs(shown[index + 2] - expected.charCodeAt(index))) <= 8) matching++;
-              if (Math.max(Math.abs(shown[index] - 104), Math.abs(shown[index + 1] - 210),
-                Math.abs(shown[index + 2] - 164)) <= 2) overlay++;
+              const sourceRed = expected.charCodeAt(index + 2);
+              const sourceGreen = expected.charCodeAt(index + 1);
+              const sourceBlue = expected.charCodeAt(index);
+              // The official fixture already has green annotations. Exclude
+              // source green hues so unchanged source boxes cannot qualify.
+              const sourceAlreadyGreen = sourceGreen >= 150 &&
+                sourceGreen >= sourceRed + 24 && sourceGreen >= sourceBlue + 24;
+              if (!sourceAlreadyGreen && Math.max(Math.abs(shown[index] - 104),
+                Math.abs(shown[index + 1] - 210), Math.abs(shown[index + 2] - 164)) <= 2)
+                  addedOverlay++;
             }
-            return {width, height, matching: matching / (width * height), overlay};
+            return {width, height, matching: matching / (width * height),
+              added_overlay: addedOverlay};
         }""",
             base64.b64encode(posted_pixels).decode("ascii"),
         )
@@ -488,7 +497,7 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
             "Positive sampled frame used incorrect canvas geometry",
         )
         matching_fraction = canvas["matching"]
-        overlay_pixels = canvas["overlay"]
+        overlay_pixels = canvas["added_overlay"]
         stage = "sample_frame_and_box_pixels"
         stage = "positive_sample_controls"
         _require(
@@ -509,6 +518,7 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
                 "response_frame_correlated": True,
                 "displayed_frame_matching_fraction": round(matching_fraction, 4),
                 "box_overlay_pixels": overlay_pixels,
+                "box_added_overlay_pixels": overlay_pixels,
             }
         )
         stage = "recording_during_inference"
