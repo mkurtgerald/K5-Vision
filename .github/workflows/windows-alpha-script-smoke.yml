@@ -3,6 +3,9 @@ name: Windows Alpha Script Smoke
 on:
   pull_request:
     paths:
+      - "scripts/windows_hosted_qualification.py"
+      - "scripts/qualification/**"
+      - "tests/test_windows_hosted_qualification.py"
       - "Install-K5VisionAlpha.ps1"
       - "scripts/windows-alpha/**"
       - "src/k5vision/operator_runtime.py"
@@ -38,6 +41,9 @@ on:
   push:
     branches: [main]
     paths:
+      - "scripts/windows_hosted_qualification.py"
+      - "scripts/qualification/**"
+      - "tests/test_windows_hosted_qualification.py"
       - "scripts/windows-alpha/**"
       - "src/k5vision/operator_runtime.py"
       - "src/k5vision/main.py"
@@ -77,6 +83,8 @@ jobs:
   windows-alpha-script:
     runs-on: windows-latest
     timeout-minutes: 15
+    env:
+      K5_QUAL_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -84,8 +92,64 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
-      - name: Parse Windows alpha PowerShell
+      - name: Prepare isolated hosted qualification
+        id: runtime_python
         shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:RUNNER_TEMP -match "['`r`n]" -or $env:RUNNER_TEMP -match '[\x00-\x1f]') { throw "Runner temporary path cannot be represented safely." }
+          if ($env:RUNNER_TOOL_CACHE -notmatch '^[A-Za-z]:\\') { throw "Hosted toolcache must be a local absolute path." }
+          $cacheRoot = [IO.Path]::GetFullPath($env:RUNNER_TOOL_CACHE)
+          $bootstrapRoot = Join-Path $cacheRoot "Python\3.12.10\x64"
+          $bootstrapPython = Join-Path $bootstrapRoot "python.exe"
+          $bootstrapDll = Join-Path $bootstrapRoot "python312.dll"
+          $complete = Join-Path $cacheRoot "Python\3.12.10\x64.complete"
+          $license = Join-Path $bootstrapRoot "LICENSE.txt"
+          if ($bootstrapPython -match '[\s"''{}]') { throw "Cached bootstrap path cannot be represented safely." }
+          foreach ($path in @($cacheRoot, $bootstrapRoot, $bootstrapPython, $bootstrapDll, $complete, $license)) {
+              $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+              while ($null -ne $item) {
+                  if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                      throw "Cached bootstrap path is a reparse point."
+                  }
+                  $item = if ($item -is [IO.DirectoryInfo]) { $item.Parent } else { $item.Directory }
+              }
+          }
+          if (-not (Test-Path -LiteralPath $complete -PathType Leaf)) { throw "Cached bootstrap is incomplete." }
+          foreach ($name in @("pyvenv.cfg", "python._pth", "python312._pth")) {
+              if (Test-Path -LiteralPath (Join-Path $bootstrapRoot $name)) { throw "Cached bootstrap has an unreviewed path hook." }
+          }
+          foreach ($binary in @($bootstrapPython, $bootstrapDll)) {
+              $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($binary)
+              if ($version.ProductVersion -ne "3.12.10" -or $version.FileVersion -ne "3.12.10") {
+                  throw "Cached bootstrap version is not exactly 3.12.10."
+              }
+              $stream = [IO.File]::Open($binary, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+              $reader = New-Object IO.BinaryReader($stream)
+              try {
+                  if ($reader.ReadUInt16() -ne 0x5a4d) { throw "Cached bootstrap has no DOS header." }
+                  $stream.Position = 0x3c
+                  $offset = $reader.ReadUInt32()
+                  if ($offset -lt 64 -or $offset -gt 1048576 -or $offset + 26 -gt $stream.Length) { throw "Cached bootstrap PE offset is invalid." }
+                  $stream.Position = $offset
+                  if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x8664) {
+                      throw "Cached bootstrap is not Windows x64."
+                  }
+                  $stream.Position = $offset + 24
+                  if ($reader.ReadUInt16() -ne 0x20b) { throw "Cached bootstrap is not PE32+." }
+              } finally { $reader.Dispose() }
+          }
+          $env:K5_BOOTSTRAP_PYTHON = $bootstrapPython
+          $env:K5_BOOTSTRAP_PYTHON_SHA256 = (Get-FileHash -LiteralPath $bootstrapPython -Algorithm SHA256).Hash.ToLowerInvariant()
+          $env:K5_BOOTSTRAP_DLL_SHA256 = (Get-FileHash -LiteralPath $bootstrapDll -Algorithm SHA256).Hash.ToLowerInvariant()
+          foreach ($name in @("K5_BOOTSTRAP_PYTHON", "K5_BOOTSTRAP_PYTHON_SHA256", "K5_BOOTSTRAP_DLL_SHA256")) {
+              "$name=$([Environment]::GetEnvironmentVariable($name))" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          }
+          & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --prepare --profile alpha
+          if ($LASTEXITCODE -ne 0) { throw "Isolated hosted qualification preparation failed." }
+
+      - name: Parse Windows alpha PowerShell
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 1 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           $failed = $false
@@ -104,39 +168,40 @@ jobs:
           }
           if ($failed) { throw "Windows alpha PowerShell parse failed." }
 
-      - name: Set up Python
-        id: runtime_python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: "3.12"
-          cache: pip
-
       - name: Install targeted test dependencies
-        shell: powershell
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 2 '{0}'; exit $LASTEXITCODE"
         run: |
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }
           pip install -e ".[dev]"
+          if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }
 
       - name: Verify clean Windows alpha runtime dependency install
-        shell: powershell
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 3 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           $probe = Join-Path $env:RUNNER_TEMP "k5-alpha-runtime-probe"
           python -m venv $probe
+          if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }
           $probePython = Join-Path $probe "Scripts\python.exe"
           & $probePython -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }
           & $probePython -m pip install --requirement scripts\windows-alpha\runtime-requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }
           & $probePython -m pip install --no-deps .
+          if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }
           & $probePython -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }
           & $probePython -m k5vision.cli --version
+          if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }
 
       - name: Run Windows alpha boundary regressions
-        shell: powershell
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 4 '{0}'; exit $LASTEXITCODE"
         run: |
-          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py tests/test_app_resource_lifetime.py tests/test_windows_alpha_analytics.py tests/test_cli.py tests/test_installed_alpha_facade_witness.py -q --no-cov
+          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py tests/test_app_resource_lifetime.py tests/test_windows_alpha_analytics.py tests/test_cli.py tests/test_installed_alpha_facade_witness.py -q --no-cov -o verbosity_test_cases=1
 
       - name: Qualify Windows local recovery identity
-        shell: powershell
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 5 '{0}'; exit $LASTEXITCODE"
         run: |
           $ErrorActionPreference = "Stop"
           $probe = Join-Path $env:RUNNER_TEMP "k5-alpha-runtime-probe"
@@ -151,31 +216,147 @@ jobs:
           import sys
           from pathlib import Path
           from uuid import uuid4
-          from k5vision.identity_state import validate_new_identity_directory
+          def _k5_recovery_diagnostic(phase, error):
+              try:
+                  if phase not in (
+                      "identity_import", "root_admission", "root_create",
+                      "base_admission", "pytest_launch", "cleanup",
+                  ):
+                      return
+                  category = "unexpected"
+                  identity_type = getattr(
+                      sys.modules.get("k5vision.identity_state"), "IdentityStateError", None
+                  )
+                  security_type = getattr(
+                      sys.modules.get("k5vision.windows_identity_security"),
+                      "WindowsIdentitySecurityError", None,
+                  )
+                  if type(error) is identity_type:
+                      category = "identity_other"
+                      args = BaseException.args.__get__(error)
+                      if len(args) == 1 and type(args[0]) is str and len(args[0]) <= 256:
+                          category = {
+                              "Windows identity requires a supported fixed local volume": "identity_volume",
+                              "Windows identity ownership or access is unsafe or unsupported": "identity_security",
+                              "identity directory must be an absolute local directory": "identity_path",
+                              "network identity directories are not supported": "identity_path",
+                              "linked identity paths are not supported": "identity_path",
+                              "identity parent is not a directory": "identity_path",
+                              "use a new identity directory beneath an existing private parent": "identity_parent",
+                          }.get(args[0], category)
+                      cause = BaseException.__cause__.__get__(error)
+                      cause_args = BaseException.args.__get__(cause) if type(cause) is security_type else ()
+                      if (
+                          len(cause_args) == 1 and type(cause_args[0]) is str
+                          and len(cause_args[0]) <= 256
+                      ):
+                          if category == "identity_volume":
+                              category = {
+                                  "Windows identity requires an ordinary local path": "volume_path",
+                                  "Windows identity requires a fixed local volume": "volume_type",
+                                  "Windows identity volume cannot be established": "volume_query",
+                                  "Windows identity volume aliases are unsupported": "volume_alias",
+                              }.get(cause_args[0], category)
+                          elif category == "identity_security":
+                              category = {
+                                  "Windows identity path has unsupported ownership": "security_owner",
+                                  "Windows identity path grants unsafe access": "security_access",
+                                  "Windows identity directory lacks private file inheritance": "security_inheritance",
+                                  "Windows identity inspection is unavailable": "security_query",
+                                  "Windows identity token is unavailable": "security_query",
+                                  "Windows identity token cannot be read": "security_query",
+                                  "Windows identity ACL cannot be established": "security_query",
+                                  "unsupported Windows security identifier": "security_unsupported",
+                                  "invalid Windows identity ACL": "security_unsupported",
+                                  "unsupported Windows identity ACL": "security_unsupported",
+                                  "invalid Windows identity ACL entry": "security_unsupported",
+                                  "unsupported Windows identity ACL entry": "security_unsupported",
+                                  "unsupported Windows identity access mask": "security_unsupported",
+                                  "invalid native Windows security identifier": "security_unsupported",
+                                  "unsupported native Windows security identifier": "security_unsupported",
+                                  "Windows identity token is unsupported": "security_unsupported",
+                                  "Windows identity ACL is invalid": "security_unsupported",
+                              }.get(cause_args[0], category)
+                  elif type(error) is subprocess.TimeoutExpired:
+                      category = "timeout"
+                  elif type(error) in (ImportError, ModuleNotFoundError):
+                      category = "import_error"
+                  elif type(error) is PermissionError:
+                      category = "permission_error"
+                  elif type(error) is FileNotFoundError:
+                      category = "missing_file"
+                  elif type(error) is FileExistsError:
+                      category = "existing_file"
+                  elif type(error) is OSError:
+                      category = "os_error"
+                  print("K5_RECOVERY_DIAGNOSTIC=" + phase + ":" + category, flush=True)
+              except BaseException:
+                  pass
+
+          try:
+              print("K5_RECOVERY_DIAGNOSTIC=inline:entered", flush=True)
+          except BaseException:
+              pass
+
+          try:
+              from k5vision.identity_state import validate_new_identity_directory
+          except Exception as _k5_error:
+              _k5_recovery_diagnostic("identity_import", _k5_error)
+              raise
 
           root = Path(os.environ["LOCALAPPDATA"]) / ("K5 Recovery pytest-" + uuid4().hex)
-          validate_new_identity_directory(root)
-          root.mkdir(mode=0o700)
+          try:
+              validate_new_identity_directory(root)
+          except Exception as _k5_error:
+              _k5_recovery_diagnostic("root_admission", _k5_error)
+              raise
+          try:
+              root.mkdir(mode=0o700)
+          except Exception as _k5_error:
+              _k5_recovery_diagnostic("root_create", _k5_error)
+              raise
           try:
               base = root / "pytest"
-              validate_new_identity_directory(base)
-              result = subprocess.run([
-                  sys.executable, "-m", "pytest",
-                  "tests/test_recovery_admin.py",
-                  "tests/test_recovery_admin_windows.py",
-                  "tests/test_windows_identity_security.py",
-                  "-q", "-rP", "--no-cov", "-o", "junit_family=xunit1",
-                  "--junitxml=recovery-windows-results.xml", "--basetemp", str(base),
-              ], check=False, timeout=600)
+              try:
+                  validate_new_identity_directory(base)
+              except Exception as _k5_error:
+                  _k5_recovery_diagnostic("base_admission", _k5_error)
+                  raise
+              try:
+                  result = subprocess.run([
+                      sys.executable, "-m", "pytest",
+                      "tests/test_recovery_admin.py",
+                      "tests/test_recovery_admin_windows.py",
+                      "tests/test_windows_identity_security.py",
+                      "-q", "-rP", "--no-cov", "-o", "junit_family=xunit1",
+                      "--junitxml=recovery-windows-results.xml", "--basetemp", str(base),
+                  ], check=False, timeout=600)
+              except Exception as _k5_error:
+                  _k5_recovery_diagnostic("pytest_launch", _k5_error)
+                  raise
+              try:
+                  if type(result) is subprocess.CompletedProcess:
+                      _k5_returncode = dict.get(vars(result), "returncode")
+                      if type(_k5_returncode) is int:
+                          if _k5_returncode == 0:
+                              print("K5_RECOVERY_DIAGNOSTIC=pytest_return:zero", flush=True)
+                          else:
+                              print("K5_RECOVERY_DIAGNOSTIC=pytest_return:nonzero", flush=True)
+              except BaseException:
+                  pass
               raise SystemExit(result.returncode)
           finally:
-              shutil.rmtree(root)
+              try:
+                  shutil.rmtree(root)
+              except Exception as _k5_error:
+                  _k5_recovery_diagnostic("cleanup", _k5_error)
+                  raise
           '@
           $qualification | python -
           if ($LASTEXITCODE -ne 0) { throw "Windows local recovery identity qualification failed." }
 
       - name: Verify exact candidate workflow and owned Windows relay boundary
-        shell: powershell
+        shell: powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) {{ throw 'Cached bootstrap changed' }}; $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) 'python312.dll'; if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) {{ throw 'Cached bootstrap runtime changed' }}; & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --profile alpha --step 6 '{0}'; exit $LASTEXITCODE"
         env:
           K5_SETUP_PYTHON: ${{ steps.runtime_python.outputs.python-path }}
         run: |
@@ -193,3 +374,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Owned Start preflight boundary observation failed." }
           python -m pytest tests/test_windows_alpha_facade_witness.py::test_windows_facade_process_observer_real_owned_births --no-cov -q -rP
           if ($LASTEXITCODE -ne 0) { throw "Owned facade process observation qualification failed." }
+      - name: Finalize owned hosted qualification
+        id: bounded_qualification
+        if: always()
+        shell: powershell
+        run: |
+          if ([string]::IsNullOrEmpty($env:K5_BOOTSTRAP_PYTHON)) { throw "Cached bootstrap was not admitted." }
+          if ((Get-FileHash -LiteralPath $env:K5_BOOTSTRAP_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_PYTHON_SHA256) { throw "Cached bootstrap changed." }
+          $dll = Join-Path (Split-Path -Parent $env:K5_BOOTSTRAP_PYTHON) "python312.dll"
+          if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_BOOTSTRAP_DLL_SHA256) { throw "Cached bootstrap runtime changed." }
+          & $env:K5_BOOTSTRAP_PYTHON -I -B -S scripts/windows_hosted_qualification.py --finish --profile alpha
+          if ($LASTEXITCODE -ne 0) { throw "Owned hosted qualification did not complete cleanly." }
+
