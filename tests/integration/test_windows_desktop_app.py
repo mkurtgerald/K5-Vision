@@ -654,7 +654,22 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         page.goto(client.origin + "/operator/")
         page.locator("#username").fill(username)
         page.locator("#password").fill(password)
-        page.locator("#sign-in-button").click()
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST" and response.url.endswith("/api/v1/auth/login")
+            )
+        ) as browser_login:
+            page.locator("#sign-in-button").click()
+        _require(browser_login.value.status == 200, "Desktop browser login failed")
+        browser_token = browser_login.value.json().get("session_token")
+        _require(
+            isinstance(browser_token, str) and 32 <= len(browser_token) <= 128,
+            "Desktop browser login did not return a bounded session",
+        )
+        # New human login revokes the earlier account-verification session.
+        # Observe the backend using the browser's current session without a
+        # second login that would revoke the active browser.
+        client.token = browser_token
         page.locator("#workspace").wait_for(state="visible")
         page.locator("#add-camera-button").click()
         page.locator("#new-camera-name").fill("Generated desktop camera")
