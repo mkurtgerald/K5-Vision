@@ -473,10 +473,19 @@ def test_ordinary_account_lifecycle_and_pending_users_remain_valid(tmp_path, pas
     registry = UserRegistry(database_path=state.database_path, site_id=state.site_id)
     try:
         account = registry.list()[0]
+        second, temporary_credential, _ = registry.create_with_bootstrap(
+            _request("second-admin"), actor="current-admin"
+        )
+        registry.activate_bootstrap_password(
+            username=second.username,
+            temporary_credential=temporary_credential,
+            new_password=password,
+            actor="bootstrap-user",
+        )
         registry.update(
             account.id, UserPatch(role=UserRole.OPERATOR, enabled=False), actor="current-admin"
         )
-        registry.create_with_bootstrap(_request("second-admin"), actor="current-admin")
+        registry.create_with_bootstrap(_request("pending-admin"), actor="current-admin")
     finally:
         registry.close()
     assert load_identity_state(state.directory) == state

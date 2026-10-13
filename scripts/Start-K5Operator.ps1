@@ -5,6 +5,7 @@ param(
     [string]$RuntimeRoot = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'K5VisionOperatorRuntime'),
     [string]$StateRoot = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'K5VisionOperatorState'),
     [ValidateRange(1024, 65535)][int]$Port = 8000,
+    [ValidateRange(1, 4096)][int]$RecordingLimitGb = 20,
     [string]$DiagnosticName = '',
     [switch]$NoBrowser
 )
@@ -313,7 +314,16 @@ if runtime.is_relative_to(project) or project.is_relative_to(runtime): raise Val
     $stage = 'venv-admission'
     Assert-K5PrivateDirectory -Python $python -Helper $helper -Path $venv
     $stage = 'pip-installation'
-    $null = Invoke-K5PythonText -Python $python -Arguments @('-I', '-B', '-m', 'pip', 'install', '--no-input', '--disable-pip-version-check', '--quiet', '--upgrade', $PackagePath)
+    try {
+        # Installed-wheel restarts reuse satisfied dependencies without Internet.
+        $null = Invoke-K5PythonText -Python $python -Arguments @('-I', '-B', '-m', 'pip', 'install', '--no-input', '--disable-pip-version-check', '--quiet', '--no-index', '--upgrade', $PackagePath)
+    } catch {
+        # First setup or changed requirements can explicitly need PyPI resolution.
+        $null = Invoke-K5PythonText -Python $python -Arguments @('-I', '-B', '-m', 'pip', 'install', '--no-input', '--disable-pip-version-check', '--quiet', '--upgrade', $PackagePath)
+    }
+    # Content-addressed product releases can carry the same project version.
+    # Resolve dependencies normally, then replace only K5's package bytes.
+    $null = Invoke-K5PythonText -Python $python -Arguments @('-I', '-B', '-m', 'pip', 'install', '--no-input', '--disable-pip-version-check', '--quiet', '--force-reinstall', '--no-deps', $PackagePath)
     $stage = 'native-workers'
     Write-Host 'Preparing verified native Windows media workers...'
     $stage = 'worker-assembly'
@@ -342,7 +352,7 @@ if runtime.is_relative_to(project) or project.is_relative_to(runtime): raise Val
     Assert-K5PrivateDirectory -Python $python -Helper $helper -Path $recordings
     $stage = 'operator'
     Write-Host 'Starting the local operator. Keep this window open; Ctrl+C stops the pilot.'
-    $arguments = @('-I', '-B', '-m', 'k5vision.cli', 'operator', '--identity-dir', $identity, '--recording-root', $recordings, '--media-exe', $media, '--gateway-exe', $gateway, '--port', [string]$Port)
+    $arguments = @('-I', '-B', '-m', 'k5vision.cli', 'operator', '--identity-dir', $identity, '--recording-root', $recordings, '--media-exe', $media, '--gateway-exe', $gateway, '--port', [string]$Port, '--recording-limit-gb', [string]$RecordingLimitGb)
     if (-not $NoBrowser) { $arguments += '--open-browser' }
     & $python @arguments
     $result = $LASTEXITCODE

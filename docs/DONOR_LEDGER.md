@@ -224,3 +224,49 @@ Package dependencies declared in `pyproject.toml` are dependencies, not automati
   Full source/artifact references are in the test-tool manifest.
 - **Replacement:** supply separately admitted fixture tools; this does not
   change the K5/MediaMTX runtime or the normalized provider contract.
+
+## OpenVINO / Open Model Zoo optional operator person view
+
+- **Source:** https://github.com/openvinotoolkit/open_model_zoo
+- **Version/revision:** model `person-detection-retail-0013` FP16 at
+  `6697dead54ed1cdd664b0313189c2cb52ee6335e`; OpenVINO API/runtime `2026.3.1`,
+  NumPy `2.2.6`, OpenVINO telemetry `2025.2.0`.
+- **License/copyright:** model's official `model.yml` expressly links Apache-2.0;
+  copyright (c) 2023-2024 Intel Corporation. OpenVINO source is Apache-2.0;
+  NumPy source is BSD-3-Clause; exact platform/native/transitive wheel notice
+  closure remains separate from the API/model source review.
+- **K5 files affected:** `operator_analytics.py`, `operator_analytics_person.py`,
+  `data/operator-person-model-manifest.json`, unit/native witness tests, and
+  `docs/OPERATOR_PERSON_DETECTION_REVIEW.md`.
+- **Integration/modifications:** independently written K5 adapter uses documented
+  OpenVINO public APIs and exact local model bytes; no model or native binary is
+  committed, bundled or downloaded during product startup. No restricted
+  Analytics Lab detector, tracker or pose implementation is copied/imported.
+  Existing K5 worker lifecycle is reused without invoking its Analytics Lab
+  backend. No donor implementation source is modified.
+- **Purpose/runtime:** optional native CPU view-only person boxes; missing config
+  leaves inference disabled. MediaMTX recording remains independent. The
+  transient view cannot produce source-attested events or unattended analytics.
+- **Required notices:** full unchanged OMZ Apache-2.0 license at
+  `src/k5vision/data/analytics-runtime-Apache-2.0.txt`, Git blob
+  `261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64`; preserve Intel attribution and
+  all separately supplied runtime-wheel notices in any later redistribution.
+- **Development image:** official Apache OMZ model example at the same revision,
+  553,577 bytes, Git blob `de3f62ab7774b00d88d8658a142ea20993780323`, SHA-256
+  `2be4dfa4d874e5f7929bebd1baf401e2ee630c4bf36cead7a2f8d5421d583959`.
+  Ephemeral functional test only; no private cameras/data or image distribution.
+- **Review/commercial conclusion:** Apache permits commercial use of its licensed
+  material with required terms/notices. This closes the independent API/model
+  artifact identity for an optional engineering candidate, not legal sign-off,
+  model training-data provenance/suitability, native/transitive redistribution,
+  commercial release or physical-camera/accuracy acceptance.
+- **Reviewed by/on:** automated exact upstream model definition, documented
+  interface, artifact hashes, source license and example Git identity inspection,
+  2026-10-13. Real native execution is separately tested and reported per platform.
+- **Integrity:** model definition Git blob `7faf63ff85b3d8692cfe8dc20a98d2e765e0da96`;
+  README Git blob `3219ebf6ec2fe7ae954200b5f72a78b78c4cd663`; artifact size/SHA-384
+  and immutable source references in the pinned manifest. Only its two exact
+  LF/CRLF byte representations are admitted. Native model reads verify bounded
+  immutable XML/BIN bytes and do not reopen paths after admission.
+- **Replacement:** new model/revision/runtime requires new immutable manifest,
+  interface/provenance review and native execution; no unreviewed fallback.

@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -7,6 +9,7 @@ from k5vision.services.user_registry import (
     UserRegistry,
     UserRegistryCapacityError,
     UserRegistryConflictError,
+    UserRegistryLastAdministratorError,
 )
 
 
@@ -17,6 +20,21 @@ def _user(username: str = "operator.one") -> UserCreate:
         role=UserRole.OPERATOR,
         enabled=True,
     )
+
+
+def _initialized_administrator(registry: UserRegistry, username: str):
+    request = _user(username).model_copy(update={"role": UserRole.ADMINISTRATOR})
+    account, credential, _ = registry.create_with_bootstrap(request, actor="setup-admin")
+    assert (
+        registry.activate_bootstrap_password(
+            username=username,
+            temporary_credential=credential,
+            new_password="local administrator test password",
+            actor="bootstrap-user",
+        )
+        == account
+    )
+    return account
 
 
 def test_user_registry_persists_site_scope_and_audit(tmp_path) -> None:
@@ -201,3 +219,149 @@ def test_user_models_reject_unbounded_or_empty_administration_requests() -> None
         UserCreate(username="valid.user", display_name="x" * 129)
     with pytest.raises(ValueError):
         UserPatch()
+
+
+@pytest.mark.parametrize("durable", [False, True])
+@pytest.mark.parametrize(
+    "patch",
+    [
+        UserPatch(enabled=False),
+        UserPatch(role=UserRole.OPERATOR),
+        UserPatch(display_name="Changed name", enabled=False, role=UserRole.VIEWER),
+    ],
+)
+def test_last_enabled_administrator_rejection_preserves_account_and_audit(
+    tmp_path, durable, patch
+) -> None:
+    database = tmp_path / "users.sqlite3" if durable else ":memory:"
+    registry = UserRegistry(database_path=database, site_id="site-a")
+    try:
+        administrator = _initialized_administrator(registry, "admin.one")
+        disabled = _initialized_administrator(registry, "disabled.admin")
+        registry.update(
+            disabled.id,
+            UserPatch(enabled=False),
+            actor="current-admin",
+        )
+        accounts_before = registry.list()
+        audit_before = registry.audit_events()
+        with pytest.raises(
+            UserRegistryLastAdministratorError,
+            match="Activate another enabled administrator",
+        ):
+            registry.update(administrator.id, patch, actor="current-admin")
+        assert registry.list() == accounts_before
+        assert registry.audit_events() == audit_before
+
+        # A rejected transaction releases its write lock and preserves ordinary
+        # administrative updates that do not remove account authority.
+        renamed = registry.update(
+            administrator.id, UserPatch(display_name="Daily administrator"), actor="current-admin"
+        )
+        assert renamed is not None and renamed.enabled
+        assert renamed.role is UserRole.ADMINISTRATOR
+        assert registry.audit_events()[-1].changed_fields == ("display_name",)
+    finally:
+        registry.close()
+
+
+def test_administrator_in_another_site_cannot_allow_last_admin_removal(tmp_path) -> None:
+    database = tmp_path / "users.sqlite3"
+    registry = UserRegistry(database_path=database, site_id="site-a")
+    other = UserRegistry(database_path=database, site_id="site-b")
+    try:
+        administrator = _initialized_administrator(registry, "admin.one")
+        _initialized_administrator(other, "admin.one")
+        with pytest.raises(UserRegistryLastAdministratorError):
+            registry.update(administrator.id, UserPatch(enabled=False), actor="current-admin")
+        assert registry.get(administrator.id) == administrator
+    finally:
+        registry.close()
+        other.close()
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_concurrent_admin_removals_leave_one_enabled_admin(tmp_path, durable) -> None:
+    database = tmp_path / "users.sqlite3" if durable else ":memory:"
+    first = UserRegistry(database_path=database, site_id="site-a")
+    second = UserRegistry(database_path=database, site_id="site-a") if durable else first
+    try:
+        administrators = [
+            _initialized_administrator(first, username) for username in ("admin.one", "admin.two")
+        ]
+        barrier = Barrier(2)
+
+        def remove_authority(registry, account, patch):
+            barrier.wait(timeout=5)
+            try:
+                registry.update(account.id, patch, actor="current-admin")
+            except UserRegistryLastAdministratorError:
+                return "refused"
+            return "updated"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            operations = [
+                executor.submit(
+                    remove_authority, first, administrators[0], UserPatch(enabled=False)
+                ),
+                executor.submit(
+                    remove_authority, second, administrators[1], UserPatch(role=UserRole.OPERATOR)
+                ),
+            ]
+            assert sorted(operation.result(timeout=10) for operation in operations) == [
+                "refused",
+                "updated",
+            ]
+        enabled_administrators = [
+            account
+            for account in first.list()
+            if account.enabled and account.role is UserRole.ADMINISTRATOR
+        ]
+        assert len(enabled_administrators) == 1
+        assert [event.action for event in first.audit_events()].count("updated") == 1
+        if durable:
+            reopened = UserRegistry(database_path=database, site_id="site-a")
+            try:
+                assert reopened.list() == first.list()
+            finally:
+                reopened.close()
+    finally:
+        first.close()
+        if second is not first:
+            second.close()
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_pending_administrator_must_activate_before_last_admin_removal(tmp_path, durable) -> None:
+    database = tmp_path / "users.sqlite3" if durable else ":memory:"
+    registry = UserRegistry(database_path=database, site_id="site-a")
+    try:
+        first = _initialized_administrator(registry, "admin.one")
+        pending, credential, _ = registry.create_with_bootstrap(
+            _user("admin.two").model_copy(update={"role": UserRole.ADMINISTRATOR}),
+            actor="current-admin",
+        )
+        audit_before = registry.audit_events()
+        with pytest.raises(UserRegistryLastAdministratorError):
+            registry.update(first.id, UserPatch(enabled=False), actor="current-admin")
+        assert registry.get(first.id) == first
+        assert registry.audit_events() == audit_before
+        assert (
+            registry.activate_bootstrap_password(
+                username=pending.username,
+                temporary_credential=credential,
+                new_password="another administrator test password",
+                actor="bootstrap-user",
+            )
+            == pending
+        )
+        disabled = registry.update(first.id, UserPatch(enabled=False), actor="current-admin")
+        assert disabled is not None and not disabled.enabled
+        assert (
+            registry.verify_password(
+                username=pending.username, password="another administrator test password"
+            )
+            == pending
+        )
+    finally:
+        registry.close()

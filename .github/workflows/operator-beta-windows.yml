@@ -1,0 +1,206 @@
+name: Native Windows Beta Sprint
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product]
+    paths:
+      - .github/workflows/operator-beta-windows.yml
+      - .github/actions/provision-operator-tools/**
+      - src/k5vision/operator_*.py
+      - src/k5vision/operator_web/**
+      - src/k5vision/data/**
+      - src/k5vision/identity_state.py
+      - src/k5vision/windows_identity_security.py
+      - src/k5vision/analytics_runtime.py
+      - src/k5vision/analytics_config.py
+      - src/k5vision/auth_sessions.py
+      - src/k5vision/user_admin_api.py
+      - src/k5vision/services/**
+      - scripts/*K5Operator*.ps1
+      - scripts/*operator*receipt.py
+      - scripts/provision_operator_person_acceptance.py
+      - docs/WINDOWS_*.md
+      - docs/OPERATOR_PERSON_DETECTION_REVIEW.md
+      - tests/**
+      - pyproject.toml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: operator-beta-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-windows:
+    name: Native Windows ${{ matrix.lane }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [product, launcher, install, browser, person]
+    env:
+      K5_BETA_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_OPERATOR_PERSON_ACCEPTANCE: "1"
+    steps:
+      - name: Checkout exact product revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install development dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install -e ".[dev]"
+          if ($LASTEXITCODE -ne 0) { throw "Development install failed" }
+      - name: Install browser driver for acceptance only
+        if: matrix.lane == 'browser' || matrix.lane == 'person'
+        shell: pwsh
+        run: |
+          python -m pip install "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Browser driver installation failed" }
+      - name: Install exact optional person runtime for acceptance only
+        if: matrix.lane == 'person'
+        shell: pwsh
+        run: |
+          python -m pip install "openvino==2026.3.1" "numpy==2.2.6" "openvino-telemetry==2025.2.0"
+          if ($LASTEXITCODE -ne 0) { throw "Person runtime installation failed" }
+      - name: Provision immutable native development workers
+        uses: ./.github/actions/provision-operator-tools
+      - name: Build candidate wheel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip wheel . --no-deps --wheel-dir operator-beta-wheel
+          if ($LASTEXITCODE -ne 0) { throw "Product wheel build failed" }
+          $wheels = @(Get-ChildItem -LiteralPath operator-beta-wheel -Filter "*.whl" -File)
+          if ($wheels.Count -ne 1) { throw "Expected one product wheel" }
+          "K5_OPERATOR_WHEEL=$($wheels[0].FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Provision admitted person model and official fixture
+        if: matrix.lane == 'person'
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Person development artifacts refused" }
+      - name: Run actual native acceptance
+        timeout-minutes: 8
+        shell: pwsh
+        env:
+          K5_BETA_LANE: ${{ matrix.lane }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          [string[]]$tests = switch ($env:K5_BETA_LANE) {
+            "product" { @(
+              "tests/unit/test_mediamtx_provider.py", "tests/unit/test_operator_media_gateway.py",
+              "tests/unit/test_operator_product_state.py", "tests/unit/test_operator_product_api.py",
+              "tests/unit/test_operator_product_service.py", "tests/unit/test_operator_recording_storage.py",
+              "tests/unit/test_operator_native_process.py", "tests/unit/test_operator_profile_lock.py",
+              "tests/unit/test_operator_analytics.py", "tests/unit/test_operator_analytics_person.py",
+              "tests/test_user_registry.py", "tests/test_user_admin_api.py", "tests/test_user_sessions.py",
+              "tests/test_recovery_admin.py", "tests/integration/test_operator_product_runtime.py"
+            ) }
+            "launcher" { @("tests/integration/test_operator_windows_launcher.py") }
+            "install" { @("tests/integration/test_windows_operator_install.py") }
+            "browser" { @("tests/integration/test_operator_beta_browser.py") }
+            "person" { @("tests/integration/test_operator_beta_capacity.py", "tests/integration/test_operator_person_view_runtime.py") }
+            default { throw "Unknown beta lane" }
+          }
+          python -m pytest @tests --no-cov -s -o faulthandler_timeout=180 "--junitxml=operator-beta-$($env:K5_BETA_LANE).xml"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Require actual native receipt
+        shell: pwsh
+        env:
+          K5_BETA_LANE: ${{ matrix.lane }}
+        run: |
+          python scripts/verify_operator_beta_receipt.py $env:K5_BETA_LANE "operator-beta-$($env:K5_BETA_LANE).xml" "operator-beta-$($env:K5_BETA_LANE)-receipt.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Remove only owned development artifacts
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrEmpty($env:K5_DONOR_TOOL_ROOT)) { exit 0 }
+          $toolRoot = [IO.Path]::GetFullPath($env:K5_DONOR_TOOL_ROOT)
+          $expected = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar)
+          if (-not [string]::Equals([IO.Directory]::GetParent($toolRoot).FullName, $expected, [StringComparison]::OrdinalIgnoreCase) -or
+              [IO.Path]::GetFileName($toolRoot) -notmatch '^K5 donor development tools [a-f0-9]{32}$') {
+            throw "Development cleanup ownership refused"
+          }
+          if (Test-Path -LiteralPath $toolRoot) { Remove-Item -LiteralPath $toolRoot -Recurse -Force }
+      - name: Retain finite acceptance evidence only
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: operator-beta-witness-${{ matrix.lane }}-${{ github.run_id }}
+          path: |
+            operator-beta-${{ matrix.lane }}.xml
+            operator-beta-${{ matrix.lane }}-receipt.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  qualified-package:
+    name: Package after all native sprint gates
+    needs: native-windows
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - name: Checkout exact qualified revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build and allowlist qualified per-user package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Join-Path $env:GITHUB_WORKSPACE "windows-operator-beta"
+          New-Item -ItemType Directory -Path (Join-Path $package "dist") | Out-Null
+          python -m pip wheel . --no-deps --wheel-dir (Join-Path $package "dist")
+          if ($LASTEXITCODE -ne 0) { throw "Qualified wheel build failed" }
+          $wheels = @(Get-ChildItem -LiteralPath (Join-Path $package "dist") -Filter "*.whl" -File)
+          if ($wheels.Count -ne 1) { throw "Expected one qualified wheel" }
+          $files = @(
+            @{Source="scripts/Start-K5Operator.ps1"; Destination="scripts/Start-K5Operator.ps1"},
+            @{Source="scripts/Install-K5Operator.ps1"; Destination="scripts/Install-K5Operator.ps1"},
+            @{Source="scripts/Uninstall-K5Operator.ps1"; Destination="scripts/Uninstall-K5Operator.ps1"},
+            @{Source="src/k5vision/windows_identity_security.py"; Destination="src/k5vision/windows_identity_security.py"},
+            @{Source="docs/WINDOWS_OPERATOR_PILOT.md"; Destination="README.md"},
+            @{Source="docs/WINDOWS_OPERATOR_INSTALL.md"; Destination="docs/WINDOWS_OPERATOR_INSTALL.md"},
+            @{Source="LICENSE"; Destination="LICENSE"},
+            @{Source="THIRD_PARTY_NOTICES.md"; Destination="THIRD_PARTY_NOTICES.md"},
+            @{Source="third_party/licenses/MediaMTX-MIT.txt"; Destination="third_party/licenses/MediaMTX-MIT.txt"},
+            @{Source="third_party/licenses/Caddy-Apache-2.0.txt"; Destination="third_party/licenses/Caddy-Apache-2.0.txt"}
+          )
+          foreach ($entry in $files) {
+            $destination = Join-Path $package $entry.Destination
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            Copy-Item -LiteralPath $entry.Source -Destination $destination
+          }
+          $allowed = @($wheels[0].FullName) + @($files | ForEach-Object { Join-Path $package $_.Destination })
+          $actual = @(Get-ChildItem -LiteralPath $package -File -Recurse)
+          if ($actual.Count -ne $allowed.Count -or @($actual | Where-Object {$_.FullName -notin $allowed}).Count -ne 0) {
+            throw "Qualified package allowlist failed"
+          }
+          Write-Host "Qualified package includes only the project wheel, three scripts, identity helper, instructions and notices"
+      - name: Upload qualified per-user Windows package
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: k5-operator-windows-beta-${{ github.event.pull_request.head.sha || github.sha }}
+          path: windows-operator-beta/
+          if-no-files-found: error
+          retention-days: 14

@@ -14,7 +14,10 @@
     hls: null, nativeLive: false, hlsScript: null, retryTimer: null, retryCount: 0,
     pollTimer: null, expiryTimer: null, selectionController: null,
     spans: [], selectedSpan: null, historyEpoch: 0, historyRolling: true, signingOut: false,
-    dialogMode: "add",
+    dialogMode: "add", cameraSetupEpoch: 0, diagnostics: null, statusUnavailable: false,
+    removeTarget: null, removing: false,
+    personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
+    personFrameId: 0,
   };
 
   class ApiError extends Error {
@@ -52,10 +55,12 @@
       const headers = { Accept: "application/json" };
       if (token) headers.Authorization = `Bearer ${token}`;
       if (options.body !== undefined) headers["Content-Type"] = "application/json";
+      if (options.rawBody !== undefined) headers["Content-Type"] = "application/octet-stream";
       const response = await fetch(path, {
         method: options.method || "GET", headers, signal,
         credentials: "same-origin", cache: "no-store",
         ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+        ...(options.rawBody !== undefined ? { body: options.rawBody } : {}),
       });
       if (!response.ok) {
         if (response.status === 401 && token && path !== "/api/v1/auth/login" && !state.signingOut) {
@@ -89,6 +94,7 @@
   }
 
   function stopLive(resetRetries = true) {
+    stopPersonView();
     clearTimeout(state.retryTimer);
     state.retryTimer = null;
     state.nativeLive = false;
@@ -130,6 +136,10 @@
     state.account = null;
     state.cameras = [];
     state.workerStatus = "ready";
+    state.diagnostics = null;
+    state.statusUnavailable = false;
+    state.removeTarget = null;
+    state.removing = false;
     state.selected = null;
     state.media = null;
     state.spans = [];
@@ -141,7 +151,12 @@
     $("new-camera-name").readOnly = false;
     $("new-camera-host").readOnly = false;
     state.dialogMode = "add";
+    state.cameraSetupEpoch += 1;
     if ($("add-camera-dialog").open) $("add-camera-dialog").close();
+    for (const id of ["remove-camera-dialog", "connection-help-dialog"]) {
+      if ($(id).open) $(id).close();
+    }
+    setRemovalBusy(false);
     $("camera-list").replaceChildren();
     $("history-list").replaceChildren();
     $("camera-search").value = "";
@@ -239,30 +254,105 @@
     $("camera-title").textContent = camera?.name || "Select a camera";
     $("camera-subtitle").textContent = camera ? String(camera.host || "Enrolled camera") : "Live view and recording history in one place.";
     $("connection-badge").hidden = !camera;
-    $("recording-badge").hidden = !camera?.recording;
+    $("recording-badge").hidden = !camera || (!camera.recording && state.workerStatus !== "disk_full");
     $("update-source-button").hidden = !camera || state.account?.role !== "administrator";
+    $("remove-camera-button").hidden = !camera || state.account?.role !== "administrator";
+    $("person-view-panel").hidden = !camera || camera.analytics_status !== "configured";
     $("recording-badge").textContent = state.workerStatus === "disk_full" ? "Recording paused" : "Recording";
     $("recording-badge").classList.toggle("paused", state.workerStatus === "disk_full");
     if (camera) {
       const status = statusDetails(camera);
       $("connection-badge").textContent = status.text;
       $("connection-badge").className = `status-badge ${status.style}`;
-      $("analytics-state").textContent = camera.analytics_status === "active"
-        ? "Person detection active" : camera.analytics_status === "unavailable"
+      $("analytics-state").textContent = camera.analytics_status === "configured"
+        ? "Person detection ready · Sampled view" : camera.analytics_status === "unavailable"
           ? "Person detection unavailable" : "Person detection not configured";
+      if (status.style !== "online" || state.workerStatus === "unavailable") {
+        stopPersonView("Sampled view stopped while the camera is unavailable. Start it again after live video returns.");
+      }
       if (status.style === "offline" && state.view === "live" && state.media) {
-        livePlaceholder("Camera disconnected", "Live video will return when the camera reconnects. Recording history is still available.", true);
+        livePlaceholder("Camera disconnected", "Check the camera’s power, network and RTSP address. Use Connection help for setup steps. Recording history is still available.", true);
         message("live-state", "Camera disconnected");
       }
     } else $("analytics-state").textContent = "";
+    renderPersonControls();
   }
 
   function renderWorkerStatus() {
+    const reason = state.diagnostics?.storage?.reason;
     const value = state.workerStatus === "disk_full"
-      ? "Recording paused: low disk space or storage limit. Live view and recording history remain available."
+      ? reason === "inspection"
+        ? "Recording paused: storage could not be checked safely. Check the K5 startup message. Live view and retained recording history remain available."
+        : reason === "free_space"
+          ? "Recording paused: disk space is low. Free space on the recording drive. K5 checks storage automatically; live view and retained history remain available."
+          : "Recording paused: storage limit reached. K5 retires eligible older recordings automatically. Live view and retained recording history remain available."
       : state.workerStatus === "unavailable" ? "Media service is restarting. Recording history will return when the service is ready." : "";
     $("worker-message").textContent = value;
     $("worker-message").hidden = !value;
+  }
+
+  function byteLabel(value) {
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    if (value < 1024) return `${value} B`;
+    const units = ["KiB", "MiB", "GiB", "TiB"];
+    let size = value / 1024;
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1; }
+    return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unit]}`;
+  }
+
+  function renderDiagnostics() {
+    const diagnostics = state.diagnostics;
+    const service = state.statusUnavailable ? "Service status unavailable · Select refresh to retry"
+      : state.workerStatus === "ready" ? "Media service ready"
+        : state.workerStatus === "disk_full" ? "Recording paused · Storage needs attention"
+          : "Media service restarting";
+    $("service-status").textContent = service;
+    $("service-status").closest(".system-status").classList.toggle("warning", state.statusUnavailable || state.workerStatus !== "ready");
+    const storage = diagnostics?.storage;
+    const used = byteLabel(storage?.recording_bytes);
+    const free = byteLabel(storage?.free_bytes);
+    const limit = byteLabel(diagnostics?.max_recording_bytes);
+    $("storage-status").textContent = state.statusUnavailable ? "Recording storage status could not be checked."
+      : storage?.reason === "inspection" ? `Storage could not be checked safely${limit ? ` · ${limit} recording limit` : ""}`
+        : used && free && limit ? `${used} recorded · ${limit} recording limit · ${free} disk free`
+          : limit ? `Recording limit ${limit} · Waiting for storage status`
+            : "Checking recording storage…";
+    $("connection-help-status").textContent = state.workerStatus === "disk_full"
+      ? diagnostics?.storage?.reason === "inspection"
+        ? "Recording is paused because storage could not be checked safely. Check the K5 startup message for the recording-storage problem. Live view and retained history remain available."
+        : "Recording is paused. Free disk space or increase the configured recording limit, then K5 will resume automatically when storage can be admitted. Live view and retained history remain available."
+      : state.workerStatus === "unavailable" || state.statusUnavailable
+        ? "K5 is checking or restarting its media service. If this persists, confirm K5 is running and check its startup message."
+        : "The media service is ready. If a camera stays disconnected or connecting, check the camera settings below.";
+  }
+
+  async function refreshDiagnostics() {
+    if (!state.token) return;
+    const epoch = state.sessionEpoch;
+    try {
+      const diagnostics = await request("/api/v1/operator/status");
+      if (epoch !== state.sessionEpoch) return;
+      if (!diagnostics || !["ready", "unavailable", "disk_full"].includes(diagnostics.worker_status)) throw new ApiError(503);
+      state.diagnostics = diagnostics;
+      state.statusUnavailable = false;
+      state.workerStatus = diagnostics.worker_status;
+      renderWorkerStatus(); renderCameraHeading(); renderDiagnostics();
+    } catch (error) {
+      if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
+      state.statusUnavailable = true;
+      renderDiagnostics();
+    }
+  }
+
+  function clearCameraSelection(title = "Choose a camera to begin", description = "Your live feed will appear here.") {
+    state.selectionEpoch += 1;
+    state.selectionController?.abort();
+    stopLive(); stopPlayback();
+    state.selected = null; state.media = null;
+    resetHistory(); renderCameras();
+    livePlaceholder(title, description);
+    message("live-state", "No camera selected");
   }
 
   async function refreshCameras(selectFirst = false) {
@@ -277,17 +367,14 @@
       state.cameras = data.cameras.filter((camera) => camera && typeof camera.device_id === "string" && typeof camera.name === "string");
       renderCameras();
       if (state.selected && !currentCamera()) {
-        state.selectionEpoch += 1;
-        state.selectionController?.abort();
-        stopLive(); stopPlayback();
-        state.selected = null; state.media = null;
-        resetHistory(); renderCameras();
-        livePlaceholder("Camera unavailable", "Select another camera or refresh the camera list.");
+        clearCameraSelection("Camera unavailable", "Select another camera or refresh the camera list.");
       }
       if (selectFirst && !state.selected && state.cameras.length) await selectCamera(state.cameras[0].device_id);
+      return true;
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
       $("camera-list-message").textContent = apiMessage(error, "Camera list unavailable. Select refresh to try again.");
+      return false;
     }
   }
 
@@ -295,7 +382,7 @@
     clearTimeout(state.pollTimer);
     if (!state.token) return;
     state.pollTimer = setTimeout(async () => {
-      await refreshCameras();
+      await Promise.all([refreshCameras(), refreshDiagnostics()]);
       scheduleCameraPoll();
     }, 10000);
   }
@@ -367,6 +454,115 @@
     livePlaceholder("Reconnecting", reason);
     message("live-state", `Reconnecting · Attempt ${state.retryCount} of ${RETRY_DELAYS.length}`);
     state.retryTimer = setTimeout(() => void startLive(epoch), delay);
+  }
+
+  function canSamplePerson() {
+    const video = $("live-video");
+    const camera = currentCamera();
+    return Boolean(state.token && !state.signingOut && state.view === "live"
+      && camera?.analytics_status === "configured" && statusDetails(camera).style === "online"
+      && state.workerStatus !== "unavailable" && video.readyState >= 2 && !video.paused
+      && video.videoWidth > 0 && video.videoHeight > 0);
+  }
+
+  function renderPersonControls() {
+    $("toggle-person-view").textContent = state.personEnabled ? "Stop sampled view" : "Start sampled view";
+    $("toggle-person-view").setAttribute("aria-pressed", String(state.personEnabled));
+    $("toggle-person-view").disabled = !state.personEnabled && !canSamplePerson();
+  }
+
+  function stopPersonView(reason = "Select Start sampled view while live video is playing. Samples are processed locally and are not saved.") {
+    state.personEnabled = false;
+    state.personEpoch += 1;
+    clearTimeout(state.personTimer);
+    state.personTimer = null;
+    state.personController?.abort();
+    state.personController = null;
+    const canvas = $("person-view-canvas");
+    canvas.width = 0; canvas.height = 0; canvas.hidden = true;
+    message("person-view-message", reason);
+    renderPersonControls();
+  }
+
+  function validPersonBox(box) {
+    return box && box.category === "person"
+      && [box.confidence, box.x_min, box.y_min, box.x_max, box.y_max].every((value) => Number.isFinite(value) && value >= 0 && value <= 1)
+      && box.x_min < box.x_max && box.y_min < box.y_max;
+  }
+
+  async function samplePerson(epoch) {
+    if (!state.personEnabled || epoch !== state.personEpoch) return;
+    if (!canSamplePerson()) {
+      stopPersonView("Sampled view stopped while live video is unavailable. Start it again when video returns.");
+      return;
+    }
+    const began = performance.now();
+    const cameraId = state.selected;
+    const video = $("live-video");
+    const scale = Math.min(1, 544 / video.videoWidth, 320 / video.videoHeight);
+    const width = Math.max(1, Math.floor(video.videoWidth * scale));
+    const height = Math.max(1, Math.floor(video.videoHeight * scale));
+    const capture = document.createElement("canvas");
+    capture.width = width; capture.height = height;
+    let snapshot = null;
+    let pixels = null;
+    const controller = new AbortController();
+    state.personController = controller;
+    try {
+      const context = capture.getContext("2d", { willReadFrequently: true });
+      context.drawImage(video, 0, 0, width, height);
+      snapshot = context.getImageData(0, 0, width, height);
+      capture.width = 0; capture.height = 0;
+      pixels = new Uint8Array(snapshot.data.length);
+      for (let offset = 0; offset < pixels.length; offset += 4) {
+        pixels[offset] = snapshot.data[offset + 2];
+        pixels[offset + 1] = snapshot.data[offset + 1];
+        pixels[offset + 2] = snapshot.data[offset];
+        pixels[offset + 3] = 255;
+      }
+      const frameId = state.personFrameId = (state.personFrameId + 1) % 2147483648;
+      const query = new URLSearchParams({ width: String(width), height: String(height), frame_id: String(frameId) });
+      const result = await request(`/api/v1/operator/cameras/${encodeURIComponent(cameraId)}/person-view?${query}`, {
+        method: "POST", rawBody: pixels, signal: controller.signal,
+      });
+      if (epoch !== state.personEpoch || !state.personEnabled || cameraId !== state.selected || !canSamplePerson()) return;
+      if (!result || result.frame_id !== frameId || !["active", "busy", "unavailable"].includes(result.status)
+        || !Array.isArray(result.boxes) || result.boxes.length > 32 || !result.boxes.every(validPersonBox)) throw new ApiError(503);
+      if (result.status === "unavailable") {
+        stopPersonView("Person detection is unavailable. Live video and recording continue. Start sampled view to retry.");
+        return;
+      }
+      if (result.status === "busy") message("person-view-message", "Person detection is busy. Waiting for the next sample…");
+      else {
+        // The response belongs to this exact frozen sample, never the moving
+        // live player. Publish frame and boxes together in one canvas update.
+        const canvas = $("person-view-canvas");
+        canvas.width = width; canvas.height = height;
+        const output = canvas.getContext("2d");
+        output.putImageData(snapshot, 0, 0);
+        output.strokeStyle = "#68d2a4"; output.fillStyle = "#68d2a4";
+        output.lineWidth = 2; output.font = "12px Segoe UI, sans-serif";
+        for (const box of result.boxes) {
+          const x = box.x_min * width; const y = box.y_min * height;
+          output.strokeRect(x, y, (box.x_max - box.x_min) * width, (box.y_max - box.y_min) * height);
+          output.fillText(`Person ${Math.round(box.confidence * 100)}%`, x + 3, Math.max(14, y - 4));
+        }
+        canvas.hidden = false;
+        message("person-view-message", `${result.boxes.length} ${result.boxes.length === 1 ? "person" : "people"} in this sample · Samples are not saved or recorded as events.`);
+      }
+    } catch (error) {
+      if (error.name === "AbortError" || epoch !== state.personEpoch || !state.token) return;
+      if (error.status === 429) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
+      else stopPersonView(apiMessage(error, "Person detection is unavailable. Live video and recording continue. Start sampled view to retry."));
+    } finally {
+      pixels?.fill(0);
+      snapshot?.data.fill(0);
+      capture.width = 0; capture.height = 0;
+      if (state.personController === controller) state.personController = null;
+      if (state.personEnabled && epoch === state.personEpoch) {
+        state.personTimer = setTimeout(() => void samplePerson(epoch), Math.max(0, 500 - (performance.now() - began)));
+      }
+    }
   }
 
   async function startLive(epoch = state.selectionEpoch) {
@@ -635,14 +831,14 @@
       const expires = Date.parse(result.expires_at);
       if (Number.isFinite(expires)) state.expiryTimer = setTimeout(expireSession, Math.max(0, Math.min(expires - Date.now(), DAY)));
       setLastDay(); resetHistory();
-      await refreshCameras(true);
+      await Promise.all([refreshCameras(true), refreshDiagnostics()]);
       scheduleCameraPoll();
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
       state.token = "";
       message("sign-in-message", error.status === 401
         ? "Username or password is incorrect."
-        : apiMessage(error, "Sign-in is unavailable. Try again shortly."), true);
+        : apiMessage(error, "Sign-in is unavailable. Confirm K5 is running on this PC and check its startup message."), true);
     } finally {
       credentials.password = "";
       if (epoch === state.sessionEpoch) {
@@ -653,7 +849,7 @@
   });
 
   $("sign-out-button").addEventListener("click", () => void signOut());
-  $("refresh-cameras").addEventListener("click", () => void refreshCameras(true));
+  $("refresh-cameras").addEventListener("click", () => void Promise.all([refreshCameras(true), refreshDiagnostics()]));
   $("camera-search").addEventListener("input", renderCameras);
   $("live-tab").addEventListener("click", () => setView("live"));
   $("history-tab").addEventListener("click", () => setView("history"));
@@ -663,12 +859,24 @@
     if (!state.token || state.view !== "live") return;
     $("live-placeholder").hidden = true; $("live-video-label").hidden = false; $("play-live").hidden = true;
     message("live-state", "Live video connected");
+    renderPersonControls();
   });
+  $("live-video").addEventListener("pause", () => { if (state.personEnabled) stopPersonView("Sampled view stopped while live video is paused."); });
   $("live-video").addEventListener("waiting", () => {
+    if (state.personEnabled) stopPersonView("Sampled view stopped while live video is buffering. Start it again when video returns.");
     if (state.token && state.view === "live") {
       $("live-video-label").hidden = true;
       message("live-state", "Buffering live video…");
     }
+  });
+  $("toggle-person-view").addEventListener("click", () => {
+    if (state.personEnabled) { stopPersonView(); return; }
+    if (!canSamplePerson()) return;
+    state.personEnabled = true;
+    const epoch = ++state.personEpoch;
+    renderPersonControls();
+    message("person-view-message", "Processing a sampled frame…");
+    void samplePerson(epoch);
   });
   $("live-video").addEventListener("error", () => {
     if (state.token && state.media && state.view === "live" && state.nativeLive) scheduleLiveRetry(state.selectionEpoch, "The live stream is unavailable. Waiting for the camera…");
@@ -696,6 +904,8 @@
     if (state.account?.role !== "administrator") return;
     const camera = mode === "update" ? currentCamera() : null;
     if (mode === "update" && !camera) return;
+    if (mode === "update") stopPersonView();
+    state.cameraSetupEpoch += 1;
     state.dialogMode = mode;
     $("add-camera-form").reset(); message("add-camera-message", "");
     $("new-camera-name").readOnly = mode === "update";
@@ -705,6 +915,7 @@
       ? "Changing the stream address reconnects live video and recording. The current address is kept private."
       : "Connect an RTSP camera to live view and continuous recording.";
     $("save-camera").textContent = mode === "update" ? "Update source" : "Connect camera";
+    $("save-camera").disabled = false;
     if (camera) {
       $("new-camera-name").value = camera.name;
       $("new-camera-host").value = camera.host;
@@ -717,6 +928,7 @@
   $("close-add-camera").addEventListener("click", closeAddCamera);
   $("cancel-add-camera").addEventListener("click", closeAddCamera);
   $("add-camera-dialog").addEventListener("close", () => {
+    if ($("add-camera-dialog").open) return;
     $("add-camera-form").reset();
     $("new-camera-name").readOnly = false;
     $("new-camera-host").readOnly = false;
@@ -724,8 +936,9 @@
   });
   $("add-camera-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (state.account?.role !== "administrator") return;
+    if (state.account?.role !== "administrator" || $("save-camera").disabled) return;
     const epoch = state.sessionEpoch;
+    const setupEpoch = state.cameraSetupEpoch;
     const updating = state.dialogMode === "update";
     const camera = { name: $("new-camera-name").value.trim(), host: $("new-camera-host").value.trim(), source_uri: $("new-camera-source").value.trim() };
     $("new-camera-source").value = "";
@@ -734,25 +947,95 @@
     try {
       const created = await request("/api/v1/operator/cameras", { method: "POST", body: camera });
       if (epoch !== state.sessionEpoch) return;
-      closeAddCamera();
-      notice(updating
-        ? "Camera source updated. Live video and recording will reconnect."
-        : "Camera saved. The live connection and recording status will update as it connects.");
+      if (setupEpoch === state.cameraSetupEpoch) {
+        closeAddCamera();
+        notice(updating
+          ? "Camera source updated. Live video and recording will reconnect."
+          : "Camera saved. The live connection and recording status will update as it connects.");
+      }
       await refreshCameras();
       const deviceId = created.device_id || created.camera?.device_id;
-      if (deviceId) await selectCamera(deviceId);
+      if (deviceId && setupEpoch === state.cameraSetupEpoch) await selectCamera(deviceId);
     } catch (error) {
-      if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
+      if (error.name === "AbortError" || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       message("add-camera-message", error.status === 422
         ? "Check the camera IP address and RTSP stream. Enter the stream address again to retry."
         : error.status === 409 ? "This camera is already configured. Refresh the camera list."
           : apiMessage(error, "Camera setup failed. Enter the stream address again and retry."), true);
     } finally {
       camera.source_uri = "";
-      $("new-camera-source").value = "";
-      $("save-camera").disabled = false;
+      // Submitted credentials were cleared before the request. Completion may
+      // belong to an earlier dialog while the next camera is already being set
+      // up, so it must not clear or enable controls owned by that new dialog.
+      if (epoch === state.sessionEpoch && setupEpoch === state.cameraSetupEpoch) $("save-camera").disabled = false;
     }
   });
+
+  function setRemovalBusy(busy) {
+    state.removing = busy;
+    for (const id of ["confirm-remove-camera", "cancel-remove-camera", "close-remove-camera"]) $(id).disabled = busy;
+    $("confirm-remove-camera").textContent = busy ? "Removing…" : "Remove camera";
+  }
+
+  function closeRemoveCamera() {
+    if (!state.removing) $("remove-camera-dialog").close();
+  }
+
+  $("remove-camera-button").addEventListener("click", () => {
+    const camera = currentCamera();
+    if (!camera || state.account?.role !== "administrator") return;
+    state.removeTarget = { device_id: camera.device_id, name: camera.name, host: camera.host };
+    $("remove-camera-name").textContent = `${camera.name} · ${camera.host}`;
+    message("remove-camera-message", "");
+    setRemovalBusy(false);
+    $("remove-camera-dialog").showModal();
+    $("cancel-remove-camera").focus();
+  });
+  $("cancel-remove-camera").addEventListener("click", closeRemoveCamera);
+  $("close-remove-camera").addEventListener("click", closeRemoveCamera);
+  $("remove-camera-dialog").addEventListener("cancel", (event) => { if (state.removing) event.preventDefault(); });
+  $("remove-camera-dialog").addEventListener("close", () => { state.removeTarget = null; });
+  $("remove-camera-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (state.removing || !state.removeTarget || state.account?.role !== "administrator") return;
+    const target = state.removeTarget;
+    const epoch = state.sessionEpoch;
+    setRemovalBusy(true);
+    message("remove-camera-message", "Removing camera and stopping new recording…");
+    let delayed = false;
+    try {
+      try {
+        await request(`/api/v1/operator/cameras/${encodeURIComponent(target.device_id)}`, { method: "DELETE" });
+      } catch (error) {
+        if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
+        if (error.status === 503) {
+          const refreshed = await refreshCameras();
+          if (!refreshed || state.cameras.some((camera) => camera.device_id === target.device_id)) throw error;
+          delayed = true;
+        } else if (error.status !== 404) throw error;
+      }
+      if (epoch !== state.sessionEpoch) return;
+      state.cameras = state.cameras.filter((camera) => camera.device_id !== target.device_id);
+      if (state.selected === target.device_id) clearCameraSelection();
+      else renderCameras();
+      $("remove-camera-dialog").close();
+      await Promise.all([refreshCameras(true), refreshDiagnostics()]);
+      if (epoch !== state.sessionEpoch) return;
+      notice(delayed
+        ? "Camera removed from the workspace. The media service is restarting to finish applying the change. Existing recording files remain subject to retention."
+        : "Camera removed. Existing recording files remain subject to retention.");
+    } catch (error) {
+      if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
+      message("remove-camera-message", apiMessage(error, "Camera removal could not be confirmed. Refresh the camera list before trying again."), true);
+    } finally {
+      if (epoch === state.sessionEpoch) setRemovalBusy(false);
+    }
+  });
+
+  $("connection-help-button").addEventListener("click", () => { renderDiagnostics(); $("connection-help-dialog").showModal(); });
+  for (const id of ["close-connection-help", "done-connection-help"]) {
+    $(id).addEventListener("click", () => $("connection-help-dialog").close());
+  }
 
   window.addEventListener("pagehide", () => { stopLive(); stopPlayback(); });
   setLastDay();
