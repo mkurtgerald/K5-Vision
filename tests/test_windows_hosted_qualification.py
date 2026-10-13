@@ -1,4 +1,4 @@
-"""Portable fake API tests only. Never invokes NativeMetrics or a real Job."""
+"""Portable fake API tests only. Never loads Windows DLLs or invokes a real Job."""
 
 import ast
 import contextlib
@@ -693,7 +693,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
             return rows
 
         calls = self.during_listeners(changed)
-        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unavailable"):
+        with self.assertRaisesRegex(ResourceFailure, "job_accounting_regressed"):
             owner.sample()
         self.assertEqual(len(calls), 1)
         self.assertEqual(owner.last_cpu, 2.5)
@@ -1358,7 +1358,7 @@ class NonAtomicCensusFakeTests(unittest.TestCase):
             return original(job)
 
         self.native.accounting = accounting
-        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unavailable"):
+        with self.assertRaisesRegex(ResourceFailure, "job_accounting_regressed"):
             owner.sample()
         self.assertEqual(calls, [1, 2])
         self.assertEqual(owner.last_cpu, 2.5)
@@ -2976,7 +2976,7 @@ class SampledCurrentCensusTests(unittest.TestCase):
         self.clock.value += 0.25
         self.native.total = 3
         before = self.native.read_count
-        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unavailable"):
+        with self.assertRaisesRegex(ResourceFailure, "job_accounting_regressed"):
             owner.sample()
         self.assertEqual(self.native.read_count, before + 1)
         self.assertEqual(owner.last_total, 4)
@@ -3711,7 +3711,7 @@ class NativeBoundaryFakeTests(unittest.TestCase):
 
     def test_unreadable_udp_fails_closed(self):
         native = self.tcp_native(udp_error=5)
-        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unavailable"):
+        with self.assertRaisesRegex(ResourceFailure, "endpoint_table_probe_invalid"):
             native.listeners({11})
 
     def test_unreadable_udp_second_read_fails_closed_both_families(self):
@@ -3735,7 +3735,7 @@ class NativeBoundaryFakeTests(unittest.TestCase):
                     return original(buffer, length, ordered, family, table_class, reserved)
 
                 native.ip.GetExtendedUdpTable = unreadable
-                with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unavailable"):
+                with self.assertRaisesRegex(ResourceFailure, "endpoint_table_query_failed"):
                     native.listeners({11})
 
     def test_tcp_and_udp_same_address_remain_distinct(self):
@@ -3752,6 +3752,324 @@ class NativeBoundaryFakeTests(unittest.TestCase):
             owner.close()
         with self.assertRaises(ResourceFailure):
             owner.close()
+
+
+class FixedResourceDiagnosticTests(unittest.TestCase):
+    """Actual emitters with inert ctypes callbacks; no DLL or native Job calls."""
+
+    CATEGORIES = {
+        "job_membership_query_failed": "belongs",
+        "job_limits_set_failed": "configure",
+        "job_limits_query_failed": "configure",
+        "job_accounting_query_failed": "accounting",
+        "job_accounting_invalid": "accounting",
+        "job_members_query_failed": "members",
+        "job_member_ids_invalid": "members",
+        "process_open_failed": "open_member",
+        "process_times_query_failed": "identity",
+        "process_birth_invalid": "identity",
+        "process_rss_query_failed": "rss",
+        "host_memory_query_failed": "host",
+        "host_cpu_query_failed": "host",
+        "host_disk_query_failed": "host",
+        "host_metrics_invalid": "host",
+        "endpoint_table_probe_invalid": "listeners",
+        "endpoint_table_query_failed": "listeners",
+        "endpoint_table_size_invalid": "listeners",
+        "endpoint_table_rows_invalid": "listeners",
+        "endpoint_port_invalid": "listeners",
+        "final_job_accounting_regressed": "final_accounting",
+        "job_accounting_regressed": "sample_accounting",
+        "host_cpu_delta_invalid": "sample_host",
+    }
+
+    @classmethod
+    def restored(cls):
+        tree = ast.parse((ROOT / "scripts/windows_hosted_qualification.py").read_text())
+        removed = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "resource_need"
+                and len(node.args) == 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in cls.CATEGORIES
+            ):
+                removed.append(node.args.pop().value)
+        namespace = dict(vars(guard))
+        classes = ast.Module(
+            body=[
+                node
+                for node in tree.body
+                if isinstance(node, ast.ClassDef)
+                and node.name in {"NativeMetrics", "QualificationResources"}
+            ],
+            type_ignores=[],
+        )
+        exec(compile(classes, "<inert diagnostic equivalence>", "exec"), namespace)
+        return types.SimpleNamespace(**namespace), tree, removed
+
+    def native_fixture(self, module, category, *, fail=True):
+        native = module.NativeMetrics.__new__(module.NativeMetrics)
+        events, saved = [], []
+        fault = category if fail else ""
+
+        def write(pointer, value, kind=guard.U64):
+            ctypes.cast(pointer, ctypes.POINTER(kind))[0] = value
+
+        def belongs(process, job, pointer):
+            events.append("membership")
+            write(pointer, 0, ctypes.c_int32)
+            return fault != "job_membership_query_failed"
+
+        def set_limits(handle, kind, pointer, size):
+            events.append(("set_limits", kind, size))
+            saved.append(ctypes.string_at(pointer, size))
+            return fault != "job_limits_set_failed"
+
+        def query(handle, kind, pointer, size, length):
+            events.append(("query", kind, size))
+            if kind == 9:
+                ctypes.memmove(pointer, saved[0], size)
+                return fault != "job_limits_query_failed"
+            if kind == 1:
+                value = Accounting()
+                value.total, value.active, value.user = 2, 2, 10_000_000
+                if fault == "job_accounting_invalid":
+                    value.total = 1
+                ctypes.memmove(pointer, ctypes.byref(value), size)
+                return fault != "job_accounting_query_failed"
+            value = ProcessIds()
+            value.assigned = value.count = 2
+            value.pids[0], value.pids[1] = 11, 12
+            if fault == "job_member_ids_invalid":
+                value.pids[1] = 11
+            ctypes.memmove(pointer, ctypes.byref(value), size)
+            return fault != "job_members_query_failed"
+
+        def open_process(rights, inherit, pid):
+            events.append(("open", rights, inherit))
+            return 0 if fault == "process_open_failed" else 77
+
+        def times(handle, birth, exited, kernel, user):
+            events.append("process_times")
+            write(birth, 0 if fault == "process_birth_invalid" else 101)
+            return fault != "process_times_query_failed"
+
+        def wait(handle, timeout):
+            events.append(("wait", timeout))
+            return 258
+
+        def rss(handle, pointer, size):
+            events.append("rss")
+            value = MemoryCounters()
+            value.cb, value.working_set = size, 100
+            ctypes.memmove(pointer, ctypes.byref(value), size)
+            return fault != "process_rss_query_failed"
+
+        def memory(pointer):
+            events.append("host_memory")
+            value = guard.HostMemory()
+            value.length = ctypes.sizeof(value)
+            value.total, value.available = 8 * GIB, 5 * GIB
+            if fault == "host_metrics_invalid":
+                value.total = 0
+            ctypes.memmove(pointer, ctypes.byref(value), ctypes.sizeof(value))
+            return fault != "host_memory_query_failed"
+
+        def system_times(idle, kernel, user):
+            events.append("host_cpu")
+            for pointer, value in ((idle, 100), (kernel, 200), (user, 100)):
+                write(pointer, value)
+            return fault != "host_cpu_query_failed"
+
+        def disk(root, available, total, free):
+            events.append("host_disk")
+            for pointer, value in ((available, 10 * GIB), (total, 20 * GIB), (free, 10 * GIB)):
+                write(pointer, value)
+            return fault != "host_disk_query_failed"
+
+        def table(buffer, size, ordered, family, table_class, reserved):
+            events.append(("endpoint", buffer is not None, family, table_class))
+            row = Tcp4()
+            row.pid, row.state, row.port = 11, 2, 0x2823
+            row.local[:] = b"\x7f\0\0\1"
+            if fault == "endpoint_port_invalid":
+                row.port = 0
+            payload = b"\1\0\0\0" + bytes(row)
+            if family != 2 or table_class != 3:
+                payload = b"\0" * 4
+            write(size, len(payload), guard.U32)
+            if buffer is None:
+                return 5 if fault == "endpoint_table_probe_invalid" else 122
+            if fault == "endpoint_table_query_failed":
+                return 5
+            ctypes.memmove(buffer, payload, len(payload))
+            if fault == "endpoint_table_size_invalid":
+                write(size, len(payload) + 1, guard.U32)
+            if fault == "endpoint_table_rows_invalid":
+                ctypes.memmove(buffer, b"\xff" * 4, 4)
+            return 0
+
+        native.k = types.SimpleNamespace(
+            IsProcessInJob=belongs,
+            SetInformationJobObject=set_limits,
+            QueryInformationJobObject=query,
+            OpenProcess=open_process,
+            GetProcessTimes=times,
+            WaitForSingleObject=wait,
+            K32GetProcessMemoryInfo=rss,
+            GlobalMemoryStatusEx=memory,
+            GetSystemTimes=system_times,
+            GetDiskFreeSpaceExW=disk,
+            GetCurrentProcess=lambda: 99,
+        )
+        native.ip = types.SimpleNamespace(GetExtendedTcpTable=table, GetExtendedUdpTable=table)
+        job = types.SimpleNamespace(handle=100)
+        operation = self.CATEGORIES[category]
+        args = {
+            "belongs": (77, job),
+            "configure": (job,),
+            "accounting": (job,),
+            "members": (job,),
+            "open_member": (11, job),
+            "identity": (77,),
+            "rss": (77,),
+            "host": (Path("inert-private-path"),),
+            "listeners": ({11},),
+        }
+        if operation == "open_member":
+            native.belongs = lambda handle, job: events.append("belongs") or True
+        return lambda: getattr(native, operation)(*args[operation]), events
+
+    def fixture(self, module, category, *, fail=True):
+        if category not in {
+            "final_job_accounting_regressed",
+            "job_accounting_regressed",
+            "host_cpu_delta_invalid",
+        }:
+            return self.native_fixture(module, category, fail=fail)
+        clock, native, events = Clock(), FakeNative(), []
+        for name in (
+            "configure",
+            "parent_outside",
+            "accounting",
+            "members",
+            "open_member",
+            "belongs",
+            "identity",
+            "rss",
+            "host",
+            "listeners",
+            "close_handle",
+        ):
+            original = getattr(native, name)
+
+            def traced(*args, name=name, original=original):
+                events.append(name)
+                return original(*args)
+
+            setattr(native, name, traced)
+        owner = module.QualificationResources(
+            types.SimpleNamespace(WindowsJob=FakeJob),
+            "inert-private-path",
+            clock=clock,
+            native_factory=lambda: native,
+        )
+        job = owner.job_factory()
+        clock.value += 0.25
+        if category == "final_job_accounting_regressed":
+            owner.last_cpu = 4 if fail else 1
+            return job.accounting, events
+        if category == "job_accounting_regressed":
+            owner.last_cpu = 2 if fail else 1
+        elif fail:
+            owner.host_seed = (1000, 2000, 1000)
+        return owner._sample, events
+
+    def test_all_generic_emitters_have_unique_fixed_sanitized_codes(self):
+        source = ast.parse((ROOT / "scripts/windows_hosted_qualification.py").read_text())
+        calls = [
+            node
+            for node in ast.walk(source)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "resource_need"
+        ]
+        self.assertTrue(all(len(node.args) == 2 and not node.keywords for node in calls))
+        _, _, removed = self.restored()
+        self.assertEqual(len(removed), 23)
+        self.assertEqual(set(removed), self.CATEGORIES.keys())
+        for category in removed:
+            self.assertRegex(category, r"\A[a-z_]{1,64}\Z")
+
+    def test_stripping_only_diagnostic_literals_restores_exact_baseline_ast(self):
+        _, restored, _ = self.restored()
+        self.assertEqual(
+            hashlib.sha256(ast.dump(restored, include_attributes=False).encode()).hexdigest(),
+            "640917a141beb910037345a99416c0e51f94111b0bd7f4a96cd9d847a2a70531",
+        )
+
+    def test_all_twenty_three_actual_failures_keep_call_order_and_type(self):
+        baseline, _, _ = self.restored()
+        for category in self.CATEGORIES:
+            with self.subTest(category=category):
+                original, old_events = self.fixture(baseline, category)
+                diagnostic, new_events = self.fixture(guard, category)
+                with self.assertRaisesRegex(ResourceFailure, r"\Aresource_evidence_unavailable\Z"):
+                    original()
+                with self.assertRaises(ResourceFailure) as refused:
+                    diagnostic()
+                self.assertEqual(str(refused.exception), category)
+                self.assertEqual(new_events, old_events)
+
+    def test_diagnostics_preserve_success_values_and_call_order(self):
+        baseline, _, _ = self.restored()
+        for category in self.CATEGORIES:
+            with self.subTest(category=category):
+                original, old_events = self.fixture(baseline, category, fail=False)
+                diagnostic, new_events = self.fixture(guard, category, fail=False)
+                first, second = original(), diagnostic()
+                if isinstance(first, types.SimpleNamespace):
+                    first, second = vars(first), vars(second)
+                self.assertEqual(first, second)
+                self.assertEqual(new_events, old_events)
+
+    def test_actual_failures_reach_only_sanitized_main_output(self):
+        for category in self.CATEGORIES:
+            with self.subTest(category=category):
+                operation, _ = self.fixture(guard, category)
+                output = io.StringIO()
+                with (
+                    patch.object(sys, "argv", ["guard", "--prepare", "--profile", "alpha"]),
+                    patch.object(
+                        guard,
+                        "prepare",
+                        side_effect=lambda profile, operation=operation: operation(),
+                    ),
+                    contextlib.redirect_stderr(output),
+                ):
+                    self.assertEqual(guard.main(), 1)
+                self.assertEqual(
+                    output.getvalue(), "K5_HOSTED_QUALIFICATION_REFUSED=" + category + "\n"
+                )
+
+    def test_default_fallback_and_external_error_redaction_are_unchanged(self):
+        guard.resource_need(True)
+        with self.assertRaisesRegex(ResourceFailure, r"\Aresource_evidence_unavailable\Z"):
+            guard.resource_need(False)
+        for error in (ResourceFailure("private/path pid=77"), OSError("private credential")):
+            output = io.StringIO()
+            with (
+                patch.object(sys, "argv", ["guard", "--prepare", "--profile", "alpha"]),
+                patch.object(guard, "prepare", side_effect=error),
+                contextlib.redirect_stderr(output),
+            ):
+                self.assertEqual(guard.main(), 1)
+            self.assertEqual(
+                output.getvalue(), "K5_HOSTED_QUALIFICATION_REFUSED=qualification_failed\n"
+            )
 
 
 class QualificationPolicyTests(unittest.TestCase):

@@ -1444,7 +1444,10 @@ class NativeMetrics:
 
     def belongs(self, process, job):
         value = c.c_int32()
-        resource_need(self.k.IsProcessInJob(process, job.handle, c.byref(value)))
+        resource_need(
+            self.k.IsProcessInJob(process, job.handle, c.byref(value)),
+            "job_membership_query_failed",
+        )
         return bool(value.value)
 
     def parent_outside(self, job):
@@ -1458,11 +1461,13 @@ class NativeMetrics:
         limits.basic.flags = 0x2000 | 0x200 | 0x8
         limits.basic.active, limits.job_memory = ACTIVE_LIMIT, COMMIT_LIMIT
         resource_need(
-            self.k.SetInformationJobObject(job.handle, 9, c.byref(limits), c.sizeof(limits))
+            self.k.SetInformationJobObject(job.handle, 9, c.byref(limits), c.sizeof(limits)),
+            "job_limits_set_failed",
         )
         check = ExtendedLimits()
         resource_need(
-            self.k.QueryInformationJobObject(job.handle, 9, c.byref(check), c.sizeof(check), None)
+            self.k.QueryInformationJobObject(job.handle, 9, c.byref(check), c.sizeof(check), None),
+            "job_limits_query_failed",
         )
         resource_need(
             check.basic.flags == limits.basic.flags
@@ -1475,31 +1480,37 @@ class NativeMetrics:
     def accounting(self, job):
         value = Accounting()
         resource_need(
-            self.k.QueryInformationJobObject(job.handle, 1, c.byref(value), c.sizeof(value), None)
+            self.k.QueryInformationJobObject(job.handle, 1, c.byref(value), c.sizeof(value), None),
+            "job_accounting_query_failed",
         )
         resource_need(
             0 <= value.user
             and 0 <= value.kernel
             and value.active <= ACTIVE_LIMIT
-            and value.total >= value.active
+            and value.total >= value.active,
+            "job_accounting_invalid",
         )
         return value.total, value.active, (value.user + value.kernel) / 10_000_000
 
     def members(self, job):
         value = ProcessIds()
         resource_need(
-            self.k.QueryInformationJobObject(job.handle, 3, c.byref(value), c.sizeof(value), None)
+            self.k.QueryInformationJobObject(job.handle, 3, c.byref(value), c.sizeof(value), None),
+            "job_members_query_failed",
         )
         resource_need(value.assigned == value.count <= ACTIVE_LIMIT, "membership_incomplete")
         result = tuple(int(value.pids[n]) for n in range(value.count))
-        resource_need(len(set(result)) == len(result) and all(0 < pid < 2**32 for pid in result))
+        resource_need(
+            len(set(result)) == len(result) and all(0 < pid < 2**32 for pid in result),
+            "job_member_ids_invalid",
+        )
         return set(result)
 
     def open_member(self, pid, job):
         # QUERY_INFORMATION | VM_READ | SYNCHRONIZE, for zero-time state reads only.
         # No terminate, write, injection or all-access rights.
         handle = self.k.OpenProcess(0x0400 | 0x0010 | 0x00100000, False, pid)
-        resource_need(handle)
+        resource_need(handle, "process_open_failed")
         try:
             resource_need(self.belongs(handle, job), "ownership_unproven")
             birth, _ = self.identity(handle)
@@ -1515,9 +1526,10 @@ class NativeMetrics:
         resource_need(
             self.k.GetProcessTimes(
                 handle, c.byref(birth), c.byref(exit_time), c.byref(kernel), c.byref(user)
-            )
+            ),
+            "process_times_query_failed",
         )
-        resource_need(birth.value > 0)
+        resource_need(birth.value > 0, "process_birth_invalid")
         # GetProcessTimes leaves exit_time undefined while the process is live.
         # Only the retained process object's signal state proves termination.
         state = self.k.WaitForSingleObject(handle, 0)
@@ -1527,23 +1539,31 @@ class NativeMetrics:
     def rss(self, handle):
         value = MemoryCounters()
         value.cb = c.sizeof(value)
-        resource_need(self.k.K32GetProcessMemoryInfo(handle, c.byref(value), c.sizeof(value)))
+        resource_need(
+            self.k.K32GetProcessMemoryInfo(handle, c.byref(value), c.sizeof(value)),
+            "process_rss_query_failed",
+        )
         return value.working_set
 
     def host(self, disk_root):
         mem = HostMemory()
         mem.length = c.sizeof(mem)
-        resource_need(self.k.GlobalMemoryStatusEx(c.byref(mem)))
+        resource_need(self.k.GlobalMemoryStatusEx(c.byref(mem)), "host_memory_query_failed")
         idle, kernel, user = (U64() for _ in range(3))
-        resource_need(self.k.GetSystemTimes(c.byref(idle), c.byref(kernel), c.byref(user)))
+        resource_need(
+            self.k.GetSystemTimes(c.byref(idle), c.byref(kernel), c.byref(user)),
+            "host_cpu_query_failed",
+        )
         available, total, free = U64(), U64(), U64()
         resource_need(
             self.k.GetDiskFreeSpaceExW(
                 str(disk_root), c.byref(available), c.byref(total), c.byref(free)
-            )
+            ),
+            "host_disk_query_failed",
         )
         resource_need(
-            0 < mem.total and 0 <= mem.available <= mem.total and available.value <= total.value
+            0 < mem.total and 0 <= mem.available <= mem.total and available.value <= total.value,
+            "host_metrics_invalid",
         )
         return mem.available, mem.total, (idle.value, kernel.value, user.value), available.value
 
@@ -1559,14 +1579,20 @@ class NativeMetrics:
         for protocol, family, row_type, query, table_class in tables:
             size = U32()
             status = query(None, c.byref(size), False, family, table_class, 0)
-            resource_need(status in (0, 122) and 4 <= size.value <= 4 * 1024 * 1024)
+            resource_need(
+                status in (0, 122) and 4 <= size.value <= 4 * 1024 * 1024,
+                "endpoint_table_probe_invalid",
+            )
             capacity = size.value
             buffer = c.create_string_buffer(capacity)
-            resource_need(query(buffer, c.byref(size), False, family, table_class, 0) == 0)
-            resource_need(4 <= size.value <= capacity)
+            resource_need(
+                query(buffer, c.byref(size), False, family, table_class, 0) == 0,
+                "endpoint_table_query_failed",
+            )
+            resource_need(4 <= size.value <= capacity, "endpoint_table_size_invalid")
             count = U32.from_buffer_copy(buffer.raw[:4]).value
             stride = c.sizeof(row_type)
-            resource_need(4 + count * stride <= size.value)
+            resource_need(4 + count * stride <= size.value, "endpoint_table_rows_invalid")
             for n in range(count):
                 row = row_type.from_buffer_copy(buffer.raw[4 + n * stride : 4 + (n + 1) * stride])
                 if row.pid not in owned_pids:
@@ -1577,7 +1603,7 @@ class NativeMetrics:
                     "owned_listener_not_loopback",
                 )
                 port = int.from_bytes(int(row.port).to_bytes(4, "little")[:2], "big")
-                resource_need(0 < port < 65536)
+                resource_need(0 < port < 65536, "endpoint_port_invalid")
                 # Preserve TCP record shape; UDP is a bound endpoint, not TCP LISTEN.
                 endpoint = (row.pid, family, bytes(row.local), port)
                 result.add(endpoint if protocol == "tcp" else (*endpoint, "udp"))
@@ -1676,7 +1702,8 @@ class QualificationResources:
                 resource_need(
                     owner.final_cpu_seconds >= 0
                     and (owner.last_cpu is None or owner.final_cpu_seconds >= owner.last_cpu)
-                    and (owner.last_total is None or owner.final_total >= owner.last_total)
+                    and (owner.last_total is None or owner.final_total >= owner.last_total),
+                    "final_job_accounting_regressed",
                 )
                 return state
 
@@ -1724,7 +1751,8 @@ class QualificationResources:
             observed = self.native.accounting(self.job)
             resource_need(
                 (self.last_cpu is None or observed[2] >= self.last_cpu)
-                and (self.last_total is None or observed[0] >= self.last_total)
+                and (self.last_total is None or observed[0] >= self.last_total),
+                "job_accounting_regressed",
             )
             # Preserve every cumulative observation, including discarded attempts,
             # so final Job drain must also account for the exited children.
@@ -1939,7 +1967,10 @@ class QualificationResources:
         available, total, times, disk = self.native.host(self.disk_root)
         delta = tuple(b - a for a, b in zip(self.host_seed, times, strict=True))
         elapsed = delta[1] + delta[2]  # GetSystemTimes kernel includes idle.
-        resource_need(all(x >= 0 for x in delta) and elapsed > 0 and delta[0] <= elapsed)
+        resource_need(
+            all(x >= 0 for x in delta) and elapsed > 0 and delta[0] <= elapsed,
+            "host_cpu_delta_invalid",
+        )
         cpu = 100.0 * (elapsed - delta[0]) / elapsed
         measured = self.clock()
         resource_need(0 <= measured - started <= STALE_SECONDS, "resource_evidence_stale")
