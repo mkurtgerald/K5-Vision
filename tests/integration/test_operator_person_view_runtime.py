@@ -74,6 +74,22 @@ def _diagnostic_helpers():
     return module
 
 
+def _transport_error_code(error):
+    """Classify a transport failure without retaining native/browser error text."""
+    detail = str(getattr(error, "message", ""))
+    for marker, code in (
+        ("ECONNRESET", "connection_reset"),
+        ("socket hang up", "connection_reset"),
+        ("ECONNREFUSED", "connection_refused"),
+        ("ETIMEDOUT", "connection_timeout"),
+        ("Request context disposed", "request_context_closed"),
+        ("Target page, context or browser has been closed", "browser_closed"),
+    ):
+        if marker in detail:
+            return code
+    return "unclassified"
+
+
 def _recording_bytes(root):
     __tracebackhide__ = True
     return sum(path.stat().st_size for path in root.rglob("*.mp4"))
@@ -310,6 +326,8 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
     product = browser = context = playwright = None
     stage = "product_start"
     failure = None
+    transport_error = None
+    person_probe_statuses = {"authorized": None, "revoked": None, "anonymous": None}
     script_errors = []
     request_failures = {}
     started = time.monotonic()
@@ -530,6 +548,39 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         )
         _require(recording_live(), "Actual person inference interrupted continuous recording")
         receipt["recording_continues"] = True
+        # Authentication precedes frame buffering. A revoked large upload can
+        # reset a Windows connection while the rejected client is still sending
+        # pixels. Use one complete, valid four-byte frame for the authorization
+        # transition, first proving this identical request succeeds while signed
+        # in. Both post-logout requests still require an actual HTTP 401.
+        stage = "authorized_minimal_person_request"
+        probe_url = (
+            client.origin
+            + sample_route
+            + "?"
+            + urlencode(
+                {
+                    "width": 1,
+                    "height": 1,
+                    "frame_id": result["frame_id"],
+                }
+            )
+        )
+        probe_frame = bytes(4)
+        probe_headers = {
+            "Authorization": "Bearer " + revoked_token,
+            "Origin": client.origin,
+            "Content-Type": "application/octet-stream",
+        }
+        person_probe_statuses["authorized"] = context.request.post(
+            probe_url, data=probe_frame, headers=probe_headers
+        ).status
+        _require(
+            person_probe_statuses["authorized"] == 200,
+            "The complete minimal person request did not succeed while authorized",
+        )
+        receipt["authorized_person_probe"] = True
+        receipt["logout_request_frame_bytes"] = len(probe_frame)
         stage = "logout_canvas_clear"
         page.locator("#sign-out-button").click()
         page.locator("#sign-in").wait_for(state="visible")
@@ -543,27 +594,22 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         )
         stage = "logout_inference_revocation"
         replay = context.request.post(
-            sample.value.request.url,
-            data=posted_pixels,
-            headers={
-                "Authorization": "Bearer " + revoked_token,
-                "Origin": client.origin,
-                "Content-Type": "application/octet-stream",
-            },
+            probe_url,
+            data=probe_frame,
+            headers=probe_headers,
         )
+        person_probe_statuses["revoked"] = replay.status
         _require(
             replay.status == 401, "Sign-out left the captured native person request authorized"
         )
+        stage = "anonymous_person_request"
+        person_probe_statuses["anonymous"] = context.request.post(
+            probe_url,
+            data=probe_frame,
+            headers={"Origin": client.origin, "Content-Type": "application/octet-stream"},
+        ).status
         _require(
-            context.request.post(
-                sample.value.request.url,
-                data=posted_pixels,
-                headers={
-                    "Origin": client.origin,
-                    "Content-Type": "application/octet-stream",
-                },
-            ).status
-            == 401,
+            person_probe_statuses["anonymous"] == 401,
             "Anonymous browser pixels were admitted for person inference",
         )
         _require(
@@ -614,6 +660,7 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         stage = "product_closing"
     except BaseException as error:
         failure = diagnostic_helpers._failure_code(error)
+        transport_error = _transport_error_code(error)
     finally:
         cleanup_failures = []
         for label, resource in (("operator_browser", context), ("browser", browser)):
@@ -653,6 +700,8 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         diagnostic = {
             "stage": stage,
             "failure_code": failure,
+            "transport_error_code": transport_error,
+            "person_probe_statuses": person_probe_statuses,
             "script_error_codes": script_errors[:32],
             "request_failure_counts": request_failures,
             "cleanup_failure_codes": cleanup_failures,

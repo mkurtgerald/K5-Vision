@@ -78,7 +78,8 @@ _TRUE = {
     ).split(),
     "person-view": (
         "actual_inference ui_sample_positive recording_continues response_frame_correlated "
-        "logout_cleared logout_person_request_denied anonymous_person_request_denied owned_cleanup"
+        "authorized_person_probe logout_cleared logout_person_request_denied "
+        "anonymous_person_request_denied owned_cleanup"
     ).split(),
 }
 
@@ -139,6 +140,7 @@ def verify(lane: str, path: Path) -> list[dict]:
             _require(receipt.get("browser_script_errors") == 0)
             _require(receipt.get("model_revision") == "6697dead54ed1cdd664b0313189c2cb52ee6335e")
             _require(receipt.get("mock_inference") is False)
+            _require(receipt.get("logout_request_frame_bytes") == 4)
             _require(1 <= receipt.get("person_boxes", 0) <= 32)
             _require(receipt.get("displayed_frame_matching_fraction", 0) >= 0.90)
             _require(receipt.get("box_overlay_pixels", 0) >= 100)
