@@ -1260,7 +1260,7 @@ COMMIT_LIMIT = 3 * GIB
 ACTIVE_LIMIT = 32
 SAMPLE_INTERVAL = 0.250
 STALE_SECONDS = 1.0
-MAX_SAMPLE_ATTEMPTS = 3
+MAX_SAMPLE_ATTEMPTS = 8
 MAX_RETAINED_BIRTHS = 4096  # Evidence storage bound, not an active-process limit.
 U32, U64, SIZE, HANDLE = c.c_uint32, c.c_uint64, c.c_size_t, c.c_void_p
 

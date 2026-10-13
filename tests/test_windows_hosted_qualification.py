@@ -536,11 +536,11 @@ class StableSnapshotFakeTests(unittest.TestCase):
             owner.sample()
         self.assertEqual(len(calls), 1)
 
-    def test_three_changing_attempts_exhaust_without_returning_mixed_snapshot(self):
+    def test_eight_changing_attempts_exhaust_without_returning_mixed_snapshot(self):
         owner = self.make()
-        self.native.pids.add(13)
-        self.native.identities[13] = (103, False)
-        self.native.total = self.job.total_processes = 3
+        self.native.pids = set(range(11, 19))
+        self.native.identities = {pid: (pid + 90, False) for pid in self.native.pids}
+        self.native.total = self.job.total_processes = 8
         owner.sample()
         self.clock.value += 0.25
         self.native.read_count = 0
@@ -552,8 +552,8 @@ class StableSnapshotFakeTests(unittest.TestCase):
         calls = self.during_listeners(changed)
         with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unstable"):
             owner.sample()
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(self.native.read_count, 6)
+        self.assertEqual(len(calls), 8)
+        self.assertEqual(self.native.read_count, 16)
         self.assertTrue(owner.cleanup_complete)
 
     def test_original_deadline_is_not_reset_between_attempts(self):
@@ -787,7 +787,7 @@ class BirthLedgerFakeTests(unittest.TestCase):
         self.assertEqual(snapshot.total_births, 4)
         self.assertEqual(len(owner.witnessed_births), 4)
 
-    def test_third_arrival_pass_cannot_succeed_without_stable_final_pass(self):
+    def test_eighth_arrival_pass_cannot_succeed_without_stable_final_pass(self):
         owner = self.make_witnessed()
 
         def changed(number, rows):
@@ -799,8 +799,8 @@ class BirthLedgerFakeTests(unittest.TestCase):
         calls = self.during_listeners(changed)
         with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unstable"):
             owner.sample()
-        self.assertEqual((len(calls), self.native.read_count), (6, 6))
-        self.assertEqual(len(owner.witnessed_births), 5)
+        self.assertEqual((len(calls), self.native.read_count), (16, 16))
+        self.assertEqual(len(owner.witnessed_births), 10)
         self.assertTrue(owner.cleanup_complete and owner.birth_evidence_complete)
 
     def test_birth_wholly_between_polls_is_retained_as_sampled_coverage_gap(self):
@@ -1216,18 +1216,18 @@ class NonAtomicCensusFakeTests(unittest.TestCase):
         self.assertEqual(calls, [1, 2, 3, 4])
         self.assertTrue(owner.failed and owner.cleanup_complete)
 
-    def test_new_initial_arrival_every_attempt_exhausts_original_three_attempts(self):
+    def test_new_initial_arrival_every_attempt_exhausts_eight_attempts(self):
         owner = self.make_witnessed()
         calls = self.during_members(
             lambda number: self.birth(13 + number // 2, 103 + number // 2) if number % 2 else None
         )
         with self.assertRaisesRegex(ResourceFailure, "initial_active_count_mismatch"):
             owner.sample()
-        self.assertEqual(calls, [1, 2, 3, 4, 5, 6])
-        self.assertEqual(len(owner.witnessed_births), 5)
+        self.assertEqual(calls, list(range(1, 17)))
+        self.assertEqual(len(owner.witnessed_births), 10)
         self.assertTrue(owner.cleanup_complete and owner.birth_evidence_complete)
 
-    def test_equal_active_turnover_every_attempt_exhausts_original_three_attempts(self):
+    def test_equal_active_turnover_every_attempt_exhausts_eight_attempts(self):
         owner = self.make_witnessed()
 
         def changed(number):
@@ -1238,8 +1238,8 @@ class NonAtomicCensusFakeTests(unittest.TestCase):
         calls = self.during_members(changed)
         with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unstable"):
             owner.sample()
-        self.assertEqual(calls, [1, 2, 3, 4, 5, 6])
-        self.assertEqual(len(owner.witnessed_births), 5)
+        self.assertEqual(calls, list(range(1, 17)))
+        self.assertEqual(len(owner.witnessed_births), 10)
 
     def test_stale_census_does_not_reset_inclusive_original_deadline(self):
         for duration in (1.0, 1.0 + 2**-10):
@@ -1307,7 +1307,7 @@ class NonAtomicCensusFakeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ResourceFailure, categories[failure]):
                     owner.sample()
                 self.assertEqual(
-                    calls, [1, 2, 3, 4, 5, 6] if failure in ("exited", "incomplete") else [1]
+                    calls, list(range(1, 17)) if failure in ("exited", "incomplete") else [1]
                 )
                 self.assertNotIn((13, 103), owner.witnessed_births)
                 self.assertTrue(owner.cleanup_complete)
@@ -2214,11 +2214,11 @@ class ProvenExitTimingTests(unittest.TestCase):
                 owner.close()
                 self.assertEqual(self.native.closed_handles.count(13), events["opens"])
 
-    def test_permanently_still_listed_exit_exhausts_three_attempts_without_acceptance(self):
+    def test_permanently_still_listed_exit_exhausts_eight_attempts_without_acceptance(self):
         owner, events = self.timeline("rss", still_listed=True, disappear=False)
         with self.assertRaisesRegex(ResourceFailure, "departed_member_still_listed"):
             owner.sample()
-        self.assertEqual(events["members"], 6)
+        self.assertEqual(events["members"], 16)
         self.assertEqual(owner.incomplete_exit_births, {(13, 103)})
         self.assertNotIn((13, 103), owner.absent_births)
         self.assertTrue(owner.cleanup_complete)
@@ -2450,13 +2450,14 @@ class ProvenExitTimingTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unstable"):
             owner.sample()
-        self.assertEqual((len(calls), self.native.read_count), (6, 6))
-        self.assertEqual(len(owner.incomplete_exit_births), 3)
+        self.assertEqual((len(calls), self.native.read_count), (16, 16))
+        self.assertEqual(len(owner.incomplete_exit_births), 8)
         self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
 
     def test_late_signaled_survivor_each_attempt_exhausts_without_stable_snapshot(self):
         owner = self.make()
-        self.birth()
+        for pid in range(13, 19):
+            self.birth(pid, pid + 90)
         owner.sample()
         self.clock.value += 0.25
         self.native.read_count = 0
@@ -2464,14 +2465,14 @@ class ProvenExitTimingTests(unittest.TestCase):
 
         def identity(handle):
             read = self.native.read_count
-            if read in (2, 4, 6) and handle == 10 + read // 2 and handle in self.native.pids:
+            if read in range(2, 17, 2) and handle == 10 + read // 2 and handle in self.native.pids:
                 self.expire(handle)
             return original(handle)
 
         self.native.identity = identity
         with self.assertRaisesRegex(ResourceFailure, "final_survivor_signaled"):
             owner.sample()
-        self.assertEqual(self.native.read_count, 6)
+        self.assertEqual(self.native.read_count, 16)
 
     def test_original_inclusive_one_second_deadline_covers_exit_retries(self):
         for duration in (1.0, 1.0 + 2**-10):
@@ -2592,6 +2593,158 @@ class ProvenExitTimingTests(unittest.TestCase):
         self.assertTrue(owner.unretained_handle_cleanup_failed and self.job.drained)
         self.assertFalse(owner.cleanup_complete)
         self.assertEqual(self.native.closed_handles, [])
+
+
+class FiniteAttemptBoundTests(unittest.TestCase):
+    make = AdapterTests.make
+    make_witnessed = StableSnapshotFakeTests.make_witnessed
+    expire = StableSnapshotFakeTests.expire
+    birth = BirthLedgerFakeTests.birth
+
+    def churn(self, waves, *, incomplete=True, duration=None):
+        owner = self.make_witnessed()
+        original_rss, original_listeners = self.native.rss, self.native.listeners
+        events = {"listeners": 0}
+        started = self.clock.value
+
+        def rss(handle):
+            value = original_rss(handle)
+            if incomplete and handle >= 13:
+                self.expire(handle)
+            return value
+
+        def listeners(pids):
+            rows = original_listeners(pids)
+            if self.job.drained:
+                return rows
+            events["listeners"] += 1
+            number = events["listeners"]
+            if number % 2 and number <= 2 * waves:
+                self.birth(13 + number // 2, 103 + number // 2)
+            if duration is not None and number == 2 * waves + 1:
+                self.clock.value = started + duration
+            return rows
+
+        self.native.rss, self.native.listeners = rss, listeners
+        return owner, events
+
+    def test_bound_is_exactly_eight_and_original_stale_limit_is_unchanged(self):
+        self.assertEqual(guard.MAX_SAMPLE_ATTEMPTS, 8)
+        self.assertEqual(guard.STALE_SECONDS, 1.0)
+
+    def test_three_churn_passes_refuse_old_bound_but_fourth_stable_pass_succeeds(self):
+        for incomplete in (False, True):
+            for bound in (3, 8):
+                with self.subTest(incomplete=incomplete, bound=bound):
+                    owner, events = self.churn(3, incomplete=incomplete)
+                    with patch.object(guard, "MAX_SAMPLE_ATTEMPTS", bound):
+                        if bound == 3:
+                            with self.assertRaisesRegex(
+                                ResourceFailure, "resource_evidence_unstable"
+                            ):
+                                owner.sample()
+                            self.assertEqual((self.native.read_count, events["listeners"]), (6, 6))
+                        else:
+                            snapshot = owner.sample()
+                            self.assertEqual((self.native.read_count, events["listeners"]), (8, 7))
+                            self.assertEqual(snapshot.total_births, 5)
+                            self.assertEqual(snapshot.active_processes, 2 if incomplete else 5)
+                            owner.close()
+                    self.assertEqual(len(owner.witnessed_births), 2 if incomplete else 5)
+                    self.assertEqual(len(owner.incomplete_exit_births), 3 if incomplete else 0)
+                    self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
+                    state = association_state()
+                    guard.accumulate_associations(state, owner)
+                    self.assertEqual(state, association_state(5, 2 if incomplete else 5))
+
+    def test_seven_churn_passes_need_eighth_stability_but_eight_churn_passes_exhaust(self):
+        for waves in (7, 8):
+            with self.subTest(waves=waves):
+                owner, events = self.churn(waves)
+                if waves == 7:
+                    self.assertEqual(owner.sample().active_processes, 2)
+                    self.assertEqual(events["listeners"], 15)
+                    owner.close()
+                else:
+                    with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unstable"):
+                        owner.sample()
+                    self.assertEqual(events["listeners"], 16)
+                self.assertEqual(self.native.read_count, 16)
+                self.assertEqual(len(owner.incomplete_exit_births), waves)
+                self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
+
+    def test_stable_sample_returns_early_without_spending_extra_attempts(self):
+        owner, events = self.churn(0)
+        owner.sample()
+        self.assertEqual((self.native.read_count, events["listeners"]), (2, 1))
+
+    def test_fourth_pass_still_has_original_inclusive_acquisition_deadline(self):
+        for duration in (1.0, 1.0 + 2**-10):
+            with self.subTest(duration=duration):
+                owner, events = self.churn(3, duration=duration)
+                if duration == 1:
+                    snapshot = owner.sample()
+                    self.assertEqual(snapshot.measured_at - snapshot.started_at, 1)
+                else:
+                    with self.assertRaisesRegex(ResourceFailure, "resource_evidence_stale"):
+                        owner.sample()
+                self.assertEqual((self.native.read_count, events["listeners"]), (8, 7))
+
+    def test_original_scheduled_sleep_and_start_gap_refuse_over_750ms_acquisition(self):
+        for duration in (0.75, 0.75 + 2**-10):
+            with self.subTest(duration=duration):
+                owner, events = self.churn(3, duration=duration)
+                snapshot = owner.sample()
+                self.assertEqual(snapshot.measured_at - snapshot.started_at, duration)
+                self.clock.value += 0.25
+                if duration == 0.75:
+                    owner.sample()
+                    self.assertEqual(self.native.read_count, 10)
+                else:
+                    with self.assertRaisesRegex(ResourceFailure, "resource_evidence_stale"):
+                        owner.sample()
+                    self.assertEqual((self.native.read_count, events["listeners"]), (8, 7))
+
+    def test_late_accounting_or_member_api_failure_is_never_retried(self):
+        for api in ("accounting", "members"):
+            with self.subTest(api=api):
+                owner, events = self.churn(3)
+                original = getattr(self.native, api)
+                calls = []
+
+                def failing(job, original=original, calls=calls):
+                    calls.append(True)
+                    if len(calls) == 7:
+                        raise ResourceFailure("resource_evidence_unavailable")
+                    return original(job)
+
+                setattr(self.native, api, failing)
+                with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unavailable"):
+                    owner.sample()
+                self.assertEqual((len(calls), events["listeners"]), (7, 6))
+                self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
+
+    def test_late_unknown_birth_never_enlarges_zero_or_positive_frozen_allowance(self):
+        for allowance in (0, 2):
+            with self.subTest(allowance=allowance):
+                owner, events = self.churn(3)
+                self.native.total += allowance
+                self.job.total_processes = self.native.total
+                original = self.native.listeners
+
+                def listeners(pids, original=original, events=events):
+                    rows = original(pids)
+                    if not self.job.drained and events["listeners"] == 7:
+                        self.native.total += 1
+                        self.job.total_processes = self.native.total
+                    return rows
+
+                self.native.listeners = listeners
+                with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
+                    owner.sample()
+                self.assertEqual((self.native.read_count, events["listeners"]), (8, 7))
+                self.assertEqual(owner.final_total, 6 + allowance)
+                self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
 
 
 class MembershipPredicateFakeTests(unittest.TestCase):
