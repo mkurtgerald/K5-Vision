@@ -4024,7 +4024,7 @@ class FixedResourceDiagnosticTests(unittest.TestCase):
         _, restored, _ = self.restored()
         self.assertEqual(
             hashlib.sha256(ast.dump(restored, include_attributes=False).encode()).hexdigest(),
-            "0dbaa0a4f29577e3c4fec8f739ba1c0f41c854fd51e73076b94751cf848630fa",
+            "7c9614a1bfa2b32bf51eef4af2ae4f032933497b5e38ffecc28bfd2a147f89bd",
         )
 
     def test_all_twenty_three_actual_failures_keep_call_order_and_type(self):
@@ -4166,9 +4166,17 @@ class OpenFailureDiagnosticTests(unittest.TestCase):
         native.members, native.listeners, native.open_member = members, listeners, open_member
         return owner, native, events, retained
 
-    def test_every_failed_open_site_is_fatal_for_each_fixed_error_class(self):
+    def test_nondeferrable_open_failures_keep_each_fixed_error_class(self):
         for site in self.SITES:
             for error in (87, 5, 0, 6, 1168, 2**32 - 1):
+                if error == 87 and site in {
+                    "initial_new",
+                    "initial_vanished",
+                    "closing_new",
+                    "closing_vanished",
+                }:
+                    # These four transitions are covered by UnopenedCensusTests.
+                    continue
                 with self.subTest(site=site, error=error):
                     owner, native, events, retained = self.scenario(site)
 
@@ -4323,6 +4331,444 @@ class OpenFailureDiagnosticTests(unittest.TestCase):
             self.assertEqual(
                 output.getvalue(), "K5_HOSTED_QUALIFICATION_REFUSED=" + category + "\n"
             )
+
+
+class UnopenedCensusTests(unittest.TestCase):
+    scenario = OpenFailureDiagnosticTests.scenario
+
+    @staticmethod
+    def sample(owner):
+        with patch.object(guard.c, "get_last_error", return_value=87, create=True):
+            return owner.sample()
+
+    def test_both_omission_sites_require_an_extra_full_stable_attempt(self):
+        for site, reads, pid, total in (
+            ("initial_vanished", 4, 11, 2),
+            ("closing_vanished", 6, 13, 3),
+        ):
+            with self.subTest(site=site):
+                owner, native, events, _ = self.scenario(site)
+                targets = []
+                original = native.listeners
+
+                def listeners(pids, original=original, targets=targets, owner=owner):
+                    targets.append((owner.job.drained, set(pids)))
+                    return original(pids)
+
+                native.listeners = listeners
+                snapshot = self.sample(owner)
+                self.assertEqual(native.read_count, reads)
+                self.assertEqual(snapshot.active_processes, total - 1)
+                self.assertEqual(owner.unbound_endpoint_pids, {pid})
+                self.assertNotIn(pid, owner.handles)
+                for ledger in (
+                    owner.witnessed_births,
+                    owner.incomplete_exit_births,
+                    owner.absent_births,
+                ):
+                    self.assertFalse(any(identity[0] == pid for identity in ledger))
+                self.assertTrue(
+                    all(pid in pids for _, pids in targets[int(site.startswith("closing")) :])
+                )
+                owner.close()
+                self.assertEqual(targets[-1], (True, set(range(11, 11 + total))))
+                self.assertNotIn(pid, native.closed_handles)
+                state = association_state()
+                guard.accumulate_associations(state, owner)
+                self.assertEqual(state, association_state(total, total - 1))
+                owner.close()
+                with self.assertRaisesRegex(guard.Refusal, "association_counts_already_recorded"):
+                    guard.accumulate_associations(state, owner)
+                self.assertEqual(state, association_state(total, total - 1))
+
+    def test_next_complete_census_must_omit_without_reopen_recovery(self):
+        for site, reads in (("initial_new", 2), ("closing_new", 3)):
+            with self.subTest(site=site):
+                owner, native, events, _ = self.scenario(site)
+                with self.assertRaisesRegex(ResourceFailure, "unopened_member_still_listed"):
+                    self.sample(owner)
+                self.assertEqual(native.read_count, reads)
+                self.assertEqual(sum(isinstance(x, tuple) for x in events), 1)
+                self.assertTrue(owner.cleanup_complete)
+
+    def test_any_reappearance_after_observed_omission_is_fatal(self):
+        for site, pid, reappear_reads in (
+            ("initial_vanished", 11, (3, 4)),
+            ("closing_vanished", 13, (4, 5, 6)),
+        ):
+            for reappear in reappear_reads:
+                for reused in (False, True):
+                    with self.subTest(site=site, read=reappear, reused=reused):
+                        owner, native, events, _ = self.scenario(site)
+                        original = native.members
+                        reads = []
+
+                        def members(
+                            job,
+                            original=original,
+                            reads=reads,
+                            reappear=reappear,
+                            native=native,
+                            pid=pid,
+                            reused=reused,
+                        ):
+                            rows = original(job)
+                            reads.append(1)
+                            if len(reads) == reappear:
+                                native.pids.add(pid)
+                                native.identities[pid] = (999 if reused else pid + 90, False)
+                                rows.add(pid)
+                            return rows
+
+                        native.members = members
+                        with self.assertRaisesRegex(ResourceFailure, "unopened_member_reappeared"):
+                            self.sample(owner)
+                        self.assertEqual(len(reads), reappear)
+                        self.assertFalse(
+                            any(identity[0] == pid for identity in owner.witnessed_births)
+                        )
+                        self.assertEqual(sum(isinstance(x, tuple) for x in events), 1)
+
+    def delayed(self, *, initial, failure_attempt):
+        case = AdapterTests()
+        owner = case.make()
+        native = case.native
+        target = 11 if initial else 13
+        if initial:
+            native.pids.remove(11)
+        original_members, original_open = native.members, native.open_member
+        original_accounting = native.accounting
+        reads = []
+
+        def members(job):
+            reads.append(1)
+            if len(reads) == 2 * failure_attempt - int(initial):
+                native.pids.add(target)
+                native.identities[target] = (target + 90, False)
+                native.total = job.total_processes = 2 if initial else 3
+            return original_members(job)
+
+        def accounting(job):
+            total, active, cpu = original_accounting(job)
+            if (native.read_count + 1) // 2 < failure_attempt and native.read_count % 2:
+                active -= 1  # Retryable stale-low count, never an impossible over-total count.
+            return total, active, cpu
+
+        def opened(pid, job):
+            if pid == target:
+                native.pids.remove(pid)
+                raise ResourceFailure("process_open_initial_invalid_parameter")
+            return original_open(pid, job)
+
+        native.members, native.accounting, native.open_member = members, accounting, opened
+        return owner, native, reads
+
+    def test_resolution_needs_a_spare_attempt_without_increasing_eight(self):
+        for initial, failure_attempt, accepted in (
+            (True, 7, True),
+            (True, 8, False),
+            (False, 6, True),
+            (False, 7, False),
+            (False, 8, False),
+        ):
+            with self.subTest(initial=initial, attempt=failure_attempt):
+                owner, native, reads = self.delayed(
+                    initial=initial, failure_attempt=failure_attempt
+                )
+                if accepted:
+                    self.assertEqual(self.sample(owner).active_processes, 1 if initial else 2)
+                    owner.close()
+                else:
+                    with self.assertRaises(ResourceFailure):
+                        self.sample(owner)
+                self.assertEqual(len(reads), 16)
+                self.assertTrue(owner.cleanup_complete)
+
+    def test_resolution_keeps_the_original_inclusive_one_second_deadline(self):
+        for site, final_read in (("initial_vanished", 4), ("closing_vanished", 6)):
+            for duration in (1.0, 1.0 + 2**-10):
+                with self.subTest(site=site, duration=duration):
+                    owner, native, events, _ = self.scenario(site)
+                    start, original = owner.clock.value, native.members
+                    reads = []
+
+                    def members(
+                        job,
+                        original=original,
+                        reads=reads,
+                        final_read=final_read,
+                        owner=owner,
+                        start=start,
+                        duration=duration,
+                    ):
+                        rows = original(job)
+                        reads.append(1)
+                        if len(reads) == final_read:
+                            owner.clock.value = start + duration
+                        return rows
+
+                    native.members = members
+                    if duration == 1:
+                        self.assertEqual(self.sample(owner).measured_at - start, 1)
+                        owner.close()
+                    else:
+                        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_stale"):
+                            self.sample(owner)
+                    self.assertEqual(len(reads), final_read)
+
+    def test_partial_rss_and_current_unbound_endpoint_union_survive_retry(self):
+        owner, native, events, _ = self.scenario("closing_vanished")
+        original_rss, original_listeners = native.rss, native.listeners
+        row = (13, 2, b"\x7f\0\0\1", 9000)
+        targets = []
+
+        def rss(handle):
+            return 400 if native.read_count <= 2 else original_rss(handle)
+
+        def listeners(pids):
+            targets.append(set(pids))
+            rows = original_listeners(pids)
+            if not owner.job.drained and 13 in pids:
+                rows.add(row)
+            return rows
+
+        native.rss, native.listeners = rss, listeners
+        snapshot = self.sample(owner)
+        self.assertEqual(snapshot.rss_bytes, 800)
+        self.assertEqual(owner.observed_peak_rss_bytes, 800)
+        self.assertEqual(owner.observed_listeners, {row})
+        self.assertEqual(snapshot.owned_loopback_listeners, 1)
+        self.assertTrue(all(13 in pids for pids in targets[1:]))
+        owner.close()
+        self.assertTrue(owner.cleanup_complete)
+
+    def test_unbound_rows_cannot_hide_other_current_member_or_endpoint_api_failures(self):
+        failures = {
+            "members": "job_members_query_failed",
+            "accounting": "job_accounting_query_failed",
+            "rss": "process_rss_query_failed",
+            "listeners": "endpoint_table_query_failed",
+            "belongs": "ownership_unproven",
+            "identity": "pid_reuse_or_exit",
+        }
+        for method, category in failures.items():
+            with self.subTest(method=method):
+                owner, native, events, _ = self.scenario("initial_vanished")
+                original = getattr(native, method)
+                calls = []
+
+                def failed(
+                    *args,
+                    method=method,
+                    original=original,
+                    category=category,
+                    calls=calls,
+                    owner=owner,
+                ):
+                    calls.append(1)
+                    trigger = not owner.job.drained and (
+                        method not in {"members", "accounting"} or len(calls) == 2
+                    )
+                    if trigger:
+                        if method == "belongs":
+                            return False
+                        if method == "identity":
+                            return (999, False)
+                        raise ResourceFailure(category)
+                    return original(*args)
+
+                setattr(native, method, failed)
+                with self.assertRaisesRegex(ResourceFailure, category):
+                    self.sample(owner)
+                self.assertTrue(owner.cleanup_complete)
+
+    def test_rss_endpoint_and_active_caps_still_refuse(self):
+        for cap, category in (
+            ("rss", "owned_rss_exceeded"),
+            ("endpoints", "listener_evidence_limit"),
+            ("active", "final_members_exceed_limit"),
+        ):
+            with self.subTest(cap=cap):
+                owner, native, events, _ = self.scenario("initial_vanished")
+                if cap == "rss":
+                    native.rss_each = guard.RSS_LIMIT + 1
+                elif cap == "endpoints":
+                    native.listener_rows = {(11, 2, b"\x7f\0\0\1", x) for x in range(1, 4098)}
+                else:
+                    original = native.members
+                    reads = []
+
+                    def members(job, original=original, reads=reads):
+                        rows = original(job)
+                        reads.append(1)
+                        return set(range(100, 133)) if len(reads) == 2 else rows
+
+                    native.members = members
+                with self.assertRaisesRegex(ResourceFailure, category):
+                    self.sample(owner)
+                if cap == "rss":
+                    self.assertGreater(owner.observed_peak_rss_bytes, guard.RSS_LIMIT)
+                if cap == "endpoints":
+                    self.assertEqual(len(owner.observed_listeners), 4097)
+
+    def test_numeric_storage_uses_existing_union_limit(self):
+        owner, native, events, _ = self.scenario("initial_vanished")
+        with patch.object(guard, "MAX_RETAINED_BIRTHS", 1):
+            with self.assertRaisesRegex(ResourceFailure, "birth_evidence_limit"):
+                self.sample(owner)
+        self.assertEqual(owner.unbound_endpoint_pids, {11})
+        self.assertEqual(owner.witnessed_births, set())
+        self.assertTrue(owner.cleanup_complete)
+
+    def test_old_numeric_targets_are_cleanup_only_and_not_an_identity_blacklist(self):
+        owner, native, events, _ = self.scenario("initial_vanished")
+        self.sample(owner)
+        owner.clock.value += 0.25
+        targets = []
+        original_listeners = native.listeners
+
+        def listeners(pids):
+            targets.append((owner.job.drained, set(pids)))
+            return original_listeners(pids)
+
+        native.listeners = listeners
+        self.sample(owner)
+        self.assertTrue(all(11 not in pids for _, pids in targets))
+        # A later acquisition must bind a current row afresh, never use the marker.
+        owner.clock.value += 0.25
+        native.pids.add(11)
+        native.identities[11] = (333, False)
+        native.total = owner.job.total_processes = 3
+        native.open_member = lambda pid, job: FakeNative.open_member(native, pid, job)
+        self.sample(owner)
+        self.assertIn((11, 333), owner.witnessed_births)
+        self.assertNotIn((11, 101), owner.witnessed_births)
+        self.assertEqual(owner.incomplete_exit_births, set())
+        self.assertEqual(owner.absent_births, set())
+        owner.close()
+        self.assertEqual(targets[-1], (True, {11, 12}))
+        state = association_state()
+        guard.accumulate_associations(state, owner)
+        self.assertEqual(state, association_state(3, 2))
+
+    def test_final_numeric_endpoint_query_failure_or_reuse_never_claims_cleanup(self):
+        for failure in ("endpoint", "api"):
+            with self.subTest(failure=failure):
+                owner, native, events, _ = self.scenario("initial_vanished")
+                self.sample(owner)
+                original = native.listeners
+                targets = []
+
+                def listeners(
+                    pids,
+                    targets=targets,
+                    owner=owner,
+                    failure=failure,
+                    original=original,
+                ):
+                    targets.append(set(pids))
+                    if owner.job.drained:
+                        if failure == "api":
+                            raise ResourceFailure("endpoint_table_query_failed")
+                        # A later unrelated reuse may conservatively refuse; no control.
+                        return {(11, 2, b"\x7f\0\0\1", 9000)}
+                    return original(pids)
+
+                native.listeners = listeners
+                with self.assertRaisesRegex(ResourceFailure, "owned_listener_cleanup_failed"):
+                    owner.close()
+                self.assertEqual(targets, [{11, 12}])
+                self.assertFalse(owner.cleanup_complete)
+                self.assertTrue(owner.job.drained and owner.association_counts_complete)
+                self.assertNotIn(11, native.closed_handles)
+                with self.assertRaisesRegex(ResourceFailure, "owned_job_cleanup_failed"):
+                    owner.close()
+
+    def test_retained_live_omission_keeps_its_separate_signal_requirement(self):
+        for signal in (False, True):
+            with self.subTest(signal=signal):
+                owner, native, events, _ = self.scenario("closing_vanished")
+                original = native.members
+                reads = []
+
+                def members(job, original=original, reads=reads, native=native, signal=signal):
+                    rows = original(job)
+                    reads.append(1)
+                    if len(reads) >= 3:
+                        native.pids.discard(11)
+                        rows.discard(11)
+                        native.identities[11] = (101, signal)
+                    return rows
+
+                native.members = members
+                if signal:
+                    self.sample(owner)
+                    self.assertEqual(owner.absent_births, {(11, 101)})
+                    self.assertEqual(owner.unbound_endpoint_pids, {13})
+                    owner.close()
+                else:
+                    with self.assertRaisesRegex(ResourceFailure, "departure_not_signaled"):
+                        self.sample(owner)
+                    self.assertEqual(len(reads), 16)
+                    self.assertEqual(owner.absent_births, set())
+
+    def run_owned_gap(self, state, *, final_total=3, cleanup=False):
+        base = FakeNative
+
+        class Native(base):
+            def members(self, job):
+                if self.read_count == 5:
+                    self.pids.add(13)
+                    self.identities[13] = (103, False)
+                    self.total = 3
+                return super().members(job)
+
+            def open_member(self, pid, job):
+                if pid == 13:
+                    self.pids.remove(13)
+                    raise ResourceFailure("process_open_initial_invalid_parameter")
+                return super().open_member(pid, job)
+
+            def listeners(self, pids):
+                if self.job is not None and self.job.drained and cleanup:
+                    return {(13, 2, b"\x7f\0\0\1", 9000)} if 13 in pids else set()
+                return super().listeners(pids)
+
+        with patch.dict(globals(), {"FakeNative": Native}):
+            return SampledRunOwnedTests().run_job(state, total=final_total)
+
+    def test_multiple_owned_jobs_record_native_gap_once_despite_repeated_close(self):
+        state = SampledRunOwnedTests().state()
+        for number in range(1, 4):
+            error, owners, native = self.run_owned_gap(state)
+            self.assertIsNone(error)
+            self.assertEqual(
+                tuple(state[field] for field in guard.ASSOCIATION_FIELDS),
+                (3 * number, 2 * number, number),
+            )
+            self.assertTrue(owners[0].association_counts_recorded)
+            self.assertEqual(owners[0].unbound_endpoint_pids, {13})
+            self.assertTrue(state["all_owned_cleanup"] and not state["pending_payload"])
+
+    def test_owned_cleanup_failure_and_missing_final_accounting_stay_truthful(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                state = SampledRunOwnedTests().state(7, 4)
+                error, owners, native = self.run_owned_gap(
+                    state, final_total=None if missing else 3, cleanup=not missing
+                )
+                self.assertIsNotNone(error)
+                self.assertFalse(state["all_owned_cleanup"])
+                self.assertTrue(owners[0].failed)
+                if missing:
+                    self.assertFalse(state["association_counts_complete"])
+                    self.assertEqual(state["job_total_associations"], 7)
+                else:
+                    self.assertTrue(state["association_counts_complete"])
+                    self.assertEqual(state["job_total_associations"], 10)
+                    self.assertEqual(state["fully_live_observed_associations"], 6)
+                self.assertGreater(state["peak_rss_bytes"], 0)
+                self.assertGreater(state["cpu_seconds"], 0)
 
 
 class QualificationPolicyTests(unittest.TestCase):

@@ -1656,6 +1656,8 @@ class QualificationResources:
         self.observed_peak_rss_bytes = 0
         self.final_cpu_seconds = self.final_active = self.final_total = None
         self.handles = {}  # pid -> (read-only process handle, creation FILETIME)
+        # Numeric endpoint targets only; never process-object or lifetime evidence.
+        self.unbound_endpoint_pids = set()
         # A handle alone is not resource evidence. Only complete live identity,
         # RSS and listener observations count as a fully live observation.
         self.witnessed_births = set()  # (pid, creation FILETIME), retained through drain.
@@ -1752,6 +1754,8 @@ class QualificationResources:
         self.native.parent_outside(self.job)
         pending_missing = {}  # Retained PID -> fixed refusal category if it never signals.
         signaled_births = set()
+        unopened_pending, unopened_omitted = set(), set()
+        unopened_changed = False
 
         def fresh():
             resource_need(0 <= self.clock() - started <= STALE_SECONDS, "resource_evidence_stale")
@@ -1823,6 +1827,7 @@ class QualificationResources:
                     raise
 
         def no_reappearance(members):
+            nonlocal unopened_changed
             resource_need(
                 not any(
                     pid in self.handles and (pid, self.handles[pid][1]) in self.absent_births
@@ -1831,6 +1836,12 @@ class QualificationResources:
                 and not members & pending_missing.keys(),
                 "retry_member_set_expanded",
             )
+            resource_need(not members & unopened_omitted, "unopened_member_reappeared")
+            resource_need(not members & unopened_pending, "unopened_member_still_listed")
+            if unopened_pending:
+                unopened_omitted.update(unopened_pending)
+                unopened_pending.clear()
+                unopened_changed = True
 
         rss, listeners = 0, set()
 
@@ -1844,12 +1855,26 @@ class QualificationResources:
             return self.witnessed_births | self.incomplete_exit_births
 
         def audit(members, *, prior_rss=0, omitted=frozenset()):
-            nonlocal rss
+            nonlocal rss, unopened_changed
             departed, new_births, attempt_rss = set(), set(), prior_rss
             for pid in sorted(members):
                 if pid not in self.handles:
-                    resource_need(len(self.handles) < MAX_RETAINED_BIRTHS, "birth_evidence_limit")
-                    self.handles[pid] = open_member(pid)
+                    resource_need(
+                        len(self.handles.keys() | self.unbound_endpoint_pids) < MAX_RETAINED_BIRTHS
+                        or pid in self.unbound_endpoint_pids,
+                        "birth_evidence_limit",
+                    )
+                    try:
+                        self.handles[pid] = open_member(pid)
+                    except ResourceFailure as error:
+                        if str(error) != "process_open_initial_invalid_parameter":
+                            raise
+                        # Error87 is not exit proof. The next census must omit
+                        # this unbound row, followed by an extra stable attempt.
+                        unopened_pending.add(pid)
+                        self.unbound_endpoint_pids.add(pid)
+                        unopened_changed = True
+                        continue
                 known = witnessed(pid)
                 signaled = exited(pid)
                 resource_need(
@@ -1868,13 +1893,17 @@ class QualificationResources:
                     if not known:
                         new_births.add(pid)
             rss = max(rss, attempt_rss)
-            # Query the conservative retained-PID superset, including departures.
+            # Include retained PIDs and this acquisition's unbound numeric rows.
             # Preserve endpoint evidence from every acquisition pass.
-            listeners.update(self.native.listeners(set(self.handles)))
+            listeners.update(
+                self.native.listeners(self.handles.keys() | unopened_pending | unopened_omitted)
+            )
             self.observed_listeners.update(listeners)
             resource_need(len(self.observed_listeners) <= 4096, "listener_evidence_limit")
             completed, incomplete_exits = set(), set()
             for pid in members:
+                if pid in unopened_pending:
+                    continue
                 signaled = exited(pid)
                 resource_need(pid not in departed or signaled, "pid_reuse_or_exit")
                 if signaled:
@@ -1890,6 +1919,7 @@ class QualificationResources:
 
         remaining_members = None
         for attempt in range(MAX_SAMPLE_ATTEMPTS):
+            unopened_changed = False
             fresh()
             before = accounting()
             members = self.native.members(self.job)
@@ -1929,7 +1959,7 @@ class QualificationResources:
             departed_still_listed = survivors & departed
             for pid in departed_still_listed:
                 listed_exit(pid)
-            for pid in members - departed - survivors:
+            for pid in members - departed - survivors - unopened_omitted:
                 resource_need(witnessed(pid), "final_survivor_missing")
                 if exited(pid):
                     departed.add(pid)
@@ -1937,7 +1967,7 @@ class QualificationResources:
                     # Already RSS-audited this pass; include it in the next pass
                     # without double-charging the same object's working set.
                     pending_missing.setdefault(pid, "final_survivor_missing")
-            for pid in members - survivors - pending_missing.keys():
+            for pid in members - survivors - pending_missing.keys() - unopened_omitted:
                 self.absent_births.add((pid, self.handles[pid][1]))
             resource_need(
                 len(survivors | pending_missing.keys()) <= ACTIVE_LIMIT,
@@ -1958,14 +1988,21 @@ class QualificationResources:
                 departed.update(new_departures)
             fresh()
             counts_match = before[1] == len(members) and after[1] == len(survivors)
-            if not pending_missing and not departed and not newcomers and counts_match:
+            if (
+                not pending_missing
+                and not unopened_pending
+                and not unopened_changed
+                and not departed
+                and not newcomers
+                and counts_match
+            ):
                 # Historical associations need not have complete live samples.
                 # They remain disclosed gaps, never invented identity evidence.
                 resource_need(after[0] >= len(classified_births()), "association_count_underflow")
                 break
-            # Re-read non-atomic counts only after every visible live arrival was
-            # fully witnessed or proved exited, and every missing retained handle
-            # proved exited. Incomplete exits never count as full live evidence.
+            # Unbound rows need next-census omission and an extra stable attempt.
+            # Missing retained objects still need exact same-object signal proof.
+            # Neither unbound rows nor incomplete exits count as full evidence.
             # Preserve cumulative accounting and the original acquisition deadline.
             if attempt + 1 == MAX_SAMPLE_ATTEMPTS:
                 resource_need(before[1] == len(members), "initial_active_count_mismatch")
@@ -2030,9 +2067,10 @@ class QualificationResources:
                 except BaseException:
                     failures.append("owned_job_cleanup_failed")
                 try:
-                    # Retained process handles bind PIDs through owned Job drain.
+                    # Numeric endpoint targets grant no control or identity proof.
+                    # Check the bounded conservative union after owned Job drain.
                     resource_need(
-                        not self.native.listeners(set(self.handles)),
+                        not self.native.listeners(self.handles.keys() | self.unbound_endpoint_pids),
                         "owned_listener_cleanup_failed",
                     )
                 except BaseException:
