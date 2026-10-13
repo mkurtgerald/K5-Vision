@@ -496,7 +496,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
             owner.sample()
         self.assertEqual(len(calls), 1)
 
-    def test_unmatched_birth_or_unknown_member_never_qualifies(self):
+    def test_unobserved_birth_is_disclosed_but_current_member_requires_count_conservation(self):
         for total_increase, new_pid in ((True, False), (False, True)):
             with self.subTest(total_increase=total_increase, new_pid=new_pid):
                 owner = self.make_witnessed()
@@ -514,9 +514,17 @@ class StableSnapshotFakeTests(unittest.TestCase):
                     return rows
 
                 calls = self.during_listeners(changed)
-                with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
-                    owner.sample()
-                self.assertEqual(len(calls), 1 if total_increase else 3)
+                if total_increase:
+                    self.assertEqual(owner.sample().total_births, 3)
+                    owner.close()
+                    state = association_state()
+                    guard.accumulate_associations(state, owner)
+                    self.assertEqual(state, association_state(3, 2))
+                else:
+                    with self.assertRaisesRegex(ResourceFailure, "association_count_underflow"):
+                        owner.sample()
+                    self.assertFalse(owner.association_counts_complete)
+                self.assertEqual(len(calls), 2 if total_increase else 3)
 
     def test_reappearing_proved_departure_never_retries(self):
         owner = self.make_witnessed()
@@ -823,7 +831,7 @@ class BirthLedgerFakeTests(unittest.TestCase):
         self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
         self.assertFalse(owner.birth_evidence_complete)
 
-    def test_unmatched_closing_count_cannot_be_charged_to_cpu(self):
+    def test_unmatched_closing_count_is_disclosed_and_cpu_evidence_is_preserved(self):
         owner = self.make_witnessed()
 
         def changed(number, rows):
@@ -832,12 +840,16 @@ class BirthLedgerFakeTests(unittest.TestCase):
             return rows
 
         calls = self.during_listeners(changed)
-        with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
-            owner.sample()
+        snapshot = owner.sample()
         self.assertEqual(len(calls), 1)
         self.assertEqual(owner.last_cpu, 2.5)
+        self.assertEqual((snapshot.total_births, snapshot.job_cpu_seconds), (3, 2.5))
+        owner.close()
         self.assertTrue(owner.cleanup_complete)
         self.assertFalse(owner.birth_evidence_complete)
+        state = association_state()
+        guard.accumulate_associations(state, owner)
+        self.assertEqual(state, association_state(3, 2))
 
     def test_newly_discovered_signaled_handle_is_not_a_completed_ledger_entry(self):
         owner = self.make_witnessed()
@@ -1105,10 +1117,10 @@ class NonAtomicCensusFakeTests(unittest.TestCase):
         calls = self.during_members(changed)
         return owner, calls
 
-    def test_stale_low_initial_count_with_equal_active_turnover_requires_fresh_pass(self):
+    def test_equal_active_turnover_before_members_can_return_fully_audited_current_census(self):
         owner, calls = self.stale_low_arrival(turnover=True)
         snapshot = owner.sample()
-        self.assertEqual(calls, [1, 2, 3, 4])
+        self.assertEqual(calls, [1, 2])
         self.assertEqual((snapshot.total_births, snapshot.active_processes), (3, 2))
         self.assertEqual(owner.witnessed_births, {(11, 101), (12, 102), (13, 103)})
         owner.close()
@@ -1128,8 +1140,8 @@ class NonAtomicCensusFakeTests(unittest.TestCase):
         self.native.rss = rss
         self.native.listener_rows = {(13, 2, b"\x7f\0\0\1", 9000)}
         snapshot = owner.sample()
-        self.assertEqual(calls, [1, 2, 3, 4])
-        self.assertEqual(observed, [13, 13])
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(observed, [13])
         self.assertEqual((snapshot.total_births, snapshot.active_processes), (3, 1))
         self.assertEqual(snapshot.owned_loopback_listeners, 1)
         self.assertEqual(len(owner.witnessed_births), 3)
@@ -1179,28 +1191,34 @@ class NonAtomicCensusFakeTests(unittest.TestCase):
                         self.birth()
 
                 calls = self.during_members(changed)
-                # This later fully live child cannot pay the historical deficit.
+                # Later live children are audited without erasing the historical gap.
                 self.during_listeners(
                     lambda number, rows: (self.birth(14, 104) if number == 1 else None) or rows
                 )
-                with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
-                    owner.sample()
-                self.assertEqual(calls, [1, 2])
+                self.assertEqual(owner.sample().total_births, 5)
+                self.assertEqual(calls, [1, 2, 3, 4])
                 self.assertEqual(owner.last_total, 5)
-                self.assertEqual(len(owner.witnessed_births), 3)
+                self.assertEqual(len(owner.witnessed_births), 4)
+                owner.close()
                 self.assertTrue(owner.cleanup_complete)
                 self.assertFalse(owner.birth_evidence_complete)
                 self.assertIsNone(owner.terminal_evidence_failure)
+                state = association_state()
+                guard.accumulate_associations(state, owner)
+                self.assertEqual(state, association_state(5, 4))
 
-    def test_stale_low_census_cannot_enlarge_initial_gap_allowance(self):
+    def test_stale_low_census_preserves_historical_gap_and_audits_visible_arrival(self):
         owner, calls = self.stale_low_arrival()
         self.native.total = self.job.total_processes = 4
-        with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
-            owner.sample()
-        self.assertEqual(calls, [1, 2])
+        self.assertEqual(owner.sample().total_births, 5)
+        self.assertEqual(calls, [1, 2, 3, 4])
         self.assertEqual(owner.last_total, 5)
         self.assertIn((13, 103), owner.witnessed_births)
+        owner.close()
         self.assertFalse(owner.birth_evidence_complete)
+        state = association_state()
+        guard.accumulate_associations(state, owner)
+        self.assertEqual(state, association_state(5, 3))
 
     def test_consistently_low_total_cannot_return_more_ledger_entries_than_accounted(self):
         owner, calls = self.stale_low_arrival()
@@ -1211,7 +1229,7 @@ class NonAtomicCensusFakeTests(unittest.TestCase):
             return 2, active, cpu
 
         self.native.accounting = accounting
-        with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
+        with self.assertRaisesRegex(ResourceFailure, "association_count_underflow"):
             owner.sample()
         self.assertEqual(calls, [1, 2, 3, 4])
         self.assertTrue(owner.failed and owner.cleanup_complete)
@@ -1227,7 +1245,7 @@ class NonAtomicCensusFakeTests(unittest.TestCase):
         self.assertEqual(len(owner.witnessed_births), 10)
         self.assertTrue(owner.cleanup_complete and owner.birth_evidence_complete)
 
-    def test_equal_active_turnover_every_attempt_exhausts_eight_attempts(self):
+    def test_current_census_is_stable_after_fully_proved_initial_equal_active_turnover(self):
         owner = self.make_witnessed()
 
         def changed(number):
@@ -1236,10 +1254,11 @@ class NonAtomicCensusFakeTests(unittest.TestCase):
                 self.birth(13 + number // 2, 103 + number // 2)
 
         calls = self.during_members(changed)
-        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unstable"):
-            owner.sample()
-        self.assertEqual(calls, list(range(1, 17)))
-        self.assertEqual(len(owner.witnessed_births), 10)
+        snapshot = owner.sample()
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(len(owner.witnessed_births), 3)
+        self.assertEqual((snapshot.active_processes, snapshot.rss_bytes), (2, 200))
+        self.assertEqual(owner.absent_births, {(11, 101)})
 
     def test_stale_census_does_not_reset_inclusive_original_deadline(self):
         for duration in (1.0, 1.0 + 2**-10):
@@ -1474,7 +1493,7 @@ class SampledAllowanceFakeTests(unittest.TestCase):
         self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
         self.assertFalse(owner.birth_evidence_complete)
 
-    def test_allowance_is_not_enlarged_by_a_later_attempt(self):
+    def test_unobserved_associations_on_later_attempt_remain_disclosed(self):
         owner = self.make_witnessed()
         self.native.total = self.job.total_processes = 3
         original = self.native.accounting
@@ -1486,13 +1505,16 @@ class SampledAllowanceFakeTests(unittest.TestCase):
 
         self.native.accounting = accounting
         self.during_listeners(lambda number, rows: (self.expire() if number == 1 else None) or rows)
-        with self.assertRaisesRegex(ResourceFailure, "initial_birth_evidence_gap"):
-            owner.sample()
-        self.assertEqual(self.native.read_count, 3)
-        self.assertTrue(owner.failed and owner.cleanup_complete)
+        self.assertEqual(owner.sample().total_births, 4)
+        self.assertEqual(self.native.read_count, 4)
+        owner.close()
+        self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
         self.assertEqual((owner.final_total, len(owner.witnessed_births)), (4, 2))
+        state = association_state()
+        guard.accumulate_associations(state, owner)
+        self.assertEqual(state, association_state(4, 2))
 
-    def test_initial_allowance_does_not_hide_unknown_birth_during_first_audit(self):
+    def test_unobserved_birth_during_first_audit_adds_to_disclosed_historical_gap(self):
         owner = self.make_witnessed()
         self.native.total = self.job.total_processes = 3
 
@@ -1501,20 +1523,23 @@ class SampledAllowanceFakeTests(unittest.TestCase):
             return rows
 
         calls = self.during_listeners(changed)
-        with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
-            owner.sample()
+        self.assertEqual(owner.sample().total_births, 4)
         self.assertEqual(len(calls), 1)
+        owner.close()
         self.assertEqual(owner.final_total, 4)
+        state = association_state()
+        guard.accumulate_associations(state, owner)
+        self.assertEqual(state, association_state(4, 2))
 
-    def test_failed_in_sample_verdict_cannot_be_rebased_by_next_sample(self):
+    def test_actual_api_failure_with_coverage_gap_cannot_be_rebased_by_next_sample(self):
         owner = self.make_witnessed()
 
         def changed(number, rows):
             self.native.total = self.job.total_processes = 3
-            return rows
+            raise ResourceFailure("owned_listener_not_loopback")
 
         self.during_listeners(changed)
-        with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
+        with self.assertRaisesRegex(ResourceFailure, "owned_listener_not_loopback"):
             owner.sample()
         self.clock.value += 0.25
         with self.assertRaisesRegex(ResourceFailure, "resource_guard_failed"):
@@ -1765,7 +1790,8 @@ class AssociationAccountingTests(unittest.TestCase):
                 self.assertEqual(receipt["job_total_associations"], 8)
                 self.assertEqual(receipt["fully_live_observed_associations"], 3)
                 self.assertEqual(receipt["unobserved_or_rejected_associations"], 5)
-                self.assertIn("between-sample", receipt["resource_evidence"])
+                self.assertIn("between component observations", receipt["resource_evidence"])
+                self.assertIn("including during acquisition", receipt["resource_evidence"])
                 self.assertFalse(work.exists())
                 self.assertFalse(
                     any(field in receipt for field in ("pids", "addresses", "handles"))
@@ -1785,7 +1811,7 @@ class SampledRunOwnedTests(unittest.TestCase):
             "pending_payload": False,
         }
 
-    def run_job(self, state, *, total=3, failure=None):
+    def run_job(self, state, *, total=3, failure=None, unobserved=0):
         clock, native = Clock(), FakeNative()
         instances = []
         implementation = guard.QualificationResources
@@ -1796,6 +1822,20 @@ class SampledRunOwnedTests(unittest.TestCase):
             return available, size, (times[0] * 2, times[1], times[2]), free
 
         native.host = host
+        original_listeners = native.listeners
+        gap_recorded = False
+
+        def listeners(pids):
+            nonlocal gap_recorded
+            rows = original_listeners(pids)
+            if unobserved and not gap_recorded and native.read_count >= 5:
+                native.total += unobserved
+                if type(native.job.total_processes) is int:
+                    native.job.total_processes += unobserved
+                gap_recorded = True
+            return rows
+
+        native.listeners = listeners
         if failure == "rss":
             native.rss_each = GIB + 1
         elif failure == "ownership":
@@ -2275,7 +2315,7 @@ class ProvenExitTimingTests(unittest.TestCase):
         self.assertNotIn((13, 103), owner.absent_births)
         self.assertEqual(self.native.closed_handles.count(113), 1)
 
-    def test_incomplete_exit_cannot_explain_a_simultaneous_unknown_birth(self):
+    def test_incomplete_exit_and_simultaneous_unobserved_birth_remain_coverage_gaps(self):
         for initial_gap in (0, 2):
             with self.subTest(initial_gap=initial_gap):
                 owner, _ = self.timeline("rss")
@@ -2291,11 +2331,14 @@ class ProvenExitTimingTests(unittest.TestCase):
                     return result
 
                 self.native.rss = rss
-                with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
-                    owner.sample()
+                self.assertEqual(owner.sample().total_births, 4 + initial_gap)
                 self.assertEqual(owner.incomplete_exit_births, {(13, 103)})
+                owner.close()
                 self.assertEqual(owner.final_total, 4 + initial_gap)
                 self.assertTrue(owner.cleanup_complete)
+                state = association_state()
+                guard.accumulate_associations(state, owner)
+                self.assertEqual(state, association_state(4 + initial_gap, 2))
 
     def test_incomplete_exit_is_classified_once_across_retries_and_later_samples(self):
         owner, _ = self.timeline("rss")
@@ -2724,7 +2767,7 @@ class FiniteAttemptBoundTests(unittest.TestCase):
                 self.assertEqual((len(calls), events["listeners"]), (7, 6))
                 self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
 
-    def test_late_unknown_birth_never_enlarges_zero_or_positive_frozen_allowance(self):
+    def test_late_unobserved_birth_is_disclosed_with_zero_or_positive_prior_gap(self):
         for allowance in (0, 2):
             with self.subTest(allowance=allowance):
                 owner, events = self.churn(3)
@@ -2740,11 +2783,262 @@ class FiniteAttemptBoundTests(unittest.TestCase):
                     return rows
 
                 self.native.listeners = listeners
-                with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
-                    owner.sample()
+                self.assertEqual(owner.sample().total_births, 6 + allowance)
                 self.assertEqual((self.native.read_count, events["listeners"]), (8, 7))
+                owner.close()
                 self.assertEqual(owner.final_total, 6 + allowance)
                 self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
+                state = association_state()
+                guard.accumulate_associations(state, owner)
+                self.assertEqual(state, association_state(6 + allowance, 2))
+
+
+class SampledCurrentCensusTests(unittest.TestCase):
+    make = AdapterTests.make
+    make_witnessed = StableSnapshotFakeTests.make_witnessed
+    expire = StableSnapshotFakeTests.expire
+    birth = BirthLedgerFakeTests.birth
+    during_members = NonAtomicCensusFakeTests.during_members
+
+    BOUNDARIES = (
+        ("accounting", 1),
+        ("members", 1),
+        ("identity", 1),
+        ("rss", 1),
+        ("listeners", 1),
+        ("accounting", 2),
+        ("members", 2),
+        ("identity", 5),
+        ("host", 1),
+    )
+
+    def at_read(self, owner, method, ordinal, when, action):
+        original = getattr(self.native, method)
+        calls = []
+        fired = []
+
+        def instrumented(*args):
+            if self.job.drained:
+                return original(*args)
+            calls.append(True)
+            trigger = len(calls) == ordinal and not fired
+            if trigger and when == "before":
+                fired.append(True)
+                action()
+            value = original(*args)
+            if trigger and when == "after":
+                fired.append(True)
+                action()
+            return value
+
+        setattr(self.native, method, instrumented)
+        return fired
+
+    def test_historical_gap_plus_nonatomic_initial_arrival_never_invents_or_erases_coverage(self):
+        for gap in (0, 1, 5):
+            for turnover in (False, True):
+                with self.subTest(gap=gap, turnover=turnover):
+                    owner = self.make_witnessed()
+                    self.native.total = self.job.total_processes = 2 + gap
+
+                    def arrived(turnover=turnover):
+                        if turnover:
+                            self.expire()
+                        self.birth()
+
+                    self.at_read(owner, "accounting", 1, "after", arrived)
+                    snapshot = owner.sample()
+                    self.assertEqual(snapshot.total_births, 3 + gap)
+                    self.assertIn((13, 103), owner.witnessed_births)
+                    self.assertEqual(snapshot.active_processes, 2 if turnover else 3)
+                    owner.close()
+                    state = association_state()
+                    guard.accumulate_associations(state, owner)
+                    self.assertEqual(state, association_state(3 + gap, 3))
+
+    def test_unseen_or_rejected_association_at_each_read_boundary_is_only_disclosed(self):
+        for method, ordinal in self.BOUNDARIES:
+            for when in ("before", "after"):
+                with self.subTest(method=method, ordinal=ordinal, when=when):
+                    owner = self.make_witnessed()
+
+                    def unobserved():
+                        self.native.total = self.job.total_processes = 3
+
+                    fired = self.at_read(owner, method, ordinal, when, unobserved)
+                    snapshot = owner.sample()
+                    self.assertEqual(fired, [True])
+                    self.assertEqual((snapshot.active_processes, snapshot.rss_bytes), (2, 200))
+                    self.assertEqual(owner.witnessed_births, {(11, 101), (12, 102)})
+                    self.assertEqual(owner.incomplete_exit_births, set())
+                    owner.close()
+                    state = association_state()
+                    guard.accumulate_associations(state, owner)
+                    self.assertEqual(state, association_state(3, 2))
+
+    def test_visible_arrival_at_each_read_is_audited_or_remains_after_last_captured_census(self):
+        for method, ordinal in self.BOUNDARIES:
+            for when in ("before", "after"):
+                with self.subTest(method=method, ordinal=ordinal, when=when):
+                    owner = self.make_witnessed()
+                    rss_reads = []
+                    original_rss = self.native.rss
+
+                    def rss(handle, original_rss=original_rss, rss_reads=rss_reads):
+                        rss_reads.append(handle)
+                        return original_rss(handle)
+
+                    self.native.rss = rss
+                    fired = self.at_read(owner, method, ordinal, when, self.birth)
+                    snapshot = owner.sample()
+                    self.assertEqual(fired, [True])
+                    if (13, 103) in owner.witnessed_births:
+                        self.assertIn(13, rss_reads)
+                        self.assertEqual(snapshot.active_processes, 3)
+                    else:
+                        # A birth after the final returned membership list cannot
+                        # be reconstructed by a sampled census. Do not promote it.
+                        self.assertEqual(snapshot.active_processes, 2)
+                        self.assertNotIn(13, rss_reads)
+                        self.clock.value += 0.25
+                        self.assertEqual(owner.sample().active_processes, 3)
+                        self.assertIn(13, rss_reads)
+                        self.assertIn((13, 103), owner.witnessed_births)
+                    owner.close()
+                    state = association_state()
+                    guard.accumulate_associations(state, owner)
+                    self.assertEqual(state, association_state(3, 3))
+
+    def test_positive_gap_never_exempts_any_current_live_api_or_identity_failure(self):
+        for failure, category in (
+            ("open_member", "resource_evidence_unavailable"),
+            ("belongs", "ownership_unproven"),
+            ("identity", "process_wait_failed"),
+            ("rss", "resource_evidence_unavailable"),
+            ("listeners", "owned_listener_not_loopback"),
+            ("members", "membership_incomplete"),
+            ("accounting", "resource_evidence_unavailable"),
+        ):
+            with self.subTest(failure=failure):
+                owner = self.make_witnessed()
+                self.birth()
+                self.native.total = self.job.total_processes = 7
+                original = getattr(self.native, failure)
+                calls = []
+
+                def failed(
+                    *args, original=original, failure=failure, category=category, calls=calls
+                ):
+                    if self.job.drained:
+                        return original(*args)
+                    if failure in {"members", "accounting", "listeners"} or args[0] == 13:
+                        calls.append(True)
+                        raise ResourceFailure(category)
+                    return original(*args)
+
+                setattr(self.native, failure, failed)
+                with self.assertRaisesRegex(ResourceFailure, category):
+                    owner.sample()
+                self.assertEqual(calls, [True])
+                self.assertNotIn((13, 103), owner.witnessed_births)
+                self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
+                state = association_state()
+                guard.accumulate_associations(state, owner)
+                self.assertEqual(state, association_state(7, 2))
+
+    def test_stable_conservation_includes_proven_incomplete_identities(self):
+        owner = self.make_witnessed()
+        original_accounting, original_rss = self.native.accounting, self.native.rss
+
+        def accounting(job):
+            _, active, cpu = original_accounting(job)
+            return 2, active, cpu
+
+        def rss(handle):
+            value = original_rss(handle)
+            if handle == 13:
+                self.expire(handle)
+            return value
+
+        self.native.accounting, self.native.rss = accounting, rss
+        self.at_read(owner, "members", 1, "before", self.birth)
+        with self.assertRaisesRegex(ResourceFailure, "association_count_underflow"):
+            owner.sample()
+        self.assertEqual(owner.incomplete_exit_births, {(13, 103)})
+        self.assertEqual(owner.witnessed_births, {(11, 101), (12, 102)})
+        self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
+        self.assertEqual(owner.final_total, 3)
+
+    def test_monotonic_lifetime_accounting_remains_fatal_despite_accepted_prior_gap(self):
+        owner = self.make_witnessed()
+        self.native.total = self.job.total_processes = 4
+        owner.sample()
+        self.clock.value += 0.25
+        self.native.total = 3
+        before = self.native.read_count
+        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unavailable"):
+            owner.sample()
+        self.assertEqual(self.native.read_count, before + 1)
+        self.assertEqual(owner.last_total, 4)
+        self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
+
+    def test_gap_never_erases_observed_rss_peak_or_listener_union(self):
+        case = ProvenExitTimingTests()
+        owner, _ = case.timeline("rss")
+        original = case.native.rss
+
+        def rss(handle):
+            value = original(handle)
+            if handle == 13:
+                case.native.total = case.job.total_processes = 5
+            return value
+
+        case.native.rss = rss
+        snapshot = owner.sample()
+        self.assertEqual((snapshot.rss_bytes, snapshot.owned_loopback_listeners), (300, 1))
+        self.assertEqual(owner.observed_peak_rss_bytes, 300)
+        self.assertEqual(len(owner.observed_listeners), 1)
+        owner.close()
+        state = association_state()
+        guard.accumulate_associations(state, owner)
+        self.assertEqual(state, association_state(5, 2))
+
+    def test_in_acquisition_gaps_accumulate_exactly_once_across_jobs_and_payload_failure(self):
+        case = SampledRunOwnedTests()
+        state = case.state()
+        for gap, failure in ((1, None), (2, None), (3, "payload")):
+            error, owners, _ = case.run_job(state, total=2, failure=failure, unobserved=gap)
+            self.assertEqual(str(error) if error else None, "child_exit" if failure else None)
+            saved = dict(state)
+            owners[0].close()
+            owners[0].job.close()
+            self.assertEqual(state, saved)
+        self.assertEqual(case.counts(state), (12, 6, 6))
+        self.assertEqual((state["cpu_seconds"], state["peak_rss_bytes"]), (9, 200))
+        self.assertTrue(state["association_counts_complete"] and state["all_owned_cleanup"])
+
+    def test_gap_with_unavailable_final_count_preserves_partial_aggregates_and_blocks_launch(self):
+        case = SampledRunOwnedTests()
+        state = case.state(8, 3)
+        error, owners, _ = case.run_job(state, total=5.0, unobserved=3)
+        self.assertEqual(str(error), "association_counts_unavailable")
+        self.assertEqual(case.counts(state), (8, 3, 5))
+        self.assertFalse(state["association_counts_complete"])
+        self.assertTrue(owners[0].cleanup_complete)
+        self.assertEqual((state["cpu_seconds"], state["peak_rss_bytes"]), (3, 200))
+        error, owners, _ = case.run_job(state)
+        self.assertEqual(str(error), "association_counts_incomplete")
+        self.assertEqual(owners, [])
+
+    def test_gap_never_hides_cleanup_failure_or_discards_recovered_counts(self):
+        case = SampledRunOwnedTests()
+        state = case.state(8, 3)
+        error, owners, _ = case.run_job(state, total=2, unobserved=3, failure="cleanup")
+        self.assertEqual(str(error), "cleanup_incomplete")
+        self.assertEqual(case.counts(state), (13, 5, 8))
+        self.assertTrue(state["association_counts_complete"])
+        self.assertFalse(owners[0].cleanup_complete or state["all_owned_cleanup"])
+        self.assertIs(state["pending_payload"], True)
 
 
 class MembershipPredicateFakeTests(unittest.TestCase):
@@ -2764,9 +3058,7 @@ class MembershipPredicateFakeTests(unittest.TestCase):
         def accounting(job):
             read = self.native.read_count + 1
             if read == 3:
-                if category == "initial_birth_evidence_gap":
-                    self.native.total = self.job.total_processes = 3
-                elif category == "retry_member_set_expanded":
+                if category == "retry_member_set_expanded":
                     self.native.pids.add(11)
                 elif category == "departure_handle_missing":
                     # Deliberately corrupt fake evidence to cover a defensive leaf;
@@ -2795,14 +3087,11 @@ class MembershipPredicateFakeTests(unittest.TestCase):
             if number != 1:
                 return rows
             if category in {
-                "initial_birth_evidence_gap",
                 "retry_member_set_expanded",
                 "departure_handle_missing",
                 "departure_not_signaled",
             }:
                 self.expire()
-            elif category == "final_birth_evidence_gap":
-                self.native.total = self.job.total_processes = 3
             elif category == "departed_member_still_listed":
                 self.native.identities[11] = (101, True)
             elif category == "final_survivor_missing":
@@ -2815,22 +3104,24 @@ class MembershipPredicateFakeTests(unittest.TestCase):
         if category == "initial_members_exceed_limit":
             self.native.pids = set(range(1, 34))
             self.native.total = self.job.total_processes = 33
+        elif category == "association_count_underflow":
+            self.native.pids.add(13)
+            self.native.identities[13] = (103, False)
         return owner
 
     def test_each_fixed_membership_predicate_category_is_distinct_and_source_free(self):
         categories = (
             "initial_active_count_mismatch",
             "initial_members_exceed_limit",
-            "initial_birth_evidence_gap",
             "retry_member_set_expanded",
             "departure_handle_missing",
             "departure_not_signaled",
-            "final_birth_evidence_gap",
+            "association_count_underflow",
             "departed_member_still_listed",
             "final_survivor_missing",
             "final_active_count_mismatch",
         )
-        self.assertEqual(len(set(categories)), 10)
+        self.assertEqual(len(set(categories)), 9)
         for category in categories:
             with self.subTest(category=category):
                 owner = self.configure(category)

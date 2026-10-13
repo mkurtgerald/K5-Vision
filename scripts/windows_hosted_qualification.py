@@ -1199,8 +1199,9 @@ def finish(profile):
             "supervisor and transport excluded"
         ),
         "resource_evidence": (
-            "sampled RSS and owned endpoints only; between-sample peaks and transient "
-            "listeners unproven; association counters cover recovered final Job totals "
+            "sampled RSS and owned endpoints only; processes, RSS peaks and transient "
+            "listeners between component observations, including during acquisition, "
+            "unproven; association counters cover recovered final Job totals "
             "and are partial when association_counts_complete is false"
         ),
     }
@@ -1826,7 +1827,6 @@ class QualificationResources:
             return departed, attempt_rss
 
         remaining_members = None
-        initial_allowance = None
         for attempt in range(MAX_SAMPLE_ATTEMPTS):
             fresh()
             before = accounting()
@@ -1845,25 +1845,6 @@ class QualificationResources:
             for pid in self.handles.keys() - members:
                 resource_need(exited(pid), "departure_not_signaled")
                 self.absent_births.add((pid, self.handles[pid][1]))
-            known_births = classified_births()
-            unobserved = {
-                pid
-                for pid in members
-                if pid not in self.handles or (pid, self.handles[pid][1]) not in known_births
-            }
-            if initial_allowance is None:
-                # Initial accounting and membership are non-atomic. This covers
-                # unobserved-or-rejected associations in that initial census,
-                # without claiming they all predate acquisition. Freeze it here:
-                # later attempts may never forgive additional unexplained births.
-                initial_allowance = max(0, before[0] - len(known_births) - len(unobserved))
-            # Accounting precedes the non-atomic membership read. Live arrivals
-            # may outnumber that older count, but excess above the frozen
-            # allowance is never retryable or charged to a future arrival.
-            resource_need(
-                before[0] - len(known_births) - initial_allowance <= len(unobserved),
-                "initial_birth_evidence_gap",
-            )
             departed, attempt_rss = audit(members)
             after = accounting()
             survivors = self.native.members(self.job)
@@ -1880,10 +1861,6 @@ class QualificationResources:
             for pid in members - survivors:
                 self.absent_births.add((pid, self.handles[pid][1]))
             resource_need(len(survivors) <= ACTIVE_LIMIT, "final_members_exceed_limit")
-            resource_need(
-                after[0] - len(classified_births()) - initial_allowance <= len(newcomers),
-                "final_birth_evidence_gap",
-            )
             resource_need(not newcomers & self.handles.keys(), "new_birth_identity_reappeared")
             final_signaled = set()
             for pid in survivors - newcomers - departed:
@@ -1899,16 +1876,15 @@ class QualificationResources:
                 departed.update(new_departures)
             fresh()
             counts_match = before[1] == len(members) and after[1] == len(survivors)
-            if not departed and not newcomers and counts_match and after[0] == before[0]:
-                resource_need(
-                    after[0] == len(classified_births()) + initial_allowance,
-                    "final_birth_evidence_gap",
-                )
+            if not departed and not newcomers and counts_match:
+                # Historical associations need not have complete live samples.
+                # They remain disclosed gaps, never invented identity evidence.
+                resource_need(after[0] >= len(classified_births()), "association_count_underflow")
                 break
             # Re-read non-atomic counts only after every visible live arrival was
             # fully witnessed or proved exited, and every missing retained handle
             # proved exited. Incomplete exits never count as full live evidence.
-            # Never reset lifetime count gaps or the original acquisition deadline.
+            # Preserve cumulative accounting and the original acquisition deadline.
             if attempt + 1 == MAX_SAMPLE_ATTEMPTS:
                 resource_need(before[1] == len(members), "initial_active_count_mismatch")
                 resource_need(after[1] == len(survivors), "final_active_count_mismatch")
