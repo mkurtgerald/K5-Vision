@@ -5,9 +5,11 @@ accept the displayed software terms, and choose **Install**. Leave **Launch K5
 Vision** selected on the final screen and choose **Finish**. The installer creates
 a Start menu entry and offers a desktop shortcut.
 
-The application includes its own runtime and native recording workers. Setup and
+The application includes its own runtime. First launch downloads and verifies its
+native recording workers automatically, so it needs Internet access once. Later
+launches reuse the verified private cache. Setup and
 normal use require no PowerShell, Command Prompt, separate Python installation,
-package downloads, Docker or WSL. Use Windows 10/11 on an x64 computer and a
+manual package downloads, Docker or WSL. Use Windows 10/11 on an x64 computer and a
 current Edge or Chrome browser. This candidate is an unsigned testing build.
 
 On first launch, choose an administrator username, enter a password of at least

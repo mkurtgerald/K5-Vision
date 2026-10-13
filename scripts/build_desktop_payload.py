@@ -114,24 +114,23 @@ def inventory_wheels(wheels: Path, pins: list[dict[str, object]]) -> list[dict[s
     return inventory
 
 
-def worker(source: Path, name: str, payload: Path) -> dict[str, object]:
+def worker_download(source: Path, name: str) -> dict[str, object]:
     manifest = json.loads((ROOT / "src/k5vision/data" / f"{name}-donor-manifest.json").read_text())
     artifacts = [item for item in manifest["artifacts"] if item["platform"] == "windows_amd64"]
     if len(artifacts) != 1:
         raise ValueError("Worker platform identity invalid")
     artifact = artifacts[0]
     admit(source, {"bytes": artifact["executable_bytes"], "sha256": artifact["executable_sha256"]})
-    target = payload / "workers" / artifact["executable"]
-    target.parent.mkdir(exist_ok=True)
-    shutil.copyfile(source, target)
     return {
-        "name": manifest["component"],
+        "component": manifest["component"],
         "version": manifest["version"],
-        "source": manifest["source"],
-        "source_commit": manifest["source_commit"],
-        "license": manifest["license"],
-        "archive_sha256": artifact["sha256"],
+        "url": artifact["url"],
+        "sha256": artifact["sha256"],
+        "bytes": {"mediamtx": 28583662, "caddy": 18479498}[name],
+        "executable": artifact["executable"],
         "executable_sha256": artifact["executable_sha256"],
+        "executable_bytes": artifact["executable_bytes"],
+        "license_sha256": manifest["license_sha256"],
     }
 
 
@@ -247,9 +246,15 @@ def build(args: argparse.Namespace) -> None:
         if scripts.exists():
             shutil.rmtree(scripts)
     workers = [
-        worker(args.media_exe, "mediamtx", payload),
-        worker(args.gateway_exe, "caddy", payload),
+        worker_download(args.media_exe, "mediamtx"),
+        worker_download(args.gateway_exe, "caddy"),
     ]
+    (payload / "workers").mkdir()
+    (payload / "workers/donor-downloads.json").write_text(
+        json.dumps({"schema_version": 1, "artifacts": workers}, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     licenses = payload / "licenses"
     licenses.mkdir()
     for source in (
@@ -285,7 +290,8 @@ def build(args: argparse.Namespace) -> None:
                 "head_sha": args.head_sha,
                 "scope": "manual-RTSP operator",
                 "python": donors["python"],
-                "workers": workers,
+                "worker_downloads": workers,
+                "workers_bundled": False,
                 "wheels": wheel_inventory,
                 "project_wheel_sha256": digest(project[0]),
             },

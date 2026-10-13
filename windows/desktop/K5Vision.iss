@@ -82,8 +82,8 @@ var
   Prefix: String;
   I: Integer;
 begin
-  Prefix := 'Global\K5VisionDesktop-S-1-5-';
-  Result := (Length(Name) > Length(Prefix)) and (Length(Name) <= 160) and
+  Prefix := 'Global\K5VisionDesktop-S-1-';
+  Result := (Length(Name) > Length(Prefix)) and (Length(Name) <= 224) and
     (Copy(Name, 1, Length(Prefix)) = Prefix);
   if not Result then exit;
   for I := Length(Prefix) + 1 to Length(Name) do begin

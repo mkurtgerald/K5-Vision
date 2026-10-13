@@ -69,7 +69,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $compiler = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
           if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw "Native .NET Framework compiler unavailable" }
-          & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warn:4 /warnaserror+ /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /out:desktop-build/payload/K5Vision.exe windows/desktop/K5Vision.cs desktop-build/PayloadIdentity.generated.cs
+          & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll /out:desktop-build/payload/K5Vision.exe windows/desktop/K5Vision.cs desktop-build/PayloadIdentity.generated.cs
           if ($LASTEXITCODE -ne 0) { throw "Native graphical supervisor compilation failed" }
       - name: Provision exact reviewed Inno Setup compiler
         shell: pwsh
@@ -132,6 +132,7 @@ jobs:
             runtime='CPython 3.12.10 embedded amd64'; installer='Inno Setup 6.4.3';
             scope='Native Windows manual-RTSP recording operator'; no_terminal_required=$true;
             no_external_python_required=$true; no_runtime_package_downloads=$true
+            workers_bundled=$false; first_launch_internet_required=$true
           }
           $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $release "desktop-package.json") -Encoding utf8
       - name: Upload qualified graphical Windows installer

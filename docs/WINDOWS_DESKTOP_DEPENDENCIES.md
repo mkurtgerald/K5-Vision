@@ -2,9 +2,11 @@
 
 Reviewed on 2026-10-13. This record covers the recording-first desktop package:
 an embedded CPython runtime, an exact minimal Python operator environment,
-the pinned native media workers, and an Inno Setup installer. The user installs
-and starts the application through Windows graphical controls. Development tools
-and separately configured analytics remain outside this package.
+official first-run native-worker provisioning, and an Inno Setup installer. The user installs
+and starts the application through Windows graphical controls. First launch
+requires Internet access to the pinned official worker downloads; subsequent
+launches reuse the admitted private copies. Development tools and separately
+configured analytics remain outside this package.
 
 ## CPython runtime
 
@@ -127,9 +129,10 @@ requires the separate model/native/transitive review already described in
 
 ## Native Go media workers
 
-The desktop package bundles the same unmodified official Windows amd64 workers
-already pinned for the native operator pilot. Their surrounding K5 interfaces
-remain the replacement boundary.
+The desktop installer does not bundle these worker executables. Its graphical
+first launch downloads the same unmodified official Windows amd64 workers
+already pinned for the native operator pilot, with finite progress and no shell
+commands. Their surrounding K5 interfaces remain the replacement boundary.
 
 | Component | Immutable source | Archive SHA-256 | Executable SHA-256 |
 | --- | --- | --- | --- |
@@ -138,14 +141,19 @@ remain the replacement boundary.
 
 Official source, download URLs, executable sizes and archive identities are in
 `src/k5vision/data/caddy-donor-manifest.json` and
-`src/k5vision/data/mediamtx-donor-manifest.json`. Preserve the existing complete
-Caddy Apache-2.0 and MediaMTX MIT notices and upstream archive notices. Caddy's
-official release supplies target-specific SBOMs; capture the exact compiled
-module inventory for both workers and reconcile its module licenses/notices
-before a broad commercial redistribution claim. Earlier pilot records admitted
-official downloads and explicitly left the transitive binary redistribution
-review open. Bundling the same bytes does not silently close that outstanding
-review or make K5 the owner of the Go dependencies.
+`src/k5vision/data/mediamtx-donor-manifest.json`. The installed, hash-bound
+`workers/donor-downloads.json` selects exactly these two Windows artifacts.
+Provisioning verifies each archive SHA-256, executable length/SHA-256 and
+unchanged license SHA-256 before using it. The private worker directory retains
+the official archive's complete license alongside its executable. Existing
+verified copies are reused; modified bytes are refused rather than executed.
+
+Caddy's official release supplies target-specific SBOMs. The separately captured
+exact compiled-module inventory and supplied notices help assess future worker
+redistribution, but package-level declarations alone do not establish all native
+component rights. Earlier pilot records admitted official downloads and left
+broader binary redistribution review open. Keeping the same download boundary
+does not silently close that review or make K5 the owner of Go dependencies.
 
 This record establishes the package inputs and the bounded desktop scope. It
 does not grant rights over restricted analytics material, settle missing terms

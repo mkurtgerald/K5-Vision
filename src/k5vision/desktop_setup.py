@@ -170,6 +170,11 @@ class _DiscardOutput:
     def flush(self) -> None:
         pass
 
+    def isatty(self) -> bool:
+        # Uvicorn's default formatter probes the redirected stdout stream when
+        # deciding whether to color its output, even when logs are suppressed.
+        return False
+
 
 def _watch_control_pipe(source: BinaryIO, stop: threading.Event) -> None:
     try:

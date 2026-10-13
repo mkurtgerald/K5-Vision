@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import secrets
 import threading
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -135,6 +137,19 @@ def test_invalid_credentials_do_not_touch_disk(tmp_path, password, field, value,
         b"{" + b"x" * desktop_setup.MAX_REQUEST_BYTES,
         b"[" * 2000 + b"]" * 2000,
     ],
+    ids=[
+        "empty",
+        "array",
+        "invalid-utf8",
+        "truncated-json",
+        "duplicate-field",
+        "boolean-schema",
+        "extra-field",
+        "null-directory",
+        "invalid-unicode",
+        "oversized-request",
+        "deeply-nested-json",
+    ],
 )
 def test_malformed_duplicate_large_or_unsupported_input_has_finite_safe_output(payload):
     code, result = _call(payload)
@@ -165,6 +180,21 @@ def test_tty_input_is_refused_before_read_or_setup(tmp_path):
     output = io.StringIO()
     assert desktop_setup.main([], input_stream=Terminal(), output_stream=output) == 1
     assert json.loads(output.getvalue())["reason"] == "invalid_request"
+
+
+def test_discard_stream_supports_actual_uvicorn_formatter_without_terminal_output(capsys):
+    from uvicorn.logging import DefaultFormatter
+
+    sink = desktop_setup._DiscardOutput()
+    with redirect_stdout(sink), redirect_stderr(sink):
+        formatter = DefaultFormatter()
+        record = logging.LogRecord("uvicorn.error", logging.WARNING, "", 0, "suppressed", (), None)
+        message = formatter.format(record)
+        assert "\x1b" not in message
+        assert sink.write(message) == len(message)
+        sink.flush()
+    output = capsys.readouterr()
+    assert output.out == output.err == ""
 
 
 def test_setup_failure_preserves_partial_state_and_never_exposes_exception(

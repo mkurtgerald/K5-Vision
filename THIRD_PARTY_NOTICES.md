@@ -119,9 +119,12 @@ for exact donor identities, view limits, evidence and unresolved release gates.
 ## Native graphical Windows operator candidate
 
 The separate graphical operator installer bundles the unchanged official
-CPython 3.12.10 Windows amd64 embeddable distribution, the exact admitted
-MediaMTX v1.21.2 and Caddy v2.11.7 executables, and fifteen pinned binary Python
-distributions for the manual-RTSP recording operator. This packaging scope
+CPython 3.12.10 Windows amd64 embeddable distribution and fifteen pinned binary
+Python distributions for the manual-RTSP recording operator. Its first graphical
+launch downloads MediaMTX v1.21.2 and Caddy v2.11.7 directly from their official
+releases, verifies their archive, executable and license hashes, and preserves
+their supplied licenses in the private profile. These worker executables are
+not bundled in the K5 installer. This packaging scope
 supersedes the earlier no-binary-bundling statements only for that explicit
 desktop installer. It does not bundle FFmpeg, ONVIF, Analytics Lab, OpenVINO,
 models, sample images or development/browser tools.
@@ -132,8 +135,9 @@ the dedicated `WINDOWS_DESKTOP_DEPENDENCIES.md` review. Every dependency's
 `.dist-info` directory and upstream license/notice files remain installed.
 `dependency-inventory.json` records exact wheel and retained-notice hashes.
 The source `windows/desktop/donors.json` and `runtime-requirements.txt` pin each
-artifact; preserving these identities does not replace outstanding transitive
-native-binary redistribution review.
+artifact. The pinned `workers/donor-downloads.json` controls official first-run
+worker provisioning; preserving these identities does not replace outstanding
+transitive native-binary redistribution review.
 
 The GUI installer is produced with Inno Setup 6.4.3, copyright (C) 1997-2025
 Jordan Russell, portions copyright (C) 2000-2025 Martijn Laan. Its unchanged
