@@ -91,8 +91,9 @@ jobs:
           $process = Start-Process -FilePath $archive -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', ('/DIR="' + $install + '"')) -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Reviewed compiler installation failed" }
           $iscc = Join-Path $install "ISCC.exe"
-          $version = (Get-Item -LiteralPath $iscc).VersionInfo.FileVersion
-          if ($version -notmatch '^6\.4\.3(?:\.|$)') { throw "Unexpected Inno Setup compiler version" }
+          if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) { throw "Reviewed compiler frontend unavailable" }
+          # ISCC's upstream frontend resource uses 0.0.0.0. The exact admitted
+          # installer pins its bytes; check the actual engine banner at compile.
           "K5_DESKTOP_ISCC=$iscc" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           Write-Host "Native Inno Setup compiler 6.4.3 admitted by exact official archive SHA256"
       - name: Build click-through native Windows installer
@@ -104,8 +105,16 @@ jobs:
           New-Item -ItemType Directory -Path $output | Out-Null
           $launcherHash = (Get-FileHash -LiteralPath (Join-Path $payload "K5Vision.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
           $configuration = (Resolve-Path -LiteralPath windows/desktop/K5Vision.iss).Path
-          & $env:K5_DESKTOP_ISCC ('/DPayloadRoot=' + $payload) ('/DOutputRoot=' + $output) ('/DLauncherSha=' + $launcherHash) $configuration
-          if ($LASTEXITCODE -ne 0) { throw "Native GUI installer build failed" }
+          $compilerOutput = @(& $env:K5_DESKTOP_ISCC ('/DPayloadRoot=' + $payload) ('/DOutputRoot=' + $output) ('/DLauncherSha=' + $launcherHash) $configuration 2>&1 | ForEach-Object { $_.ToString() })
+          $compilerExit = $LASTEXITCODE
+          $compilerOutput | Where-Object { $_ -match '^Compiler engine version:|^Error on line|^Error:|^Warning:' } | ForEach-Object { Write-Host $_ }
+          if ($compilerExit -ne 0) {
+            $compilerOutput | Select-Object -Last 6 | ForEach-Object { Write-Host $_ }
+            throw "Native GUI installer build failed"
+          }
+          if (@($compilerOutput | Where-Object { $_ -match '^Compiler engine version: Inno Setup 6\.4\.3(?:\s|$)' }).Count -ne 1) {
+            throw "Unexpected Inno Setup compiler engine version"
+          }
           "K5_DESKTOP_SETUP=$(Join-Path $output 'K5VisionSetup.exe')" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           "K5_DESKTOP_PAYLOAD=$payload" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
       - name: Exercise actual installer, first-run account, tray, media and uninstall
