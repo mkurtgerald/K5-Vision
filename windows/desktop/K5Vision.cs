@@ -595,6 +595,22 @@ namespace K5VisionDesktop
             catch { return false; }
         }
 
+        internal void AddDiagnostic(Dictionary<string, object> result)
+        {
+            lock (gate)
+            {
+                result["backend_invalid_output"] = InvalidOutput;
+                result["backend_status"] = outcome == null ? "none" : (string)outcome["status"];
+            }
+            try
+            {
+                bool exited = Process.HasExited;
+                result["backend_exited"] = exited;
+                result["backend_exit_code"] = exited ? (object)Process.ExitCode : null;
+            }
+            catch { }
+        }
+
         public void Dispose()
         {
             try { Process.StandardInput.Close(); } catch { }
@@ -610,6 +626,7 @@ namespace K5VisionDesktop
         private readonly Options options;
         private readonly string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
         private readonly Label status = new Label();
+        private readonly TextBox diagnostic = new TextBox();
         private readonly Panel setup = new Panel();
         private readonly TextBox username = new TextBox();
         private readonly TextBox password = new TextBox();
@@ -627,6 +644,7 @@ namespace K5VisionDesktop
         private Task operation = Task.FromResult(true);
         private volatile bool exiting;
         private bool busy = true, ready, checkedPayload;
+        private string phase = "preparing";
 
         internal OperatorWindow(Options options, EventWaitHandle openEvent)
         {
@@ -645,6 +663,9 @@ namespace K5VisionDesktop
             status.Location = new Point(30, 78); status.Size = new Size(500, 62);
             status.Text = "Preparing K5 Vision…"; status.Name = "Status"; SetId(status, 1006);
             Controls.Add(status);
+            diagnostic.Visible = false; diagnostic.ReadOnly = true; diagnostic.Name = "Diagnostic";
+            SetId(diagnostic, 1010); Controls.Add(diagnostic);
+            GC.KeepAlive(diagnostic.Handle);
             setup.Location = new Point(30, 146); setup.Size = new Size(500, 226); setup.Visible = false;
             AddInput("Administrator username", username, 0, false, 1008);
             username.Text = "admin"; username.MaxLength = 64; username.Name = "Username";
@@ -674,7 +695,8 @@ namespace K5VisionDesktop
             {
                 if (openEvent.WaitOne(0)) { ShowOwner(); if (!options.NoBrowser) OpenDashboard(); }
                 if (ready && backend != null && backend.Process.HasExited)
-                { ready = false; open.Enabled = false; status.Text = "Recording stopped unexpectedly. Close and reopen K5 Vision to try again. Your recordings have been kept."; ShowOwner(); }
+                { phase = "failed"; ready = false; open.Enabled = false; status.Text = "Recording stopped unexpectedly. Close and reopen K5 Vision to try again. Your recordings have been kept."; ShowOwner(); }
+                UpdateDiagnostic();
             };
             timer.Start();
             FormClosing += delegate(object sender, FormClosingEventArgs args)
@@ -682,6 +704,17 @@ namespace K5VisionDesktop
                 if (!exiting && args.CloseReason == CloseReason.UserClosing) { args.Cancel = true; Hide(); }
             };
             Shown += delegate { Prepare(); };
+            UpdateDiagnostic();
+        }
+
+        private void UpdateDiagnostic()
+        {
+            Dictionary<string, object> snapshot = new Dictionary<string, object> {
+                { "schema_version", 1 }, { "phase", phase }, { "exiting", exiting }, { "ready", ready },
+                { "backend_present", backend != null }, { "backend_exited", false },
+                { "backend_exit_code", null }, { "backend_invalid_output", false }, { "backend_status", "none" } };
+            if (backend != null) backend.AddDiagnostic(snapshot);
+            diagnostic.Text = Json.Serializer.Serialize(snapshot);
         }
 
         private static void SetId(Control control, int id)
@@ -717,7 +750,7 @@ namespace K5VisionDesktop
                 Dictionary<string, object> result = await preparation;
                 if (exiting) return;
                 if ((string)result["status"] == "new")
-                { busy = false; setup.Visible = true; status.Text = "Create your administrator account to get started."; }
+                { phase = "account"; busy = false; setup.Visible = true; status.Text = "Create your administrator account to get started."; }
                 else if ((string)result["status"] == "ready") StartRecording();
                 else Fail("K5 Vision could not use this account profile safely. Your existing data has been kept.");
             }
@@ -731,7 +764,7 @@ namespace K5VisionDesktop
             { status.Text = "Choose a password with 12 to 256 characters."; return; }
             if (password.Text != confirmation.Text)
             { status.Text = "The passwords do not match. Please enter them again."; return; }
-            busy = true; create.Enabled = false;
+            phase = "initializing"; busy = true; create.Enabled = false;
             Dictionary<string, object> request = Request("initialize");
             request["username"] = username.Text; request["password"] = password.Text; request["confirmation"] = confirmation.Text;
             password.Clear(); confirmation.Clear(); status.Text = "Creating your account…";
@@ -765,7 +798,7 @@ namespace K5VisionDesktop
         private async void StartRecording()
         {
             if (exiting) return;
-            busy = true; setup.Visible = false; status.Text = "Preparing your camera services. First launch may take a few minutes…";
+            phase = "starting"; busy = true; setup.Visible = false; status.Text = "Preparing your camera services. First launch may take a few minutes…";
             bool failed = false;
             try
             {
@@ -802,7 +835,7 @@ namespace K5VisionDesktop
                 operation = startup;
                 await startup;
                 if (exiting) return;
-                ready = true; busy = false; open.Enabled = true;
+                phase = "running"; ready = true; busy = false; open.Enabled = true;
                 status.Text = "Recording service is running. You can close this window; K5 Vision stays in the tray.";
                 tray.Text = "K5 Vision — recording service running";
                 if (!options.NoBrowser) OpenDashboard();
@@ -830,14 +863,15 @@ namespace K5VisionDesktop
         private void Fail(string message)
         {
             if (exiting || IsDisposed) return;
-            busy = false; ready = false; open.Enabled = false; create.Enabled = false;
+            phase = "failed"; busy = false; ready = false; open.Enabled = false; create.Enabled = false;
             status.Text = message; ShowOwner();
         }
 
         private async void StopAndQuit()
         {
             if (exiting) return;
-            exiting = true; ready = false; timer.Stop(); open.Enabled = create.Enabled = quit.Enabled = false;
+            phase = "stopping"; exiting = true; ready = false; timer.Stop(); open.Enabled = create.Enabled = quit.Enabled = false;
+            UpdateDiagnostic();
             cancellation.Cancel();
             status.Text = "Stopping recording safely…";
             Task pending = operation;

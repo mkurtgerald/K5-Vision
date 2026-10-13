@@ -75,6 +75,7 @@ class _Windows:
                 wintypes.DWORD,
             ),
             "IsWindowVisible": ([wintypes.HWND], wintypes.BOOL),
+            "IsWindow": ([wintypes.HWND], wintypes.BOOL),
             "IsWindowEnabled": ([wintypes.HWND], wintypes.BOOL),
             "GetDlgItem": ([wintypes.HWND, ctypes.c_int], wintypes.HWND),
             "GetDlgCtrlID": ([wintypes.HWND], ctypes.c_int),
@@ -149,6 +150,17 @@ class _Windows:
             ),
             self.api.GetDlgItem(form, identifier),
         )
+
+    def control_text(self, form, identifier):
+        """WM_GETTEXT reads another process's actual edit/label control value."""
+        control = self.control(form, identifier)
+        if not control:
+            return ""
+        value = ctypes.create_unicode_buffer(1024)
+        self.message(
+            control, 0x000D, ctypes.cast(value, ctypes.c_void_p).value, parameter=len(value)
+        )
+        return value.value
 
     def message(self, window, message, value=0, *, parameter=0):
         __tracebackhide__ = True
@@ -374,7 +386,21 @@ def _recording_bytes(profile):
 
 def _tray_recording(client, profile, camera_id, before, diagnostic):
     """Require a connected recording source and new bytes while both UIs are closed."""
-    status, body, _ = client.get("/api/v1/operator/cameras")
+    files = list((profile / "recordings").rglob("*.mp4"))
+    after = sum(path.stat().st_size for path in files)
+    diagnostic.update(
+        recording_file_count=len(files),
+        recording_bytes_before=before,
+        recording_bytes_after=after,
+        camera_request_unavailable=True,
+        camera_http_status=0,
+    )
+    try:
+        status, body, _ = client.get("/api/v1/operator/cameras")
+    except RuntimeError:
+        return False
+    diagnostic["camera_request_unavailable"] = False
+    diagnostic["camera_http_status"] = status if status in {200, 401, 403, 404, 503} else 0
     camera_status, camera_recording = "unavailable", False
     if status == 200:
         payload = json.loads(body)
@@ -386,14 +412,9 @@ def _tray_recording(client, profile, camera_id, before, diagnostic):
                 )
                 camera_recording = camera.get("recording") is True
                 break
-    files = list((profile / "recordings").rglob("*.mp4"))
-    after = sum(path.stat().st_size for path in files)
     diagnostic.update(
         camera_status=camera_status,
         camera_recording=camera_recording,
-        recording_file_count=len(files),
-        recording_bytes_before=before,
-        recording_bytes_after=after,
     )
     return camera_status == "live" and camera_recording and after > before
 
@@ -413,7 +434,7 @@ def _healthy(client, diagnostic):
 
 def _desktop_status(api, form):
     """Map our public UI messages to finite codes, never retain unknown text."""
-    text = api.text(api.control(form, _STATUS))
+    text = api.control_text(form, _STATUS)
     for prefix, code in (
         ("Preparing K5 Vision", "preparing"),
         ("Create your administrator account", "account_ready"),
@@ -431,6 +452,81 @@ def _desktop_status(api, form):
         if text.startswith(prefix):
             return code
     return "unclassified"
+
+
+def _failure_detail(error):
+    """Only fixed classifications are admitted from our controlled assertions."""
+    text = str(error)
+    for marker, code in (
+        ("desktop application exited", "desktop_exited"),
+        ("readiness deadline expired", "readiness_deadline"),
+        ("Native desktop control did not respond", "native_control_deadline"),
+        ("Expected enabled desktop button is unavailable", "native_control_unavailable"),
+        ("Owned desktop/backend/native processes survived", "owned_process_survived"),
+        ("Desktop opened a console window", "console_window"),
+    ):
+        if marker in text:
+            return code
+    return "unclassified"
+
+
+def _cohort_diagnostic(cohort):
+    counts = {"desktop": 0, "python": 0, "mediamtx": 0, "caddy": 0, "other": 0}
+    allowed = {
+        "k5vision.exe": "desktop",
+        "python.exe": "python",
+        "pythonw.exe": "python",
+        "mediamtx.exe": "mediamtx",
+        "caddy.exe": "caddy",
+    }
+    for process in cohort.snapshot():
+        try:
+            if process.is_running():
+                counts[allowed.get(process.name().casefold(), "other")] += 1
+        except psutil.NoSuchProcess:
+            continue
+    return counts
+
+
+def _desktop_probe(api, form):
+    """Admit only finite, source-free fields from the app's diagnostic textbox."""
+    try:
+        data = json.loads(api.control_text(form, 1010))
+    except (ValueError, UnicodeError):
+        return {"available": False}
+    if not isinstance(data, dict):
+        return {"available": False}
+    if data.get("schema_version") != 1:
+        return {"available": False}
+    result = {"available": True}
+    for key in ("ready", "exiting", "backend_present", "backend_exited", "backend_invalid_output"):
+        if type(data.get(key)) is bool:
+            result[key] = data[key]
+    value = data.get("backend_exit_code")
+    if value is None or type(value) is int and -(2**31) <= value <= 2**31 - 1:
+        result["backend_exit_code"] = value
+    phase = data.get("phase")
+    result["phase"] = (
+        phase
+        if phase
+        in {
+            "preparing",
+            "account",
+            "initializing",
+            "stopping",
+            "starting",
+            "running",
+            "failed",
+        }
+        else "unclassified"
+    )
+    status = data.get("backend_status")
+    result["backend_status"] = (
+        status
+        if status in {"none", "ready", "new", "refused", "running", "stopped"}
+        else "unclassified"
+    )
+    return result
 
 
 def _generate_fixture(parent, media, ffmpeg, upstream_port, helpers):
@@ -566,7 +662,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     cohort = _Cohort(api)
     playwright = browser = context = None
     form = None
+    app = None
     stage, failure, cleanup_failed = "installer", None, False
+    failure_detail = None
     readiness_diagnostic = {"health_http_status": 0}
     recording_diagnostic = {}
     receipt = {
@@ -621,8 +719,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "GUI account did not authorize an administrator",
         )
         _require(
-            api.text(api.control(form, _PASSWORD)) == ""
-            and api.text(api.control(form, _CONFIRM)) == "",
+            api.control_text(form, _PASSWORD) == "" and api.control_text(form, _CONFIRM) == "",
             "Desktop left the initial password in its input controls",
         )
         receipt["actual_gui_account_setup"] = True
@@ -787,6 +884,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["uninstall_preserves_profile_and_media"] = True
         receipt["no_console_windows"] = not cohort.console_seen and not cohort.failed
     except BaseException as error:
+        failure_detail = _failure_detail(error)
         failure = {
             "TimeoutExpired": "process_timeout",
             "TimeoutError": "browser_timeout",
@@ -795,7 +893,16 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "Error": "browser_error",
         }.get(type(error).__name__, "qualification_error")
     finally:
-        desktop_status = _desktop_status(api, form) if form else "unavailable"
+        try:
+            desktop_status = _desktop_status(api, form) if form else "unavailable"
+            desktop_probe = _desktop_probe(api, form) if form else {"available": False}
+        except BaseException:
+            desktop_status = "unresponsive"
+            desktop_probe = {"available": False}
+        process_counts = _cohort_diagnostic(cohort)
+        app_exit_code = app.poll() if app else None
+        form_alive = bool(form and api.api.IsWindow(form))
+        form_visible = bool(form and api.api.IsWindowVisible(form))
         cohort.finish()
         for resource in (context, browser, playwright):
             if resource is not None:
@@ -827,8 +934,14 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         diagnostic = {
             "stage": stage,
             "failure_code": failure,
+            "failure_detail": failure_detail,
             "cleanup_failed": cleanup_failed,
             "desktop_status": desktop_status,
+            "desktop_probe": desktop_probe,
+            "owned_process_counts": process_counts,
+            "app_exit_code": app_exit_code,
+            "form_alive": form_alive,
+            "form_visible": form_visible,
             **readiness_diagnostic,
             **recording_diagnostic,
         }
