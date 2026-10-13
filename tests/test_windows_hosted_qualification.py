@@ -3765,7 +3765,7 @@ class FixedResourceDiagnosticTests(unittest.TestCase):
         "job_accounting_invalid": "accounting",
         "job_members_query_failed": "members",
         "job_member_ids_invalid": "members",
-        "process_open_failed": "open_member",
+        "process_open_initial_other": "open_member",
         "process_times_query_failed": "identity",
         "process_birth_invalid": "identity",
         "process_rss_query_failed": "rss",
@@ -3793,10 +3793,21 @@ class FixedResourceDiagnosticTests(unittest.TestCase):
                 and isinstance(node.func, ast.Name)
                 and node.func.id == "resource_need"
                 and len(node.args) == 2
-                and isinstance(node.args[1], ast.Constant)
-                and node.args[1].value in cls.CATEGORIES
             ):
-                removed.append(node.args.pop().value)
+                code = node.args[1]
+                if isinstance(code, ast.Constant) and code.value in cls.CATEGORIES:
+                    removed.append(node.args.pop().value)
+                elif isinstance(code, ast.IfExp) and {
+                    item.value
+                    for item in ast.walk(code)
+                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                } == {
+                    "process_open_initial_invalid_parameter",
+                    "process_open_initial_access_denied",
+                    "process_open_initial_other",
+                }:
+                    node.args.pop()
+                    removed.append("process_open_initial_other")
         namespace = dict(vars(guard))
         classes = ast.Module(
             body=[
@@ -3850,7 +3861,7 @@ class FixedResourceDiagnosticTests(unittest.TestCase):
 
         def open_process(rights, inherit, pid):
             events.append(("open", rights, inherit))
-            return 0 if fault == "process_open_failed" else 77
+            return 0 if fault == "process_open_initial_other" else 77
 
         def times(handle, birth, exited, kernel, user):
             events.append("process_times")
@@ -3941,7 +3952,12 @@ class FixedResourceDiagnosticTests(unittest.TestCase):
         }
         if operation == "open_member":
             native.belongs = lambda handle, job: events.append("belongs") or True
-        return lambda: getattr(native, operation)(*args[operation]), events
+
+        def invoke():
+            with patch.object(module.c, "get_last_error", return_value=1, create=True):
+                return getattr(native, operation)(*args[operation])
+
+        return invoke, events
 
     def fixture(self, module, category, *, fail=True):
         if category not in {
@@ -4004,11 +4020,11 @@ class FixedResourceDiagnosticTests(unittest.TestCase):
         for category in removed:
             self.assertRegex(category, r"\A[a-z_]{1,64}\Z")
 
-    def test_stripping_only_diagnostic_literals_restores_exact_baseline_ast(self):
+    def test_stripping_diagnostic_codes_preserves_reviewed_predicate_ast(self):
         _, restored, _ = self.restored()
         self.assertEqual(
             hashlib.sha256(ast.dump(restored, include_attributes=False).encode()).hexdigest(),
-            "640917a141beb910037345a99416c0e51f94111b0bd7f4a96cd9d847a2a70531",
+            "0dbaa0a4f29577e3c4fec8f739ba1c0f41c854fd51e73076b94751cf848630fa",
         )
 
     def test_all_twenty_three_actual_failures_keep_call_order_and_type(self):
@@ -4069,6 +4085,243 @@ class FixedResourceDiagnosticTests(unittest.TestCase):
                 self.assertEqual(guard.main(), 1)
             self.assertEqual(
                 output.getvalue(), "K5_HOSTED_QUALIFICATION_REFUSED=qualification_failed\n"
+            )
+
+
+class OpenFailureDiagnosticTests(unittest.TestCase):
+    SITES = (
+        "initial_new",
+        "initial_vanished",
+        "closing_new",
+        "closing_vanished",
+        "initial_new_signaled",
+        "initial_retained_signaled",
+        "closing_departed_listed",
+        "closing_late_signal",
+        "closing_new_signaled",
+    )
+
+    @staticmethod
+    def suffix(error):
+        return "invalid_parameter" if error == 87 else "access_denied" if error == 5 else "other"
+
+    def scenario(self, site, module=guard):
+        clock, native, events = Clock(), FakeNative(), []
+        owner = module.QualificationResources(
+            types.SimpleNamespace(WindowsJob=FakeJob),
+            "inert-owned",
+            clock=clock,
+            native_factory=lambda: native,
+        )
+        job = owner.job_factory()
+        clock.value += 0.25
+        reads = 0
+        original_members, original_open = native.members, native.open_member
+        original_listeners = native.listeners
+        target = 13 if site.startswith("closing_new") or site == "closing_vanished" else 11
+        retained = "signaled" in site or site in {"closing_departed_listed", "closing_late_signal"}
+        if site in {"initial_new_signaled", "initial_retained_signaled"}:
+            native.identities[11] = (101, True)
+        if site == "initial_retained_signaled":
+            owner.handles.update({11: (11, 101), 12: (12, 102)})
+            owner.witnessed_births.update({(11, 101), (12, 102)})
+
+        def members(job):
+            nonlocal reads
+            reads += 1
+            events.append("members")
+            if reads == 2:
+                if site in {"closing_new", "closing_vanished", "closing_new_signaled"}:
+                    native.pids.add(13)
+                    native.identities[13] = (103, site == "closing_new_signaled")
+                    native.total = job.total_processes = 3
+                if site == "closing_late_signal":
+                    native.identities[11] = (101, True)
+            return original_members(job)
+
+        def listeners(pids):
+            events.append("listeners")
+            if site == "closing_departed_listed" and not job.drained:
+                native.identities[11] = (101, True)
+            return original_listeners(pids)
+
+        backend = module.NativeMetrics.__new__(module.NativeMetrics)
+
+        def failed_open(rights, inherit, pid):
+            events.append(("OpenProcess", rights, inherit))
+            if site.endswith("vanished"):
+                native.pids.discard(pid)
+                native.identities[pid] = (native.identities[pid][0], True)
+            return 0
+
+        backend.k = types.SimpleNamespace(OpenProcess=failed_open)
+
+        def open_member(pid, current_job):
+            revalidation = pid in owner.handles
+            events.append("revalidation_open" if revalidation else "first_open")
+            if pid == target and (not retained or revalidation):
+                return backend.open_member(pid, current_job)
+            return original_open(pid, current_job)
+
+        native.members, native.listeners, native.open_member = members, listeners, open_member
+        return owner, native, events, retained
+
+    def test_every_failed_open_site_is_fatal_for_each_fixed_error_class(self):
+        for site in self.SITES:
+            for error in (87, 5, 0, 6, 1168, 2**32 - 1):
+                with self.subTest(site=site, error=error):
+                    owner, native, events, retained = self.scenario(site)
+
+                    def saved_error(error=error, events=events):
+                        events.append("saved_error")
+                        return error
+
+                    with (
+                        patch.object(
+                            guard.c, "get_last_error", side_effect=saved_error, create=True
+                        ),
+                        self.assertRaises(ResourceFailure) as refused,
+                    ):
+                        owner.sample()
+                    phase = "revalidation" if retained else "initial"
+                    self.assertEqual(
+                        str(refused.exception), "process_open_" + phase + "_" + self.suffix(error)
+                    )
+                    opening = next(i for i, event in enumerate(events) if isinstance(event, tuple))
+                    self.assertEqual(events[opening], ("OpenProcess", 0x00100410, False))
+                    self.assertEqual(events[opening + 1], "saved_error")
+                    self.assertEqual(events.count("saved_error"), 1)
+                    self.assertLessEqual(native.read_count, 2)
+                    self.assertTrue(owner.failed and owner.cleanup_complete and owner.job.drained)
+                    self.assertTrue(owner.association_counts_complete)
+                    self.assertLessEqual(len(owner.witnessed_births), owner.final_total)
+
+    def test_null_open_reads_saved_error_once_before_any_other_operation(self):
+        for error in (87, 5, 0, 6, 1168):
+            with self.subTest(error=error):
+                events = []
+                native = NativeMetrics.__new__(NativeMetrics)
+                native.k = types.SimpleNamespace(
+                    OpenProcess=lambda *args, events=events: events.append("open") or 0
+                )
+                native.belongs = lambda *args: self.fail("No handle means no ownership query")
+                native.identity = lambda *args: self.fail("No handle means no identity query")
+                native.close_handle = lambda *args: self.fail("NULL is not a handle to close")
+                with (
+                    patch.object(
+                        guard.c,
+                        "get_last_error",
+                        side_effect=lambda events=events, error=error: (
+                            events.append("saved_error") or error
+                        ),
+                        create=True,
+                    ),
+                    self.assertRaises(ResourceFailure) as refused,
+                ):
+                    native.open_member(11, object())
+                self.assertEqual(
+                    str(refused.exception), "process_open_initial_" + self.suffix(error)
+                )
+                self.assertEqual(events, ["open", "saved_error"])
+
+    def test_successful_open_never_reads_last_error_or_changes_rights_and_order(self):
+        for signaled in (False, True):
+            with self.subTest(signaled=signaled):
+                events = []
+                native = NativeMetrics.__new__(NativeMetrics)
+                native.k = types.SimpleNamespace(
+                    OpenProcess=lambda rights, inherit, pid, events=events: (
+                        events.append(("open", rights, inherit)) or 77
+                    )
+                )
+                native.belongs = lambda *args, events=events: events.append("belongs") or True
+                native.identity = lambda *args, events=events, signaled=signaled: (
+                    events.append("identity") or (101, signaled)
+                )
+                native.close_handle = lambda *args: self.fail("Successful handle stays retained")
+                with patch.object(guard.c, "get_last_error", create=True) as saved_error:
+                    self.assertEqual(native.open_member(11, object()), (77, 101))
+                saved_error.assert_not_called()
+                self.assertEqual(events, [("open", 0x00100410, False), "belongs", "identity"])
+
+    def test_later_ownership_identity_and_close_failures_keep_original_categories(self):
+        for failure in ("ownership_unproven", "process_times_query_failed", "process_wait_failed"):
+            for close_fails in (False, True):
+                with self.subTest(failure=failure, close_fails=close_fails):
+                    events = []
+                    native = NativeMetrics.__new__(NativeMetrics)
+                    native.k = types.SimpleNamespace(OpenProcess=lambda *args: 77)
+                    native.belongs = lambda *args, failure=failure: failure != "ownership_unproven"
+
+                    def identity(handle, failure=failure):
+                        raise ResourceFailure(failure)
+
+                    def close(handle, close_fails=close_fails, events=events):
+                        events.append("close")
+                        if close_fails:
+                            raise ResourceFailure("resource_handle_cleanup_failed")
+
+                    native.identity, native.close_handle = identity, close
+                    with (
+                        patch.object(guard.c, "get_last_error", create=True) as saved_error,
+                        self.assertRaises(ResourceFailure) as refused,
+                    ):
+                        native.open_member(11, object())
+                    saved_error.assert_not_called()
+                    self.assertEqual(
+                        str(refused.exception),
+                        "resource_handle_cleanup_failed" if close_fails else failure,
+                    )
+                    self.assertEqual(events, ["close"])
+
+    def test_wrapper_does_not_mask_later_errors_or_lose_cleanup_poison(self):
+        for failure in (
+            "ownership_unproven",
+            "process_wait_failed",
+            "resource_handle_cleanup_failed",
+        ):
+            case = AdapterTests()
+            owner = case.make()
+            case.native.open_member = lambda *args, failure=failure: (_ for _ in ()).throw(
+                ResourceFailure(failure)
+            )
+            with (
+                self.subTest(failure=failure),
+                patch.object(guard.c, "get_last_error", create=True) as saved_error,
+                self.assertRaises(ResourceFailure) as refused,
+            ):
+                owner.sample()
+            saved_error.assert_not_called()
+            self.assertEqual(str(refused.exception), failure)
+            self.assertEqual(owner.cleanup_complete, failure != "resource_handle_cleanup_failed")
+            self.assertEqual(
+                owner.unretained_handle_cleanup_failed, failure == "resource_handle_cleanup_failed"
+            )
+
+    def test_all_six_open_categories_are_fixed_sanitized_and_main_visible(self):
+        categories = {
+            "process_open_" + phase + "_" + suffix
+            for phase in ("initial", "revalidation")
+            for suffix in ("invalid_parameter", "access_denied", "other")
+        }
+        source = ast.parse((ROOT / "scripts/windows_hosted_qualification.py").read_text())
+        literals = {
+            n.value
+            for n in ast.walk(source)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        }
+        self.assertTrue(categories <= literals)
+        for category in categories:
+            self.assertRegex(category, r"\A[a-z_]{1,64}\Z")
+            output = io.StringIO()
+            with (
+                patch.object(sys, "argv", ["guard", "--prepare", "--profile", "alpha"]),
+                patch.object(guard, "prepare", side_effect=ResourceFailure(category)),
+                contextlib.redirect_stderr(output),
+            ):
+                self.assertEqual(guard.main(), 1)
+            self.assertEqual(
+                output.getvalue(), "K5_HOSTED_QUALIFICATION_REFUSED=" + category + "\n"
             )
 
 

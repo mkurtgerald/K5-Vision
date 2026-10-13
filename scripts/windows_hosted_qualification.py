@@ -1510,7 +1510,16 @@ class NativeMetrics:
         # QUERY_INFORMATION | VM_READ | SYNCHRONIZE, for zero-time state reads only.
         # No terminate, write, injection or all-access rights.
         handle = self.k.OpenProcess(0x0400 | 0x0010 | 0x00100000, False, pid)
-        resource_need(handle, "process_open_failed")
+        if not handle:
+            error = c.get_last_error()
+            resource_need(
+                handle,
+                "process_open_initial_invalid_parameter"
+                if error == 87
+                else "process_open_initial_access_denied"
+                if error == 5
+                else "process_open_initial_other",
+            )
         try:
             resource_need(self.belongs(handle, job), "ownership_unproven")
             birth, _ = self.identity(handle)
@@ -1782,6 +1791,15 @@ class QualificationResources:
             try:
                 return self.native.open_member(pid, self.job)
             except ResourceFailure as error:
+                code = {
+                    "process_open_initial_invalid_parameter": (
+                        "process_open_revalidation_invalid_parameter"
+                    ),
+                    "process_open_initial_access_denied": "process_open_revalidation_access_denied",
+                    "process_open_initial_other": "process_open_revalidation_other",
+                }.get(str(error))
+                if code is not None and pid in self.handles:
+                    raise ResourceFailure(code) from None
                 if str(error) == "resource_handle_cleanup_failed":
                     self.unretained_handle_cleanup_failed = True
                 raise
