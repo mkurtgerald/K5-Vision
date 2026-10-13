@@ -292,8 +292,10 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             }""")
             diagnostics = client.json("/api/v1/operator/status")
             _require(
-                set(diagnostics) == {"worker_status", "max_recording_bytes", "storage"}
+                set(diagnostics)
+                == {"worker_status", "max_recording_bytes", "storage", "analytics_status"}
                 and diagnostics["worker_status"] == "ready"
+                and diagnostics["analytics_status"] == "disabled"
                 and diagnostics["max_recording_bytes"] == 20 * 1024**3
                 and diagnostics["storage"]["recording_allowed"] is True,
                 "Operator service and storage status was incomplete",

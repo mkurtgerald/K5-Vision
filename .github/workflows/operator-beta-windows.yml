@@ -99,7 +99,7 @@ jobs:
           K5_BETA_LANE: ${{ matrix.lane }}
         run: |
           $ErrorActionPreference = "Stop"
-          $tests = switch ($env:K5_BETA_LANE) {
+          [string[]]$tests = switch ($env:K5_BETA_LANE) {
             "product" { @(
               "tests/unit/test_mediamtx_provider.py", "tests/unit/test_operator_media_gateway.py",
               "tests/unit/test_operator_product_state.py", "tests/unit/test_operator_product_api.py",
