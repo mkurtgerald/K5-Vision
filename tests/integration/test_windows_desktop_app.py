@@ -40,7 +40,7 @@ pytestmark = pytest.mark.skipif(
     reason="Desktop qualification requires Windows and explicitly supplied installer/tools",
 )
 _TITLE = "K5 Vision"
-_PASSWORD, _CONFIRM, _CREATE, _STOP, _USERNAME = 1001, 1002, 1003, 1005, 1008
+_PASSWORD, _CONFIRM, _CREATE, _STOP, _STATUS, _USERNAME = 1001, 1002, 1003, 1005, 1006, 1008
 
 
 def _require(condition, message):
@@ -372,6 +372,41 @@ def _recording_bytes(profile):
     return sum(path.stat().st_size for path in (profile / "recordings").rglob("*.mp4"))
 
 
+def _healthy(client, diagnostic):
+    """A normal startup 503 means not ready; strict API assertions follow readiness."""
+    status, body, _ = client.get("/api/v1/health")
+    diagnostic["health_http_status"] = status if status in {200, 401, 403, 404, 409, 503} else 0
+    if status != 200:
+        return False
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("status") == "ok"
+
+
+def _desktop_status(api, form):
+    """Map our public UI messages to finite codes, never retain unknown text."""
+    text = api.text(api.control(form, _STATUS))
+    for prefix, code in (
+        ("Preparing K5 Vision", "preparing"),
+        ("Create your administrator account", "account_ready"),
+        ("Creating your account", "account_creating"),
+        ("Starting your cameras", "cameras_starting"),
+        ("Recording service is running", "recording_running"),
+        ("K5 Vision could not verify", "verification_failed"),
+        ("K5 Vision could not use this account profile", "profile_refused"),
+        ("Account setup could not complete safely", "account_refused"),
+        ("Account setup could not complete.", "account_failed"),
+        ("K5 Vision could not start recording", "recording_start_failed"),
+        ("Recording stopped unexpectedly", "recording_stopped"),
+        ("Stopping recording safely", "stopping"),
+    ):
+        if text.startswith(prefix):
+            return code
+    return "unclassified"
+
+
 def _generate_fixture(parent, media, ffmpeg, upstream_port, helpers):
     __tracebackhide__ = True
     video = parent / "generated red camera.mp4"
@@ -502,7 +537,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     processes, reservations = [], []
     cohort = _Cohort(api)
     playwright = browser = context = None
+    form = None
     stage, failure, cleanup_failed = "installer", None, False
+    readiness_diagnostic = {"health_http_status": 0}
     receipt = {
         "schema_version": "1",
         "platform": platform.system(),
@@ -544,7 +581,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         client = runtime._Client(port)
         stage = "embedded_product_startup"
         _wait(
-            lambda: client.json("/api/v1/health").get("status") == "ok",
+            lambda: _healthy(client, readiness_diagnostic),
             "Desktop embedded product startup",
             process=app,
             timeout=60,
@@ -655,7 +692,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         app = _start_app(installed, profile, port, cohort)
         form = _wait(lambda: api.form(app.pid), "Returning desktop window", process=app)
         _wait(
-            lambda: client.json("/api/v1/health").get("status") == "ok",
+            lambda: _healthy(client, readiness_diagnostic),
             "Returning embedded product",
             process=app,
             timeout=60,
@@ -708,6 +745,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "Error": "browser_error",
         }.get(type(error).__name__, "qualification_error")
     finally:
+        desktop_status = _desktop_status(api, form) if form else "unavailable"
         cohort.finish()
         for resource in (context, browser, playwright):
             if resource is not None:
@@ -736,10 +774,18 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 shutil.rmtree(parent)
             except Exception:
                 cleanup_failed = True
-        diagnostic = {"stage": stage, "failure_code": failure, "cleanup_failed": cleanup_failed}
+        diagnostic = {
+            "stage": stage,
+            "failure_code": failure,
+            "cleanup_failed": cleanup_failed,
+            "desktop_status": desktop_status,
+            **readiness_diagnostic,
+        }
         record_testsuite_property(
             "desktop_windows_diagnostic", json.dumps(diagnostic, sort_keys=True)
         )
+        if failure is not None or cleanup_failed:
+            print("Desktop qualification diagnostic: " + json.dumps(diagnostic, sort_keys=True))
     _require(failure is None, "Desktop qualification failed at " + stage + ": " + str(failure))
     _require(not cleanup_failed, "Owned desktop qualification cleanup failed")
     _require(not cohort.console_seen and not cohort.failed, "Desktop opened a console window")
