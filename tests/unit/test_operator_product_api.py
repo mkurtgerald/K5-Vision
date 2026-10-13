@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,6 +26,7 @@ from k5vision.media.mediamtx_provider import (
     MediaWorkerError,
     MediaWorkerErrorCode,
 )
+from k5vision.operator_analytics import OperatorAnalyticsResult
 from k5vision.operator_product_api import install_operator_product_api
 from k5vision.operator_product_state import OperatorCameraStore
 from k5vision.services.device_registry import DeviceRegistry
@@ -62,12 +65,37 @@ class _Service:
         self.provider = _Provider()
         self.applied = []
         self.worker_status = "ready"
+        self.max_recording_bytes = 20 * 1024**3
+        self.storage = None
 
     def status(self):
         return self.worker_status
 
+    def diagnostics(self):
+        return {
+            "worker_status": self.status(),
+            "max_recording_bytes": self.max_recording_bytes,
+            "storage": self.storage,
+        }
+
     async def apply_sources(self, sources):
         self.applied.append(sources)
+
+
+class _Analytics:
+    def __init__(self):
+        self.submissions = []
+        self.closed = []
+        self.callback = None
+
+    async def infer(self, **submission):
+        self.submissions.append({**submission, "bytes": bytes(submission["frame"].payload)})
+        if self.callback is not None:
+            await self.callback(submission)
+        return OperatorAnalyticsResult("active", submission["frame_id"])
+
+    async def close_owner(self, owner_id):
+        self.closed.append(owner_id)
 
 
 @dataclass
@@ -81,6 +109,7 @@ class _Harness:
     sessions: UserSessionManager
     admin: UserAccount
     token: str
+    analytics: _Analytics | None = None
 
     @property
     def headers(self):
@@ -139,10 +168,23 @@ def product(tmp_path, monkeypatch, request):
     app.state.device_registry = registry
     app.state.user_registry = users
     app.state.user_session_manager = sessions
-    public_port = getattr(request, "param", 8080)
-    install_operator_product_api(app, cameras=cameras, service=service, public_port=public_port)
+    options = getattr(request, "param", 8080)
+    public_port = options if isinstance(options, int) else options.get("public_port", 8080)
+    analytics = _Analytics() if isinstance(options, dict) and options.get("analytics") else None
+    install_operator_product_api(
+        app,
+        cameras=cameras,
+        service=service,
+        public_port=public_port,
+        analytics=analytics,
+        analytics_status=options.get("analytics_status", "disabled")
+        if isinstance(options, dict)
+        else "disabled",
+    )
     with TestClient(app, base_url=f"http://127.0.0.1:{public_port}") as client:
-        yield _Harness(client, app, cameras, service, registry, users, sessions, admin, token)
+        yield _Harness(
+            client, app, cameras, service, registry, users, sessions, admin, token, analytics
+        )
     cameras.close()
     registry.close()
     users.close()
@@ -300,6 +342,20 @@ def test_media_session_accepts_omitted_default_origin_port_with_human_auth(produ
 
 
 def test_logout_revokes_cookie_and_durable_disable_and_role_changes_take_effect(product):
+    replacement, credential, _ = product.users.create_with_bootstrap(
+        UserCreate(
+            username="replacement-admin",
+            display_name="Replacement administrator",
+            role=UserRole.ADMINISTRATOR,
+        ),
+        actor="test",
+    )
+    product.users.activate_bootstrap_password(
+        username=replacement.username,
+        temporary_credential=credential,
+        new_password="replacement administrator test password",
+        actor="bootstrap-user",
+    )
     device_id = product.enroll()
     binding = MediaMTXBinding(product.service.site_id, UUID(device_id))
     headers = product.media_headers(f"/media/live/{binding.path_name}/index.m3u8")
@@ -503,3 +559,362 @@ def test_unstored_enrolled_device_cannot_issue_media_cookie(product):
     )
     assert response.status_code == 404
     assert "set-cookie" not in response.headers
+
+
+def test_status_requires_a_current_human_session_and_returns_only_safe_sample(product):
+    route = "/api/v1/operator/status"
+    assert product.client.get(route).status_code == 401
+    product.enroll()
+    product.service.storage = {
+        "recording_bytes": 512,
+        "free_bytes": 2 * 1024**3,
+        "recording_allowed": True,
+        "reason": "ready",
+    }
+    response = product.client.get(route, headers=product.headers)
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "worker_status": "ready",
+        "max_recording_bytes": 20 * 1024**3,
+        "storage": product.service.storage,
+        "analytics_status": "disabled",
+    }
+    assert "private-test-value" not in response.text
+    assert "127.0.0.1" not in response.text
+    assert product.token not in response.text
+    alternate, temporary, _ = product.users.create_with_bootstrap(
+        UserCreate(
+            username="second-storage-admin", display_name="Admin", role=UserRole.ADMINISTRATOR
+        ),
+        actor="test",
+    )
+    assert product.users.activate_bootstrap_password(
+        username=alternate.username,
+        temporary_credential=temporary,
+        new_password="second-storage-test-password",
+        actor="test",
+    )
+    product.users.update(product.admin.id, UserPatch(enabled=False), actor="test")
+    assert product.client.get(route, headers=product.headers).status_code == 401
+
+
+def test_status_supports_viewer_and_reports_unknown_storage_without_guessing(product):
+    viewer = product.users.create(
+        UserCreate(username="storage-viewer", display_name="Viewer", role=UserRole.VIEWER),
+        actor="test",
+    )
+    token, _ = asyncio.run(product.sessions.issue(viewer))
+    product.service.worker_status = "unavailable"
+    response = product.client.get(
+        "/api/v1/operator/status", headers={"Authorization": "Bearer " + token}
+    )
+    assert response.status_code == 200
+    assert response.json()["storage"] is None
+    assert response.json()["worker_status"] == "unavailable"
+
+
+def test_removal_revokes_media_and_history_but_preserves_endpoint_identity_for_readd(product):
+    device_id = product.enroll()
+    binding = MediaMTXBinding(product.service.site_id, UUID(device_id))
+    media_headers = product.media_headers(f"/media/live/{binding.path_name}/index.m3u8")
+    assert (
+        product.client.get("/api/v1/operator/media-auth", headers=media_headers).status_code == 200
+    )
+    response = product.client.delete(
+        f"/api/v1/operator/cameras/{device_id}", headers=product.headers
+    )
+    assert response.status_code == 204
+    assert product.cameras.list_sources() == ()
+    assert product.service.applied[-1] == ()
+    assert product.registry.get(UUID(device_id)) is not None
+    assert (
+        product.client.get("/api/v1/operator/media-auth", headers=media_headers).status_code == 401
+    )
+    assert (
+        product.client.get(
+            f"/api/v1/operator/cameras/{device_id}/history", headers=product.headers
+        ).status_code
+        == 404
+    )
+    assert product.enroll() == device_id
+    assert (
+        product.client.get("/api/v1/operator/media-auth", headers=media_headers).status_code == 200
+    )
+
+
+def _person_headers(product, **extra):
+    return {
+        **product.headers,
+        "Origin": "http://127.0.0.1:8080",
+        "Content-Type": "application/octet-stream",
+        **extra,
+    }
+
+
+def _person_url(device_id, *, width=2, height=2, frame_id=17):
+    return (
+        f"/api/v1/operator/cameras/{device_id}/person-view"
+        f"?width={width}&height={height}&frame_id={frame_id}"
+    )
+
+
+@pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
+def test_person_view_preserves_correlation_and_isolates_session_camera_identity(product):
+    first = product.enroll()
+    second = product.client.post(
+        "/api/v1/operator/cameras",
+        headers=product.headers,
+        json={"name": "Other", "host": "192.0.2.10", "source_uri": "rtsp://192.0.2.10/live"},
+    ).json()["device_id"]
+    payload = bytes(range(16))
+    for device_id in [first, second]:
+        response = product.client.post(
+            _person_url(device_id), headers=_person_headers(product), content=payload
+        )
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json() == {"status": "active", "frame_id": 17, "boxes": []}
+        assert product.token not in response.text
+    submissions = product.analytics.submissions
+    assert [str(item["camera_id"]) for item in submissions] == [first, second]
+    assert submissions[0]["owner_id"] == UUID(
+        bytes=hashlib.sha256(product.token.encode("ascii")).digest()[:16]
+    )
+    assert submissions[0]["owner_id"] != product.admin.id
+    assert submissions[0]["bytes"] == payload
+    assert submissions[0]["frame"].metadata.source_elapsed_ms == 0
+    assert submissions[0]["frame"].metadata.pixel_format == "BGRx"
+    assert bytes(submissions[0]["frame"].payload) == bytes(16)
+    assert (
+        product.client.get("/api/v1/operator/cameras", headers=product.headers).json()["cameras"][
+            0
+        ]["analytics_status"]
+        == "configured"
+    )
+
+
+@pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
+def test_person_view_requires_current_session_origin_and_enrolled_camera(product):
+    device_id = product.enroll()
+    route = _person_url(device_id)
+    cases = [
+        ({"Content-Type": "application/octet-stream", "Origin": "http://127.0.0.1:8080"}, 401),
+        ({**product.headers, "Content-Type": "application/octet-stream"}, 403),
+        (_person_headers(product, Origin="http://external.test:8080"), 403),
+        (_person_headers(product, Origin="http://localhost:8080"), 403),
+        (_person_headers(product, Origin="http://127.0.0.1:8090"), 403),
+    ]
+    for headers, expected in cases:
+        assert (
+            product.client.post(route, headers=headers, content=bytes(16)).status_code == expected
+        )
+    assert (
+        product.client.post(
+            _person_url(uuid4()), headers=_person_headers(product), content=bytes(16)
+        ).status_code
+        == 404
+    )
+    assert product.analytics.submissions == []
+
+
+@pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
+def test_person_view_rejects_geometry_types_body_lengths_and_encodings(product):
+    device_id = product.enroll()
+    route = _person_url(device_id)
+    for suffix in [
+        "width=0&height=2&frame_id=1",
+        "width=961&height=2&frame_id=1",
+        "width=960&height=960&frame_id=1",
+        "width=2&height=2&frame_id=-1",
+        "width=2&height=2&frame_id=2147483648",
+        "width=2&height=2&frame_id=1&width=2",
+        "width=2&height=2&frame_id=1&source=private-value",
+        "width=2.0&height=2&frame_id=1",
+    ]:
+        response = product.client.post(
+            route.split("?", 1)[0] + "?" + suffix,
+            headers=_person_headers(product),
+            content=bytes(16),
+        )
+        assert response.status_code == 422
+        assert "private-value" not in response.text
+    for headers, body, expected in [
+        (_person_headers(product, **{"Content-Type": "image/jpeg"}), bytes(16), 415),
+        (_person_headers(product, **{"Content-Encoding": "gzip"}), bytes(16), 415),
+        (_person_headers(product), bytes(15), 400),
+        (_person_headers(product, **{"Content-Length": "1638401"}), bytes(16), 413),
+        (_person_headers(product, **{"Content-Length": "bad"}), bytes(16), 400),
+    ]:
+        assert product.client.post(route, headers=headers, content=body).status_code == expected
+    assert product.analytics.submissions == []
+    # A valid larger frame passes the special route, whereas arbitrary camera
+    # mutation paths continue to use the original 16 KiB credential body gate.
+    assert (
+        product.client.post(
+            _person_url(device_id, width=100, height=100),
+            headers=_person_headers(product),
+            content=bytes(40000),
+        ).status_code
+        == 200
+    )
+    assert (
+        product.client.post(
+            f"/api/v1/operator/cameras/{device_id}/unknown",
+            headers=product.headers,
+            content=bytes(40000),
+        ).status_code
+        == 413
+    )
+
+
+@pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
+@pytest.mark.parametrize("revocation", ["session", "camera"])
+def test_person_view_reauthorizes_after_inference_before_returning_boxes(product, revocation):
+    device_id = product.enroll()
+
+    async def revoke(_submission):
+        if revocation == "session":
+            await product.sessions.revoke(product.token)
+        else:
+            product.cameras.remove(UUID(device_id))
+
+    product.analytics.callback = revoke
+    response = product.client.post(
+        _person_url(device_id), headers=_person_headers(product), content=bytes(16)
+    )
+    assert response.status_code == (401 if revocation == "session" else 404)
+    assert "boxes" not in response.text
+    assert bytes(product.analytics.submissions[0]["frame"].payload) == bytes(16)
+
+
+@pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
+def test_cookie_clear_closes_revoked_analytics_owner_without_admitting_media(product):
+    product.enroll()
+    asyncio.run(product.sessions.revoke(product.token))
+    response = product.client.delete("/api/v1/operator/media-session", headers=product.headers)
+    assert response.status_code == 204
+    assert product.analytics.closed == [
+        UUID(bytes=hashlib.sha256(product.token.encode("ascii")).digest()[:16])
+    ]
+    assert (
+        product.client.get("/api/v1/operator/cameras", headers=product.headers).status_code == 401
+    )
+    product.client.delete(
+        "/api/v1/operator/media-session", headers={"Authorization": "Bearer invalid"}
+    )
+    assert len(product.analytics.closed) == 1
+
+
+@pytest.mark.parametrize("product", [{"analytics_status": "unavailable"}], indirect=True)
+def test_person_configuration_failure_leaves_recording_product_available(product):
+    device_id = product.enroll()
+    response = product.client.get("/api/v1/operator/cameras", headers=product.headers)
+    assert response.status_code == 200
+    assert response.json()["cameras"][0]["recording"] is True
+    assert response.json()["cameras"][0]["analytics_status"] == "unavailable"
+    assert (
+        product.client.post(
+            _person_url(device_id), headers=_person_headers(product), content=bytes(16)
+        ).status_code
+        == 503
+    )
+
+
+async def _person_asgi(product, device_id, *, receive_frame=None, headers=None):
+    reads = 0
+    sent = []
+
+    async def receive():
+        nonlocal reads
+        reads += 1
+        if receive_frame is not None:
+            return await receive_frame()
+        return {"type": "http.request", "body": bytes(16), "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    path, query = _person_url(device_id).split("?", 1)
+    values = _person_headers(product) if headers is None else headers
+    await product.app(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": query.encode("ascii"),
+            "headers": [
+                (key.lower().encode("ascii"), value.encode("ascii"))
+                for key, value in values.items()
+            ],
+            "server": ("127.0.0.1", 8080),
+            "client": ("127.0.0.1", 12345),
+            "root_path": "",
+        },
+        receive,
+        send,
+    )
+    status = next(item["status"] for item in sent if item["type"] == "http.response.start")
+    raw = b"".join(item.get("body", b"") for item in sent if item["type"] == "http.response.body")
+    return status, reads, json.loads(raw)
+
+
+@pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
+def test_person_view_rejects_fifth_request_before_reading_its_body(product):
+    device_id = product.enroll()
+
+    async def concurrent_views():
+        gate = asyncio.Event()
+
+        async def wait(_submission):
+            await gate.wait()
+
+        product.analytics.callback = wait
+        tasks = [asyncio.create_task(_person_asgi(product, device_id)) for _ in range(5)]
+        try:
+            async with asyncio.timeout(2):
+                while len(product.analytics.submissions) < 4:
+                    await asyncio.sleep(0)
+                rejected = await tasks[4]
+            assert rejected[0:2] == (429, 0)
+        finally:
+            gate.set()
+        values = await asyncio.gather(*tasks)
+        assert [value[0] for value in values] == [200, 200, 200, 200, 429]
+        assert [value[1] for value in values] == [1, 1, 1, 1, 0]
+
+    product.client.portal.call(concurrent_views)
+
+
+@pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
+def test_person_view_stream_bound_timeout_and_auth_precede_pixel_admission(product):
+    device_id = product.enroll()
+
+    async def streams():
+        rejected = await _person_asgi(
+            product, device_id, headers={"Origin": "http://127.0.0.1:8080"}
+        )
+        assert rejected[0:2] == (401, 0)
+
+        async def oversize():
+            return {"type": "http.request", "body": bytes(17), "more_body": True}
+
+        async def short():
+            return {"type": "http.request", "body": bytes(8), "more_body": False}
+
+        async def delayed():
+            await asyncio.sleep(10)
+            return {"type": "http.request", "body": bytes(16), "more_body": False}
+
+        assert (await _person_asgi(product, device_id, receive_frame=oversize))[0:2] == (413, 1)
+        assert (await _person_asgi(product, device_id, receive_frame=short))[0:2] == (400, 1)
+        assert (await _person_asgi(product, device_id, receive_frame=delayed))[0:2] == (408, 1)
+        assert product.analytics.submissions == []
+        # Every rejection releases its admission slot.
+        assert (await _person_asgi(product, device_id))[0] == 200
+
+    product.client.portal.call(streams)

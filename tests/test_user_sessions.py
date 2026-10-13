@@ -128,6 +128,7 @@ def test_non_admin_session_is_authenticated_but_cannot_administer_users() -> Non
 def test_authority_change_revokes_existing_human_session() -> None:
     with TestClient(create_app()) as client:
         account = _create_initialized_user(client, username="admin.one", role="administrator")
+        _create_initialized_user(client, username="admin.two", role="administrator")
         session = _login(client, "admin.one")
         token = str(session["session_token"])
 
@@ -141,6 +142,29 @@ def test_authority_change_revokes_existing_human_session() -> None:
     assert changed.status_code == 200
     assert changed.json()["role"] == "operator"
     assert after_change.status_code == 401
+
+
+@pytest.mark.parametrize("patch", [{"enabled": False}, {"role": "operator"}])
+def test_last_admin_removal_returns_conflict_without_revoking_session(patch) -> None:
+    with TestClient(create_app()) as client:
+        account = _create_initialized_user(client, username="admin.one", role="administrator")
+        token = str(_login(client, "admin.one")["session_token"])
+        audit_before = client.get("/api/v1/users/audit", headers=_headers(token)).json()
+        rejected = client.patch(
+            f"/api/v1/users/{account['id']}", json=patch, headers=_headers(token)
+        )
+        still_authenticated = client.get("/api/v1/auth/me", headers=_headers(token))
+        accounts_after = client.get("/api/v1/users", headers=_headers(token))
+        audit_after = client.get("/api/v1/users/audit", headers=_headers(token))
+
+    assert rejected.status_code == 409
+    assert rejected.json() == {
+        "detail": "Activate another enabled administrator before removing this administrator"
+    }
+    assert still_authenticated.status_code == 200
+    assert still_authenticated.json() == account
+    assert accounts_after.json() == [account]
+    assert audit_after.json() == audit_before
 
 
 def test_password_identity_survives_restart_but_sessions_do_not() -> None:

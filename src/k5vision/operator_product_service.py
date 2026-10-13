@@ -146,6 +146,8 @@ class OperatorProductService:
         self._needs_reconcile = False
         self._spawns: set[asyncio.Task] = set()
         self._storage = None
+        self._storage_status = None
+        self._health_failures = {"media": 0, "gateway": 0}
         self._media_file = self.state_root / "operator-mediamtx.json"
         self._gateway_file = self.state_root / "operator-gateway.json"
 
@@ -181,6 +183,44 @@ class OperatorProductService:
             return "unavailable"
         return "disk_full" if self._disk_full else "ready"
 
+    def diagnostics(self) -> dict:
+        """Return the last bounded sample, with no paths, sources or credentials."""
+        storage = self._storage_status
+        snapshot = None
+        if storage is not None:
+            reason = "ready"
+            if not storage.recording_allowed:
+                if storage.free_bytes < 1024**3:
+                    reason = "free_space"
+                elif storage.total_bytes > self.max_recording_bytes:
+                    reason = "capacity"
+                else:
+                    reason = "inspection"
+            snapshot = {
+                "recording_bytes": storage.total_bytes,
+                "free_bytes": storage.free_bytes,
+                "recording_allowed": storage.recording_allowed,
+                "reason": reason,
+            }
+        return {
+            "worker_status": self.status(),
+            "max_recording_bytes": self.max_recording_bytes,
+            "storage": snapshot,
+        }
+
+    def _check_gateway(self) -> None:
+        """Probe the owned loopback HTTP listener without redirects or a proxy."""
+        request = Request(f"http://127.0.0.1:{self.public_port}/operator/")
+        try:
+            with build_opener(ProxyHandler({}), _NoRedirect()).open(request, timeout=2) as response:
+                if response.status != 200 or not response.read(1):
+                    raise ValueError
+        except HTTPError as error:
+            error.close()
+            raise OperatorProductError("Native operator gateway health check failed") from None
+        except Exception:
+            raise OperatorProductError("Native operator gateway health check failed") from None
+
     def _write_media(self) -> None:
         _private_configuration(
             self._media_file, json.dumps(self._configuration(self._sources), indent=2)
@@ -197,6 +237,18 @@ class OperatorProductService:
             except MediaWorkerError:
                 await asyncio.sleep(0.1)
         raise OperatorProductError("Native recording worker did not become ready")
+
+    async def _wait_gateway(self) -> None:
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if self._gateway is None or self._gateway.poll() is not None:
+                break
+            try:
+                await asyncio.to_thread(self._check_gateway)
+                return
+            except OperatorProductError:
+                await asyncio.sleep(0.1)
+        raise OperatorProductError("Native operator gateway did not become ready")
 
     def _start_media(self) -> None:
         from k5vision.operator_native_process import OwnedNativeProcess
@@ -248,15 +300,14 @@ class OperatorProductService:
                 self.recording_root, max_bytes=self.max_recording_bytes
             )
             storage = await asyncio.to_thread(self._storage.prune)
+            self._storage_status = storage
             self._disk_full = not storage.recording_allowed
             self._sources = tuple(sources)
             await self._spawn(self._start_media)
             await self._wait_media()
             self._paths = {source.binding.path_name for source in sources}
             await self._spawn(self._start_gateway)
-            await asyncio.sleep(0.15)
-            if self._gateway.poll() is not None:
-                raise OperatorProductError("Native operator gateway did not start")
+            await self._wait_gateway()
             self._ready = True
             self._task = asyncio.create_task(self._maintain(), name="operator-native-supervisor")
         except asyncio.CancelledError:
@@ -314,6 +365,7 @@ class OperatorProductService:
 
     async def _maintain(self) -> None:
         last_storage = 0.0
+        last_health = 0.0
         while not self._closing:
             await asyncio.sleep(2)
             try:
@@ -322,22 +374,44 @@ class OperatorProductService:
                         self._media is None
                         or self._media.poll() is not None
                         or self._needs_reconcile
+                        or self._health_failures["media"] >= 3
                     ):
                         self._ready = False
                         if self._media is not None:
                             await asyncio.to_thread(self._media.stop)
                         await self._spawn(self._start_media)
                         await self._wait_media()
+                        self._health_failures["media"] = 0
                         self._paths = {s.binding.path_name for s in self._sources}
                         self._needs_reconcile = False
-                    if self._gateway is None or self._gateway.poll() is not None:
+                    if (
+                        self._gateway is None
+                        or self._gateway.poll() is not None
+                        or self._health_failures["gateway"] >= 3
+                    ):
                         self._ready = False
                         if self._gateway is not None:
                             await asyncio.to_thread(self._gateway.stop)
                         await self._spawn(self._start_gateway)
-                        await asyncio.sleep(0.15)
+                        await self._wait_gateway()
+                        self._health_failures["gateway"] = 0
+                    if time.monotonic() - last_health >= 10 or any(self._health_failures.values()):
+                        for component, probe in (
+                            ("media", self.provider.info),
+                            ("gateway", self._check_gateway),
+                        ):
+                            try:
+                                if component == "media":
+                                    await probe()
+                                else:
+                                    await asyncio.to_thread(probe)
+                                self._health_failures[component] = 0
+                            except Exception:
+                                self._health_failures[component] += 1
+                        last_health = time.monotonic()
                     if time.monotonic() - last_storage >= 15:
                         result = await asyncio.to_thread(self._storage.prune)
+                        self._storage_status = result
                         paused = not result.recording_allowed
                         if paused != self._disk_full:
                             self._disk_full = paused
@@ -352,7 +426,7 @@ class OperatorProductService:
                             await asyncio.to_thread(self._write_media)
                             self._needs_reconcile = False
                         last_storage = time.monotonic()
-                    self._ready = True
+                    self._ready = not any(self._health_failures.values())
             except asyncio.CancelledError:
                 raise
             except Exception:

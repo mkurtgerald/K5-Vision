@@ -58,7 +58,9 @@ class _Storage:
         self.max_bytes = max_bytes
 
     def inspect(self):
-        return SimpleNamespace(recording_allowed=self.allowed)
+        return SimpleNamespace(
+            recording_allowed=self.allowed, total_bytes=100, free_bytes=2 * 1024**3
+        )
 
     prune = inspect
 
@@ -106,6 +108,7 @@ def native(tmp_path, monkeypatch):
         rtsp_port=18084,
         hls_port=18085,
     )
+    monkeypatch.setattr(service, "_check_gateway", lambda: None)
     return SimpleNamespace(
         service=service,
         processes=processes,
@@ -249,6 +252,112 @@ def test_dead_media_worker_restarts_from_saved_sources(native, monkeypatch):
             await service.stop()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("component", ["media", "gateway"])
+def test_alive_unresponsive_worker_is_recovered_after_repeated_probes(
+    native, monkeypatch, component
+):
+    _fast_maintenance(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        try:
+            await service.start((_source(1),))
+            failed = getattr(service, "_" + component)
+            other = service._gateway if component == "media" else service._media
+            attempts = []
+            observed_status = []
+
+            def check():
+                if getattr(service, "_" + component) is failed:
+                    observed_status.append(service.status())
+                    attempts.append(True)
+                    raise OperatorProductError("Worker is unresponsive")
+
+            async def info():
+                check()
+
+            if component == "media":
+                monkeypatch.setattr(service.provider, "info", info)
+            else:
+                monkeypatch.setattr(service, "_check_gateway", check)
+            await _until(
+                lambda: (
+                    getattr(service, "_" + component) is not failed and service.status() == "ready"
+                )
+            )
+            assert len(attempts) == 3
+            assert "unavailable" in observed_status
+            assert failed.stopped == 1
+            assert (service._gateway if component == "media" else service._media) is other
+            assert set(service._media.paths) == {_source(1).binding.path_name}
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_transient_health_failure_marks_unavailable_without_restarting_workers(native, monkeypatch):
+    _fast_maintenance(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        try:
+            await service.start(())
+            original = service._media, service._gateway
+            attempts = []
+            observed_status = []
+
+            def probe():
+                observed_status.append(service.status())
+                attempts.append(True)
+                if len(attempts) == 1:
+                    raise OperatorProductError("Temporary listener delay")
+
+            monkeypatch.setattr(service, "_check_gateway", probe)
+            await _until(lambda: len(attempts) >= 2 and service.status() == "ready")
+            assert observed_status[1] == "unavailable"
+            assert (service._media, service._gateway) == original
+            assert all(process.stopped == 0 for process in original)
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("total", "free", "allowed", "reason"),
+    [
+        (100, 2 * 1024**3, True, "ready"),
+        (100, 100, False, "free_space"),
+        (21 * 1024**3, 2 * 1024**3, False, "capacity"),
+        (100, 2 * 1024**3, False, "inspection"),
+    ],
+)
+def test_diagnostics_projects_only_last_aggregate_storage_sample(
+    native, total, free, allowed, reason
+):
+    service = native.service
+    assert service.diagnostics()["storage"] is None
+    service._storage_status = SimpleNamespace(
+        total_bytes=total, free_bytes=free, recording_allowed=allowed
+    )
+    result = service.diagnostics()
+    assert result == {
+        "worker_status": "unavailable",
+        "max_recording_bytes": 20 * 1024**3,
+        "storage": {
+            "recording_bytes": total,
+            "free_bytes": free,
+            "recording_allowed": allowed,
+            "reason": reason,
+        },
+    }
+    text = json.dumps(result)
+    assert service.credentials.password not in text
+    assert str(service.state_root) not in text
+    assert "rtsp://" not in text
 
 
 def test_partial_camera_update_is_reconciled_without_a_manual_process_crash(native, monkeypatch):

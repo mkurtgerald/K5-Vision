@@ -93,3 +93,25 @@ OpenCV or other native runtime binary is bundled. Exact native/transitive wheel
 notices and redistribution review, separate model/data rights, and commercial
 project authority remain release gates. See `docs/ANALYTICS_RUNTIME_PACKAGING.md`
 and `docs/DONOR_LEDGER.md`; the upstream register's pending reviews remain pending.
+
+## Independent OpenVINO / Open Model Zoo person view
+
+The optional K5 operator person-view adapter uses the documented public API of
+OpenVINO `2026.3.1` and the separately licensed Open Model Zoo
+`person-detection-retail-0013` FP16 model at revision
+`6697dead54ed1cdd664b0313189c2cb52ee6335e`. The official model definition is
+copyright (c) 2023-2024 Intel Corporation and expressly links the Apache-2.0
+license. The unchanged exact source-root license remains in
+`src/k5vision/data/analytics-runtime-Apache-2.0.txt`. NumPy `2.2.6` is separately
+BSD-3-Clause licensed; OpenVINO telemetry `2025.2.0` and supplied platform/native
+dependencies retain their own package notices.
+
+K5 wrote this adapter independently; no Analytics Lab detector/tracker source is
+copied or imported. That project's separate engineering-wrapper restrictions
+remain unchanged. No model, native runtime, dataset or image is bundled in K5.
+The official Apache OMZ person example used by the ephemeral native witness
+retains Intel/Open Model Zoo attribution and the same license. Do not remove
+applicable native/transitive package notices when provisioning separate wheels.
+Any product redistribution requires the outstanding artifact/native/transitive
+release review. See `docs/OPERATOR_PERSON_DETECTION_REVIEW.md` and the donor ledger
+for exact donor identities, view limits, evidence and unresolved release gates.
