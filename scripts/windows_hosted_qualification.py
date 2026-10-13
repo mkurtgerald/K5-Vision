@@ -1621,8 +1621,13 @@ class QualificationResources:
         self.final_cpu_seconds = self.final_active = self.final_total = None
         self.handles = {}  # pid -> (read-only process handle, creation FILETIME)
         # A handle alone is not resource evidence. Only complete live identity,
-        # RSS and listener observations can charge a lifetime Job association.
+        # RSS and listener observations count as a fully live observation.
         self.witnessed_births = set()  # (pid, creation FILETIME), retained through drain.
+        # Same-object owned exits can explain census changes without claiming a
+        # complete live RSS/listener observation. Never promote them to witnesses.
+        self.incomplete_exit_births = set()
+        self.absent_births = set()  # Exact exited identities actually omitted by a census.
+        self.unretained_handle_cleanup_failed = False
         self.birth_evidence_complete = False
         self.association_counts_complete = self.association_counts_recorded = False
         self.terminal_evidence_failure = None
@@ -1730,10 +1735,51 @@ class QualificationResources:
             resource_need(actual == birth, "pid_reuse_or_exit")
             return signaled
 
+        def open_member(pid):
+            try:
+                return self.native.open_member(pid, self.job)
+            except ResourceFailure as error:
+                if str(error) == "resource_handle_cleanup_failed":
+                    self.unretained_handle_cleanup_failed = True
+                raise
+
+        def listed_exit(pid):
+            # A retained exited handle does not bind a still-listed PID: the PID
+            # may have been reused. Reopen with the existing read-only API only.
+            handle, birth = open_member(pid)
+            try:
+                resource_need(birth == self.handles[pid][1], "pid_reuse_or_exit")
+                resource_need(self.native.belongs(handle, self.job), "ownership_unproven")
+                actual, signaled = self.native.identity(handle)
+                resource_need(actual == birth and signaled, "pid_reuse_or_exit")
+            finally:
+                try:
+                    self.native.close_handle(handle)
+                except BaseException:
+                    # Do not retry an ambiguous HANDLE value or later claim that
+                    # draining the registered handles proved this temporary close.
+                    self.unretained_handle_cleanup_failed = True
+                    raise
+
+        def no_reappearance(members):
+            resource_need(
+                not any(
+                    pid in self.handles and (pid, self.handles[pid][1]) in self.absent_births
+                    for pid in members
+                ),
+                "retry_member_set_expanded",
+            )
+
         rss, listeners = 0, set()
 
         def witnessed(pid):
             return pid in self.handles and (pid, self.handles[pid][1]) in self.witnessed_births
+
+        def classified_births():
+            resource_need(
+                not self.witnessed_births & self.incomplete_exit_births, "birth_evidence_overlap"
+            )
+            return self.witnessed_births | self.incomplete_exit_births
 
         def audit(members, *, prior_rss=0):
             nonlocal rss
@@ -1741,11 +1787,15 @@ class QualificationResources:
             for pid in sorted(members):
                 if pid not in self.handles:
                     resource_need(len(self.handles) < MAX_RETAINED_BIRTHS, "birth_evidence_limit")
-                    self.handles[pid] = self.native.open_member(pid, self.job)
+                    self.handles[pid] = open_member(pid)
                 known = witnessed(pid)
                 signaled = exited(pid)
-                resource_need(known or not signaled, "new_birth_already_exited")
+                resource_need(
+                    (pid, self.handles[pid][1]) not in self.incomplete_exit_births or signaled,
+                    "pid_reuse_or_exit",
+                )
                 if signaled:
+                    listed_exit(pid)
                     departed.add(pid)
                 else:
                     # API errors are fatal; CPU/commit cannot replace live RSS.
@@ -1755,24 +1805,24 @@ class QualificationResources:
                     if not known:
                         new_births.add(pid)
             rss = max(rss, attempt_rss)
-            # All retained PIDs are still bound by their exact process handles.
-            # Include departures and preserve evidence from every acquisition pass.
+            # Query the conservative retained-PID superset, including departures.
+            # Preserve endpoint evidence from every acquisition pass.
             listeners.update(self.native.listeners(set(self.handles)))
             self.observed_listeners.update(listeners)
             resource_need(len(self.observed_listeners) <= 4096, "listener_evidence_limit")
-            completed = set()
+            completed, incomplete_exits = set(), set()
             for pid in members:
                 signaled = exited(pid)
                 resource_need(pid not in departed or signaled, "pid_reuse_or_exit")
-                resource_need(
-                    pid not in new_births or not signaled, "new_birth_observation_incomplete"
-                )
                 if signaled:
                     departed.add(pid)
+                    if not witnessed(pid):
+                        incomplete_exits.add((pid, self.handles[pid][1]))
                 elif pid in new_births:
                     completed.add((pid, self.handles[pid][1]))
             # Never promote a partially measured or already-exited new handle.
             self.witnessed_births.update(completed)
+            self.incomplete_exit_births.update(incomplete_exits)
             return departed, attempt_rss
 
         remaining_members = None
@@ -1781,10 +1831,11 @@ class QualificationResources:
             fresh()
             before = accounting()
             members = self.native.members(self.job)
-            for pid, birth in self.witnessed_births:
+            for pid, birth in classified_births():
                 resource_need(pid in self.handles, "departure_handle_missing")
                 resource_need(self.handles[pid][1] == birth, "pid_reuse_or_exit")
             resource_need(len(members) <= ACTIVE_LIMIT, "initial_members_exceed_limit")
+            no_reappearance(members)
             if remaining_members is not None:
                 # Previously departed PIDs cannot reappear under retained handles.
                 resource_need(
@@ -1793,55 +1844,79 @@ class QualificationResources:
                 )
             for pid in self.handles.keys() - members:
                 resource_need(exited(pid), "departure_not_signaled")
-            unobserved = {pid for pid in members if not witnessed(pid)}
+                self.absent_births.add((pid, self.handles[pid][1]))
+            known_births = classified_births()
+            unobserved = {
+                pid
+                for pid in members
+                if pid not in self.handles or (pid, self.handles[pid][1]) not in known_births
+            }
             if initial_allowance is None:
                 # Initial accounting and membership are non-atomic. This covers
                 # unobserved-or-rejected associations in that initial census,
                 # without claiming they all predate acquisition. Freeze it here:
                 # later attempts may never forgive additional unexplained births.
-                initial_allowance = max(0, before[0] - len(self.witnessed_births) - len(unobserved))
+                initial_allowance = max(0, before[0] - len(known_births) - len(unobserved))
             # Accounting precedes the non-atomic membership read. Live arrivals
             # may outnumber that older count, but excess above the frozen
             # allowance is never retryable or charged to a future arrival.
             resource_need(
-                before[0] - len(self.witnessed_births) - initial_allowance <= len(unobserved),
+                before[0] - len(known_births) - initial_allowance <= len(unobserved),
                 "initial_birth_evidence_gap",
             )
             departed, attempt_rss = audit(members)
             after = accounting()
             survivors = self.native.members(self.job)
             newcomers = survivors - members
-            resource_need(not survivors & departed, "departed_member_still_listed")
-            resource_need(members - departed <= survivors, "final_survivor_missing")
+            no_reappearance(survivors)
+            departed_still_listed = survivors & departed
+            for pid in departed_still_listed:
+                listed_exit(pid)
+            for pid in members - departed - survivors:
+                # A fully audited member may exit before the closing census.
+                # Only its retained same-object owned exit can explain absence.
+                resource_need(witnessed(pid) and exited(pid), "final_survivor_missing")
+                departed.add(pid)
+            for pid in members - survivors:
+                self.absent_births.add((pid, self.handles[pid][1]))
             resource_need(len(survivors) <= ACTIVE_LIMIT, "final_members_exceed_limit")
             resource_need(
-                after[0] - len(self.witnessed_births) - initial_allowance <= len(newcomers),
+                after[0] - len(classified_births()) - initial_allowance <= len(newcomers),
                 "final_birth_evidence_gap",
             )
             resource_need(not newcomers & self.handles.keys(), "new_birth_identity_reappeared")
-            for pid in survivors - newcomers:
-                resource_need(not exited(pid), "final_survivor_signaled")
+            final_signaled = set()
+            for pid in survivors - newcomers - departed:
+                if exited(pid):
+                    listed_exit(pid)
+                    departed.add(pid)
+                    final_signaled.add(pid)
             if newcomers:
-                # Charge every counter increment with full live evidence before
-                # retrying. Add to the earlier sum conservatively; a later smaller
-                # census cannot erase observed resident memory or listener evidence.
+                # Audit every arrival before retrying. Preserve full live evidence
+                # or exact owned exit proof separately. Conservative RSS sums and
+                # listener unions survive either outcome and every later census.
                 new_departures, _ = audit(newcomers, prior_rss=attempt_rss)
-                resource_need(not new_departures, "new_birth_observation_incomplete")
+                departed.update(new_departures)
             fresh()
             counts_match = before[1] == len(members) and after[1] == len(survivors)
             if not departed and not newcomers and counts_match and after[0] == before[0]:
                 resource_need(
-                    after[0] == len(self.witnessed_births) + initial_allowance,
+                    after[0] == len(classified_births()) + initial_allowance,
                     "final_birth_evidence_gap",
                 )
                 break
             # Re-read non-atomic counts only after every visible live arrival was
-            # fully witnessed and every missing retained handle proved exited.
+            # fully witnessed or proved exited, and every missing retained handle
+            # proved exited. Incomplete exits never count as full live evidence.
             # Never reset lifetime count gaps or the original acquisition deadline.
             if attempt + 1 == MAX_SAMPLE_ATTEMPTS:
                 resource_need(before[1] == len(members), "initial_active_count_mismatch")
                 resource_need(after[1] == len(survivors), "final_active_count_mismatch")
+                resource_need(not departed_still_listed, "departed_member_still_listed")
+                resource_need(not final_signaled, "final_survivor_signaled")
                 raise ResourceFailure("resource_evidence_unstable")
+            # Signaled is not absent: retain every PID from the actual census
+            # until a later membership read omits it with exact owned exit proof.
             remaining_members = survivors
         available, total, times, disk = self.native.host(self.disk_root)
         delta = tuple(b - a for a, b in zip(self.host_seed, times, strict=True))
@@ -1872,7 +1947,9 @@ class QualificationResources:
         if self.closed:
             resource_need(self.cleanup_complete, "owned_job_cleanup_failed")
             return
-        failures = []
+        failures = (
+            ["resource_handle_cleanup_failed"] if self.unretained_handle_cleanup_failed else []
+        )
         try:
             if self.job is not None:
                 try:
@@ -1905,7 +1982,10 @@ class QualificationResources:
         self.association_counts_complete = (
             self.job is not None
             and type(self.final_total) is int
-            and len(self.witnessed_births) <= self.final_total < 2**32
+            and not self.witnessed_births & self.incomplete_exit_births
+            and len(self.witnessed_births) + len(self.incomplete_exit_births)
+            <= self.final_total
+            < 2**32
             and type(self.final_active) is int
             and self.final_active == 0
             and (self.last_total is None or self.final_total >= self.last_total)

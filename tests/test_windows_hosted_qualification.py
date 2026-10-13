@@ -359,20 +359,22 @@ class StableSnapshotFakeTests(unittest.TestCase):
         self.native.listeners = listeners
         return calls
 
-    def test_newly_discovered_exit_before_rss_now_refuses_missing_live_evidence(self):
+    def test_newly_discovered_proved_exit_before_rss_is_incomplete_coverage(self):
         owner = self.make()
         original = self.native.open_member
 
         def opened(pid, job):
             value = original(pid, job)
-            if pid == 11:
+            if pid == 11 and pid in self.native.pids:
                 self.expire(pid)
             return value
 
         self.native.open_member = opened
-        with self.assertRaisesRegex(ResourceFailure, "new_birth_already_exited"):
-            owner.sample()
-        self.assertEqual(owner.witnessed_births, set())
+        snapshot = owner.sample()
+        self.assertEqual((snapshot.active_processes, snapshot.rss_bytes), (1, 100))
+        self.assertEqual(owner.witnessed_births, {(12, 102)})
+        self.assertEqual(owner.incomplete_exit_births, {(11, 101)})
+        owner.close()
         self.assertTrue(owner.cleanup_complete)
 
     def test_previously_witnessed_exit_before_rss_can_stabilize(self):
@@ -393,7 +395,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
         self.assertEqual(self.native.read_count, 4)
         self.assertEqual(set(owner.handles), {11, 12})
         owner.close()
-        self.assertEqual(self.native.closed_handles, [11, 12])
+        self.assertEqual(self.native.closed_handles, [11, 11, 12])
 
     def test_exit_during_rss_preserves_observed_high_water(self):
         owner = self.make_witnessed()
@@ -432,7 +434,7 @@ class StableSnapshotFakeTests(unittest.TestCase):
         owner.close()
         self.assertEqual(owner.final_cpu_seconds, 3)
 
-    def test_exit_after_identity_pass_is_not_an_unproved_retry(self):
+    def test_exit_after_identity_pass_requires_retained_exit_proof_and_fresh_retry(self):
         owner = self.make()
         original = self.native.members
         calls = []
@@ -444,12 +446,15 @@ class StableSnapshotFakeTests(unittest.TestCase):
             return original(job)
 
         self.native.members = members
-        with self.assertRaisesRegex(ResourceFailure, "final_survivor_missing"):
-            owner.sample()
-        self.assertEqual(len(calls), 2)
+        snapshot = owner.sample()
+        self.assertEqual((snapshot.active_processes, snapshot.rss_bytes), (1, 200))
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(owner.witnessed_births, {(11, 101), (12, 102)})
+        self.assertEqual(owner.incomplete_exit_births, set())
+        owner.close()
         self.assertTrue(self.job.drained)
 
-    def test_survivor_exit_during_final_state_recheck_refuses(self):
+    def test_survivor_exit_during_final_state_recheck_requires_fresh_stable_retry(self):
         owner = self.make()
         original = self.native.identity
         reads = {11: 0, 12: 0}
@@ -461,9 +466,10 @@ class StableSnapshotFakeTests(unittest.TestCase):
             return original(handle)
 
         self.native.identity = identity
-        with self.assertRaisesRegex(ResourceFailure, "final_survivor_signaled"):
-            owner.sample()
-        self.assertEqual(self.native.read_count, 2)
+        snapshot = owner.sample()
+        self.assertEqual(snapshot.active_processes, 1)
+        self.assertEqual(self.native.read_count, 4)
+        self.assertIn((11, 101), owner.absent_births)
 
     def test_changed_creation_on_signaled_handle_never_retries(self):
         owner = self.make()
@@ -837,13 +843,13 @@ class BirthLedgerFakeTests(unittest.TestCase):
         owner = self.make_witnessed()
         self.birth()
         self.native.identities[13] = (103, True)
-        with self.assertRaisesRegex(ResourceFailure, "new_birth_already_exited"):
+        with self.assertRaisesRegex(ResourceFailure, "departed_member_still_listed"):
             owner.sample()
         self.assertNotIn((13, 103), owner.witnessed_births)
         self.assertIn(13, self.native.closed_handles)
         self.assertTrue(owner.cleanup_complete)
 
-    def test_new_birth_exiting_after_rss_before_listener_completion_refuses(self):
+    def test_new_birth_exiting_after_rss_before_listener_completion_is_not_fully_observed(self):
         owner = self.make_witnessed()
         self.birth()
         original = self.native.rss
@@ -855,9 +861,10 @@ class BirthLedgerFakeTests(unittest.TestCase):
             return value
 
         self.native.rss = rss
-        with self.assertRaisesRegex(ResourceFailure, "new_birth_observation_incomplete"):
-            owner.sample()
+        snapshot = owner.sample()
         self.assertNotIn((13, 103), owner.witnessed_births)
+        self.assertEqual(owner.incomplete_exit_births, {(13, 103)})
+        self.assertEqual(snapshot.total_births, 3)
         self.assertEqual(owner.observed_peak_rss_bytes, 300)
 
     def test_new_birth_rss_failure_does_not_count_retained_handle(self):
@@ -1286,8 +1293,8 @@ class NonAtomicCensusFakeTests(unittest.TestCase):
                     )
 
                 categories = dict(
-                    exited="new_birth_already_exited",
-                    incomplete="new_birth_observation_incomplete",
+                    exited="departed_member_still_listed",
+                    incomplete="departed_member_still_listed",
                     reused="pid_reuse_or_exit",
                     foreign="ownership_unproven",
                     rss="resource_evidence_unavailable",
@@ -1299,7 +1306,9 @@ class NonAtomicCensusFakeTests(unittest.TestCase):
                     self.native.fail = "listener"
                 with self.assertRaisesRegex(ResourceFailure, categories[failure]):
                     owner.sample()
-                self.assertEqual(calls, [1])
+                self.assertEqual(
+                    calls, [1, 2, 3, 4, 5, 6] if failure in ("exited", "incomplete") else [1]
+                )
                 self.assertNotIn((13, 103), owner.witnessed_births)
                 self.assertTrue(owner.cleanup_complete)
                 self.assertIn(13, self.native.closed_handles)
@@ -1556,8 +1565,8 @@ class SampledAllowanceFakeTests(unittest.TestCase):
                     foreign="ownership_unproven",
                     rss="resource_evidence_unavailable",
                     listener="owned_listener_not_loopback",
-                    exited="new_birth_already_exited",
-                    incomplete="new_birth_observation_incomplete",
+                    exited="departed_member_still_listed",
+                    incomplete="departed_member_still_listed",
                     identity="pid_reuse_or_exit",
                 )[failure]
                 with self.assertRaisesRegex(ResourceFailure, category):
@@ -1791,6 +1800,28 @@ class SampledRunOwnedTests(unittest.TestCase):
             native.rss_each = GIB + 1
         elif failure == "ownership":
             native.belongs = lambda handle, job: native.read_count < 5
+        elif failure == "temporary_cleanup":
+            original_identity = native.identity
+            original_open = native.open_member
+            original_close = native.close_handle
+
+            def identity(handle):
+                if handle == 11 and native.read_count >= 5:
+                    native.identities[11] = (101, True)
+                return original_identity(handle)
+
+            def opened(pid, job):
+                if pid == 11 and native.read_count >= 5:
+                    native.identities[111] = (101, True)
+                    return 111, 101
+                return original_open(pid, job)
+
+            def close(handle):
+                original_close(handle)
+                if handle == 111:
+                    raise ResourceFailure("resource_handle_cleanup_failed")
+
+            native.identity, native.open_member, native.close_handle = identity, opened, close
 
         def resources(common, disk):
             owner = implementation(common, disk, clock=clock, native_factory=lambda: native)
@@ -1944,6 +1975,40 @@ class SampledRunOwnedTests(unittest.TestCase):
         )
         self.assertEqual((state["cpu_seconds"], state["peak_rss_bytes"]), (3, 200))
 
+    def test_temporary_close_failure_keeps_counts_but_never_claims_cleanup_or_receipt(self):
+        state = self.state(8, 3)
+        error, instances, native = self.run_job(state, total=5, failure="temporary_cleanup")
+        owner = instances[0]
+        self.assertEqual(str(error), "cleanup_incomplete")
+        self.assertTrue(owner.unretained_handle_cleanup_failed and owner.job.drained)
+        self.assertFalse(owner.cleanup_complete or state["all_owned_cleanup"])
+        self.assertIs(state["pending_payload"], True)
+        self.assertTrue(owner.association_counts_complete and owner.association_counts_recorded)
+        self.assertEqual(self.counts(state), (13, 5, 8))
+        self.assertEqual((state["cpu_seconds"], state["peak_rss_bytes"]), (3, 200))
+        self.assertEqual(native.closed_handles, [111, 11, 12])
+        with self.assertRaisesRegex(ResourceFailure, "owned_job_cleanup_failed"):
+            owner.close()
+        self.assertEqual(native.closed_handles, [111, 11, 12])
+        self.assertEqual(self.counts(state), (13, 5, 8))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "owned"
+            work.mkdir()
+            workflow = root / guard.PROFILES["alpha"]
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text("inert mock workflow")
+            state.update(prepared=True, failed=False, finished_steps=[0])
+            with (
+                patch.object(guard, "ROOT", root),
+                patch.object(guard, "read_state", return_value=(work, state)),
+                patch.object(guard, "workflow_steps", return_value=[{"body": "mock"}]),
+                self.assertRaisesRegex(guard.Refusal, "cleanup_unproven"),
+            ):
+                guard.finish("alpha")
+            self.assertTrue(work.exists())
+            self.assertFalse((root / "hosted-alpha-qualification.json").exists())
+
     def test_cpu_and_wall_refusal_still_retain_final_coverage_counts(self):
         for limit, category in (("cpu", "cpu_limit"), ("wall", "deadline")):
             with self.subTest(limit=limit):
@@ -2008,6 +2073,525 @@ class SampledRunOwnedTests(unittest.TestCase):
         with self.assertRaisesRegex(guard.Refusal, "association_counts_unavailable"):
             guard.accumulate_associations(state, owner)
         self.assertEqual(state, association_state(8, 3))
+
+
+class ProvenExitTimingTests(unittest.TestCase):
+    make = AdapterTests.make
+    make_witnessed = StableSnapshotFakeTests.make_witnessed
+    expire = StableSnapshotFakeTests.expire
+    birth = BirthLedgerFakeTests.birth
+    during_members = NonAtomicCensusFakeTests.during_members
+    during_listeners = StableSnapshotFakeTests.during_listeners
+
+    def timeline(self, timing, *, closing=False, still_listed=False, disappear=True):
+        owner = self.make_witnessed()
+        if not closing:
+            self.birth()
+        originals = {
+            name: getattr(self.native, name)
+            for name in ("open_member", "identity", "rss", "listeners", "members")
+        }
+        events = dict(opens=0, identities=0, rss=[], listeners=0, members=0, exited=False)
+        row = (13, 2, b"\x7f\0\0\1", 9000)
+
+        def expire():
+            if events["exited"]:
+                return
+            events["exited"] = True
+            self.native.identities[13] = (103, True)
+            if not still_listed:
+                self.native.pids.remove(13)
+
+        def opened(pid, job):
+            value = originals["open_member"](pid, job)
+            if pid == 13:
+                events["opens"] += 1
+                if timing == "open" and events["opens"] == 1:
+                    expire()
+            return value
+
+        def identity(handle):
+            if handle == 13:
+                events["identities"] += 1
+                if (timing, events["identities"]) in {
+                    ("before_rss", 1),
+                    ("post_listener_check", 2),
+                    ("final_live_check", 3),
+                }:
+                    expire()
+            value = originals["identity"](handle)
+            if handle == 13 and (timing, events["identities"]) in {
+                ("post_listener_return", 2),
+                ("final_live_return", 3),
+            }:
+                expire()
+            return value
+
+        def rss(handle):
+            events["rss"].append(handle)
+            value = originals["rss"](handle)
+            if handle == 13 and timing == "rss":
+                expire()
+            return value
+
+        def listeners(pids):
+            rows = originals["listeners"](pids)
+            if self.job.drained:
+                return rows
+            events["listeners"] += 1
+            if closing and events["listeners"] == 1:
+                self.birth()
+            if 13 in pids and timing == "listeners":
+                expire()
+            return rows | ({row} if 13 in pids else set())
+
+        def members(job):
+            events["members"] += 1
+            if timing == "closing_members" and events["members"] == 2:
+                expire()
+            if still_listed and disappear and events["members"] == 3:
+                self.native.pids.remove(13)
+            return originals["members"](job)
+
+        self.native.open_member, self.native.identity = opened, identity
+        self.native.rss, self.native.listeners, self.native.members = rss, listeners, members
+        return owner, events
+
+    def test_all_same_object_exit_timings_preserve_evidence_and_require_stability(self):
+        incomplete = {"open", "before_rss", "rss", "listeners", "post_listener_check"}
+        timings = sorted(incomplete) + [
+            "post_listener_return",
+            "closing_members",
+            "final_live_check",
+            "final_live_return",
+        ]
+        for timing in timings:
+            with self.subTest(timing=timing):
+                owner, events = self.timeline(timing)
+                snapshot = owner.sample()
+                self.assertEqual(snapshot.total_births, 3)
+                self.assertEqual(events["members"], 2 if timing == "final_live_return" else 4)
+                self.assertEqual(
+                    snapshot.active_processes, 3 if timing == "final_live_return" else 2
+                )
+                self.assertEqual(
+                    snapshot.rss_bytes, 200 if timing in {"open", "before_rss"} else 300
+                )
+                self.assertEqual(snapshot.owned_loopback_listeners, 1)
+                self.assertEqual((13, 103) in owner.incomplete_exit_births, timing in incomplete)
+                self.assertEqual((13, 103) in owner.witnessed_births, timing not in incomplete)
+                if timing == "final_live_return":
+                    self.clock.value += 0.25
+                    self.assertEqual(owner.sample().active_processes, 2)
+                self.assertIn((13, 103), owner.absent_births)
+                owner.close()
+                state = association_state()
+                guard.accumulate_associations(state, owner)
+                self.assertEqual(state, association_state(3, 2 if timing in incomplete else 3))
+
+    def test_closing_newcomer_incomplete_exits_always_consume_a_fresh_retry(self):
+        for timing in ("open", "before_rss", "rss", "listeners", "post_listener_check"):
+            with self.subTest(timing=timing):
+                owner, events = self.timeline(timing, closing=True)
+                snapshot = owner.sample()
+                self.assertEqual((snapshot.total_births, snapshot.active_processes), (3, 2))
+                self.assertEqual(events["members"], 4)
+                self.assertEqual(owner.incomplete_exit_births, {(13, 103)})
+                self.assertEqual(owner.witnessed_births, {(11, 101), (12, 102)})
+
+    def test_signaled_but_still_listed_requires_fresh_identity_then_actual_absence(self):
+        for closing in (False, True):
+            with self.subTest(closing=closing):
+                owner, events = self.timeline("rss", closing=closing, still_listed=True)
+                snapshot = owner.sample()
+                self.assertEqual(snapshot.active_processes, 2)
+                # Removal follows the next accounting read, so that stale active
+                # count consumes another retry before an exact stable census.
+                self.assertEqual(events["members"], 6)
+                if not closing:
+                    self.assertGreater(events["opens"], 1)
+                self.assertIn((13, 103), owner.absent_births)
+                owner.close()
+                self.assertEqual(self.native.closed_handles.count(13), events["opens"])
+
+    def test_permanently_still_listed_exit_exhausts_three_attempts_without_acceptance(self):
+        owner, events = self.timeline("rss", still_listed=True, disappear=False)
+        with self.assertRaisesRegex(ResourceFailure, "departed_member_still_listed"):
+            owner.sample()
+        self.assertEqual(events["members"], 6)
+        self.assertEqual(owner.incomplete_exit_births, {(13, 103)})
+        self.assertNotIn((13, 103), owner.absent_births)
+        self.assertTrue(owner.cleanup_complete)
+
+    def test_absent_identity_cannot_reappear_in_later_sample_even_with_positive_allowance(self):
+        for timing in ("rss", "post_listener_return"):
+            for extra in (0, 2):
+                with self.subTest(timing=timing, extra=extra):
+                    owner, events = self.timeline(timing)
+                    owner.sample()
+                    self.clock.value += 0.25
+                    self.native.pids.add(13)
+                    self.native.total += extra
+                    self.job.total_processes = self.native.total
+                    opens = events["opens"]
+                    with self.assertRaisesRegex(ResourceFailure, "retry_member_set_expanded"):
+                        owner.sample()
+                    self.assertEqual(events["opens"], opens)
+
+    def test_full_witness_pid_reuse_without_any_observed_absence_is_not_an_allowance(self):
+        owner = self.make_witnessed()
+        self.native.identities[11] = (101, True)
+        self.native.identities[111] = (999, False)
+        self.native.total = self.job.total_processes = 3
+        original = self.native.open_member
+        self.native.open_member = lambda pid, job: (111, 999) if pid == 11 else original(pid, job)
+        with self.assertRaisesRegex(ResourceFailure, "pid_reuse_or_exit"):
+            owner.sample()
+        self.assertEqual(owner.absent_births, set())
+        self.assertEqual(self.native.closed_handles.count(111), 1)
+        self.assertTrue(owner.cleanup_complete)
+
+    def test_incomplete_exit_pid_reuse_without_any_observed_absence_is_refused(self):
+        owner, _ = self.timeline("rss", still_listed=True, disappear=False)
+        self.native.total = self.job.total_processes = 4  # One initial unexplained association.
+        original_members, original_open = self.native.members, self.native.open_member
+        reused = False
+
+        def members(job):
+            nonlocal reused
+            if self.native.read_count == 3:
+                reused = True
+                self.native.total = self.job.total_processes = 5
+                self.native.identities[113] = (999, False)
+            return original_members(job)
+
+        def opened(pid, job):
+            return (113, 999) if pid == 13 and reused else original_open(pid, job)
+
+        self.native.members, self.native.open_member = members, opened
+        with self.assertRaisesRegex(ResourceFailure, "pid_reuse_or_exit"):
+            owner.sample()
+        self.assertEqual(owner.incomplete_exit_births, {(13, 103)})
+        self.assertNotIn((13, 103), owner.absent_births)
+        self.assertEqual(self.native.closed_handles.count(113), 1)
+
+    def test_incomplete_exit_cannot_explain_a_simultaneous_unknown_birth(self):
+        for initial_gap in (0, 2):
+            with self.subTest(initial_gap=initial_gap):
+                owner, _ = self.timeline("rss")
+                self.native.total += initial_gap
+                self.job.total_processes = self.native.total
+                original = self.native.rss
+
+                def rss(handle, original=original):
+                    result = original(handle)
+                    if handle == 13:
+                        self.native.total += 1
+                        self.job.total_processes = self.native.total
+                    return result
+
+                self.native.rss = rss
+                with self.assertRaisesRegex(ResourceFailure, "final_birth_evidence_gap"):
+                    owner.sample()
+                self.assertEqual(owner.incomplete_exit_births, {(13, 103)})
+                self.assertEqual(owner.final_total, 4 + initial_gap)
+                self.assertTrue(owner.cleanup_complete)
+
+    def test_incomplete_exit_is_classified_once_across_retries_and_later_samples(self):
+        owner, _ = self.timeline("rss")
+        owner.sample()
+        for total in (3, 3, 5):
+            self.clock.value += 0.25
+            self.native.total = self.job.total_processes = total
+            self.assertEqual(owner.sample().total_births, total)
+            self.assertEqual(owner.incomplete_exit_births, {(13, 103)})
+        owner.close()
+        state = association_state()
+        guard.accumulate_associations(state, owner)
+        self.assertEqual(state, association_state(5, 2))
+
+    def test_full_and_incomplete_identity_sets_must_be_disjoint(self):
+        owner = self.make_witnessed()
+        owner.incomplete_exit_births.add((11, 101))
+        with self.assertRaisesRegex(ResourceFailure, "birth_evidence_overlap"):
+            owner.sample()
+        self.assertFalse(owner.association_counts_complete)
+
+    def test_incomplete_exit_never_waives_rss_listener_identity_or_ownership_api_errors(self):
+        for failure, category in (
+            ("rss", "resource_evidence_unavailable"),
+            ("listeners", "owned_listener_not_loopback"),
+            ("identity", "process_wait_failed"),
+            ("birth", "pid_reuse_or_exit"),
+            ("ownership", "ownership_unproven"),
+        ):
+            with self.subTest(failure=failure):
+                owner = self.make_witnessed()
+                self.birth()
+                original_rss = self.native.rss
+                original_identity = self.native.identity
+                original_belongs = self.native.belongs
+                reads = []
+
+                def rss(handle, failure=failure, original_rss=original_rss):
+                    value = original_rss(handle)
+                    if handle == 13:
+                        self.expire(13)
+                        if failure == "rss":
+                            raise ResourceFailure("resource_evidence_unavailable")
+                    return value
+
+                def identity(
+                    handle, failure=failure, original_identity=original_identity, reads=reads
+                ):
+                    if handle == 13:
+                        reads.append(handle)
+                        if len(reads) == 2:
+                            if failure == "identity":
+                                raise ResourceFailure("process_wait_failed")
+                            if failure == "birth":
+                                return 999, True
+                    return original_identity(handle)
+
+                def belongs(handle, job, failure=failure, original_belongs=original_belongs):
+                    return not (
+                        failure == "ownership" and handle == 13 and self.native.identities[13][1]
+                    ) and original_belongs(handle, job)
+
+                self.native.rss, self.native.identity, self.native.belongs = rss, identity, belongs
+                if failure == "listeners":
+                    self.native.fail = "listener"
+                with self.assertRaisesRegex(ResourceFailure, category):
+                    owner.sample()
+                self.assertEqual(owner.incomplete_exit_births, set())
+                self.assertNotIn((13, 103), owner.witnessed_births)
+                self.assertTrue(owner.cleanup_complete)
+
+    def test_late_missing_member_needs_signaled_same_identity_and_successful_recheck(self):
+        for failure, category in (
+            ("live", "final_survivor_missing"),
+            ("birth", "pid_reuse_or_exit"),
+            ("identity", "process_wait_failed"),
+            ("ownership", "ownership_unproven"),
+        ):
+            with self.subTest(failure=failure):
+                owner = self.make_witnessed()
+                original_identity = self.native.identity
+                original_belongs = self.native.belongs
+                missing = []
+
+                def members(number, failure=failure, missing=missing):
+                    if number == 2:
+                        missing.append(True)
+                        self.native.pids.remove(11)
+                        if failure != "live":
+                            self.native.identities[11] = (999 if failure == "birth" else 101, True)
+
+                def identity(
+                    handle, failure=failure, missing=missing, original_identity=original_identity
+                ):
+                    if missing and handle == 11 and failure == "identity":
+                        raise ResourceFailure("process_wait_failed")
+                    return original_identity(handle)
+
+                self.native.identity = identity
+
+                def belongs(
+                    handle, job, failure=failure, missing=missing, original_belongs=original_belongs
+                ):
+                    return not (
+                        missing and handle == 11 and failure == "ownership"
+                    ) and original_belongs(handle, job)
+
+                self.native.belongs = belongs
+                self.during_members(members)
+                with self.assertRaisesRegex(ResourceFailure, category):
+                    owner.sample()
+
+    def test_incomplete_exit_does_not_erase_rss_or_listener_limits(self):
+        for limit in ("rss", "listeners"):
+            with self.subTest(limit=limit):
+                owner, _ = self.timeline("rss")
+                if limit == "rss":
+                    self.native.rss_each = GIB
+                    category = "owned_rss_exceeded"
+                else:
+                    original = self.native.listeners
+
+                    def listeners(pids, original=original):
+                        rows = original(pids)
+                        return (
+                            rows
+                            if self.job.drained
+                            else rows | {(13, 2, b"\x7f\0\0\1", port) for port in range(1, 4097)}
+                        )
+
+                    self.native.listeners = listeners
+                    category = "listener_evidence_limit"
+                with self.assertRaisesRegex(ResourceFailure, category):
+                    owner.sample()
+                self.assertTrue(owner.cleanup_complete)
+
+    def test_closing_incomplete_exit_each_attempt_cannot_return_without_stability(self):
+        owner = self.make_witnessed()
+        original = self.native.rss
+
+        def rss(handle):
+            value = original(handle)
+            if handle >= 13:
+                self.expire(handle)
+            return value
+
+        self.native.rss = rss
+        calls = self.during_listeners(
+            lambda number, rows: (
+                (self.birth(13 + number // 2, 103 + number // 2) if number % 2 else None) or rows
+            )
+        )
+        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unstable"):
+            owner.sample()
+        self.assertEqual((len(calls), self.native.read_count), (6, 6))
+        self.assertEqual(len(owner.incomplete_exit_births), 3)
+        self.assertTrue(owner.cleanup_complete and owner.association_counts_complete)
+
+    def test_late_signaled_survivor_each_attempt_exhausts_without_stable_snapshot(self):
+        owner = self.make()
+        self.birth()
+        owner.sample()
+        self.clock.value += 0.25
+        self.native.read_count = 0
+        original = self.native.identity
+
+        def identity(handle):
+            read = self.native.read_count
+            if read in (2, 4, 6) and handle == 10 + read // 2 and handle in self.native.pids:
+                self.expire(handle)
+            return original(handle)
+
+        self.native.identity = identity
+        with self.assertRaisesRegex(ResourceFailure, "final_survivor_signaled"):
+            owner.sample()
+        self.assertEqual(self.native.read_count, 6)
+
+    def test_original_inclusive_one_second_deadline_covers_exit_retries(self):
+        for duration in (1.0, 1.0 + 2**-10):
+            with self.subTest(duration=duration):
+                owner, _ = self.timeline("rss")
+                original = self.native.listeners
+
+                def listeners(pids, original=original, duration=duration):
+                    rows = original(pids)
+                    if not self.job.drained:
+                        self.clock.value += duration / 2
+                    return rows
+
+                self.native.listeners = listeners
+                if duration == 1:
+                    snapshot = owner.sample()
+                    self.assertEqual(snapshot.measured_at - snapshot.started_at, 1)
+                else:
+                    with self.assertRaisesRegex(ResourceFailure, "resource_evidence_stale"):
+                        owner.sample()
+
+    def test_fresh_binding_failures_close_temporary_handle_and_never_qualify(self):
+        for failure, category in (
+            ("open", "resource_evidence_unavailable"),
+            ("ownership", "ownership_unproven"),
+            ("birth", "pid_reuse_or_exit"),
+            ("live", "pid_reuse_or_exit"),
+            ("identity", "process_wait_failed"),
+            ("close", "resource_handle_cleanup_failed"),
+        ):
+            with self.subTest(failure=failure):
+                owner = self.make_witnessed()
+                self.native.identities[11] = (101, True)
+                self.native.identities[111] = (101, failure != "live")
+                original_open, original_identity = self.native.open_member, self.native.identity
+                original_belongs, original_close = self.native.belongs, self.native.close_handle
+
+                def opened(pid, job, failure=failure, original_open=original_open):
+                    if pid != 11:
+                        return original_open(pid, job)
+                    if failure == "open":
+                        raise ResourceFailure("resource_evidence_unavailable")
+                    return 111, 999 if failure == "birth" else 101
+
+                def identity(handle, failure=failure, original_identity=original_identity):
+                    if handle == 111 and failure == "identity":
+                        raise ResourceFailure("process_wait_failed")
+                    return original_identity(handle)
+
+                def close(handle, failure=failure, original_close=original_close):
+                    original_close(handle)
+                    if handle == 111 and failure == "close":
+                        raise ResourceFailure("resource_handle_cleanup_failed")
+
+                self.native.open_member, self.native.identity, self.native.close_handle = (
+                    opened,
+                    identity,
+                    close,
+                )
+                self.native.belongs = (
+                    lambda handle, job, failure=failure, original_belongs=original_belongs: (
+                        not (handle == 111 and failure == "ownership")
+                        and original_belongs(handle, job)
+                    )
+                )
+                with self.assertRaisesRegex(ResourceFailure, category):
+                    owner.sample()
+                self.assertEqual(
+                    self.native.closed_handles.count(111), 0 if failure == "open" else 1
+                )
+                self.assertEqual(owner.cleanup_complete, failure != "close")
+                self.assertTrue(self.job.drained)
+
+    def test_terminal_total_must_cover_full_and_incomplete_even_after_accounting_error(self):
+        owner = self.make_witnessed()
+        original_accounting, original_members = self.native.accounting, self.native.members
+        original_rss = self.native.rss
+
+        def accounting(job):
+            if self.native.read_count == 1:
+                raise ResourceFailure("resource_evidence_unavailable")
+            return original_accounting(job)
+
+        def members(job):
+            self.birth()
+            self.job.total_processes = 2
+            return original_members(job)
+
+        def rss(handle):
+            value = original_rss(handle)
+            if handle == 13:
+                self.expire(handle)
+            return value
+
+        self.native.accounting, self.native.members, self.native.rss = accounting, members, rss
+        with self.assertRaisesRegex(ResourceFailure, "resource_evidence_unavailable"):
+            owner.sample()
+        self.assertEqual(owner.last_total, 2)
+        self.assertEqual(owner.incomplete_exit_births, {(13, 103)})
+        self.assertEqual(len(owner.witnessed_births), 2)
+        self.assertEqual(owner.final_total, 2)
+        self.assertTrue(owner.cleanup_complete)
+        self.assertFalse(owner.association_counts_complete)
+        state = association_state(8, 3)
+        with self.assertRaisesRegex(guard.Refusal, "association_counts_unavailable"):
+            guard.accumulate_associations(state, owner)
+        self.assertEqual(state, association_state(8, 3))
+
+    def test_unregistered_open_cleanup_failure_is_sticky_and_still_drains_owned_job(self):
+        owner = self.make()
+
+        def opened(pid, job):
+            raise ResourceFailure("resource_handle_cleanup_failed")
+
+        self.native.open_member = opened
+        with self.assertRaisesRegex(ResourceFailure, "resource_handle_cleanup_failed"):
+            owner.sample()
+        self.assertTrue(owner.unretained_handle_cleanup_failed and self.job.drained)
+        self.assertFalse(owner.cleanup_complete)
+        self.assertEqual(self.native.closed_handles, [])
 
 
 class MembershipPredicateFakeTests(unittest.TestCase):
@@ -2092,9 +2676,8 @@ class MembershipPredicateFakeTests(unittest.TestCase):
             "departed_member_still_listed",
             "final_survivor_missing",
             "final_active_count_mismatch",
-            "final_survivor_signaled",
         )
-        self.assertEqual(len(set(categories)), 11)
+        self.assertEqual(len(set(categories)), 10)
         for category in categories:
             with self.subTest(category=category):
                 owner = self.configure(category)
