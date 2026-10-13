@@ -246,8 +246,9 @@ namespace K5VisionDesktop
             if (!admitted.Contains("runtime/python.exe") || !admitted.Contains("runtime/python312._pth") ||
                 !admitted.Contains("workers/donor-downloads.json"))
                 throw new InvalidOperationException();
-            foreach (string tree in new[] { "runtime", "workers" })
-                VerifyTree(Path.Combine(root, tree), root, admitted);
+            foreach (string bootstrap in new[] { "K5Vision.exe", "payload-manifest.json", "unins000.exe", "unins000.dat", "unins000.msg" })
+                admitted.Add(bootstrap);
+            VerifyTree(root, root, admitted);
         }
 
         private static void VerifyTree(string directory, string root, HashSet<string> admitted)

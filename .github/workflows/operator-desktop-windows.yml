@@ -69,7 +69,10 @@ jobs:
           $ErrorActionPreference = "Stop"
           $compiler = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
           if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw "Native .NET Framework compiler unavailable" }
-          & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll /out:desktop-build/payload/K5Vision.exe windows/desktop/K5Vision.cs desktop-build/PayloadIdentity.generated.cs
+          $source = (Resolve-Path -LiteralPath windows/desktop/K5Vision.cs).Path
+          $identity = (Resolve-Path -LiteralPath desktop-build/PayloadIdentity.generated.cs).Path
+          $output = Join-Path $env:GITHUB_WORKSPACE "desktop-build\payload\K5Vision.exe"
+          & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll ('/out:' + $output) $source $identity
           if ($LASTEXITCODE -ne 0) { throw "Native graphical supervisor compilation failed" }
       - name: Provision exact reviewed Inno Setup compiler
         shell: pwsh
@@ -100,7 +103,8 @@ jobs:
           $output = Join-Path $env:GITHUB_WORKSPACE "desktop-build/installer"
           New-Item -ItemType Directory -Path $output | Out-Null
           $launcherHash = (Get-FileHash -LiteralPath (Join-Path $payload "K5Vision.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
-          & $env:K5_DESKTOP_ISCC ('/DPayloadRoot=' + $payload) ('/DOutputRoot=' + $output) ('/DLauncherSha=' + $launcherHash) windows/desktop/K5Vision.iss
+          $configuration = (Resolve-Path -LiteralPath windows/desktop/K5Vision.iss).Path
+          & $env:K5_DESKTOP_ISCC ('/DPayloadRoot=' + $payload) ('/DOutputRoot=' + $output) ('/DLauncherSha=' + $launcherHash) $configuration
           if ($LASTEXITCODE -ne 0) { throw "Native GUI installer build failed" }
           "K5_DESKTOP_SETUP=$(Join-Path $output 'K5VisionSetup.exe')" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           "K5_DESKTOP_PAYLOAD=$payload" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
