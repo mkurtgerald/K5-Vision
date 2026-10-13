@@ -1,0 +1,167 @@
+name: Native Windows Desktop Installer
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint]
+    paths:
+      - .github/workflows/operator-desktop-windows.yml
+      - .github/actions/provision-operator-tools/**
+      - windows/desktop/**
+      - scripts/build_desktop_payload.py
+      - scripts/verify_desktop_receipt.py
+      - src/k5vision/**
+      - tests/integration/test_windows_desktop_app.py
+      - tests/unit/test_desktop*.py
+      - docs/WINDOWS_DESKTOP*.md
+      - third_party/licenses/**
+      - THIRD_PARTY_NOTICES.md
+      - pyproject.toml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: operator-desktop-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-desktop:
+    name: Build and exercise actual graphical Windows installation
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      K5_BETA_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+    steps:
+      - name: Checkout exact desktop revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up native development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install acceptance dependencies only in development Python
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Desktop development install failed" }
+      - name: Verify desktop setup and process ownership on Windows
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_desktop_setup.py tests/unit/test_desktop_payload.py tests/unit/test_operator_native_process.py tests/unit/test_operator_product_service.py -o addopts= --no-cov
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Provision immutable native acceptance tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Build exact offline operator runtime and file manifest
+        shell: pwsh
+        run: |
+          python scripts/build_desktop_payload.py --output desktop-build --head-sha $env:K5_BETA_HEAD_SHA --media-exe $env:K5_MEDIAMTX_DONOR_EXE --gateway-exe $env:K5_CADDY_DONOR_EXE
+          if ($LASTEXITCODE -ne 0) { throw "Offline desktop payload build failed" }
+      - name: Compile native graphical supervisor with payload identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $compiler = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw "Native .NET Framework compiler unavailable" }
+          $source = (Resolve-Path -LiteralPath windows/desktop/K5Vision.cs).Path
+          $identity = (Resolve-Path -LiteralPath desktop-build/PayloadIdentity.generated.cs).Path
+          $output = Join-Path $env:GITHUB_WORKSPACE "desktop-build\payload\K5Vision.exe"
+          & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll ('/out:' + $output) $source $identity
+          if ($LASTEXITCODE -ne 0) { throw "Native graphical supervisor compilation failed" }
+      - name: Provision exact reviewed Inno Setup compiler
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $identity = (Get-Content -LiteralPath windows/desktop/donors.json -Raw | ConvertFrom-Json).inno_setup
+          $compilerRoot = Join-Path $env:RUNNER_TEMP ("K5 desktop compiler " + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $compilerRoot | Out-Null
+          $archive = Join-Path $compilerRoot "innosetup-6.4.3.exe"
+          Invoke-WebRequest -Uri $identity.url -OutFile $archive -TimeoutSec 180
+          $actual = Get-Item -LiteralPath $archive
+          if ($actual.Length -ne $identity.bytes -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $identity.sha256) {
+            throw "Inno Setup compiler archive identity mismatch"
+          }
+          $install = Join-Path $compilerRoot "compiler"
+          $process = Start-Process -FilePath $archive -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', ('/DIR="' + $install + '"')) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Reviewed compiler installation failed" }
+          $iscc = Join-Path $install "ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) { throw "Reviewed compiler frontend unavailable" }
+          # ISCC's upstream frontend resource uses 0.0.0.0. The exact admitted
+          # installer pins its bytes; check the actual engine banner at compile.
+          "K5_DESKTOP_ISCC=$iscc" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          Write-Host "Native Inno Setup compiler 6.4.3 admitted by exact official archive SHA256"
+      - name: Build click-through native Windows installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $payload = (Resolve-Path -LiteralPath desktop-build/payload).Path
+          $output = Join-Path $env:GITHUB_WORKSPACE "desktop-build/installer"
+          New-Item -ItemType Directory -Path $output | Out-Null
+          $launcherHash = (Get-FileHash -LiteralPath (Join-Path $payload "K5Vision.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
+          $configuration = (Resolve-Path -LiteralPath windows/desktop/K5Vision.iss).Path
+          $compilerOutput = @(& $env:K5_DESKTOP_ISCC ('/DPayloadRoot=' + $payload) ('/DOutputRoot=' + $output) ('/DLauncherSha=' + $launcherHash) $configuration 2>&1 | ForEach-Object { $_.ToString() })
+          $compilerExit = $LASTEXITCODE
+          $compilerOutput | Where-Object { $_ -match '^Compiler engine version:|^Error on line|^Error:|^Warning:' } | ForEach-Object { Write-Host $_ }
+          if ($compilerExit -ne 0) {
+            $compilerOutput | Select-Object -Last 6 | ForEach-Object { Write-Host $_ }
+            throw "Native GUI installer build failed"
+          }
+          if (@($compilerOutput | Where-Object { $_ -match '^Compiler engine version: Inno Setup 6\.4\.3(?:\s|$)' }).Count -ne 1) {
+            throw "Unexpected Inno Setup compiler engine version"
+          }
+          "K5_DESKTOP_SETUP=$(Join-Path $output 'K5VisionSetup.exe')" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_PAYLOAD=$payload" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Exercise actual installer, first-run account, tray, media and uninstall
+        timeout-minutes: 12
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_desktop_app.py -o addopts= --no-cov -s -o faulthandler_timeout=180 --junitxml=desktop-build/desktop-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_desktop_receipt.py desktop-build/desktop-windows.xml desktop-build/desktop-windows-receipt.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Admit only the actually exercised installer and finite evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $release = Join-Path $env:GITHUB_WORKSPACE "desktop-build/release"
+          New-Item -ItemType Directory -Path $release | Out-Null
+          Copy-Item -LiteralPath $env:K5_DESKTOP_SETUP -Destination (Join-Path $release "K5VisionSetup.exe")
+          Copy-Item -LiteralPath desktop-build/desktop-windows-receipt.json -Destination $release
+          Copy-Item -LiteralPath desktop-build/payload/payload-manifest.json -Destination $release
+          Copy-Item -LiteralPath desktop-build/payload/dependency-inventory.json -Destination $release
+          $setup = Get-Item -LiteralPath $env:K5_DESKTOP_SETUP
+          $metadata = @{
+            schema_version=1; head_sha=$env:K5_BETA_HEAD_SHA; unsigned=$true;
+            setup_sha256=(Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant();
+            setup_bytes=$setup.Length;
+            launcher_sha256=(Get-FileHash -LiteralPath desktop-build/payload/K5Vision.exe -Algorithm SHA256).Hash.ToLowerInvariant();
+            payload_manifest_sha256=(Get-FileHash -LiteralPath desktop-build/payload/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant();
+            runtime='CPython 3.12.10 embedded amd64'; installer='Inno Setup 6.4.3';
+            scope='Native Windows manual-RTSP recording operator'; no_terminal_required=$true;
+            no_external_python_required=$true; no_runtime_package_downloads=$true
+            workers_bundled=$false; first_launch_internet_required=$true
+          }
+          $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $release "desktop-package.json") -Encoding utf8
+      - name: Upload qualified graphical Windows installer
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: k5-vision-windows-setup-${{ github.event.pull_request.head.sha || github.sha }}
+          path: desktop-build/release/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve finite graphical acceptance evidence on failure
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: desktop-windows-witness-${{ github.run_id }}
+          path: |
+            desktop-build/desktop-windows.xml
+            desktop-build/desktop-windows-receipt.json
+          if-no-files-found: warn
+          retention-days: 14
