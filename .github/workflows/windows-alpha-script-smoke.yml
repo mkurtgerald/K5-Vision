@@ -216,25 +216,141 @@ jobs:
           import sys
           from pathlib import Path
           from uuid import uuid4
-          from k5vision.identity_state import validate_new_identity_directory
+          def _k5_recovery_diagnostic(phase, error):
+              try:
+                  if phase not in (
+                      "identity_import", "root_admission", "root_create",
+                      "base_admission", "pytest_launch", "cleanup",
+                  ):
+                      return
+                  category = "unexpected"
+                  identity_type = getattr(
+                      sys.modules.get("k5vision.identity_state"), "IdentityStateError", None
+                  )
+                  security_type = getattr(
+                      sys.modules.get("k5vision.windows_identity_security"),
+                      "WindowsIdentitySecurityError", None,
+                  )
+                  if type(error) is identity_type:
+                      category = "identity_other"
+                      args = BaseException.args.__get__(error)
+                      if len(args) == 1 and type(args[0]) is str and len(args[0]) <= 256:
+                          category = {
+                              "Windows identity requires a supported fixed local volume": "identity_volume",
+                              "Windows identity ownership or access is unsafe or unsupported": "identity_security",
+                              "identity directory must be an absolute local directory": "identity_path",
+                              "network identity directories are not supported": "identity_path",
+                              "linked identity paths are not supported": "identity_path",
+                              "identity parent is not a directory": "identity_path",
+                              "use a new identity directory beneath an existing private parent": "identity_parent",
+                          }.get(args[0], category)
+                      cause = BaseException.__cause__.__get__(error)
+                      cause_args = BaseException.args.__get__(cause) if type(cause) is security_type else ()
+                      if (
+                          len(cause_args) == 1 and type(cause_args[0]) is str
+                          and len(cause_args[0]) <= 256
+                      ):
+                          if category == "identity_volume":
+                              category = {
+                                  "Windows identity requires an ordinary local path": "volume_path",
+                                  "Windows identity requires a fixed local volume": "volume_type",
+                                  "Windows identity volume cannot be established": "volume_query",
+                                  "Windows identity volume aliases are unsupported": "volume_alias",
+                              }.get(cause_args[0], category)
+                          elif category == "identity_security":
+                              category = {
+                                  "Windows identity path has unsupported ownership": "security_owner",
+                                  "Windows identity path grants unsafe access": "security_access",
+                                  "Windows identity directory lacks private file inheritance": "security_inheritance",
+                                  "Windows identity inspection is unavailable": "security_query",
+                                  "Windows identity token is unavailable": "security_query",
+                                  "Windows identity token cannot be read": "security_query",
+                                  "Windows identity ACL cannot be established": "security_query",
+                                  "unsupported Windows security identifier": "security_unsupported",
+                                  "invalid Windows identity ACL": "security_unsupported",
+                                  "unsupported Windows identity ACL": "security_unsupported",
+                                  "invalid Windows identity ACL entry": "security_unsupported",
+                                  "unsupported Windows identity ACL entry": "security_unsupported",
+                                  "unsupported Windows identity access mask": "security_unsupported",
+                                  "invalid native Windows security identifier": "security_unsupported",
+                                  "unsupported native Windows security identifier": "security_unsupported",
+                                  "Windows identity token is unsupported": "security_unsupported",
+                                  "Windows identity ACL is invalid": "security_unsupported",
+                              }.get(cause_args[0], category)
+                  elif type(error) is subprocess.TimeoutExpired:
+                      category = "timeout"
+                  elif type(error) in (ImportError, ModuleNotFoundError):
+                      category = "import_error"
+                  elif type(error) is PermissionError:
+                      category = "permission_error"
+                  elif type(error) is FileNotFoundError:
+                      category = "missing_file"
+                  elif type(error) is FileExistsError:
+                      category = "existing_file"
+                  elif type(error) is OSError:
+                      category = "os_error"
+                  print("K5_RECOVERY_DIAGNOSTIC=" + phase + ":" + category, flush=True)
+              except BaseException:
+                  pass
+
+          try:
+              print("K5_RECOVERY_DIAGNOSTIC=inline:entered", flush=True)
+          except BaseException:
+              pass
+
+          try:
+              from k5vision.identity_state import validate_new_identity_directory
+          except Exception as _k5_error:
+              _k5_recovery_diagnostic("identity_import", _k5_error)
+              raise
 
           root = Path(os.environ["LOCALAPPDATA"]) / ("K5 Recovery pytest-" + uuid4().hex)
-          validate_new_identity_directory(root)
-          root.mkdir(mode=0o700)
+          try:
+              validate_new_identity_directory(root)
+          except Exception as _k5_error:
+              _k5_recovery_diagnostic("root_admission", _k5_error)
+              raise
+          try:
+              root.mkdir(mode=0o700)
+          except Exception as _k5_error:
+              _k5_recovery_diagnostic("root_create", _k5_error)
+              raise
           try:
               base = root / "pytest"
-              validate_new_identity_directory(base)
-              result = subprocess.run([
-                  sys.executable, "-m", "pytest",
-                  "tests/test_recovery_admin.py",
-                  "tests/test_recovery_admin_windows.py",
-                  "tests/test_windows_identity_security.py",
-                  "-q", "-rP", "--no-cov", "-o", "junit_family=xunit1",
-                  "--junitxml=recovery-windows-results.xml", "--basetemp", str(base),
-              ], check=False, timeout=600)
+              try:
+                  validate_new_identity_directory(base)
+              except Exception as _k5_error:
+                  _k5_recovery_diagnostic("base_admission", _k5_error)
+                  raise
+              try:
+                  result = subprocess.run([
+                      sys.executable, "-m", "pytest",
+                      "tests/test_recovery_admin.py",
+                      "tests/test_recovery_admin_windows.py",
+                      "tests/test_windows_identity_security.py",
+                      "-q", "-rP", "--no-cov", "-o", "junit_family=xunit1",
+                      "--junitxml=recovery-windows-results.xml", "--basetemp", str(base),
+                  ], check=False, timeout=600)
+              except Exception as _k5_error:
+                  _k5_recovery_diagnostic("pytest_launch", _k5_error)
+                  raise
+              try:
+                  if type(result) is subprocess.CompletedProcess:
+                      _k5_returncode = dict.get(vars(result), "returncode")
+                      if type(_k5_returncode) is int:
+                          if _k5_returncode == 0:
+                              print("K5_RECOVERY_DIAGNOSTIC=pytest_return:zero", flush=True)
+                          else:
+                              print("K5_RECOVERY_DIAGNOSTIC=pytest_return:nonzero", flush=True)
+              except BaseException:
+                  pass
               raise SystemExit(result.returncode)
           finally:
-              shutil.rmtree(root)
+              try:
+                  shutil.rmtree(root)
+              except Exception as _k5_error:
+                  _k5_recovery_diagnostic("cleanup", _k5_error)
+                  raise
           '@
           $qualification | python -
           if ($LASTEXITCODE -ne 0) { throw "Windows local recovery identity qualification failed." }

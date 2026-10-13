@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import time
@@ -4933,6 +4934,8 @@ class QualificationPolicyTests(unittest.TestCase):
             self.assertIn("Runner temporary path cannot be represented safely", text)
 
     def assert_original_body(self, kind, original, body):
+        if kind == "alpha" and original["name"] == RECOVERY_STEP:
+            body = normalize_recovery_body(body)
         check = 'if ($LASTEXITCODE -ne 0) { throw "Qualification dependency command failed." }\n'
         if kind == "alpha" and original["name"] in {
             "Install targeted test dependencies",
@@ -5604,6 +5607,569 @@ class ReviewRegressionTests(unittest.TestCase):
                 (site / "unexpected.pth").write_text("hook")
                 with self.assertRaisesRegex(guard.Refusal, "dependency_extra_file"):
                     guard.verify_environment(prefix)
+
+
+RECOVERY_ORIGINAL_INLINE = """import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from uuid import uuid4
+from k5vision.identity_state import validate_new_identity_directory
+
+root = Path(os.environ["LOCALAPPDATA"]) / ("K5 Recovery pytest-" + uuid4().hex)
+validate_new_identity_directory(root)
+root.mkdir(mode=0o700)
+try:
+    base = root / "pytest"
+    validate_new_identity_directory(base)
+    result = subprocess.run([
+        sys.executable, "-m", "pytest",
+        "tests/test_recovery_admin.py",
+        "tests/test_recovery_admin_windows.py",
+        "tests/test_windows_identity_security.py",
+        "-q", "-rP", "--no-cov", "-o", "junit_family=xunit1",
+        "--junitxml=recovery-windows-results.xml", "--basetemp", str(base),
+    ], check=False, timeout=600)
+    raise SystemExit(result.returncode)
+finally:
+    shutil.rmtree(root)
+"""
+
+RECOVERY_RETURN_MARKER = """try:
+    if type(result) is subprocess.CompletedProcess:
+        _k5_returncode = dict.get(vars(result), "returncode")
+        if type(_k5_returncode) is int:
+            if _k5_returncode == 0:
+                print("K5_RECOVERY_DIAGNOSTIC=pytest_return:zero", flush=True)
+            else:
+                print("K5_RECOVERY_DIAGNOSTIC=pytest_return:nonzero", flush=True)
+except BaseException:
+    pass
+"""
+
+RECOVERY_STEP = "Qualify Windows local recovery identity"
+RECOVERY_INLINE_SHA256 = "734467b71c051796729256607e64ea4d7990ab6550c26799ce5ff7b32ade3fd3"
+RECOVERY_HELPER_AST_SHA256 = "ac13e7457f25a5dcfe282b38708898248a0f8870c2a2ab8341d27fbc5b12f37c"
+RECOVERY_PHASES = {
+    "identity_import",
+    "root_admission",
+    "root_create",
+    "base_admission",
+    "pytest_launch",
+    "cleanup",
+}
+RECOVERY_CATEGORIES = {
+    "unexpected",
+    "identity_other",
+    "identity_volume",
+    "identity_security",
+    "identity_path",
+    "identity_parent",
+    "volume_path",
+    "volume_type",
+    "volume_query",
+    "volume_alias",
+    "security_owner",
+    "security_access",
+    "security_inheritance",
+    "security_query",
+    "security_unsupported",
+    "timeout",
+    "import_error",
+    "permission_error",
+    "missing_file",
+    "existing_file",
+    "os_error",
+}
+
+
+def recovery_body():
+    return next(
+        row["body"]
+        for row in guard.workflow_steps((ROOT / guard.PROFILES["alpha"]).read_text())
+        if row["name"] == RECOVERY_STEP
+    )
+
+
+def split_recovery_inline(body):
+    assert body.count("$qualification = @'\n") == 1
+    before, remainder = body.split("$qualification = @'\n")
+    inline, after = remainder.split("\n'@", 1)
+    return before + "$qualification = @'\n", inline + "\n", "'@" + after
+
+
+def normalize_recovery_body(body):
+    """Allow exactly the reviewed diagnostics, never a changed original operation."""
+    before, inline, after = split_recovery_inline(body)
+    assert hashlib.sha256(inline.encode()).hexdigest() == RECOVERY_INLINE_SHA256
+    tree = ast.parse(inline)
+    helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    assert len(helpers) == 1
+    helper = helpers[0]
+    assert helper.name == "_k5_recovery_diagnostic"
+    assert hashlib.sha256(ast.dump(helper).encode()).hexdigest() == RECOVERY_HELPER_AST_SHA256
+    tree.body.remove(helper)
+    entered = ast.parse(
+        'try:\n    print("K5_RECOVERY_DIAGNOSTIC=inline:entered", flush=True)\n'
+        "except BaseException:\n    pass\n"
+    ).body[0]
+    entries = [n for n in tree.body if ast.dump(n) == ast.dump(entered)]
+    assert len(entries) == 1
+    tree.body.remove(entries[0])
+    phases = []
+    return_markers = []
+    return_marker = ast.dump(ast.parse(RECOVERY_RETURN_MARKER).body[0])
+
+    class RemoveDiagnostics(ast.NodeTransformer):
+        def visit_Try(self, node):
+            if ast.dump(node) == return_marker:
+                return_markers.append(node)
+                return None
+            if len(node.handlers) == 1 and node.handlers[0].name == "_k5_error":
+                handler = node.handlers[0]
+                assert len(node.body) == 1 and not node.orelse and not node.finalbody
+                assert ast.dump(handler.type) == ast.dump(ast.Name(id="Exception", ctx=ast.Load()))
+                assert len(handler.body) == 2
+                call = handler.body[0].value
+                assert call.func.id == "_k5_recovery_diagnostic" and not call.keywords
+                assert len(call.args) == 2 and call.args[1].id == "_k5_error"
+                phase = call.args[0].value
+                assert phase in RECOVERY_PHASES
+                phases.append(phase)
+                assert isinstance(handler.body[1], ast.Raise)
+                assert handler.body[1].exc is None and handler.body[1].cause is None
+                return node.body[0]
+            return self.generic_visit(node)
+
+    tree = RemoveDiagnostics().visit(tree)
+    assert len(return_markers) == 1
+    assert len(phases) == 6 and set(phases) == RECOVERY_PHASES
+    assert ast.dump(tree) == ast.dump(ast.parse(RECOVERY_ORIGINAL_INLINE))
+    return before + RECOVERY_ORIGINAL_INLINE + after
+
+
+class RecoveryIdentityError(RuntimeError):
+    pass
+
+
+class RecoverySecurityError(RuntimeError):
+    pass
+
+
+class RecoveryTimeoutError(Exception):
+    pass
+
+
+class RecoveryInlineHarness:
+    """Only inert Python callbacks; no product import, filesystem write or child."""
+
+    def __init__(self, failures=None, returncode=0, print_error=None, completed=False):
+        self.events, self.output = [], []
+        self.failures = failures or {}
+        self.print_error = print_error
+        owner = self
+
+        def op(name, *args):
+            owner.events.append((name, args))
+            if name in owner.failures:
+                raise owner.failures[name]
+
+        class InertPath:
+            def __init__(self, value):
+                self.value = value
+                op("path", value)
+
+            def __truediv__(self, value):
+                op("join", value)
+                result = object.__new__(InertPath)
+                result.value = self.value + "/" + value
+                return result
+
+            def mkdir(self, **kwargs):
+                op("mkdir", self.value, kwargs)
+
+            def __str__(self):
+                op("path_string", self.value)
+                return self.value
+
+        def validate(path):
+            op("base" if path.value.endswith("/pytest") else "root", path.value)
+
+        def run(argv, **kwargs):
+            op("run", argv, kwargs)
+            if completed:
+                return subprocess.CompletedProcess(argv, returncode)
+
+            class Result:
+                @property
+                def returncode(self):
+                    op("returncode")
+                    return returncode
+
+            return Result()
+
+        def cleanup(path):
+            op("cleanup", path.value)
+
+        def uuid4():
+            op("uuid")
+            return types.SimpleNamespace(hex="inert")
+
+        class Environment(dict):
+            def __getitem__(self, key):
+                op("environment", key)
+                return super().__getitem__(key)
+
+        identity = types.SimpleNamespace(
+            IdentityStateError=RecoveryIdentityError, validate_new_identity_directory=validate
+        )
+        security = types.SimpleNamespace(WindowsIdentitySecurityError=RecoverySecurityError)
+        self.modules = {
+            "os": types.SimpleNamespace(environ=Environment(LOCALAPPDATA="PRIVATE_LOCATION")),
+            "shutil": types.SimpleNamespace(rmtree=cleanup),
+            "subprocess": types.SimpleNamespace(
+                run=run,
+                TimeoutExpired=RecoveryTimeoutError,
+                CompletedProcess=subprocess.CompletedProcess,
+            ),
+            "sys": types.SimpleNamespace(
+                executable="inert-python",
+                modules={
+                    "k5vision.identity_state": identity,
+                    "k5vision.windows_identity_security": security,
+                },
+            ),
+            "pathlib": types.SimpleNamespace(Path=InertPath),
+            "uuid": types.SimpleNamespace(uuid4=uuid4),
+            "k5vision.identity_state": identity,
+        }
+
+        def importing(name, globals=None, locals=None, fromlist=(), level=0):
+            op("import:" + name, tuple(fromlist or ()), level)
+            return self.modules[name]
+
+        def printing(value, *, flush):
+            if self.print_error is not None:
+                raise self.print_error
+            assert type(value) is str and flush is True
+            self.output.append(value)
+
+        import builtins
+
+        self.namespace = {
+            "__builtins__": {**vars(builtins), "__import__": importing, "print": printing}
+        }
+
+    def execute(self, inline):
+        try:
+            exec(compile(inline, "<inert-recovery-inline>", "exec"), self.namespace)
+        except BaseException as error:
+            self.error = error
+        else:
+            self.error = None
+        self.context = self.error.__context__ if self.error is not None else None
+        self.cause = self.error.__cause__ if self.error is not None else None
+        return self
+
+
+class RecoveryInlineDiagnosticTests(unittest.TestCase):
+    def inline(self):
+        return split_recovery_inline(recovery_body())[1]
+
+    def assert_closed(self, output):
+        for row in output:
+            self.assertLess(len(row), 100)
+            self.assertNotIn("PRIVATE", row)
+            self.assertTrue(row.startswith("K5_RECOVERY_DIAGNOSTIC="))
+            phase, category = row.split("=", 1)[1].split(":")
+            if phase == "inline":
+                self.assertEqual(category, "entered")
+            elif phase == "pytest_return":
+                self.assertIn(category, {"zero", "nonzero"})
+            else:
+                self.assertIn(phase, RECOVERY_PHASES)
+                self.assertIn(category, RECOVERY_CATEGORIES)
+
+    def paired(self, failures=None, code=0, print_error=None, completed=False):
+        failures = failures or {}
+        old = RecoveryInlineHarness(failures, code, completed=completed).execute(
+            RECOVERY_ORIGINAL_INLINE
+        )
+        for error in failures.values():
+            error.__traceback__ = None
+            error.__context__ = None
+        new = RecoveryInlineHarness(failures, code, print_error, completed=completed).execute(
+            self.inline()
+        )
+        self.assertEqual(old.events, new.events)
+        self.assertIs(type(old.error), type(new.error))
+        if any(old.error is item for item in failures.values()):
+            self.assertIs(old.error, new.error)
+        else:
+            self.assertIs(old.error.code, new.error.code)
+        if isinstance(old.context, SystemExit):
+            self.assertIs(type(old.context), type(new.context))
+            self.assertEqual(old.context.code, new.context.code)
+        else:
+            self.assertIs(old.context, new.context)
+        self.assertIs(old.cause, new.cause)
+        self.assert_closed(new.output)
+        return new
+
+    def test_exact_normalization_restores_original_hash(self):
+        normalized = normalize_recovery_body(recovery_body())
+        profile = guard.load_json(ROOT / "scripts/qualification/windows-hosted-profile.json")
+        expected = next(
+            row for row in profile["original_steps"]["alpha"] if row["name"] == RECOVERY_STEP
+        )
+        self.assertEqual(hashlib.sha256(normalized.encode()).hexdigest(), expected["body_sha256"])
+
+    def test_normalization_rejects_changed_operations_and_duplicate_instrumentation(self):
+        body = recovery_body()
+        mutations = [
+            body.replace("timeout=600", "timeout=601"),
+            body.replace("check=False", "check=True"),
+            body.replace("mode=0o700", "mode=0o777"),
+            body.replace('"-q", "-rP"', '"-v", "-rP"'),
+            body.replace("raise SystemExit(result.returncode)", "raise SystemExit(0)"),
+            body.replace("shutil.rmtree(root)", "pass"),
+            body.replace("except Exception as _k5_error:", "except BaseException as _k5_error:", 1),
+            body.replace('"root_admission", _k5_error', '"base_admission", _k5_error', 1),
+            body.replace("    raise\n", "    raise _k5_error\n", 1),
+            body.replace(
+                'print("K5_RECOVERY_DIAGNOSTIC=inline:entered", flush=True)',
+                'print("K5_RECOVERY_DIAGNOSTIC=inline:entered", flush=True)\n'
+                '    print("duplicate")',
+            ),
+            body.replace('category = "unexpected"', "category = str(error)"),
+        ]
+        for changed in mutations:
+            with self.subTest(mutation=mutations.index(changed)):
+                self.assertNotEqual(body, changed)
+                with self.assertRaises(AssertionError):
+                    normalize_recovery_body(changed)
+
+    def test_success_and_nonzero_exit_keep_original_calls_and_cleanup(self):
+        for code in (0, 1, 2, 5):
+            result = self.paired(code=code)
+            self.assertEqual(result.output, ["K5_RECOVERY_DIAGNOSTIC=inline:entered"])
+            self.assertEqual(sum(name == "cleanup" for name, _ in result.events), 1)
+
+    def test_each_failure_phase_preserves_exception_and_original_operations(self):
+        for operation, phase in (
+            ("import:k5vision.identity_state", "identity_import"),
+            ("root", "root_admission"),
+            ("mkdir", "root_create"),
+            ("base", "base_admission"),
+            ("run", "pytest_launch"),
+            ("cleanup", "cleanup"),
+        ):
+            error = RuntimeError("PRIVATE_ERROR")
+            result = self.paired({operation: error})
+            self.assertEqual(result.output[-1], "K5_RECOVERY_DIAGNOSTIC=" + phase + ":unexpected")
+            frames = []
+            tb = error.__traceback__
+            while tb:
+                frames.append(tb.tb_frame.f_code.co_name)
+                tb = tb.tb_next
+            self.assertEqual(frames.count("op"), 1)
+
+    def test_cleanup_wins_body_failure_with_original_context(self):
+        for operation in ("base", "run", "returncode"):
+            primary, cleanup = RuntimeError("PRIVATE_BODY"), OSError("PRIVATE_CLEANUP")
+            result = self.paired({operation: primary, "cleanup": cleanup})
+            self.assertIs(result.error, cleanup)
+            self.assertIs(result.context, primary)
+            self.assertEqual(result.output[-1], "K5_RECOVERY_DIAGNOSTIC=cleanup:os_error")
+
+    def test_base_exceptions_and_uncovered_operations_preserve_behavior(self):
+        for operation in ("root", "mkdir", "base", "run", "cleanup"):
+            for error in (KeyboardInterrupt("PRIVATE"), SystemExit(17)):
+                result = self.paired({operation: error})
+                self.assertEqual(result.output, ["K5_RECOVERY_DIAGNOSTIC=inline:entered"])
+        for operation in (
+            "import:os",
+            "import:uuid",
+            "environment",
+            "path",
+            "uuid",
+            "join",
+            "returncode",
+        ):
+            result = self.paired({operation: RuntimeError("PRIVATE")})
+            self.assertLessEqual(len(result.output), 1)
+
+    def test_print_failures_never_mask_original_exception_or_exit(self):
+        for printing_error in (OSError("PRIVATE_PRINT"), KeyboardInterrupt(), SystemExit(99)):
+            for operation in (None, "root", "base", "run", "cleanup"):
+                failures = {} if operation is None else {operation: RuntimeError("PRIVATE")}
+                self.paired(failures, print_error=printing_error)
+
+    def test_builtin_exception_classes_are_closed_and_exact(self):
+        for error, category in (
+            (RecoveryTimeoutError("PRIVATE"), "timeout"),
+            (ImportError("PRIVATE"), "import_error"),
+            (ModuleNotFoundError("PRIVATE"), "import_error"),
+            (PermissionError("PRIVATE"), "permission_error"),
+            (FileNotFoundError("PRIVATE"), "missing_file"),
+            (FileExistsError("PRIVATE"), "existing_file"),
+            (OSError("PRIVATE"), "os_error"),
+            (ValueError("PRIVATE"), "unexpected"),
+        ):
+            result = self.paired({"run": error})
+            self.assertEqual(result.output[-1], "K5_RECOVERY_DIAGNOSTIC=pytest_launch:" + category)
+
+        class PermissionSubclass(PermissionError):
+            pass
+
+        self.assertTrue(
+            self.paired({"run": PermissionSubclass("PRIVATE")}).output[-1].endswith(":unexpected")
+        )
+
+    def test_all_literal_identity_maps_are_source_owned_and_executable(self):
+        helper = ast.parse(self.inline()).body[6]
+        self.assertIsInstance(helper, ast.FunctionDef)
+        maps = [node for node in ast.walk(helper) if isinstance(node, ast.Dict)]
+        self.assertEqual(len(maps), 3)
+        source_strings = {}
+        for name in ("identity_state", "windows_identity_security"):
+            source_strings[name] = {
+                node.value
+                for node in ast.walk(
+                    ast.parse((ROOT / "src/k5vision" / (name + ".py")).read_text())
+                )
+                if isinstance(node, ast.Constant) and type(node.value) is str
+            }
+        for index, mapping in enumerate(maps):
+            for key, value in zip(mapping.keys, mapping.values, strict=True):
+                self.assertIn(
+                    key.value,
+                    source_strings["identity_state" if index == 0 else "windows_identity_security"],
+                )
+                self.assertIn(value.value, RECOVERY_CATEGORIES)
+                if index == 0:
+                    error = RecoveryIdentityError(key.value)
+                else:
+                    outer = (
+                        "Windows identity requires a supported fixed local volume"
+                        if index == 1
+                        else "Windows identity ownership or access is unsafe or unsupported"
+                    )
+                    error = RecoveryIdentityError(outer)
+                    error.__cause__ = RecoverySecurityError(key.value)
+                result = self.paired({"root": error})
+                self.assertEqual(
+                    result.output[-1], "K5_RECOVERY_DIAGNOSTIC=root_admission:" + value.value
+                )
+
+    def test_private_unknown_malformed_and_hostile_values_never_escape(self):
+        class Hostile:
+            def __str__(self):
+                raise AssertionError("untrusted str")
+
+            def __repr__(self):
+                raise AssertionError("untrusted repr")
+
+        for args in (
+            ("PRIVATE" * 10000,),
+            ("PRIVATE", "extra"),
+            (Hostile(),),
+            (),
+            ("unknown PRIVATE",),
+        ):
+            result = self.paired({"root": RecoveryIdentityError(*args)})
+            self.assertTrue(result.output[-1].endswith(":identity_other"))
+
+        class HostileIdentity(RecoveryIdentityError):
+            def __str__(self):
+                raise AssertionError("untrusted str")
+
+            def __repr__(self):
+                raise AssertionError("untrusted repr")
+
+            @property
+            def args(self):
+                raise AssertionError("untrusted args")
+
+            @property
+            def __cause__(self):
+                raise AssertionError("untrusted cause")
+
+        error = HostileIdentity("Windows identity requires a supported fixed local volume")
+        harness = RecoveryInlineHarness({"root": error})
+        harness.modules["k5vision.identity_state"].IdentityStateError = HostileIdentity
+        # Do not use harness.execute's reporting reads on the hostile exception.
+        with self.assertRaises(HostileIdentity) as raised:
+            exec(compile(self.inline(), "<inert-inline>", "exec"), harness.namespace)
+        self.assertIs(raised.exception, error)
+        self.assertEqual(
+            harness.output[-1], "K5_RECOVERY_DIAGNOSTIC=root_admission:identity_volume"
+        )
+        self.assert_closed(harness.output)
+
+    def test_only_explicit_exact_cause_is_classified(self):
+        outer = "Windows identity ownership or access is unsafe or unsupported"
+        for cause in (
+            OSError("Windows identity path has unsupported ownership"),
+            RecoverySecurityError("PRIVATE" * 10000),
+        ):
+            error = RecoveryIdentityError(outer)
+            error.__cause__ = cause
+            self.assertTrue(self.paired({"root": error}).output[-1].endswith(":identity_security"))
+        error = RecoveryIdentityError(outer)
+        error.__context__ = RecoverySecurityError("Windows identity path has unsupported ownership")
+        result = RecoveryInlineHarness({"root": error}).execute(self.inline())
+        self.assertTrue(result.output[-1].endswith(":identity_security"))
+
+    def test_real_completed_process_emits_only_fixed_zero_or_nonzero(self):
+        for code in (0, 1, 5, -9):
+            result = self.paired(code=code, completed=True)
+            category = "zero" if code == 0 else "nonzero"
+            self.assertEqual(result.output[-1], "K5_RECOVERY_DIAGNOSTIC=pytest_return:" + category)
+        result = self.paired({"run": OSError("PRIVATE")}, completed=True)
+        self.assertFalse(any("pytest_return" in row for row in result.output))
+        result = self.paired({"cleanup": OSError("PRIVATE")}, completed=True)
+        self.assertEqual(
+            result.output[-2:],
+            [
+                "K5_RECOVERY_DIAGNOSTIC=pytest_return:zero",
+                "K5_RECOVERY_DIAGNOSTIC=cleanup:os_error",
+            ],
+        )
+        self.paired(completed=True, print_error=OSError("PRIVATE"))
+
+    def test_return_marker_skips_properties_and_non_exact_integer_codes(self):
+        result = self.paired(code=5)
+        self.assertEqual(sum(name == "returncode" for name, _ in result.events), 1)
+        self.assertFalse(any("pytest_return" in row for row in result.output))
+
+        class HostileCode:
+            def __eq__(self, other):
+                raise AssertionError("untrusted equality")
+
+            def __str__(self):
+                raise AssertionError("untrusted string")
+
+        for code in (True, None, "PRIVATE", HostileCode()):
+            result = self.paired(code=code, completed=True)
+            self.assertIs(result.error.code, code)
+            self.assertFalse(any("pytest_return" in row for row in result.output))
+
+    def test_classifier_failure_and_unknown_phase_cannot_change_control_flow(self):
+        class BrokenModules:
+            def get(self, key):
+                raise RuntimeError("PRIVATE")
+
+        error = RuntimeError("PRIVATE")
+        harness = RecoveryInlineHarness({"root": error})
+        harness.modules["sys"].modules = BrokenModules()
+        harness.execute(self.inline())
+        self.assertIs(harness.error, error)
+        self.assertEqual(harness.output, ["K5_RECOVERY_DIAGNOSTIC=inline:entered"])
+        before = list(harness.output)
+        harness.namespace["_k5_recovery_diagnostic"]("PRIVATE_PHASE", error)
+        self.assertEqual(before, harness.output)
 
 
 if __name__ == "__main__":
