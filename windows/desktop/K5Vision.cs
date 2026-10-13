@@ -307,17 +307,25 @@ namespace K5VisionDesktop
                     throw new InvalidOperationException();
         }
 
-        private static void Download(string url, string target, long expectedBytes)
+        private static void Download(string url, string target, long expectedBytes, CancellationToken cancellation)
         {
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            Stopwatch elapsed = Stopwatch.StartNew();
             Uri uri = new Uri(url);
             for (int redirect = 0; redirect < 6; redirect++)
             {
+                cancellation.ThrowIfCancellationRequested();
+                int remaining = 120000 - (int)elapsed.ElapsedMilliseconds;
+                if (remaining <= 0) throw new InvalidOperationException();
                 if (uri.Scheme != "https" || !new[] { "github.com", "release-assets.githubusercontent.com",
                     "objects.githubusercontent.com", "github-releases.githubusercontent.com" }.Contains(uri.Host))
                     throw new InvalidOperationException();
                 HttpWebRequest request = (HttpWebRequest)WebRequest.Create(uri);
-                request.AllowAutoRedirect = false; request.Timeout = request.ReadWriteTimeout = 120000;
+                request.AllowAutoRedirect = false; request.Timeout = request.ReadWriteTimeout = remaining;
                 request.UserAgent = "K5-Vision-Desktop";
+                Action abort = delegate { try { request.Abort(); } catch { } };
+                using (CancellationTokenRegistration registration = cancellation.Register(abort))
+                using (System.Threading.Timer deadline = new System.Threading.Timer(delegate { abort(); }, null, remaining, Timeout.Infinite))
                 using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
                 {
                     if ((int)response.StatusCode >= 300 && (int)response.StatusCode <= 399)
@@ -336,6 +344,7 @@ namespace K5VisionDesktop
                         int count;
                         while ((count = source.Read(buffer, 0, buffer.Length)) != 0)
                         {
+                            cancellation.ThrowIfCancellationRequested();
                             total += count;
                             if (total > expectedBytes || total > 128 * 1024 * 1024) throw new InvalidOperationException();
                             file.Write(buffer, 0, count);
@@ -369,7 +378,7 @@ namespace K5VisionDesktop
             }
         }
 
-        internal static Dictionary<string, string> Provision(string application, string profile)
+        internal static Dictionary<string, string> Provision(string application, string profile, CancellationToken cancellation)
         {
             string cache = Path.Combine(profile, "desktop-workers");
             PrivateDirectory(cache, profile);
@@ -380,6 +389,7 @@ namespace K5VisionDesktop
             Dictionary<string, string> result = new Dictionary<string, string>();
             foreach (object item in (IEnumerable)manifest["artifacts"])
             {
+                cancellation.ThrowIfCancellationRequested();
                 Dictionary<string, object> artifact = (Dictionary<string, object>)item;
                 string component = (string)artifact["component"];
                 if (component != "MediaMTX" && component != "Caddy") throw new InvalidOperationException();
@@ -407,7 +417,8 @@ namespace K5VisionDesktop
                     string candidateLicense = Path.Combine(directory, "license-" + nonce + ".txt");
                     try
                     {
-                        Download((string)artifact["url"], zip, Convert.ToInt64(artifact["bytes"]));
+                        Download((string)artifact["url"], zip, Convert.ToInt64(artifact["bytes"]), cancellation);
+                        cancellation.ThrowIfCancellationRequested();
                         VerifyFile(zip, profile, Convert.ToInt64(artifact["bytes"]), (string)artifact["sha256"]);
                         using (FileStream input = new FileStream(zip, FileMode.Open, FileAccess.Read, FileShare.Read))
                         using (ZipArchive archive = new ZipArchive(input, ZipArchiveMode.Read))
@@ -610,6 +621,7 @@ namespace K5VisionDesktop
         private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         private readonly EventWaitHandle openEvent;
         private readonly ProcessJob job = new ProcessJob();
+        private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
         private Bridge backend;
         private Dictionary<string, string> workers;
         private Task operation = Task.FromResult(true);
@@ -754,12 +766,13 @@ namespace K5VisionDesktop
         {
             if (exiting) return;
             busy = true; setup.Visible = false; status.Text = "Preparing your camera services. First launch may take a few minutes…";
+            bool failed = false;
             try
             {
                 Task startup = Task.Run(delegate
                 {
                     if (exiting) throw new InvalidOperationException();
-                    workers = Workers.Provision(root, options.Profile);
+                    workers = Workers.Provision(root, options.Profile, cancellation.Token);
                     if (exiting) throw new InvalidOperationException();
                     Dictionary<string, object> request = Request("serve");
                     request["recording_root"] = Path.Combine(options.Profile, "recordings");
@@ -794,10 +807,11 @@ namespace K5VisionDesktop
                 tray.Text = "K5 Vision — recording service running";
                 if (!options.NoBrowser) OpenDashboard();
             }
-            catch
+            catch { failed = true; }
+            if (failed)
             {
                 await Task.Run(delegate { if (backend != null && !backend.Stop()) job.Dispose(); });
-                Fail("K5 Vision could not start recording. Close any other K5 Vision app and try again. Your recordings have been kept.");
+                Fail("K5 Vision could not prepare the recording service. Check your Internet connection, close any other K5 Vision app, and reopen this app. Your recordings have been kept.");
             }
         }
 
@@ -824,6 +838,7 @@ namespace K5VisionDesktop
         {
             if (exiting) return;
             exiting = true; ready = false; timer.Stop(); open.Enabled = create.Enabled = quit.Enabled = false;
+            cancellation.Cancel();
             status.Text = "Stopping recording safely…";
             Task pending = operation;
             await Task.Run(delegate
@@ -839,6 +854,7 @@ namespace K5VisionDesktop
             if (disposing)
             {
                 exiting = true; timer.Dispose(); tray.Visible = false; tray.Dispose();
+                cancellation.Cancel(); cancellation.Dispose();
                 job.Dispose(); if (backend != null) backend.Dispose();
             }
             base.Dispose(disposing);
