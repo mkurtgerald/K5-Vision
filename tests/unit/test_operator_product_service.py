@@ -131,7 +131,7 @@ def _source(index):
     )
 
 
-async def _until(predicate, *, timeout=1):
+async def _until(predicate, *, timeout=3):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -148,7 +148,9 @@ def _fast_maintenance(native, monkeypatch):
     async def sleep(delay):
         if delay >= 0.1:
             clock.value += delay
-            await original_sleep(0)
+            # Preserve logical cadence without a busy loop that starves the
+            # native-thread wakeup on Windows' coarser event-loop clock.
+            await original_sleep(0.001)
         else:
             await original_sleep(delay)
 

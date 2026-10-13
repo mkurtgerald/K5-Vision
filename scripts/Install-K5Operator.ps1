@@ -356,11 +356,13 @@ try {
     $privateReady = $true
     $stage = 'settings-parsing'
     $settings = ($output -join "`n") | ConvertFrom-Json
-    $arguments = @('-PackagePath', $settings.wheel, '-PythonExecutable', $python, '-RuntimeRoot', $settings.runtime, '-StateRoot', $settings.state, '-Port', [string]$settings.port, '-RecordingLimitGb', [string]$settings.recording_limit_gb)
-    if ($NoBrowser) { $arguments += '-NoBrowser' }
+    # This is another PowerShell script, so bind named parameters with a
+    # hashtable. Native-executable argv arrays would bind these as positionals.
+    $arguments = @{PackagePath=[string]$settings.wheel; PythonExecutable=$python; RuntimeRoot=[string]$settings.runtime; StateRoot=[string]$settings.state; Port=[int]$settings.port; RecordingLimitGb=[int]$settings.recording_limit_gb}
+    if ($NoBrowser) { $arguments['NoBrowser'] = $true }
     if ($DiagnosticName) {
         if ($DiagnosticName -cnotmatch '^installed-launcher-diagnostic-[0-9a-f]{32}\.json$') { throw 'Diagnostic basename refused.' }
-        $arguments += @('-DiagnosticName', ('launcher-diagnostic-' + $DiagnosticName.Substring(30)))
+        $arguments['DiagnosticName'] = 'launcher-diagnostic-' + $DiagnosticName.Substring(30)
     }
     $stage = 'starter-dispatch'
     & $settings.starter @arguments
