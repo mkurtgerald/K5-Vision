@@ -644,6 +644,7 @@ namespace K5VisionDesktop
         private Task operation = Task.FromResult(true);
         private volatile bool exiting;
         private bool busy = true, ready, checkedPayload;
+        private bool disposed;
         private string phase = "preparing";
 
         internal OperatorWindow(Options options, EventWaitHandle openEvent)
@@ -885,8 +886,9 @@ namespace K5VisionDesktop
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
+            if (disposing && !disposed)
             {
+                disposed = true;
                 exiting = true; timer.Dispose(); tray.Visible = false; tray.Dispose();
                 cancellation.Cancel(); cancellation.Dispose();
                 job.Dispose(); if (backend != null) backend.Dispose();

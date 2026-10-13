@@ -188,7 +188,13 @@ class _Windows:
 
     def close(self, form):
         __tracebackhide__ = True
-        _require(bool(self.api.PostMessageW(form, 0x0010, 0, 0)), "Desktop close command failed")
+        # A real title-bar X sends WM_SYSCOMMAND/SC_CLOSE, setting WinForms'
+        # CloseReason.UserClosing. Direct WM_CLOSE represents an external
+        # termination request and can be classified as TaskManagerClosing.
+        _require(
+            bool(self.api.PostMessageW(form, 0x0112, 0xF060, 0)),
+            "Desktop title-bar close command failed",
+        )
 
 
 class _Cohort:
@@ -794,7 +800,11 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         browser = None
         stage = "window_closing_to_tray"
         api.close(form)
-        _wait(lambda: not api.api.IsWindowVisible(form), "Close hides desktop to tray", process=app)
+        _wait(
+            lambda: api.api.IsWindow(form) and not api.api.IsWindowVisible(form),
+            "Title-bar close preserves the desktop window hidden in the tray",
+            process=app,
+        )
         receipt["close_hides_to_tray"] = True
         stage = "tray_recording_growth"
         before = _recording_bytes(profile)
