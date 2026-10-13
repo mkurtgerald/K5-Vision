@@ -201,6 +201,47 @@ def _run_script(powershell: Path, script: Path, arguments: list[str]) -> tuple[i
     stage = match.group(1) if match else "unclassified"
     if stage not in {"platform", "python", "package-and-private-paths", "shortcuts"}:
         stage = "unclassified"
+    detail = re.search(
+        r"K5 install diagnostic: ([a-z0-9-]+) public-line ([0-9]{1,4}) reason ([a-z-]+)", text
+    )
+    if (
+        detail
+        and detail.group(1)
+        in {
+            "bootstrap",
+            "package-admission",
+            "root-separation",
+            "profile-admission",
+            "shortcut-admission",
+            "shortcut-slot-0",
+            "shortcut-slot-1",
+            "shortcut-slot-2",
+            "identity-admission",
+            "package-content",
+            "wheel-admission",
+            "install-admission",
+            "release-lock",
+            "runtime-lock",
+            "release-stage",
+            "release-commit",
+        }
+        and detail.group(3)
+        in {
+            "private-boundary",
+            "foreign-access",
+            "file-inheritance",
+            "ownership",
+            "volume-alias",
+            "volume-type",
+            "acl-query",
+            "python-validation",
+            "file-operation",
+            "other",
+        }
+    ):
+        stage += (
+            "/" + detail.group(1) + " public-line " + detail.group(2) + " reason " + detail.group(3)
+        )
     return result.returncode, stage
 
 
@@ -302,7 +343,9 @@ def _request(origin: str, route: str, data: dict | None = None) -> tuple[int, di
         return 0, {}
 
 
-def test_native_windows_installed_operator_lifecycle(record_testsuite_property) -> None:
+def test_native_windows_installed_operator_lifecycle(
+    record_testsuite_property, monkeypatch
+) -> None:
     __tracebackhide__ = True
     project = Path(__file__).resolve().parents[2]
     wheel = Path(os.environ["K5_OPERATOR_WHEEL"]).resolve(strict=True)
@@ -479,19 +522,24 @@ def test_native_windows_installed_operator_lifecycle(record_testsuite_property) 
             identity_state.load_identity_state(identity.directory).site_id == identity.site_id,
             "Upgrade changed durable identity",
         )
-        owned = OwnedNativeProcess(
-            [
-                str(powershell),
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(install / "Start-K5Operator.ps1"),
-                "-NoBrowser",
-            ],
-            cwd=parent,
-        )
+        # This actual child process inherits no-index; environment restoration
+        # does not alter its snapshot. Cached dependencies must suffice while
+        # the local same-version K5 wheel still updates its installed code.
+        with monkeypatch.context() as startup_environment:
+            startup_environment.setenv("PIP_NO_INDEX", "1")
+            owned = OwnedNativeProcess(
+                [
+                    str(powershell),
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(install / "Start-K5Operator.ps1"),
+                    "-NoBrowser",
+                ],
+                cwd=parent,
+            )
         deadline = time.monotonic() + 150
         while True:
             _require(owned.poll() is None, "Upgraded wrapper exited before readiness")
@@ -608,6 +656,7 @@ def test_native_windows_installed_operator_lifecycle(record_testsuite_property) 
                 "foreign_writable_tree_refused": True,
                 "recording_limit_persisted": True,
                 "same_version_wheel_upgrade": True,
+                "cached_runtime_no_index": True,
                 "installed_wrapper_health": True,
                 "administrator_login": True,
                 "live_upgrade_uninstall_refused": True,

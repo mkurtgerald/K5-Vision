@@ -618,6 +618,51 @@ def test_product_startup_failure_closes_camera_store_and_attempts_native_cleanup
     _assert_profile_lease_available(tmp_path / "identity")
 
 
+def test_rejected_optional_person_configuration_does_not_prevent_recording_start(
+    native, tmp_path, monkeypatch
+):
+    import k5vision.operator_analytics_person as person_module
+
+    def refuse(_environment):
+        raise person_module.OperatorPersonConfigurationError("Person configuration was refused.")
+
+    monkeypatch.setattr(person_module, "load_person_configuration", refuse)
+    app, calls = _product_application(native, tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.get("/api/v1/health").status_code == 200
+        assert app.state.operator_person_status == "unavailable"
+        assert calls == [("start", ())]
+    assert calls == [("start", ()), ("stop", ())]
+    _assert_profile_lease_available(tmp_path / "identity")
+
+
+def test_configured_person_broker_closes_even_when_recording_startup_fails(
+    native, tmp_path, monkeypatch
+):
+    import k5vision.operator_analytics as broker_module
+    import k5vision.operator_analytics_person as person_module
+
+    closed = []
+
+    class Broker:
+        def __init__(self, _config):
+            pass
+
+        async def aclose(self):
+            closed.append(True)
+
+    monkeypatch.setattr(person_module, "load_person_configuration", lambda _environment: object())
+    monkeypatch.setattr(broker_module, "OperatorAnalyticsBroker", Broker)
+    app, calls = _product_application(native, tmp_path, monkeypatch, fail_start=True)
+    with pytest.raises(OperatorProductError, match="startup"):
+        with TestClient(app):
+            pass
+    assert closed == [True]
+    assert calls == [("start", ()), ("stop", ())]
+    assert app.state.operator_camera_store.closed
+    _assert_profile_lease_available(tmp_path / "identity")
+
+
 def test_second_product_application_cannot_start_workers_for_an_active_identity(
     native, tmp_path, monkeypatch
 ):

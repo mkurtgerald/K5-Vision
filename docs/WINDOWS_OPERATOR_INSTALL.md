@@ -8,6 +8,8 @@ checks. It does not install a Windows service or a signed MSI/EXE.
 Use Windows 10/11, installed **64-bit CPython 3.12.4 or newer within 3.12.x**, a
 current Edge/Chrome browser and H.264 RTSP camera streams. First application
 launch needs Internet access for Python dependencies and pinned native workers.
+Later launches try the installed dependencies without a package index before
+requesting online setup, so a complete cached runtime can start without Internet.
 The package includes donor licenses/notices; it does not bundle native binaries,
 Python, models or FFmpeg. The existing pilot distribution/license limits apply.
 

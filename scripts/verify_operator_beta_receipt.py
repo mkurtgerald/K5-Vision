@@ -39,7 +39,11 @@ _TESTS = {
         (
             "test_native_person_broker_positive_blank_capacity_and_cleanup",
             "operator_beta_person_receipt",
-        )
+        ),
+        (
+            "test_assembled_person_view_browser_native_boxes_recording_and_logout",
+            "operator_person_view_runtime_receipt",
+        ),
     ],
 }
 _TRUE = {
@@ -56,7 +60,8 @@ _TRUE = {
         "recording_limit_persisted installed_wrapper_health administrator_login "
         "live_upgrade_uninstall_refused owned_tree_cleanup stopped_upgrade "
         "prior_release_preserved changed_release_refused unknown_content_refused "
-        "uninstall_preserves_profile"
+        "uninstall_preserves_profile same_version_wheel_upgrade bootstrap_identity_refused "
+        "foreign_writable_tree_refused cached_runtime_no_index"
     ).split(),
     "browser": (
         "ui_login ui_two_camera_enrollment simultaneous_recording camera_switch_pixel_isolation "
@@ -69,6 +74,10 @@ _TRUE = {
         "single_flight_busy independent_view_workers third_view_capacity_denied "
         "close_owner_released_capacity idle_views_expired closed_broker_refused "
         "owned_native_threads_stopped"
+    ).split(),
+    "person-view": (
+        "actual_inference ui_sample_positive recording_continues response_frame_correlated "
+        "logout_cleared logout_person_request_denied anonymous_person_request_denied owned_cleanup"
     ).split(),
 }
 
@@ -93,7 +102,8 @@ def verify(lane: str, path: Path) -> list[dict]:
             common.pop("schema_version")
         for key, expected in common.items():
             _require(type(receipt.get(key)) is type(expected) and receipt[key] == expected)
-        _require(all(receipt.get(key) is True for key in _TRUE[lane]))
+        group = "person-view" if property_name == "operator_person_view_runtime_receipt" else lane
+        _require(all(receipt.get(key) is True for key in _TRUE[group]))
         if lane == "launcher":
             _require(str(receipt.get("powershell_version", "")).startswith("5.1"))
             cached = property_name == "operator_windows_launcher_receipt"
@@ -120,6 +130,20 @@ def verify(lane: str, path: Path) -> list[dict]:
                 frames = receipt.get(field, [])
                 _require(len(frames) == count and all(type(n) is int and n >= 4 for n in frames))
             _require(0 < receipt.get("duration_seconds", 0) < 180)
+        elif group == "person-view":
+            _require(receipt.get("portable_ancestor_adjustment") is False)
+            _require(receipt.get("browser_channel") == "msedge")
+            _require(receipt.get("playwright_version") == "1.58.0")
+            _require(bool(receipt.get("browser_version")))
+            _require(receipt.get("browser_script_errors") == 0)
+            _require(receipt.get("model_revision") == "6697dead54ed1cdd664b0313189c2cb52ee6335e")
+            _require(receipt.get("mock_inference") is False)
+            _require(1 <= receipt.get("person_boxes", 0) <= 32)
+            _require(receipt.get("displayed_frame_matching_fraction", 0) >= 0.90)
+            _require(receipt.get("box_overlay_pixels", 0) >= 100)
+            _require(receipt.get("live_decoded_frames", 0) >= 4)
+            _require(receipt.get("recorded_playback_decoded_frames", 0) > 0)
+            _require(0 < receipt.get("duration_seconds", 0) < 90)
         elif lane == "person":
             _require(receipt.get("model_revision") == "6697dead54ed1cdd664b0313189c2cb52ee6335e")
             _require(receipt.get("mock_inference") is False)

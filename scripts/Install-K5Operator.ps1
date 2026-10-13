@@ -16,6 +16,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $stage = 'platform'
+$script:pythonDiagnostic = 'unavailable'
 
 function Invoke-K5InstallPython {
     param([string]$Code, [string[]]$Arguments)
@@ -26,7 +27,23 @@ function Invoke-K5InstallPython {
         $output = @(& $PythonExecutable -I -B -c "exec(__import__('base64').b64decode('$encoded'))" @Arguments 2>&1)
         $code = $LASTEXITCODE
     } finally { $ErrorActionPreference = $previous }
-    if ($code -ne 0) { throw 'Installer admission failed.' }
+    if ($code -ne 0) {
+        foreach ($item in $output) {
+            try {
+                $detail = ([string]$item) | ConvertFrom-Json
+                $phases = @('bootstrap', 'package-admission', 'root-separation',
+                    'profile-admission', 'shortcut-admission', 'shortcut-slot-0', 'shortcut-slot-1', 'shortcut-slot-2', 'identity-admission',
+                    'package-content', 'wheel-admission', 'install-admission',
+                    'release-lock', 'runtime-lock', 'release-stage', 'release-commit')
+                if ($detail.schema_version -ceq '1' -and $detail.phase -cin $phases -and
+                    $detail.reason -cin @('private-boundary', 'foreign-access', 'file-inheritance', 'ownership', 'volume-alias', 'volume-type', 'acl-query', 'python-validation', 'file-operation', 'other') -and
+                    $detail.line -is [int] -and $detail.line -ge 1 -and $detail.line -le 1000) {
+                    $script:pythonDiagnostic = $detail.phase + ' public-line ' + [string]$detail.line + ' reason ' + $detail.reason
+                }
+            } catch { }
+        }
+        throw 'Installer admission failed.'
+    }
     return ($output -join "`n").Trim()
 }
 
@@ -74,6 +91,27 @@ try {
     $install = @'
 import ctypes,hashlib,importlib.util,json,msvcrt,os,re,shutil,stat,sys,uuid,zipfile
 from pathlib import Path
+phase='bootstrap'
+def diagnostic(kind,error,trace):
+    line=0
+    while trace is not None:
+        if trace.tb_frame.f_code.co_filename=='<string>': line=trace.tb_lineno
+        trace=trace.tb_next
+    reason='other'
+    if kind.__module__=='k5_install_security' and kind.__name__=='WindowsIdentitySecurityError':
+        reason={
+            'Windows identity path grants unsafe access':'foreign-access',
+            'Windows identity directory lacks private file inheritance':'file-inheritance',
+            'Windows identity path has unsupported ownership':'ownership',
+            'Windows identity volume aliases are unsupported':'volume-alias',
+            'Windows identity requires a fixed local volume':'volume-type',
+            'Windows identity ACL cannot be established':'acl-query',
+        }.get(str(error),'private-boundary')
+    elif kind is ValueError: reason='python-validation'
+    elif issubclass(kind,OSError): reason='file-operation'
+    if 1<=line<=1000:
+        print(json.dumps({'schema_version':'1','phase':phase,'line':line,'reason':reason}))
+sys.excepthook=diagnostic
 package,root,runtime,state=map(Path,sys.argv[1:5]);port=int(sys.argv[5]);logon=sys.argv[6]=='1';recording_limit_gb=int(sys.argv[7])
 shortcuts=list(map(Path,sys.argv[8:]));lock=None;runtime_handle=None;candidate=None;committed=False;originals={}
 def ordinary(path,kind):
@@ -121,22 +159,29 @@ def replace_file(path,data):
     try: write_new(temporary,data);os.replace(temporary,path)
     finally:
         if temporary.exists(): temporary.unlink()
+phase='package-admission'
 admit(helper,'file')
 for path in (package,): admit(path,'dir')
+phase='root-separation'
 for path in (root,runtime,state):
     if not path.is_absolute() or '..' in path.parts: raise ValueError('Absolute roots required')
 for a,b in ((root,package),(root,runtime),(root,state),(state,runtime),(state,package),(runtime,package)):
     if a.is_relative_to(b) or b.is_relative_to(a): raise ValueError('Separate roots required')
+phase='profile-admission'
 for path in (runtime,state):
     if path.exists(): admit(path,'dir')
     else: admit(path.parent,'dir')
-for path in shortcuts:
+phase='shortcut-admission'
+for index,path in enumerate(shortcuts):
+    phase='shortcut-slot-'+str(index)
     directory(path.parent)
     if path.exists(): admit(path,'file')
 if logon:
+    phase='identity-admission'
     # Initial account creation belongs to an interactive first launch. Startup
     # never carries a password or invents/reset an interrupted identity.
     admit(state/'identity','dir')
+phase='package-content'
 files=['scripts/Start-K5Operator.ps1','scripts/Install-K5Operator.ps1','scripts/Uninstall-K5Operator.ps1',
        'src/k5vision/windows_identity_security.py','README.md','docs/WINDOWS_OPERATOR_INSTALL.md',
        'LICENSE','THIRD_PARTY_NOTICES.md','third_party/licenses/MediaMTX-MIT.txt','third_party/licenses/Caddy-Apache-2.0.txt']
@@ -146,6 +191,7 @@ if len(wheels)!=1 or not re.fullmatch(r'k5_vision-[0-9A-Za-z_.+]+-py3-none-any\.
     raise ValueError('One local operator wheel required')
 wheel=wheels[0];files.append('dist/'+wheel.name)
 for name in files: admit(package/name,'file')
+phase='wheel-admission'
 with zipfile.ZipFile(wheel) as archive:
     if len(archive.infolist())>4096 or len(set(archive.namelist()))!=len(archive.namelist()):
         raise ValueError('Wheel contents refused')
@@ -156,15 +202,18 @@ with zipfile.ZipFile(wheel) as archive:
 manifest={'schema_version':'1','files':{name:digest(package/name) for name in sorted(files)}}
 manifest_bytes=json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()
 release=hashlib.sha256(manifest_bytes).hexdigest()
+phase='install-admission'
 directory(root)
 allowed={'releases','active.json','Start-K5Operator.ps1','Uninstall-K5Operator.ps1','windows_identity_security.py','.install.lock'}
 if any(path.name not in allowed for path in root.iterdir()): raise ValueError('Unowned installation content refused')
+phase='release-lock'
 lock_path=root/'.install.lock'
 if lock_path.exists(): admit(lock_path,'file')
 lock=lock_path.open('a+b')
 if lock.seek(0,2)==0: lock.write(b'1');lock.flush()
 lock.seek(0);msvcrt.locking(lock.fileno(),msvcrt.LK_NBLCK,1)
 try:
+    phase='runtime-lock'
     if runtime.exists():
         runtime_lock=runtime/'operator-launcher.lock'
         if runtime_lock.exists(): admit(runtime_lock,'file')
@@ -173,6 +222,7 @@ try:
         kernel.CreateFileW.restype=ctypes.c_void_p;kernel.CloseHandle.argtypes=(ctypes.c_void_p,)
         runtime_handle=kernel.CreateFileW(str(runtime_lock),0xC0000000,0,None,4,0x80,None)
         if runtime_handle==ctypes.c_void_p(-1).value: runtime_handle=None;raise ValueError('Stop running operator before install')
+    phase='release-stage'
     directory(root/'releases')
     if (root/'active.json').exists():
         prior=read_json(root/'active.json')
@@ -263,6 +313,7 @@ try {
     exit $LASTEXITCODE
 } catch { Write-Host 'K5 operator could not start. Reinstall the reviewed package; existing identity and recordings were preserved.'; exit 1 }
 """%(encoded,python_literal,helper_hash)
+    phase='release-commit'
     for name in ('windows_identity_security.py','Start-K5Operator.ps1','Uninstall-K5Operator.ps1','active.json'):
         path=root/name
         if path.exists(): admit(path,'file');originals[name]=path.read_bytes()
@@ -312,5 +363,6 @@ finally:
     exit 0
 } catch {
     Write-Host ('K5 operator installation failed at ' + $stage + '. Stop any running operator before retrying. Existing identity and recordings were preserved.')
+    Write-Host ('K5 install diagnostic: ' + $script:pythonDiagnostic)
     exit 1
 }

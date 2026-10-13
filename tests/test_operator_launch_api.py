@@ -225,6 +225,11 @@ def test_disabled_user_session_is_revoked_before_operator_launch(monkeypatch, tm
             username="administrator-user",
             role="administrator",
         )
+        _issue_session(
+            client,
+            username="replacement-administrator",
+            role="administrator",
+        )
         enrolled = client.post(
             "/api/v1/devices",
             json={

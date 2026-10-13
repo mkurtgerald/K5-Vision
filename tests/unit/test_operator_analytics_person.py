@@ -195,7 +195,6 @@ def test_cancelled_native_person_call_reserves_capacity_until_real_completion(
 ):
     config, _manifest, _files = admitted
     entered, release = threading.Event(), threading.Event()
-    monkeypatch.setattr(lifecycle, "_CLOSE_TIMEOUT_SECONDS", 0.01)
 
     class Detector:
         def __init__(self, _config):
@@ -219,8 +218,10 @@ def test_cancelled_native_person_call_reserves_capacity_until_real_completion(
             pending.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await pending
-            with pytest.raises(RuntimeError, match="cleanup is incomplete"):
-                await provider.aclose()
+            with monkeypatch.context() as unfinished_call:
+                unfinished_call.setattr(lifecycle, "_CLOSE_TIMEOUT_SECONDS", 0.01)
+                with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+                    await provider.aclose()
             with pytest.raises(RuntimeError, match="capacity"):
                 await factory()
         finally:

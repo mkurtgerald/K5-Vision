@@ -314,7 +314,13 @@ if runtime.is_relative_to(project) or project.is_relative_to(runtime): raise Val
     $stage = 'venv-admission'
     Assert-K5PrivateDirectory -Python $python -Helper $helper -Path $venv
     $stage = 'pip-installation'
-    $null = Invoke-K5PythonText -Python $python -Arguments @('-I', '-B', '-m', 'pip', 'install', '--no-input', '--disable-pip-version-check', '--quiet', '--upgrade', $PackagePath)
+    try {
+        # Installed-wheel restarts reuse satisfied dependencies without Internet.
+        $null = Invoke-K5PythonText -Python $python -Arguments @('-I', '-B', '-m', 'pip', 'install', '--no-input', '--disable-pip-version-check', '--quiet', '--no-index', '--upgrade', $PackagePath)
+    } catch {
+        # First setup or changed requirements can explicitly need PyPI resolution.
+        $null = Invoke-K5PythonText -Python $python -Arguments @('-I', '-B', '-m', 'pip', 'install', '--no-input', '--disable-pip-version-check', '--quiet', '--upgrade', $PackagePath)
+    }
     # Content-addressed product releases can carry the same project version.
     # Resolve dependencies normally, then replace only K5's package bytes.
     $null = Invoke-K5PythonText -Python $python -Arguments @('-I', '-B', '-m', 'pip', 'install', '--no-input', '--disable-pip-version-check', '--quiet', '--force-reinstall', '--no-deps', $PackagePath)
