@@ -28,6 +28,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE_ROOT = ROOT / "scripts/qualification"
 GIB = 1024**3
+EVIDENCE_MODE = "sampled-owned-job-v1"
+MAX_ASSOCIATIONS = 2**53 - 1  # Exact cross-Job JSON integers; not a resource cap.
+ASSOCIATION_FIELDS = (
+    "job_total_associations",
+    "fully_live_observed_associations",
+    "unobserved_or_rejected_associations",
+)
 PROFILES = {
     "alpha": ".github/workflows/windows-alpha-script-smoke.yml",
     "operator": ".github/workflows/operator-product-windows.yml",
@@ -166,6 +173,42 @@ def validate_wheelhouse(path, records):
         )
 
 
+def association_evidence(value, *, require_complete=True):
+    need(type(value) is dict and value.get("evidence_mode") == EVIDENCE_MODE, "evidence_mode")
+    need(type(value.get("association_counts_complete")) is bool, "association_counts")
+    counts = [value.get(field) for field in ASSOCIATION_FIELDS]
+    need(
+        all(type(count) is int and 0 <= count <= MAX_ASSOCIATIONS for count in counts),
+        "association_counts",
+    )
+    need(counts[0] == counts[1] + counts[2], "association_counts")
+    need(
+        not require_complete or value["association_counts_complete"],
+        "association_counts_incomplete",
+    )
+
+
+def accumulate_associations(state, resources):
+    association_evidence(state)
+    need(resources.association_counts_recorded is False, "association_counts_already_recorded")
+    need(resources.association_counts_complete is True, "association_counts_unavailable")
+    total, observed = resources.final_total, len(resources.witnessed_births)
+    need(type(total) is int and 0 <= observed <= total < 2**32, "association_counts")
+    additions = (total, observed, total - observed)
+    updated = {
+        **state,
+        **{
+            field: state[field] + count
+            for field, count in zip(ASSOCIATION_FIELDS, additions, strict=True)
+        },
+    }
+    # Validate every new aggregate before committing any field. Close never
+    # records counts; this explicit once-per-Job path also covers refused stages.
+    association_evidence(updated)
+    state.update({field: updated[field] for field in ASSOCIATION_FIELDS})
+    resources.association_counts_recorded = True
+
+
 def receipt_valid(receipt):
     required = {
         "source_sha",
@@ -182,6 +225,7 @@ def receipt_valid(receipt):
         "stage_count",
     }
     need(type(receipt) is dict and required <= receipt.keys(), "receipt_missing")
+    association_evidence(receipt)
     need(receipt["completed"] is True and receipt["cleanup_complete"] is True, "receipt_incomplete")
     need(receipt["owned_active"] == 0 and receipt["owned_listeners"] == 0, "cleanup_incomplete")
     need(
@@ -295,6 +339,7 @@ def read_state(profile, *, cleanup=False):
         work.parent == parent and re.fullmatch(r"k5-hosted-[a-z0-9_]{8,32}", work.name), "work_root"
     )
     state = load_json(work / "state.json")
+    association_evidence(state, require_complete=not cleanup)
     need(all(state.get(k) == v for k, v in identity.items()), "state_identity")
     need(
         state["bootstrap_path"] == str(ordinary(Path(sys.base_prefix) / "python.exe"))
@@ -311,6 +356,7 @@ def read_state(profile, *, cleanup=False):
 
 
 def save_state(work, state):
+    association_evidence(state, require_complete=False)
     temporary = work / "state.next.json"
     need(not temporary.exists(), "state_temporary")
     temporary.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
@@ -398,6 +444,8 @@ def child_environment(work, state):
 
 
 def run_owned(arguments, *, cwd, env, work, state, seconds):
+    association_evidence(state)
+    need(state.get("pending_payload") is False, "payload_pending")
     state["pending_payload"] = True
     save_state(work, state)
     common = common_module()
@@ -448,6 +496,14 @@ def run_owned(arguments, *, cwd, env, work, state, seconds):
             resources.close()
         except BaseException:
             original = Refusal("cleanup_incomplete")
+        try:
+            accumulate_associations(state, resources)
+        except (Refusal, ResourceFailure) as error:
+            # Keep recovered earlier aggregates, explicitly marked partial.
+            # Missing terminal accounting is never an invented zero or coverage.
+            state["association_counts_complete"] = False
+            if original is None:
+                original = error
         if resources.final_cpu_seconds is not None:
             state["cpu_seconds"] += resources.final_cpu_seconds
         else:
@@ -889,6 +945,9 @@ def prepare(profile):
     )
     state = {
         **identity,
+        "evidence_mode": EVIDENCE_MODE,
+        "association_counts_complete": True,
+        **dict.fromkeys(ASSOCIATION_FIELDS, 0),
         "bootstrap_path": str(bootstrap),
         "bootstrap_sha256": digest(bootstrap),
         "host_temp": str(parent),
@@ -1093,6 +1152,7 @@ def admit_absent_shell_profiles(state):
 
 def finish(profile):
     work, state = read_state(profile, cleanup=True)
+    association_evidence(state, require_complete=False)
     expected = workflow_steps((ROOT / PROFILES[profile]).read_text())
     guarded = [
         i
@@ -1101,6 +1161,7 @@ def finish(profile):
     ]
     success = (
         state["prepared"]
+        and state["association_counts_complete"]
         and not state["failed"]
         and state["finished_steps"] == guarded
         and 0 <= time.time() - state["started_at"] <= 900
@@ -1123,6 +1184,9 @@ def finish(profile):
                 "attempt",
                 "peak_rss_bytes",
                 "cpu_seconds",
+                "evidence_mode",
+                "association_counts_complete",
+                *ASSOCIATION_FIELDS,
             )
         },
         "completed": bool(success),
@@ -1133,6 +1197,11 @@ def finish(profile):
         "execution_boundary": (
             "owned step payloads only; read-only selector, PowerShell launcher, "
             "supervisor and transport excluded"
+        ),
+        "resource_evidence": (
+            "sampled RSS and owned endpoints only; between-sample peaks and transient "
+            "listeners unproven; association counters cover recovered final Job totals "
+            "and are partial when association_counts_complete is false"
         ),
     }
     path = ROOT / f"hosted-{profile}-qualification.json"
@@ -1525,9 +1594,10 @@ class NativeMetrics:
 class QualificationResources:
     """Explicit factory adapter. Caller schedules samples and enforces host policy.
 
-    No background thread is hidden here. Call sample at <=250ms intervals; call
-    assert_fresh immediately before using evidence/gate decisions. The 1s limit
-    is hard staleness, not permission to sample at 1Hz. All measurements are local
+    No background thread is hidden here. The caller schedules 250ms sleeps;
+    acquisition time adds to that interval. Call assert_fresh immediately before
+    using evidence/gate decisions. The 1s limit is hard staleness, not a claim of
+    a hard 250ms start-to-start interval. All measurements are local
     proposal evidence; sampled RSS is not a kernel resident-memory hard cap.
     """
 
@@ -1554,6 +1624,7 @@ class QualificationResources:
         # RSS and listener observations can charge a lifetime Job association.
         self.witnessed_births = set()  # (pid, creation FILETIME), retained through drain.
         self.birth_evidence_complete = False
+        self.association_counts_complete = self.association_counts_recorded = False
         self.terminal_evidence_failure = None
         self.observed_listeners = set()
         self.last_start = self.last_cpu = self.last_total = None
@@ -1705,6 +1776,7 @@ class QualificationResources:
             return departed, attempt_rss
 
         remaining_members = None
+        initial_allowance = None
         for attempt in range(MAX_SAMPLE_ATTEMPTS):
             fresh()
             before = accounting()
@@ -1712,7 +1784,6 @@ class QualificationResources:
             for pid, birth in self.witnessed_births:
                 resource_need(pid in self.handles, "departure_handle_missing")
                 resource_need(self.handles[pid][1] == birth, "pid_reuse_or_exit")
-            resource_need(before[1] == len(members), "initial_active_count_mismatch")
             resource_need(len(members) <= ACTIVE_LIMIT, "initial_members_exceed_limit")
             if remaining_members is not None:
                 # Previously departed PIDs cannot reappear under retained handles.
@@ -1723,8 +1794,17 @@ class QualificationResources:
             for pid in self.handles.keys() - members:
                 resource_need(exited(pid), "departure_not_signaled")
             unobserved = {pid for pid in members if not witnessed(pid)}
+            if initial_allowance is None:
+                # Initial accounting and membership are non-atomic. This covers
+                # unobserved-or-rejected associations in that initial census,
+                # without claiming they all predate acquisition. Freeze it here:
+                # later attempts may never forgive additional unexplained births.
+                initial_allowance = max(0, before[0] - len(self.witnessed_births) - len(unobserved))
+            # Accounting precedes the non-atomic membership read. Live arrivals
+            # may outnumber that older count, but excess above the frozen
+            # allowance is never retryable or charged to a future arrival.
             resource_need(
-                before[0] - len(self.witnessed_births) == len(unobserved),
+                before[0] - len(self.witnessed_births) - initial_allowance <= len(unobserved),
                 "initial_birth_evidence_gap",
             )
             departed, attempt_rss = audit(members)
@@ -1733,9 +1813,9 @@ class QualificationResources:
             newcomers = survivors - members
             resource_need(not survivors & departed, "departed_member_still_listed")
             resource_need(members - departed <= survivors, "final_survivor_missing")
-            resource_need(after[1] == len(survivors), "final_active_count_mismatch")
+            resource_need(len(survivors) <= ACTIVE_LIMIT, "final_members_exceed_limit")
             resource_need(
-                after[0] - len(self.witnessed_births) == len(newcomers),
+                after[0] - len(self.witnessed_births) - initial_allowance <= len(newcomers),
                 "final_birth_evidence_gap",
             )
             resource_need(not newcomers & self.handles.keys(), "new_birth_identity_reappeared")
@@ -1748,13 +1828,20 @@ class QualificationResources:
                 new_departures, _ = audit(newcomers, prior_rss=attempt_rss)
                 resource_need(not new_departures, "new_birth_observation_incomplete")
             fresh()
-            if not departed and not newcomers:
-                resource_need(after[0] == before[0], "sample_birth_count_changed")
-                resource_need(after[0] == len(self.witnessed_births), "final_birth_evidence_gap")
+            counts_match = before[1] == len(members) and after[1] == len(survivors)
+            if not departed and not newcomers and counts_match and after[0] == before[0]:
+                resource_need(
+                    after[0] == len(self.witnessed_births) + initial_allowance,
+                    "final_birth_evidence_gap",
+                )
                 break
-            # Only fully witnessed arrivals or proved departures are retryable.
+            # Re-read non-atomic counts only after every visible live arrival was
+            # fully witnessed and every missing retained handle proved exited.
             # Never reset lifetime count gaps or the original acquisition deadline.
-            resource_need(attempt + 1 < MAX_SAMPLE_ATTEMPTS, "resource_evidence_unstable")
+            if attempt + 1 == MAX_SAMPLE_ATTEMPTS:
+                resource_need(before[1] == len(members), "initial_active_count_mismatch")
+                resource_need(after[1] == len(survivors), "final_active_count_mismatch")
+                raise ResourceFailure("resource_evidence_unstable")
             remaining_members = survivors
         available, total, times, disk = self.native.host(self.disk_root)
         delta = tuple(b - a for a, b in zip(self.host_seed, times, strict=True))
@@ -1815,16 +1902,23 @@ class QualificationResources:
             self.handles.clear()
             self.closed = True
             self.cleanup_complete = not failures
+        self.association_counts_complete = (
+            self.job is not None
+            and type(self.final_total) is int
+            and len(self.witnessed_births) <= self.final_total < 2**32
+            and type(self.final_active) is int
+            and self.final_active == 0
+            and (self.last_total is None or self.final_total >= self.last_total)
+        )
+        self.birth_evidence_complete = self.association_counts_complete and self.final_total == len(
+            self.witnessed_births
+        )
+        if self.job is not None and not self.association_counts_complete:
+            self.failed = True
+            self.terminal_evidence_failure = "association_counts_unavailable"
         if failures:
             self.failed = True
             raise ResourceFailure(failures[0])
-        self.birth_evidence_complete = self.final_total == len(self.witnessed_births)
-        if self.job is not None and not self.birth_evidence_complete:
-            # Actual cleanup can succeed while qualification evidence is incomplete.
-            # Close remains cleanup-only; run_owned preserves earlier precise errors
-            # and checks this category before allowing a would-be successful stage.
-            self.failed = True
-            self.terminal_evidence_failure = "unwitnessed_birth_at_drain"
 
 
 if __name__ == "__main__":
