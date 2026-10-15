@@ -108,9 +108,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $curl -PathType Leaf)) {
             throw 'Required pinned-build transfer executable unavailable.'
           }
-          & $curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
-            --connect-timeout 20 --max-time 420 --retry 2 --retry-delay 2 \
-            --retry-max-time 420 --output $target $uri
+          & $curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 420 --retry 2 --retry-delay 2 --retry-max-time 420 --output $target $uri
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $target -PathType Leaf)) {
             throw 'Verified GStreamer build-time transfer did not complete.'
           }
