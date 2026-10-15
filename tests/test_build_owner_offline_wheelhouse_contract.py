@@ -22,3 +22,8 @@ def test_windows_ci_collects_exact_closed_wheels_without_owner_network():
     assert "pip wheel --no-deps --wheel-dir $wheels $env:GITHUB_WORKSPACE" in text
     assert "K5_OFFLINE_WHEELHOUSE_EXTERNAL_APPROVAL=not_granted" in text
     assert "unqualified-owner-offline-manifest-" in text
+
+
+def test_windows_git_checkout_preserves_exact_requirements_lf_bytes():
+    attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+    assert "scripts/windows-alpha/runtime-requirements.txt text eol=lf" in attributes
