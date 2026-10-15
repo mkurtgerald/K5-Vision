@@ -12,7 +12,9 @@ if ($env:OS -ne "Windows_NT") { throw "Windows is required." }
 
 $MediaMtxVersion = "1.21.1"
 $MediaMtxArchiveSha256 = "faa97974861eb75a68b5aa326c78e7e7a6f670b5ef191bace78e715130381f23"
-$MediaMtxArchiveUri = "https://github.com/bluenviron/mediamtx/releases/download/v$MediaMtxVersion/mediamtx_v$MediaMtxVersion" + "_windows_amd64.zip"
+# Build-time upstream acquisition only. Owner execution never downloads MediaMTX.
+# The archive is covered by the exact Inno setup artifact and verified again here.
+$MediaMtxArchiveName = "mediamtx_v$MediaMtxVersion" + "_windows_amd64.zip"
 
 # Keep admission in the installed launcher so Test and Start cannot drift. This
 # child never receives a source URI or credential and cannot import the checkout.
@@ -406,46 +408,30 @@ function Invoke-K5NativeProbe {
 }
 
 function Get-K5MediaMtx {
-    $root = Join-Path $env:LOCALAPPDATA "K5RunnerTools\mediamtx\$MediaMtxVersion"
+    # The setup owns these bytes; never trust a pre-existing shared cache or
+    # remove a foreign path. Expand only under this run's isolated session root.
+    $archive = Join-Path $PSScriptRoot (Join-Path "payload\mediamtx" $MediaMtxArchiveName)
+    if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+        throw "The installed MediaMTX offline bundle is missing. Repair the installation."
+    }
+    $actualArchive = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualArchive -cne $MediaMtxArchiveSha256) {
+        throw "The installed MediaMTX offline bundle failed identity verification."
+    }
+    $root = Join-Path $sessionRoot "mediamtx-runtime"
+    if (Test-Path -LiteralPath $root) {
+        throw "The private synthetic test runtime path is already occupied."
+    }
+    New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+    Expand-Archive -LiteralPath $archive -DestinationPath $root -ErrorAction Stop
     $exe = Join-Path $root "mediamtx.exe"
-    $archiveRecord = Join-Path $root "k5-archive.sha256"
-    $exeRecord = Join-Path $root "k5-exe.sha256"
-    $ready = $false
-
-    if ((Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $archiveRecord) -and (Test-Path -LiteralPath $exeRecord)) {
-        $recordedArchive = (Get-Content -LiteralPath $archiveRecord -Raw).Trim().ToLowerInvariant()
-        $recordedExe = (Get-Content -LiteralPath $exeRecord -Raw).Trim().ToLowerInvariant()
-        $actualExe = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-        $ready = $recordedArchive -eq $MediaMtxArchiveSha256 -and $recordedExe -eq $actualExe
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        throw "The installed MediaMTX bundle lacks the approved executable."
     }
-
-    if (-not $ready) {
-        if (Test-Path -LiteralPath $root) {
-            Remove-Item -LiteralPath $root -Recurse -Force
-        }
-        New-Item -ItemType Directory -Force -Path $root | Out-Null
-        $archive = Join-Path $sessionRoot "mediamtx.zip"
-        $priorProgress = $ProgressPreference
-        try {
-            $ProgressPreference = "SilentlyContinue"
-            Write-Host "Provisioning pinned local RTSP test server..."
-            Invoke-WebRequest -Uri $MediaMtxArchiveUri -OutFile $archive -UseBasicParsing
-        } finally {
-            $ProgressPreference = $priorProgress
-        }
-        $actualArchive = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actualArchive -ne $MediaMtxArchiveSha256) {
-            throw "MediaMTX archive failed pinned SHA-256 verification."
-        }
-        Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
-        if (-not (Test-Path -LiteralPath $exe)) {
-            throw "Pinned MediaMTX archive did not contain the Windows executable."
-        }
-        $actualExe = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-        [IO.File]::WriteAllText($archiveRecord, $MediaMtxArchiveSha256)
-        [IO.File]::WriteAllText($exeRecord, $actualExe)
+    $exeInfo = Get-Item -LiteralPath $exe -Force
+    if (($exeInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The installed MediaMTX bundle contains an unapproved executable link."
     }
-
     return $exe
 }
 

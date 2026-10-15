@@ -58,6 +58,37 @@ jobs:
           if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Python Software Foundation') { throw 'Python vendor signature verification failed.' }
           Write-Host 'K5_BUNDLED_PYTHON_IDENTITY=3.12.10/verified'
 
+      - name: Acquire hash-pinned offline MediaMTX test server bundle
+        shell: powershell
+        timeout-minutes: 4
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Controlled CI acquisition only: the shipped owner launcher is offline.
+          $version = '1.21.1'
+          $asset = "mediamtx_v${version}_windows_amd64.zip"
+          $url = "https://github.com/bluenviron/mediamtx/releases/download/v${version}/${asset}"
+          $targetDir = Join-Path $env:GITHUB_WORKSPACE 'build\owner-installer\mediamtx'
+          New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+          $target = Join-Path $targetDir $asset
+          if (Test-Path -LiteralPath $target) { throw 'Fresh dependency acquisition required.' }
+          Invoke-WebRequest -Uri $url -OutFile $target -UseBasicParsing -ErrorAction Stop
+          if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+              'faa97974861eb75a68b5aa326c78e7e7a6f670b5ef191bace78e715130381f23') {
+            throw 'Offline MediaMTX archive has an unreviewed identity.'
+          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead($target)
+          try {
+            $members = @($zip.Entries | Where-Object { $_.FullName -ceq 'mediamtx.exe' })
+            if ($members.Count -ne 1 -or $members[0].Length -le 0 -or
+                $members[0].Length -gt 100MB) {
+              throw 'Offline MediaMTX archive inventory is invalid.'
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          Write-Host 'K5_OFFLINE_MEDIAMTX_BUNDLE=v1.21.1_sha256_verified'
+
       - name: Checkout exact Analytics Lab engineering donor
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -179,6 +210,7 @@ jobs:
               5 = 'runtime launcher'; 6 = 'source revision receipt'
               7 = 'analytics configuration'; 8 = 'person-detection model asset'
               9 = 'pose-estimation model asset'; 10 = 'GStreamer video runtime'
+              11 = 'offline MediaMTX synthetic RTSP bundle'
             }
             $component = $missing[[int]$probe.ExitCode]
             if (-not $component) { $component = 'unrecognized prerequisite failure' }

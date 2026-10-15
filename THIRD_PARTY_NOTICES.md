@@ -13,6 +13,17 @@ runtime package is described below; all upstream rights remain effective.
 
 Dependencies declared in `pyproject.toml` must be reviewed under `docs/COMMERCIAL_DEPENDENCY_POLICY.md` before commercial distribution. Their inclusion as package dependencies does not transfer their copyrights to K5 Vision and does not change their governing licenses.
 
+### MediaMTX (synthetic test server only)
+
+The Windows engineering installer bundles MediaMTX v1.21.1 for locally
+generated synthetic RTSP testing. The release ZIP is pinned to SHA-256
+`faa97974861eb75a68b5aa326c78e7e7a6f670b5ef191bace78e715130381f23`
+and verified during CI acquisition and before local execution. The upstream
+MediaMTX source is MIT licensed (copyright (c) 2019 aler9). The complete
+upstream MIT text is installed as `payload/licenses/MediaMTX-MIT.txt`.
+Commercial and transitive-binary review obligations remain separate; this
+engineering addition is not blanket commercial clearance.
+
 ### GStreamer
 
 K5 Vision uses a reviewed external GStreamer runtime surface for RTSP/RTP media transport. The Stage 04 approved surface is pinned to GStreamer 1.28.7 and the `rtspsrc`, `queue`, and `fakesink` elements. GStreamer and its own plugin code are tracked under LGPL-2.1-or-later for engineering dependency purposes. Preserve all applicable upstream copyright/license notices and satisfy the governing LGPL source/relinking obligations for the exact binaries distributed with a K5 release. Approval of this narrow surface is not blanket approval to redistribute every plugin present in a general-purpose GStreamer installation. The internal engineering Windows candidate may use the exact SHA-256-identified gst-libav and FFmpeg 7.1 decoder under a runtime LGPL-2.1-or-later check. This does not clear codec patents, dynamic-linking/source/relinking obligations, transitive dependencies or redistribution. The x264 encoder used only for generated synthetic test publication is also not release-cleared. See `docs/WINDOWS_DECODER_COMPATIBILITY.md`. The review records are maintained in `docs/STAGE_03_GSTREAMER_REVIEW.md` and `docs/STAGE_04_DEPENDENCY_REVIEW.md`.

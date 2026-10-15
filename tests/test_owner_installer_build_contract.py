@@ -71,3 +71,39 @@ def test_owner_setup_requires_bundled_analytics_and_native_preflight():
         "Installed wheel closure mismatch",
     ):
         assert marker in transaction
+
+
+def test_media_server_is_bundled_by_setup_and_never_downloaded_on_owner_host():
+    script = (ROOT / "scripts/windows-alpha/Start-K5VisionAlpha.ps1").read_text(
+        encoding="utf-8"
+    )
+    installer = ISS.read_text(encoding="utf-8")
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    gui = (ROOT / "scripts/windows-alpha/owner-installer/K5VisionAlpha.cs").read_text(
+        encoding="utf-8"
+    )
+    expected = "faa97974861eb75a68b5aa326c78e7e7a6f670b5ef191bace78e715130381f23"
+    assert expected in script and expected in workflow
+    assert "mediamtx_v1.21.1_windows_amd64.zip" in installer
+    assert "MediaMTX-MIT.txt" in installer and "MediaMTX-MIT.txt" in (
+        ROOT / "THIRD_PARTY_NOTICES.md"
+    ).read_text(encoding="utf-8")
+    assert "MediaMTX-MIT.txt" in (
+        ROOT / "docs/licenses/MediaMTX-MIT.txt"
+    ).as_posix()
+    assert "MIT License" in (
+        ROOT / "docs/licenses/MediaMTX-MIT.txt"
+    ).read_text(encoding="utf-8")
+    assert "payload\\mediamtx\\mediamtx_v1.21.1_windows_amd64.zip" in gui
+    assert "return 11;" in gui
+    assert "K5_OFFLINE_MEDIAMTX_BUNDLE=v1.21.1_sha256_verified" in workflow
+    assert "Get-K5MediaMtx" in script and "Expand-Archive -LiteralPath $archive" in script
+    assert "$sessionRoot" in script
+    media_section = script.split("function Get-K5MediaMtx {", 1)[1].split(
+        "function Start-K5SyntheticSource {", 1
+    )[0]
+    assert "Invoke-WebRequest" not in media_section
+    assert "MediaMtxArchiveUri" not in script
+    assert "https://github.com/bluenviron/mediamtx" not in script
+    assert "Remove-Item -LiteralPath $root -Recurse -Force" not in media_section
+    assert "MediaMtxArchiveSha256" in media_section

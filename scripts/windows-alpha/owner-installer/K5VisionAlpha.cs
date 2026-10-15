@@ -343,6 +343,8 @@ namespace K5VisionAlpha
             string gst = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 @"K5RunnerTools\k5-gstreamer\1.28.7\msvc_x86_64\bin\gst-launch-1.0.exe");
             if (!File.Exists(gst)) return 10;
+            if (!File.Exists(Path.Combine(root,
+                @"payload\mediamtx\mediamtx_v1.21.1_windows_amd64.zip"))) return 11;
             return 0;
         }
 
@@ -358,6 +360,7 @@ namespace K5VisionAlpha
                 case 8: return "person-detection model asset";
                 case 9: return "pose-estimation model asset";
                 case 10: return "GStreamer video runtime";
+                case 11: return "offline MediaMTX test server bundle";
                 default: return "unknown runtime prerequisite";
             }
         }
