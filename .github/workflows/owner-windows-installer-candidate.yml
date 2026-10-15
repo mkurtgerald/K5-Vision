@@ -101,7 +101,22 @@ jobs:
           $target = Join-Path $destination $asset
           if (Test-Path -LiteralPath $target) { throw 'Fresh bundled dependency required.' }
           $uri = 'https://gstreamer.freedesktop.org/data/pkg/windows/' + $version + '/msvc/' + $asset
-          Invoke-WebRequest -Uri $uri -OutFile $target -UseBasicParsing -ErrorAction Stop
+          # PowerShell's direct fetch has been observed to return a successful
+          # 5 MiB truncated transfer. Use the supported Windows curl executable
+          # for one bounded build-time download; never a runtime owner fetch.
+          $curl = Join-Path $env:WINDIR 'System32\curl.exe'
+          if (-not (Test-Path -LiteralPath $curl -PathType Leaf)) {
+            throw 'Required pinned-build transfer executable unavailable.'
+          }
+          & $curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+            --connect-timeout 20 --max-time 420 --retry 2 --retry-delay 2 \
+            --retry-max-time 420 --output $target $uri
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $target -PathType Leaf)) {
+            throw 'Verified GStreamer build-time transfer did not complete.'
+          }
+          if ((Get-Item -LiteralPath $target).Length -lt 100MB) {
+            throw 'GStreamer build-time transfer was incomplete.'
+          }
           $checksumFile = Join-Path $destination ($asset + '.sha256sum')
           Invoke-WebRequest -Uri ($uri + '.sha256sum') -OutFile $checksumFile -UseBasicParsing -ErrorAction Stop
           $checksumText = (Get-Content -LiteralPath $checksumFile -Raw).Trim()
