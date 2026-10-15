@@ -31,6 +31,7 @@ Source: "{#SourceRoot}\build\owner-installer\K5VisionAlpha.exe"; DestDir: "{app}
 Source: "{#SourceRoot}\build\owner-installer\python-3.12.10-amd64.exe"; DestDir: "{app}\payload"; Flags: ignoreversion
 Source: "{#SourceRoot}\build\owner-installer\mediamtx\mediamtx_v1.21.1_windows_amd64.zip"; DestDir: "{app}\payload\mediamtx"; Flags: ignoreversion
 Source: "{#SourceRoot}\docs\licenses\MediaMTX-MIT.txt"; DestDir: "{app}\payload\licenses"; Flags: ignoreversion
+Source: "{#SourceRoot}\build\owner-installer\gstreamer\gstreamer-1.0-msvc-x86_64-1.28.7.exe"; DestDir: "{app}\payload\gstreamer"; Flags: ignoreversion
 Source: "{#SourceRoot}\scripts\windows-alpha\Install-K5VisionAlpha.ps1"; DestDir: "{app}\payload\windows-alpha"; Flags: ignoreversion
 Source: "{#SourceRoot}\scripts\windows-alpha\Start-K5VisionAlpha.ps1"; DestDir: "{app}\payload\windows-alpha"; Flags: ignoreversion
 Source: "{#SourceRoot}\scripts\windows-alpha\Test-K5VisionAlpha.ps1"; DestDir: "{app}\payload\windows-alpha"; Flags: ignoreversion
@@ -149,7 +150,8 @@ begin
     RaiseException('Verified owner analytics payload is missing.');
   if not FileExists(PySetup) or not FileExists(Bootstrap) or
      not FileExists(AppRoot + '\payload\mediamtx\mediamtx_v1.21.1_windows_amd64.zip') or
-     not FileExists(AppRoot + '\payload\licenses\MediaMTX-MIT.txt') then
+     not FileExists(AppRoot + '\payload\licenses\MediaMTX-MIT.txt') or
+     not FileExists(AppRoot + '\payload\gstreamer\gstreamer-1.0-msvc-x86_64-1.28.7.exe') then
     RaiseException('K5 installer payload is incomplete.');
   K5PostInstallPhase := 2;
   if not FileExists(PythonExe) then

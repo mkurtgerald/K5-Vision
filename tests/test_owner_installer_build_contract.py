@@ -74,27 +74,21 @@ def test_owner_setup_requires_bundled_analytics_and_native_preflight():
 
 
 def test_media_server_is_bundled_by_setup_and_never_downloaded_on_owner_host():
-    script = (ROOT / "scripts/windows-alpha/Start-K5VisionAlpha.ps1").read_text(
-        encoding="utf-8"
-    )
+    script = (ROOT / "scripts/windows-alpha/Start-K5VisionAlpha.ps1").read_text(encoding="utf-8")
     installer = ISS.read_text(encoding="utf-8")
     workflow = WORKFLOW.read_text(encoding="utf-8")
     gui = (ROOT / "scripts/windows-alpha/owner-installer/K5VisionAlpha.cs").read_text(
         encoding="utf-8"
     )
+    license_path = ROOT / "docs/licenses/MediaMTX-MIT.txt"
     expected = "faa97974861eb75a68b5aa326c78e7e7a6f670b5ef191bace78e715130381f23"
     assert expected in script and expected in workflow
     assert "mediamtx_v1.21.1_windows_amd64.zip" in installer
-    assert "MediaMTX-MIT.txt" in installer and "MediaMTX-MIT.txt" in (
-        ROOT / "THIRD_PARTY_NOTICES.md"
-    ).read_text(encoding="utf-8")
-    assert "MediaMTX-MIT.txt" in (
-        ROOT / "docs/licenses/MediaMTX-MIT.txt"
-    ).as_posix()
-    assert "MIT License" in (
-        ROOT / "docs/licenses/MediaMTX-MIT.txt"
-    ).read_text(encoding="utf-8")
-    assert "payload\\mediamtx\\mediamtx_v1.21.1_windows_amd64.zip" in gui
+    assert "MediaMTX-MIT.txt" in installer
+    assert "MediaMTX-MIT.txt" in (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    assert license_path.is_file()
+    assert "MIT License" in license_path.read_text(encoding="utf-8")
+    assert r"payload\mediamtx\mediamtx_v1.21.1_windows_amd64.zip" in gui
     assert "return 11;" in gui
     assert "K5_OFFLINE_MEDIAMTX_BUNDLE=v1.21.1_sha256_verified" in workflow
     assert "Get-K5MediaMtx" in script and "Expand-Archive -LiteralPath $archive" in script
@@ -107,3 +101,25 @@ def test_media_server_is_bundled_by_setup_and_never_downloaded_on_owner_host():
     assert "https://github.com/bluenviron/mediamtx" not in script
     assert "Remove-Item -LiteralPath $root -Recurse -Force" not in media_section
     assert "MediaMtxArchiveSha256" in media_section
+
+
+def test_gstreamer_owner_runtime_uses_hash_pinned_bundle_and_refuses_foreign_root():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    installer = ISS.read_text(encoding="utf-8")
+    provision = (ROOT / "scripts/provision-stage03-gstreamer.ps1").read_text(encoding="utf-8")
+    transaction = (ROOT / "scripts/windows-alpha/install_transaction.py").read_text(
+        encoding="utf-8"
+    )
+    gui = (ROOT / "scripts/windows-alpha/owner-installer/K5VisionAlpha.cs").read_text(
+        encoding="utf-8"
+    )
+    identity = "032fc6062b8539838fc8da22589cb9b24c5d820baa7f8cc160af9ea08395badf"
+    assert identity in workflow and identity in provision
+    assert "gstreamer-1.0-msvc-x86_64-1.28.7.exe" in installer
+    assert "K5_OFFLINE_GSTREAMER_BUNDLE=1.28.7_sha256_verified" in workflow
+    assert "-OfflineInstaller" in transaction
+    assert "self.analytics_bundle is not None or self.offline is not None" in transaction
+    assert "Bundled offline GStreamer runtime failed exact identity admission" in provision
+    assert "no foreign changes permitted" in provision
+    assert r"payload\gstreamer\gstreamer-1.0-msvc-x86_64-1.28.7.exe" in gui
+    assert "return 12;" in gui

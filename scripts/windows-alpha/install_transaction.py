@@ -1199,22 +1199,29 @@ class Installer:
                 # Never change the shared GStreamer runtime during an upgrade.
                 # A missing/different requested version fails candidate preflight.
                 self.owner_install_stage("gstreamer")
-                if self.offline is None and not any(
-                    (self.root / name).exists() for name in MANAGED
-                ):
-                    self.command(
-                        [
-                            self.host,
-                            "-NoProfile",
-                            "-NonInteractive",
-                            "-ExecutionPolicy",
-                            "Bypass",
-                            "-File",
-                            self.source.parent / "provision-stage03-gstreamer.ps1",
-                            "-Version",
-                            self.gstreamer,
-                        ]
-                    )
+                if not any((self.root / name).exists() for name in MANAGED):
+                    command = [
+                        self.host,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        self.source.parent / "provision-stage03-gstreamer.ps1",
+                        "-Version",
+                        self.gstreamer,
+                    ]
+                    if self.analytics_bundle is not None or self.offline is not None:
+                        # Bundled owner setup never falls back to remote acquisition.
+                        bundle = (
+                            self.source.parent
+                            / "gstreamer"
+                            / f"gstreamer-1.0-msvc-x86_64-{self.gstreamer}.exe"
+                        )
+                        if not bundle.is_file():
+                            raise RuntimeError("Offline GStreamer installer payload is absent.")
+                        command.extend(["-OfflineInstaller", bundle])
+                    self.command(command)
                 self.prepare_wheels()
                 self.owner_install_stage("wheel-hashes")
                 hashes = self.wheel_hashes()

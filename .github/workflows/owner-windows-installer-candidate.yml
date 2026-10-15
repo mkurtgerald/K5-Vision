@@ -89,6 +89,25 @@ jobs:
           }
           Write-Host 'K5_OFFLINE_MEDIAMTX_BUNDLE=v1.21.1_sha256_verified'
 
+      - name: Acquire pinned GStreamer installer for offline owner setup
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '1.28.7'
+          $asset = 'gstreamer-1.0-msvc-x86_64-' + $version + '.exe'
+          $destination = Join-Path $env:GITHUB_WORKSPACE 'build\owner-installer\gstreamer'
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+          $target = Join-Path $destination $asset
+          if (Test-Path -LiteralPath $target) { throw 'Fresh bundled dependency required.' }
+          $uri = 'https://gstreamer.freedesktop.org/data/pkg/windows/' + $version + '/msvc/' + $asset
+          Invoke-WebRequest -Uri $uri -OutFile $target -UseBasicParsing -ErrorAction Stop
+          $sha = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -cne '032fc6062b8539838fc8da22589cb9b24c5d820baa7f8cc160af9ea08395badf') {
+            throw 'Offline GStreamer runtime installer identity mismatch.'
+          }
+          Write-Host 'K5_OFFLINE_GSTREAMER_BUNDLE=1.28.7_sha256_verified'
+
       - name: Checkout exact Analytics Lab engineering donor
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -211,6 +230,7 @@ jobs:
               7 = 'analytics configuration'; 8 = 'person-detection model asset'
               9 = 'pose-estimation model asset'; 10 = 'GStreamer video runtime'
               11 = 'offline MediaMTX synthetic RTSP bundle'
+              12 = 'offline GStreamer runtime bundle'
             }
             $component = $missing[[int]$probe.ExitCode]
             if (-not $component) { $component = 'unrecognized prerequisite failure' }

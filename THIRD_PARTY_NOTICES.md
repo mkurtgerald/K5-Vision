@@ -26,6 +26,14 @@ engineering addition is not blanket commercial clearance.
 
 ### GStreamer
 
+The Windows internal-engineering installer now bundles the reviewed vendor
+GStreamer 1.28.7 MSVC x64 runtime installer, SHA-256
+`032fc6062b8539838fc8da22589cb9b24c5d820baa7f8cc160af9ea08395badf`.
+Offline owner setup verifies this identity without any GStreamer download.
+LGPL source/relinking, bundled plugins, codec patents, x264 encoder, transitive
+dependencies and commercial-redistribution reviews remain OPEN. This change
+does not grant commercial or production distribution rights.
+
 K5 Vision uses a reviewed external GStreamer runtime surface for RTSP/RTP media transport. The Stage 04 approved surface is pinned to GStreamer 1.28.7 and the `rtspsrc`, `queue`, and `fakesink` elements. GStreamer and its own plugin code are tracked under LGPL-2.1-or-later for engineering dependency purposes. Preserve all applicable upstream copyright/license notices and satisfy the governing LGPL source/relinking obligations for the exact binaries distributed with a K5 release. Approval of this narrow surface is not blanket approval to redistribute every plugin present in a general-purpose GStreamer installation. The internal engineering Windows candidate may use the exact SHA-256-identified gst-libav and FFmpeg 7.1 decoder under a runtime LGPL-2.1-or-later check. This does not clear codec patents, dynamic-linking/source/relinking obligations, transitive dependencies or redistribution. The x264 encoder used only for generated synthetic test publication is also not release-cleared. See `docs/WINDOWS_DECODER_COMPATIBILITY.md`. The review records are maintained in `docs/STAGE_03_GSTREAMER_REVIEW.md` and `docs/STAGE_04_DEPENDENCY_REVIEW.md`.
 
 ### psutil

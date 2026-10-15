@@ -345,6 +345,8 @@ namespace K5VisionAlpha
             if (!File.Exists(gst)) return 10;
             if (!File.Exists(Path.Combine(root,
                 @"payload\mediamtx\mediamtx_v1.21.1_windows_amd64.zip"))) return 11;
+            if (!File.Exists(Path.Combine(root,
+                @"payload\gstreamer\gstreamer-1.0-msvc-x86_64-1.28.7.exe"))) return 12;
             return 0;
         }
 
@@ -361,6 +363,7 @@ namespace K5VisionAlpha
                 case 9: return "pose-estimation model asset";
                 case 10: return "GStreamer video runtime";
                 case 11: return "offline MediaMTX test server bundle";
+                case 12: return "offline GStreamer runtime bundle";
                 default: return "unknown runtime prerequisite";
             }
         }

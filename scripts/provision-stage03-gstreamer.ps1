@@ -1,5 +1,6 @@
 param(
-    [string]$Version = "1.28.7"
+    [string]$Version = "1.28.7",
+    [string]$OfflineInstaller = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,6 +21,7 @@ $gstLaunch = Join-Path $binPath "gst-launch-1.0.exe"
 $gstInspect = Join-Path $binPath "gst-inspect-1.0.exe"
 $hashRecord = Join-Path $installRoot "k5-installer.sha256"
 $installerSha256 = $null
+$reviewedOfflineSha256 = "032fc6062b8539838fc8da22589cb9b24c5d820baa7f8cc160af9ea08395badf"
 
 function Assert-ExpectedRuntime {
     if (-not (Test-Path -LiteralPath $gstLaunch) -or -not (Test-Path -LiteralPath $gstInspect)) {
@@ -59,7 +61,27 @@ function Get-RecordedInstallerHash {
 $recordedInstallerSha256 = Get-RecordedInstallerHash
 $runtimeReady = Assert-ExpectedRuntime
 
-if (-not $runtimeReady -or [string]::IsNullOrWhiteSpace([string]$recordedInstallerSha256)) {
+if (-not $runtimeReady -or [string]::IsNullOrWhiteSpace([string]$recordedInstallerSha256) -or
+    (-not [string]::IsNullOrWhiteSpace($OfflineInstaller) -and
+     $recordedInstallerSha256 -cne $reviewedOfflineSha256)) {
+    if (-not [string]::IsNullOrWhiteSpace($OfflineInstaller)) {
+        if ($Version -cne '1.28.7') { throw 'Unreviewed offline GStreamer version.' }
+        if (-not [IO.Path]::IsPathRooted($OfflineInstaller) -or
+            -not (Test-Path -LiteralPath $OfflineInstaller -PathType Leaf)) {
+            throw 'Bundled offline GStreamer runtime is missing.'
+        }
+        $installerSha256 = (Get-FileHash -LiteralPath $OfflineInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($installerSha256 -cne $reviewedOfflineSha256) {
+            throw 'Bundled offline GStreamer runtime failed exact identity admission.'
+        }
+        if (Test-Path -LiteralPath $installRoot) {
+            throw 'Existing GStreamer tool root was not admitted; no foreign changes permitted.'
+        }
+        New-Item -ItemType Directory -Path $installRoot -ErrorAction Stop | Out-Null
+        $installerPath = $OfflineInstaller
+    } else {
+        # Developer/CI standalone provisioning only. The owner always supplies
+        # an offline installer, so this network branch is unreachable for setup.
     New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
     $downloadRoot = Join-Path $env:RUNNER_TEMP "k5-stage03-gstreamer-$Version"
     if (Test-Path -LiteralPath $downloadRoot) {
@@ -92,6 +114,7 @@ if (-not $runtimeReady -or [string]::IsNullOrWhiteSpace([string]$recordedInstall
         throw "Downloaded Stage 03 GStreamer installer failed the official upstream SHA-256 check."
     }
 
+    }
     $arguments = @(
         "/CURRENTUSER",
         "/TYPE=runtime",
