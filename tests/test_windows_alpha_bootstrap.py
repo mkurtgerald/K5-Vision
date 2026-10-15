@@ -344,3 +344,12 @@ def test_windows_alpha_installer_supports_private_bundled_python_without_path() 
     # K5-owned embedded runtime was supplied.
     assert "if ($null -eq $pythonCommand) {\n    $py = Get-Command py.exe" in text
     assert "if ($null -eq $pythonCommand) {\n    foreach ($candidateName" in text
+
+
+def test_bundled_owner_python_cannot_fall_back_to_online_wheel_build():
+    content = (ROOT / "scripts/windows-alpha/Install-K5VisionAlpha.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert 'if (-not [string]::IsNullOrWhiteSpace($PythonExecutable) -and $offlineCount -ne 3)' in content
+    assert "Bundled owner setup requires a reviewed local wheelhouse" in content
+    assert '$offlineCount -eq 3' in content
