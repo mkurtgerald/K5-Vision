@@ -119,7 +119,11 @@ def test_gstreamer_owner_runtime_uses_hash_pinned_bundle_and_refuses_foreign_roo
     assert "K5_OFFLINE_GSTREAMER_BUNDLE=1.28.7_sha256_verified" in workflow
     assert "Required pinned-build transfer executable unavailable." in workflow
     assert "GStreamer build-time transfer was incomplete." in workflow
-    assert "--retry-max-time 420 --output $target $uri" in workflow
+    assert "K5_GSTREAMER_TRANSFER_CHUNKS=" in workflow
+    assert "GStreamer origin did not honor verified byte range." in workflow
+    assert "GStreamer range response was incomplete." in workflow
+    assert "$receivedFrom -ne $position -or $receivedTo -ne $last" in workflow
+    assert "GStreamer reconstructed file length was inconsistent." in workflow
     assert "-OfflineInstaller" in transaction
     assert "if self.analytics_bundle is not None:" in transaction
     assert "if self.offline is None and not any(" in transaction

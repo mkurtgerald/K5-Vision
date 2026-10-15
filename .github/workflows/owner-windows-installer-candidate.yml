@@ -91,7 +91,7 @@ jobs:
 
       - name: Acquire pinned GStreamer installer for offline owner setup
         shell: powershell
-        timeout-minutes: 8
+        timeout-minutes: 12
         run: |
           $ErrorActionPreference = 'Stop'
           $version = '1.28.7'
@@ -101,20 +101,77 @@ jobs:
           $target = Join-Path $destination $asset
           if (Test-Path -LiteralPath $target) { throw 'Fresh bundled dependency required.' }
           $uri = 'https://gstreamer.freedesktop.org/data/pkg/windows/' + $version + '/msvc/' + $asset
-          # PowerShell's direct fetch has been observed to return a successful
-          # 5 MiB truncated transfer. Use the supported Windows curl executable
-          # for one bounded build-time download; never a runtime owner fetch.
+          # The hosted proxy has terminated responses after 5 MiB.
+          # Fetch strict, independently verified 4 MiB byte ranges instead.
+          # An origin that does not honor Content-Range is refused, not bypassed.
           $curl = Join-Path $env:WINDIR 'System32\curl.exe'
           if (-not (Test-Path -LiteralPath $curl -PathType Leaf)) {
             throw 'Required pinned-build transfer executable unavailable.'
           }
-          & $curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 420 --retry 2 --retry-delay 2 --retry-max-time 420 --output $target $uri
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $target -PathType Leaf)) {
-            throw 'Verified GStreamer build-time transfer did not complete.'
+          $chunkBytes = 4MB
+          $position = [long]0
+          $totalBytes = $null
+          $chunkCount = 0
+          $chunkFile = Join-Path $destination 'k5-owned-gst-part.bin'
+          $headerFile = Join-Path $destination 'k5-owned-gst-part.headers'
+          if ((Test-Path -LiteralPath $chunkFile) -or (Test-Path -LiteralPath $headerFile)) {
+            throw 'Fresh private transfer staging required.'
           }
-          if ((Get-Item -LiteralPath $target).Length -lt 100MB) {
-            throw 'GStreamer build-time transfer was incomplete.'
+          $output = [IO.File]::Open($target, [IO.FileMode]::CreateNew,
+              [IO.FileAccess]::Write, [IO.FileShare]::None)
+          try {
+            do {
+              $last = $position + $chunkBytes - 1
+              if ($null -ne $totalBytes) {
+                $last = [Math]::Min($last, $totalBytes - 1)
+              }
+              $range = '{0}-{1}' -f $position, $last
+              & $curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --range $range --connect-timeout 20 --max-time 60 --output $chunkFile --dump-header $headerFile $uri
+              if ($LASTEXITCODE -ne 0) {
+                throw 'Pinned GStreamer range transfer failed.'
+              }
+              $headers = [IO.File]::ReadAllText($headerFile)
+              if ($headers -notmatch '(?im)^HTTP/\S+\s+206\s') {
+                throw 'GStreamer origin did not honor verified byte range.'
+              }
+              $responseRanges = [regex]::Matches($headers,
+                  '(?im)^content-range:\s*bytes\s+([0-9]+)-([0-9]+)/([0-9]+)\s*$')
+              if ($responseRanges.Count -ne 1) {
+                throw 'GStreamer response range is missing or ambiguous.'
+              }
+              $item = $responseRanges[0]
+              $receivedFrom = [long]$item.Groups[1].Value
+              $receivedTo = [long]$item.Groups[2].Value
+              $remoteTotal = [long]$item.Groups[3].Value
+              if ($remoteTotal -lt 100MB -or $remoteTotal -gt 1GB -or
+                  $receivedFrom -ne $position -or $receivedTo -ne $last -or
+                  ($null -ne $totalBytes -and $remoteTotal -ne $totalBytes)) {
+                throw 'GStreamer range identity or size was inconsistent.'
+              }
+              $totalBytes = $remoteTotal
+              if ((Get-Item -LiteralPath $chunkFile).Length -ne ($last - $position + 1)) {
+                throw 'GStreamer range response was incomplete.'
+              }
+              $reader = [IO.File]::OpenRead($chunkFile)
+              try {
+                $reader.CopyTo($output)
+              } finally {
+                $reader.Dispose()
+              }
+              Remove-Item -LiteralPath $chunkFile, $headerFile -Force -ErrorAction Stop
+              $position = $last + 1
+              $chunkCount++
+              if ($chunkCount -gt 256) {
+                throw 'GStreamer transfer exceeded the reviewed chunk limit.'
+              }
+            } while ($position -lt $totalBytes)
+          } finally {
+            $output.Dispose()
           }
+          if ((Get-Item -LiteralPath $target).Length -ne $totalBytes) {
+            throw 'GStreamer reconstructed file length was inconsistent.'
+          }
+          Write-Host ('K5_GSTREAMER_TRANSFER_CHUNKS=' + $chunkCount)
           $checksumFile = Join-Path $destination ($asset + '.sha256sum')
           Invoke-WebRequest -Uri ($uri + '.sha256sum') -OutFile $checksumFile -UseBasicParsing -ErrorAction Stop
           $checksumText = (Get-Content -LiteralPath $checksumFile -Raw).Trim()
