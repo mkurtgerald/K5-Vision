@@ -91,7 +91,7 @@ jobs:
 
       - name: Acquire pinned GStreamer installer for offline owner setup
         shell: powershell
-        timeout-minutes: 12
+        timeout-minutes: 20
         run: |
           $ErrorActionPreference = 'Stop'
           $version = '1.28.7'
@@ -102,13 +102,13 @@ jobs:
           if (Test-Path -LiteralPath $target) { throw 'Fresh bundled dependency required.' }
           $uri = 'https://gstreamer.freedesktop.org/data/pkg/windows/' + $version + '/msvc/' + $asset
           # The hosted proxy has terminated responses after 5 MiB.
-          # Fetch strict, independently verified 4 MiB byte ranges instead.
+          # Fetch exact 1 MiB ranges: the Windows CI proxy also truncated a 4 MiB range at 1 MiB.
           # An origin that does not honor Content-Range is refused, not bypassed.
           $curl = Join-Path $env:WINDIR 'System32\curl.exe'
           if (-not (Test-Path -LiteralPath $curl -PathType Leaf)) {
             throw 'Required pinned-build transfer executable unavailable.'
           }
-          $chunkBytes = 4MB
+          $chunkBytes = 1MB
           $position = [long]0
           $totalBytes = $null
           $chunkCount = 0
@@ -161,7 +161,7 @@ jobs:
               Remove-Item -LiteralPath $chunkFile, $headerFile -Force -ErrorAction Stop
               $position = $last + 1
               $chunkCount++
-              if ($chunkCount -gt 256) {
+              if ($chunkCount -gt 512) {
                 throw 'GStreamer transfer exceeded the reviewed chunk limit.'
               }
             } while ($position -lt $totalBytes)

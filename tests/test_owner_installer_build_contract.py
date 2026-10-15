@@ -118,7 +118,11 @@ def test_gstreamer_owner_runtime_uses_hash_pinned_bundle_and_refuses_foreign_roo
     assert "gstreamer-1.0-msvc-x86_64-1.28.7.exe" in installer
     assert "K5_OFFLINE_GSTREAMER_BUNDLE=1.28.7_sha256_verified" in workflow
     assert "Required pinned-build transfer executable unavailable." in workflow
-    assert "GStreamer build-time transfer was incomplete." in workflow
+    assert "Pinned GStreamer range transfer failed." in workflow
+    assert "$chunkBytes = 1MB" in workflow
+    assert "if ($chunkCount -gt 512)" in workflow
+    assert "--range $range" in workflow
+    assert "--max-time 60" in workflow
     assert "K5_GSTREAMER_TRANSFER_CHUNKS=" in workflow
     assert "GStreamer origin did not honor verified byte range." in workflow
     assert "GStreamer range response was incomplete." in workflow
