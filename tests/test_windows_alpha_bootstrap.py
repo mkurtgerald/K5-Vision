@@ -347,9 +347,10 @@ def test_windows_alpha_installer_supports_private_bundled_python_without_path() 
 
 
 def test_bundled_owner_python_cannot_fall_back_to_online_wheel_build():
-    content = (ROOT / "scripts/windows-alpha/Install-K5VisionAlpha.ps1").read_text(
-        encoding="utf-8"
+    content = (ROOT / "scripts/windows-alpha/Install-K5VisionAlpha.ps1").read_text(encoding="utf-8")
+    assert (
+        'if (-not [string]::IsNullOrWhiteSpace($PythonExecutable) -and $offlineCount -ne 3)'
+        in content
     )
-    assert 'if (-not [string]::IsNullOrWhiteSpace($PythonExecutable) -and $offlineCount -ne 3)' in content
     assert "Bundled owner setup requires a reviewed local wheelhouse" in content
     assert '$offlineCount -eq 3' in content
