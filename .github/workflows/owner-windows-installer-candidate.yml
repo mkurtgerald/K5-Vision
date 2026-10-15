@@ -4,6 +4,9 @@ on:
     branches:
       - fix/transactional-alpha-upgrade-20261003
     paths:
+      - .gitattributes
+      - scripts/build_owner_offline_wheelhouse.py
+      - tests/test_build_owner_offline_wheelhouse_contract.py
       - scripts/windows-alpha/**
       - scripts/provision-stage03-gstreamer.ps1
       - .github/workflows/owner-windows-installer-candidate.yml
