@@ -88,14 +88,15 @@ class _DirectRtspFrameBackend(_PresentationCtypesBackend):  # pragma: no cover
                 "native decoder initialization failed",
             )
         location = quote_pipeline_value(self._source_uri)
+        decoder = getattr(self, "_decoder_element", "d3d11h264dec")
         description = (
             f"rtspsrc location={location} protocols=tcp latency=100 "
             "tcp-timeout=5000000 teardown-timeout=0 "
-            "! rtph264depay ! h264parse ! d3d11h264dec ! videoconvert "
+            f"! rtph264depay ! h264parse ! {decoder} ! videoconvert "
             "! video/x-raw,format=BGRx "
             "! appsink name=k5sink sync=false max-buffers=4 drop=true"
         ).encode()
-        pipeline = self._core.gst_parse_launch(description, None)
+        pipeline = self._core.gst_parse_launch_full(description, None, 1, None)
         if not pipeline:
             raise NativePlaybackDecoderError(
                 NativePlaybackDecoderErrorCode.NATIVE_FAILURE,

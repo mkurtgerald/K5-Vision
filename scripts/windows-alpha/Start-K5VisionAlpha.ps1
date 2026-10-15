@@ -12,7 +12,9 @@ if ($env:OS -ne "Windows_NT") { throw "Windows is required." }
 
 $MediaMtxVersion = "1.21.1"
 $MediaMtxArchiveSha256 = "faa97974861eb75a68b5aa326c78e7e7a6f670b5ef191bace78e715130381f23"
-$MediaMtxArchiveUri = "https://github.com/bluenviron/mediamtx/releases/download/v$MediaMtxVersion/mediamtx_v$MediaMtxVersion" + "_windows_amd64.zip"
+# Build-time upstream acquisition only. Owner execution never downloads MediaMTX.
+# The archive is covered by the exact Inno setup artifact and verified again here.
+$MediaMtxArchiveName = "mediamtx_v$MediaMtxVersion" + "_windows_amd64.zip"
 
 # Keep admission in the installed launcher so Test and Start cannot drift. This
 # child never receives a source URI or credential and cannot import the checkout.
@@ -141,6 +143,51 @@ function Test-K5AlphaOperatorReceipt([object]$Receipt, [bool]$AnalyticsRequired)
         return $false
     }
     return $true
+}
+
+
+function Get-K5AlphaOperatorReceiptFailureClass([object]$Receipt, [bool]$AnalyticsRequired) {
+    # Never print the receipt or any source, only one fixed error identifier.
+    if ($null -eq $Receipt) { return "invalid_receipt" }
+    $fields = @($Receipt.PSObject.Properties.Name)
+    if ("completed" -cnotin $fields -or $Receipt.completed -isnot [bool] -or
+        -not $Receipt.completed) { return "invalid_receipt" }
+    $required = @(
+        @{ Name = "delivered_frames"; Failure = "frames_missing" },
+        @{ Name = "presentations"; Failure = "presentations_missing" }
+    )
+    if ($AnalyticsRequired) {
+        if ("analytics_enabled" -cnotin $fields -or $Receipt.analytics_enabled -isnot [bool]) {
+            return "invalid_receipt"
+        }
+        if (-not $Receipt.analytics_enabled) { return "analytics_disabled" }
+        $required += @(
+            @{ Name = "analytics_provider_submissions"; Failure = "submissions_missing" },
+            @{ Name = "analytics_provider_completions"; Failure = "completions_missing" },
+            @{ Name = "analytics_rendered_boxes"; Failure = "boxes_missing" }
+        )
+    }
+    foreach ($item in $required) {
+        $name = [string]$item.Name
+        if ($name -cnotin $fields) { return "invalid_receipt" }
+        $counter = $Receipt.$name
+        if (($counter -isnot [int] -and $counter -isnot [long]) -or $counter -lt 0) {
+            return "invalid_receipt"
+        }
+        if ($counter -eq 0) { return [string]$item.Failure }
+    }
+    if ($AnalyticsRequired) {
+        if ("analytics_failures" -cnotin $fields) { return "invalid_receipt" }
+        $failed = $Receipt.analytics_failures
+        if (($failed -isnot [int] -and $failed -isnot [long]) -or $failed -lt 0) {
+            return "invalid_receipt"
+        }
+        if ($failed -gt 0) { return "analytics_failures" }
+        if ($Receipt.analytics_provider_completions -gt $Receipt.analytics_provider_submissions) {
+            return "invalid_receipt"
+        }
+    }
+    return "invalid_receipt"
 }
 
 $python = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
@@ -361,46 +408,30 @@ function Invoke-K5NativeProbe {
 }
 
 function Get-K5MediaMtx {
-    $root = Join-Path $env:LOCALAPPDATA "K5RunnerTools\mediamtx\$MediaMtxVersion"
+    # The setup owns these bytes; never trust a pre-existing shared cache or
+    # remove a foreign path. Expand only under this run's isolated session root.
+    $archive = Join-Path $PSScriptRoot (Join-Path "payload\mediamtx" $MediaMtxArchiveName)
+    if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+        throw "The installed MediaMTX offline bundle is missing. Repair the installation."
+    }
+    $actualArchive = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualArchive -cne $MediaMtxArchiveSha256) {
+        throw "The installed MediaMTX offline bundle failed identity verification."
+    }
+    $root = Join-Path $sessionRoot "mediamtx-runtime"
+    if (Test-Path -LiteralPath $root) {
+        throw "The private synthetic test runtime path is already occupied."
+    }
+    New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+    Expand-Archive -LiteralPath $archive -DestinationPath $root -ErrorAction Stop
     $exe = Join-Path $root "mediamtx.exe"
-    $archiveRecord = Join-Path $root "k5-archive.sha256"
-    $exeRecord = Join-Path $root "k5-exe.sha256"
-    $ready = $false
-
-    if ((Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $archiveRecord) -and (Test-Path -LiteralPath $exeRecord)) {
-        $recordedArchive = (Get-Content -LiteralPath $archiveRecord -Raw).Trim().ToLowerInvariant()
-        $recordedExe = (Get-Content -LiteralPath $exeRecord -Raw).Trim().ToLowerInvariant()
-        $actualExe = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-        $ready = $recordedArchive -eq $MediaMtxArchiveSha256 -and $recordedExe -eq $actualExe
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        throw "The installed MediaMTX bundle lacks the approved executable."
     }
-
-    if (-not $ready) {
-        if (Test-Path -LiteralPath $root) {
-            Remove-Item -LiteralPath $root -Recurse -Force
-        }
-        New-Item -ItemType Directory -Force -Path $root | Out-Null
-        $archive = Join-Path $sessionRoot "mediamtx.zip"
-        $priorProgress = $ProgressPreference
-        try {
-            $ProgressPreference = "SilentlyContinue"
-            Write-Host "Provisioning pinned local RTSP test server..."
-            Invoke-WebRequest -Uri $MediaMtxArchiveUri -OutFile $archive -UseBasicParsing
-        } finally {
-            $ProgressPreference = $priorProgress
-        }
-        $actualArchive = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actualArchive -ne $MediaMtxArchiveSha256) {
-            throw "MediaMTX archive failed pinned SHA-256 verification."
-        }
-        Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
-        if (-not (Test-Path -LiteralPath $exe)) {
-            throw "Pinned MediaMTX archive did not contain the Windows executable."
-        }
-        $actualExe = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-        [IO.File]::WriteAllText($archiveRecord, $MediaMtxArchiveSha256)
-        [IO.File]::WriteAllText($exeRecord, $actualExe)
+    $exeInfo = Get-Item -LiteralPath $exe -Force
+    if (($exeInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The installed MediaMTX bundle contains an unapproved executable link."
     }
-
     return $exe
 }
 
@@ -706,15 +737,76 @@ try {
 
     Write-Host "Launching the authenticated K5 Windows operator path..."
     $operatorHeaders = @{ Authorization = "Bearer $sessionToken" }
-    $receipt = Invoke-RestMethod -Method Post -Uri "$baseUri/api/v1/operator/live" -Headers $operatorHeaders -ContentType "application/json" -TimeoutSec 60 -Body (
-        ConvertTo-K5Json @{
-            device_id = $device.id
-            stream_token = $streamToken
-            width = 1280
-            height = 720
+    try {
+        $receipt = Invoke-RestMethod -Method Post -Uri "$baseUri/api/v1/operator/live" -Headers $operatorHeaders -ContentType "application/json" -TimeoutSec 60 -Body (
+            ConvertTo-K5Json @{
+                device_id = $device.id
+                stream_token = $streamToken
+                width = 1280
+                height = 720
+            }
+        )
+    } catch {
+        # Classify only a bounded, source-free service error; never print
+        # response bodies, RTSP sources, credentials or exception text.
+        $failureRecord = $_
+        $operatorFailureClass = "unknown"
+        try {
+            $response = $failureRecord.Exception.Response
+            if ($null -ne $response -and [int]$response.StatusCode -eq 503) {
+                $body = [string]$failureRecord.ErrorDetails.Message
+                if ([string]::IsNullOrWhiteSpace($body)) {
+                    $responseStream = $response.GetResponseStream()
+                    try {
+                        if ($null -ne $responseStream) {
+                            $buffer = New-Object byte[] 2049
+                            $count = $responseStream.Read($buffer, 0, $buffer.Length)
+                            if ($count -gt 0 -and $count -le 2048) {
+                                $decoder = [Text.UTF8Encoding]::new($false, $true)
+                                $body = $decoder.GetString($buffer, 0, $count)
+                            }
+                        }
+                    } finally {
+                        if ($null -ne $responseStream) { $responseStream.Dispose() }
+                    }
+                }
+                if ($body.Length -le 2048) {
+                    $detail = [string](ConvertFrom-Json -InputObject $body -ErrorAction Stop).detail
+                    if ($detail.Length -le 1024) {
+                        switch -Regex ($detail) {
+                            '^selected live source could not be resolved$' {
+                                $operatorFailureClass = "source_unavailable"
+                                break
+                            }
+                            '^configured analytics could not start$' {
+                                $operatorFailureClass = "analytics_start_failure"
+                                break
+                            }
+                            '^Live operator runtime is not configured$' {
+                                $operatorFailureClass = "unconfigured"
+                                break
+                            }
+                            '^live operator runtime failed at (execution_failure|start_failure|assembly_failure|cleanup_failure):' {
+                                $operatorFailureClass = $Matches[1]
+                                break
+                            }
+                            '^live operator runtime failed$' {
+                                $operatorFailureClass = "launch_failure"
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {
+            $operatorFailureClass = "unknown"
         }
-    )
+        Write-Host ("K5_OPERATOR_LIVE_FAILURE=" + $operatorFailureClass)
+        throw "K5 Windows operator live request failed."
+    }
     if (-not (Test-K5AlphaOperatorReceipt -Receipt $receipt -AnalyticsRequired $analyticsRequired)) {
+        $receiptFailureClass = Get-K5AlphaOperatorReceiptFailureClass -Receipt $receipt -AnalyticsRequired $analyticsRequired
+        Write-Host ("K5_OPERATOR_RECEIPT_FAILURE=" + $receiptFailureClass)
         throw "K5 Windows operator alpha test did not complete the selected acceptance checks."
     }
     if ($analyticsRequired) {

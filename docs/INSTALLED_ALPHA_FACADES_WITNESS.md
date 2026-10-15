@@ -269,12 +269,18 @@ merely selecting hosted tests must never implicitly provision that layout.
 
 `.github/workflows/installed-analytics-candidate.yml` now has two jobs:
 
-1. A read-only `windows-latest` hosted admission job, bounded to 10 minutes with
-   an 8-minute polling budget inside its 9-minute step. It checks exact trusted
+1. A read-only `windows-latest` hosted admission job, bounded to 18 minutes with
+   a 16-minute polling budget inside its 17-minute step. It checks exact trusted
    repository/branch/SHA and successful matching pull-request workflow runs
 2. The existing physical job, bounded to 25 minutes, requires that job's success
    and exact `qualified_sha` output. Its first step revalidates the same hosted
    gates and branch once, immediately before any native checkout/provisioning
+
+The hosted wait covers the existing Windows smoke job's 15-minute execution
+bound plus one minute for relative start delay and polling. The nested step/job
+limits retain separate completion overhead. Longer queues still fail closed;
+any completed required-gate failure is refused immediately. No gate is skipped,
+and the physical job's 25-minute allowance is unchanged.
 
 Only the existing two trusted branches plus
 `feat/installed-alpha-facade-witness-20261005` are admitted. The legacy branch

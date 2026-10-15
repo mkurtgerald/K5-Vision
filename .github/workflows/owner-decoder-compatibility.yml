@@ -1,0 +1,66 @@
+name: Owner Decoder Compatibility Review
+on:
+  push:
+    branches: [fix/transactional-alpha-upgrade-20261003]
+    paths:
+      - .github/workflows/owner-decoder-compatibility.yml
+      - scripts/qualify_owner_software_decoder.py
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reviewed-software-decoder:
+    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact engineering probe only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: scripts/qualify_owner_software_decoder.py
+      - name: Provision exact hosted controller Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12.10'
+      - name: Install same byte-bound GStreamer release in owned hosted workspace
+        id: install
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted') { throw 'Isolated hosted runner required.' }
+          $root = Join-Path $env:RUNNER_TEMP 'k5-decoder-compatibility'
+          if (Test-Path -LiteralPath $root) { throw 'Fresh owned runtime root required.' }
+          $setup = Join-Path $env:RUNNER_TEMP 'k5-reviewed-gstreamer.exe'
+          $uri = 'https://gstreamer.freedesktop.org/data/pkg/windows/1.28.7/msvc/gstreamer-1.0-msvc-x86_64-1.28.7.exe'
+          Invoke-WebRequest -UseBasicParsing -TimeoutSec 180 -Uri $uri -OutFile $setup
+          $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -cne '032fc6062b8539838fc8da22589cb9b24c5d820baa7f8cc160af9ea08395badf') { throw 'Reviewed runtime byte identity mismatch.' }
+          'owned_install=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
+          $p = Start-Process -FilePath $setup -ArgumentList '/CURRENTUSER','/TYPE=runtime',("/DIR=" + $root),'/VERYSILENT','/NORESTART','/SP-' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw 'Reviewed runtime installation failed.' }
+          ('K5_CODEC_INSTALLER_SHA256=' + $hash) | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
+      - name: Verify shipped codec license identity and eight synthetic decoded frames
+        shell: powershell
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = Join-Path $env:pythonLocation 'python.exe'
+          & $python -I -B (Join-Path $env:GITHUB_WORKSPACE 'scripts/qualify_owner_software_decoder.py')
+          if ($LASTEXITCODE -ne 0) { throw 'Software decoder review failed; no product fallback is authorized.' }
+      - name: Remove only runtime owned by this review
+        if: always() && steps.install.outputs.owned_install == 'true'
+        shell: powershell
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'k5-decoder-compatibility'
+          $uninstaller = Join-Path $root 'unins000.exe'
+          if (Test-Path -LiteralPath $uninstaller) {
+            $p = Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait
+            if ($p.ExitCode -ne 0) { throw 'Owned runtime uninstall failed.' }
+          }

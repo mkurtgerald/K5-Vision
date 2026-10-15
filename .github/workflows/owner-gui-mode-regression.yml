@@ -1,0 +1,28 @@
+name: Owner GUI Mode Regression
+on:
+  push:
+    branches: [fix/transactional-alpha-upgrade-20261003]
+    paths:
+      - scripts/windows-alpha/owner-installer/K5VisionAlpha.cs
+      - tests/test_owner_gui_source_contract.py
+      - .github/workflows/owner-gui-mode-regression.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compiled-mode-contract:
+    if: github.repository == 'mkurtgerald/K5-Vision' && github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Compile actual GUI and prove source-mode environment isolation
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          py -3.12 -B -m unittest discover -s tests -p test_owner_gui_source_contract.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Compiled owner GUI mode contract failed.' }
+          Write-Host 'K5_OWNER_GUI_MODE_REGRESSION=passed'

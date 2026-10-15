@@ -696,7 +696,8 @@ def test_both_archive_calls_override_hostile_autocrlf_without_host_changes(tmp_p
     import hashlib
     import zipfile
 
-    path = "src/k5vision/data/analytics-runtime-manifest.json"
+    # Probe the hostile setting on unpinned text; the manifest has a fixed LF attribute.
+    path = "scripts/installed_analytics_witness.py"
     expected = subprocess.check_output(["git", "show", f"HEAD:{path}"], cwd=ROOT)
     env = dict(os.environ)
     # Per-child environment simulates the common Windows checkout setting;
@@ -720,8 +721,9 @@ def test_both_archive_calls_override_hostile_autocrlf_without_host_changes(tmp_p
     )
     with zipfile.ZipFile(output) as archive:
         assert archive.read(path) == expected
+        manifest = archive.read("src/k5vision/data/analytics-runtime-manifest.json")
     assert (
-        hashlib.sha256(expected).hexdigest()
+        hashlib.sha256(manifest).hexdigest()
         == "62cd59b95380f429e7b77cfaf4855845ad96242ed6f2d2bafa2a1600cde1f3c2"
     )
     tree = ast.parse((ROOT / "scripts/installed_analytics_witness.py").read_text())

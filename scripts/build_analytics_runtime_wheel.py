@@ -26,6 +26,43 @@ _admission = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_admission)
 
 
+def _read_verified_checkout_source(root: Path, entry: dict) -> bytes:
+    """Preserve exact pinned donor bytes despite Windows CRLF checkout smudging.
+
+    Only a uniform CRLF conversion of reviewed donor *text* can be restored.
+    The canonical length, SHA-256 and (at the caller) Git blob SHA-1 must
+    still match the frozen manifest. Installed-file admission stays strict.
+    """
+    data = _admission._safe_file(root, entry["source_path"]).read_bytes()
+    canonical = data
+    if entry["source"] == "analytics" and (
+        len(data) != entry["size"]
+        or hashlib.sha256(data).hexdigest() != entry["sha256"]
+    ):
+        name = entry["source_path"]
+        text_source = (
+            name == "LICENSE" or name.endswith((".py", ".md", ".txt"))
+        )
+        if (
+            not text_source
+            or b"\r\n" not in data
+            or b"\r" in data.replace(b"\r\n", b"")
+            or data.count(b"\n") != data.count(b"\r\n")
+        ):
+            raise _admission.AnalyticsPackageError(
+                f"Analytics checkout source differs from pinned manifest: {entry['source_path']}"
+            )
+        canonical = data.replace(b"\r\n", b"\n")
+    if (
+        len(canonical) != entry["size"]
+        or hashlib.sha256(canonical).hexdigest() != entry["sha256"]
+    ):
+        raise _admission.AnalyticsPackageError(
+            f"Analytics checkout source differs from pinned manifest: {entry['source_path']}"
+        )
+    return canonical
+
+
 def build_wheel(source_root: Path, output_dir: Path) -> Path:
     """Build one deterministic wheel; reject any changed/missing package source."""
     source_root = source_root.resolve(strict=True)
@@ -47,7 +84,7 @@ def build_wheel(source_root: Path, output_dir: Path) -> Path:
     files = _admission._generated_files(raw_manifest)
     for entry in manifest["files"]:
         root = source_root if entry["source"] == "analytics" else _admission._MANIFEST_PATH.parent
-        data = _admission._verify_file(root, entry["source_path"], entry["size"], entry["sha256"])
+        data = _read_verified_checkout_source(root, entry)
         git_blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
         if git_blob != entry["git_blob_sha1"]:
             raise _admission.AnalyticsPackageError("Analytics source Git blob does not match")

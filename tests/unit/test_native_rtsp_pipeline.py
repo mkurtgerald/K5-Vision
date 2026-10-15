@@ -20,13 +20,16 @@ class FakeCore:
         self.message: _GstMessage | None = None
         self.state_calls: list[int] = []
         self.unrefs = 0
+        self.parse_flags: int | None = None
+        self.fail_parse = False
 
     def gst_init_check(self, *args) -> int:
         return 1
 
-    def gst_parse_launch(self, description: bytes, error) -> int:
+    def gst_parse_launch_full(self, description: bytes, context, flags: int, error) -> int | None:
         self.description = description
-        return 1234
+        self.parse_flags = flags
+        return None if self.fail_parse else 1234
 
     def gst_element_set_state(self, pipeline, state: int) -> int:
         self.state_calls.append(state)
@@ -85,6 +88,7 @@ def test_native_pipeline_start_wait_and_close_without_retaining_diagnostics() ->
     pipeline = _pipeline(core)
 
     pipeline._start('rtspsrc location="rtsp://user:secret@example/live" ! fakesink', 0.1)
+    assert core.parse_flags == 1
     assert core.description is not None
     assert b"user:secret" in core.description
 

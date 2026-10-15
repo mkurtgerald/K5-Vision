@@ -78,10 +78,15 @@ _APP_FILENAMES = ("gstapp-1.0-0.dll", "libgstapp-1.0-0.dll")
 
 _CORE_EXPORTS = (
     "gst_init_check",
-    "gst_parse_launch",
+    "gst_parse_launch_full",
     "gst_bin_get_by_name",
     "gst_element_set_state",
     "gst_object_unref",
+    "gst_element_factory_find",
+    "gst_plugin_feature_get_plugin",
+    "gst_plugin_get_filename",
+    "gst_plugin_get_version",
+    "gst_plugin_get_license",
     "gst_buffer_new_allocate",
     "gst_buffer_fill",
     "gst_buffer_get_size",

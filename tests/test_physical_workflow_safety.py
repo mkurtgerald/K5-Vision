@@ -124,9 +124,11 @@ def test_qualification_requires_explicit_reviewed_revision(path: Path) -> None:
         assert (
             "  push:\n    branches:\n      - feat/installed-analytics-operator-20261003\n"
             "      - feat/alpha-analytics-preflight-20261004\n"
+            "      - fix/transactional-alpha-upgrade-20261003\n"
             "      - feat/installed-alpha-facade-witness-20261005\n    paths:\n" in triggers
         )
         assert "github.ref == 'refs/heads/feat/alpha-analytics-preflight-20261004'" in admission
+        assert "github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'" in admission
         assert (
             "github.ref == 'refs/heads/feat/installed-alpha-facade-witness-20261005'" in admission
         )
@@ -234,6 +236,30 @@ def test_qualification_upload_requires_its_validation_outcome(path: Path) -> Non
                 header = upload.split("        uses:", maxsplit=1)[0]
                 assert "if: success() && steps.safe_alpha_evidence.outcome == 'success'" in header
                 assert "if: always()" not in header
+                continue
+            if (
+                path.name == _INSTALLED_CANDIDATE
+                and "name: installed-alpha-wheel-provenance" in upload
+            ):
+                capture = [step for step in steps if "        id: wheel_provenance\n" in step]
+                alpha = [step for step in steps if "        id: safe_alpha_evidence\n" in step]
+                cleanup = [step for step in steps if step.startswith("Remove only this job's")]
+                assert len(capture) == len(alpha) == len(cleanup) == 1
+                assert "steps.safe_evidence.outcome == 'success'" in capture[0]
+                assert "steps.safe_alpha_evidence.outcome == 'success'" in capture[0]
+                assert (
+                    "github.ref == 'refs/heads/fix/transactional-alpha-upgrade-20261003'"
+                    in capture[0]
+                )
+                assert "capture_installer_wheel_provenance.py" in capture[0]
+                assert steps.index(validation) < steps.index(capture[0])
+                assert steps.index(alpha[0]) < steps.index(capture[0])
+                assert steps.index(capture[0]) < steps.index(cleanup[0]) < steps.index(upload)
+                header = upload.split("        uses:", maxsplit=1)[0]
+                assert "if: success() && steps.wheel_provenance.outcome == 'success'" in header
+                assert "if: always()" not in header
+                assert "path: artifacts/installed-alpha-wheel-provenance.json" in upload
+                assert "*.whl" not in upload and "k5-qualification-artifacts" not in upload
                 continue
             if path.name == _INSTALLED_CANDIDATE and any(
                 f"name: {name}\n" in upload

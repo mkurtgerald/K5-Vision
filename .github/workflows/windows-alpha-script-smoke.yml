@@ -20,11 +20,24 @@ on:
       - "tests/test_windows_identity_security.py"
       - "docs/RECOVERY_ADMIN.md"
       - "tests/test_windows_alpha_bootstrap.py"
+      - "tests/test_windows_alpha_upgrade.py"
       - "tests/test_public_test_operator_runtime.py"
       - "tests/test_windows_alpha_direct_witness.py"
       - "tests/test_windows_alpha_analytics.py"
       - "tests/test_windows_alpha_preflight_boundary.py"
       - "scripts/windows_owned_preflight.py"
+      - "scripts/capture_installer_wheel_provenance.py"
+      - "scripts/installer_wheel_requirements.py"
+      - "scripts/installer_wheel_storage.py"
+      - "scripts/assert-stage-one-physical-admission.ps1"
+      - "tests/test_installed_git_alias_admission.py"
+      - "scripts/admit_installed_git_alias.cs"
+      - "scripts/assert-installed-git-alias.ps1"
+      - "tests/test_stage_one_physical_admission_diagnostics.py"
+      - "tests/test_capture_installer_wheel_provenance.py"
+      - "tests/test_installer_wheel_requirements.py"
+      - "tests/test_installer_wheel_storage.py"
+      - "tests/test_installer_runtime_platform_dependencies.py"
       - "scripts/installed_analytics_witness.py"
       - "scripts/installed_alpha_launcher_witness.py"
       - "scripts/installed_alpha_facade_witness.py"
@@ -54,11 +67,24 @@ on:
       - "tests/test_windows_identity_security.py"
       - "docs/RECOVERY_ADMIN.md"
       - "tests/test_windows_alpha_bootstrap.py"
+      - "tests/test_windows_alpha_upgrade.py"
       - "tests/test_public_test_operator_runtime.py"
       - "tests/test_windows_alpha_direct_witness.py"
       - "tests/test_windows_alpha_analytics.py"
       - "tests/test_windows_alpha_preflight_boundary.py"
       - "scripts/windows_owned_preflight.py"
+      - "scripts/capture_installer_wheel_provenance.py"
+      - "scripts/installer_wheel_requirements.py"
+      - "scripts/installer_wheel_storage.py"
+      - "scripts/assert-stage-one-physical-admission.ps1"
+      - "tests/test_installed_git_alias_admission.py"
+      - "scripts/admit_installed_git_alias.cs"
+      - "scripts/assert-installed-git-alias.ps1"
+      - "tests/test_stage_one_physical_admission_diagnostics.py"
+      - "tests/test_capture_installer_wheel_provenance.py"
+      - "tests/test_installer_wheel_requirements.py"
+      - "tests/test_installer_wheel_storage.py"
+      - "tests/test_installer_runtime_platform_dependencies.py"
       - "scripts/installed_analytics_witness.py"
       - "scripts/installed_alpha_launcher_witness.py"
       - "scripts/installed_alpha_facade_witness.py"
@@ -84,6 +110,26 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
+      - name: Compile camera-free owner GUI candidate
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path -LiteralPath $compiler)) { throw 'Windows GUI compiler missing.' }
+          $output = Join-Path $env:RUNNER_TEMP 'K5VisionAlpha-GUI.exe'
+          $source = Join-Path $env:GITHUB_WORKSPACE 'scripts\windows-alpha\owner-installer\K5VisionAlpha.cs'
+          if (-not (Test-Path -LiteralPath $source)) { throw 'Owner Windows GUI source missing.' }
+          & $compiler /nologo /target:winexe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll "/out:$output" $source
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $output)) {
+            throw 'Owner Windows GUI compilation failed.'
+          }
+          # A GUI-subsystem executable must be awaited; LASTEXITCODE may be stale.
+          $guiProbe = Start-Process -FilePath $output -ArgumentList '--self-check' -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+          if ($guiProbe.ExitCode -ne 3) {
+            throw 'Owner GUI must refuse a missing installed runtime.'
+          }
+          Write-Host 'K5_OWNER_GUI_HOSTED_COMPILE=passed'
+
       - name: Parse Windows alpha PowerShell
         shell: powershell
         run: |
@@ -104,6 +150,254 @@ jobs:
           }
           if ($failed) { throw "Windows alpha PowerShell parse failed." }
 
+      - name: Parse and compile exact Git alias sources only
+        id: git_alias_compile
+        timeout-minutes: 2
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          # Hosted syntax/compile qualification only. Never invoke the helper,
+          # Begin, Complete, a physical guard, or any native metadata entry point.
+          function Assert-OrdinaryPath([string]$Path, [bool]$Directory) {
+              if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 1024 -or
+                  $Path -cnotmatch '\A[A-Z]:\\' -or $Path -match '[\x00-\x1f"<>|?*]' -or
+                  $Path.Substring(2).Contains(':') -or [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'path' }
+              foreach ($part in $Path.Substring(3).Split('\')) {
+                  if ($part.Length -eq 0 -or $part -in @('.', '..') -or
+                      $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'path' }
+              }
+              $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+              if ($item.FullName -cne $Path -or [bool]$item.PSIsContainer -ne $Directory) { throw 'path' }
+              $count = 0
+              while ($null -ne $item) {
+                  $count++
+                  if ($count -gt 32 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                      -not [string]::IsNullOrEmpty($item.LinkType)) { throw 'path' }
+                  $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+              }
+          }
+          function Assert-CompilerIdle {
+              $rows = @(Get-CimInstance -ClassName Win32_Process -Property Name -OperationTimeoutSec 10 -ErrorAction Stop)
+              if ($rows.Count -lt 1 -or $rows.Count -gt 32768) { throw 'compiler_inventory' }
+              foreach ($row in $rows) {
+                  if ($row.Name -isnot [string] -or $row.Name.Length -eq 0 -or $row.Name.Length -gt 260 -or
+                      $row.Name -match '[\x00\\/:\r\n]') { throw 'compiler_inventory' }
+                  if ($row.Name -iin @('csc.exe', 'cvtres.exe', 'vbc.exe', 'VBCSCompiler.exe')) { throw 'compiler_occupied' }
+              }
+          }
+          function Read-PinnedCheckoutSource([string]$Name, [int]$Size, [string]$Digest) {
+              $path = Join-Path $env:GITHUB_WORKSPACE ('scripts\' + $Name)
+              Assert-OrdinaryPath $path $false
+              $stream = $null
+              $sha256 = $null
+              try {
+                  # Open once, bound before allocation, and retain only verified bytes.
+                  $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+                  if ($stream.Length -lt $Size -or $stream.Length -gt 2 * $Size) { throw 'source_size' }
+                  $raw = [byte[]]::new([int]$stream.Length)
+                  $offset = 0
+                  while ($offset -lt $raw.Length) {
+                      $read = $stream.Read($raw, $offset, $raw.Length - $offset)
+                      if ($read -le 0) { throw 'source_read' }
+                      $offset += $read
+                  }
+                  if ($stream.ReadByte() -ne -1) { throw 'source_size' }
+                  $utf8 = [Text.UTF8Encoding]::new($false, $true)
+                  # Windows checkout may convert LF to CRLF. This is the only
+                  # accepted transformation; hash/parse/compile the same LF bytes.
+                  $text = $utf8.GetString($raw).Replace("`r`n", "`n")
+                  if ($text.Contains("`r")) { throw 'source_encoding' }
+                  $bytes = $utf8.GetBytes($text)
+                  if ($bytes.Length -ne $Size) { throw 'source_size' }
+                  $sha256 = [Security.Cryptography.SHA256]::Create()
+                  $actual = ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+                  if ($actual -cne $Digest) { throw 'source_hash' }
+                  return $utf8.GetString($bytes)
+              } finally {
+                  try { if ($null -ne $sha256) { $sha256.Dispose() } }
+                  finally { if ($null -ne $stream) { $stream.Dispose() } }
+              }
+          }
+          function Get-CompileFailureProjection([Management.Automation.ErrorRecord]$FailureRecord, [string]$Phase) {
+              $stage = 'unknown'
+              if ($Phase -cin @('runtime', 'context', 'compiler_runtime', 'compiler_idle_before',
+                  'source_binding', 'helper_parse', 'compiler_temp', 'compile', 'compiled_type',
+                  'compiler_environment', 'compiler_idle_after')) { $stage = $Phase }
+              $reason = 'unknown'
+              switch -CaseSensitive ($FailureRecord.Exception.Message) {
+                  'runtime' { $reason = 'runtime' }
+                  'context' { $reason = 'context' }
+                  'path' { $reason = 'path' }
+                  'compiler_inventory' { $reason = 'compiler_inventory' }
+                  'compiler_occupied' { $reason = 'compiler_occupied' }
+                  'source_size' { $reason = 'source_size' }
+                  'source_read' { $reason = 'source_read' }
+                  'source_encoding' { $reason = 'source_encoding' }
+                  'source_hash' { $reason = 'source_hash' }
+                  'source_parse' { $reason = 'source_parse' }
+                  'type_reuse' { $reason = 'type_reuse' }
+                  'compiler_temp_exists' { $reason = 'compiler_temp_exists' }
+                  'compiler_temp' { $reason = 'compiler_temp' }
+                  'compiled_type' { $reason = 'compiled_type' }
+                  'compiler_environment' { $reason = 'compiler_environment' }
+              }
+              $compilerCode = 'unknown'
+              if ($stage -ceq 'compile' -and $FailureRecord.FullyQualifiedErrorId -cin @(
+                  'SOURCE_CODE_ERROR,Microsoft.PowerShell.Commands.AddTypeCommand',
+                  'COMPILER_ERRORS,Microsoft.PowerShell.Commands.AddTypeCommand'
+              )) {
+                  $reason = 'compiler_error'
+                  if ($FailureRecord.TargetObject -is [System.CodeDom.Compiler.CompilerError] -and
+                      $FailureRecord.TargetObject.ErrorNumber -cmatch '\ACS[0-9]{4}\z') {
+                      $compilerCode = $FailureRecord.TargetObject.ErrorNumber
+                  }
+              }
+              return @{ stage = $stage; reason = $reason; compiler_code = $compilerCode }
+          }
+          $phase = 'runtime'
+          $failureError = $null
+          try {
+              if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne 'Windows' -or
+                  $PSVersionTable.PSEdition -cne 'Desktop' -or
+                  $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1 -or
+                  -not [Environment]::Is64BitProcess -or -not [Environment]::Is64BitOperatingSystem) { throw 'runtime' }
+              $phase = 'context'
+              if ($env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or
+                  $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,5}\z') { throw 'context' }
+              $phase = 'compiler_runtime'
+              $runtime = [Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory().TrimEnd('\')
+              if ($runtime -cne 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319') { throw 'runtime' }
+              Assert-OrdinaryPath $runtime $true
+              foreach ($name in @('csc.exe', 'System.Core.dll')) {
+                  $path = Join-Path $runtime $name
+                  $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                  if ($item.FullName -cne $path -or $item.PSIsContainer -or
+                      ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'runtime' }
+              }
+              # Inbox system binaries retain existing OS trust, including Windows hardlinks.
+              $systemCorePath = Join-Path $runtime 'System.Core.dll'
+              if ($null -ne ('K5ExactGitAlias' -as [type])) { throw 'type_reuse' }
+              $phase = 'compiler_idle_before'
+              Assert-CompilerIdle
+              $phase = 'source_binding'
+              $helper = Read-PinnedCheckoutSource 'assert-installed-git-alias.ps1' 13028 '67c4d3d7bcef1ae8e8bfea56acaaf7e2192622a217ae1e2450f8680ae2b93dc8'
+              $source = Read-PinnedCheckoutSource 'admit_installed_git_alias.cs' 36598 'a751156ee06792f8f4625fa988c73a54c8e9a0a24937c06ab9264762f965d23f'
+              $phase = 'helper_parse'
+              $tokens = $null
+              $parseErrors = $null
+              $null = [Management.Automation.Language.Parser]::ParseInput($helper, [ref]$tokens, [ref]$parseErrors)
+              if ($parseErrors.Count -ne 0) { throw 'source_parse' }
+              $phase = 'compiler_temp'
+              Assert-OrdinaryPath $env:RUNNER_TEMP $true
+              $compilerTemp = Join-Path $env:RUNNER_TEMP ('k5-git-alias-smoke-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)
+              if ([IO.File]::Exists($compilerTemp) -or [IO.Directory]::Exists($compilerTemp) -or
+                  (Test-Path -LiteralPath $compilerTemp -ErrorAction Stop)) { throw 'compiler_temp_exists' }
+              $created = New-Item -Path $compilerTemp -ItemType Directory -ErrorAction Stop
+              if ($created.FullName -cne $compilerTemp) { throw 'compiler_temp' }
+              Assert-OrdinaryPath $compilerTemp $true
+              $previousTemp = [Environment]::GetEnvironmentVariable('TEMP', 'Process')
+              $previousTmp = [Environment]::GetEnvironmentVariable('TMP', 'Process')
+              $compileFailure = $null
+              $restoreError = $null
+              try {
+                  [Environment]::SetEnvironmentVariable('TEMP', $compilerTemp, 'Process')
+                  [Environment]::SetEnvironmentVariable('TMP', $compilerTemp, 'Process')
+                  $phase = 'compile'
+                  $types = @(Add-Type -TypeDefinition $source -Language CSharp -PassThru -ReferencedAssemblies $systemCorePath -ErrorAction Stop -WarningAction SilentlyContinue -Verbose:$false -Debug:$false)
+                  $phase = 'compiled_type'
+                  if (@($types | Where-Object { $_.FullName -ceq 'K5ExactGitAlias' }).Count -ne 1) { throw 'compiled_type' }
+              } catch { $compileFailure = $_; throw }
+              finally {
+                  try { [Environment]::SetEnvironmentVariable('TEMP', $previousTemp, 'Process') } catch { $restoreError = $_ }
+                  try { [Environment]::SetEnvironmentVariable('TMP', $previousTmp, 'Process') } catch { if ($null -eq $restoreError) { $restoreError = $_ } }
+                  if ($null -ne $restoreError -and $null -eq $compileFailure) {
+                      $phase = 'compiler_environment'
+                      throw 'compiler_environment'
+                  }
+              }
+              $phase = 'compiler_idle_after'
+              Assert-CompilerIdle
+              # CodeDOM may retain transient directories until this process exits.
+              # Final artifact admission belongs exclusively to the next step.
+              Write-Output 'Exact Git alias helper parsed and C# compiled; native code was not invoked.'
+          } catch {
+              $failureError = $_ # First ErrorRecord stays private; project only fixed categories.
+              $projection = Get-CompileFailureProjection $failureError $phase
+              [Console]::Error.WriteLine('Exact Git alias hosted compilation refused: phase=' + $projection.stage + '; reason=' + $projection.reason + '; compiler=' + $projection.compiler_code + '; artifacts retained.')
+              exit 1
+          }
+
+      - name: Independently admit Git alias compiler artifacts
+        if: ${{ always() }}
+        timeout-minutes: 1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          # Same hosted job, fresh PowerShell process after the compile step exits.
+          # Do not compile, invoke the helper, reuse its state, or delete artifacts.
+          function Assert-OrdinaryPath([string]$Path, [bool]$Directory) {
+              if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 1024 -or
+                  $Path -cnotmatch '\A[A-Z]:\\' -or $Path -match '[\x00-\x1f"<>|?*]' -or
+                  $Path.Substring(2).Contains(':') -or [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'path' }
+              foreach ($part in $Path.Substring(3).Split('\')) {
+                  if ($part.Length -eq 0 -or $part -in @('.', '..') -or
+                      $part.EndsWith('.') -or $part.EndsWith(' ')) { throw 'path' }
+              }
+              $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+              if ($item.FullName -cne $Path -or [bool]$item.PSIsContainer -ne $Directory) { throw 'path' }
+              $first = $item
+              $count = 0
+              while ($null -ne $item) {
+                  $count++
+                  if ($count -gt 32 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                      -not [string]::IsNullOrEmpty($item.LinkType)) { throw 'path' }
+                  $item = $(if ($item -is [IO.FileInfo]) { $item.Directory } else { $item.Parent })
+              }
+              return $first
+          }
+          try {
+              if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne 'Windows' -or
+                  $PSVersionTable.PSEdition -cne 'Desktop' -or
+                  $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1 -or
+                  -not [Environment]::Is64BitProcess -or -not [Environment]::Is64BitOperatingSystem) { throw 'runtime' }
+              if ($env:GITHUB_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z' -or
+                  $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[1-9][0-9]{0,5}\z') { throw 'context' }
+              # Names only; no command lines, executable paths, owners or PID signaling.
+              $rows = @(Get-CimInstance -ClassName Win32_Process -Property Name -OperationTimeoutSec 10 -ErrorAction Stop)
+              if ($rows.Count -lt 1 -or $rows.Count -gt 32768) { throw 'compiler_inventory' }
+              foreach ($row in $rows) {
+                  if ($row.Name -isnot [string] -or $row.Name.Length -eq 0 -or $row.Name.Length -gt 260 -or
+                      $row.Name -match '[\x00\\/:\r\n]') { throw 'compiler_inventory' }
+                  if ($row.Name -iin @('csc.exe', 'cvtres.exe', 'vbc.exe', 'VBCSCompiler.exe')) { throw 'compiler_occupied' }
+              }
+              $null = Assert-OrdinaryPath $env:RUNNER_TEMP $true
+              $compilerTemp = Join-Path $env:RUNNER_TEMP ('k5-git-alias-smoke-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)
+              if (Test-Path -LiteralPath $compilerTemp -ErrorAction Stop) {
+                  $null = Assert-OrdinaryPath $compilerTemp $true
+                  $entries = [IO.Directory]::EnumerateFileSystemEntries($compilerTemp).GetEnumerator()
+                  $count = 0
+                  [long]$bytes = 0
+                  try {
+                      while ($entries.MoveNext()) {
+                          $count++
+                          if ($count -gt 64) { throw 'compiler_artifacts' }
+                          $entry = [string]$entries.Current
+                          $file = Assert-OrdinaryPath $entry $false
+                          if ($file.Length -lt 0 -or $file.Length -gt 16777216 - $bytes) { throw 'compiler_artifacts' }
+                          $bytes += $file.Length
+                      }
+                  } finally { $entries.Dispose() }
+              }
+              # Missing temp can follow an earlier refusal. This post step cannot
+              # replace compile success. Bounds are admission limits, not a disk quota.
+              Write-Output 'Git alias compiler idle; retained shallow artifacts admitted.'
+          } catch {
+              [Console]::Error.WriteLine('Git alias compiler post-admission refused; artifacts retained.')
+              exit 1
+          }
+
       - name: Set up Python
         id: runtime_python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
@@ -116,6 +410,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+
+      - name: Verify exact PowerShell storage packet contract
+        timeout-minutes: 1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pytest tests/test_installed_analytics_candidate_workflow.py::test_windows_powershell_storage_packet_contract --no-cov -q --tb=no
+          if ($LASTEXITCODE -ne 0) { throw "PowerShell storage packet contract refused; see closed subreason above." }
 
       - name: Verify clean Windows alpha runtime dependency install
         shell: powershell
@@ -133,7 +435,7 @@ jobs:
       - name: Run Windows alpha boundary regressions
         shell: powershell
         run: |
-          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py tests/test_app_resource_lifetime.py tests/test_windows_alpha_analytics.py tests/test_cli.py tests/test_installed_alpha_facade_witness.py -q --no-cov
+          pytest tests/test_one_file_windows_bootstrap.py tests/test_windows_alpha_bootstrap.py tests/test_windows_alpha_upgrade.py tests/test_public_test_operator_runtime.py tests/test_windows_alpha_direct_witness.py tests/test_app_resource_lifetime.py tests/test_windows_alpha_analytics.py tests/test_cli.py tests/test_capture_installer_wheel_provenance.py tests/test_installer_wheel_requirements.py tests/test_installer_wheel_storage.py tests/test_stage_one_physical_admission_diagnostics.py tests/test_installed_git_alias_admission.py tests/test_installer_runtime_platform_dependencies.py tests/test_installed_alpha_facade_witness.py -q --no-cov
 
       - name: Qualify Windows local recovery identity
         shell: powershell
