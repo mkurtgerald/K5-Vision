@@ -137,11 +137,13 @@ if (-not $runtimeReady -or [string]::IsNullOrWhiteSpace([string]$recordedInstall
     $installerSha256 = $recordedInstallerSha256
 }
 
-$registryPath = Join-Path $env:RUNNER_TEMP "k5-stage03-gstreamer-registry-$Version.bin"
 if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_PATH)) {
     Add-Content -LiteralPath $env:GITHUB_PATH -Value $binPath
 }
 if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
+    # Runner-only receipt: private Windows hosts never require RUNNER_TEMP.
+    if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) { throw "CI registry root missing." }
+    $registryPath = Join-Path $env:RUNNER_TEMP "k5-stage03-gstreamer-registry-$Version.bin"
     Add-Content -LiteralPath $env:GITHUB_ENV -Value "K5_GSTREAMER_ROOT=$installRoot"
     Add-Content -LiteralPath $env:GITHUB_ENV -Value "GST_REGISTRY_1_0=$registryPath"
     if (-not [string]::IsNullOrWhiteSpace([string]$installerSha256)) {

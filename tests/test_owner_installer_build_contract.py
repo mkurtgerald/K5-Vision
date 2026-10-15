@@ -135,3 +135,14 @@ def test_gstreamer_owner_runtime_uses_hash_pinned_bundle_and_refuses_foreign_roo
     assert "no foreign changes permitted" in provision
     assert r"payload\gstreamer\gstreamer-1.0-msvc-x86_64-1.28.7.exe" in gui
     assert "return 12;" in gui
+
+
+def test_bundled_gstreamer_does_not_require_github_runner_temp_on_owner_host():
+    text = (ROOT / "scripts/provision-stage03-gstreamer.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert text.index('if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {') < text.index(
+        '$registryPath = Join-Path $env:RUNNER_TEMP'
+    )
+    assert 'if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP))' in text
+    assert "Bundled offline GStreamer runtime failed exact identity admission" in text
