@@ -270,7 +270,13 @@ jobs:
           $script = Join-Path $env:GITHUB_WORKSPACE 'scripts\windows-alpha\owner-installer\K5VisionAlpha.iss'
           $out = Join-Path $env:GITHUB_WORKSPACE 'dist\owner-installer'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-          & $compiler "/DSourceRoot=$env:GITHUB_WORKSPACE" "/DK5Revision=$env:GITHUB_SHA" $script
+          $reviewedManifest = Join-Path $env:GITHUB_WORKSPACE 'build\owner-installer\offline\manifest.json'
+          if (-not (Test-Path -LiteralPath $reviewedManifest -PathType Leaf)) { throw 'Missing closed wheelhouse manifest.' }
+          $manifestSha = (Get-FileHash -LiteralPath $reviewedManifest -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($manifestSha -cnotmatch '^[0-9a-f]{64}$') { throw 'Offline manifest digest invalid.' }
+          # Bind the candidate EXE to exact reviewed bytes, never to a neighboring manifest hash.
+          # Independent hash/provenance and licensing approval remain outstanding.
+          & $compiler "/DSourceRoot=$env:GITHUB_WORKSPACE" "/DK5Revision=$env:GITHUB_SHA" "/DOfflineWheelhouseDigest=$manifestSha" $script
           if ($LASTEXITCODE -ne 0) { throw 'Inno setup compilation failed.' }
           $exe = Join-Path $out ("K5VisionAlpha-Setup-" + $env:GITHUB_SHA + ".exe")
           if (-not (Test-Path -LiteralPath $exe)) { throw 'Compiled installer missing.' }

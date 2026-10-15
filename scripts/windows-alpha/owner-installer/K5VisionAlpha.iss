@@ -4,6 +4,9 @@
 #ifndef K5Revision
   #error Exact K5Revision is required.
 #endif
+#ifndef OfflineWheelhouseDigest
+  #error Exact offline wheelhouse digest is required.
+#endif
 
 [Setup]
 AppId={{72241A0E-7DB0-4A48-BEDA-C594A66AC358}
@@ -47,6 +50,23 @@ Source: "{#SourceRoot}\scripts\windows-alpha\runtime-requirements.txt"; DestDir:
 Source: "{#SourceRoot}\scripts\provision-stage03-gstreamer.ps1"; DestDir: "{app}\payload"; Flags: ignoreversion
 Source: "{#SourceRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+; This closed candidate is staged outside {app}: path/root non-overlap is enforced.
+Source: "{#SourceRoot}\build\owner-installer\offline\manifest.json"; DestDir: "{tmp}\k5-closed\manifest"; Flags: ignoreversion
+Source: "{#SourceRoot}\build\owner-installer\offline\wheelhouse\*.whl"; DestDir: "{tmp}\k5-closed\wheelhouse"; Flags: ignoreversion
+Source: "{#SourceRoot}\scripts\windows-alpha\Install-K5VisionAlpha.ps1"; DestDir: "{tmp}\k5-closed\scripts\windows-alpha"; Flags: ignoreversion
+Source: "{#SourceRoot}\scripts\windows-alpha\Start-K5VisionAlpha.ps1"; DestDir: "{tmp}\k5-closed\scripts\windows-alpha"; Flags: ignoreversion
+Source: "{#SourceRoot}\scripts\windows-alpha\Test-K5VisionAlpha.ps1"; DestDir: "{tmp}\k5-closed\scripts\windows-alpha"; Flags: ignoreversion
+Source: "{#SourceRoot}\scripts\windows-alpha\Run-K5VisionAlpha.ps1"; DestDir: "{tmp}\k5-closed\scripts\windows-alpha"; Flags: ignoreversion
+Source: "{#SourceRoot}\scripts\windows-alpha\install_transaction.py"; DestDir: "{tmp}\k5-closed\scripts\windows-alpha"; Flags: ignoreversion
+Source: "{#SourceRoot}\scripts\windows-alpha\owner_analytics_bundle.py"; DestDir: "{tmp}\k5-closed\scripts\windows-alpha"; Flags: ignoreversion
+Source: "{#SourceRoot}\scripts\windows-alpha\runtime-requirements.txt"; DestDir: "{tmp}\k5-closed\scripts\windows-alpha"; Flags: ignoreversion
+Source: "{#SourceRoot}\scripts\provision-stage03-gstreamer.ps1"; DestDir: "{tmp}\k5-closed\scripts"; Flags: ignoreversion
+Source: "{#SourceRoot}\build\owner-installer\analytics\manifest.json"; DestDir: "{tmp}\k5-closed\scripts\analytics"; Flags: ignoreversion
+Source: "{#SourceRoot}\build\owner-installer\analytics\wheels\*.whl"; DestDir: "{tmp}\k5-closed\scripts\analytics\wheels"; Flags: ignoreversion
+Source: "{#SourceRoot}\build\owner-installer\analytics\models\*"; DestDir: "{tmp}\k5-closed\scripts\analytics\models"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceRoot}\build\owner-installer\analytics\Analytics-Lab-LICENSE"; DestDir: "{tmp}\k5-closed\scripts\analytics"; Flags: ignoreversion
+Source: "{#SourceRoot}\build\owner-installer\analytics\Analytics-Lab-THIRD_PARTY.md"; DestDir: "{tmp}\k5-closed\scripts\analytics"; Flags: ignoreversion
+
 
 [Icons]
 Name: "{autoprograms}\K5 Vision Alpha"; Filename: "{app}\K5VisionAlpha.exe"; WorkingDir: "{app}"
@@ -94,7 +114,7 @@ var
   Stage: String;
 begin
   Result := 'not-reported';
-  if not LoadStringFromFile(ExpandConstant('{app}\payload\owner-install-stage.txt'), Raw) then
+  if not LoadStringFromFile(ExpandConstant('{tmp}\k5-closed\scripts\owner-install-stage.txt'), Raw) then
     Exit;
   Stage := Trim(String(Raw));
   { Accept fixed identifiers only. Never project source, exception, log, or path data. }
@@ -136,6 +156,7 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   AppRoot, PythonRoot, PythonExe, PySetup, Bootstrap, Parameters: String;
+  OfflineBase, ReviewedManifest, ReviewedWheels, GstProvisioner: String;
 begin
   if CurStep <> ssPostInstall then
     Exit;
@@ -145,9 +166,17 @@ begin
   PythonRoot := AppRoot + '\python312';
   PythonExe := PythonRoot + '\python.exe';
   PySetup := AppRoot + '\payload\python-3.12.10-amd64.exe';
-  Bootstrap := AppRoot + '\payload\windows-alpha\Install-K5VisionAlpha.ps1';
-  if not FileExists(AppRoot + '\payload\analytics\manifest.json') then
+  OfflineBase := ExpandConstant('{tmp}\k5-closed');
+  Bootstrap := OfflineBase + '\scripts\windows-alpha\Install-K5VisionAlpha.ps1';
+  ReviewedManifest := OfflineBase + '\manifest\manifest.json';
+  ReviewedWheels := OfflineBase + '\wheelhouse';
+  GstProvisioner := OfflineBase + '\scripts\provision-stage03-gstreamer.ps1';
+  if not FileExists(AppRoot + '\payload\analytics\manifest.json') or
+     not FileExists(OfflineBase + '\scripts\analytics\manifest.json') then
     RaiseException('Verified owner analytics payload is missing.');
+  if not FileExists(Bootstrap) or not FileExists(ReviewedManifest) or
+     not DirExists(ReviewedWheels) or not FileExists(GstProvisioner) then
+    RaiseException('Closed offline owner wheelhouse payload is missing.');
   if not FileExists(PySetup) or not FileExists(Bootstrap) or
      not FileExists(AppRoot + '\payload\mediamtx\mediamtx_v1.21.1_windows_amd64.zip') or
      not FileExists(AppRoot + '\payload\licenses\MediaMTX-MIT.txt') or
@@ -163,10 +192,25 @@ begin
   if not FileExists(PythonExe) then
     RaiseException('Private Python runtime is unavailable.');
   K5PostInstallPhase := 3;
+  { The offline transactional verifier never mutates shared GStreamer.
+    A fresh GUI setup uses the existing hash-guarded provisioner; upgrades
+    refuse shared-runtime changes and rely on preflight admission. }
+  if (not DirExists(AppRoot + '\.venv')) and
+     (not FileExists(AppRoot + '\k5-revision.txt')) then
+  begin
+    Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+      Q(GstProvisioner) + ' -Version 1.28.7 -OfflineInstaller ' +
+      Q(AppRoot + '\payload\gstreamer\gstreamer-1.0-msvc-x86_64-1.28.7.exe');
+    RunOrFail(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      Parameters, 'offline GStreamer admission');
+  end;
   Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
     Q(Bootstrap) + ' -InstallRoot ' + Q(AppRoot) +
     ' -PythonExecutable ' + Q(PythonExe) +
-    ' -K5Revision {#K5Revision} -SkipDesktopShortcut';
+    ' -K5Revision {#K5Revision} -SkipDesktopShortcut' +
+    ' -Wheelhouse ' + Q(ReviewedWheels) +
+    ' -WheelhouseManifest ' + Q(ReviewedManifest) +
+    ' -WheelhouseManifestSha256 {#OfflineWheelhouseDigest}';
   RunOrFail(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     Parameters, 'transactional runtime installation');
   K5PostInstallPhase := 4;
