@@ -118,7 +118,8 @@ def test_gstreamer_owner_runtime_uses_hash_pinned_bundle_and_refuses_foreign_roo
     assert "gstreamer-1.0-msvc-x86_64-1.28.7.exe" in installer
     assert "K5_OFFLINE_GSTREAMER_BUNDLE=1.28.7_sha256_verified" in workflow
     assert "-OfflineInstaller" in transaction
-    assert "self.analytics_bundle is not None or self.offline is not None" in transaction
+    assert "if self.analytics_bundle is not None:" in transaction
+    assert "if self.offline is None and not any(" in transaction
     assert "Bundled offline GStreamer runtime failed exact identity admission" in provision
     assert "no foreign changes permitted" in provision
     assert r"payload\gstreamer\gstreamer-1.0-msvc-x86_64-1.28.7.exe" in gui

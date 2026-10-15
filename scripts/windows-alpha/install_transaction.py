@@ -1199,7 +1199,11 @@ class Installer:
                 # Never change the shared GStreamer runtime during an upgrade.
                 # A missing/different requested version fails candidate preflight.
                 self.owner_install_stage("gstreamer")
-                if not any((self.root / name).exists() for name in MANAGED):
+                # Externally admitted offline wheelhouses never provision or
+                # modify a shared GStreamer tool root during a transaction.
+                if self.offline is None and not any(
+                    (self.root / name).exists() for name in MANAGED
+                ):
                     command = [
                         self.host,
                         "-NoProfile",
@@ -1211,7 +1215,7 @@ class Installer:
                         "-Version",
                         self.gstreamer,
                     ]
-                    if self.analytics_bundle is not None or self.offline is not None:
+                    if self.analytics_bundle is not None:
                         # Bundled owner setup never falls back to remote acquisition.
                         bundle = (
                             self.source.parent
