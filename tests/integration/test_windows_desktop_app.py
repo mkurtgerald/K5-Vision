@@ -8,6 +8,7 @@ are exercised; no WinForms or process behavior is mocked.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import importlib.util
 import json
 import os
@@ -19,8 +20,10 @@ import subprocess
 import threading
 import time
 from ctypes import wintypes
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
+from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
 import psutil
@@ -635,7 +638,12 @@ def _generate_fixture(parent, media, ffmpeg, upstream_port, helpers):
         helpers._stop_owned(upstream)
         raise
     source_uri = f"rtsp://127.0.0.1:{upstream_port}/generated"
-    publisher = helpers._start(
+    publisher = _publish_fixture(parent, ffmpeg, source_uri, helpers)
+    return [upstream, publisher], source_uri
+
+
+def _publish_fixture(parent, ffmpeg, source_uri, helpers):
+    return helpers._start(
         [
             str(ffmpeg),
             "-hide_banner",
@@ -645,7 +653,7 @@ def _generate_fixture(parent, media, ffmpeg, upstream_port, helpers):
             "-stream_loop",
             "-1",
             "-i",
-            str(video),
+            str(parent / "generated red camera.mp4"),
             "-c",
             "copy",
             "-f",
@@ -656,7 +664,386 @@ def _generate_fixture(parent, media, ffmpeg, upstream_port, helpers):
         ],
         parent,
     )
-    return [upstream, publisher], source_uri
+
+
+def _closed_hashes(profile):
+    """Call only after the generated source has disconnected and finalized."""
+    files = sorted((profile / "recordings").rglob("*.mp4"))
+    _require(0 < len(files) <= 64, "VM clock proof has no bounded closed recording inventory")
+    _require(
+        all(0 < path.stat().st_size <= 16 * 1024**2 for path in files)
+        and sum(path.stat().st_size for path in files) <= 64 * 1024**2,
+        "VM clock closed recording inventory exceeded its byte bound",
+    )
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.ReadFile.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
+    kernel.ReadFile.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes, kernel.CloseHandle.restype = [wintypes.HANDLE], wintypes.BOOL
+    hashes = {}
+    for path in files:
+        # Zero sharing requires the actual MediaMTX writer (and any transient
+        # reader) to have closed. Source status alone is not closure evidence.
+        handle = kernel.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x00200000, None)
+        if handle in (None, ctypes.c_void_p(-1).value):
+            raise RuntimeError("VM clock recording has not closed for exclusive reading")
+        try:
+            digest, total = hashlib.sha256(), 0
+            buffer = ctypes.create_string_buffer(65536)
+            while True:
+                count = wintypes.DWORD()
+                if not kernel.ReadFile(handle, buffer, len(buffer), ctypes.byref(count), None):
+                    raise RuntimeError("VM clock closed recording could not be read")
+                if not count.value:
+                    break
+                total += count.value
+                _require(total <= 16 * 1024**2, "VM clock closed recording exceeded its bound")
+                digest.update(buffer.raw[: count.value])
+            hashes[path] = digest.digest()
+        finally:
+            kernel.CloseHandle(handle)
+    return hashes
+
+
+def _hashes_preserved(hashes):
+    return all(
+        path.is_file() and hashlib.sha256(path.read_bytes()).digest() == expected
+        for path, expected in hashes.items()
+    )
+
+
+def _vm_recorded_frames(ffprobe, video):
+    """VM phases can span the real recorder's full 60-second segment cadence."""
+    result = subprocess.run(
+        [
+            str(ffprobe),
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height,nb_read_frames",
+            "-of",
+            "json",
+            str(video),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=15,
+        check=False,
+    )
+    _require(
+        result.returncode == 0 and len(result.stdout) <= 4096,
+        "VM clock retained recording could not be decoded within its bound",
+    )
+    streams = json.loads(result.stdout)["streams"]
+    _require(
+        len(streams) == 1
+        and (streams[0]["codec_name"], streams[0]["width"], streams[0]["height"])
+        == ("h264", 320, 240),
+        "VM clock retained recording changed its generated video format",
+    )
+    frames = int(streams[0]["nb_read_frames"])
+    _require(0 < frames <= 61 * 15, "VM clock retained recording exceeded its frame bound")
+    return frames
+
+
+def _vm_clock_phase(
+    *,
+    page,
+    context,
+    client,
+    profile,
+    camera_id,
+    parent,
+    processes,
+    source_uri,
+    ffmpeg,
+    ffprobe,
+    helpers,
+    browser_helpers,
+    app,
+    setup_sha256,
+    diagnostic,
+):
+    """Actually change only an opted-in disposable Windows guest's UTC clock."""
+    __tracebackhide__ = True
+    route = "/api/v1/operator/cameras/" + camera_id
+    original_token = client.token
+    captured_live = []
+    non_loopback = []
+
+    def observed_request(request):
+        parsed = urlsplit(request.url)
+        if parsed.path.startswith("/media/live/") and parsed.path.endswith(".m3u8"):
+            # A past low-latency blocking query can become stale when a stream
+            # resets; fetch the actual admitted playlist without that query.
+            captured_live[:] = [parsed._replace(query="", fragment="").geturl()]
+
+    def loopback_only(route):
+        parsed = urlsplit(route.request.url)
+        if parsed.scheme in {"http", "https"} and parsed.hostname == "127.0.0.1":
+            route.continue_()
+        elif parsed.scheme in {"blob", "data"}:
+            route.continue_()
+        else:
+            non_loopback[:] = [True]
+            route.abort()
+
+    def camera_disconnected():
+        cameras = client.json("/api/v1/operator/cameras")["cameras"]
+        return any(
+            camera.get("device_id") == camera_id and camera.get("status") == "disconnected"
+            for camera in cameras
+        )
+
+    diagnostic["vm_clock_stage"] = "finalize_closed_segments"
+    # Interrupt only our generated publisher. An observed disconnected source
+    # closes the real recorder; active, growing files are never hashed as fixed.
+    helpers._stop_owned(processes[-1])
+    _wait(camera_disconnected, "VM clock closed-source finalization", process=app, timeout=15)
+    _wait(lambda: _recording_bytes(profile) > 0, "VM clock closed recordings", process=app)
+    closed = _wait(
+        lambda: _closed_hashes(profile),
+        "VM clock exclusive closed-recording admission",
+        process=app,
+        timeout=10,
+    )
+    _require(
+        sum(_vm_recorded_frames(ffprobe, path) for path in closed) > 0,
+        "VM clock pre-shift closed footage is not decodable",
+    )
+    historical_start = datetime.now(UTC) - timedelta(minutes=5)
+    historical_end = datetime.now(UTC) + timedelta(seconds=10)
+    history_query = "?" + urlencode(
+        {"start": historical_start.isoformat(), "end": historical_end.isoformat()}
+    )
+    before_history = client.json(route + "/history" + history_query)["spans"]
+    _require(bool(before_history), "VM clock pre-shift recording history is empty")
+    page.on("request", observed_request)
+    processes.append(_publish_fixture(parent, ffmpeg, source_uri, helpers))
+    baseline_bytes = _recording_bytes(profile)
+    _wait(
+        lambda: _tray_recording(client, profile, camera_id, baseline_bytes, {}),
+        "VM clock source reconnect and recording",
+        process=app,
+        timeout=15,
+    )
+    browser_helpers._decoded_color(page, "live-video", "red")
+    _wait(lambda: bool(captured_live), "VM clock actual HLS request", process=app, timeout=10)
+    live_url = captured_live[-1]
+    _require(
+        urlsplit(live_url).hostname == "127.0.0.1"
+        and context.request.get(live_url, timeout=5000).status == 200,
+        "VM clock baseline authenticated live media failed",
+    )
+    phases = []
+    guard = _helpers("windows_vm_clock").WindowsVmClockGuard(
+        parent / "vm-clock-guard.json", watchdog_seconds=90
+    )
+    page.route("**/*", loopback_only)
+    try:
+        with guard:
+            diagnostic["vm_clock_stage"] = "guard_armed"
+            for offset, direction in ((172800, "forward"), (-172800, "backward")):
+                baseline = client.json("/api/v1/operator/status")
+                previous_count = baseline["clock"]["change_count"]
+                bytes_before = _recording_bytes(profile)
+                diagnostic["vm_clock_stage"] = direction + "_shift"
+                shifted_at = time.monotonic()
+                native = guard.shift(offset)
+                actual_step = native["actual_step_seconds"]
+                diagnostic["vm_clock_native_step_seconds"] = actual_step
+                _require(
+                    type(actual_step) in (int, float) and abs(actual_step - offset) <= 2,
+                    "VM clock native UTC did not perform the requested real step",
+                )
+
+                def clock_changed(previous_count=previous_count, offset=offset):
+                    status = client.json("/api/v1/operator/status")
+                    clock = status["clock"]
+                    step = clock.get("last_step_seconds")
+                    if (
+                        clock.get("status") == "changed"
+                        and clock.get("change_count", 0) > previous_count
+                        and type(step) in (int, float)
+                        and abs(step - offset) <= 2
+                        and clock.get("sync_verified") is False
+                    ):
+                        return status
+                    return None
+
+                changed = _wait(
+                    clock_changed, "VM clock signed recorder alert", process=app, timeout=10
+                )
+                observed_utc = datetime.fromisoformat(changed["server_utc"].replace("Z", "+00:00"))
+                _require(
+                    abs((observed_utc - datetime.now(UTC)).total_seconds()) < 2,
+                    "VM clock recorder UTC did not follow the actual guest clock",
+                )
+                _require(
+                    client.token == original_token
+                    and client.json("/api/v1/auth/me").get("role") == "administrator",
+                    "VM clock step invalidated the existing human session",
+                )
+                page.locator("#recorder-time-warning").wait_for(state="visible", timeout=10_000)
+                _wait(
+                    lambda direction=direction: (
+                        direction in page.locator("#recorder-time-warning").inner_text()
+                    ),
+                    "VM clock warning direction",
+                    process=app,
+                    timeout=10,
+                )
+                # Observe at least two normal five-second storage-maintenance
+                # cycles and allow pre-step live buffers to drain naturally.
+                _wait(
+                    lambda since=shifted_at: time.monotonic() - since >= 10,
+                    "VM clock held observation interval",
+                    process=app,
+                    timeout=15,
+                )
+                diagnostic["vm_clock_stage"] = direction + "_live"
+                live_status = context.request.get(live_url, timeout=5000).status
+                diagnostic["vm_clock_media_http_status"] = live_status
+                _require(live_status == 200, "VM clock step expired authenticated live media")
+                _require(
+                    page.locator("#workspace").is_visible(),
+                    "VM clock step signed out the browser's existing human session",
+                )
+                frames_before = browser_helpers._decoded_color(page, "live-video", "red")
+                page.wait_for_function(
+                    """before => {
+                      const video = document.getElementById('live-video');
+                      return video.readyState >= 2 && !video.paused &&
+                        video.getVideoPlaybackQuality().totalVideoFrames >= before + 4;
+                    }""",
+                    arg=frames_before,
+                    timeout=10_000,
+                )
+                frames_after = browser_helpers._decoded_color(page, "live-video", "red")
+                recording = {}
+                _wait(
+                    lambda before=bytes_before, result=recording: _tray_recording(
+                        client, profile, camera_id, before, result
+                    ),
+                    "VM clock recording progress after real UTC step",
+                    process=app,
+                    timeout=15,
+                )
+                now = datetime.now(UTC)
+                phase_query = "?" + urlencode(
+                    {
+                        "start": (now - timedelta(minutes=2)).isoformat(),
+                        "end": (now + timedelta(minutes=1)).isoformat(),
+                    }
+                )
+                _wait(
+                    lambda query=phase_query: client.json(route + "/history" + query)["spans"],
+                    "VM clock shifted recorder UTC history query",
+                    process=app,
+                    timeout=10,
+                )
+                _require(_hashes_preserved(closed), "VM clock step changed closed footage hashes")
+                held = guard.snapshot()
+                _require(
+                    abs(held["baseline_residual_seconds"] - offset) <= 2,
+                    "VM clock requested UTC step did not remain in effect",
+                )
+                diagnostic["vm_clock_stage"] = direction + "_restore"
+                restoration = guard.restore()
+                _require(
+                    restoration["restored"] is True and abs(restoration["residual_seconds"]) <= 2,
+                    "VM clock UTC restoration was not verified",
+                )
+                # Force an observation of the correction before the next phase,
+                # so its signed step is measured from restored recorder UTC.
+                client.json("/api/v1/operator/status")
+                phases.append(
+                    {
+                        "requested_offset_seconds": offset,
+                        "actual_step_seconds": actual_step,
+                        "held_offset_seconds": held["baseline_residual_seconds"],
+                        "monotonic_elapsed_seconds": held["elapsed_seconds"]
+                        - native["before"]["elapsed_seconds"],
+                        "same_human_session": True,
+                        "clock_alert_direction": direction,
+                        "recorder_utc_verified": True,
+                        "history_utc_query_verified": True,
+                        "live_http_status": live_status,
+                        "live_decoded_frames_before": frames_before,
+                        "live_decoded_frames_after": frames_after,
+                        "recording_bytes_before": bytes_before,
+                        "recording_bytes_after": recording["recording_bytes_after"],
+                        "closed_segment_hashes_preserved": True,
+                        "utc_restored": restoration["restored"],
+                        "restore_residual_seconds": restoration["residual_seconds"],
+                    }
+                )
+    finally:
+        page.unroute("**/*", loopback_only)
+        page.remove_listener("request", observed_request)
+        try:
+            diagnostic["vm_clock_guard"] = guard.receipt()
+        except RuntimeError:
+            diagnostic["vm_clock_guard"] = {"available": False}
+    diagnostic["vm_clock_stage"] = "restored_playback"
+    _require(_hashes_preserved(closed), "VM clock restoration changed closed footage hashes")
+    restored_history = client.json(route + "/history" + history_query)["spans"]
+    _require(
+        all(span in restored_history for span in before_history),
+        "VM clock restoration lost retained recording history",
+    )
+    page.locator("#history-tab").click()
+    page.locator("#history-start").fill(historical_start.strftime("%Y-%m-%dT%H:%M:%S"))
+    page.locator("#history-end").fill(historical_end.strftime("%Y-%m-%dT%H:%M:%S"))
+    page.locator("#history-form").evaluate("form => form.requestSubmit()")
+    page.locator(".history-item").first.wait_for(state="visible", timeout=15_000)
+    page.locator(".history-item").first.click()
+    page.locator("#play-recording").click()
+    playback_frames = browser_helpers._decoded_color(page, "playback-video", "red")
+    page.locator("#live-tab").click()
+    browser_helpers._decoded_color(page, "live-video", "red")
+    _require(not non_loopback, "VM clock proof attempted an external request while shifted")
+    diagnostic["vm_clock_stage"] = "complete"
+    guard_receipt = guard.receipt()
+    _require(
+        guard_receipt["clock_restored"] is True and guard_receipt["services_restored"] is True,
+        "VM clock guard did not restore UTC and original guest time services",
+    )
+    return {
+        "schema_version": "1",
+        "head_sha": os.environ["K5_DESKTOP_HEAD_SHA"],
+        "installer_sha256": setup_sha256,
+        "method": "windows_SetSystemTime",
+        "offset_seconds": [172800, -172800],
+        "simulated_time": False,
+        "browser_clock_only": False,
+        "phases": phases,
+        "closed_segments": len(closed),
+        "closed_segment_hashes_preserved": True,
+        "retained_playback_decoded_frames": playback_frames,
+        "loopback_only": True,
+        "guard": guard_receipt,
+        "utc_restored": guard_receipt["clock_restored"],
+        "time_services_restored": guard_receipt["services_restored"],
+    }
 
 
 def test_native_windows_click_install_account_browser_tray_restart_uninstall(
@@ -671,6 +1058,16 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     browser_api = pytest.importorskip("playwright.sync_api")
     _require(version("playwright") == "1.58.0", "Expected reviewed Playwright version is absent")
     setup = Path(os.environ["K5_DESKTOP_SETUP"]).resolve(strict=True)
+    vm_clock_enabled = os.environ.get("K5_VM_CLOCK_ACCEPTANCE") == "1"
+    setup_sha256 = None
+    if vm_clock_enabled:
+        with setup.open("rb") as stream:
+            setup_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+        _require(
+            setup_sha256 == os.environ.get("K5_DESKTOP_SETUP_SHA256")
+            and len(os.environ.get("K5_DESKTOP_HEAD_SHA", "")) == 40,
+            "VM clock exact installer/revision identity was not admitted",
+        )
     media, ffmpeg, ffprobe = (
         helpers._tool(name)
         for name in ("K5_MEDIAMTX_DONOR_EXE", "K5_DONOR_FFMPEG", "K5_DONOR_FFPROBE")
@@ -689,6 +1086,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     failure_detail = None
     readiness_diagnostic = {"health_http_status": 0}
     recording_diagnostic = {}
+    vm_clock_diagnostic = {}
     receipt = {
         "schema_version": "1",
         "platform": platform.system(),
@@ -818,6 +1216,26 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["live_decoded_frames"] = browser_helpers._decoded_color(page, "live-video", "red")
         receipt["actual_edge_login_enrollment_live"] = True
         _wait(lambda: _recording_bytes(profile) > 0, "Desktop recording bytes", process=app)
+        if vm_clock_enabled:
+            stage = "actual_vm_clock_changes"
+            receipt["vm_clock"] = _vm_clock_phase(
+                page=page,
+                context=context,
+                client=client,
+                profile=profile,
+                camera_id=camera_id,
+                parent=parent,
+                processes=processes,
+                source_uri=source_uri,
+                ffmpeg=ffmpeg,
+                ffprobe=ffprobe,
+                helpers=helpers,
+                browser_helpers=browser_helpers,
+                app=app,
+                setup_sha256=setup_sha256,
+                diagnostic=vm_clock_diagnostic,
+            )
+            receipt["host_clock_step_acceptance"] = True
         stage = "browser_closing"
         context.close()
         context = None
@@ -866,7 +1284,8 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["graceful_owned_process_cleanup"] = True
         saved_files = sorted((profile / "recordings").rglob("*.mp4"))
         _require(bool(saved_files), "Desktop retained no recorded media")
-        decoded = sum(helpers._decoded_frames(ffprobe, path) for path in saved_files)
+        decoder = _vm_recorded_frames if vm_clock_enabled else helpers._decoded_frames
+        decoded = sum(decoder(ffprobe, path) for path in saved_files)
         _require(decoded > 0, "Desktop recordings did not contain decodable media")
         receipt["recorded_decoded_frames"] = decoded
         _require(not cohort.console_seen and not cohort.failed, "Desktop opened a console window")
@@ -984,6 +1403,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "form_visible": form_visible,
             **readiness_diagnostic,
             **recording_diagnostic,
+            **vm_clock_diagnostic,
         }
         record_testsuite_property(
             "desktop_windows_diagnostic", json.dumps(diagnostic, sort_keys=True)
@@ -994,7 +1414,12 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     _require(not cleanup_failed, "Owned desktop qualification cleanup failed")
     _require(not cohort.console_seen and not cohort.failed, "Desktop opened a console window")
     elapsed = time.monotonic() - started
-    _require(elapsed < 240, "Desktop qualification exceeded its bounded four-minute duration")
+    _require(
+        elapsed < (360 if vm_clock_enabled else 240),
+        "Desktop qualification exceeded its bounded VM duration"
+        if vm_clock_enabled
+        else "Desktop qualification exceeded its bounded four-minute duration",
+    )
     receipt["duration_seconds"] = round(elapsed, 2)
     receipt["owned_cleanup"] = True
     record_testsuite_property("desktop_windows_receipt", json.dumps(receipt, sort_keys=True))

@@ -111,6 +111,15 @@ availability, absolute UTC accuracy, DST behavior or recording retention across
 a PC clock correction. The time-critical increment requires its own new passing
 Windows receipt; earlier candidate evidence does not qualify it.
 
+A separate automated gate is being added on a disposable GitHub-hosted Windows
+VM. It installs the exact same EXE artifact, arms an independent recovery
+watchdog, temporarily controls the guest's time services, and moves its UTC clock
+forward and backward by 48 hours. It must verify session lifetime, advancing live
+video, recording, closed-file hashes and UTC history, then restore UTC and the
+time services before uploading evidence. This gate is **pending**; only its
+exact-build workflow receipt can establish a pass. It does not qualify physical
+camera clocks, NTP accuracy, capacity or endurance, and adds no tester setup step.
+
 The recording candidate includes the reviewed ONVIF connector; separately
 provisioned person detection remains outside the bundled desktop runtime.
 Physical-camera compatibility, measured capacity and long-duration recording

@@ -382,8 +382,9 @@
     const unavailable = recorderUtc === null || clock?.status === "unavailable";
     const step = typeof clock?.last_step_seconds === "number" && Number.isFinite(clock.last_step_seconds)
       ? Math.abs(clock.last_step_seconds).toFixed(1) : null;
+    const direction = clock?.last_step_seconds < 0 ? "backward" : "forward";
     $("recorder-time-warning").textContent = changed
-      ? `The recorder clock changed${step ? ` by ${step} seconds` : ""}. Check Windows Settings → Time & language → Date & time and the camera's NTP settings, then retest the camera connection. Earlier footage may use the previous clock. Age retention uses observed elapsed time to protect footage from clock corrections.`
+      ? `The recorder clock changed${step ? ` by ${step} seconds (${direction})` : ""}. Check Windows Settings → Time & language → Date & time and the camera's NTP settings, then retest the camera connection. Earlier footage may use the previous clock. Age retention uses observed elapsed time to protect footage from clock corrections.`
       : unavailable ? "Recorder time is unavailable. Check Windows time synchronization before relying on recording timestamps." : "";
     $("recorder-time-warning").hidden = !changed && !unavailable;
     $("connection-help-status").textContent = state.workerStatus === "disk_full"

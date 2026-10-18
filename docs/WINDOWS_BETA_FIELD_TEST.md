@@ -71,6 +71,17 @@ PC clock-step cases. Windows Date & time settings provide the graphical controls
 camera time/NTP changes use that camera's settings. Restore the approved
 automatic-time configuration afterward. No tester terminal is required.
 
+Maintainer automation is adding a separate disposable GitHub-hosted Windows VM
+gate using the exact same EXE artifact as desktop qualification. An independent
+watchdog is armed before guest time services are temporarily controlled and
+the guest's UTC clock is moved +48 hours and -48 hours. The gate must check
+session lifetime, live video, recording, closed-file SHA-256 hashes and UTC
+history, then restore UTC and the time services before evidence upload. Its status
+remains **pending**
+until the exact-build workflow receipt passes. A generated-media VM result does
+not complete physical-camera time/NTP accuracy, UTC/DST field checks, capacity
+or endurance qualification. Testers do not run this automation themselves.
+
 | Case | Required observation and evidence |
 | --- | --- |
 | Windows and camera agree with the approved reference | Record the independently observed Windows error and the camera-relative offset/uncertainty. A camera-reported NTP mode alone must not produce a verified-synchronization claim |
@@ -89,8 +100,10 @@ Maintainer automation records retained-file SHA-256 comparisons for generated
 test video and the clock-step/reference measurements; the public field report
 contains aggregate pass/fail results only. The operator checks history and
 playback through the GUI. A missing hash comparison or an untested actual Windows
-clock-step case remains pending. Fake clocks in one Python test do not establish
-the native recorder's behavior across an actual PC clock correction.
+clock-step case remains pending; link any passing automated clock receipt
+separately from the physical station's observations. Fake clocks in one Python
+test do not establish the native recorder's behavior across an actual PC clock
+correction.
 
 Record genuine time discontinuities as discontinuities. Successful decoding is
 not proof of absolute timestamp accuracy or continuous chronology. The recording

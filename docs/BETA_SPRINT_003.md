@@ -66,6 +66,15 @@ native wall-clock age deletion with conservative K5 elapsed-time retention.
 These protections require their own tests and must not be described as an
 absolute-time or evidence-grade synchronization guarantee.
 
+A dedicated automated clock gate is being added on a separate GitHub-hosted
+Windows VM. It installs the exact same EXE artifact, prearms an independent
+recovery watchdog, temporarily controls guest time services, and performs real
+UTC corrections of +48 and -48 hours. It must verify session lifetime, live video,
+recording, closed-file SHA-256 hashes and UTC history, then restore UTC and time
+services before uploading evidence. This gate remains **pending** until its
+exact-build workflow receipt passes; it is not a tester terminal procedure.
+Physical-camera time/NTP accuracy, capacity and endurance remain separate gates.
+
 The [time acceptance matrix](WINDOWS_BETA_FIELD_TEST.md#time-acceptance-matrix)
 requires camera offsets in both directions, a camera clock change during
 authentication, UTC/DST handling, forward/back PC clock steps, unavailable time
