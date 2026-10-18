@@ -308,6 +308,7 @@ def test_http_denial_and_redirect_are_finite_and_do_not_redirect(camera, status,
         b"<NotSOAP/>",
         "<!DOCTYPE x><x/>".encode("utf-16"),
     ],
+    ids=["entity", "over-budget", "malformed", "non-soap", "utf16-doctype"],
 )
 def test_untrusted_xml_and_response_limit_are_enforced(camera, body):
     camera.malformed = body

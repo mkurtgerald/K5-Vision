@@ -361,10 +361,10 @@ def _request(
                     http_body_shape="nonempty" if body else "empty",
                 )
             # Caddy can accept a connection before the Python control plane is
-            # ready. Its ordinary HTTP503 may have no JSON body. This outcome
+            # ready. Its ordinary HTTP502/503 may have no JSON body. A non200
             # cannot qualify startup; both loops still require JSON200/ok.
-            if readiness and route == "/api/v1/health" and response.code == 503:
-                return 503, {}
+            if readiness and route == "/api/v1/health" and response.code != 200:
+                return response.code, {}
             return response.code, json.loads(body)
     except OSError:
         return 0, {}
