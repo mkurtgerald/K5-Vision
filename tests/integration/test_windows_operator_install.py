@@ -322,7 +322,14 @@ def _foreign_access(path: Path, *, grant: bool, permission: str = "F") -> None:
     _require(result.returncode == 0, "Native foreign-access fixture operation failed")
 
 
-def _request(origin: str, route: str, data: dict | None = None) -> tuple[int, dict]:
+def _request(
+    origin: str,
+    route: str,
+    data: dict | None = None,
+    *,
+    readiness: bool = False,
+    diagnostic: dict | None = None,
+) -> tuple[int, dict]:
     __tracebackhide__ = True
     payload = None if data is None else json.dumps(data).encode()
     request = Request(
@@ -330,6 +337,13 @@ def _request(origin: str, route: str, data: dict | None = None) -> tuple[int, di
         data=payload,
         headers={"Origin": origin, "Content-Type": "application/json"},
     )
+    if diagnostic is not None:
+        diagnostic.update(
+            http_route="health" if route == "/api/v1/health" else "login",
+            http_status=0,
+            http_body_bytes=0,
+            http_body_shape="unavailable",
+        )
     opener = build_opener(ProxyHandler({}))
     try:
         try:
@@ -339,6 +353,18 @@ def _request(origin: str, route: str, data: dict | None = None) -> tuple[int, di
         with response:
             body = response.read(65_537)
             _require(len(body) <= 65_536, "Installed operator response exceeded its budget")
+            if diagnostic is not None:
+                diagnostic.update(
+                    http_route="health" if route == "/api/v1/health" else "login",
+                    http_status=response.code,
+                    http_body_bytes=len(body),
+                    http_body_shape="nonempty" if body else "empty",
+                )
+            # Caddy can accept a connection before the Python control plane is
+            # ready. Its ordinary HTTP503 may have no JSON body. This outcome
+            # cannot qualify startup; both loops still require JSON200/ok.
+            if readiness and route == "/api/v1/health" and response.code == 503:
+                return 503, {}
             return response.code, json.loads(body)
     except OSError:
         return 0, {}
@@ -461,6 +487,7 @@ def test_native_windows_installed_operator_lifecycle(
     owned = None
     descendants = []
     install = parent / "installed operator with spaces"
+    diagnostic = {"phase": "fixture_setup"}
     try:
         _private_directory(parent)
         runtime, state = parent / "runtime", parent / "state"
@@ -531,8 +558,10 @@ def test_native_windows_installed_operator_lifecycle(
         result, _ = _run_script(powershell, installer, arguments)
         _require(result != 0 and not install.exists(), "Installer replaced a foreign shortcut")
         shortcuts[0].unlink()
+        diagnostic["phase"] = "first_install"
         result, stage = _run_script(powershell, installer, arguments)
         _require(result == 0, "Native installer failed at " + stage)
+        diagnostic["phase"] = "installed_settings"
         active = (install / "active.json").read_bytes()
         _require(
             _json(install / "active.json")["recording_limit_gb"] == 1,
@@ -572,6 +601,7 @@ def test_native_windows_installed_operator_lifecycle(
             len(list((install / "releases").iterdir())) == 1, "Repeat install duplicated release"
         )
 
+        diagnostic["phase"] = "first_wrapper_start"
         diagnostic_name = "installed-launcher-diagnostic-" + uuid4().hex + ".json"
         owned = OwnedNativeProcess(
             [
@@ -597,13 +627,17 @@ def test_native_windows_installed_operator_lifecycle(
                     "Installed wrapper exited: "
                     + _installed_failure(install, runtime, diagnostic_name),
                 )
-            status, body = _request(origin, "/api/v1/health")
+            status, body = _request(origin, "/api/v1/health", readiness=True, diagnostic=diagnostic)
             if status == 200 and body.get("status") == "ok":
                 break
             _require(time.monotonic() < deadline, "Installed wrapper readiness deadline expired")
             time.sleep(0.2)
+        diagnostic["phase"] = "first_wrapper_login"
         status, login = _request(
-            origin, "/api/v1/auth/login", {"username": username, "password": password}
+            origin,
+            "/api/v1/auth/login",
+            {"username": username, "password": password},
+            diagnostic=diagnostic,
         )
         _require(
             status == 200 and login.get("account", {}).get("role") == "administrator",
@@ -627,6 +661,7 @@ def test_native_windows_installed_operator_lifecycle(
 
         # A changed same-version wheel must install new source bytes rather than
         # merely switch the release pointer. The fixture adds only a comment.
+        diagnostic["phase"] = "same_version_upgrade"
         upgraded_digest = _upgrade_same_version_wheel(package / "dist" / wheel.name)
         result, stage = _run_script(powershell, installer, arguments)
         _require(result == 0, "Stopped native upgrade failed at " + stage)
@@ -643,6 +678,7 @@ def test_native_windows_installed_operator_lifecycle(
         # This actual child process inherits no-index; environment restoration
         # does not alter its snapshot. Cached dependencies must suffice while
         # the local same-version K5 wheel still updates its installed code.
+        diagnostic["phase"] = "upgraded_wrapper_start"
         diagnostic_name = "installed-launcher-diagnostic-" + uuid4().hex + ".json"
         with monkeypatch.context() as startup_environment:
             startup_environment.setenv("PIP_NO_INDEX", "1")
@@ -669,14 +705,19 @@ def test_native_windows_installed_operator_lifecycle(
                     "Upgraded wrapper exited: "
                     + _installed_failure(install, runtime, diagnostic_name),
                 )
-            status, body = _request(origin, "/api/v1/health")
+            status, body = _request(origin, "/api/v1/health", readiness=True, diagnostic=diagnostic)
             if status == 200 and body.get("status") == "ok":
                 break
             _require(time.monotonic() < deadline, "Upgraded wrapper readiness deadline expired")
             time.sleep(0.2)
+        diagnostic["phase"] = "upgraded_module_admission"
         _verify_installed_module(runtime, upgraded_digest)
+        diagnostic["phase"] = "upgraded_wrapper_login"
         status, login = _request(
-            origin, "/api/v1/auth/login", {"username": username, "password": password}
+            origin,
+            "/api/v1/auth/login",
+            {"username": username, "password": password},
+            diagnostic=diagnostic,
         )
         _require(
             status == 200 and login.get("account", {}).get("role") == "administrator",
@@ -690,6 +731,7 @@ def test_native_windows_installed_operator_lifecycle(
         _require(not alive, "Upgraded native descendants survived owned cleanup")
         owned = None
 
+        diagnostic["phase"] = "uninstall_custody"
         current = install / "releases" / _json(install / "active.json")["release"]
         # Forging helper + its mutable certifying metadata must never execute
         # helper code. Only the reviewed LF/CRLF pins authorize bootstrap code.
@@ -757,6 +799,10 @@ def test_native_windows_installed_operator_lifecycle(
             identity_state.load_identity_state(identity.directory).site_id == identity.site_id,
             "Uninstall removed or changed durable identity",
         )
+    except BaseException:
+        record_testsuite_property("operator_windows_install_diagnostic", json.dumps(diagnostic))
+        print("Installed lifecycle diagnostic: " + json.dumps(diagnostic, sort_keys=True))
+        raise
     finally:
         if owned is not None:
             owned.stop()
