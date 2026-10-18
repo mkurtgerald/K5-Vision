@@ -7,6 +7,7 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const DAY = 86400000;
+  const TIME_SAMPLE_MAX_AGE = 30000;
   const RETRY_DELAYS = [1000, 2000, 4000, 8000, 10000];
   const CAMERA_ERROR_CODES = new Set([
     "discovery_unavailable", "camera_auth_failed", "camera_unreachable",
@@ -22,13 +23,14 @@
     dialogMode: "add", cameraSetupEpoch: 0, diagnostics: null, statusUnavailable: false,
     cameraSetupBusy: false, cameraSetupController: null, cameraProbe: null, cameraProbeTimer: null,
     cameraConnectionNotice: null,
+    recorderTime: null, sessionExpiresAt: null, sessionExpirySteady: null,
     removeTarget: null, removing: false,
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
     personFrameId: 0,
   };
 
   class ApiError extends Error {
-    constructor(status, code = "") { super("Request unavailable"); this.status = status; this.code = code; }
+    constructor(status, code = "", clock = null) { super("Request unavailable"); this.status = status; this.code = code; this.clock = clock; }
   }
   class SelectionError extends Error {}
 
@@ -104,14 +106,18 @@
         if (response.status === 401 && token && path !== "/api/v1/auth/login" && !state.signingOut) {
           expireSession();
         }
-        let code = "";
+        let code = "", clock = null;
         if (path.startsWith("/api/v1/operator/camera")) {
           try {
             const detail = (await response.json()).detail;
-            if (CAMERA_ERROR_CODES.has(detail)) code = detail;
+            const candidate = typeof detail === "string" ? detail : detail?.code;
+            if (CAMERA_ERROR_CODES.has(candidate)) {
+              code = candidate;
+              clock = cameraClockReport(detail?.clock);
+            }
           } catch (_) { /* Unknown response text never becomes a user-facing error. */ }
         }
-        throw new ApiError(response.status, code);
+        throw new ApiError(response.status, code, clock);
       }
       if (response.status === 204) return null;
       return await response.json();
@@ -184,6 +190,9 @@
     state.diagnostics = null;
     state.statusUnavailable = false;
     state.cameraConnectionNotice = null;
+    state.recorderTime = null;
+    state.sessionExpiresAt = null;
+    state.sessionExpirySteady = null;
     state.removeTarget = null;
     state.removing = false;
     state.selected = null;
@@ -207,6 +216,8 @@
     message("sign-in-message", reason, Boolean(reason));
     notice("");
     $("worker-message").hidden = true;
+    $("recorder-time-warning").hidden = true;
+    $("recorder-time-status").textContent = "Checking recorder time…";
   }
 
   function clearMediaCookie(token) {
@@ -362,6 +373,19 @@
         : used && free && limit ? `${used} recorded · ${limit} recording limit · ${free} disk free`
           : limit ? `Recording limit ${limit} · Waiting for storage status`
             : "Checking recording storage…";
+    const clock = diagnostics?.clock;
+    const recorderUtc = recorderNow();
+    $("recorder-time-status").textContent = recorderUtc === null
+      ? "Recorder time could not be checked. Time synchronization is not verified."
+      : `Recorder time: ${utcLabel(recorderUtc)} UTC · Time synchronization is not verified`;
+    const changed = clock?.status === "changed";
+    const unavailable = recorderUtc === null || clock?.status === "unavailable";
+    const step = typeof clock?.last_step_seconds === "number" && Number.isFinite(clock.last_step_seconds)
+      ? Math.abs(clock.last_step_seconds).toFixed(1) : null;
+    $("recorder-time-warning").textContent = changed
+      ? `The recorder clock changed${step ? ` by ${step} seconds` : ""}. Check Windows Settings → Time & language → Date & time and the camera's NTP settings, then retest the camera connection. Earlier footage may use the previous clock. Age retention uses observed elapsed time to protect footage from clock corrections.`
+      : unavailable ? "Recorder time is unavailable. Check Windows time synchronization before relying on recording timestamps." : "";
+    $("recorder-time-warning").hidden = !changed && !unavailable;
     $("connection-help-status").textContent = state.workerStatus === "disk_full"
       ? diagnostics?.storage?.reason === "inspection"
         ? "Recording is paused because storage could not be checked safely. Check the K5 startup message for the recording-storage problem. Live view and retained history remain available."
@@ -379,12 +403,16 @@
       if (epoch !== state.sessionEpoch) return;
       if (!diagnostics || !["ready", "unavailable", "disk_full"].includes(diagnostics.worker_status)) throw new ApiError(503);
       state.diagnostics = diagnostics;
+      const serverUtc = utcMilliseconds(diagnostics.server_utc);
+      state.recorderTime = Number.isFinite(serverUtc) ? { utc: serverUtc, steady: performance.now() } : null;
       state.statusUnavailable = false;
+      scheduleSessionExpiry();
       state.workerStatus = diagnostics.worker_status;
       renderWorkerStatus(); renderCameraHeading(); renderDiagnostics();
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
       state.statusUnavailable = true;
+      state.recorderTime = null;
       renderDiagnostics();
     }
   }
@@ -682,6 +710,10 @@
 
   function utcInput(date, seconds = false) { return date.toISOString().slice(0, seconds ? 23 : 16); }
   function parseUtc(value) { return new Date(`${value.length === 16 ? value + ":00" : value}Z`); }
+  function utcMilliseconds(value) {
+    return typeof value === "string" && value.length <= 32 &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/.test(value) ? Date.parse(value) : NaN;
+  }
   function spanStartMilliseconds(value) {
     const milliseconds = Date.parse(value);
     const fraction = typeof value === "string" ? value.match(/\.([0-9]+)(?:Z|[+-]\d{2}:\d{2})$/)?.[1] : null;
@@ -702,12 +734,34 @@
   }
 
   function setLastDay() {
-    const end = new Date(); end.setUTCMilliseconds(0);
+    const current = recorderNow();
+    if (current === null) return false;
+    const end = new Date(current); end.setUTCMilliseconds(0);
     $("history-start").value = utcInput(new Date(end.getTime() - DAY), true);
     $("history-end").value = utcInput(end, true);
     $("history-day").value = "";
-    $("history-day").max = new Date().toISOString().slice(0, 10);
+    $("history-day").max = end.toISOString().slice(0, 10);
     state.historyRolling = true;
+    return true;
+  }
+
+  function recorderNow() {
+    const sample = state.recorderTime;
+    if (!sample || state.statusUnavailable) return null;
+    const elapsed = performance.now() - sample.steady;
+    return Number.isFinite(elapsed) && elapsed >= 0 && elapsed <= TIME_SAMPLE_MAX_AGE ? sample.utc + elapsed : null;
+  }
+
+  function scheduleSessionExpiry() {
+    clearTimeout(state.expiryTimer);
+    state.expiryTimer = null;
+    const current = recorderNow();
+    if (state.sessionExpirySteady === null && current !== null && Number.isFinite(state.sessionExpiresAt)) {
+      state.sessionExpirySteady = performance.now() + Math.max(0, Math.min(state.sessionExpiresAt - current, DAY));
+    }
+    if (Number.isFinite(state.sessionExpirySteady)) {
+      state.expiryTimer = setTimeout(expireSession, Math.max(0, Math.min(state.sessionExpirySteady - performance.now(), DAY)));
+    }
   }
 
   function resetHistory() {
@@ -732,7 +786,16 @@
 
   async function loadHistory() {
     if (!state.selected || !state.token) { message("history-message", "Select a camera to view its history."); return; }
-    if (state.historyRolling) setLastDay();
+    if (state.historyRolling) {
+      const before = state.selected, session = state.sessionEpoch;
+      await refreshDiagnostics();
+      if (before !== state.selected || session !== state.sessionEpoch || !state.token) return;
+      if (!state.historyRolling) return;
+      if (!setLastDay()) {
+        message("history-message", "Recorder time is unavailable. Refresh service status or choose an explicit UTC interval.", true);
+        return;
+      }
+    }
     const start = parseUtc($("history-start").value);
     const end = parseUtc($("history-end").value);
     if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end <= start || end - start > DAY) {
@@ -878,10 +941,13 @@
       $("add-camera-button").hidden = account.role !== "administrator";
       $("sign-in").hidden = true;
       $("workspace").hidden = false;
-      const expires = Date.parse(result.expires_at);
-      if (Number.isFinite(expires)) state.expiryTimer = setTimeout(expireSession, Math.max(0, Math.min(expires - Date.now(), DAY)));
-      setLastDay(); resetHistory();
+      state.sessionExpiresAt = Date.parse(result.expires_at);
+      state.sessionExpirySteady = Number.isInteger(result.expires_in_seconds) && result.expires_in_seconds > 0 && result.expires_in_seconds <= 86400
+        ? performance.now() + result.expires_in_seconds * 1000 : null;
+      scheduleSessionExpiry();
       await Promise.all([refreshCameras(true), refreshDiagnostics()]);
+      if (epoch !== state.sessionEpoch) return;
+      setLastDay(); resetHistory();
       scheduleCameraPoll();
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
@@ -934,7 +1000,7 @@
   $("history-form").addEventListener("submit", (event) => { event.preventDefault(); void loadHistory(); });
   $("history-start").addEventListener("input", () => { state.historyRolling = false; });
   $("history-end").addEventListener("input", () => { state.historyRolling = false; });
-  $("last-24-hours").addEventListener("click", () => { setLastDay(); void loadHistory(); });
+  $("last-24-hours").addEventListener("click", () => { state.historyRolling = true; void loadHistory(); });
   $("history-day").addEventListener("change", () => {
     const date = new Date(`${$("history-day").value}T00:00:00Z`);
     if (!Number.isFinite(date.getTime())) return;
@@ -960,6 +1026,38 @@
     $("camera-profile").replaceChildren();
     $("camera-profile-section").hidden = true;
     $("save-camera").disabled = true;
+    $("camera-clock-status").hidden = true;
+    $("camera-clock-status").textContent = "";
+  }
+
+  function cameraClockReport(value) {
+    if (!value || value.sync_verified !== false || !["measured", "unavailable"].includes(value.status)) return null;
+    if (value.status === "unavailable") return { status: "unavailable" };
+    if (typeof value.offset_seconds !== "number" || !Number.isFinite(value.offset_seconds) ||
+        Math.abs(value.offset_seconds) > 315576000000 || typeof value.measured_at !== "string" ||
+        !Number.isFinite(utcMilliseconds(value.measured_at)) ||
+        typeof value.uncertainty_seconds !== "number" || !Number.isFinite(value.uncertainty_seconds) ||
+        value.uncertainty_seconds < 0 || value.uncertainty_seconds > 15 ||
+        !["ntp", "manual", "unknown"].includes(value.reported_mode)) return null;
+    return value;
+  }
+
+  function renderCameraClock(value) {
+    const clock = cameraClockReport(value);
+    let text = "Camera time could not be checked. Time synchronization is not verified. Check Windows time synchronization and the camera's NTP settings.";
+    let warning = true;
+    if (clock?.status === "measured") {
+      const offset = Math.abs(clock.offset_seconds);
+      const mode = clock.reported_mode === "ntp" ? "Camera reports NTP mode." : clock.reported_mode === "manual" ? "Camera reports manual time." : "Camera time mode is unknown.";
+      const alignment = offset > 5
+        ? `Camera is ${offset.toFixed(1)} seconds ${clock.offset_seconds > 0 ? "ahead of" : "behind"} the recorder. Authentication uses camera time.`
+        : `Camera and recorder differ by ${offset.toFixed(1)} seconds.`;
+      text = `${alignment} Checked ${utcLabel(clock.measured_at)} UTC, with measurement uncertainty ±${clock.uncertainty_seconds.toFixed(1)} seconds. ${mode} Time synchronization is not verified. Check Windows time synchronization and camera NTP settings.`;
+      warning = offset > 5;
+    }
+    $("camera-clock-status").textContent = text;
+    $("camera-clock-status").classList.toggle("error", warning);
+    $("camera-clock-status").hidden = false;
   }
 
   function setCameraSetupBusy(busy, action = "") {
@@ -1013,7 +1111,7 @@
   function cameraSetupError(error) {
     const messages = {
       discovery_unavailable: "Camera discovery is unavailable. Enter the camera’s IP address instead.",
-      camera_auth_failed: "The camera did not accept this account. Check its username and password. Some cameras use a separate ONVIF account.",
+      camera_auth_failed: "Camera authentication failed. Check the camera account and its time/NTP settings. Some cameras use a separate ONVIF account.",
       camera_unreachable: "The camera could not be reached. Check its power, IP address and camera settings port, and confirm ONVIF is enabled.",
       camera_unsupported: "This camera has no supported H.264 stream. Enable ONVIF and H.264 in its settings, then test again.",
       camera_invalid_response: "The camera did not return usable video settings. Check that ONVIF is enabled and try again.",
@@ -1158,6 +1256,7 @@
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       if (typeof tested.probe_id !== "string" || !tested.probe_id || tested.probe_id.length > 256 || tested.probe_id.includes("://") ||
         !Array.isArray(tested.profiles) || tested.profiles.length > 64) throw new SelectionError();
+      renderCameraClock(tested.clock);
       const profiles = tested.profiles.filter((profile) =>
         typeof profile.id === "string" && profile.id && profile.id.length <= 256 && !profile.id.includes("://") &&
         ["H264", "H265", "MJPEG", "UNKNOWN"].includes(profile.codec)
@@ -1199,6 +1298,7 @@
       message("add-camera-message", "Camera account accepted. Choose an H.264 stream; video is checked after connecting.");
     } catch (error) {
       if (controller.signal.aborted || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
+      renderCameraClock(error.clock);
       message("add-camera-message", cameraSetupError(error), true);
     } finally {
       credentials.password = "";

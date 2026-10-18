@@ -33,6 +33,7 @@ import base64
 import hashlib
 import http.client
 import ipaddress
+import math
 import re
 import secrets
 import select
@@ -42,7 +43,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 from urllib.request import parse_http_list, parse_keqv_list
@@ -61,11 +62,73 @@ _CODES = frozenset({"auth_failed", "unreachable", "unsupported", "invalid_respon
 _TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 
 
+@dataclass(frozen=True)
+class OnvifClockReading:
+    """Read-only clock comparison to this PC, never proof of NTP synchronization."""
+
+    status: str = "unavailable"
+    offset_seconds: float | None = None
+    measured_at: datetime | None = None
+    uncertainty_seconds: float | None = None
+    reported_mode: str = "unknown"
+    sync_verified: bool = False
+
+    def __post_init__(self) -> None:
+        valid = (
+            type(self.status) is str
+            and self.status in {"measured", "unavailable"}
+            and type(self.reported_mode) is str
+            and self.reported_mode in {"ntp", "manual", "unknown"}
+            and self.sync_verified is False
+            and (
+                self.measured_at is None
+                or (
+                    isinstance(self.measured_at, datetime)
+                    and self.measured_at.utcoffset() == timedelta(0)
+                )
+            )
+        )
+        if self.status == "measured":
+            valid = (
+                valid
+                and self.measured_at is not None
+                and type(self.offset_seconds) in {int, float}
+                and abs(self.offset_seconds) <= 400_000_000_000
+                and math.isfinite(self.offset_seconds)
+                and type(self.uncertainty_seconds) in {int, float}
+                and 0 <= self.uncertainty_seconds <= 10
+                and math.isfinite(self.uncertainty_seconds)
+            )
+        else:
+            valid = valid and self.offset_seconds is None and self.uncertainty_seconds is None
+        if not valid:
+            raise ValueError("Invalid camera clock reading")
+
+    def public(self) -> dict:
+        return {
+            "status": self.status,
+            "offset_seconds": self.offset_seconds,
+            "measured_at": (
+                self.measured_at.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                if self.measured_at is not None
+                else None
+            ),
+            "uncertainty_seconds": self.uncertainty_seconds,
+            "reported_mode": self.reported_mode,
+            "sync_verified": False,
+        }
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 class OnvifError(RuntimeError):
     """Finite diagnostic that contains no remote text or private values."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, clock: OnvifClockReading | None = None) -> None:
         self.code = code if code in _CODES else "invalid_response"
+        self.clock = clock if isinstance(clock, OnvifClockReading) else None
         super().__init__("Camera connection failed")
 
 
@@ -77,6 +140,7 @@ class OnvifProfile:
     width: int
     height: int
     source_uri: str = field(repr=False)
+    clock: OnvifClockReading | None = None
 
 
 def _ip(value: str) -> str:
@@ -246,7 +310,7 @@ def _envelope(
     operation: str, username: str, password: str, *, created_at: datetime | None = None
 ) -> bytes:
     nonce = secrets.token_bytes(16)
-    created = (created_at or datetime.now(UTC)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    created = (created_at or _utc_now()).isoformat(timespec="seconds").replace("+00:00", "Z")
     digest = base64.b64encode(
         hashlib.sha1(nonce + created.encode() + password.encode(), usedforsecurity=False).digest()
     ).decode("ascii")
@@ -287,19 +351,24 @@ class _Client:
         self.deadline = deadline
         self.require_secure = require_secure
         self._camera_clock: tuple[datetime, float] | None = None
+        self.clock = OnvifClockReading(measured_at=_utc_now())
+        self._clock_endpoint: str | None = None
+        self._clock_recheck_used = False
         self.challenge: dict[str, str] | None = None
         self.nonce_count = 0
 
-    def synchronize_clock(self, endpoint: str) -> None:
+    def synchronize_clock(self, endpoint: str) -> bool:
         """Read the device's UTC clock anonymously without changing either clock.
 
         This optional PRE_AUTH action has its own short deadline. An older or
         restricted camera can still use the remaining authenticated probe budget.
         """
         started = time.monotonic()
+        self._clock_endpoint = endpoint
+        self.clock = OnvifClockReading(measured_at=_utc_now())
         remaining = self.deadline - started
         if remaining <= 0:
-            return
+            return False
         clock_reader = _Client(
             self.host,
             "",
@@ -315,12 +384,16 @@ class _Client:
                 "GetSystemDateAndTime",
                 authenticated=False,
             )
+            mode = {"NTP": "ntp", "Manual": "manual"}.get(
+                _text(response, "DateTimeType"), "unknown"
+            )
+            self.clock = OnvifClockReading(measured_at=_utc_now(), reported_mode=mode)
             utc = _find(response, "UTCDateTime")
             if utc is None:
-                return
+                return False
             date, clock = _find(utc, "Date"), _find(utc, "Time")
             if date is None or clock is None:
-                return
+                return False
             camera_time = datetime(
                 int(_text(date, "Year")),
                 int(_text(date, "Month")),
@@ -332,7 +405,21 @@ class _Client:
             )
             # Refuse a boundary date that cannot advance through this probe.
             camera_time + timedelta(seconds=max(0, self.deadline - started) + 1)
-            self._camera_clock = camera_time, (started + time.monotonic()) / 2
+            finished = time.monotonic()
+            sampled = (started + finished) / 2
+            observed = _utc_now()
+            offset = (
+                camera_time + timedelta(seconds=finished - sampled) - observed
+            ).total_seconds()
+            self._camera_clock = camera_time, sampled
+            self.clock = OnvifClockReading(
+                status="measured",
+                offset_seconds=round(offset, 3),
+                measured_at=observed,
+                uncertainty_seconds=math.ceil((1 + (finished - started) / 2) * 1000) / 1000,
+                reported_mode=mode,
+            )
+            return True
         except (
             OnvifError,
             OSError,
@@ -341,7 +428,7 @@ class _Client:
             ET.ParseError,
             http.client.HTTPException,
         ):
-            return
+            return False
 
     def _created_at(self) -> datetime | None:
         if self._camera_clock is None:
@@ -401,7 +488,63 @@ class _Client:
             fields.append(f'opaque="{challenge["opaque"]}"')
         return "Digest " + ", ".join(fields)
 
+    def _changed_clock_after_refresh(self) -> bool:
+        previous = self._camera_clock
+        previous_uncertainty = self.clock.uncertainty_seconds or 0
+        if self._clock_endpoint is None or not self.synchronize_clock(self._clock_endpoint):
+            return False
+        fresh = self._created_at()
+        if fresh is None:
+            return False
+        try:
+            predicted = (
+                previous[0] + timedelta(seconds=time.monotonic() - previous[1])
+                if previous is not None
+                else _utc_now()
+            )
+        except OverflowError:
+            return False
+        uncertainty = previous_uncertainty + (self.clock.uncertainty_seconds or 0)
+        return abs((fresh - predicted).total_seconds()) > uncertainty
+
     def request(
+        self,
+        endpoint: str,
+        operation: str,
+        namespace: str,
+        action: str,
+        *,
+        authenticated: bool = True,
+    ) -> ET.Element:
+        def call():
+            try:
+                return None, self._request(
+                    endpoint, operation, namespace, action, authenticated=authenticated
+                )
+            except OnvifError as error:
+                return error.code, None
+            except (OSError, http.client.HTTPException):
+                return "unreachable", None
+            except Exception:
+                return "invalid_response", None
+
+        code, result = call()
+        if code is None:
+            return result
+        if (
+            code == "auth_failed"
+            and authenticated
+            and self._clock_endpoint is not None
+            and not self._clock_recheck_used
+        ):
+            self._clock_recheck_used = True
+            if self._changed_clock_after_refresh():
+                code, result = call()
+                if code is None:
+                    return result
+        raise OnvifError(code, clock=self.clock)
+
+    def _request(
         self,
         endpoint: str,
         operation: str,
@@ -559,6 +702,17 @@ def _probe(host: str, port: int, secure: bool, username: str, password: str, bud
     authority = f"[{host}]" if ":" in host else host
     base = f"{'https' if secure else 'http'}://{authority}:{port}"
     client = _Client(host, username, password, time.monotonic() + budget, require_secure=secure)
+    try:
+        return _probe_profiles(client, base, host, username, password)
+    except OnvifError as error:
+        raise OnvifError(error.code, clock=client.clock) from None
+    except (OSError, http.client.HTTPException):
+        raise OnvifError("unreachable", clock=client.clock) from None
+    except Exception:
+        raise OnvifError("invalid_response", clock=client.clock) from None
+
+
+def _probe_profiles(client: _Client, base: str, host: str, username: str, password: str):
     device = base + "/onvif/device_service"
     client.synchronize_clock(device)
     media = base + "/onvif/media_service"
@@ -625,10 +779,10 @@ def _probe(host: str, port: int, secure: bool, username: str, password: str, bud
                 continue
             raise
         uri = _stream_uri(_text(response, "Uri"), host, username, password)
-        results.append(OnvifProfile(token, name, codec, width, height, uri))
+        results.append(OnvifProfile(token, name, codec, width, height, uri, client.clock))
     if not results:
         raise OnvifError("unsupported")
-    return tuple(results)
+    return tuple(replace(profile, clock=client.clock) for profile in results)
 
 
 def _discovery_candidates(body: bytes, sender: str) -> list[dict]:
@@ -756,11 +910,11 @@ class OnvifConnector:
             try:
                 return True, function(*arguments)
             except OnvifError as error:
-                return False, error.code
+                return False, (error.code, error.clock)
             except (OSError, http.client.HTTPException):
-                return False, "unreachable"
+                return False, ("unreachable", None)
             except Exception:
-                return False, "invalid_response"
+                return False, ("invalid_response", None)
         finally:
             with self._lock:
                 self._active -= 1
@@ -780,7 +934,8 @@ class OnvifConnector:
         task.add_done_callback(self._tasks.discard)
         success, result = await asyncio.shield(task)
         if not success:
-            raise OnvifError(result)
+            code, clock = result
+            raise OnvifError(code, clock=clock)
         return result
 
     async def discover(self, interface: str | None = None) -> list[dict]:

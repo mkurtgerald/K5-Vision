@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import math
+import re
 import secrets
 import socket
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from datetime import datetime
 from time import monotonic
 from uuid import UUID
 
@@ -24,6 +27,66 @@ _PROBE_TTL_SECONDS = 120
 _MAX_PROBES = 16
 _MAX_PROFILES = 8
 _MAX_DISCOVERED = 64
+_CLOCK_FIELDS = frozenset(
+    {
+        "status",
+        "offset_seconds",
+        "measured_at",
+        "uncertainty_seconds",
+        "reported_mode",
+        "sync_verified",
+    }
+)
+_OBSERVED_UTC = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z\Z"
+)
+
+
+def _public_clock(reading: object) -> dict:
+    """Publish a read-only sample, never raw camera time or a synchronization claim."""
+    unavailable = {
+        "status": "unavailable",
+        "offset_seconds": None,
+        "measured_at": None,
+        "uncertainty_seconds": None,
+        "reported_mode": "unknown",
+        "sync_verified": False,
+    }
+    try:
+        publish = getattr(reading, "public", None)
+        if not callable(publish):
+            return unavailable
+        public = publish()
+        if (
+            type(public) is not dict
+            or public.keys() != _CLOCK_FIELDS
+            or public["status"] not in {"measured", "unavailable"}
+            or public["reported_mode"] not in {"ntp", "manual", "unknown"}
+            or public["sync_verified"] is not False
+        ):
+            return unavailable
+        observed = public["measured_at"]
+        if observed is not None:
+            if type(observed) is not str or not _OBSERVED_UTC.fullmatch(observed):
+                return unavailable
+            datetime.fromisoformat(observed.replace("Z", "+00:00"))
+        offset, uncertainty = public["offset_seconds"], public["uncertainty_seconds"]
+        if public["status"] == "measured":
+            if (
+                observed is None
+                or type(offset) not in (int, float)
+                or not math.isfinite(offset)
+                or abs(offset) > 315576000000
+                or type(uncertainty) not in (int, float)
+                or not math.isfinite(uncertainty)
+                or not 0 <= uncertainty <= 15
+            ):
+                return unavailable
+        elif offset is not None or uncertainty is not None:
+            return unavailable
+        return dict(public)
+    except Exception:
+        return unavailable
 
 
 def _camera_ipv4_interfaces() -> tuple[str, ...]:
@@ -150,16 +213,22 @@ def _public_name(value: object, fallback: str, *, private: tuple[str, ...] = ())
 def _connector_failure(error: Exception, *, discovery: bool = False) -> HTTPException:
     code = getattr(error, "code", "invalid_response")
     if code == "busy":
-        return HTTPException(429, "camera_busy")
-    if discovery:
-        return HTTPException(503, "discovery_unavailable")
-    status, detail = {
-        "auth_failed": (422, "camera_auth_failed"),
-        "unreachable": (503, "camera_unreachable"),
-        "unsupported": (422, "camera_unsupported"),
-        "invalid_response": (502, "camera_invalid_response"),
-    }.get(code, (502, "camera_invalid_response"))
-    return HTTPException(status, detail)
+        status, detail = 429, "camera_busy"
+    elif discovery:
+        status, detail = 503, "discovery_unavailable"
+    else:
+        status, detail = {
+            "auth_failed": (422, "camera_auth_failed"),
+            "unreachable": (503, "camera_unreachable"),
+            "unsupported": (422, "camera_unsupported"),
+            "invalid_response": (502, "camera_invalid_response"),
+        }.get(code, (502, "camera_invalid_response"))
+    public_detail = (
+        detail
+        if discovery
+        else {"code": detail, "clock": _public_clock(getattr(error, "clock", None))}
+    )
+    return HTTPException(status, public_detail, headers={"Cache-Control": "no-store"})
 
 
 def install_operator_onvif_api(
@@ -238,6 +307,7 @@ def install_operator_onvif_api(
                 ):
                     raise ValueError
                 public = []
+                clock = _public_clock(getattr(selected[0], "clock", None))
                 for index, profile in enumerate(selected, 1):
                     if (
                         profile.codec not in {"H264", "H265", "MJPEG", "UNKNOWN"}
@@ -264,6 +334,9 @@ def install_operator_onvif_api(
                         }
                     )
             except Exception as error:
+                # A private network operation may outlive the human session.
+                # Recheck failed probes before releasing even safe diagnostics.
+                await current_admin(session)
                 raise _connector_failure(error) from None
             await current_admin(session)
             if vault.get(identifier, session) is not probe:
@@ -272,6 +345,7 @@ def install_operator_onvif_api(
                 "probe_id": identifier,
                 "expires_in_seconds": max(0, int(probe.expires - monotonic())),
                 "profiles": public,
+                "clock": clock,
             }
         except BaseException:
             vault.discard(identifier, probe)

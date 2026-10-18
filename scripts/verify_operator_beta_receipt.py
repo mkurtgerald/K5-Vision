@@ -25,7 +25,11 @@ _TESTS = {
         (
             "test_assembled_operator_product_login_live_recording_logout_and_restart",
             "operator_product_runtime_receipt",
-        )
+        ),
+        (
+            "test_native_mediamtx_records_reconnects_and_restores_playback",
+            "native_donor_runtime_receipt",
+        ),
     ],
     "install": [
         ("test_native_windows_installed_operator_lifecycle", "operator_windows_install_receipt")
@@ -56,6 +60,10 @@ _TRUE = {
         "whole_product_restart_preserved logout_revoked_cached_media "
         "session_invalid_after_restart live_hls_media_received source_reconnected"
     ).split(),
+    "donor": (
+        "past_dated_segment_preserved retained_file_hashes_preserved "
+        "restart_inventory_preserved source_reconnected"
+    ).split(),
     "install": (
         "per_user_install start_desktop_logon_shortcuts repeat_install foreign_shortcut_refused "
         "recording_limit_persisted installed_wrapper_health administrator_login "
@@ -71,7 +79,9 @@ _TRUE = {
         "ui_history_and_gaps script_visible_credentials_absent logout_revoked_media_and_session "
         "owned_cleanup ui_service_storage_status ui_removal_cancel_preserved_camera "
         "ui_removal_preserved_files_and_denied_media ui_reenrollment_restored_history "
-        "onvif_credential_profile_enrollment no_manual_stream_uri onvif_clock_skew_compensated"
+        "onvif_credential_profile_enrollment no_manual_stream_uri onvif_clock_skew_compensated "
+        "onvif_time_health_displayed recorder_time_health_displayed "
+        "server_utc_rolling_history browser_clock_skew_session_preserved"
     ).split(),
     "person": (
         "single_flight_busy independent_view_workers third_view_capacity_denied "
@@ -107,7 +117,13 @@ def verify(lane: str, path: Path) -> list[dict]:
             common.pop("schema_version")
         for key, expected in common.items():
             _require(type(receipt.get(key)) is type(expected) and receipt[key] == expected)
-        group = "person-view" if property_name == "operator_person_view_runtime_receipt" else lane
+        group = (
+            "person-view"
+            if property_name == "operator_person_view_runtime_receipt"
+            else "donor"
+            if property_name == "native_donor_runtime_receipt"
+            else lane
+        )
         _require(all(receipt.get(key) is True for key in _TRUE[group]))
         if lane == "launcher":
             _require(str(receipt.get("powershell_version", "")).startswith("5.1"))
@@ -117,6 +133,19 @@ def verify(lane: str, path: Path) -> list[dict]:
                 _require(receipt.get("cached") is False)
                 _require(receipt.get("downloaded_workers") is True)
                 _require(receipt.get("installed_worker_digests") is True)
+        elif group == "donor":
+            _require(receipt.get("version") == "v1.21.2")
+            _require(receipt.get("media") == "locally_generated_h264")
+            _require(receipt.get("production_camera_acceptance") is False)
+            _require(receipt.get("analytics_acceptance") is False)
+            _require(receipt.get("browser_acceptance") is False)
+            _require(receipt.get("anonymous_api_status") == 401)
+            _require(receipt.get("anonymous_playback_status") == 401)
+            _require(type(receipt.get("recording_segments")) is int)
+            _require(receipt["recording_segments"] >= 3)
+            frames = receipt.get("playback_decoded_frames_after_restart")
+            _require(type(frames) is list and len(frames) >= 2)
+            _require(all(type(count) is int and count > 0 for count in frames))
         elif lane == "product":
             _require(receipt.get("portable_ancestor_adjustment") is False)
             _require(receipt.get("recording_spans", 0) >= 3)
@@ -125,6 +154,9 @@ def verify(lane: str, path: Path) -> list[dict]:
             _require(str(receipt.get("powershell_version", "")).startswith("5.1"))
             _require(receipt.get("windows_service") is False)
         elif lane == "browser":
+            _require(receipt.get("host_clock_step_acceptance") is False)
+            _require(type(receipt.get("browser_date_skew_seconds")) is int)
+            _require(receipt["browser_date_skew_seconds"] == 172800)
             _require(receipt.get("portable_ancestor_adjustment") is False)
             _require(receipt.get("browser_channel") == "msedge")
             _require(receipt.get("playwright_version") == "1.58.0")

@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,7 +29,7 @@ from k5vision.media.mediamtx_provider import (
     MediaWorkerErrorCode,
 )
 from k5vision.operator_analytics import OperatorAnalyticsResult
-from k5vision.operator_onvif import OnvifError, OnvifProfile
+from k5vision.operator_onvif import OnvifClockReading, OnvifError, OnvifProfile
 from k5vision.operator_product_api import install_operator_product_api
 from k5vision.operator_product_state import OperatorCameraStore
 from k5vision.services.device_registry import DeviceRegistry
@@ -990,6 +990,27 @@ def _onvif_connect_body(probe, *, name="Front door"):
     }
 
 
+_UNAVAILABLE_CLOCK = {
+    "status": "unavailable",
+    "offset_seconds": None,
+    "measured_at": None,
+    "uncertainty_seconds": None,
+    "reported_mode": "unknown",
+    "sync_verified": False,
+}
+
+
+def _measured_clock(*, offset=1200.5, mode="ntp"):
+    return OnvifClockReading(
+        status="measured",
+        offset_seconds=offset,
+        measured_at=datetime(2026, 10, 18, 12, 0, tzinfo=UTC),
+        uncertainty_seconds=0.25,
+        reported_mode=mode,
+        sync_verified=False,
+    )
+
+
 def test_onvif_discovery_projects_only_public_candidates(product, onvif):
     onvif.candidates[0]["source_uri"] = "rtsp://private-credential@127.0.0.1/source"
     response = product.client.post(
@@ -1010,7 +1031,8 @@ def test_onvif_probe_handles_hide_execution_material_and_connect_private_source(
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     result = response.json()
-    assert set(result) == {"probe_id", "expires_in_seconds", "profiles"}
+    assert set(result) == {"probe_id", "expires_in_seconds", "profiles", "clock"}
+    assert result["clock"] == _UNAVAILABLE_CLOCK
     assert len(result["probe_id"]) == 32 and 0 < result["expires_in_seconds"] <= 120
     profile = result["profiles"][0]
     assert set(profile) == {"id", "name", "codec", "width", "height", "supported"}
@@ -1039,6 +1061,57 @@ def test_onvif_probe_handles_hide_execution_material_and_connect_private_source(
         json=_onvif_connect_body(result),
     )
     assert replay.status_code == 410 and replay.json()["detail"] == "camera_probe_expired"
+
+
+@pytest.mark.parametrize(("offset", "mode"), [(1200.5, "ntp"), (-1200, "manual"), (0, "unknown")])
+def test_onvif_probe_publishes_only_read_only_measured_clock(product, onvif, offset, mode):
+    onvif.profiles = (replace(onvif.profiles[0], clock=_measured_clock(offset=offset, mode=mode)),)
+
+    response = _onvif_probe(product)
+
+    assert response.status_code == 200
+    assert response.json()["clock"] == {
+        "status": "measured",
+        "offset_seconds": offset,
+        "measured_at": "2026-10-18T12:00:00.000Z",
+        "uncertainty_seconds": 0.25,
+        "reported_mode": mode,
+        "sync_verified": False,
+    }
+    assert response.headers["cache-control"] == "no-store"
+    assert "camera-password" not in response.text and "rtsp://" not in response.text
+    assert not product.cameras.list_sources()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"offset_seconds": True},
+        {"offset_seconds": float("nan")},
+        {"offset_seconds": float("inf")},
+        {"offset_seconds": 315576000001},
+        {"uncertainty_seconds": -1},
+        {"uncertainty_seconds": 15.1},
+        {"measured_at": "2026-02-30T12:00:00Z"},
+        {"measured_at": "camera-password<UTCDateTime>private-raw-time</UTCDateTime>"},
+        {"reported_mode": "private-camera-mode"},
+        {"sync_verified": True},
+        {"raw_utc": "private-camera-time"},
+    ],
+)
+def test_onvif_probe_sanitizes_invalid_clock_without_disclosing_remote_fields(
+    product, onvif, changes
+):
+    report = {**_measured_clock().public(), **changes}
+    reading = SimpleNamespace(public=lambda: report)
+    onvif.profiles = (replace(onvif.profiles[0], clock=reading),)
+
+    response = _onvif_probe(product)
+
+    assert response.status_code == 200
+    assert response.json()["clock"] == _UNAVAILABLE_CLOCK
+    assert "private-" not in response.text and "camera-password" not in response.text
+    assert "UTCDateTime" not in response.text and "raw_utc" not in response.text
 
 
 def test_onvif_https_management_endpoint_is_public_and_durably_preserved(product, onvif):
@@ -1108,10 +1181,48 @@ def test_onvif_failures_never_echo_credentials_or_logout_human(
 ):
     onvif.error = error
     response = _onvif_probe(product)
-    assert response.status_code == status and response.json() == {"detail": detail}
+    assert response.status_code == status
+    assert response.json() == {"detail": {"code": detail, "clock": _UNAVAILABLE_CLOCK}}
     assert "camera-password" not in response.text and "rtsp://" not in response.text
     assert product.client.get("/api/v1/operator/status", headers=product.headers).status_code == 200
     assert not product.app.state.operator_onvif_probes._probes
+
+
+def test_onvif_failed_authentication_preserves_sanitized_clock_diagnostic(product, onvif):
+    onvif.error = OnvifError("auth_failed", clock=_measured_clock())
+
+    response = _onvif_probe(product)
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {
+            "code": "camera_auth_failed",
+            "clock": {
+                "status": "measured",
+                "offset_seconds": 1200.5,
+                "measured_at": "2026-10-18T12:00:00.000Z",
+                "uncertainty_seconds": 0.25,
+                "reported_mode": "ntp",
+                "sync_verified": False,
+            },
+        }
+    }
+    assert "camera-password" not in response.text and "rtsp://" not in response.text
+    assert not product.app.state.operator_onvif_probes._probes
+    assert not product.cameras.list_sources()
+
+
+def test_onvif_failed_probe_sanitizes_invalid_clock_report(product, onvif):
+    reading = SimpleNamespace(public=lambda: {"raw_utc": "private-clock-xml"})
+    onvif.error = OnvifError("unreachable", clock=reading)
+
+    response = _onvif_probe(product)
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "camera_unreachable", "clock": _UNAVAILABLE_CLOCK}
+    }
+    assert "private-clock-xml" not in response.text and "raw_utc" not in response.text
 
 
 @pytest.mark.parametrize(
@@ -1175,6 +1286,21 @@ def test_onvif_revocation_during_network_probe_rejects_result_and_discards_priva
     onvif.callback = revoke
     response = _onvif_probe(product)
     assert response.status_code == 401
+    assert not product.app.state.operator_onvif_probes._probes
+    assert not product.cameras.list_sources()
+
+
+def test_onvif_revocation_during_failed_probe_withholds_clock_metadata(product, onvif):
+    async def revoke():
+        await product.sessions.revoke(product.token)
+
+    onvif.callback = revoke
+    onvif.error = OnvifError("auth_failed", clock=_measured_clock())
+
+    response = _onvif_probe(product)
+
+    assert response.status_code == 401
+    assert "clock" not in response.text and "1200.5" not in response.text
     assert not product.app.state.operator_onvif_probes._probes
     assert not product.cameras.list_sources()
 

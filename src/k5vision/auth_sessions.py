@@ -7,6 +7,7 @@ import hashlib
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Annotated
 from uuid import UUID
 
@@ -45,19 +46,25 @@ class UserSessionIssue(BaseModel):
     account: UserAccount
     session_token: SessionToken
     expires_at: datetime
+    expires_in_seconds: int = Field(
+        ge=MIN_SESSION_TTL_SECONDS, le=MAX_SESSION_TTL_SECONDS, strict=True
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class _SessionRecord:
     account: UserAccount
     expires_at: datetime
+    deadline: float
 
 
 class UserSessionManager:
     """Maintain one bounded opaque in-process session per durable user."""
 
     def __init__(self, *, ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS) -> None:
-        if not MIN_SESSION_TTL_SECONDS <= ttl_seconds <= MAX_SESSION_TTL_SECONDS:
+        if type(ttl_seconds) is not int or not (
+            MIN_SESSION_TTL_SECONDS <= ttl_seconds <= MAX_SESSION_TTL_SECONDS
+        ):
             raise ValueError(
                 f"ttl_seconds must be between {MIN_SESSION_TTL_SECONDS} "
                 f"and {MAX_SESSION_TTL_SECONDS}"
@@ -66,6 +73,11 @@ class UserSessionManager:
         self._sessions: dict[bytes, _SessionRecord] = {}
         self._user_tokens: dict[UUID, bytes] = {}
         self._lock = asyncio.Lock()
+
+    @property
+    def ttl_seconds(self) -> int:
+        """Return the bounded elapsed lifetime advertised to a new login."""
+        return self._ttl_seconds
 
     @staticmethod
     def _digest(token: str) -> bytes:
@@ -83,9 +95,13 @@ class UserSessionManager:
         """Issue a new session and revoke any prior session for the same user."""
         token = secrets.token_urlsafe(32)
         digest = self._digest(token)
-        expires_at = datetime.now(UTC) + timedelta(seconds=self._ttl_seconds)
-        record = _SessionRecord(account=account, expires_at=expires_at)
         async with self._lock:
+            expires_at = datetime.now(UTC) + timedelta(seconds=self._ttl_seconds)
+            record = _SessionRecord(
+                account=account,
+                expires_at=expires_at,
+                deadline=monotonic() + self._ttl_seconds,
+            )
             previous = self._user_tokens.get(account.id)
             if previous is not None:
                 self._sessions.pop(previous, None)
@@ -98,12 +114,11 @@ class UserSessionManager:
         if not self._token_is_valid(token):
             return None
         digest = self._digest(token)
-        now = datetime.now(UTC)
         async with self._lock:
             record = self._sessions.get(digest)
             if record is None:
                 return None
-            if record.expires_at <= now:
+            if record.deadline <= monotonic():
                 self._sessions.pop(digest, None)
                 if self._user_tokens.get(record.account.id) == digest:
                     self._user_tokens.pop(record.account.id, None)

@@ -42,16 +42,36 @@ These results establish the tested software behavior with generated streams and
 emulated camera responses on native Windows. They do not establish camera
 firmware compatibility, sustained hardware capacity or long-duration recording.
 
-## ONVIF interoperability hardening
+## Time-critical increment: qualification pending
 
-The next increment handles camera clock differences through the standard,
-read-only `GetSystemDateAndTime` operation. K5 uses the returned UTC time for
-authentication without changing either clock. An unavailable or malformed time
-response leaves most of the connection budget for normal authentication.
-The qualification requires actual authenticated cameras with positive and
-negative clock offsets, wrong-password rejection, and an installed Windows GUI
-run with a skewed camera clock. The earlier artifact linked above predates this
-increment; require the new revision's passing receipt before distributing it.
+Clock handling is a release gate. Reading camera UTC and compensating a
+WS-Security timestamp can enable login while the camera and Windows clocks
+remain wrong. It does not synchronize either clock or verify an NTP source.
+The earlier artifact linked above predates this increment; require the new
+revision's passing Windows receipt before distributing the new behavior.
+
+The increment reports the sampled camera-minus-PC difference, observation time,
+uncertainty and camera-reported time mode. Relative alignment stays distinct
+from verified absolute time. An unavailable measurement remains unavailable;
+camera-reported NTP mode is not a synchronization-health claim. A bounded clock
+re-read permits one authentication retry when a measured clock change explains
+the failure. Incorrect credentials must still fail. No camera, Windows or NTP
+configuration is written.
+
+Recording chronology also depends on Windows time. The pinned recording worker
+can move frame timestamps after a PC clock correction; successful camera login
+does not qualify the resulting history. The increment adds PC clock-step
+reporting, anchors the browser's rolling history to server UTC, and replaces
+native wall-clock age deletion with conservative K5 elapsed-time retention.
+These protections require their own tests and must not be described as an
+absolute-time or evidence-grade synchronization guarantee.
+
+The [time acceptance matrix](WINDOWS_BETA_FIELD_TEST.md#time-acceptance-matrix)
+requires camera offsets in both directions, a camera clock change during
+authentication, UTC/DST handling, forward/back PC clock steps, unavailable time
+sources, wrong-password rejection and retained-file integrity. Physical-camera
+and independent UTC accuracy results remain field gates. Windows and camera
+NTP settings are configured through their normal graphical settings.
 
 Setup also distinguishes an accepted camera account from available video.
 Saving an ONVIF profile shows that K5 is waiting for video until the worker
@@ -64,11 +84,12 @@ cameras. Keep these gates pending until the required observations exist.
 
 | Priority | Gate | Required result |
 | --- | --- | --- |
-| 1 | Physical-camera compatibility | Install through the GUI, connect representative ONVIF cameras, select their H.264 profiles, and verify advancing live video and recorded playback |
-| 2 | Ordinary recovery | Outage/reconnect, sign-out, window-to-tray behavior, restart, removal/restoration and upgrade preserve the expected access and history |
-| 3 | Measured capacity | Run the intended camera count and actual stream settings for eight hours; measure CPU, memory, recording growth and playback failures |
-| 4 | Storage retention | Exercise the installed quota and age retention using consented test media; verify retained playback and report pauses or gaps |
-| 5 | Endurance | Complete at least a 24-hour recording run with an outage and application restart; investigate drift, gaps and playback failures, extending the run when needed |
+| 1 | Time correctness and retention | Complete the time matrix, verify warnings and UTC history, preserve retained test-file hashes across clock steps, and state the independently verified time accuracy |
+| 2 | Physical-camera compatibility | Install through the GUI, connect representative ONVIF cameras, select their H.264 profiles, and verify advancing live video and recorded playback |
+| 3 | Ordinary recovery | Outage/reconnect, sign-out, window-to-tray behavior, restart, removal/restoration and upgrade preserve the expected access and history |
+| 4 | Measured capacity | Run the intended camera count and actual stream settings for eight hours; measure CPU, memory, recording growth and playback failures |
+| 5 | Storage retention | Exercise the installed quota and conservative elapsed-age retention using consented test media; verify retained playback and report pauses or gaps |
+| 6 | Endurance | Complete at least a 24-hour recording run with an outage and application restart; investigate drift, gaps and playback failures, extending the run when needed |
 
 The [field procedure](WINDOWS_BETA_FIELD_TEST.md) uses the desktop application,
 browser and ordinary Windows tools. Access to the actual station and cameras

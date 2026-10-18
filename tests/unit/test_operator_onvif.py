@@ -68,6 +68,10 @@ def camera():
         clock_body=None,
         clock_delay=0,
         clock_requests=[],
+        clock_sequence=None,
+        clock_mode=None,
+        shift_after_action=None,
+        after_action=None,
     )
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -85,11 +89,20 @@ def camera():
                 assert not _text(root, "Username") and not _text(root, "Password")
                 assert self.headers.get("Authorization") is None
                 time.sleep(settings.clock_delay)
-                when = datetime.now(UTC) + timedelta(seconds=settings.clock_offset or 0)
+                offset = settings.clock_offset
+                if settings.clock_sequence is not None:
+                    index = min(len(settings.clock_requests) - 1, len(settings.clock_sequence) - 1)
+                    offset = settings.clock_sequence[index]
+                when = datetime.now(UTC) + timedelta(seconds=offset or 0)
                 response = settings.clock_body
                 if response is None:
+                    mode = (
+                        f"<DateTimeType>{escape(settings.clock_mode)}</DateTimeType>"
+                        if settings.clock_mode is not None
+                        else ""
+                    )
                     response = _soap(
-                        "<GetSystemDateAndTimeResponse><SystemDateAndTime><UTCDateTime>"
+                        f"<GetSystemDateAndTimeResponse><SystemDateAndTime>{mode}<UTCDateTime>"
                         f"<Date><Year>{when.year}</Year><Month>{when.month}</Month>"
                         f"<Day>{when.day}</Day></Date><Time><Hour>{when.hour}</Hour>"
                         f"<Minute>{when.minute}</Minute><Second>{when.second}</Second>"
@@ -97,7 +110,7 @@ def camera():
                     )
                 status = settings.clock_status
                 if status is None:
-                    status = 200 if settings.clock_offset is not None else 404
+                    status = 200 if offset is not None else 404
                 self.send_response(status)
                 if status == 401:
                     self.send_header("WWW-Authenticate", 'Digest realm="clock", nonce="private"')
@@ -182,6 +195,10 @@ def camera():
                     )
             else:
                 raise AssertionError("Unexpected SOAP action")
+            if settings.shift_after_action and action == settings.shift_after_action[0]:
+                settings.clock_offset = settings.shift_after_action[1]
+            if settings.after_action is not None:
+                settings.after_action(action)
             self.send_response(status)
             self.send_header("Content-Length", str(len(response) if not settings.drip else 1000000))
             self.end_headers()
@@ -278,7 +295,7 @@ def test_camera_clock_compensation_does_not_admit_bad_credentials(camera):
     with pytest.raises(onvif.OnvifError) as caught:
         _probe(camera, password="wrong-fixture-only-password")
     assert caught.value.code == "auth_failed"
-    assert len(camera.clock_requests) == 1 and camera.rejected
+    assert len(camera.clock_requests) == 2 and camera.rejected
     assert len(camera.requests) == 1
 
 
@@ -338,6 +355,151 @@ def test_extreme_clock_arithmetic_falls_back_instead_of_rejecting_authentication
     client._camera_clock = datetime.max.replace(tzinfo=UTC), time.monotonic() - 2
     assert client._created_at() is None
     assert client._camera_clock is None
+
+
+@pytest.mark.parametrize("jump", [-1200, 1200])
+def test_real_camera_jump_during_auth_rereads_clock_and_retries_failed_operation(camera, jump):
+    camera.clock_offset = 0
+    camera.shift_after_action = "GetCapabilities", jump
+    (profile,) = _probe(camera)
+    assert profile.clock.status == "measured"
+    assert abs(profile.clock.offset_seconds - jump) < 3
+    assert len(camera.clock_requests) == 2
+    assert [action for _, action, _, _ in camera.requests] == [
+        "GetCapabilities",
+        "GetProfiles",
+        "GetProfiles",
+        "GetStreamUri",
+    ]
+    assert profile.clock.sync_verified is False
+
+
+def test_initially_unavailable_clock_can_recover_correct_credentials(camera):
+    camera.clock_offset = 1200
+    camera.clock_sequence = [None, 1200]
+    (profile,) = _probe(camera)
+    assert len(camera.clock_requests) == 2
+    assert [action for _, action, _, _ in camera.requests] == [
+        "GetCapabilities",
+        "GetCapabilities",
+        "GetProfiles",
+        "GetStreamUri",
+    ]
+    assert profile.clock.status == "measured"
+
+
+def test_unchanged_clock_never_retries_bad_password_and_exposes_only_safe_reading(camera):
+    camera.clock_offset = 1200
+    camera.clock_mode = "NTP"
+    with pytest.raises(onvif.OnvifError) as caught:
+        _probe(camera, password="wrong-fixture-only-password")
+    assert len(camera.clock_requests) == 2
+    assert len(camera.requests) == 1
+    assert caught.value.code == "auth_failed"
+    public = caught.value.clock.public()
+    assert public["status"] == "measured" and public["reported_mode"] == "ntp"
+    assert abs(public["offset_seconds"] - 1200) < 3
+    assert public["sync_verified"] is False
+    assert _PASSWORD not in repr(public) and "wrong-fixture-only-password" not in repr(public)
+
+
+def test_clock_reread_failure_never_retries_authentication(camera):
+    camera.clock_offset = 0
+    camera.clock_sequence = [0, None]
+    camera.shift_after_action = "GetCapabilities", 1200
+    with pytest.raises(onvif.OnvifError) as caught:
+        _probe(camera)
+    assert caught.value.clock.status == "unavailable"
+    assert caught.value.code == "auth_failed"
+    assert len(camera.clock_requests) == 2
+    assert [action for _, action, _, _ in camera.requests] == ["GetCapabilities", "GetProfiles"]
+
+
+def test_second_camera_jump_does_not_create_unbounded_auth_retries(camera):
+    camera.clock_offset = 0
+    camera.shift_after_action = "GetCapabilities", 1200
+
+    def jump_again(action):
+        if action == "GetProfiles" and len(camera.clock_requests) == 2:
+            camera.clock_offset = -1200
+
+    camera.after_action = jump_again
+    with pytest.raises(onvif.OnvifError) as caught:
+        _probe(camera)
+    assert caught.value.code == "auth_failed"
+    assert len(camera.clock_requests) == 2
+    assert [action for _, action, _, _ in camera.requests].count("GetStreamUri") == 1
+
+
+@pytest.mark.parametrize("jump", [-7200, 7200])
+def test_pc_wall_clock_jump_does_not_change_monotonic_wsse_prediction(camera, monkeypatch, jump):
+    camera.clock_offset = 0
+
+    def pc_jump(action):
+        if action == "GetCapabilities":
+            monkeypatch.setattr(
+                onvif, "_utc_now", lambda: datetime.now(UTC) + timedelta(seconds=jump)
+            )
+
+    camera.after_action = pc_jump
+    (profile,) = _probe(camera)
+    assert len(camera.clock_requests) == 1 and not camera.rejected
+    assert abs(profile.clock.offset_seconds) < 3
+    assert [action for _, action, _, _ in camera.requests] == [
+        "GetCapabilities",
+        "GetProfiles",
+        "GetStreamUri",
+    ]
+
+
+@pytest.mark.parametrize(
+    "mode,expected", [("Manual", "manual"), ("NTP", "ntp"), ("private-server.example", "unknown")]
+)
+def test_clock_report_is_frozen_finite_and_never_exposes_time_configuration(camera, mode, expected):
+    camera.clock_offset = -1200
+    camera.clock_mode = mode
+    (profile,) = _probe(camera)
+    report = profile.clock.public()
+    assert set(report) == {
+        "status",
+        "offset_seconds",
+        "measured_at",
+        "uncertainty_seconds",
+        "reported_mode",
+        "sync_verified",
+    }
+    assert report["reported_mode"] == expected
+    assert report["status"] == "measured"
+    assert -1203 < report["offset_seconds"] < -1197
+    assert report["measured_at"].endswith("Z") and 1 <= report["uncertainty_seconds"] <= 2
+    assert report["sync_verified"] is False
+    assert "private-server.example" not in str(report)
+    with pytest.raises(AttributeError):
+        profile.clock.status = "changed"
+
+
+def test_unavailable_time_report_has_no_offset_and_is_present_on_failed_probe(camera):
+    with pytest.raises(onvif.OnvifError) as caught:
+        _probe(camera, password="wrong-fixture-only-password")
+    report = caught.value.clock.public()
+    assert report["status"] == "unavailable"
+    assert report["offset_seconds"] is None and report["uncertainty_seconds"] is None
+    assert report["reported_mode"] == "unknown" and report["sync_verified"] is False
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"status": "private"},
+        {"reported_mode": "https://private"},
+        {"sync_verified": True},
+        {"status": "measured", "offset_seconds": float("nan")},
+        {"status": "measured", "offset_seconds": 0, "uncertainty_seconds": float("inf")},
+    ],
+)
+def test_clock_report_rejects_nonfinite_or_nonallowlisted_metadata(values):
+    with pytest.raises(ValueError, match="Invalid camera clock reading"):
+        onvif.OnvifClockReading(measured_at=datetime.now(UTC), **values)
 
 
 def test_real_media2_fallback_only_after_unsupported_action(camera):

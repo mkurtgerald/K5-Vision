@@ -14,11 +14,13 @@ import json
 import math
 import os
 import platform
+import re
 import secrets
 import shutil
 import socket
 import subprocess
 import time
+from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -147,6 +149,97 @@ def _onvif_clock_proof(fixture):
     return proof
 
 
+def _assert_onvif_time_health(page, fixture, clock):
+    """Check an actual ONVIF sample and its visible, deliberately limited claim."""
+    __tracebackhide__ = True
+    _require(
+        type(clock) is dict
+        and set(clock)
+        == {
+            "status",
+            "offset_seconds",
+            "measured_at",
+            "uncertainty_seconds",
+            "reported_mode",
+            "sync_verified",
+        },
+        "ONVIF time response left the bounded six-field contract",
+    )
+    offset, uncertainty, measured = (
+        clock["offset_seconds"],
+        clock["uncertainty_seconds"],
+        clock["measured_at"],
+    )
+    _require(
+        clock["status"] == "measured"
+        and type(offset) in (int, float)
+        and math.isfinite(offset)
+        and type(uncertainty) in (int, float)
+        and math.isfinite(uncertainty)
+        and 0 <= uncertainty <= 15
+        and type(measured) is str
+        and measured.endswith("Z")
+        and clock["reported_mode"] == fixture.clock_mode.lower()
+        and clock["sync_verified"] is False,
+        "ONVIF time response did not preserve the observed offset and unverified mode",
+    )
+    sampled = datetime.fromisoformat(measured.replace("Z", "+00:00"))
+    _require(
+        sampled.utcoffset().total_seconds() == 0
+        and abs((datetime.now(UTC) - sampled).total_seconds()) < 30
+        and abs(offset - fixture.clock_skew_seconds) <= uncertainty + 2,
+        "ONVIF clock sample was not a fresh measurement of the generated camera",
+    )
+    page.locator("#camera-clock-status").wait_for(state="visible")
+    displayed = page.locator("#camera-clock-status").inner_text()
+    if abs(fixture.clock_skew_seconds) > 5:
+        direction = "ahead of" if fixture.clock_skew_seconds > 0 else "behind"
+        rendered_offset = re.search(
+            r"Camera is ([0-9]+(?:\.[0-9]+)?) seconds (ahead of|behind) the recorder", displayed
+        )
+        _require(
+            rendered_offset is not None
+            and rendered_offset.group(2) == direction
+            and abs(float(rendered_offset.group(1)) - abs(offset)) <= 0.11,
+            "Camera clock offset direction was absent from the actual setup view",
+        )
+    _require(
+        "Time synchronization is not verified" in displayed
+        and (fixture.clock_mode != "NTP" or "Camera reports NTP mode" in displayed),
+        "Camera setup presented an unverified NTP report as synchronization proof",
+    )
+
+
+def _assert_recorder_time_health(page, client):
+    """Compare the visible recorder UTC with its real server response, not browser Date."""
+    __tracebackhide__ = True
+    diagnostics = client.json("/api/v1/operator/status")
+    clock, server_utc = diagnostics.get("clock"), diagnostics.get("server_utc")
+    _require(
+        type(server_utc) is str
+        and server_utc.endswith("Z")
+        and type(clock) is dict
+        and clock.get("status") == "observing"
+        and clock.get("sync_verified") is False,
+        "Recorder status did not expose observed UTC without a synchronization claim",
+    )
+    server = datetime.fromisoformat(server_utc.replace("Z", "+00:00"))
+    page.wait_for_function("""() => {
+      const value = document.getElementById('recorder-time-status').textContent;
+      return value.startsWith('Recorder time: ') && value.includes(' UTC') &&
+        value.includes('Time synchronization is not verified');
+    }""")
+    displayed = page.locator("#recorder-time-status").inner_text()
+    timestamp = displayed.removeprefix("Recorder time: ").split(" UTC", 1)[0]
+    parsed = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    _require(
+        abs((parsed - server).total_seconds()) < 15
+        and page.locator("#recorder-time-warning").is_hidden(),
+        "Recorder display followed client time or showed an unobserved host-clock change",
+    )
+    return diagnostics
+
+
 def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=False):
     """Use actual credential/profile controls without entering a stream address."""
     __tracebackhide__ = True
@@ -209,7 +302,7 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
         _require(profiles.value.status == 200, "Actual ONVIF credential/profile request failed")
         profile_payload = profiles.value.json()
         _require(
-            set(profile_payload) == {"probe_id", "expires_in_seconds", "profiles"},
+            set(profile_payload) == {"probe_id", "expires_in_seconds", "profiles", "clock"},
             "Profile response left the bounded public contract",
         )
         _require(
@@ -226,6 +319,7 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
         ]
         _require(bool(selected), "Generated H264 camera profile was not offered")
         page.locator("#camera-profile").select_option(selected[0]["id"])
+        _assert_onvif_time_health(page, fixture, profile_payload["clock"])
         _require(
             page.locator("#add-camera-message").inner_text()
             == (
@@ -379,6 +473,8 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
                     "worker_status": "ready",
                     "max_recording_bytes": 20 * 1024**3,
                     "storage": None,
+                    "server_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "clock": {"status": "observing", "sync_verified": False},
                 }
             elif path == "/api/v1/operator/camera-profiles":
                 payload = route.request.post_data_json
@@ -387,6 +483,14 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
                 data = {
                     "probe_id": probe_id,
                     "expires_in_seconds": 120,
+                    "clock": {
+                        "status": "unavailable",
+                        "offset_seconds": None,
+                        "measured_at": None,
+                        "uncertainty_seconds": None,
+                        "reported_mode": "unknown",
+                        "sync_verified": False,
+                    },
                     "profiles": [
                         {
                             "id": "generated-h264-profile",
@@ -614,6 +718,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         "analytics_acceptance": False,
         "long_duration_acceptance": False,
         "hardware_capacity_acceptance": False,
+        "host_clock_step_acceptance": False,
         "camera_count": 2,
         "width": 320,
         "height": 240,
@@ -676,6 +781,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                     host=host,
                     stream_uri=source,
                     clock_skew_seconds=1200 if camera_index == 0 else -1200,
+                    clock_mode="NTP",
                 )
             )
         for video, source in zip(videos, sources, strict=True):
@@ -729,6 +835,18 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         anonymous = browser.new_context()
         page = context.new_page()
         page.set_default_timeout(10_000)
+        # Shift only this browser's Date API. OS UTC, media workers and the actual
+        # HTTP server retain their real clocks; performance.now remains monotonic.
+        page.add_init_script("""(() => {
+          const NativeDate = Date;
+          class SkewedDate extends NativeDate {
+            constructor(...args) {
+              super(...(args.length ? args : [NativeDate.now() + 172800000]));
+            }
+            static now() { return NativeDate.now() + 172800000; }
+          }
+          window.Date = SkewedDate;
+        })();""")
 
         def script_failed(error):
             if len(script_errors) < 32:
@@ -752,6 +870,12 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         page.on("requestfailed", request_failed)
         stage = "sign_in_page"
         page.goto(client.origin + "/operator/", wait_until="domcontentloaded")
+        browser_skew = page.evaluate("Date.now() - (performance.timeOrigin + performance.now())")
+        _require(
+            type(browser_skew) in (int, float) and abs(browser_skew - 172800000) < 2000,
+            "Qualification did not apply the browser-only two-day Date offset",
+        )
+        receipt["browser_date_skew_seconds"] = 172800
         browser_capabilities = page.evaluate("""() => ({
             abort_signal_any: typeof AbortSignal.any === 'function',
             abort_signal_timeout: typeof AbortSignal.timeout === 'function',
@@ -779,13 +903,22 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         diagnostics = client.json("/api/v1/operator/status")
         _require(
             set(diagnostics)
-            == {"worker_status", "max_recording_bytes", "storage", "analytics_status"}
+            == {
+                "worker_status",
+                "max_recording_bytes",
+                "storage",
+                "analytics_status",
+                "server_utc",
+                "clock",
+            }
             and diagnostics["worker_status"] == "ready"
             and diagnostics["analytics_status"] == "disabled"
             and diagnostics["max_recording_bytes"] == 20 * 1024**3
             and diagnostics["storage"]["recording_allowed"] is True,
             "Operator service and storage status was incomplete",
         )
+        _assert_recorder_time_health(page, client)
+        receipt["recorder_time_health_displayed"] = True
         page.locator("#connection-help-button").click()
         page.locator("#connection-help-dialog").wait_for(state="visible")
         _require(
@@ -814,6 +947,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         receipt["onvif_credential_profile_enrollment"] = True
         receipt["onvif_wrong_password_rejected"] = True
         receipt["no_manual_stream_uri"] = True
+        receipt["onvif_time_health_displayed"] = True
         receipt["generated_camera_discovered"] = False
         clock_proofs = [_onvif_clock_proof(camera) for camera in onvif_cameras]
         _require(
@@ -890,6 +1024,19 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             if index == 0:
                 page.locator("#history-tab").click()
             page.locator(".history-item").first.wait_for(state="visible", timeout=15_000)
+            actual_time = client.json("/api/v1/operator/status")["server_utc"]
+            server_now = datetime.fromisoformat(actual_time.replace("Z", "+00:00"))
+            displayed_end = datetime.fromisoformat(
+                page.locator("#history-end").input_value()
+            ).replace(tzinfo=UTC)
+            displayed_start = datetime.fromisoformat(
+                page.locator("#history-start").input_value()
+            ).replace(tzinfo=UTC)
+            _require(
+                abs((displayed_end - server_now).total_seconds()) < 15
+                and (displayed_end - displayed_start).total_seconds() == 86400,
+                "Rolling history followed skewed browser Date instead of real recorder UTC",
+            )
             page.locator(".history-item").first.click()
             page.locator("#play-recording").click()
             stage = "playback_decode"
@@ -912,6 +1059,14 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         receipt["playback_decoded_frames"] = playback_frames
         receipt["recording_pixel_isolation"] = True
         receipt["ui_history_and_gaps"] = True
+        receipt["server_utc_rolling_history"] = True
+        _require(
+            page.locator("#workspace").is_visible()
+            and page.locator("#sign-in").is_hidden()
+            and client.get("/api/v1/operator/cameras")[0] == 200,
+            "Skewed browser Date incorrectly expired the still-valid human session",
+        )
+        receipt["browser_clock_skew_session_preserved"] = True
         receipt["script_visible_credentials_absent"] = True
         recording_root = identity.directory / "recordings"
         saved_files = sorted(recording_root.rglob("*.mp4"))

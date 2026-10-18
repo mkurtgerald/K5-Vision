@@ -44,6 +44,35 @@ retry.
 If you used the earlier operator candidate, K5 Vision uses its existing account,
 cameras and recordings. It does not replace or reset an existing account profile.
 
+## Camera and recording time
+
+The time-critical increment is pending qualification on its exact Windows build.
+Its connection test reports the camera's time difference from this PC, when it
+can read the camera's UTC time. A positive difference means the camera is ahead;
+a negative difference means it is behind. The report includes an uncertainty
+allowance for the camera's whole-second clock and network round trip. An
+unavailable reading stays unavailable.
+
+This is relative clock alignment. A small difference does not prove that either
+clock has the correct UTC time. A camera reporting NTP mode only reports its
+configuration; K5 does not verify its time server or declare NTP synchronization.
+K5 uses the measured camera time for the camera account check and can re-read it
+once if authentication fails after a clock change. An incorrect password still
+fails. K5 does not set either clock or change NTP settings.
+
+Configure automatic time through **Windows Settings → Time & language → Date &
+time** and the camera's own date/time or NTP settings. Use the site's approved
+time source. If absolute recording time matters, verify Windows against that
+source independently; an accepted camera account is not proof of accurate
+recording timestamps or a correct camera overlay clock.
+
+History uses UTC. The new increment anchors its rolling history window to the
+recorder's reported UTC and reports a detected PC clock step. Investigate that
+warning even when video continues. The recording worker's timestamps can move
+when Windows time changes; do not infer continuous or accurate chronology from
+successful playback alone. Required clock, history and retention checks are in
+the [field time matrix](WINDOWS_BETA_FIELD_TEST.md#time-acceptance-matrix).
+
 ## Keep recording while the window is closed
 
 Closing the browser or the K5 Vision window keeps the recorder running. K5 Vision
@@ -77,7 +106,10 @@ new ONVIF flow passed; use the qualified build's exact commit and receipt.
 The clock-skew gate uses a generated camera whose clock differs from Windows and
 requires successful authenticated enrollment and decoded video from the installed
 application. It exercises the read-only clock lookup and rejects a wrong camera
-password.
+password. That gate alone does not establish actual clock synchronization, NTP
+availability, absolute UTC accuracy, DST behavior or recording retention across
+a PC clock correction. The time-critical increment requires its own new passing
+Windows receipt; earlier candidate evidence does not qualify it.
 
 The recording candidate includes the reviewed ONVIF connector; separately
 provisioned person detection remains outside the bundled desktop runtime.

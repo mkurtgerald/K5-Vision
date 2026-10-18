@@ -18,11 +18,12 @@ _TRUE = (
     "second_click_reopens_single_instance graceful_owned_process_cleanup "
     "restart_preserves_account_camera_history uninstall_preserves_profile_and_media "
     "no_console_windows owned_cleanup onvif_credential_profile_enrollment no_manual_stream_uri "
-    "onvif_wrong_password_rejected onvif_clock_skew_compensated"
+    "onvif_wrong_password_rejected onvif_clock_skew_compensated "
+    "onvif_time_health_displayed recorder_time_health_displayed"
 ).split()
 _FALSE = (
     "physical_camera_acceptance capacity_acceptance endurance_acceptance windows_service "
-    "mocked_gui user_terminal_required"
+    "mocked_gui user_terminal_required host_clock_step_acceptance"
 ).split()
 
 

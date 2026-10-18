@@ -476,6 +476,11 @@ def _failure_detail(error):
         ("Actual ONVIF credential/profile request failed", "onvif_profiles_failed"),
         ("Profile-based camera connection failed", "onvif_connect_failed"),
         ("Actual authenticated ONVIF SOAP flow was incomplete", "onvif_protocol_incomplete"),
+        ("ONVIF time response", "onvif_clock_contract"),
+        ("Camera clock offset direction was absent", "onvif_clock_display"),
+        ("Camera setup presented an unverified NTP report", "onvif_sync_claim"),
+        ("Recorder status did not expose observed UTC", "recorder_clock_contract"),
+        ("Recorder display followed client time", "recorder_clock_display"),
         ("Actual ONVIF camera clock compensation was not proven", "onvif_clock_unproven"),
         ("ONVIF profile acceptance claimed unverified video readiness", "onvif_false_video_ready"),
         ("Manual stream field remained", "manual_stream_field"),
@@ -693,6 +698,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         "capacity_acceptance": False,
         "endurance_acceptance": False,
         "windows_service": False,
+        "host_clock_step_acceptance": False,
         "mocked_gui": False,
         "user_terminal_required": False,
         "browser_channel": "msedge",
@@ -759,7 +765,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         stage = "generated_camera_fixture"
         processes, source_uri = _generate_fixture(parent, media, ffmpeg, upstream_port, helpers)
         onvif_camera = _helpers("onvif_camera_fixture").OnvifCameraFixture(
-            host="127.0.0.1", stream_uri=source_uri, clock_skew_seconds=1200
+            host="127.0.0.1", stream_uri=source_uri, clock_skew_seconds=1200, clock_mode="NTP"
         )
         stage = "actual_browser_enrollment"
         playwright = browser_api.sync_playwright().start()
@@ -788,6 +794,8 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         # second login that would revoke the active browser.
         client.token = browser_token
         page.locator("#workspace").wait_for(state="visible")
+        browser_helpers._assert_recorder_time_health(page, client)
+        receipt["recorder_time_health_displayed"] = True
         enrolled, discovery_completed = browser_helpers._onvif_enroll(
             page,
             name="Generated desktop camera",
@@ -799,6 +807,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["onvif_credential_profile_enrollment"] = True
         receipt["onvif_wrong_password_rejected"] = True
         receipt["no_manual_stream_uri"] = True
+        receipt["onvif_time_health_displayed"] = True
         receipt["bounded_discovery_executed"] = discovery_completed
         receipt["generated_camera_discovered"] = False
         receipt.update(browser_helpers._onvif_clock_proof(onvif_camera))

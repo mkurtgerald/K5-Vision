@@ -32,7 +32,14 @@ class OnvifCameraFixture:
     """Own bounded actual HTTP requests and never retain SOAP/credential payloads."""
 
     def __init__(
-        self, *, host: str, stream_uri: str, width=320, height=240, clock_skew_seconds=0
+        self,
+        *,
+        host: str,
+        stream_uri: str,
+        width=320,
+        height=240,
+        clock_skew_seconds=0,
+        clock_mode="Manual",
     ) -> None:
         source = urlsplit(stream_uri)
         if host not in {"127.0.0.1", "127.0.0.2"} or (
@@ -47,9 +54,12 @@ class OnvifCameraFixture:
             raise ValueError("Generated ONVIF fixture geometry was refused")
         if type(clock_skew_seconds) is not int or abs(clock_skew_seconds) > 86400:
             raise ValueError("Generated ONVIF fixture clock skew was refused")
+        if clock_mode not in {"Manual", "NTP"}:
+            raise ValueError("Generated ONVIF fixture clock mode was refused")
         self.host = host
         self.width, self.height = width, height
         self.clock_skew_seconds = clock_skew_seconds
+        self.clock_mode = clock_mode
         self.username = "generated-camera-user"
         self.password = secrets.token_urlsafe(24)
         self._stream_uri = stream_uri
@@ -190,7 +200,8 @@ class OnvifCameraFixture:
         now = datetime.now(UTC) + timedelta(seconds=self.clock_skew_seconds)
         return (
             "<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime>"
-            "<tt:DateTimeType>Manual</tt:DateTimeType><tt:DaylightSavings>false</tt:DaylightSavings>"
+            f"<tt:DateTimeType>{self.clock_mode}</tt:DateTimeType>"
+            "<tt:DaylightSavings>false</tt:DaylightSavings>"
             "<tt:UTCDateTime><tt:Time>"
             f"<tt:Hour>{now.hour}</tt:Hour><tt:Minute>{now.minute}</tt:Minute>"
             f"<tt:Second>{now.second}</tt:Second></tt:Time><tt:Date>"

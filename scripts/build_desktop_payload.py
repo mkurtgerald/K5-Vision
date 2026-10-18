@@ -349,7 +349,7 @@ def build(args: argparse.Namespace) -> None:
             "-c",
             "import fastapi,pydantic,psutil,uvicorn; import k5vision.desktop_setup; "
             "import k5vision.operator_product; import k5vision.operator_product_api; "
-            "import k5vision.operator_onvif; "
+            "import k5vision.operator_onvif; import k5vision.operator_time; "
             "import importlib.util; "
             "assert importlib.util.find_spec('onvif') is None; "
             "assert importlib.util.find_spec('zeep') is None; "

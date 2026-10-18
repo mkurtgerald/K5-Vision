@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import platform
@@ -340,6 +341,8 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
         "analytics_acceptance": False,
         "browser_acceptance": False,
         "time_zone_restart_regression": False,
+        "past_dated_segment_preserved": False,
+        "retained_file_hashes_preserved": False,
     }
     try:
         _private_write(
@@ -384,7 +387,7 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
                 rtsp_port=rtsp_port,
                 hls_port=hls_port,
                 segment_seconds=3,
-                retention_seconds=3600,
+                retention_seconds=0,
             ),
         )
         for listener in reservations:
@@ -500,6 +503,27 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
             receipt["recording_segments"] = len(recordings)
             receipt["playback_spans"] = len(spans)
 
+            # Reproduce footage named while the PC clock was far in the past,
+            # without changing any OS clock. Native wall-age cleanup used to
+            # remove this valid segment immediately when the worker restarted.
+            historical = files[0].with_name("2001-01-01_00-00-00-000000_+0000.mp4")
+            assert files[0].stat().st_size <= _MAX_PLAYBACK_BYTES
+            historical.write_bytes(files[0].read_bytes())
+            if os.name == "posix":
+                historical.chmod(0o600)
+            expected_recordings = await provider.recordings(binding)
+            expected_spans = await provider.playback_spans(binding)
+            assert len(expected_recordings) == len(recordings) + 1
+            assert expected_spans == spans  # Default playback is the recent 24 hours.
+            historical_start = expected_recordings[0].started_at
+            assert historical_start.year == 2001
+            historical_spans = await provider.playback_spans(
+                binding, start=historical_start, end=historical_start + timedelta(minutes=1)
+            )
+            assert len(historical_spans) == 1
+            files = sorted(recording_directory.rglob("*.mp4"))
+            hashes = {path: hashlib.sha256(path.read_bytes()).digest() for path in files}
+
             # Source has ended before termination, including on Windows where
             # Popen.terminate uses TerminateProcess rather than a Unix signal.
             _stop_owned(target)
@@ -513,11 +537,20 @@ def test_native_mediamtx_records_reconnects_and_restores_playback(
                 provider.info, label="Restart version admission", processes=(upstream, target)
             )
             assert restarted_info.started_at > initial_info.started_at
-            assert await provider.recordings(binding) == recordings
-            assert await provider.playback_spans(binding) == spans
+            assert await provider.recordings(binding) == expected_recordings
+            assert await provider.playback_spans(binding) == expected_spans
+            assert (
+                await provider.playback_spans(
+                    binding, start=historical_start, end=historical_start + timedelta(minutes=1)
+                )
+                == historical_spans
+            )
             assert sorted(recording_directory.rglob("*.mp4")) == files
+            assert all(hashlib.sha256(path.read_bytes()).digest() == hashes[path] for path in files)
             receipt["restart_inventory_preserved"] = True
             receipt["time_zone_restart_regression"] = sys.platform == "linux"
+            receipt["past_dated_segment_preserved"] = True
+            receipt["retained_file_hashes_preserved"] = True
             decoded = []
             print("Native donor phase: authenticated playback download and decode", flush=True)
             for index, span in enumerate(spans):
