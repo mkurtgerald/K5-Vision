@@ -7,21 +7,31 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const DAY = 86400000;
+  const TIME_SAMPLE_MAX_AGE = 30000;
   const RETRY_DELAYS = [1000, 2000, 4000, 8000, 10000];
+  const CAMERA_ERROR_CODES = new Set([
+    "discovery_unavailable", "camera_auth_failed", "camera_unreachable",
+    "camera_unsupported", "camera_invalid_response", "camera_busy",
+    "camera_probe_expired", "camera_profile_unsupported",
+  ]);
   const state = {
     token: "", account: null, cameras: [], workerStatus: "ready", selected: null, media: null,
     view: "live", sessionEpoch: 0, selectionEpoch: 0, requests: new Set(),
     hls: null, nativeLive: false, hlsScript: null, retryTimer: null, retryCount: 0,
+    mediaAuthRefreshUsed: false,
     pollTimer: null, expiryTimer: null, selectionController: null,
     spans: [], selectedSpan: null, historyEpoch: 0, historyRolling: true, signingOut: false,
     dialogMode: "add", cameraSetupEpoch: 0, diagnostics: null, statusUnavailable: false,
+    cameraSetupBusy: false, cameraSetupController: null, cameraProbe: null, cameraProbeTimer: null,
+    cameraConnectionNotice: null,
+    recorderTime: null, sessionExpiresAt: null, sessionExpirySteady: null,
     removeTarget: null, removing: false,
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
     personFrameId: 0,
   };
 
   class ApiError extends Error {
-    constructor(status) { super("Request unavailable"); this.status = status; }
+    constructor(status, code = "", clock = null) { super("Request unavailable"); this.status = status; this.code = code; this.clock = clock; }
   }
   class SelectionError extends Error {}
 
@@ -31,9 +41,40 @@
     element.classList.toggle("error", error);
   }
 
-  function notice(value, error = false) {
+  function notice(value, error = false, owner = "") {
+    if (owner !== "camera_connection") state.cameraConnectionNotice = null;
     message("workspace-message", value, error);
     $("workspace-message").hidden = !value;
+  }
+
+  function cameraConnectionStatus(camera, workerStatus) {
+    if (workerStatus === "unavailable" || camera?.status === "unavailable") return {
+      text: "Camera saved. The media service is unavailable. Live video and recording are not confirmed.",
+      error: true,
+    };
+    if (camera?.status === "live") {
+      if (workerStatus === "disk_full") return {
+        text: "Camera stream is reaching K5. Recording is paused because storage needs attention.",
+        error: true,
+      };
+      return camera.recording === true
+        ? { text: "Camera stream is reaching K5. Recording is enabled.", error: false }
+        : { text: "Camera stream is reaching K5. Recording is not active.", error: true };
+    }
+    if (camera?.status === "disconnected") return {
+      text: "Camera saved, but its video stream is disconnected. Check its power, network and video permissions, then use Reconnect camera.",
+      error: true,
+    };
+    return {
+      text: "Camera saved. Waiting for its video stream. Live video and recording are not confirmed yet.",
+      error: false,
+    };
+  }
+
+  function renderCameraConnectionNotice(camera) {
+    if (!camera || state.cameraConnectionNotice !== camera.device_id) return;
+    const result = cameraConnectionStatus(camera, state.workerStatus);
+    notice(result.text, result.error, "camera_connection");
   }
 
   function apiMessage(error, fallback) {
@@ -63,10 +104,21 @@
         ...(options.rawBody !== undefined ? { body: options.rawBody } : {}),
       });
       if (!response.ok) {
-        if (response.status === 401 && token && path !== "/api/v1/auth/login" && !state.signingOut) {
+        if (response.status === 401 && token && token === state.token && path !== "/api/v1/auth/login" && !state.signingOut) {
           expireSession();
         }
-        throw new ApiError(response.status);
+        let code = "", clock = null;
+        if (path.startsWith("/api/v1/operator/camera")) {
+          try {
+            const detail = (await response.json()).detail;
+            const candidate = typeof detail === "string" ? detail : detail?.code;
+            if (CAMERA_ERROR_CODES.has(candidate)) {
+              code = candidate;
+              clock = cameraClockReport(detail?.clock);
+            }
+          } catch (_) { /* Unknown response text never becomes a user-facing error. */ }
+        }
+        throw new ApiError(response.status, code, clock);
       }
       if (response.status === 204) return null;
       return await response.json();
@@ -138,20 +190,21 @@
     state.workerStatus = "ready";
     state.diagnostics = null;
     state.statusUnavailable = false;
+    state.cameraConnectionNotice = null;
+    state.recorderTime = null;
+    state.sessionExpiresAt = null;
+    state.sessionExpirySteady = null;
     state.removeTarget = null;
     state.removing = false;
     state.selected = null;
     state.media = null;
+    state.mediaAuthRefreshUsed = false;
     state.spans = [];
     state.selectedSpan = null;
     $("workspace").hidden = true;
     $("sign-in").hidden = false;
     $("password").value = "";
-    $("add-camera-form").reset();
-    $("new-camera-name").readOnly = false;
-    $("new-camera-host").readOnly = false;
-    state.dialogMode = "add";
-    state.cameraSetupEpoch += 1;
+    resetCameraSetup();
     if ($("add-camera-dialog").open) $("add-camera-dialog").close();
     for (const id of ["remove-camera-dialog", "connection-help-dialog"]) {
       if ($(id).open) $(id).close();
@@ -165,6 +218,8 @@
     message("sign-in-message", reason, Boolean(reason));
     notice("");
     $("worker-message").hidden = true;
+    $("recorder-time-warning").hidden = true;
+    $("recorder-time-status").textContent = "Checking recorder time…";
   }
 
   function clearMediaCookie(token) {
@@ -185,6 +240,7 @@
   async function signOut() {
     if (state.signingOut) return;
     state.signingOut = true;
+    closeAddCamera();
     const token = state.token;
     state.sessionEpoch += 1;
     state.selectionEpoch += 1;
@@ -258,7 +314,7 @@
     $("update-source-button").hidden = !camera || state.account?.role !== "administrator";
     $("remove-camera-button").hidden = !camera || state.account?.role !== "administrator";
     $("person-view-panel").hidden = !camera || camera.analytics_status !== "configured";
-    $("recording-badge").textContent = state.workerStatus === "disk_full" ? "Recording paused" : "Recording";
+    $("recording-badge").textContent = state.workerStatus === "disk_full" ? "Recording paused" : "Recording enabled";
     $("recording-badge").classList.toggle("paused", state.workerStatus === "disk_full");
     if (camera) {
       const status = statusDetails(camera);
@@ -271,9 +327,10 @@
         stopPersonView("Sampled view stopped while the camera is unavailable. Start it again after live video returns.");
       }
       if (status.style === "offline" && state.view === "live" && state.media) {
-        livePlaceholder("Camera disconnected", "Check the camera’s power, network and RTSP address. Use Connection help for setup steps. Recording history is still available.", true);
+        livePlaceholder("Camera disconnected", "Check the camera’s power and network, or use Reconnect camera to test its account and video stream. Recording history is still available.", true);
         message("live-state", "Camera disconnected");
       }
+      renderCameraConnectionNotice(camera);
     } else $("analytics-state").textContent = "";
     renderPersonControls();
   }
@@ -318,6 +375,20 @@
         : used && free && limit ? `${used} recorded · ${limit} recording limit · ${free} disk free`
           : limit ? `Recording limit ${limit} · Waiting for storage status`
             : "Checking recording storage…";
+    const clock = diagnostics?.clock;
+    const recorderUtc = recorderNow();
+    $("recorder-time-status").textContent = recorderUtc === null
+      ? "Recorder time could not be checked. Time synchronization is not verified."
+      : `Recorder time: ${utcLabel(recorderUtc)} UTC · Time synchronization is not verified`;
+    const changed = clock?.status === "changed";
+    const unavailable = recorderUtc === null || clock?.status === "unavailable";
+    const step = typeof clock?.last_step_seconds === "number" && Number.isFinite(clock.last_step_seconds)
+      ? Math.abs(clock.last_step_seconds).toFixed(1) : null;
+    const direction = clock?.last_step_seconds < 0 ? "backward" : "forward";
+    $("recorder-time-warning").textContent = changed
+      ? `The recorder clock changed${step ? ` by ${step} seconds (${direction})` : ""}. Check Windows Settings → Time & language → Date & time and the camera's NTP settings, then retest the camera connection. Earlier footage may use the previous clock. Age retention uses observed elapsed time to protect footage from clock corrections.`
+      : unavailable ? "Recorder time is unavailable. Check Windows time synchronization before relying on recording timestamps." : "";
+    $("recorder-time-warning").hidden = !changed && !unavailable;
     $("connection-help-status").textContent = state.workerStatus === "disk_full"
       ? diagnostics?.storage?.reason === "inspection"
         ? "Recording is paused because storage could not be checked safely. Check the K5 startup message for the recording-storage problem. Live view and retained history remain available."
@@ -335,12 +406,16 @@
       if (epoch !== state.sessionEpoch) return;
       if (!diagnostics || !["ready", "unavailable", "disk_full"].includes(diagnostics.worker_status)) throw new ApiError(503);
       state.diagnostics = diagnostics;
+      const serverUtc = utcMilliseconds(diagnostics.server_utc);
+      state.recorderTime = Number.isFinite(serverUtc) ? { utc: serverUtc, steady: performance.now() } : null;
       state.statusUnavailable = false;
+      scheduleSessionExpiry();
       state.workerStatus = diagnostics.worker_status;
       renderWorkerStatus(); renderCameraHeading(); renderDiagnostics();
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
       state.statusUnavailable = true;
+      state.recorderTime = null;
       renderDiagnostics();
     }
   }
@@ -350,6 +425,8 @@
     state.selectionController?.abort();
     stopLive(); stopPlayback();
     state.selected = null; state.media = null;
+    state.cameraConnectionNotice = null;
+    notice("");
     resetHistory(); renderCameras();
     livePlaceholder(title, description);
     message("live-state", "No camera selected");
@@ -402,8 +479,13 @@
     state.historyEpoch += 1;
     state.selected = deviceId;
     state.media = null;
+    state.mediaAuthRefreshUsed = false;
     stopLive(); stopPlayback(); resetHistory();
-    renderCameras(); notice("");
+    if (state.cameraConnectionNotice !== deviceId) {
+      state.cameraConnectionNotice = null;
+      notice("");
+    }
+    renderCameras();
     livePlaceholder("Connecting to camera", "Opening your live view…");
     message("live-state", "Connecting…");
     try {
@@ -454,6 +536,38 @@
     livePlaceholder("Reconnecting", reason);
     message("live-state", `Reconnecting · Attempt ${state.retryCount} of ${RETRY_DELAYS.length}`);
     state.retryTimer = setTimeout(() => void startLive(epoch), delay);
+  }
+
+  async function recoverMediaAccess(epoch) {
+    const session = state.sessionEpoch, token = state.token, deviceId = state.selected;
+    if (!token || !deviceId || epoch !== state.selectionEpoch || state.view !== "live" || state.signingOut) return;
+    const current = () => session === state.sessionEpoch && token === state.token
+      && epoch === state.selectionEpoch && deviceId === state.selected
+      && state.view === "live" && !state.signingOut;
+    stopLive(false);
+    if (state.mediaAuthRefreshUsed) {
+      livePlaceholder("Media access unavailable", "Media access could not be restored. Select reconnect to try again.", true);
+      message("live-state", "Live view unavailable · Select reconnect to try again");
+      return;
+    }
+    state.mediaAuthRefreshUsed = true;
+    livePlaceholder("Restoring media access", "Checking your existing camera access…");
+    message("live-state", "Restoring media access…");
+    try {
+      const media = await request(`/api/v1/operator/cameras/${encodeURIComponent(deviceId)}/media-session`, {
+        method: "POST", signal: state.selectionController?.signal,
+      });
+      if (!current()) return;
+      state.media = {
+        live_url: safeMediaUrl(media.live_url, "/media/live/"),
+        playback_url: safeMediaUrl(media.playback_url, "/media/playback"),
+      };
+      await startLive(epoch);
+    } catch (error) {
+      if (error.name === "AbortError" || !current()) return;
+      livePlaceholder("Media access unavailable", apiMessage(error, "Media access could not be restored. Select reconnect to try again."), true);
+      message("live-state", "Live view unavailable · Select reconnect to try again");
+    }
   }
 
   function canSamplePerson() {
@@ -580,7 +694,7 @@
         state.hls = hls;
         hls.on(window.Hls.Events.ERROR, (_event, data) => {
           if (!data.fatal || hls !== state.hls || epoch !== state.selectionEpoch) return;
-          if (data.response?.code === 401 || data.response?.code === 403) { expireSession(); return; }
+          if (data.response?.code === 401 || data.response?.code === 403) { void recoverMediaAccess(epoch); return; }
           if (data.details === "manifestIncompatibleCodecsError") {
             stopLive();
             livePlaceholder("Video format unavailable", "Select an H.264 stream in your camera settings, then reconnect.", true);
@@ -632,6 +746,10 @@
 
   function utcInput(date, seconds = false) { return date.toISOString().slice(0, seconds ? 23 : 16); }
   function parseUtc(value) { return new Date(`${value.length === 16 ? value + ":00" : value}Z`); }
+  function utcMilliseconds(value) {
+    return typeof value === "string" && value.length <= 32 &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/.test(value) ? Date.parse(value) : NaN;
+  }
   function spanStartMilliseconds(value) {
     const milliseconds = Date.parse(value);
     const fraction = typeof value === "string" ? value.match(/\.([0-9]+)(?:Z|[+-]\d{2}:\d{2})$/)?.[1] : null;
@@ -652,12 +770,34 @@
   }
 
   function setLastDay() {
-    const end = new Date(); end.setUTCMilliseconds(0);
+    const current = recorderNow();
+    if (current === null) return false;
+    const end = new Date(current); end.setUTCMilliseconds(0);
     $("history-start").value = utcInput(new Date(end.getTime() - DAY), true);
     $("history-end").value = utcInput(end, true);
     $("history-day").value = "";
-    $("history-day").max = new Date().toISOString().slice(0, 10);
+    $("history-day").max = end.toISOString().slice(0, 10);
     state.historyRolling = true;
+    return true;
+  }
+
+  function recorderNow() {
+    const sample = state.recorderTime;
+    if (!sample || state.statusUnavailable) return null;
+    const elapsed = performance.now() - sample.steady;
+    return Number.isFinite(elapsed) && elapsed >= 0 && elapsed <= TIME_SAMPLE_MAX_AGE ? sample.utc + elapsed : null;
+  }
+
+  function scheduleSessionExpiry() {
+    clearTimeout(state.expiryTimer);
+    state.expiryTimer = null;
+    const current = recorderNow();
+    if (state.sessionExpirySteady === null && current !== null && Number.isFinite(state.sessionExpiresAt)) {
+      state.sessionExpirySteady = performance.now() + Math.max(0, Math.min(state.sessionExpiresAt - current, DAY));
+    }
+    if (Number.isFinite(state.sessionExpirySteady)) {
+      state.expiryTimer = setTimeout(expireSession, Math.max(0, Math.min(state.sessionExpirySteady - performance.now(), DAY)));
+    }
   }
 
   function resetHistory() {
@@ -682,7 +822,16 @@
 
   async function loadHistory() {
     if (!state.selected || !state.token) { message("history-message", "Select a camera to view its history."); return; }
-    if (state.historyRolling) setLastDay();
+    if (state.historyRolling) {
+      const before = state.selected, session = state.sessionEpoch;
+      await refreshDiagnostics();
+      if (before !== state.selected || session !== state.sessionEpoch || !state.token) return;
+      if (!state.historyRolling) return;
+      if (!setLastDay()) {
+        message("history-message", "Recorder time is unavailable. Refresh service status or choose an explicit UTC interval.", true);
+        return;
+      }
+    }
     const start = parseUtc($("history-start").value);
     const end = parseUtc($("history-end").value);
     if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end <= start || end - start > DAY) {
@@ -828,10 +977,13 @@
       $("add-camera-button").hidden = account.role !== "administrator";
       $("sign-in").hidden = true;
       $("workspace").hidden = false;
-      const expires = Date.parse(result.expires_at);
-      if (Number.isFinite(expires)) state.expiryTimer = setTimeout(expireSession, Math.max(0, Math.min(expires - Date.now(), DAY)));
-      setLastDay(); resetHistory();
+      state.sessionExpiresAt = Date.parse(result.expires_at);
+      state.sessionExpirySteady = Number.isInteger(result.expires_in_seconds) && result.expires_in_seconds > 0 && result.expires_in_seconds <= 86400
+        ? performance.now() + result.expires_in_seconds * 1000 : null;
+      scheduleSessionExpiry();
       await Promise.all([refreshCameras(true), refreshDiagnostics()]);
+      if (epoch !== state.sessionEpoch) return;
+      setLastDay(); resetHistory();
       scheduleCameraPoll();
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
@@ -884,7 +1036,7 @@
   $("history-form").addEventListener("submit", (event) => { event.preventDefault(); void loadHistory(); });
   $("history-start").addEventListener("input", () => { state.historyRolling = false; });
   $("history-end").addEventListener("input", () => { state.historyRolling = false; });
-  $("last-24-hours").addEventListener("click", () => { setLastDay(); void loadHistory(); });
+  $("last-24-hours").addEventListener("click", () => { state.historyRolling = true; void loadHistory(); });
   $("history-day").addEventListener("change", () => {
     const date = new Date(`${$("history-day").value}T00:00:00Z`);
     if (!Number.isFinite(date.getTime())) return;
@@ -899,75 +1051,340 @@
   $("playback-video").addEventListener("playing", () => message("playback-message", "Recorded video · Select a new start time to seek to another point."));
   $("playback-video").addEventListener("error", () => { if (state.token && state.selectedSpan) message("playback-message", "Playback is unavailable. Refresh history or select another interval.", true); });
 
-  function closeAddCamera() { $("new-camera-source").value = ""; $("add-camera-dialog").close(); }
+  function canManageCameras() {
+    return state.account?.role === "administrator" && Boolean(state.token) && !state.signingOut;
+  }
+
+  function clearCameraProbe() {
+    clearTimeout(state.cameraProbeTimer);
+    state.cameraProbeTimer = null;
+    state.cameraProbe = null;
+    $("camera-profile").replaceChildren();
+    $("camera-profile-section").hidden = true;
+    $("save-camera").disabled = true;
+    $("camera-clock-status").hidden = true;
+    $("camera-clock-status").textContent = "";
+  }
+
+  function cameraClockReport(value) {
+    if (!value || value.sync_verified !== false || !["measured", "unavailable"].includes(value.status)) return null;
+    if (value.status === "unavailable") return { status: "unavailable" };
+    if (typeof value.offset_seconds !== "number" || !Number.isFinite(value.offset_seconds) ||
+        Math.abs(value.offset_seconds) > 315576000000 || typeof value.measured_at !== "string" ||
+        !Number.isFinite(utcMilliseconds(value.measured_at)) ||
+        typeof value.uncertainty_seconds !== "number" || !Number.isFinite(value.uncertainty_seconds) ||
+        value.uncertainty_seconds < 0 || value.uncertainty_seconds > 15 ||
+        !["ntp", "manual", "unknown"].includes(value.reported_mode)) return null;
+    return value;
+  }
+
+  function renderCameraClock(value) {
+    const clock = cameraClockReport(value);
+    let text = "Camera time could not be checked. Time synchronization is not verified. Check Windows time synchronization and the camera's NTP settings.";
+    let warning = true;
+    if (clock?.status === "measured") {
+      const offset = Math.abs(clock.offset_seconds);
+      const mode = clock.reported_mode === "ntp" ? "Camera reports NTP mode." : clock.reported_mode === "manual" ? "Camera reports manual time." : "Camera time mode is unknown.";
+      const alignment = offset > 5
+        ? `Camera is ${offset.toFixed(1)} seconds ${clock.offset_seconds > 0 ? "ahead of" : "behind"} the recorder. Authentication uses camera time.`
+        : `Camera and recorder differ by ${offset.toFixed(1)} seconds.`;
+      text = `${alignment} Checked ${utcLabel(clock.measured_at)} UTC, with measurement uncertainty ±${clock.uncertainty_seconds.toFixed(1)} seconds. ${mode} Time synchronization is not verified. Check Windows time synchronization and camera NTP settings.`;
+      warning = offset > 5;
+    }
+    $("camera-clock-status").textContent = text;
+    $("camera-clock-status").classList.toggle("error", warning);
+    $("camera-clock-status").hidden = false;
+  }
+
+  function setCameraSetupBusy(busy, action = "") {
+    state.cameraSetupBusy = busy;
+    $("add-camera-form").setAttribute("aria-busy", String(busy));
+    for (const id of [
+      "new-camera-name", "new-camera-host", "new-camera-port", "new-camera-secure",
+      "new-camera-username", "new-camera-password",
+    ]) $(id).disabled = busy;
+    $("find-cameras").disabled = busy || !canManageCameras() || state.dialogMode === "update";
+    $("test-camera-connection").disabled = busy || !canManageCameras();
+    $("camera-profile").disabled = busy || !state.cameraProbe;
+    const selected = state.cameraProbe?.profiles.find((profile) => profile.id === $("camera-profile").value);
+    $("save-camera").disabled = busy || !canManageCameras() || !selected?.supported;
+    $("find-cameras").textContent = action === "discovery" ? "Finding cameras…" : "Find cameras on this network";
+    $("test-camera-connection").textContent = action === "profiles" ? "Testing camera…" : "Test connection";
+    $("save-camera").textContent = action === "connect" ? "Connecting camera…" : state.dialogMode === "update" ? "Reconnect camera" : "Connect camera";
+    for (const button of $("discovered-cameras").querySelectorAll("button")) button.disabled = busy;
+  }
+
+  function resetCameraSetup() {
+    state.cameraSetupEpoch += 1;
+    state.cameraSetupController?.abort();
+    state.cameraSetupController = null;
+    clearCameraProbe();
+    $("add-camera-form").reset();
+    $("new-camera-name").readOnly = false;
+    $("new-camera-host").readOnly = false;
+    $("discovered-cameras").replaceChildren();
+    message("camera-discovery-message", "If Windows Firewall blocks discovery, enter the camera’s IP address below.");
+    message("add-camera-message", "");
+    state.dialogMode = "add";
+    setCameraSetupBusy(false);
+  }
+
+  function closeAddCamera() {
+    resetCameraSetup();
+    if ($("add-camera-dialog").open) $("add-camera-dialog").close();
+  }
+
+  function cameraSetupChanged() {
+    const previouslyTested = Boolean(state.cameraProbe) || state.cameraSetupBusy;
+    state.cameraSetupEpoch += 1;
+    state.cameraSetupController?.abort();
+    state.cameraSetupController = null;
+    clearCameraProbe();
+    setCameraSetupBusy(false);
+    if (previouslyTested) message("add-camera-message", "The camera details changed. Test the connection again.");
+  }
+
+  function cameraSetupError(error) {
+    const messages = {
+      discovery_unavailable: "Camera discovery is unavailable. Enter the camera’s IP address instead.",
+      camera_auth_failed: "Camera authentication failed. Check the camera account and its time/NTP settings. Some cameras use a separate ONVIF account.",
+      camera_unreachable: "The camera could not be reached. Check its power, IP address and camera settings port, and confirm ONVIF is enabled.",
+      camera_unsupported: "This camera has no supported H.264 stream. Enable ONVIF and H.264 in its settings, then test again.",
+      camera_invalid_response: "The camera did not return usable video settings. Check that ONVIF is enabled and try again.",
+      camera_busy: "The camera is busy. Wait a moment, then test again.",
+      camera_probe_expired: "The connection test expired. Enter the camera password and test again.",
+      camera_profile_unsupported: "Choose an H.264 stream. Other video formats are not supported yet.",
+    };
+    return messages[error.code] || (error.status === 410
+      ? messages.camera_probe_expired
+      : error.status === 409 ? "This camera is already configured. Select it in the camera list to reconnect."
+        : error.status === 422 ? "Check the camera’s IP address, camera settings port and account, then test again."
+          : apiMessage(error, "The camera connection did not complete. Check the camera settings and try again."));
+  }
+
+  function cameraConnection() {
+    const host = $("new-camera-host").value.trim();
+    if (!host || /[\s/?#@\\]/.test(host) || host.includes("://")) {
+      message("add-camera-message", "Enter the camera’s numeric IP address, without a web or video address.", true);
+      $("new-camera-host").focus();
+      return null;
+    }
+    if (!$("new-camera-port").reportValidity()) return null;
+    const port = Number($("new-camera-port").value);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+    return {
+      host, port, secure: $("new-camera-secure").checked,
+      username: $("new-camera-username").value, password: $("new-camera-password").value,
+    };
+  }
+
   function openCameraSetup(mode) {
-    if (state.account?.role !== "administrator") return;
+    if (!canManageCameras()) return;
     const camera = mode === "update" ? currentCamera() : null;
     if (mode === "update" && !camera) return;
     if (mode === "update") stopPersonView();
-    state.cameraSetupEpoch += 1;
+    resetCameraSetup();
     state.dialogMode = mode;
-    $("add-camera-form").reset(); message("add-camera-message", "");
     $("new-camera-name").readOnly = mode === "update";
     $("new-camera-host").readOnly = mode === "update";
-    $("add-camera-title").textContent = mode === "update" ? "Update camera source" : "Add a camera";
+    $("add-camera-title").textContent = mode === "update" ? "Reconnect camera" : "Add a camera";
     $("camera-setup-description").textContent = mode === "update"
-      ? "Changing the stream address reconnects live video and recording. The current address is kept private."
-      : "Connect an RTSP camera to live view and continuous recording.";
-    $("save-camera").textContent = mode === "update" ? "Update source" : "Connect camera";
-    $("save-camera").disabled = false;
+      ? "Sign in to this camera and test its available video streams. Reconnecting keeps its identity and recording history."
+      : "Find an ONVIF camera on your network, then sign in to the camera. K5 finds its available video streams for you.";
+    $("camera-discovery-section").hidden = mode === "update";
     if (camera) {
       $("new-camera-name").value = camera.name;
       $("new-camera-host").value = camera.host;
+      $("new-camera-port").value = camera.management_port || 80;
+      $("new-camera-secure").checked = camera.management_secure === true;
     }
+    setCameraSetupBusy(false);
     $("add-camera-dialog").showModal();
-    $(mode === "update" ? "new-camera-source" : "new-camera-name").focus();
+    $(mode === "update" ? "new-camera-username" : "find-cameras").focus();
   }
   $("add-camera-button").addEventListener("click", () => openCameraSetup("add"));
   $("update-source-button").addEventListener("click", () => openCameraSetup("update"));
   $("close-add-camera").addEventListener("click", closeAddCamera);
   $("cancel-add-camera").addEventListener("click", closeAddCamera);
+  $("add-camera-dialog").addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeAddCamera();
+  });
   $("add-camera-dialog").addEventListener("close", () => {
     if ($("add-camera-dialog").open) return;
-    $("add-camera-form").reset();
-    $("new-camera-name").readOnly = false;
-    $("new-camera-host").readOnly = false;
-    state.dialogMode = "add";
+    $("new-camera-password").value = "";
   });
+  for (const id of [
+    "new-camera-name", "new-camera-host", "new-camera-port", "new-camera-username", "new-camera-password",
+  ]) $(id).addEventListener("input", cameraSetupChanged);
+  $("new-camera-secure").addEventListener("change", () => {
+    if ($("new-camera-secure").checked && $("new-camera-port").value === "80") $("new-camera-port").value = "443";
+    else if (!$("new-camera-secure").checked && $("new-camera-port").value === "443") $("new-camera-port").value = "80";
+    cameraSetupChanged();
+  });
+  $("camera-profile").addEventListener("change", () => setCameraSetupBusy(false));
+
+  $("find-cameras").addEventListener("click", async () => {
+    if (!canManageCameras() || state.cameraSetupBusy) return;
+    cameraSetupChanged();
+    const epoch = state.sessionEpoch, setupEpoch = state.cameraSetupEpoch;
+    const controller = new AbortController();
+    state.cameraSetupController = controller;
+    $("discovered-cameras").replaceChildren();
+    setCameraSetupBusy(true, "discovery");
+    message("camera-discovery-message", "Looking for ONVIF cameras on this network…");
+    try {
+      const found = await request("/api/v1/operator/camera-discovery", {
+        method: "POST", body: {}, signal: controller.signal,
+      });
+      if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
+      if (!Array.isArray(found.cameras)) throw new SelectionError();
+      for (const camera of found.cameras.slice(0, 64)) {
+        if (typeof camera.host !== "string" || camera.host.length > 45 || /[\s/?#@\\]/.test(camera.host) ||
+          !Number.isInteger(camera.port) || camera.port < 1 || camera.port > 65535 || typeof camera.secure !== "boolean") continue;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "button secondary discovered-camera";
+        const name = typeof camera.name === "string" && !camera.name.includes("://")
+          ? camera.name.slice(0, 128) : "Network camera";
+        button.textContent = (name || "Network camera") + " · " + camera.host;
+        button.addEventListener("click", () => {
+          cameraSetupChanged();
+          $("new-camera-host").value = camera.host;
+          $("new-camera-port").value = camera.port;
+          $("new-camera-secure").checked = camera.secure;
+          $("new-camera-username").value = "";
+          $("new-camera-password").value = "";
+          if (!$("new-camera-name").value.trim()) $("new-camera-name").value = name || "Network camera";
+          message("add-camera-message", "Camera selected. Enter the account configured on this camera, then test the connection.");
+          $("new-camera-username").focus();
+        });
+        $("discovered-cameras").append(button);
+      }
+      message("camera-discovery-message", $("discovered-cameras").children.length
+        ? "Choose your camera below, or enter a different IP address."
+        : "No ONVIF cameras were found. Enter the camera’s IP address below; discovery may be blocked by the network or Windows Firewall.");
+    } catch (error) {
+      if (controller.signal.aborted || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
+      message("camera-discovery-message", cameraSetupError(error), true);
+    } finally {
+      if (epoch === state.sessionEpoch && setupEpoch === state.cameraSetupEpoch) {
+        state.cameraSetupController = null;
+        setCameraSetupBusy(false);
+      }
+    }
+  });
+
+  $("test-camera-connection").addEventListener("click", async () => {
+    if (!canManageCameras() || state.cameraSetupBusy) return;
+    const credentials = cameraConnection();
+    if (!credentials) return;
+    clearCameraProbe();
+    const epoch = state.sessionEpoch, setupEpoch = state.cameraSetupEpoch;
+    const controller = new AbortController();
+    state.cameraSetupController = controller;
+    setCameraSetupBusy(true, "profiles");
+    message("add-camera-message", "Signing in to the camera and reading its video streams…");
+    try {
+      const tested = await request("/api/v1/operator/camera-profiles", {
+        method: "POST", body: credentials, signal: controller.signal,
+      });
+      if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
+      if (typeof tested.probe_id !== "string" || !tested.probe_id || tested.probe_id.length > 256 || tested.probe_id.includes("://") ||
+        !Array.isArray(tested.profiles) || tested.profiles.length > 64) throw new SelectionError();
+      renderCameraClock(tested.clock);
+      const profiles = tested.profiles.filter((profile) =>
+        typeof profile.id === "string" && profile.id && profile.id.length <= 256 && !profile.id.includes("://") &&
+        ["H264", "H265", "MJPEG", "UNKNOWN"].includes(profile.codec)
+      ).map((profile) => ({
+        id: profile.id, name: profile.name, codec: profile.codec, width: profile.width, height: profile.height,
+        supported: profile.supported === true && profile.codec === "H264",
+      }));
+      const first = profiles.find((profile) => profile.supported);
+      for (const profile of profiles) {
+        const option = document.createElement("option");
+        option.value = profile.id;
+        const name = typeof profile.name === "string" && !profile.name.includes("://")
+          ? profile.name.slice(0, 128) : "Camera stream";
+        const dimensions = Number.isInteger(profile.width) && Number.isInteger(profile.height) &&
+          profile.width > 0 && profile.height > 0 && profile.width <= 16384 && profile.height <= 16384
+          ? " · " + profile.width + " × " + profile.height : "";
+        option.textContent = (name || "Camera stream") + " · " + profile.codec + dimensions + (profile.supported ? "" : " · H.264 required");
+        option.disabled = !profile.supported;
+        $("camera-profile").append(option);
+      }
+      $("camera-profile-section").hidden = false;
+      if (!first) {
+        message("add-camera-message", "The camera account was accepted, but no H.264 stream is available. Enable H.264 in the camera settings, then test again.", true);
+        return;
+      }
+      state.cameraProbe = { id: tested.probe_id, profiles };
+      $("camera-profile").value = first.id;
+      const lifetime = Number.isInteger(tested.expires_in_seconds) && tested.expires_in_seconds > 0
+        ? Math.min(tested.expires_in_seconds, 120) : 120;
+      state.cameraProbeTimer = setTimeout(() => {
+        if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch || !$("add-camera-dialog").open) return;
+        state.cameraSetupEpoch += 1;
+        state.cameraSetupController?.abort();
+        state.cameraSetupController = null;
+        clearCameraProbe();
+        message("add-camera-message", "The connection test expired. Enter the camera password and test again.", true);
+        setCameraSetupBusy(false);
+      }, lifetime * 1000);
+      message("add-camera-message", "Camera account accepted. Choose an H.264 stream; video is checked after connecting.");
+    } catch (error) {
+      if (controller.signal.aborted || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
+      renderCameraClock(error.clock);
+      message("add-camera-message", cameraSetupError(error), true);
+    } finally {
+      credentials.password = "";
+      if (epoch === state.sessionEpoch && setupEpoch === state.cameraSetupEpoch) {
+        $("new-camera-password").value = "";
+        state.cameraSetupController = null;
+        setCameraSetupBusy(false);
+        if (state.cameraProbe) $("camera-profile").focus();
+      }
+    }
+  });
+
   $("add-camera-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (state.account?.role !== "administrator" || $("save-camera").disabled) return;
+    if (!canManageCameras() || state.cameraSetupBusy || $("save-camera").disabled || !state.cameraProbe) return;
     const epoch = state.sessionEpoch;
     const setupEpoch = state.cameraSetupEpoch;
     const updating = state.dialogMode === "update";
-    const camera = { name: $("new-camera-name").value.trim(), host: $("new-camera-host").value.trim(), source_uri: $("new-camera-source").value.trim() };
-    $("new-camera-source").value = "";
-    $("save-camera").disabled = true;
-    message("add-camera-message", updating ? "Updating source and reconnecting…" : "Saving camera and connecting…");
+    const profile = state.cameraProbe.profiles.find((item) => item.id === $("camera-profile").value && item.supported);
+    if (!profile) return;
+    const camera = {
+      name: $("new-camera-name").value.trim(), probe_id: state.cameraProbe.id, profile_id: profile.id,
+    };
+    const controller = new AbortController();
+    state.cameraSetupController = controller;
+    setCameraSetupBusy(true, "connect");
+    message("add-camera-message", updating ? "Reconnecting live video and recording…" : "Connecting your camera…");
     try {
-      const created = await request("/api/v1/operator/cameras", { method: "POST", body: camera });
-      if (epoch !== state.sessionEpoch) return;
-      if (setupEpoch === state.cameraSetupEpoch) {
-        closeAddCamera();
-        notice(updating
-          ? "Camera source updated. Live video and recording will reconnect."
-          : "Camera saved. The live connection and recording status will update as it connects.");
-      }
-      await refreshCameras();
+      const created = await request("/api/v1/operator/cameras/connect", {
+        method: "POST", body: camera, signal: controller.signal,
+      });
+      if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
+      closeAddCamera();
+      const completedEpoch = state.cameraSetupEpoch;
       const deviceId = created.device_id || created.camera?.device_id;
-      if (deviceId && setupEpoch === state.cameraSetupEpoch) await selectCamera(deviceId);
+      const cameraStatus = created.camera || created;
+      state.cameraConnectionNotice = deviceId || null;
+      const connection = cameraConnectionStatus(cameraStatus, state.workerStatus);
+      notice(connection.text, connection.error, "camera_connection");
+      await refreshCameras();
+      if (deviceId && completedEpoch === state.cameraSetupEpoch) await selectCamera(deviceId);
     } catch (error) {
-      if (error.name === "AbortError" || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
-      message("add-camera-message", error.status === 422
-        ? "Check the camera IP address and RTSP stream. Enter the stream address again to retry."
-        : error.status === 409 ? "This camera is already configured. Refresh the camera list."
-          : apiMessage(error, "Camera setup failed. Enter the stream address again and retry."), true);
+      if (controller.signal.aborted || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
+      if (error.status === 410 || error.code === "camera_probe_expired") clearCameraProbe();
+      message("add-camera-message", cameraSetupError(error), true);
     } finally {
-      camera.source_uri = "";
-      // Submitted credentials were cleared before the request. Completion may
-      // belong to an earlier dialog while the next camera is already being set
-      // up, so it must not clear or enable controls owned by that new dialog.
-      if (epoch === state.sessionEpoch && setupEpoch === state.cameraSetupEpoch) $("save-camera").disabled = false;
+      if (epoch === state.sessionEpoch && setupEpoch === state.cameraSetupEpoch) {
+        state.cameraSetupController = null;
+        setCameraSetupBusy(false);
+      }
     }
   });
 

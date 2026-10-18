@@ -6,6 +6,8 @@ import json
 import re
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -68,6 +70,7 @@ class DeviceRegistry:
         self._capacity = capacity
         self._site_id = normalized_site
         self._database_path = path
+        self._database_identity = None
         self._lock = threading.RLock()
         self._connection: sqlite3.Connection | None = None
         self._open()
@@ -82,6 +85,7 @@ class DeviceRegistry:
 
     def _open(self) -> None:
         connection: sqlite3.Connection | None = None
+        database_identity = None
         try:
             connection = sqlite3.connect(
                 self._database_path,
@@ -109,11 +113,14 @@ class DeviceRegistry:
                 )
                 """
             )
+            if self._database_path != ":memory:":
+                database_identity = Path(self._database_path).lstat()
         except (OSError, sqlite3.Error) as exc:
             if connection is not None:
                 connection.close()
             raise DeviceRegistryStorageError("device registry is unavailable") from exc
         self._connection = connection
+        self._database_identity = database_identity
 
     def _require_connection(self) -> sqlite3.Connection:
         connection = self._connection
@@ -263,6 +270,56 @@ class DeviceRegistry:
             except sqlite3.Error as exc:
                 raise DeviceRegistryStorageError("device registry read failed") from exc
         return None if row is None else self._decode_device(row)
+
+    def find_name_host(self, name: str, host: str) -> list[Device]:
+        """Select up to two exact site-owned identities, exposing ambiguity."""
+        with self._lock:
+            connection = self._require_connection()
+            try:
+                rows = connection.execute(
+                    """SELECT id, name, host, management_port, kind, protocols_json, tags_json
+                       FROM devices WHERE site_id = ? AND name = ? AND host = ?
+                       ORDER BY row_id LIMIT 2""",
+                    (self._site_id, name, host),
+                ).fetchall()
+            except sqlite3.Error as exc:
+                raise DeviceRegistryStorageError("device registry read failed") from exc
+        return [self._decode_device(row) for row in rows]
+
+    @contextmanager
+    def locked_operator_database(self, expected: Path) -> Iterator[Path]:
+        """Lease the live canonical file while a camera store attaches it atomically.
+
+        The caller owns the private main-database transaction and must retain this
+        lease through rollback/commit and detachment. Memory, a foreign location,
+        a replaced path, a pending transaction, and nonrollback journals are refused.
+        """
+        with self._lock:
+            connection = self._require_connection()
+            if (
+                self._database_path == ":memory:"
+                or not expected.is_absolute()
+                or Path(self._database_path) != expected
+                or self._database_identity is None
+                or connection.in_transaction
+            ):
+                raise DeviceRegistryStorageError("operator device database is unavailable")
+            try:
+                current = expected.lstat()
+                if (current.st_dev, current.st_ino) != (
+                    self._database_identity.st_dev,
+                    self._database_identity.st_ino,
+                ):
+                    raise DeviceRegistryStorageError("operator device database changed")
+                databases = connection.execute("PRAGMA database_list").fetchall()
+                main = next(row for row in databases if row["name"] == "main")
+                if Path(main["file"]) != expected or connection.execute(
+                    "PRAGMA journal_mode"
+                ).fetchone()[0].lower() not in {"delete", "truncate", "persist"}:
+                    raise DeviceRegistryStorageError("operator device database is unavailable")
+            except (OSError, sqlite3.Error, StopIteration) as exc:
+                raise DeviceRegistryStorageError("operator device database is unavailable") from exc
+            yield expected
 
     def close(self) -> None:
         """Close the database handle without deleting durable state."""

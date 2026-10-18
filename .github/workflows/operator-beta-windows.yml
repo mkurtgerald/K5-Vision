@@ -3,7 +3,7 @@ name: Native Windows Beta Sprint
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product]
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-desktop-beta]
     paths:
       - .github/workflows/operator-beta-windows.yml
       - .github/actions/provision-operator-tools/**
@@ -107,7 +107,8 @@ jobs:
               "tests/unit/test_operator_native_process.py", "tests/unit/test_operator_profile_lock.py",
               "tests/unit/test_operator_analytics.py", "tests/unit/test_operator_analytics_person.py",
               "tests/test_user_registry.py", "tests/test_user_admin_api.py", "tests/test_user_sessions.py",
-              "tests/test_recovery_admin.py", "tests/integration/test_operator_product_runtime.py"
+              "tests/test_recovery_admin.py", "tests/integration/test_operator_product_runtime.py",
+              "tests/integration/test_mediamtx_donor_runtime.py"
             ) }
             "launcher" { @("tests/integration/test_operator_windows_launcher.py") }
             "install" { @("tests/integration/test_windows_operator_install.py") }

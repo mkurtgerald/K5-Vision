@@ -3,6 +3,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from k5vision.auth_sessions import DEFAULT_SESSION_TTL_SECONDS
 from k5vision.main import (
     CONTROL_PLANE_READ_TOKEN_ENV,
     CONTROL_PLANE_SITE_ENV,
@@ -78,6 +79,9 @@ def test_initialized_admin_can_login_and_use_same_bounded_admin_surface() -> Non
     with TestClient(create_app()) as client:
         _create_initialized_user(client, username="admin.one", role="administrator")
         session = _login(client, "admin.one")
+        assert type(session["expires_in_seconds"]) is int
+        assert session["expires_in_seconds"] == DEFAULT_SESSION_TTL_SECONDS
+        assert session["expires_at"]
         token = str(session["session_token"])
 
         me = client.get("/api/v1/auth/me", headers=_headers(token))

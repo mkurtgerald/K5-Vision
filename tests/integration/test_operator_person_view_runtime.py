@@ -74,6 +74,16 @@ def _diagnostic_helpers():
     return module
 
 
+def _onvif_helpers():
+    spec = importlib.util.spec_from_file_location(
+        "k5_person_view_onvif_camera", Path(__file__).with_name("onvif_camera_fixture.py")
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _transport_error_code(error):
     """Classify a transport failure without retaining native/browser error text."""
     detail = str(getattr(error, "message", ""))
@@ -323,7 +333,7 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
     source_uri = f"rtsp://127.0.0.1:{upstream_port}/generated"
     recording_root = identity.directory / "recordings"
     processes = []
-    product = browser = context = playwright = None
+    product = browser = context = playwright = onvif_camera = None
     stage = "product_start"
     failure = None
     transport_error = None
@@ -397,18 +407,47 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         revoked_token = client.token
         page.locator("#workspace").wait_for(state="visible")
         stage = "camera_enrollment"
+        onvif_camera = _onvif_helpers().OnvifCameraFixture(
+            host="127.0.0.1", stream_uri=source_uri, width=_WIDTH, height=_HEIGHT
+        )
         page.locator("#add-camera-button").click()
         page.locator("#new-camera-name").fill("Licensed positive person fixture")
         page.locator("#new-camera-host").fill("127.0.0.1")
-        page.locator("#new-camera-source").fill(source_uri)
+        page.locator("#new-camera-port").fill(str(onvif_camera.port))
+        page.locator("#new-camera-username").fill(onvif_camera.username)
+        page.locator("#new-camera-password").fill(onvif_camera.password)
+        _require(
+            page.locator("#new-camera-source").count() == 0,
+            "Integrated person setup required a manual stream address",
+        )
         with page.expect_response(
             lambda response: (
                 response.request.method == "POST"
-                and response.url.endswith("/api/v1/operator/cameras")
+                and response.url.endswith("/api/v1/operator/camera-profiles")
+            )
+        ) as profiled:
+            page.locator("#test-camera-connection").click()
+        _require(profiled.value.status == 200, "Integrated person ONVIF profile lookup failed")
+        profiles = profiled.value.json()
+        _require(
+            source_uri not in json.dumps(profiles)
+            and onvif_camera.password not in json.dumps(profiles),
+            "Integrated person ONVIF response exposed private connection material",
+        )
+        page.locator("#camera-profile").select_option(profiles["profiles"][0]["id"])
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST"
+                and response.url.endswith("/api/v1/operator/cameras/connect")
             )
         ) as enrolled:
             page.locator("#save-camera").click()
         _require(enrolled.value.status == 201, "Integrated person UI camera enrollment failed")
+        _require(
+            onvif_camera.qualified_requests(), "Integrated person bypassed ONVIF authentication"
+        )
+        receipt["onvif_credential_profile_enrollment"] = True
+        receipt["no_manual_stream_uri"] = True
         camera = enrolled.value.json()
         _require(
             camera["analytics_status"] == "configured"
@@ -684,6 +723,11 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
                 helpers._stop_owned(process)
             except Exception:
                 cleanup_failures.append("generated_process")
+        if onvif_camera is not None:
+            try:
+                onvif_camera.close()
+            except Exception:
+                cleanup_failures.append("generated_onvif_camera")
         for listener in reservations:
             listener.close()
         deadline = time.monotonic() + 5

@@ -16,10 +16,10 @@ from pathlib import Path
 from uuid import UUID
 
 from k5vision import identity_state
-from k5vision.domain.devices import Device
+from k5vision.domain.devices import Device, DeviceProtocol
 from k5vision.media.mediamtx_config import MediaMTXSource
 from k5vision.media.mediamtx_provider import MediaMTXBinding
-from k5vision.services.device_registry import DeviceRegistry
+from k5vision.services.device_registry import DeviceRegistry, DeviceRegistryConflictError
 
 MAX_OPERATOR_CAMERAS = 64
 _DATABASE = "operator-cameras.sqlite3"
@@ -191,7 +191,7 @@ class OperatorCameraStore:
             raise OperatorCameraStoreError("Private camera state is unavailable")
         return self._connection
 
-    def _source(self, device: Device, source_uri: str) -> MediaMTXSource:
+    def _validated_source(self, device: Device, source_uri: str) -> MediaMTXSource:
         failed = False
         try:
             if not isinstance(device, Device):
@@ -203,9 +203,19 @@ class OperatorCameraStore:
             )
             if len(_device_json(admitted).encode("utf-8")) > _MAX_DEVICE_JSON_BYTES:
                 raise ValueError
+        except Exception:
+            failed = True
+        if failed:
+            raise OperatorCameraStoreError("Camera source selection is invalid")
+        return source
+
+    def _source(self, device: Device, source_uri: str) -> MediaMTXSource:
+        source = self._validated_source(device, source_uri)
+        failed = False
+        try:
             if self._registry is not None:
-                enrolled = self._registry.get(admitted.id)
-                if enrolled is None or enrolled.model_dump() != admitted.model_dump():
+                enrolled = self._registry.get(source.device.id)
+                if enrolled is None or enrolled.model_dump() != source.device.model_dump():
                     raise ValueError
         except Exception:
             failed = True
@@ -301,6 +311,177 @@ class OperatorCameraStore:
                 self._rollback(connection)
         if failure is not None:
             raise failure("Private camera update failed")
+        return source
+
+    @staticmethod
+    def _registry_files(path: Path, expected: os.stat_result | None = None) -> os.stat_result:
+        """Admit canonical metadata without treating it as a credential store."""
+        current = identity_state._regular_file(path)
+        if os.name == "posix" and (current.st_uid != os.geteuid() or current.st_mode & 0o022):
+            raise OperatorCameraStoreError("Canonical camera state is unavailable")
+        if expected is not None and (current.st_dev, current.st_ino) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            raise OperatorCameraStoreError("Canonical camera state changed during use")
+        for suffix in ("-journal", "-wal", "-shm"):
+            sibling = Path(str(path) + suffix)
+            try:
+                sibling.lstat()
+            except FileNotFoundError:
+                continue
+            info = identity_state._regular_file(sibling)
+            if os.name == "posix" and (info.st_uid != os.geteuid() or info.st_mode & 0o022):
+                raise OperatorCameraStoreError("Canonical camera state is unavailable")
+        return current
+
+    def reconnect_onvif(
+        self,
+        device_id: UUID,
+        source_uri: str,
+        management_port: int,
+        secure: bool,
+    ) -> MediaMTXSource:
+        """Migrate an enrolled endpoint and source in one durable SQLite transaction.
+
+        Attaching the canonical file to the private rollback-journal database
+        lets SQLite's super-journal commit or recover both files together. The
+        UUID and recording-path binding survive a management-port change.
+        """
+        failure = None
+        source = None
+        with self._lock:
+            try:
+                if (
+                    not isinstance(device_id, UUID)
+                    or type(management_port) is not int
+                    or not 1 <= management_port <= 65535
+                    or type(secure) is not bool
+                    or self._registry is None
+                ):
+                    raise ValueError
+                connection = self._admit()
+                main = next(
+                    row
+                    for row in connection.execute("PRAGMA database_list")
+                    if row["name"] == "main"
+                )
+                if not main["file"] or Path(main["file"]) != self._database:
+                    raise ValueError
+                registry = self._registry
+                with registry.locked_operator_database(self._root / "devices.sqlite3") as path:
+                    registry_identity = self._registry_files(path)
+                    existing_device = registry.get(device_id)
+                    if existing_device is None:
+                        raise ValueError
+                    data = existing_device.model_dump(mode="json")
+                    data["management_port"] = management_port
+                    data["protocols"] = sorted(
+                        existing_device.protocols | {DeviceProtocol.ONVIF, DeviceProtocol.RTSP}
+                    )
+                    tags = existing_device.tags - {"k5-onvif-https"}
+                    if secure:
+                        tags.add("k5-onvif-https")
+                    data["tags"] = sorted(tags)
+                    # Validate the replacement and its private URI before a write begins.
+                    source = self._validated_source(Device.model_validate(data), source_uri)
+                    if connection.in_transaction or connection.execute(
+                        "PRAGMA main.journal_mode"
+                    ).fetchone()[0].lower() not in {"delete", "truncate", "persist"}:
+                        raise ValueError
+                    attached = False
+                    try:
+                        connection.execute(
+                            "ATTACH DATABASE ? AS operator_registry", (path.as_uri() + "?mode=rw",)
+                        )
+                        attached = True
+                        if connection.execute("PRAGMA operator_registry.journal_mode").fetchone()[
+                            0
+                        ].lower() not in {"delete", "truncate", "persist"}:
+                            raise ValueError
+                        connection.execute("PRAGMA operator_registry.synchronous = FULL")
+                        connection.execute("BEGIN IMMEDIATE")
+                        selections = self._read_sources(connection)
+                        old_source = connection.execute(
+                            "SELECT device_json, source_uri FROM camera_sources "
+                            "WHERE device_id = ?",
+                            (str(device_id),),
+                        ).fetchone()
+                        if old_source is None and len(selections) >= MAX_OPERATOR_CAMERAS:
+                            raise OperatorCameraCapacityError
+                        row = connection.execute(
+                            """SELECT id, name, host, management_port, kind,
+                                      protocols_json, tags_json
+                               FROM operator_registry.devices WHERE site_id = ? AND id = ?""",
+                            (self._site_id, str(device_id)),
+                        ).fetchone()
+                        if row is None or registry._decode_device(row) != existing_device:
+                            raise ValueError
+                        try:
+                            updated = connection.execute(
+                                """UPDATE operator_registry.devices
+                                   SET management_port = ?, protocols_json = ?, tags_json = ?
+                                   WHERE site_id = ? AND id = ? AND name = ? AND host = ?
+                                     AND management_port = ? AND kind = ?
+                                     AND protocols_json = ? AND tags_json = ?""",
+                                (
+                                    management_port,
+                                    registry._protocols_json(source.device),
+                                    registry._tags_json(source.device),
+                                    self._site_id,
+                                    str(device_id),
+                                    row["name"],
+                                    row["host"],
+                                    row["management_port"],
+                                    row["kind"],
+                                    row["protocols_json"],
+                                    row["tags_json"],
+                                ),
+                            )
+                        except sqlite3.IntegrityError as exc:
+                            if exc.sqlite_errorname == "SQLITE_CONSTRAINT_UNIQUE":
+                                raise DeviceRegistryConflictError from None
+                            raise
+                        if updated.rowcount != 1:
+                            raise ValueError
+                        if old_source is None:
+                            connection.execute(
+                                "INSERT INTO camera_sources VALUES (?, ?, ?)",
+                                (str(device_id), _device_json(source.device), source.source_uri),
+                            )
+                        else:
+                            updated = connection.execute(
+                                """UPDATE camera_sources SET device_json = ?, source_uri = ?
+                                   WHERE device_id = ? AND device_json = ? AND source_uri = ?""",
+                                (
+                                    _device_json(source.device),
+                                    source.source_uri,
+                                    str(device_id),
+                                    old_source["device_json"],
+                                    old_source["source_uri"],
+                                ),
+                            )
+                            if updated.rowcount != 1:
+                                raise ValueError
+                        self._admit()
+                        self._registry_files(path, registry_identity)
+                        connection.execute("COMMIT")
+                    finally:
+                        self._rollback(connection)
+                        if attached:
+                            try:
+                                connection.execute("DETACH DATABASE operator_registry")
+                            except sqlite3.Error:
+                                self.close()
+                                raise
+            except DeviceRegistryConflictError:
+                failure = DeviceRegistryConflictError
+            except OperatorCameraCapacityError:
+                failure = OperatorCameraCapacityError
+            except Exception:
+                failure = OperatorCameraStoreError
+        if failure is not None:
+            raise failure("Camera endpoint reconnection failed")
         return source
 
     def remove(self, device_id: UUID) -> None:

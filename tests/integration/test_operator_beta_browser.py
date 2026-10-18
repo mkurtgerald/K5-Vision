@@ -11,12 +11,16 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
+import re
 import secrets
 import shutil
+import socket
 import subprocess
 import time
+from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -118,6 +122,240 @@ def _runtime_helpers():
     return module
 
 
+def _onvif_helpers():
+    spec = importlib.util.spec_from_file_location(
+        "k5_generated_onvif_fixture", Path(__file__).with_name("onvif_camera_fixture.py")
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _onvif_clock_proof(fixture):
+    """Require actual anonymous time read and accepted skewed WSSE timestamps."""
+    proof = fixture.clock_skew_evidence()
+    offset = proof.get("onvif_clock_offset_seconds")
+    reads = proof.get("onvif_time_read_count")
+    _require(
+        proof.get("onvif_clock_skew_compensated") is True
+        and type(offset) in (int, float)
+        and math.isfinite(offset)
+        and 600 < abs(offset) < 86400
+        and type(reads) is int
+        and 1 <= reads <= 128,
+        "Actual ONVIF camera clock compensation was not proven",
+    )
+    return proof
+
+
+def _assert_onvif_time_health(page, fixture, clock):
+    """Check an actual ONVIF sample and its visible, deliberately limited claim."""
+    __tracebackhide__ = True
+    _require(
+        type(clock) is dict
+        and set(clock)
+        == {
+            "status",
+            "offset_seconds",
+            "measured_at",
+            "uncertainty_seconds",
+            "reported_mode",
+            "sync_verified",
+        },
+        "ONVIF time response left the bounded six-field contract",
+    )
+    offset, uncertainty, measured = (
+        clock["offset_seconds"],
+        clock["uncertainty_seconds"],
+        clock["measured_at"],
+    )
+    _require(
+        clock["status"] == "measured"
+        and type(offset) in (int, float)
+        and math.isfinite(offset)
+        and type(uncertainty) in (int, float)
+        and math.isfinite(uncertainty)
+        and 0 <= uncertainty <= 15
+        and type(measured) is str
+        and measured.endswith("Z")
+        and clock["reported_mode"] == fixture.clock_mode.lower()
+        and clock["sync_verified"] is False,
+        "ONVIF time response did not preserve the observed offset and unverified mode",
+    )
+    sampled = datetime.fromisoformat(measured.replace("Z", "+00:00"))
+    _require(
+        sampled.utcoffset().total_seconds() == 0
+        and abs((datetime.now(UTC) - sampled).total_seconds()) < 30
+        and abs(offset - fixture.clock_skew_seconds) <= uncertainty + 2,
+        "ONVIF clock sample was not a fresh measurement of the generated camera",
+    )
+    page.locator("#camera-clock-status").wait_for(state="visible")
+    displayed = page.locator("#camera-clock-status").inner_text()
+    if abs(fixture.clock_skew_seconds) > 5:
+        direction = "ahead of" if fixture.clock_skew_seconds > 0 else "behind"
+        rendered_offset = re.search(
+            r"Camera is ([0-9]+(?:\.[0-9]+)?) seconds (ahead of|behind) the recorder", displayed
+        )
+        _require(
+            rendered_offset is not None
+            and rendered_offset.group(2) == direction
+            and abs(float(rendered_offset.group(1)) - abs(offset)) <= 0.11,
+            "Camera clock offset direction was absent from the actual setup view",
+        )
+    _require(
+        "Time synchronization is not verified" in displayed
+        and (fixture.clock_mode != "NTP" or "Camera reports NTP mode" in displayed),
+        "Camera setup presented an unverified NTP report as synchronization proof",
+    )
+
+
+def _assert_recorder_time_health(page, client):
+    """Compare the visible recorder UTC with its real server response, not browser Date."""
+    __tracebackhide__ = True
+    diagnostics = client.json("/api/v1/operator/status")
+    clock, server_utc = diagnostics.get("clock"), diagnostics.get("server_utc")
+    _require(
+        type(server_utc) is str
+        and server_utc.endswith("Z")
+        and type(clock) is dict
+        and clock.get("status") == "observing"
+        and clock.get("sync_verified") is False,
+        "Recorder status did not expose observed UTC without a synchronization claim",
+    )
+    server = datetime.fromisoformat(server_utc.replace("Z", "+00:00"))
+    page.wait_for_function("""() => {
+      const value = document.getElementById('recorder-time-status').textContent;
+      return value.startsWith('Recorder time: ') && value.includes(' UTC') &&
+        value.includes('Time synchronization is not verified');
+    }""")
+    displayed = page.locator("#recorder-time-status").inner_text()
+    timestamp = displayed.removeprefix("Recorder time: ").split(" UTC", 1)[0]
+    parsed = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    _require(
+        abs((parsed - server).total_seconds()) < 15
+        and page.locator("#recorder-time-warning").is_hidden(),
+        "Recorder display followed client time or showed an unobserved host-clock change",
+    )
+    return diagnostics
+
+
+def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=False):
+    """Use actual credential/profile controls without entering a stream address."""
+    __tracebackhide__ = True
+    source_requests = []
+
+    def observe(request):
+        material = request.url + (request.post_data or "")
+        if "rtsp://" in material.lower() or '"source_uri"' in material:
+            source_requests.append(True)
+
+    page.on("request", observe)
+    discovery_completed = False
+    try:
+        page.locator("#add-camera-button").click()
+        _require(page.locator("#new-camera-source").count() == 0, "Manual stream field remained")
+        if run_discovery:
+            with page.expect_response(
+                lambda response: (
+                    response.request.method == "POST"
+                    and response.url.endswith("/api/v1/operator/camera-discovery")
+                ),
+                timeout=25_000,
+            ) as discovery:
+                page.locator("#find-cameras").click()
+            _require(discovery.value.status == 200, "Bounded camera discovery did not complete")
+            _require("rtsp://" not in discovery.value.text().lower(), "Discovery exposed a stream")
+            discovery_completed = True
+        page.locator("#new-camera-name").fill(name)
+        page.locator("#new-camera-host").fill(fixture.host)
+        page.locator("#new-camera-port").fill(str(fixture.port))
+        page.locator("#new-camera-username").fill(fixture.username)
+        if reject_wrong:
+            page.locator("#new-camera-password").fill("deliberately-wrong-fixture-password")
+            with page.expect_response(
+                lambda response: (
+                    response.request.method == "POST"
+                    and response.url.endswith("/api/v1/operator/camera-profiles")
+                )
+            ) as rejected:
+                page.locator("#test-camera-connection").click()
+            _require(
+                rejected.value.status in {400, 401, 403, 422, 502, 503},
+                "Wrong camera credentials were admitted",
+            )
+            _require(fixture.rejected_credentials(), "Camera did not reject the actual SOAP digest")
+            _require(
+                page.locator("#save-camera").is_disabled(), "Wrong credentials enabled Connect"
+            )
+            page.wait_for_function(
+                "() => document.getElementById('new-camera-password').value === ''"
+            )
+        page.locator("#new-camera-password").fill(fixture.password)
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST"
+                and response.url.endswith("/api/v1/operator/camera-profiles")
+            )
+        ) as profiles:
+            page.locator("#test-camera-connection").click()
+        _require(profiles.value.status == 200, "Actual ONVIF credential/profile request failed")
+        profile_payload = profiles.value.json()
+        _require(
+            set(profile_payload) == {"probe_id", "expires_in_seconds", "profiles", "clock"},
+            "Profile response left the bounded public contract",
+        )
+        _require(
+            all(
+                forbidden not in profiles.value.text()
+                for forbidden in ("rtsp://", fixture.username, fixture.password)
+            ),
+            "Profile response exposed private camera execution material",
+        )
+        selected = [
+            item
+            for item in profile_payload["profiles"]
+            if item.get("codec") == "H264" and item.get("supported") is True
+        ]
+        _require(bool(selected), "Generated H264 camera profile was not offered")
+        page.locator("#camera-profile").select_option(selected[0]["id"])
+        _assert_onvif_time_health(page, fixture, profile_payload["clock"])
+        _require(
+            page.locator("#add-camera-message").inner_text()
+            == (
+                "Camera account accepted. Choose an H.264 stream; "
+                "video is checked after connecting."
+            ),
+            "ONVIF profile acceptance claimed unverified video readiness",
+        )
+        page.wait_for_function("() => document.getElementById('new-camera-password').value === ''")
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST"
+                and response.url.endswith("/api/v1/operator/cameras/connect")
+            )
+        ) as connected:
+            page.locator("#save-camera").click()
+        _require(connected.value.status == 201, "Profile-based camera connection failed")
+        camera = connected.value.json()
+        _require(
+            all(
+                forbidden not in connected.value.text()
+                for forbidden in ("rtsp://", fixture.username, fixture.password, '"source_uri"')
+            ),
+            "Connection response exposed private camera execution material",
+        )
+        page.locator("#add-camera-dialog").wait_for(state="hidden")
+        _require(
+            fixture.qualified_requests(), "Actual authenticated ONVIF SOAP flow was incomplete"
+        )
+        _require(not source_requests, "Browser sent a manual camera stream address")
+        _require("rtsp://" not in page.content().lower(), "Camera stream address entered the DOM")
+        return camera, discovery_completed
+    finally:
+        page.remove_listener("request", observe)
+
+
 def _decoded_color(page, video_id, color):
     """Require advancing decoded frames, then inspect actual same-origin pixels."""
     __tracebackhide__ = True
@@ -160,10 +398,19 @@ def _assert_no_browser_storage(page):
     storage = page.evaluate(
         """() => ({local: localStorage.length, session: sessionStorage.length,
           cookie: document.cookie, password: document.getElementById('password').value,
-          source: document.getElementById('new-camera-source').value})"""
+          cameraUsername: document.getElementById('new-camera-username').value,
+          cameraPassword: document.getElementById('new-camera-password').value})"""
     )
     _require(
-        storage == {"local": 0, "session": 0, "cookie": "", "password": "", "source": ""},
+        storage
+        == {
+            "local": 0,
+            "session": 0,
+            "cookie": "",
+            "password": "",
+            "cameraUsername": "",
+            "cameraPassword": "",
+        },
         "The operator left credentials in script-visible browser storage or setup inputs",
     )
 
@@ -178,9 +425,9 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
     browser_api = pytest.importorskip("playwright.sync_api")
     channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
     assets = Path(__file__).parents[2] / "src" / "k5vision" / "operator_web"
-    cameras, submitted, pending = [], [], []
+    cameras, submitted, pending, probes = [], [], [], {}
     account = {"username": "fixture-admin", "display_name": "Fixture", "role": "administrator"}
-    sources = ("rtsp://127.0.0.1/generated", "rtsp://127.0.0.2/generated")
+    hosts = ("127.0.0.1", "127.0.0.2")
     identifiers = ("8643f7a8-4a09-4ec0-bf35-15fd728cf001", "8643f7a8-4a09-4ec0-bf35-15fd728cf002")
     playwright = browser = context = None
     failed = False
@@ -226,23 +473,51 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
                     "worker_status": "ready",
                     "max_recording_bytes": 20 * 1024**3,
                     "storage": None,
+                    "server_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "clock": {"status": "observing", "sync_verified": False},
                 }
+            elif path == "/api/v1/operator/camera-profiles":
+                payload = route.request.post_data_json
+                probe_id = "generated-dialog-probe-" + str(len(probes) + 1)
+                probes[probe_id] = payload["host"]
+                data = {
+                    "probe_id": probe_id,
+                    "expires_in_seconds": 120,
+                    "clock": {
+                        "status": "unavailable",
+                        "offset_seconds": None,
+                        "measured_at": None,
+                        "uncertainty_seconds": None,
+                        "reported_mode": "unknown",
+                        "sync_verified": False,
+                    },
+                    "profiles": [
+                        {
+                            "id": "generated-h264-profile",
+                            "name": "Generated H264 profile",
+                            "codec": "H264",
+                            "width": 320,
+                            "height": 240,
+                            "supported": True,
+                        }
+                    ],
+                }
+            elif path == "/api/v1/operator/cameras/connect":
+                payload = route.request.post_data_json
+                host = probes[payload["probe_id"]]
+                submitted.append(host)
+                data = {
+                    "device_id": identifiers[len(cameras)],
+                    "name": payload["name"],
+                    "host": host,
+                    "status": "connecting",
+                    "recording": False,
+                    "analytics_status": "disabled",
+                }
+                cameras.append(data)
+                status = 201
             elif path == "/api/v1/operator/cameras":
-                if route.request.method == "POST":
-                    payload = route.request.post_data_json
-                    submitted.append(payload["source_uri"])
-                    data = {
-                        "device_id": identifiers[len(cameras)],
-                        "name": payload["name"],
-                        "host": payload["host"],
-                        "status": "connecting",
-                        "recording": False,
-                        "analytics_status": "disabled",
-                    }
-                    cameras.append(data)
-                    status = 201
-                else:
-                    data = {"cameras": cameras, "worker_status": "ready"}
+                data = {"cameras": cameras, "worker_status": "ready"}
             elif path.endswith("/media-session"):
                 if identifiers[0] in path and not pending:
                     pending.append(route)
@@ -261,20 +536,31 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
         page.locator("#password").fill("fixture-browser-password")
         page.locator("#sign-in-button").click()
         page.locator("#workspace").wait_for(state="visible")
-        page.locator("#add-camera-button").click()
-        page.locator("#new-camera-name").fill("First generated camera")
-        page.locator("#new-camera-host").fill("127.0.0.1")
-        page.locator("#new-camera-source").fill(sources[0])
+
+        def prepare_dialog(name, host):
+            page.locator("#add-camera-button").click()
+            page.locator("#new-camera-name").fill(name)
+            page.locator("#new-camera-host").fill(host)
+            page.locator("#new-camera-username").fill("generated-user")
+            page.locator("#new-camera-password").fill("generated-camera-password")
+            with page.expect_response(
+                lambda response: (
+                    response.request.method == "POST"
+                    and response.url.endswith("/api/v1/operator/camera-profiles")
+                )
+            ) as profiles:
+                page.locator("#test-camera-connection").click()
+            _require(profiles.value.status == 200, "Overlap regression profile request failed")
+            page.locator("#camera-profile").select_option("generated-h264-profile")
+
+        prepare_dialog("First generated camera", hosts[0])
         page.locator("#save-camera").click()
         page.locator("#add-camera-dialog").wait_for(state="hidden")
         deadline = time.monotonic() + 5
         while not pending and time.monotonic() < deadline:
             page.wait_for_timeout(10)
         _require(bool(pending), "Previous camera selection was not held for the overlap regression")
-        page.locator("#add-camera-button").click()
-        page.locator("#new-camera-name").fill("Second generated camera")
-        page.locator("#new-camera-host").fill("127.0.0.2")
-        page.locator("#new-camera-source").fill(sources[1])
+        prepare_dialog("Second generated camera", hosts[1])
         pending[0].fulfill(
             status=200,
             content_type="application/json",
@@ -287,20 +573,23 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
         )
         page.wait_for_function("() => window.Hls !== undefined")
         _require(
-            page.locator("#new-camera-source").input_value() == sources[1],
-            "Previous camera completion erased the next dialog's required stream address",
+            page.locator("#new-camera-host").input_value() == hosts[1]
+            and page.locator("#camera-profile").input_value() == "generated-h264-profile"
+            and page.locator("#save-camera").is_enabled(),
+            "Previous camera completion erased the next dialog's selected camera profile",
         )
         with page.expect_response(
             lambda response: (
                 response.request.method == "POST"
-                and response.url.endswith("/api/v1/operator/cameras")
+                and response.url.endswith("/api/v1/operator/cameras/connect")
             )
         ) as second:
             page.locator("#save-camera").click()
         _require(second.value.status == 201, "The second dialog did not enroll through the UI")
         page.locator("#add-camera-dialog").wait_for(state="hidden")
         _require(
-            submitted == list(sources), "Dialog submissions did not preserve independent sources"
+            submitted == list(hosts),
+            "Dialog submissions did not preserve independent camera probes",
         )
         _assert_no_browser_storage(page)
     except BaseException:
@@ -408,7 +697,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         videos.append(video)
     reservations, ports = helpers._reserve_ports(8)
     upstream_ports, product_ports = ports[:2], ports[2:]
-    processes, publishers = [], []
+    processes, publishers, onvif_cameras = [], [], []
     product = None
     browser = context = anonymous = playwright = None
     stage = "fixture_ready"
@@ -429,6 +718,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         "analytics_acceptance": False,
         "long_duration_acceptance": False,
         "hardware_capacity_acceptance": False,
+        "host_clock_step_acceptance": False,
         "camera_count": 2,
         "width": 320,
         "height": 240,
@@ -440,7 +730,9 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             listener.close()
         stage = "upstreams_starting"
         sources = []
-        for (_, host, color), port in zip(_CAMERAS, upstream_ports, strict=True):
+        for camera_index, ((_, host, color), port) in enumerate(
+            zip(_CAMERAS, upstream_ports, strict=True)
+        ):
             source = f"rtsp://{host}:{port}/generated"
             sources.append(source)
             config = private / f"private {color} upstream.json"
@@ -475,124 +767,23 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                 ),
             )
             processes.append(helpers._start([str(media), str(config)], private))
-        stage = "product_starting"
-        product = runtime._Product(
-            identity, identity.directory / "recordings", media, caddy, product_ports
-        )
-        client = runtime._Client(product_ports[0])
-        runtime._wait(
-            lambda: product.server.started and client.get("/operator/")[0] == 200,
-            label="Browser product startup",
-            product=product,
-        )
-        _require(
-            client.get("/api/v1/operator/status")[0] == 401,
-            "Anonymous requests received operator status",
-        )
-        stage = "browser_starting"
-        playwright = browser_api.sync_playwright().start()
-        browser = playwright.chromium.launch(
-            channel=channel, headless=True, args=["--autoplay-policy=no-user-gesture-required"]
-        )
-        receipt["browser_version"] = browser.version
-        context = browser.new_context(viewport={"width": 1440, "height": 960})
-        anonymous = browser.new_context()
-        page = context.new_page()
-        page.set_default_timeout(10_000)
 
-        def script_failed(error):
-            if len(script_errors) < 32:
-                script_errors.append(_script_error_code(error))
+            def upstream_ready(host=host, port=port):
+                try:
+                    with socket.create_connection((host, port), timeout=0.5):
+                        return True
+                except OSError:
+                    return False
 
-        def request_failed(request):
-            code = _request_failure_code(request)
-            request_failures[code] = min(100, request_failures.get(code, 0) + 1)
-
-        def request_started(request):
-            category = _request_category(request)
-            request_counts[category] = min(100, request_counts.get(category, 0) + 1)
-
-        def response_received(response):
-            code = _request_category(response.request) + "_" + str(response.status)
-            response_counts[code] = min(100, response_counts.get(code, 0) + 1)
-
-        page.on("pageerror", script_failed)
-        page.on("request", request_started)
-        page.on("response", response_received)
-        page.on("requestfailed", request_failed)
-        stage = "sign_in_page"
-        page.goto(client.origin + "/operator/", wait_until="domcontentloaded")
-        browser_capabilities = page.evaluate("""() => ({
-            abort_signal_any: typeof AbortSignal.any === 'function',
-            abort_signal_timeout: typeof AbortSignal.timeout === 'function',
-            modal_dialog: typeof HTMLDialogElement.prototype.showModal === 'function'
-        })""")
-        page.locator("#username").fill(username)
-        page.locator("#password").fill(password)
-        stage = "login_response"
-        with page.expect_response(
-            lambda response: response.url.endswith("/api/v1/auth/login")
-        ) as login:
-            page.locator("#sign-in-button").click()
-        _require(login.value.status == 200, "Browser sign-in failed")
-        client.token = login.value.json()["session_token"]
-        stage = "login_workspace"
-        page.locator("#workspace").wait_for(state="visible")
-        receipt["ui_login"] = True
-        stage = "service_storage_status"
-        page.wait_for_function("""() => {
-            const status = document.getElementById('service-status').textContent;
-            const storage = document.getElementById('storage-status').textContent;
-            return status === 'Media service ready' && storage.includes('recording limit') &&
-              storage.includes('disk free');
-        }""")
-        diagnostics = client.json("/api/v1/operator/status")
-        _require(
-            set(diagnostics)
-            == {"worker_status", "max_recording_bytes", "storage", "analytics_status"}
-            and diagnostics["worker_status"] == "ready"
-            and diagnostics["analytics_status"] == "disabled"
-            and diagnostics["max_recording_bytes"] == 20 * 1024**3
-            and diagnostics["storage"]["recording_allowed"] is True,
-            "Operator service and storage status was incomplete",
-        )
-        page.locator("#connection-help-button").click()
-        page.locator("#connection-help-dialog").wait_for(state="visible")
-        _require(
-            "media service is ready"
-            in page.locator("#connection-help-status").inner_text().lower(),
-            "Connection help did not reflect actual service readiness",
-        )
-        page.locator("#done-connection-help").click()
-        receipt["ui_service_storage_status"] = True
-        camera_ids = []
-        for (name, host, _), source in zip(_CAMERAS, sources, strict=True):
-            enrollment_index += 1
-            stage = "camera_enrollment_open"
-            page.locator("#add-camera-button").click()
-            stage = "camera_enrollment_fill"
-            page.locator("#new-camera-name").fill(name)
-            page.locator("#new-camera-host").fill(host)
-            page.locator("#new-camera-source").fill(source)
-            stage = "camera_enrollment_response"
-            with page.expect_response(
-                lambda response: (
-                    response.request.method == "POST"
-                    and response.url.endswith("/api/v1/operator/cameras")
+            runtime._wait(upstream_ready, label="Generated camera upstream listener", timeout=10)
+            onvif_cameras.append(
+                _onvif_helpers().OnvifCameraFixture(
+                    host=host,
+                    stream_uri=source,
+                    clock_skew_seconds=1200 if camera_index == 0 else -1200,
+                    clock_mode="NTP",
                 )
-            ) as enroll:
-                page.locator("#save-camera").click()
-            _require(enroll.value.status == 201, "Browser camera enrollment failed")
-            camera = enroll.value.json()
-            _require(
-                "source_uri" not in camera and source not in json.dumps(camera),
-                "Camera API exposed execution-only source material",
             )
-            camera_ids.append(camera["device_id"])
-            stage = "camera_enrollment_close"
-            page.locator("#add-camera-dialog").wait_for(state="hidden")
-        _require(len(set(camera_ids)) == 2, "Distinct generated cameras were merged")
-        receipt["ui_two_camera_enrollment"] = True
         for video, source in zip(videos, sources, strict=True):
             stage = "generated_publishers_starting"
             publisher = helpers._start(
@@ -620,6 +811,157 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             )
             processes.append(publisher)
             publishers.append(publisher)
+        stage = "product_starting"
+        product = runtime._Product(
+            identity, identity.directory / "recordings", media, caddy, product_ports
+        )
+        client = runtime._Client(product_ports[0])
+        runtime._wait(
+            lambda: product.server.started and client.get("/operator/")[0] == 200,
+            label="Browser product startup",
+            product=product,
+        )
+        _require(
+            client.get("/api/v1/operator/status")[0] == 401,
+            "Anonymous requests received operator status",
+        )
+        stage = "browser_starting"
+        playwright = browser_api.sync_playwright().start()
+        browser = playwright.chromium.launch(
+            channel=channel, headless=True, args=["--autoplay-policy=no-user-gesture-required"]
+        )
+        receipt["browser_version"] = browser.version
+        context = browser.new_context(viewport={"width": 1440, "height": 960})
+        anonymous = browser.new_context()
+        page = context.new_page()
+        page.set_default_timeout(10_000)
+        # Shift only this browser's Date API. OS UTC, media workers and the actual
+        # HTTP server retain their real clocks; performance.now remains monotonic.
+        page.add_init_script("""(() => {
+          const NativeDate = Date;
+          class SkewedDate extends NativeDate {
+            constructor(...args) {
+              super(...(args.length ? args : [NativeDate.now() + 172800000]));
+            }
+            static now() { return NativeDate.now() + 172800000; }
+          }
+          window.Date = SkewedDate;
+        })();""")
+
+        def script_failed(error):
+            if len(script_errors) < 32:
+                script_errors.append(_script_error_code(error))
+
+        def request_failed(request):
+            code = _request_failure_code(request)
+            request_failures[code] = min(100, request_failures.get(code, 0) + 1)
+
+        def request_started(request):
+            category = _request_category(request)
+            request_counts[category] = min(100, request_counts.get(category, 0) + 1)
+
+        def response_received(response):
+            code = _request_category(response.request) + "_" + str(response.status)
+            response_counts[code] = min(100, response_counts.get(code, 0) + 1)
+
+        page.on("pageerror", script_failed)
+        page.on("request", request_started)
+        page.on("response", response_received)
+        page.on("requestfailed", request_failed)
+        stage = "sign_in_page"
+        page.goto(client.origin + "/operator/", wait_until="domcontentloaded")
+        browser_skew = page.evaluate("Date.now() - (performance.timeOrigin + performance.now())")
+        _require(
+            type(browser_skew) in (int, float) and abs(browser_skew - 172800000) < 2000,
+            "Qualification did not apply the browser-only two-day Date offset",
+        )
+        receipt["browser_date_skew_seconds"] = 172800
+        browser_capabilities = page.evaluate("""() => ({
+            abort_signal_any: typeof AbortSignal.any === 'function',
+            abort_signal_timeout: typeof AbortSignal.timeout === 'function',
+            modal_dialog: typeof HTMLDialogElement.prototype.showModal === 'function'
+        })""")
+        page.locator("#username").fill(username)
+        page.locator("#password").fill(password)
+        stage = "login_response"
+        with page.expect_response(
+            lambda response: response.url.endswith("/api/v1/auth/login")
+        ) as login:
+            page.locator("#sign-in-button").click()
+        _require(login.value.status == 200, "Browser sign-in failed")
+        client.token = login.value.json()["session_token"]
+        stage = "login_workspace"
+        page.locator("#workspace").wait_for(state="visible")
+        receipt["ui_login"] = True
+        stage = "service_storage_status"
+        page.wait_for_function("""() => {
+            const status = document.getElementById('service-status').textContent;
+            const storage = document.getElementById('storage-status').textContent;
+            return status === 'Media service ready' && storage.includes('recording limit') &&
+              storage.includes('disk free');
+        }""")
+        diagnostics = client.json("/api/v1/operator/status")
+        _require(
+            set(diagnostics)
+            == {
+                "worker_status",
+                "max_recording_bytes",
+                "storage",
+                "analytics_status",
+                "server_utc",
+                "clock",
+            }
+            and diagnostics["worker_status"] == "ready"
+            and diagnostics["analytics_status"] == "disabled"
+            and diagnostics["max_recording_bytes"] == 20 * 1024**3
+            and diagnostics["storage"]["recording_allowed"] is True,
+            "Operator service and storage status was incomplete",
+        )
+        _assert_recorder_time_health(page, client)
+        receipt["recorder_time_health_displayed"] = True
+        page.locator("#connection-help-button").click()
+        page.locator("#connection-help-dialog").wait_for(state="visible")
+        _require(
+            "media service is ready"
+            in page.locator("#connection-help-status").inner_text().lower(),
+            "Connection help did not reflect actual service readiness",
+        )
+        page.locator("#done-connection-help").click()
+        receipt["ui_service_storage_status"] = True
+        camera_ids = []
+        for (name, _host, _), onvif_camera in zip(_CAMERAS, onvif_cameras, strict=True):
+            enrollment_index += 1
+            stage = "actual_onvif_camera_enrollment"
+            camera, discovered = _onvif_enroll(
+                page,
+                name=name,
+                fixture=onvif_camera,
+                reject_wrong=enrollment_index == 1,
+                run_discovery=enrollment_index == 1,
+            )
+            if enrollment_index == 1:
+                receipt["bounded_discovery_executed"] = discovered
+            camera_ids.append(camera["device_id"])
+        _require(len(set(camera_ids)) == 2, "Distinct generated cameras were merged")
+        receipt["ui_two_camera_enrollment"] = True
+        receipt["onvif_credential_profile_enrollment"] = True
+        receipt["onvif_wrong_password_rejected"] = True
+        receipt["no_manual_stream_uri"] = True
+        receipt["onvif_time_health_displayed"] = True
+        receipt["generated_camera_discovered"] = False
+        clock_proofs = [_onvif_clock_proof(camera) for camera in onvif_cameras]
+        _require(
+            clock_proofs[0]["onvif_clock_offset_seconds"] > 600
+            and clock_proofs[1]["onvif_clock_offset_seconds"] < -600,
+            "Opposite ONVIF camera clock offsets were not preserved",
+        )
+        receipt["onvif_clock_skew_compensated"] = True
+        receipt["onvif_clock_offsets_seconds"] = [
+            proof["onvif_clock_offset_seconds"] for proof in clock_proofs
+        ]
+        receipt["onvif_time_read_counts"] = [
+            proof["onvif_time_read_count"] for proof in clock_proofs
+        ]
 
         def both_live():
             views = client.json("/api/v1/operator/cameras")["cameras"]
@@ -682,6 +1024,19 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             if index == 0:
                 page.locator("#history-tab").click()
             page.locator(".history-item").first.wait_for(state="visible", timeout=15_000)
+            actual_time = client.json("/api/v1/operator/status")["server_utc"]
+            server_now = datetime.fromisoformat(actual_time.replace("Z", "+00:00"))
+            displayed_end = datetime.fromisoformat(
+                page.locator("#history-end").input_value()
+            ).replace(tzinfo=UTC)
+            displayed_start = datetime.fromisoformat(
+                page.locator("#history-start").input_value()
+            ).replace(tzinfo=UTC)
+            _require(
+                abs((displayed_end - server_now).total_seconds()) < 15
+                and (displayed_end - displayed_start).total_seconds() == 86400,
+                "Rolling history followed skewed browser Date instead of real recorder UTC",
+            )
             page.locator(".history-item").first.click()
             page.locator("#play-recording").click()
             stage = "playback_decode"
@@ -704,6 +1059,14 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         receipt["playback_decoded_frames"] = playback_frames
         receipt["recording_pixel_isolation"] = True
         receipt["ui_history_and_gaps"] = True
+        receipt["server_utc_rolling_history"] = True
+        _require(
+            page.locator("#workspace").is_visible()
+            and page.locator("#sign-in").is_hidden()
+            and client.get("/api/v1/operator/cameras")[0] == 200,
+            "Skewed browser Date incorrectly expired the still-valid human session",
+        )
+        receipt["browser_clock_skew_session_preserved"] = True
         receipt["script_visible_credentials_absent"] = True
         recording_root = identity.directory / "recordings"
         saved_files = sorted(recording_root.rglob("*.mp4"))
@@ -763,19 +1126,9 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         )
         receipt["ui_removal_preserved_files_and_denied_media"] = True
         stage = "camera_reenrollment"
-        page.locator("#add-camera-button").click()
-        page.locator("#new-camera-name").fill(_CAMERAS[1][0])
-        page.locator("#new-camera-host").fill(_CAMERAS[1][1])
-        page.locator("#new-camera-source").fill(sources[1])
-        with page.expect_response(
-            lambda response: (
-                response.request.method == "POST"
-                and response.url.endswith("/api/v1/operator/cameras")
-            )
-        ) as restored:
-            page.locator("#save-camera").click()
+        restored, _ = _onvif_enroll(page, name=_CAMERAS[1][0], fixture=onvif_cameras[1])
         _require(
-            restored.value.status == 201 and restored.value.json()["device_id"] == camera_ids[1],
+            restored["device_id"] == camera_ids[1],
             "Re-enrolling a retained camera changed its durable identity",
         )
         page.locator("#add-camera-dialog").wait_for(state="hidden")
@@ -851,6 +1204,11 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                 helpers._stop_owned(process)
             except Exception:
                 cleanup_failures.append("generated_process")
+        for fixture in onvif_cameras:
+            try:
+                fixture.close()
+            except Exception:
+                cleanup_failures.append("generated_onvif_camera")
         for listener in reservations:
             listener.close()
         diagnostic = {

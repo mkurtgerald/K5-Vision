@@ -80,3 +80,24 @@ def test_closed_registry_fails_without_deleting_durable_state(tmp_path: Path) ->
     reopened = DeviceRegistry(database_path=database, site_id="site-a")
     assert reopened.get(device.id) == device
     reopened.close()
+
+
+def test_name_host_lookup_is_exact_site_scoped_and_reports_bounded_ambiguity(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "devices.sqlite3"
+    registry = DeviceRegistry(database_path=database, site_id="site-a")
+    foreign = DeviceRegistry(database_path=database, site_id="site-b")
+    try:
+        devices = [
+            registry.register(DeviceCreate(name="Camera", host="10.0.0.10", management_port=port))
+            for port in (80, 8080, 8443)
+        ]
+        foreign.register(DeviceCreate(name="Camera", host="10.0.0.10"))
+        assert registry.find_name_host("Camera", "10.0.0.10") == devices[:2]
+        assert registry.find_name_host("camera", "10.0.0.10") == []
+        assert registry.find_name_host("Camera", "10.0.0.11") == []
+        assert len(foreign.find_name_host("Camera", "10.0.0.10")) == 1
+    finally:
+        registry.close()
+        foreign.close()

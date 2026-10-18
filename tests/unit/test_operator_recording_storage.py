@@ -50,6 +50,20 @@ def _free(monkeypatch, count):
     monkeypatch.setattr(storage_module.shutil, "disk_usage", lambda _: SimpleNamespace(free=count))
 
 
+@pytest.fixture
+def clock(monkeypatch):
+    value = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(storage_module.time, "monotonic", lambda: value.now)
+    return value
+
+
+def _settled_storage(root, clock, **bounds):
+    storage = RecordingStorage(root, **bounds)
+    storage.inspect()
+    clock.now += storage_module.MIN_CLOSED_AGE_SECONDS
+    return storage
+
+
 def test_inspect_is_aggregate_immutable_and_does_not_delete(root, monkeypatch) -> None:
     _free(monkeypatch, 500)
     files = [_segment(root, 1, size=12, age=60), _segment(root, 2, size=8, age=30)]
@@ -64,12 +78,14 @@ def test_inspect_is_aggregate_immutable_and_does_not_delete(root, monkeypatch) -
         status.total_bytes = 0
 
 
-def test_prune_oldest_closed_segments_to_hysteresis_and_preserves_newest(root, monkeypatch) -> None:
+def test_prune_oldest_closed_segments_to_hysteresis_and_preserves_newest(
+    root, monkeypatch, clock
+) -> None:
     _free(monkeypatch, 500)
     oldest = _segment(root, 1, size=10, age=100)
     middle = _segment(root, 2, size=10, age=60)
     newest = _segment(root, 3, size=10, age=30)
-    status = RecordingStorage(root, max_bytes=25, min_free_bytes=100).prune()
+    status = _settled_storage(root, clock, max_bytes=25, min_free_bytes=100).prune()
     assert status.total_bytes == 20
     assert status.deleted_segments == 1
     assert status.recording_allowed
@@ -77,13 +93,20 @@ def test_prune_oldest_closed_segments_to_hysteresis_and_preserves_newest(root, m
     assert middle.exists() and newest.exists()
 
 
-def test_newest_per_camera_and_young_segments_are_never_pruned(root, monkeypatch) -> None:
+def test_newest_per_camera_and_young_segments_are_never_pruned(root, monkeypatch, clock) -> None:
     _free(monkeypatch, 500)
     old = _segment(root, 1, size=10, age=30)
     young = _segment(root, 2, size=10, age=5)
     newest = _segment(root, 3, size=10, age=1)
     sole_other = _segment(root, 1, size=10, age=100, camera=2)
-    status = RecordingStorage(root, max_bytes=15, min_free_bytes=100).prune()
+    storage = RecordingStorage(root, max_bytes=15, min_free_bytes=100)
+    storage.inspect()
+    clock.now += 9
+    changed = time.time() - 5
+    os.utime(young, (changed, changed))
+    storage.inspect()
+    clock.now += 1
+    status = storage.prune()
     assert not old.exists()
     assert all(path.exists() for path in (young, newest, sole_other))
     assert status.total_bytes == 30
@@ -91,7 +114,9 @@ def test_newest_per_camera_and_young_segments_are_never_pruned(root, monkeypatch
     assert not status.recording_allowed
 
 
-def test_foreign_files_directories_and_nested_recordings_are_untouched(root, monkeypatch) -> None:
+def test_foreign_files_directories_and_nested_recordings_are_untouched(
+    root, monkeypatch, clock
+) -> None:
     _free(monkeypatch, 500)
     closed = _segment(root, 1, size=10, age=60)
     newest = _segment(root, 2, size=5, age=30)
@@ -103,7 +128,7 @@ def test_foreign_files_directories_and_nested_recordings_are_untouched(root, mon
     nested.mkdir()
     preserved = nested / closed.name
     preserved.write_bytes(b"do not remove")
-    status = RecordingStorage(root, max_bytes=10, min_free_bytes=100).prune()
+    status = _settled_storage(root, clock, max_bytes=10, min_free_bytes=100).prune()
     assert status.total_bytes == 5
     assert status.recording_allowed
     assert not closed.exists() and newest.exists()
@@ -111,7 +136,7 @@ def test_foreign_files_directories_and_nested_recordings_are_untouched(root, mon
     assert nested.is_dir()
 
 
-def test_low_free_space_only_retires_owned_closed_segments(root, monkeypatch) -> None:
+def test_low_free_space_only_retires_owned_closed_segments(root, monkeypatch, clock) -> None:
     closed = _segment(root, 1, size=10, age=60)
     newest = _segment(root, 2, size=5, age=30)
     foreign = root / "foreign.bin"
@@ -121,7 +146,7 @@ def test_low_free_space_only_retires_owned_closed_segments(root, monkeypatch) ->
         "disk_usage",
         lambda _: SimpleNamespace(free=0 if closed.exists() else 200),
     )
-    status = RecordingStorage(root, max_bytes=100, min_free_bytes=100).prune()
+    status = _settled_storage(root, clock, max_bytes=100, min_free_bytes=100).prune()
     assert status.recording_allowed and status.deleted_segments == 1
     assert newest.exists() and foreign.exists() and not closed.exists()
 
@@ -140,7 +165,7 @@ def test_low_free_space_without_closed_owned_files_pauses_without_foreign_deleti
 
 
 def test_windows_open_file_sharing_failure_is_skipped_without_false_quota_success(
-    root, monkeypatch
+    root, monkeypatch, clock
 ) -> None:
     _free(monkeypatch, 500)
     closed = _segment(root, 1, size=20, age=60)
@@ -153,7 +178,7 @@ def test_windows_open_file_sharing_failure_is_skipped_without_false_quota_succes
         return original(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "unlink", shared)
-    status = RecordingStorage(root, max_bytes=10, min_free_bytes=100).prune()
+    status = _settled_storage(root, clock, max_bytes=10, min_free_bytes=100).prune()
     assert not status.recording_allowed
     assert status.total_bytes == 25 and status.deleted_segments == 0
     assert closed.exists() and newest.exists()
@@ -242,11 +267,11 @@ def test_root_replacement_refuses_operations_in_new_directory(root, monkeypatch)
     assert foreign.exists()
 
 
-def test_segment_changed_after_scan_is_not_deleted(root, monkeypatch) -> None:
+def test_segment_changed_after_scan_is_not_deleted(root, monkeypatch, clock) -> None:
     _free(monkeypatch, 500)
     closed = _segment(root, 1, size=20, age=60)
     _segment(root, 2, size=5, age=30)
-    storage = RecordingStorage(root, max_bytes=10, min_free_bytes=100)
+    storage = _settled_storage(root, clock, max_bytes=10, min_free_bytes=100)
     original = storage._scan
     scans = 0
 
@@ -274,15 +299,26 @@ def test_entry_limit_refuses_incomplete_scan_before_deletion(root, monkeypatch) 
     assert closed.exists() and newest.exists()
 
 
-def test_entry_budget_is_shared_between_prune_and_final_rescan(root, monkeypatch) -> None:
+def test_entry_budget_is_shared_between_prune_and_final_rescan(root, monkeypatch, clock) -> None:
     _free(monkeypatch, 500)
     closed = _segment(root, 1, size=20, age=60)
     newest = _segment(root, 2, size=5, age=30)
+    storage = _settled_storage(root, clock, max_bytes=10, min_free_bytes=100)
     monkeypatch.setattr(storage_module, "MAX_STORAGE_ENTRIES", 4)
-    status = RecordingStorage(root, max_bytes=10, min_free_bytes=100).prune()
+    status = storage.prune()
     assert not status.recording_allowed
     assert status.deleted_segments == 1
     assert not closed.exists() and newest.exists()
+
+
+def test_healthy_storage_requires_only_one_bounded_scan(root, monkeypatch, clock) -> None:
+    _free(monkeypatch, 500)
+    files = [_segment(root, 1, age=60), _segment(root, 2, age=30)]
+    storage = _settled_storage(root, clock, max_bytes=100, min_free_bytes=100)
+    monkeypatch.setattr(storage_module, "MAX_STORAGE_ENTRIES", 3)
+    status = storage.prune()
+    assert status.recording_allowed and status.deleted_segments == 0
+    assert all(path.exists() for path in files)
 
 
 def test_time_budget_refuses_scan_without_unbounded_work(root, monkeypatch) -> None:
@@ -327,3 +363,203 @@ def test_root_and_byte_configuration_are_admitted_without_creating_directories(r
     for bounds in ({"max_bytes": 0}, {"max_bytes": True}, {"min_free_bytes": -1}):
         with pytest.raises(ValueError):
             RecordingStorage(root, **bounds)
+
+
+@pytest.mark.parametrize("jump", [-365 * 86400, 365 * 86400])
+def test_wall_clock_year_step_never_ages_observed_segments_early(
+    root, monkeypatch, clock, jump
+) -> None:
+    _free(monkeypatch, 500)
+    closed = _segment(root, 1, age=365 * 86400)
+    newest = _segment(root, 2, age=30)
+    storage = RecordingStorage(root, max_bytes=100, min_free_bytes=100, retention_seconds=20)
+    storage.inspect()
+    previous_wall = time.time()
+    monkeypatch.setattr(storage_module.time, "time", lambda: previous_wall + jump)
+    for elapsed in (0, 9, 10, 19):
+        clock.now = 1000 + elapsed
+        status = storage.prune()
+        assert status.recording_allowed and status.deleted_segments == 0
+        assert closed.exists() and newest.exists()
+    clock.now = 1020
+    status = storage.prune()
+    assert status.deleted_segments == 1 and not closed.exists() and newest.exists()
+
+
+def test_default_age_retention_expires_under_quota_after_observed_day(
+    root, monkeypatch, clock
+) -> None:
+    _free(monkeypatch, 500)
+    closed = _segment(root, 1, age=60)
+    newest = _segment(root, 2, age=30)
+    storage = RecordingStorage(root, max_bytes=100, min_free_bytes=100)
+    storage.inspect()
+    clock.now += 86400 - 1
+    assert storage.prune().deleted_segments == 0
+    clock.now += 1
+    status = storage.prune()
+    assert status.recording_allowed and status.total_bytes == newest.stat().st_size
+    assert status.deleted_segments == 1 and not closed.exists() and newest.exists()
+
+
+def test_quota_waits_for_monotonic_closed_guard_despite_old_mtime_and_wall_step(
+    root, monkeypatch, clock
+) -> None:
+    _free(monkeypatch, 500)
+    closed = _segment(root, 1, size=20, age=365 * 86400)
+    newest = _segment(root, 2, size=5, age=30)
+    storage = RecordingStorage(root, max_bytes=10, min_free_bytes=100)
+    previous_wall = time.time()
+    monkeypatch.setattr(storage_module.time, "time", lambda: previous_wall + 365 * 86400)
+    assert not storage.prune().recording_allowed
+    assert closed.exists()
+    clock.now += 9
+    assert storage.prune().deleted_segments == 0
+    clock.now += 1
+    status = storage.prune()
+    assert status.recording_allowed and status.deleted_segments == 1
+    assert not closed.exists() and newest.exists()
+
+
+def test_cold_restart_restarts_retention_age_but_quota_still_reclaims_after_closed_guard(
+    root, monkeypatch, clock
+) -> None:
+    _free(monkeypatch, 500)
+    closed = _segment(root, 1, size=20, age=60)
+    newest = _segment(root, 2, size=5, age=30)
+    storage = RecordingStorage(root, max_bytes=100, min_free_bytes=100, retention_seconds=20)
+    storage.inspect()
+    clock.now += 19
+    restarted = RecordingStorage(root, max_bytes=100, min_free_bytes=100, retention_seconds=20)
+    restarted.inspect()
+    clock.now += 1
+    assert restarted.prune().deleted_segments == 0 and closed.exists()
+    restarted_again = RecordingStorage(root, max_bytes=10, min_free_bytes=100, retention_seconds=20)
+    assert not restarted_again.prune().recording_allowed
+    clock.now += 10
+    status = restarted_again.prune()
+    assert status.recording_allowed and status.deleted_segments == 1
+    assert not closed.exists() and newest.exists()
+
+
+@pytest.mark.parametrize("change", ["size", "mtime", "identity"])
+def test_changed_segment_restarts_monotonic_age_before_expiration(
+    root, monkeypatch, clock, change
+) -> None:
+    _free(monkeypatch, 500)
+    closed = _segment(root, 1, size=10, age=60)
+    newest = _segment(root, 2, size=5, age=30)
+    original_mtime = closed.stat().st_mtime_ns
+    storage = RecordingStorage(root, max_bytes=100, min_free_bytes=100, retention_seconds=20)
+    storage.inspect()
+    clock.now += 20
+    if change == "identity":
+        replacement = closed.with_name("owned-replacement.tmp")
+        replacement.write_bytes(b"replacement")
+        os.replace(replacement, closed)
+    elif change == "size":
+        closed.write_bytes(b"changed-size-recording")
+    else:
+        original_mtime -= 1_000_000_000
+    os.utime(closed, ns=(original_mtime, original_mtime))
+    status = storage.prune()
+    assert status.deleted_segments == 0 and closed.exists() and newest.exists()
+    clock.now += 19
+    # A later observed segment replaces the changed clip's active/newest
+    # protection. Its old timestamp also models a backwards host clock step.
+    successor = _segment(root, 3, size=5, age=120)
+    assert storage.prune().deleted_segments == 0
+    clock.now += 1
+    assert storage.prune().deleted_segments == 1
+    assert not closed.exists() and newest.exists() and successor.exists()
+
+
+@pytest.mark.parametrize("change", ["created", "modified"])
+def test_backward_clock_step_preserves_latest_observed_recording_under_quota_pressure(
+    root, monkeypatch, clock, change
+) -> None:
+    _free(monkeypatch, 500)
+    pre_step = _segment(root, 1, size=10, age=-3600)
+    if change == "modified":
+        post_step = _segment(root, 2, size=5, age=60)
+    storage = RecordingStorage(root, max_bytes=15, min_free_bytes=100, retention_seconds=0)
+    storage.inspect()
+    clock.now += 15
+    if change == "created":
+        post_step = _segment(root, 2, size=10, age=3600)
+    else:
+        post_step.write_bytes(b"newestdata")
+        modified = time.time() - 3600
+        os.utime(post_step, (modified, modified))
+    storage.inspect()
+    clock.now += 15
+    status = storage.prune()
+    assert status.deleted_segments == 0 and not status.recording_allowed
+    assert pre_step.exists() and post_step.exists()
+    # Once a subsequent segment is observed, the former active clip can be
+    # reclaimed while both wall-newest and observed-newest remain protected.
+    successor = _segment(root, 3, size=5, age=7200)
+    storage.inspect()
+    clock.now += 10
+    status = storage.prune()
+    assert status.deleted_segments == 1 and status.recording_allowed
+    assert not post_step.exists() and pre_step.exists() and successor.exists()
+
+
+def test_simultaneously_observed_changes_are_all_protected_without_scan_order_guessing(
+    root, monkeypatch, clock
+) -> None:
+    _free(monkeypatch, 500)
+    pre_step = _segment(root, 1, size=10, age=-3600)
+    storage = RecordingStorage(root, max_bytes=15, min_free_bytes=100, retention_seconds=0)
+    storage.inspect()
+    clock.now += 15
+    changed = [_segment(root, 2, age=3600), _segment(root, 3, age=7200)]
+    storage.inspect()
+    clock.now += 15
+    status = storage.prune()
+    assert status.deleted_segments == 0 and not status.recording_allowed
+    assert pre_step.exists() and all(path.exists() for path in changed)
+
+
+def test_complete_scans_prune_observation_map_and_incomplete_scan_discards_age_confidence(
+    root, monkeypatch, clock
+) -> None:
+    _free(monkeypatch, 500)
+    closed = _segment(root, 1, age=60)
+    newest = _segment(root, 2, age=30)
+    storage = RecordingStorage(root, max_bytes=100, min_free_bytes=100, retention_seconds=20)
+    storage.inspect()
+    assert set(storage._observations) == {closed, newest}
+    closed.unlink()
+    storage.inspect()
+    assert set(storage._observations) == {newest}
+    closed = _segment(root, 1, age=60)
+    storage.inspect()
+    clock.now += 20
+    with monkeypatch.context() as limited:
+        limited.setattr(storage_module, "MAX_STORAGE_ENTRIES", 2)
+        status = storage.prune()
+    assert not status.recording_allowed and status.deleted_segments == 0
+    assert storage._observations == {} and closed.exists()
+    assert storage.prune().deleted_segments == 0
+    clock.now += 20
+    assert storage.prune().deleted_segments == 1 and not closed.exists() and newest.exists()
+
+
+def test_explicit_disabled_age_retention_keeps_stable_files_under_quota(
+    root, monkeypatch, clock
+) -> None:
+    _free(monkeypatch, 500)
+    files = [_segment(root, 1, age=60), _segment(root, 2, age=30)]
+    storage = RecordingStorage(root, max_bytes=100, min_free_bytes=100, retention_seconds=0)
+    storage.inspect()
+    clock.now += 31 * 86400
+    assert storage.prune().deleted_segments == 0
+    assert all(path.exists() for path in files)
+
+
+@pytest.mark.parametrize("retention", [True, -1, 30 * 86400 + 1, 1.5])
+def test_retention_bounds_are_explicit_and_finite(root, retention):
+    with pytest.raises(ValueError):
+        RecordingStorage(root, retention_seconds=retention)

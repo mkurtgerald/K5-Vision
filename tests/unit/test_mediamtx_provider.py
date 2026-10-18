@@ -355,7 +355,8 @@ def test_configuration_is_enrolled_only_private_and_windows_compatible() -> None
     path = config["paths"][_BINDING.path_name]
     assert path["source"] == source.source_uri
     assert path["record"] and not path["sourceOnDemand"]
-    assert path["recordFormat"] == "fmp4" and path["recordDeleteAfter"] == "86400s"
+    assert path["recordFormat"] == "fmp4" and path["recordDeleteAfter"] == "0s"
+    assert path["useAbsoluteTimestamp"] is False
     assert path["recordPath"].startswith(r"C:\Users\Owner\K5Recordings/%path/")
     assert path["recordPath"].endswith("_%z")
     assert config["authInternalUsers"][0]["user"] == "k5worker"
@@ -370,6 +371,18 @@ def test_configuration_is_enrolled_only_private_and_windows_compatible() -> None
     assert all(config[key] is False for key in ("webrtc", "rtmp", "srt", "moq", "metrics", "pprof"))
     assert "private" not in repr(source)
     assert "x" * 43 not in repr(_CREDENTIALS)
+
+
+@pytest.mark.parametrize("retention", [1, 3600, 86400, True, -1])
+def test_configuration_cannot_reenable_native_wall_clock_age_deletion(retention) -> None:
+    with pytest.raises(ValueError):
+        generate_mediamtx_configuration(
+            site_id="poc-site",
+            sources=[_source()],
+            credentials=_CREDENTIALS,
+            recording_directory=r"C:\Users\Owner\K5Recordings",
+            retention_seconds=retention,
+        )
 
 
 @pytest.mark.parametrize(

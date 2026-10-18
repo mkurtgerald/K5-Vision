@@ -71,6 +71,8 @@ def _product_path(path: str) -> bool:
         in {
             _PREFIX + "/media-auth",
             _PREFIX + "/media-session",
+            _PREFIX + "/camera-discovery",
+            _PREFIX + "/camera-profiles",
         }
     )
 
@@ -354,6 +356,8 @@ def install_operator_product_api(
             "device_id": str(source.binding.device_id),
             "name": source.device.name,
             "host": str(source.device.host),
+            "management_port": source.device.management_port,
+            "management_secure": "k5-onvif-https" in source.device.tags,
             "status": "unavailable",
             "recording": False,
             "analytics_status": person_status,
@@ -398,31 +402,66 @@ def install_operator_product_api(
             "worker_status": service.status(),
         }
 
-    @app.post(_PREFIX + "/cameras", status_code=201, tags=["operator"])
-    async def enroll_camera(
-        payload: _CameraEnrollment, _session: tuple[UserAccount, str] = admin_session
+    async def enroll_camera_source(
+        *,
+        name: str,
+        host: str,
+        source_uri: str,
+        session: tuple[UserAccount, str],
+        management_port: int = 80,
+        management_secure: bool = False,
+        onvif: bool = False,
+        before_store=None,
     ):
         try:
             request = DeviceCreate(
-                name=payload.name, host=payload.host, protocols={DeviceProtocol.RTSP}
+                name=name,
+                host=host,
+                management_port=management_port,
+                protocols={DeviceProtocol.ONVIF, DeviceProtocol.RTSP}
+                if onvif
+                else {DeviceProtocol.RTSP},
+                tags={"k5-onvif-https"} if onvif and management_secure else set(),
             )
             provisional = Device(**request.model_dump())
             MediaMTXSource(
-                MediaMTXBinding(service.site_id, provisional.id), provisional, payload.source_uri
+                MediaMTXBinding(service.site_id, provisional.id), provisional, source_uri
             )
         except ValueError:
             raise HTTPException(422, "Invalid camera selection") from None
         async with mutations:
+            current, _token = await authenticate(session[1])
+            if current.id != session[0].id or current.role is not UserRole.ADMINISTRATOR:
+                raise HTTPException(403, "Insufficient camera administration permission")
+            if before_store is not None:
+                before_store()
             try:
                 existing = selections()
-                if len(existing) >= 64 and not any(
-                    source.device.host == request.host
-                    and source.device.management_port == request.management_port
-                    for source in existing
+                reconnect = (
+                    registry.find_name_host(request.name, str(request.host)) if onvif else []
+                )
+                if len(reconnect) > 1:
+                    raise HTTPException(409, "Camera endpoint already enrolled")
+                if (
+                    len(existing) >= 64
+                    and not reconnect
+                    and not any(
+                        source.device.host == request.host
+                        and source.device.management_port == request.management_port
+                        for source in existing
+                    )
                 ):
                     raise HTTPException(409, "Camera capacity reached")
-                device = registry.enroll(request).device
-                source = cameras.upsert(device, payload.source_uri)
+                if reconnect:
+                    source = cameras.reconnect_onvif(
+                        reconnect[0].id,
+                        source_uri,
+                        management_port=management_port,
+                        secure=management_secure,
+                    )
+                else:
+                    device = registry.enroll(request).device
+                    source = cameras.upsert(device, source_uri)
                 await service.apply_sources(selections())
             except DeviceRegistryConflictError:
                 raise HTTPException(409, "Camera endpoint already enrolled") from None
@@ -433,6 +472,23 @@ def install_operator_product_api(
             except (DeviceRegistryStorageError, RuntimeError, OSError, ValueError):
                 raise HTTPException(503, "Camera configuration unavailable") from None
         return await camera_view(source)
+
+    @app.post(_PREFIX + "/cameras", status_code=201, tags=["operator"])
+    async def enroll_camera(
+        payload: _CameraEnrollment, session: tuple[UserAccount, str] = admin_session
+    ):
+        return await enroll_camera_source(
+            name=payload.name,
+            host=str(payload.host),
+            source_uri=payload.source_uri,
+            session=session,
+        )
+
+    from k5vision.operator_onvif_api import install_operator_onvif_api
+
+    onvif_probes = install_operator_onvif_api(
+        app, require_admin=require_admin, authenticate=authenticate, enroll=enroll_camera_source
+    )
 
     @app.delete(_PREFIX + "/cameras/{device_id}", status_code=204, tags=["operator"])
     async def remove_camera(device_id: UUID, _session: tuple[UserAccount, str] = admin_session):
@@ -605,6 +661,8 @@ def install_operator_product_api(
         admit_origin(request)
         values = request.headers.getlist("authorization")
         scheme, separator, token = (values[0] if len(values) == 1 else "").partition(" ")
+        if separator and scheme.lower() == "bearer" and _SESSION_TOKEN.fullmatch(token) is not None:
+            onvif_probes.clear_token(token)
         if (
             analytics is not None
             and separator
