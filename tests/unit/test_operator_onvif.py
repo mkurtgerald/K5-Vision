@@ -10,6 +10,7 @@ import http.server
 import threading
 import time
 import xml.etree.ElementTree as ET
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 from urllib.request import parse_http_list, parse_keqv_list
@@ -62,6 +63,11 @@ def camera():
         requests=[],
         rejected=False,
         first_fault=None,
+        clock_offset=None,
+        clock_status=None,
+        clock_body=None,
+        clock_delay=0,
+        clock_requests=[],
     )
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -74,6 +80,34 @@ def camera():
             action = list(next(item for item in root if item.tag.endswith("}Body")))[0].tag.rsplit(
                 "}", 1
             )[-1]
+            if action == "GetSystemDateAndTime":
+                settings.clock_requests.append((self.path, root, self.headers.get("Authorization")))
+                assert not _text(root, "Username") and not _text(root, "Password")
+                assert self.headers.get("Authorization") is None
+                time.sleep(settings.clock_delay)
+                when = datetime.now(UTC) + timedelta(seconds=settings.clock_offset or 0)
+                response = settings.clock_body
+                if response is None:
+                    response = _soap(
+                        "<GetSystemDateAndTimeResponse><SystemDateAndTime><UTCDateTime>"
+                        f"<Date><Year>{when.year}</Year><Month>{when.month}</Month>"
+                        f"<Day>{when.day}</Day></Date><Time><Hour>{when.hour}</Hour>"
+                        f"<Minute>{when.minute}</Minute><Second>{when.second}</Second>"
+                        "</Time></UTCDateTime></SystemDateAndTime></GetSystemDateAndTimeResponse>"
+                    )
+                status = settings.clock_status
+                if status is None:
+                    status = 200 if settings.clock_offset is not None else 404
+                self.send_response(status)
+                if status == 401:
+                    self.send_header("WWW-Authenticate", 'Digest realm="clock", nonce="private"')
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                try:
+                    self.wfile.write(response)
+                except OSError:
+                    pass
+                return
             settings.requests.append((self.path, action, root, self.headers.get("Authorization")))
             if settings.digest:
                 authorization = self.headers.get("Authorization", "")
@@ -108,6 +142,10 @@ def camera():
             valid = _text(root, "Username") == _USERNAME and hmac.compare_digest(
                 _text(root, "Password"), expected
             )
+            if settings.clock_offset is not None:
+                when = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                camera_now = datetime.now(UTC) + timedelta(seconds=settings.clock_offset)
+                valid = valid and abs((camera_now - when).total_seconds()) < 120
             status = settings.status or (200 if valid else 401)
             if not valid:
                 settings.rejected = True
@@ -210,6 +248,96 @@ def test_real_http_digest_authentication_and_wsse(camera):
     assert len(profiles) == 1
     assert camera.requests[0][3] is None
     assert all(authorization.startswith("Digest ") for *_, authorization in camera.requests[1:])
+
+
+@pytest.mark.parametrize("offset", [-21600, 21600])
+def test_real_camera_clock_skew_is_compensated_without_sending_credentials(camera, offset):
+    camera.clock_offset = offset
+    (profile,) = _probe(camera)
+    assert profile.codec == "H264"
+    assert len(camera.clock_requests) == 1
+    path, root, authorization = camera.clock_requests[0]
+    assert path == "/onvif/device_service"
+    assert authorization is None
+    assert _find_security(root) is None
+    assert all(
+        action in {"GetCapabilities", "GetProfiles", "GetStreamUri"}
+        for _, action, _, _ in camera.requests
+    )
+    for _, _, document, _ in camera.requests:
+        created = datetime.fromisoformat(_text(document, "Created").replace("Z", "+00:00"))
+        assert abs((created - datetime.now(UTC)).total_seconds() - offset) < 3
+
+
+def _find_security(root):
+    return next((item for item in root.iter() if item.tag.rsplit("}", 1)[-1] == "Security"), None)
+
+
+def test_camera_clock_compensation_does_not_admit_bad_credentials(camera):
+    camera.clock_offset = 21600
+    with pytest.raises(onvif.OnvifError) as caught:
+        _probe(camera, password="wrong-fixture-only-password")
+    assert caught.value.code == "auth_failed"
+    assert len(camera.clock_requests) == 1 and camera.rejected
+    assert len(camera.requests) == 1
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 500])
+def test_unavailable_camera_clock_is_optional_and_never_retries_with_credentials(camera, status):
+    camera.clock_status = status
+    assert len(_probe(camera)) == 1
+    assert len(camera.clock_requests) == 1
+    assert all(authorization is None for _, _, authorization in camera.clock_requests)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"<broken",
+        _soap(
+            "<GetSystemDateAndTimeResponse><SystemDateAndTime><LocalDateTime/></SystemDateAndTime></GetSystemDateAndTimeResponse>"
+        ),
+        _soap(
+            "<GetSystemDateAndTimeResponse><UTCDateTime><Date><Year>9999999999999999999</Year><Month>13</Month><Day>40</Day></Date><Time><Hour>25</Hour><Minute>80</Minute><Second>99</Second></Time></UTCDateTime></GetSystemDateAndTimeResponse>"
+        ),
+        b'<!DOCTYPE x [<!ENTITY x "private">]><x>&x;</x>',
+    ],
+)
+def test_malformed_camera_clock_falls_back_to_local_time_without_exposing_data(camera, body):
+    camera.clock_status = 200
+    camera.clock_body = body
+    assert len(_probe(camera)) == 1
+    assert len(camera.clock_requests) == 1
+
+
+def test_optional_clock_subdeadline_leaves_budget_for_successful_authentication(
+    camera, monkeypatch
+):
+    camera.clock_delay = 0.3
+    monkeypatch.setattr(onvif, "_CLOCK_READ_SECONDS", 0.05)
+    connector = onvif.OnvifConnector(timeout_seconds=1)
+    started = time.monotonic()
+    profiles = asyncio.run(connector.probe("127.0.0.1", camera.port, False, _USERNAME, _PASSWORD))
+    assert len(profiles) == 1
+    assert time.monotonic() - started < 0.5
+    assert len(camera.clock_requests) == 1
+
+
+def test_clock_read_reserves_authenticated_budget_even_for_short_probe(camera):
+    camera.clock_delay = 0.7
+    connector = onvif.OnvifConnector(timeout_seconds=0.8)
+    started = time.monotonic()
+    profiles = asyncio.run(connector.probe("127.0.0.1", camera.port, False, _USERNAME, _PASSWORD))
+    assert len(profiles) == 1
+    assert time.monotonic() - started < 0.6
+    assert len(camera.clock_requests) == 1
+
+
+def test_extreme_clock_arithmetic_falls_back_instead_of_rejecting_authentication():
+    client = onvif._Client("127.0.0.1", _USERNAME, _PASSWORD, time.monotonic() + 1)
+    client._camera_clock = datetime.max.replace(tzinfo=UTC), time.monotonic() - 2
+    assert client._created_at() is None
+    assert client._camera_clock is None
 
 
 def test_real_media2_fallback_only_after_unsupported_action(camera):

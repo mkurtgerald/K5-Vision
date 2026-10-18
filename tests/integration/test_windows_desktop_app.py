@@ -476,6 +476,8 @@ def _failure_detail(error):
         ("Actual ONVIF credential/profile request failed", "onvif_profiles_failed"),
         ("Profile-based camera connection failed", "onvif_connect_failed"),
         ("Actual authenticated ONVIF SOAP flow was incomplete", "onvif_protocol_incomplete"),
+        ("Actual ONVIF camera clock compensation was not proven", "onvif_clock_unproven"),
+        ("ONVIF profile acceptance claimed unverified video readiness", "onvif_false_video_ready"),
         ("Manual stream field remained", "manual_stream_field"),
         ("Browser sent a manual camera stream address", "manual_stream_request"),
         ("Camera stream address entered the DOM", "stream_uri_dom"),
@@ -757,7 +759,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         stage = "generated_camera_fixture"
         processes, source_uri = _generate_fixture(parent, media, ffmpeg, upstream_port, helpers)
         onvif_camera = _helpers("onvif_camera_fixture").OnvifCameraFixture(
-            host="127.0.0.1", stream_uri=source_uri
+            host="127.0.0.1", stream_uri=source_uri, clock_skew_seconds=1200
         )
         stage = "actual_browser_enrollment"
         playwright = browser_api.sync_playwright().start()
@@ -799,6 +801,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["no_manual_stream_uri"] = True
         receipt["bounded_discovery_executed"] = discovery_completed
         receipt["generated_camera_discovered"] = False
+        receipt.update(browser_helpers._onvif_clock_proof(onvif_camera))
         browser_helpers._assert_no_browser_storage(page)
         route = "/api/v1/operator/cameras/" + camera_id
         page.locator("#add-camera-dialog").wait_for(state="hidden")

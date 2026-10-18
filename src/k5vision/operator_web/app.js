@@ -21,6 +21,7 @@
     spans: [], selectedSpan: null, historyEpoch: 0, historyRolling: true, signingOut: false,
     dialogMode: "add", cameraSetupEpoch: 0, diagnostics: null, statusUnavailable: false,
     cameraSetupBusy: false, cameraSetupController: null, cameraProbe: null, cameraProbeTimer: null,
+    cameraConnectionNotice: null,
     removeTarget: null, removing: false,
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
     personFrameId: 0,
@@ -37,9 +38,40 @@
     element.classList.toggle("error", error);
   }
 
-  function notice(value, error = false) {
+  function notice(value, error = false, owner = "") {
+    if (owner !== "camera_connection") state.cameraConnectionNotice = null;
     message("workspace-message", value, error);
     $("workspace-message").hidden = !value;
+  }
+
+  function cameraConnectionStatus(camera, workerStatus) {
+    if (workerStatus === "unavailable" || camera?.status === "unavailable") return {
+      text: "Camera saved. The media service is unavailable. Live video and recording are not confirmed.",
+      error: true,
+    };
+    if (camera?.status === "live") {
+      if (workerStatus === "disk_full") return {
+        text: "Camera stream is reaching K5. Recording is paused because storage needs attention.",
+        error: true,
+      };
+      return camera.recording === true
+        ? { text: "Camera stream is reaching K5. Recording is enabled.", error: false }
+        : { text: "Camera stream is reaching K5. Recording is not active.", error: true };
+    }
+    if (camera?.status === "disconnected") return {
+      text: "Camera saved, but its video stream is disconnected. Check its power, network and video permissions, then use Reconnect camera.",
+      error: true,
+    };
+    return {
+      text: "Camera saved. Waiting for its video stream. Live video and recording are not confirmed yet.",
+      error: false,
+    };
+  }
+
+  function renderCameraConnectionNotice(camera) {
+    if (!camera || state.cameraConnectionNotice !== camera.device_id) return;
+    const result = cameraConnectionStatus(camera, state.workerStatus);
+    notice(result.text, result.error, "camera_connection");
   }
 
   function apiMessage(error, fallback) {
@@ -151,6 +183,7 @@
     state.workerStatus = "ready";
     state.diagnostics = null;
     state.statusUnavailable = false;
+    state.cameraConnectionNotice = null;
     state.removeTarget = null;
     state.removing = false;
     state.selected = null;
@@ -268,7 +301,7 @@
     $("update-source-button").hidden = !camera || state.account?.role !== "administrator";
     $("remove-camera-button").hidden = !camera || state.account?.role !== "administrator";
     $("person-view-panel").hidden = !camera || camera.analytics_status !== "configured";
-    $("recording-badge").textContent = state.workerStatus === "disk_full" ? "Recording paused" : "Recording";
+    $("recording-badge").textContent = state.workerStatus === "disk_full" ? "Recording paused" : "Recording enabled";
     $("recording-badge").classList.toggle("paused", state.workerStatus === "disk_full");
     if (camera) {
       const status = statusDetails(camera);
@@ -284,6 +317,7 @@
         livePlaceholder("Camera disconnected", "Check the camera’s power and network, or use Reconnect camera to test its account and video stream. Recording history is still available.", true);
         message("live-state", "Camera disconnected");
       }
+      renderCameraConnectionNotice(camera);
     } else $("analytics-state").textContent = "";
     renderPersonControls();
   }
@@ -360,6 +394,8 @@
     state.selectionController?.abort();
     stopLive(); stopPlayback();
     state.selected = null; state.media = null;
+    state.cameraConnectionNotice = null;
+    notice("");
     resetHistory(); renderCameras();
     livePlaceholder(title, description);
     message("live-state", "No camera selected");
@@ -413,7 +449,11 @@
     state.selected = deviceId;
     state.media = null;
     stopLive(); stopPlayback(); resetHistory();
-    renderCameras(); notice("");
+    if (state.cameraConnectionNotice !== deviceId) {
+      state.cameraConnectionNotice = null;
+      notice("");
+    }
+    renderCameras();
     livePlaceholder("Connecting to camera", "Opening your live view…");
     message("live-state", "Connecting…");
     try {
@@ -1140,7 +1180,7 @@
       }
       $("camera-profile-section").hidden = false;
       if (!first) {
-        message("add-camera-message", "The camera connected, but no H.264 stream is available. Enable H.264 in the camera settings, then test again.", true);
+        message("add-camera-message", "The camera account was accepted, but no H.264 stream is available. Enable H.264 in the camera settings, then test again.", true);
         return;
       }
       state.cameraProbe = { id: tested.probe_id, profiles };
@@ -1156,7 +1196,7 @@
         message("add-camera-message", "The connection test expired. Enter the camera password and test again.", true);
         setCameraSetupBusy(false);
       }, lifetime * 1000);
-      message("add-camera-message", "Connection verified. Choose an H.264 stream, then connect the camera.");
+      message("add-camera-message", "Camera account accepted. Choose an H.264 stream; video is checked after connecting.");
     } catch (error) {
       if (controller.signal.aborted || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       message("add-camera-message", cameraSetupError(error), true);
@@ -1193,11 +1233,12 @@
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       closeAddCamera();
       const completedEpoch = state.cameraSetupEpoch;
-      notice(updating
-        ? "Camera reconnected. Live video and recording will resume as it connects."
-        : "Camera connected. Live video and recording will begin as it becomes available.");
-      await refreshCameras();
       const deviceId = created.device_id || created.camera?.device_id;
+      const cameraStatus = created.camera || created;
+      state.cameraConnectionNotice = deviceId || null;
+      const connection = cameraConnectionStatus(cameraStatus, state.workerStatus);
+      notice(connection.text, connection.error, "camera_connection");
+      await refreshCameras();
       if (deviceId && completedEpoch === state.cameraSetupEpoch) await selectCamera(deviceId);
     } catch (error) {
       if (controller.signal.aborted || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;

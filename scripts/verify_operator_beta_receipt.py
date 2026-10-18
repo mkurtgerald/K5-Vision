@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -70,7 +71,7 @@ _TRUE = {
         "ui_history_and_gaps script_visible_credentials_absent logout_revoked_media_and_session "
         "owned_cleanup ui_service_storage_status ui_removal_cancel_preserved_camera "
         "ui_removal_preserved_files_and_denied_media ui_reenrollment_restored_history "
-        "onvif_credential_profile_enrollment no_manual_stream_uri"
+        "onvif_credential_profile_enrollment no_manual_stream_uri onvif_clock_skew_compensated"
     ).split(),
     "person": (
         "single_flight_busy independent_view_workers third_view_capacity_denied "
@@ -129,6 +130,20 @@ def verify(lane: str, path: Path) -> list[dict]:
             _require(receipt.get("playwright_version") == "1.58.0")
             _require(bool(receipt.get("browser_version")))
             _require(receipt.get("camera_count") == 2)
+            offsets = receipt.get("onvif_clock_offsets_seconds")
+            reads = receipt.get("onvif_time_read_counts")
+            _require(type(offsets) is list and len(offsets) == 2)
+            _require(
+                all(
+                    type(offset) in (int, float)
+                    and math.isfinite(offset)
+                    and 600 < abs(offset) < 86400
+                    for offset in offsets
+                )
+            )
+            _require(offsets[0] > 0 > offsets[1])
+            _require(type(reads) is list and len(reads) == 2)
+            _require(all(type(count) is int and 0 < count <= 128 for count in reads))
             _require(receipt.get("browser_script_errors") == 0)
             for field, count in (("live_decoded_frames", 3), ("playback_decoded_frames", 2)):
                 frames = receipt.get(field, [])

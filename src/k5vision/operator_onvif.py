@@ -43,7 +43,7 @@ import time
 import xml.etree.ElementTree as ET
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 from urllib.request import parse_http_list, parse_keqv_list
 from uuid import uuid4
@@ -56,6 +56,7 @@ _SOAP = "http://www.w3.org/2003/05/soap-envelope"
 _WSD = "http://schemas.xmlsoap.org/ws/2005/04/discovery"
 _WSA = "http://schemas.xmlsoap.org/ws/2004/08/addressing"
 _MAX_RESPONSE = 1024 * 1024
+_CLOCK_READ_SECONDS = 2.0
 _CODES = frozenset({"auth_failed", "unreachable", "unsupported", "invalid_response", "busy"})
 _TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 
@@ -241,9 +242,11 @@ class _Connection(http.client.HTTPConnection):
             wire.close()
 
 
-def _envelope(operation: str, username: str, password: str) -> bytes:
+def _envelope(
+    operation: str, username: str, password: str, *, created_at: datetime | None = None
+) -> bytes:
     nonce = secrets.token_bytes(16)
-    created = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    created = (created_at or datetime.now(UTC)).isoformat(timespec="seconds").replace("+00:00", "Z")
     digest = base64.b64encode(
         hashlib.sha1(nonce + created.encode() + password.encode(), usedforsecurity=False).digest()
     ).decode("ascii")
@@ -283,8 +286,72 @@ class _Client:
         self.host, self.username, self.password = host, username, password
         self.deadline = deadline
         self.require_secure = require_secure
+        self._camera_clock: tuple[datetime, float] | None = None
         self.challenge: dict[str, str] | None = None
         self.nonce_count = 0
+
+    def synchronize_clock(self, endpoint: str) -> None:
+        """Read the device's UTC clock anonymously without changing either clock.
+
+        This optional PRE_AUTH action has its own short deadline. An older or
+        restricted camera can still use the remaining authenticated probe budget.
+        """
+        started = time.monotonic()
+        remaining = self.deadline - started
+        if remaining <= 0:
+            return
+        clock_reader = _Client(
+            self.host,
+            "",
+            "",
+            started + min(_CLOCK_READ_SECONDS, remaining / 4),
+            require_secure=self.require_secure,
+        )
+        try:
+            response = clock_reader.request(
+                endpoint,
+                "<tds:GetSystemDateAndTime/>",
+                _DEVICE,
+                "GetSystemDateAndTime",
+                authenticated=False,
+            )
+            utc = _find(response, "UTCDateTime")
+            if utc is None:
+                return
+            date, clock = _find(utc, "Date"), _find(utc, "Time")
+            if date is None or clock is None:
+                return
+            camera_time = datetime(
+                int(_text(date, "Year")),
+                int(_text(date, "Month")),
+                int(_text(date, "Day")),
+                int(_text(clock, "Hour")),
+                int(_text(clock, "Minute")),
+                int(_text(clock, "Second")),
+                tzinfo=UTC,
+            )
+            # Refuse a boundary date that cannot advance through this probe.
+            camera_time + timedelta(seconds=max(0, self.deadline - started) + 1)
+            self._camera_clock = camera_time, (started + time.monotonic()) / 2
+        except (
+            OnvifError,
+            OSError,
+            ValueError,
+            OverflowError,
+            ET.ParseError,
+            http.client.HTTPException,
+        ):
+            return
+
+    def _created_at(self) -> datetime | None:
+        if self._camera_clock is None:
+            return None
+        camera_time, sampled = self._camera_clock
+        try:
+            return camera_time + timedelta(seconds=time.monotonic() - sampled)
+        except OverflowError:
+            self._camera_clock = None
+            return None
 
     def _authorization(self, path: str) -> str:
         challenge = self.challenge
@@ -334,7 +401,15 @@ class _Client:
             fields.append(f'opaque="{challenge["opaque"]}"')
         return "Digest " + ", ".join(fields)
 
-    def request(self, endpoint: str, operation: str, namespace: str, action: str) -> ET.Element:
+    def request(
+        self,
+        endpoint: str,
+        operation: str,
+        namespace: str,
+        action: str,
+        *,
+        authenticated: bool = True,
+    ) -> ET.Element:
         endpoint = _endpoint(endpoint, self.host)
         parsed = urlsplit(endpoint)
         if self.require_secure and parsed.scheme != "https":
@@ -364,17 +439,26 @@ class _Client:
                     "SOAPAction": f'"{namespace}/{action}"',
                     "Connection": "close",
                 }
-                authorization = self._authorization(path)
+                authorization = self._authorization(path) if authenticated else ""
                 if authorization:
                     headers["Authorization"] = authorization
                 connection.request(
-                    "POST", path, _envelope(operation, self.username, self.password), headers
+                    "POST",
+                    path,
+                    _envelope(
+                        operation,
+                        self.username if authenticated else "",
+                        self.password if authenticated else "",
+                        created_at=self._created_at() if authenticated else None,
+                    ),
+                    headers,
                 )
                 response = connection.getresponse()
                 if response.status in {401, 403}:
                     challenge = response.getheader("WWW-Authenticate", "")
                     if (
-                        response.status == 401
+                        authenticated
+                        and response.status == 401
                         and attempt == 0
                         and challenge.lower().startswith("digest ")
                     ):
@@ -476,6 +560,7 @@ def _probe(host: str, port: int, secure: bool, username: str, password: str, bud
     base = f"{'https' if secure else 'http'}://{authority}:{port}"
     client = _Client(host, username, password, time.monotonic() + budget, require_secure=secure)
     device = base + "/onvif/device_service"
+    client.synchronize_clock(device)
     media = base + "/onvif/media_service"
     try:
         capabilities = client.request(

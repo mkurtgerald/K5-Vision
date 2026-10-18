@@ -14,7 +14,7 @@ import hmac
 import secrets
 import threading
 import xml.etree.ElementTree as ET
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 from xml.sax.saxutils import escape
@@ -31,7 +31,9 @@ _TOKEN = "generated-h264-profile"
 class OnvifCameraFixture:
     """Own bounded actual HTTP requests and never retain SOAP/credential payloads."""
 
-    def __init__(self, *, host: str, stream_uri: str, width=320, height=240) -> None:
+    def __init__(
+        self, *, host: str, stream_uri: str, width=320, height=240, clock_skew_seconds=0
+    ) -> None:
         source = urlsplit(stream_uri)
         if host not in {"127.0.0.1", "127.0.0.2"} or (
             source.scheme != "rtsp" or source.hostname != host or source.username is not None
@@ -43,14 +45,19 @@ class OnvifCameraFixture:
             or not (1 <= width <= 4096 and 1 <= height <= 4096)
         ):
             raise ValueError("Generated ONVIF fixture geometry was refused")
+        if type(clock_skew_seconds) is not int or abs(clock_skew_seconds) > 86400:
+            raise ValueError("Generated ONVIF fixture clock skew was refused")
         self.host = host
         self.width, self.height = width, height
+        self.clock_skew_seconds = clock_skew_seconds
         self.username = "generated-camera-user"
         self.password = secrets.token_urlsafe(24)
         self._stream_uri = stream_uri
         self._lock = threading.Lock()
         self._authenticated_requests = {}
         self._authentication_failures = 0
+        self._time_read_count = 0
+        self._accepted_clock_offsets = []
         self._nonces = set()
         fixture = self
 
@@ -88,6 +95,25 @@ class OnvifCameraFixture:
                     action = body[0].tag.rsplit("}", 1)[-1]
                 except (ValueError, ET.ParseError):
                     self.reply(400, b"")
+                    return
+                if (
+                    self.path == "/onvif/device_service"
+                    and body[0].tag == "{" + _DEVICE + "}GetSystemDateAndTime"
+                ):
+                    # This ONVIF read is the only anonymous action. No time-setting
+                    # action is offered, and credentials must not accompany the read.
+                    if (
+                        document.find(".//{" + _WSSE + "}UsernameToken") is not None
+                        or self.headers.get("Authorization") is not None
+                    ):
+                        self.reply(403, b"")
+                        return
+                    with fixture._lock:
+                        if fixture._time_read_count >= 128:
+                            self.reply(429, b"")
+                            return
+                        fixture._time_read_count += 1
+                    self.reply(200, fixture._envelope(fixture._system_time_response()))
                     return
                 if not fixture._authenticate(document):
                     with fixture._lock:
@@ -129,10 +155,12 @@ class OnvifCameraFixture:
                 return False
             nonce = base64.b64decode(nonce_text, validate=True)
             when = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            local_now = datetime.now(UTC)
+            camera_now = local_now + timedelta(seconds=self.clock_skew_seconds)
             if (
                 len(nonce) < 16
                 or when.tzinfo is None
-                or abs((datetime.now(UTC) - when).total_seconds()) > 120
+                or abs((camera_now - when).total_seconds()) > 120
             ):
                 return False
             expected = base64.b64encode(
@@ -144,6 +172,7 @@ class OnvifCameraFixture:
                 if nonce in self._nonces or len(self._nonces) >= 128:
                     return False
                 self._nonces.add(nonce)
+                self._accepted_clock_offsets.append((when - local_now).total_seconds())
             return True
         except (AttributeError, TypeError, ValueError):
             return False
@@ -156,6 +185,19 @@ class OnvifCameraFixture:
             f'xmlns:trt="{_MEDIA}" xmlns:tt="{_SCHEMA}">'
             "<s:Body>" + payload + "</s:Body></s:Envelope>"
         ).encode()
+
+    def _system_time_response(self):
+        now = datetime.now(UTC) + timedelta(seconds=self.clock_skew_seconds)
+        return (
+            "<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime>"
+            "<tt:DateTimeType>Manual</tt:DateTimeType><tt:DaylightSavings>false</tt:DaylightSavings>"
+            "<tt:UTCDateTime><tt:Time>"
+            f"<tt:Hour>{now.hour}</tt:Hour><tt:Minute>{now.minute}</tt:Minute>"
+            f"<tt:Second>{now.second}</tt:Second></tt:Time><tt:Date>"
+            f"<tt:Year>{now.year}</tt:Year><tt:Month>{now.month}</tt:Month>"
+            f"<tt:Day>{now.day}</tt:Day></tt:Date></tt:UTCDateTime>"
+            "</tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse>"
+        )
 
     def _response(self, action, request, path):
         media = f"http://{self.host}:{self.port}/onvif/media_service"
@@ -213,6 +255,32 @@ class OnvifCameraFixture:
     def rejected_credentials(self) -> bool:
         with self._lock:
             return self._authentication_failures > 0
+
+    def clock_skew_evidence(self) -> dict:
+        """Return finite proof from accepted WSSE timestamps, never configured time alone."""
+        with self._lock:
+            offsets = self._accepted_clock_offsets
+            complete = all(
+                self._authenticated_requests.get(action, 0) > 0
+                for action in ("GetCapabilities", "GetProfiles", "GetStreamUri")
+            )
+            compensated = (
+                600 < abs(self.clock_skew_seconds) < 86400
+                and self._time_read_count > 0
+                and complete
+                and bool(offsets)
+                and all(
+                    600 < abs(offset) < 86400 and abs(offset - self.clock_skew_seconds) <= 120
+                    for offset in offsets
+                )
+            )
+            return {
+                "onvif_clock_skew_compensated": compensated,
+                "onvif_clock_offset_seconds": round(sum(offsets) / len(offsets), 3)
+                if offsets
+                else 0,
+                "onvif_time_read_count": self._time_read_count,
+            }
 
     def close(self) -> None:
         self._server.shutdown()

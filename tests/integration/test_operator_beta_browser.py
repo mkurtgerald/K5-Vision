@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import secrets
@@ -129,6 +130,23 @@ def _onvif_helpers():
     return module
 
 
+def _onvif_clock_proof(fixture):
+    """Require actual anonymous time read and accepted skewed WSSE timestamps."""
+    proof = fixture.clock_skew_evidence()
+    offset = proof.get("onvif_clock_offset_seconds")
+    reads = proof.get("onvif_time_read_count")
+    _require(
+        proof.get("onvif_clock_skew_compensated") is True
+        and type(offset) in (int, float)
+        and math.isfinite(offset)
+        and 600 < abs(offset) < 86400
+        and type(reads) is int
+        and 1 <= reads <= 128,
+        "Actual ONVIF camera clock compensation was not proven",
+    )
+    return proof
+
+
 def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=False):
     """Use actual credential/profile controls without entering a stream address."""
     __tracebackhide__ = True
@@ -208,6 +226,14 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
         ]
         _require(bool(selected), "Generated H264 camera profile was not offered")
         page.locator("#camera-profile").select_option(selected[0]["id"])
+        _require(
+            page.locator("#add-camera-message").inner_text()
+            == (
+                "Camera account accepted. Choose an H.264 stream; "
+                "video is checked after connecting."
+            ),
+            "ONVIF profile acceptance claimed unverified video readiness",
+        )
         page.wait_for_function("() => document.getElementById('new-camera-password').value === ''")
         with page.expect_response(
             lambda response: (
@@ -599,7 +625,9 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             listener.close()
         stage = "upstreams_starting"
         sources = []
-        for (_, host, color), port in zip(_CAMERAS, upstream_ports, strict=True):
+        for camera_index, ((_, host, color), port) in enumerate(
+            zip(_CAMERAS, upstream_ports, strict=True)
+        ):
             source = f"rtsp://{host}:{port}/generated"
             sources.append(source)
             config = private / f"private {color} upstream.json"
@@ -643,7 +671,13 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                     return False
 
             runtime._wait(upstream_ready, label="Generated camera upstream listener", timeout=10)
-            onvif_cameras.append(_onvif_helpers().OnvifCameraFixture(host=host, stream_uri=source))
+            onvif_cameras.append(
+                _onvif_helpers().OnvifCameraFixture(
+                    host=host,
+                    stream_uri=source,
+                    clock_skew_seconds=1200 if camera_index == 0 else -1200,
+                )
+            )
         for video, source in zip(videos, sources, strict=True):
             stage = "generated_publishers_starting"
             publisher = helpers._start(
@@ -781,6 +815,19 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         receipt["onvif_wrong_password_rejected"] = True
         receipt["no_manual_stream_uri"] = True
         receipt["generated_camera_discovered"] = False
+        clock_proofs = [_onvif_clock_proof(camera) for camera in onvif_cameras]
+        _require(
+            clock_proofs[0]["onvif_clock_offset_seconds"] > 600
+            and clock_proofs[1]["onvif_clock_offset_seconds"] < -600,
+            "Opposite ONVIF camera clock offsets were not preserved",
+        )
+        receipt["onvif_clock_skew_compensated"] = True
+        receipt["onvif_clock_offsets_seconds"] = [
+            proof["onvif_clock_offset_seconds"] for proof in clock_proofs
+        ]
+        receipt["onvif_time_read_counts"] = [
+            proof["onvif_time_read_count"] for proof in clock_proofs
+        ]
 
         def both_live():
             views = client.json("/api/v1/operator/cameras")["cameras"]

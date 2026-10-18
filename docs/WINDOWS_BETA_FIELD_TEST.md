@@ -1,113 +1,150 @@
 # Windows beta field qualification
 
-The automated browser gate runs real K5, Caddy, MediaMTX and Microsoft Edge on
-Windows with two generated H.264 streams. It checks the operator interface,
-decoded live and recorded video, camera switching, concurrent recording, an
-isolated camera outage, history gaps, sign-out and cleanup. Its receipt names the
-actual browser version and platform. These results qualify the assembled
-software at **two 320×240 streams, 15 fps, for less than three minutes**. They do
-not establish physical-camera compatibility, production capacity or endurance.
+Use this procedure with the native desktop installer and representative physical
+cameras. All tester steps use the installer, dashboard, Windows Settings, File
+Explorer or Task Manager. Follow [the desktop guide](WINDOWS_DESKTOP_BETA.md) for
+setup; there is no terminal, separate Python installation or manual stream URL
+step.
 
-Use the following field run to qualify an actual beta installation. Record
-failures as defects with the exact package revision and step. A skipped or
-unattempted step stays **pending**, even when the automated checks pass.
+The delivered candidate at
+`a581098a1510d3b214c11fbfa3d28625b9419d49` passed
+[native graphical Windows acceptance](https://github.com/mkurtgerald/K5-Vision/actions/runs/39159696655)
+and [five-lane Windows regression](https://github.com/mkurtgerald/K5-Vision/actions/runs/39159647805).
+The GUI test used generated H.264 media and a real SOAP camera fixture for
+credentials, profiles and automatic stream resolution. It ran discovery but
+used numeric-IP fallback because its fixture was not discovered. Separate
+actual multicast tests passed. Physical-camera compatibility, capacity and
+endurance remain pending.
 
-## Prepare one Windows beta station
+Record failures with the exact candidate revision and step. Leave every
+unattempted or incomplete gate **pending**.
 
-1. Use a dedicated Windows 10/11 x64 station and the exact proposed beta package.
-   Record the package SHA256, source revision, Windows version, CPU, RAM, free
-   recording disk space, Python version and Edge version. For the current
-   launcher, use Python 3.12.4 or newer within 3.12.x. Follow
-   [the Windows pilot guide](WINDOWS_OPERATOR_PILOT.md) for installation and
-   startup.
-2. Use two cameras representative of the first users' hardware. Record each
-   camera model, firmware, H.264 resolution, fps and configured bitrate. Use a
-   numeric camera IP and its actual RTSP path in the setup dialog. Check that
-   stream profiles remain within the capacity intended for this beta.
-3. Use a new, dedicated K5 state and recording profile. Keep the launcher console
-   open throughout the foreground pilot run. Recordings continue with the
-   browser closed; closing the launcher or logging off Windows ends this pilot.
-4. Keep passwords, IP addresses, RTSP addresses, serial numbers, source-store
-   files, private logs and recordings out of the public repository and CI
-   artifacts. Share an aggregate receipt and redacted defect descriptions.
-   Consent and retention for real recordings follow the operator's site policy.
+## Prepare the Windows station
 
-## First field gate: two cameras and ordinary failures
+1. Use Windows 10/11 x64 on the intended test hardware and a dedicated Windows
+   account or test station. Record the source revision and installer SHA-256
+   from its supplied release metadata, Windows version, CPU, RAM, available
+   recording disk space and browser version. Keep the metadata with the report.
+2. Double-click **K5VisionSetup.exe**, accept its software terms, choose
+   **Install**, and leave **Launch K5 Vision** selected when choosing
+   **Finish**. The supplied download may include an ONVIF qualification suffix
+   in its filename.
+   First launch needs Internet access to download and verify the native workers.
+   Later launches reuse the verified private cache.
+3. In the first-run window, choose an administrator username, enter a password
+   of at least 12 characters twice, and select **Create account**. Sign in to
+   the browser dashboard. An existing K5 account/profile is preserved. This
+   candidate is unsigned; report a Windows installation block as a delivery
+   issue instead of inventing a setup workaround.
+4. Choose two representative ONVIF cameras with clearly different scenes.
+   Record each model, firmware and H.264 resolution/frame rate/bitrate. Enable
+   ONVIF and an H.264 profile in each camera's own settings if required. Camera
+   accounts may differ from the K5 administrator account.
+5. In **Add a camera**, select **Find cameras on this network**, choose the
+   camera, enter its name and camera credentials, then select **Test connection**.
+   Choose an H.264 **Video stream** and select **Connect camera**. If discovery
+   finds nothing, enter the numeric camera IP in the same screen. Set its camera
+   settings port and HTTPS option when needed. K5 retrieves the stream address.
+6. Keep Windows signed in. Closing either window leaves recording active in the
+   notification area. **Stop and quit**, sign-out and shutdown end recording.
+   Test video must follow the site's consent and retention policy.
 
-Complete the following on the target station with Edge. Use clearly different
-camera scenes so a wrong-camera image is recognizable. Repeat browser playback
-in Chrome when Chrome support is included in the beta promise.
+Keep camera addresses, credentials, serial numbers, private source-store files,
+logs and recordings out of the public repository and CI artifacts. Public reports
+contain aggregate observations and redacted defects only.
+
+## Physical cameras and ordinary recovery
+
+Complete these checks in Edge. Repeat browser playback in Chrome before making
+a field-qualified Chrome compatibility claim.
 
 | Action | Required observation |
 | --- | --- |
-| Start the package, sign in and add both cameras | Setup clears the RTSP input; both camera names and connection/recording states appear; no source credential is shown. |
-| Switch cameras repeatedly during live viewing | The title and actual image always match; video advances; the second camera continues recording while the first is viewed. |
-| Close all browser windows for five minutes, then reopen and sign in | Both cameras kept recording; history has footage for the closed-browser interval. |
-| Disconnect one camera for at least 30 seconds | That camera becomes disconnected; the other camera stays live and recording. |
-| Reconnect it without restarting K5 | Live video and recording recover; history identifies the missing interval instead of suggesting continuous footage. |
-| Play and download intervals from both cameras before and after the outage | The correct camera scene appears; video advances; a downloaded MP4 plays in an independent player. |
-| Update one camera's RTSP source through the interface | The source input starts empty and clears afterward; the camera reconnects using the new source; old recordings remain available. |
-| Open Remove camera, then select Keep camera | The named camera remains enrolled; its history stays available. |
-| Confirm removal, then re-add the same camera with its original name/IP/RTSP source | Removal stops new viewing/recording and denies saved media URLs for that camera; it preserves recording files and the other camera. Re-adding restores retained history. |
-| Open Connection help and inspect service/storage status | The status matches actual service readiness and recording disk capacity; the help identifies camera-network, stream-format and credential setup checks. |
-| Sign out with live/playback URLs already open | The workspace and players clear; new requests to saved media URLs are denied; signing in again restores permitted access. |
-| Stop K5, then restart the same profile | Sign-in, saved cameras and previously recorded intervals survive; old sessions cannot open protected media. |
-| Attempt a second launch against the same running profile | The duplicate is refused; the first instance remains usable and recording. |
-| Stop the foreground launcher | K5 and its owned media/gateway workers exit; the profile can be started again cleanly. |
+| Discover and connect both cameras through the account/profile wizard | Both names and connection/recording states appear; no password or stream URL is displayed; record whether discovery or IP fallback was used |
+| Test an incorrect camera password, then correct it | The camera error is clear, the K5 administrator stays signed in, and the correct account connects |
+| Switch cameras repeatedly during live viewing | The selected name matches the actual scene, video advances, and both cameras keep recording |
+| Close all browser windows and the K5 Vision window for five minutes | K5 remains in the notification area and records; opening its Start/Desktop shortcut restores the same application and history for that interval |
+| Disconnect one camera for at least 30 seconds | That camera becomes disconnected while the other stays live and recording |
+| Reconnect it without restarting K5 | Live video and recording recover; history represents the missing interval accurately |
+| Play and download intervals from both cameras around the outage | The correct scene appears, video advances, and an independent player opens the downloaded MP4 |
+| Use the camera reconnect control, retest its account and choose its H.264 profile | The wizard updates the connection while preserving the original camera identity and retained history |
+| Open Remove camera, then select Keep camera | The named camera stays enrolled and its history stays available |
+| Confirm removal, then connect the camera again using its original name and host | Removal stops new viewing/recording; the other camera is unaffected; reconnecting restores the original identity and retained history, subject to retention |
+| Inspect connection help and service/storage status | Readiness and disk use match the station; guidance identifies network, ONVIF account, profile and storage checks |
+| Sign out with live or playback already open | The workspace and players clear, protected access ends for that session, and signing in restores authorized access |
+| Select Stop and quit, then reopen K5 Vision | The application and owned workers stop; the same account, cameras and retained history work after restart |
+| Open the Start/Desktop shortcut while K5 is already running | The existing application reopens; no duplicate recorder starts |
+| Stop K5, install the same candidate again and restart it | Account, camera identities and recordings survive; setup refuses to change application files while the recorder is running |
 
-Record elapsed reconnect and restart times. Do not substitute refreshing the
-page for automatic source recovery, or re-enrolling cameras for restart
-persistence. If the package offers an unattended Windows service, qualify
-reboot, logoff, service stop/start and removal separately using its own guide;
-the foreground pilot result does not establish those behaviors.
+Record outage recovery and restart times. Automatic camera recovery must work
+without re-enrollment. Windows sign-out and shutdown are stop events for this
+signed-in-user candidate; no boot-service or unattended-reboot claim is part of
+this qualification.
 
-## Capacity and recording retention gate
+For removal testing, use **Stop and quit**, then remove K5 through **Windows
+Settings → Apps → Installed apps**. Accounts, saved cameras and recordings remain
+in the separate private profile. Reinstall through the EXE and confirm that the
+same data returns. Perform this on the dedicated test station.
 
-Run the intended beta camera count and actual stream profiles for **at least
-eight hours** on the target station. Include concurrent live viewing and
-recorded playback for the last hour. Record five-minute CPU/RAM samples, disk
-growth, camera disconnect/reconnect counts and playback failures. Report the
-maximum observed values and any sustained growth. A two-camera test is a
-two-camera acceptance; it does not imply that the supported configuration limit
-of 64 enrolled cameras can all be recorded on that hardware.
+## Measured capacity and retention
 
-Use a disposable profile with generated or consented test video to exercise
-quota retention. The current launcher accepts `-RecordingLimitGb 1`; choose a
-test bitrate and run duration that actually fills that quota. Verify that old,
-closed segments disappear from disk and history, while recent recordings remain
-playable. Record the observed maximum disk use and whether a pause occurred.
-Do not fill or delete unrelated disk content to simulate failure. A low-space
-run, if needed, belongs on a dedicated disposable Windows test disk or VM.
+Run the intended camera count and actual H.264 profiles for **at least eight
+hours**, including concurrent live viewing and recorded playback during the
+last hour. Use Task Manager to record station CPU and memory every five minutes.
+Use dashboard storage status and File Explorer to record recording growth.
+Report maximum observed values, sustained growth, unexpected disconnects and
+playback failures. A two-camera result qualifies that tested configuration;
+the 64-camera enrollment limit is not a hardware capacity guarantee.
 
-After the run, restart K5 and recheck earlier retained recordings and the final
-hour. The default age retention is one day, so confirming age-based deletion
-requires a separate run exceeding 24 hours. Eight hours qualifies an eight-hour
-pilot only; mark the 24-hour retention gate pending until it has executed.
+The desktop candidate uses a **20 GiB recording quota** and **one-day age
+retention**. With consented test media, run long enough to exercise quota
+retention and verify that old closed segments disappear from disk and history
+while recent recordings remain playable. If the run does not reach the quota,
+leave quota retention pending. Do not fill or delete unrelated disk content to
+manufacture a low-space condition; a dedicated low-space station requires its
+own controlled test plan.
 
-## Receipt and beta decision
+The default private recording directory is
+`%LOCALAPPDATA%\K5VisionOperatorState\recordings`; open it in File Explorer.
+Keep its contents private. After the capacity run, restart K5 and recheck
+retained footage from the beginning and final hour. Confirming one-day age
+deletion requires a run exceeding 24 hours.
 
-Store this aggregate record with the tested revision. Use actual observations;
-do not set a gate to passed based on a synthetic CI receipt. The public receipt
-contains no camera address, password, recording, private file path or session.
+## Endurance and beta decision
+
+Complete **at least a 24-hour recording run** at the proposed qualified capacity,
+including a camera outage and an application restart. Check timestamps,
+unexpected gaps, retained playback and sustained memory/disk growth. Extend the
+run when defects or drift require more evidence; eight hours alone does not
+satisfy this gate.
+
+Keep this aggregate record with the tested installer. It can be completed as a
+normal field report; the structure below is a reporting template, not a command
+to run. Use actual observations and keep unfinished gates pending.
 
 ```json
 {
-  "schema_version": "1",
-  "source_revision": "<exact 40-character Git SHA>",
-  "package_sha256": "<exact package SHA256>",
+  "schema_version": "2",
+  "source_revision": "<exact installer source revision>",
+  "setup_sha256": "<installer hash from release metadata>",
   "platform": "Windows",
   "windows_version": "<observed version>",
-  "browser_version": "<observed Edge version>",
-  "physical_camera_count": 2,
-  "stream_profiles": ["<model, firmware, H264 resolution/fps/bitrate>"],
+  "browser_version": "<observed version>",
+  "physical_camera_count": 0,
+  "stream_profiles": [
+    "<model, firmware, H264 resolution/fps/bitrate>"
+  ],
+  "discovery_or_ip_fallback": "<observed result>",
   "duration_hours": 0,
-  "field_ui_and_media_gate": "pending",
+  "physical_ui_and_media_gate": "pending",
+  "camera_account_and_profile_gate": "pending",
   "source_reconnect_gate": "pending",
-  "restart_and_signout_gate": "pending",
-  "capacity_gate": "pending",
+  "tray_and_single_instance_gate": "pending",
+  "restart_signout_and_upgrade_gate": "pending",
+  "capacity_8h_gate": "pending",
   "quota_retention_gate": "pending",
   "age_retention_24h_gate": "pending",
-  "unattended_service_gate": "pending",
+  "endurance_24h_gate": "pending",
   "cpu_percent_max": null,
   "ram_mib_max": null,
   "recording_disk_gib_max": null,
@@ -117,45 +154,10 @@ contains no camera address, password, recording, private file path or session.
 }
 ```
 
-A limited recording beta can proceed for the qualified hardware and camera
-count when the first field gate, eight-hour capacity gate and quota retention
-gate pass with no blocking defect. Publish the remaining pending gates and the
-foreground-operation requirement with that beta. Person detection needs its
-own model, runtime, accuracy and camera-scene qualification; this recording
-receipt makes no analytics claim.
-
-## Reproduce the automated browser gate
-
-This is a developer check. It needs Python development dependencies, installed
-Edge, `playwright==1.58.0`, and explicitly supplied MediaMTX, Caddy, FFmpeg and
-ffprobe executables. The native CI workflow verifies the donor/development tool
-manifests before running them. Playwright and FFmpeg are not product runtime
-dependencies or bundled product binaries.
-
-```powershell
-python -m pip install -e ".[dev]" playwright==1.58.0
-$env:K5_OPERATOR_BROWSER_ACCEPTANCE = "1"
-$env:K5_OPERATOR_BROWSER_CHANNEL = "msedge"
-# Set the following to independently verified native development-tool paths:
-$env:K5_MEDIAMTX_DONOR_EXE = "C:\K5 test tools\mediamtx.exe"
-$env:K5_CADDY_DONOR_EXE = "C:\K5 test tools\caddy.exe"
-$env:K5_DONOR_FFMPEG = "C:\K5 test tools\ffmpeg.exe"
-$env:K5_DONOR_FFPROBE = "C:\K5 test tools\ffprobe.exe"
-python -m pytest tests/integration/test_operator_beta_browser.py --no-cov --junitxml=operator-beta-browser-windows.xml
-```
-
-The `operator_beta_browser_receipt` must exist in the JUnit report and the test
-must have executed successfully. The Windows receipt requires installed Edge,
-`native_windows_execution: true` and `portable_ancestor_adjustment: false`. An
-ordinary suite run without the opt-in skips this expensive fixture and supplies
-no beta evidence. The dedicated CI receipt gate rejects that skipped outcome.
-
-The optional engineering inference check is
-`tests/integration/test_operator_beta_capacity.py`. It admits the pinned
-OpenVINO/NumPy runtime and independently licensed official OMZ model/image,
-executes real positive and blank-frame inference, checks two-view admission,
-single-flight backpressure, owner/idle cleanup and native-thread shutdown. Its
-`operator_beta_person_receipt` explicitly leaves product analytics enablement,
-live-camera suitability, accuracy and endurance unqualified. The first beta
-remains a recording product unless its separate analytics integration and field
-gates have passed.
+Keep the delivery a recording candidate until the required physical-camera,
+recovery, capacity, retention and endurance results pass without a blocking
+defect. A beta decision names the observed hardware, camera models, stream
+settings, count, duration and remaining limits. Automated workflows and finite
+receipts remain linked in [the sprint record](BETA_SPRINT_003.md); they do not
+substitute for field results. This bundled desktop recording candidate does
+not qualify optional person detection or model accuracy.

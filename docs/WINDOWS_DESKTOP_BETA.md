@@ -21,12 +21,16 @@ dashboard in your browser. Sign in with that account, then:
 2. Choose a camera name and enter the camera's ONVIF username and password.
    These are the camera's
    credentials, which may differ from your K5 Vision account.
-3. Select **Test connection** to load the available video streams.
+3. Select **Test connection** to check the camera account and load its video
+   profiles. K5 reads the camera's time to handle a different clock without
+   changing the camera or Windows clock.
 4. Choose an H.264 **Video stream** and select **Connect camera**.
 
-K5 Vision obtains the stream address from the camera and starts the live view
-and recording. You do not need to look up or type an RTSP URL. RTSP remains the
-standard camera transport used by the recording worker.
+K5 Vision obtains the stream address from the camera and checks for video.
+Saving the camera settings does not establish that video or recording has started;
+check the camera's live view and recording status. You do not need to look up or
+type an RTSP URL. RTSP remains the standard camera transport used by the recording
+worker.
 
 The computer and camera must be on a reachable local network, and ONVIF must be
 enabled in the camera's settings. If discovery does not find it, enter the
@@ -70,6 +74,10 @@ stream resolution, Edge video, recording while closed, single-instance reopening
 stop, restart and uninstall on Windows. A skipped test does not qualify a
 download. Earlier manual-enrollment desktop evidence does not establish that the
 new ONVIF flow passed; use the qualified build's exact commit and receipt.
+The clock-skew gate uses a generated camera whose clock differs from Windows and
+requires successful authenticated enrollment and decoded video from the installed
+application. It exercises the read-only clock lookup and rejects a wrong camera
+password.
 
 The recording candidate includes the reviewed ONVIF connector; separately
 provisioned person detection remains outside the bundled desktop runtime.
