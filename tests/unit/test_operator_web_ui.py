@@ -383,7 +383,8 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
             if path == "/api/v1/auth/login":
                 logins.append(True)
                 data = {
-                    "session_token": token, "account": account,
+                    "session_token": token,
+                    "account": account,
                     "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
                     "expires_in_seconds": 300,
                 }
@@ -419,7 +420,9 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
             else:
                 status = 404
             route.fulfill(
-                status=status, headers=headers, content_type="application/json",
+                status=status,
+                headers=headers,
+                content_type="application/json",
                 body="" if status == 204 else json.dumps(data),
             )
 
@@ -458,7 +461,8 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
             )
             expect(page.locator("#camera-title")).to_have_text("Second camera")
             assert page.evaluate("window.__hlsSources") == [
-                media_urls(_CAMERA)["live_url"], media_urls(_OTHER)["live_url"]
+                media_urls(_CAMERA)["live_url"],
+                media_urls(_OTHER)["live_url"],
             ]
         else:
             expect(page.locator("#play-live")).to_be_visible()
