@@ -69,7 +69,8 @@ _TRUE = {
         "anonymous_media_denied one_camera_outage_isolated recording_pixel_isolation "
         "ui_history_and_gaps script_visible_credentials_absent logout_revoked_media_and_session "
         "owned_cleanup ui_service_storage_status ui_removal_cancel_preserved_camera "
-        "ui_removal_preserved_files_and_denied_media ui_reenrollment_restored_history"
+        "ui_removal_preserved_files_and_denied_media ui_reenrollment_restored_history "
+        "onvif_credential_profile_enrollment no_manual_stream_uri"
     ).split(),
     "person": (
         "single_flight_busy independent_view_workers third_view_capacity_denied "
@@ -79,7 +80,8 @@ _TRUE = {
     "person-view": (
         "actual_inference ui_sample_positive recording_continues response_frame_correlated "
         "authorized_person_probe logout_cleared logout_person_request_denied "
-        "anonymous_person_request_denied owned_cleanup"
+        "anonymous_person_request_denied owned_cleanup "
+        "onvif_credential_profile_enrollment no_manual_stream_uri"
     ).split(),
 }
 

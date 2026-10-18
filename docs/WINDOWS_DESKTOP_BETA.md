@@ -14,8 +14,28 @@ current Edge or Chrome browser. This candidate is an unsigned testing build.
 
 On first launch, choose an administrator username, enter a password of at least
 12 characters twice, and select **Create account**. K5 Vision opens the camera
-dashboard in your browser. Sign in with that account and add an H.264 camera
-using its numeric IP address and actual RTSP stream address.
+dashboard in your browser. Sign in with that account, then:
+
+1. Open **Add a camera**, choose **Find cameras on this network**, and select
+   your camera from the results.
+2. Choose a camera name and enter the camera's ONVIF username and password.
+   These are the camera's
+   credentials, which may differ from your K5 Vision account.
+3. Select **Test connection** to load the available video streams.
+4. Choose an H.264 **Video stream** and select **Connect camera**.
+
+K5 Vision obtains the stream address from the camera and starts the live view
+and recording. You do not need to look up or type an RTSP URL. RTSP remains the
+standard camera transport used by the recording worker.
+
+The computer and camera must be on a reachable local network, and ONVIF must be
+enabled in the camera's settings. If discovery does not find it, enter the
+camera's numeric IP address in the camera connection screen and continue with
+its credentials and profile. This also obtains the stream address automatically.
+If the camera uses a different settings port or HTTPS, choose those options in
+the same screen.
+If the camera only offers H.265, enable an H.264 profile in its settings and
+retry.
 
 If you used the earlier operator candidate, K5 Vision uses its existing account,
 cameras and recordings. It does not replace or reset an existing account profile.
@@ -45,10 +65,13 @@ profile. The default private data directory is
 ## Qualification scope
 
 The desktop gate must exercise the real installer, account screen, bundled
-runtime, Edge video, recording while closed, single-instance reopening, stop,
-restart and uninstall on Windows. A skipped test does not qualify a download.
+runtime, ONVIF discovery, camera credentials, H.264 profile selection, automatic
+stream resolution, Edge video, recording while closed, single-instance reopening,
+stop, restart and uninstall on Windows. A skipped test does not qualify a
+download. Earlier manual-enrollment desktop evidence does not establish that the
+new ONVIF flow passed; use the qualified build's exact commit and receipt.
 
-This recording candidate uses manual RTSP enrollment. ONVIF discovery and
-separately provisioned person detection are outside the bundled desktop runtime.
+The recording candidate includes the reviewed ONVIF connector; separately
+provisioned person detection remains outside the bundled desktop runtime.
 Physical-camera compatibility, measured capacity and long-duration recording
 remain the [field beta gates](WINDOWS_BETA_FIELD_TEST.md).

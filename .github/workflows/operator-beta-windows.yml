@@ -3,7 +3,7 @@ name: Native Windows Beta Sprint
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product]
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-desktop-beta]
     paths:
       - .github/workflows/operator-beta-windows.yml
       - .github/actions/provision-operator-tools/**

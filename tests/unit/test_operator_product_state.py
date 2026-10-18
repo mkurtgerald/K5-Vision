@@ -19,7 +19,7 @@ from k5vision.operator_product_state import (
     OperatorCameraStore,
     OperatorCameraStoreError,
 )
-from k5vision.services.device_registry import DeviceRegistry
+from k5vision.services.device_registry import DeviceRegistry, DeviceRegistryConflictError
 
 _SECRET = "source-fixture-private-secret"
 
@@ -116,6 +116,161 @@ def test_store_checks_the_existing_site_scoped_device_registry(identity, tmp_pat
     with pytest.raises(OperatorCameraStoreError):
         OperatorCameraStore(identity.directory, identity.site_id, registry=foreign)
     foreign.close()
+
+
+def _registered_store(identity, *, database=None):
+    registry = DeviceRegistry(
+        database_path=database or identity.directory / "devices.sqlite3", site_id=identity.site_id
+    )
+    device = registry.register(
+        DeviceCreate(
+            name="Retained camera",
+            host="192.0.2.10",
+            protocols={DeviceProtocol.RTSP},
+            tags={"retained-label"},
+        )
+    )
+    store = OperatorCameraStore(identity.directory, identity.site_id, registry=registry)
+    previous = store.upsert(device, _uri(device, "old"))
+    return registry, store, device, previous
+
+
+def test_onvif_port_migration_preserves_identity_history_and_survives_restart(identity) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    history = identity.directory / "recordings" / previous.binding.path_name / "retained.mp4"
+    history.parent.mkdir(parents=True)
+    history.write_bytes(b"existing recording fixture")
+    try:
+        source = store.reconnect_onvif(device.id, _uri(device, "resolved"), 8443, True)
+        assert source.device.id == device.id
+        assert source.binding == previous.binding
+        assert source.device.management_port == 8443
+        assert source.device.tags == {"retained-label", "k5-onvif-https"}
+        assert source.device.protocols == {DeviceProtocol.RTSP, DeviceProtocol.ONVIF}
+        for field in ("name", "host", "kind"):
+            assert getattr(source.device, field) == getattr(device, field)
+        assert registry.get(device.id) == source.device
+        assert store.get(device.id) == source
+        assert history.read_bytes() == b"existing recording fixture"
+        assert [row[1] for row in store._connection.execute("PRAGMA database_list")] == ["main"]
+        store.close()
+        registry.close()
+        registry = DeviceRegistry(
+            database_path=identity.directory / "devices.sqlite3", site_id=identity.site_id
+        )
+        store = OperatorCameraStore(identity.directory, identity.site_id, registry=registry)
+        assert registry.get(device.id) == source.device
+        assert store.get(device.id) == source
+        assert history.read_bytes() == b"existing recording fixture"
+    finally:
+        store.close()
+        registry.close()
+
+
+def test_onvif_private_write_failure_rolls_back_both_databases_without_credentials(
+    identity,
+) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    _change(
+        identity,
+        "CREATE TRIGGER refuse_reconnect BEFORE UPDATE ON camera_sources "
+        "BEGIN SELECT RAISE(ABORT, 'source-fixture-private-secret'); END",
+    )
+    try:
+        with pytest.raises(OperatorCameraStoreError) as raised:
+            store.reconnect_onvif(device.id, _uri(device, "resolved"), 8443, True)
+        assert raised.value.__context__ is None
+        assert _SECRET not in str(raised.value)
+        assert registry.get(device.id) == device
+        assert store.get(device.id) == previous
+        assert not store._connection.in_transaction
+        assert [row[1] for row in store._connection.execute("PRAGMA database_list")] == ["main"]
+        store.close()
+        store = OperatorCameraStore(identity.directory, identity.site_id, registry=registry)
+        assert store.get(device.id) == previous
+    finally:
+        store.close()
+        registry.close()
+
+
+def test_onvif_endpoint_conflict_preserves_canonical_and_private_state(identity) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    occupied = registry.register(
+        DeviceCreate(name="Separate endpoint", host=device.host, management_port=8080)
+    )
+    try:
+        with pytest.raises(DeviceRegistryConflictError) as raised:
+            store.reconnect_onvif(device.id, _uri(device, "resolved"), 8080, False)
+        assert raised.value.__context__ is None
+        assert registry.get(device.id) == device
+        assert registry.get(occupied.id) == occupied
+        assert store.get(device.id) == previous
+    finally:
+        store.close()
+        registry.close()
+
+
+def test_onvif_restores_removed_source_and_tracks_https_changes_without_new_identity(
+    identity,
+) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    try:
+        store.remove(device.id)
+        restored = store.reconnect_onvif(device.id, _uri(device, "restored"), 443, True)
+        assert restored.binding == previous.binding
+        assert len(registry.list()) == len(store.list_sources()) == 1
+        changed = store.reconnect_onvif(device.id, _uri(device, "http-settings"), 8080, False)
+        assert changed.binding == previous.binding
+        assert changed.device.tags == {"retained-label"}
+        assert registry.get(device.id) == changed.device
+    finally:
+        store.close()
+        registry.close()
+
+
+@pytest.mark.parametrize("target", ["main", "registry"])
+def test_onvif_cross_database_migration_refuses_wal_without_mutation(identity, target) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    handle = store._connection if target == "main" else registry._connection
+    handle.execute("PRAGMA journal_mode=WAL")
+    try:
+        with pytest.raises(OperatorCameraStoreError):
+            store.reconnect_onvif(device.id, _uri(device, "resolved"), 8443, True)
+        assert registry.get(device.id) == device
+        assert store.get(device.id) == previous
+    finally:
+        store.close()
+        registry.close()
+
+
+@pytest.mark.parametrize("foreign", ["memory", "outside"])
+def test_onvif_migration_refuses_noncanonical_registry(identity, tmp_path, foreign) -> None:
+    database = ":memory:" if foreign == "memory" else tmp_path / "devices.sqlite3"
+    registry, store, device, previous = _registered_store(identity, database=database)
+    try:
+        with pytest.raises(OperatorCameraStoreError):
+            store.reconnect_onvif(device.id, _uri(device, "resolved"), 8443, True)
+        assert registry.get(device.id) == device
+        assert store.get(device.id) == previous
+    finally:
+        store.close()
+        registry.close()
+
+
+def test_onvif_invalid_source_is_refused_before_a_transaction(identity) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    commands = []
+    store._connection.set_trace_callback(commands.append)
+    try:
+        with pytest.raises(OperatorCameraStoreError):
+            store.reconnect_onvif(device.id, _uri(_device(2), "foreign"), 8443, True)
+        assert not any(command.startswith(("ATTACH", "BEGIN", "UPDATE")) for command in commands)
+        assert registry.get(device.id) == device
+        assert store.get(device.id) == previous
+    finally:
+        store._connection.set_trace_callback(None)
+        store.close()
+        registry.close()
 
 
 def test_capacity_limits_creates_but_allows_replacement(identity) -> None:

@@ -3,7 +3,7 @@ name: Native Windows Desktop Installer
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint]
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta]
     paths:
       - .github/workflows/operator-desktop-windows.yml
       - .github/actions/provision-operator-tools/**
@@ -12,7 +12,11 @@ on:
       - scripts/verify_desktop_receipt.py
       - src/k5vision/**
       - tests/integration/test_windows_desktop_app.py
+      - tests/integration/test_operator_beta_browser.py
+      - tests/integration/onvif_camera_fixture.py
       - tests/unit/test_desktop*.py
+      - tests/unit/test_operator_onvif*.py
+      - tests/integration/test_operator_onvif*.py
       - docs/WINDOWS_DESKTOP*.md
       - third_party/licenses/**
       - THIRD_PARTY_NOTICES.md
@@ -54,7 +58,7 @@ jobs:
       - name: Verify desktop setup and process ownership on Windows
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_desktop_setup.py tests/unit/test_desktop_payload.py tests/unit/test_operator_native_process.py tests/unit/test_operator_product_service.py -o addopts= --no-cov
+          python -m pytest tests/unit/test_desktop_setup.py tests/unit/test_desktop_payload.py tests/unit/test_operator_native_process.py tests/unit/test_operator_product_service.py tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_product_api.py tests/unit/test_operator_product_state.py tests/test_device_registry.py -o addopts= --no-cov
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Provision immutable native acceptance tools
         uses: ./.github/actions/provision-operator-tools
@@ -129,6 +133,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $witness = Get-Content -LiteralPath desktop-build/desktop-windows-receipt.json -Raw | ConvertFrom-Json
+          if ($witness.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $witness.receipt.onvif_credential_profile_enrollment -isnot [bool] -or
+              $witness.receipt.onvif_credential_profile_enrollment -ne $true -or
+              $witness.receipt.no_manual_stream_uri -isnot [bool] -or
+              $witness.receipt.no_manual_stream_uri -ne $true) {
+            throw "ONVIF camera-onboarding GUI qualification is incomplete"
+          }
           $release = Join-Path $env:GITHUB_WORKSPACE "desktop-build/release"
           New-Item -ItemType Directory -Path $release | Out-Null
           Copy-Item -LiteralPath $env:K5_DESKTOP_SETUP -Destination (Join-Path $release "K5VisionSetup.exe")
@@ -143,9 +155,10 @@ jobs:
             launcher_sha256=(Get-FileHash -LiteralPath desktop-build/payload/K5Vision.exe -Algorithm SHA256).Hash.ToLowerInvariant();
             payload_manifest_sha256=(Get-FileHash -LiteralPath desktop-build/payload/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant();
             runtime='CPython 3.12.10 embedded amd64'; installer='Inno Setup 6.4.3';
-            scope='Native Windows manual-RTSP recording operator'; no_terminal_required=$true;
+            scope='Native Windows ONVIF camera-onboarding recording operator'; no_terminal_required=$true;
             no_external_python_required=$true; no_runtime_package_downloads=$true
             workers_bundled=$false; first_launch_internet_required=$true
+            onvif_camera_onboarding=$true; manual_stream_uri_required=$false
           }
           $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $release "desktop-package.json") -Encoding utf8
       - name: Upload qualified graphical Windows installer

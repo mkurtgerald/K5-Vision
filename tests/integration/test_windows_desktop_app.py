@@ -470,6 +470,15 @@ def _failure_detail(error):
         ("Expected enabled desktop button is unavailable", "native_control_unavailable"),
         ("Owned desktop/backend/native processes survived", "owned_process_survived"),
         ("Desktop opened a console window", "console_window"),
+        ("Bounded camera discovery did not complete", "onvif_discovery_failed"),
+        ("Wrong camera credentials were admitted", "onvif_wrong_password_admitted"),
+        ("Camera did not reject the actual SOAP digest", "onvif_auth_not_exercised"),
+        ("Actual ONVIF credential/profile request failed", "onvif_profiles_failed"),
+        ("Profile-based camera connection failed", "onvif_connect_failed"),
+        ("Actual authenticated ONVIF SOAP flow was incomplete", "onvif_protocol_incomplete"),
+        ("Manual stream field remained", "manual_stream_field"),
+        ("Browser sent a manual camera stream address", "manual_stream_request"),
+        ("Camera stream address entered the DOM", "stream_uri_dom"),
     ):
         if marker in text:
             return code
@@ -666,7 +675,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     username, password = "fixture-admin", secrets.token_urlsafe(32)
     processes, reservations = [], []
     cohort = _Cohort(api)
-    playwright = browser = context = None
+    playwright = browser = context = onvif_camera = None
     form = None
     app = None
     stage, failure, cleanup_failed = "installer", None, False
@@ -747,6 +756,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["embedded_python_independent_of_path"] = True
         stage = "generated_camera_fixture"
         processes, source_uri = _generate_fixture(parent, media, ffmpeg, upstream_port, helpers)
+        onvif_camera = _helpers("onvif_camera_fixture").OnvifCameraFixture(
+            host="127.0.0.1", stream_uri=source_uri
+        )
         stage = "actual_browser_enrollment"
         playwright = browser_api.sync_playwright().start()
         browser = playwright.chromium.launch(channel="msedge", headless=True)
@@ -774,19 +786,20 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         # second login that would revoke the active browser.
         client.token = browser_token
         page.locator("#workspace").wait_for(state="visible")
-        page.locator("#add-camera-button").click()
-        page.locator("#new-camera-name").fill("Generated desktop camera")
-        page.locator("#new-camera-host").fill("127.0.0.1")
-        page.locator("#new-camera-source").fill(source_uri)
-        with page.expect_response(
-            lambda response: (
-                response.request.method == "POST"
-                and response.url.endswith("/api/v1/operator/cameras")
-            )
-        ) as enrolled:
-            page.locator("#save-camera").click()
-        _require(enrolled.value.status == 201, "Desktop browser enrollment failed")
-        camera_id = enrolled.value.json()["device_id"]
+        enrolled, discovery_completed = browser_helpers._onvif_enroll(
+            page,
+            name="Generated desktop camera",
+            fixture=onvif_camera,
+            reject_wrong=True,
+            run_discovery=True,
+        )
+        camera_id = enrolled["device_id"]
+        receipt["onvif_credential_profile_enrollment"] = True
+        receipt["onvif_wrong_password_rejected"] = True
+        receipt["no_manual_stream_uri"] = True
+        receipt["bounded_discovery_executed"] = discovery_completed
+        receipt["generated_camera_discovered"] = False
+        browser_helpers._assert_no_browser_storage(page)
         route = "/api/v1/operator/cameras/" + camera_id
         page.locator("#add-camera-dialog").wait_for(state="hidden")
         stage = "actual_browser_live_decode"
@@ -932,6 +945,11 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         for process in reversed(processes):
             try:
                 helpers._stop_owned(process)
+            except Exception:
+                cleanup_failed = True
+        if onvif_camera is not None:
+            try:
+                onvif_camera.close()
             except Exception:
                 cleanup_failed = True
         for listener in reservations:

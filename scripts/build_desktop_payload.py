@@ -21,6 +21,40 @@ from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
 DONORS = ROOT / "windows" / "desktop" / "donors.json"
+ONVIF_NOTICE = "third_party/licenses/go2rtc-MIT.txt"
+ONVIF_NOTICE_SHA256 = "b0dcf4855af5a72b4dfbd9117c207b330f4cc35658576a0b5351d6e2becac546"
+ONVIF_MODULE_PATH = "runtime/Lib/site-packages/k5vision/operator_onvif.py"
+ONVIF_NOTICE_PATH = "licenses/go2rtc-MIT.txt"
+
+
+def onvif_source_adaptation(payload: Path) -> dict[str, object]:
+    """Require the installed connector and unchanged upstream permission notice.
+
+    Git may check out a text license with LF or CRLF on Windows. Admit only
+    those exact complete representations of the pinned upstream text; retain
+    the actual installed bytes and hash in the sealed payload inventory.
+    """
+    module, notice = payload / ONVIF_MODULE_PATH, payload / ONVIF_NOTICE_PATH
+    for path in (module, notice):
+        if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+            raise ValueError("Required ONVIF package material missing")
+    raw_notice = notice.read_bytes()
+    canonical = raw_notice.replace(b"\r\n", b"\n")
+    if hashlib.sha256(canonical).hexdigest() != ONVIF_NOTICE_SHA256 or raw_notice not in (
+        canonical,
+        canonical.replace(b"\n", b"\r\n"),
+    ):
+        raise ValueError("ONVIF upstream notice identity mismatch")
+    return {
+        "component": "go2rtc ONVIF selected-source adaptation",
+        "version": "v1.9.14",
+        "source": "https://github.com/AlexxIT/go2rtc",
+        "source_commit": "b5948cfb25404cc5cb37b166ecaa2dca20b11d4b",
+        "license": "MIT",
+        "integration": "Python stdlib camera-onboarding connector; no Go runtime",
+        "module": ONVIF_MODULE_PATH,
+        "retained_notice": {"path": ONVIF_NOTICE_PATH, "sha256": digest(notice)},
+    }
 
 
 def digest(path: Path) -> str:
@@ -264,9 +298,11 @@ def build(args: argparse.Namespace) -> None:
         "third_party/licenses/MediaMTX-MIT.txt",
         "third_party/licenses/Caddy-Apache-2.0.txt",
         "third_party/licenses/InnoSetup-6.4.3.txt",
+        ONVIF_NOTICE,
     ):
         shutil.copyfile(ROOT / source, licenses / Path(source).name)
     shutil.copyfile(runtime / "LICENSE.txt", licenses / "CPython-3.12.10-LICENSE.txt")
+    onvif_adaptation = onvif_source_adaptation(payload)
     # The official Windows interpreter explicitly requires external end users
     # to agree to terms protecting its Microsoft Distributable Code. Present
     # these terms in the normal installer license page, with upstream text
@@ -288,11 +324,14 @@ def build(args: argparse.Namespace) -> None:
             {
                 "schema_version": 1,
                 "head_sha": args.head_sha,
-                "scope": "manual-RTSP operator",
+                "scope": "ONVIF camera-onboarding recording operator",
+                "onvif_camera_onboarding": True,
+                "manual_stream_uri_required": False,
                 "python": donors["python"],
                 "worker_downloads": workers,
                 "workers_bundled": False,
                 "wheels": wheel_inventory,
+                "source_adaptations": [onvif_adaptation],
                 "project_wheel_sha256": digest(project[0]),
             },
             indent=2,
@@ -310,8 +349,11 @@ def build(args: argparse.Namespace) -> None:
             "-c",
             "import fastapi,pydantic,psutil,uvicorn; import k5vision.desktop_setup; "
             "import k5vision.operator_product; import k5vision.operator_product_api; "
+            "import k5vision.operator_onvif; "
             "import importlib.util; "
             "assert importlib.util.find_spec('onvif') is None; "
+            "assert importlib.util.find_spec('zeep') is None; "
+            "assert importlib.util.find_spec('lxml') is None; "
             "assert importlib.util.find_spec('pip') is None",
         ]
     )

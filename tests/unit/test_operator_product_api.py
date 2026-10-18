@@ -4,9 +4,11 @@ import asyncio
 import hashlib
 import json
 import os
+import socket
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
@@ -27,6 +29,7 @@ from k5vision.media.mediamtx_provider import (
     MediaWorkerErrorCode,
 )
 from k5vision.operator_analytics import OperatorAnalyticsResult
+from k5vision.operator_onvif import OnvifError, OnvifProfile
 from k5vision.operator_product_api import install_operator_product_api
 from k5vision.operator_product_state import OperatorCameraStore
 from k5vision.services.device_registry import DeviceRegistry
@@ -206,6 +209,8 @@ def test_enrollment_persists_private_source_and_public_rows_hide_execution_mater
         "device_id": device_id,
         "name": "Front door",
         "host": "127.0.0.1",
+        "management_port": 80,
+        "management_secure": False,
         "status": "live",
         "recording": True,
         "analytics_status": "disabled",
@@ -918,3 +923,423 @@ def test_person_view_stream_bound_timeout_and_auth_precede_pixel_admission(produ
         assert (await _person_asgi(product, device_id))[0] == 200
 
     product.client.portal.call(streams)
+
+
+class _OnvifConnector:
+    def __init__(self):
+        self.discovery_calls = 0
+        self.probe_calls = []
+        self.error = None
+        self.callback = None
+        self.candidates = [
+            {"host": "127.0.0.1", "port": 8081, "secure": False, "name": "Network camera"}
+        ]
+        self.profiles = (
+            OnvifProfile(
+                "private-profile-token",
+                "Main camera view",
+                "H264",
+                1920,
+                1080,
+                "rtsp://camera-user:camera-password@127.0.0.1/live?private-stream-token",
+            ),
+        )
+
+    async def discover(self):
+        self.discovery_calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.candidates
+
+    async def probe(self, **request):
+        self.probe_calls.append(request)
+        if self.callback is not None:
+            await self.callback()
+        if self.error is not None:
+            raise self.error
+        return self.profiles
+
+
+@pytest.fixture
+def onvif(product):
+    connector = _OnvifConnector()
+    product.app.state.operator_onvif_connector = connector
+    return connector
+
+
+def _onvif_probe(product, **overrides):
+    return product.client.post(
+        "/api/v1/operator/camera-profiles",
+        headers=product.headers,
+        json={
+            "host": "127.0.0.1",
+            "port": 8081,
+            "secure": False,
+            "username": "camera-user",
+            "password": "camera-password",
+            **overrides,
+        },
+    )
+
+
+def _onvif_connect_body(probe, *, name="Front door"):
+    return {
+        "probe_id": probe["probe_id"],
+        "profile_id": probe["profiles"][0]["id"],
+        "name": name,
+    }
+
+
+def test_onvif_discovery_projects_only_public_candidates(product, onvif):
+    onvif.candidates[0]["source_uri"] = "rtsp://private-credential@127.0.0.1/source"
+    response = product.client.post(
+        "/api/v1/operator/camera-discovery", headers=product.headers, json={}
+    )
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "cameras": [{"host": "127.0.0.1", "port": 8081, "secure": False, "name": "Network camera"}],
+        "status": "complete",
+    }
+    assert onvif.discovery_calls == 1
+    assert "private" not in response.text and "rtsp" not in response.text
+
+
+def test_onvif_probe_handles_hide_execution_material_and_connect_private_source(product, onvif):
+    response = _onvif_probe(product)
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    result = response.json()
+    assert set(result) == {"probe_id", "expires_in_seconds", "profiles"}
+    assert len(result["probe_id"]) == 32 and 0 < result["expires_in_seconds"] <= 120
+    profile = result["profiles"][0]
+    assert set(profile) == {"id", "name", "codec", "width", "height", "supported"}
+    assert len(profile["id"]) == 32 and profile["id"] != onvif.profiles[0].token
+    assert profile["codec"] == "H264" and profile["supported"] is True
+    for private in ("camera-user", "camera-password", "private-profile-token", "rtsp://"):
+        assert private not in response.text
+    assert not product.cameras.list_sources() and not product.registry.list()
+    connected = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers=product.headers,
+        json=_onvif_connect_body(result),
+    )
+    assert connected.status_code == 201
+    assert connected.headers["cache-control"] == "no-store"
+    assert "rtsp://" not in connected.text and "camera-password" not in connected.text
+    saved = product.cameras.list_sources()[0]
+    assert saved.source_uri == onvif.profiles[0].source_uri
+    assert saved.device.management_port == 8081
+    assert saved.device.protocols == {DeviceProtocol.ONVIF, DeviceProtocol.RTSP}
+    assert product.service.applied == [(saved,)]
+    assert connected.json()["device_id"] == str(saved.device.id)
+    replay = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers=product.headers,
+        json=_onvif_connect_body(result),
+    )
+    assert replay.status_code == 410 and replay.json()["detail"] == "camera_probe_expired"
+
+
+def test_onvif_https_management_endpoint_is_public_and_durably_preserved(product, onvif):
+    probe = _onvif_probe(product, secure=True, port=443).json()
+    response = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers=product.headers,
+        json=_onvif_connect_body(probe),
+    )
+    assert response.status_code == 201
+    assert response.json()["management_port"] == 443
+    assert response.json()["management_secure"] is True
+    saved = product.cameras.list_sources()[0]
+    assert "k5-onvif-https" in saved.device.tags
+
+
+@pytest.mark.parametrize("role", [UserRole.OPERATOR, UserRole.VIEWER])
+def test_onvif_all_mutations_require_administrator_before_connector_use(product, onvif, role):
+    account = product.users.create(
+        UserCreate(username="onvif-reader", display_name="Reader", role=role), actor="test"
+    )
+    token, _ = asyncio.run(product.sessions.issue(account))
+    for route, payload in (
+        ("camera-discovery", {}),
+        ("camera-profiles", {"host": "127.0.0.1"}),
+        ("cameras/connect", {"probe_id": "x" * 32, "profile_id": "y" * 32, "name": "Door"}),
+    ):
+        response = product.client.post(
+            "/api/v1/operator/" + route,
+            headers={"Authorization": "Bearer " + token},
+            json=payload,
+        )
+        assert response.status_code == 403
+    assert onvif.discovery_calls == 0 and onvif.probe_calls == []
+
+
+@pytest.mark.parametrize("route", ["camera-discovery", "camera-profiles", "cameras/connect"])
+def test_onvif_mutations_reject_cross_origin_and_missing_human_session(product, onvif, route):
+    response = product.client.post("/api/v1/operator/" + route, json={})
+    assert response.status_code == 401
+    response = product.client.post(
+        "/api/v1/operator/" + route,
+        headers={**product.headers, "Origin": "https://untrusted.invalid"},
+        json={},
+    )
+    assert response.status_code == 403
+    assert onvif.discovery_calls == 0 and onvif.probe_calls == []
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "detail"),
+    [
+        (OnvifError("auth_failed"), 422, "camera_auth_failed"),
+        (OnvifError("unreachable"), 503, "camera_unreachable"),
+        (OnvifError("unsupported"), 422, "camera_unsupported"),
+        (OnvifError("invalid_response"), 502, "camera_invalid_response"),
+        (OnvifError("busy"), 429, "camera_busy"),
+        (
+            RuntimeError("rtsp://camera-user:camera-password@127.0.0.1/live"),
+            502,
+            "camera_invalid_response",
+        ),
+    ],
+)
+def test_onvif_failures_never_echo_credentials_or_logout_human(
+    product, onvif, error, status, detail
+):
+    onvif.error = error
+    response = _onvif_probe(product)
+    assert response.status_code == status and response.json() == {"detail": detail}
+    assert "camera-password" not in response.text and "rtsp://" not in response.text
+    assert product.client.get("/api/v1/operator/status", headers=product.headers).status_code == 200
+    assert not product.app.state.operator_onvif_probes._probes
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"password": {"private-secret": "credential"}},
+        {"private-secret": "credential"},
+        {"host": "camera-user:camera-password@example.invalid"},
+        {"port": True},
+        {"secure": "false"},
+    ],
+)
+def test_onvif_validation_has_no_password_input_or_unbounded_body_echo(product, onvif, changes):
+    response = _onvif_probe(product, **changes)
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid operator request"}
+    assert not onvif.probe_calls
+    response = product.client.post(
+        "/api/v1/operator/camera-profiles",
+        headers={**product.headers, "Content-Type": "application/json"},
+        content=b'{"password":"private-secret' + b"x" * 16384,
+    )
+    assert response.status_code == 413 and "private-secret" not in response.text
+
+
+def test_onvif_probe_is_bound_to_original_user_and_session(product, onvif):
+    probe = _onvif_probe(product).json()
+    peer, _credential, _expires = product.users.create_with_bootstrap(
+        UserCreate(username="onvif-admin", display_name="Admin", role=UserRole.ADMINISTRATOR),
+        actor="test",
+    )
+    peer_token, _ = asyncio.run(product.sessions.issue(peer))
+    response = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers={"Authorization": "Bearer " + peer_token},
+        json=_onvif_connect_body(probe),
+    )
+    assert response.status_code == 410
+    renewed, _ = asyncio.run(product.sessions.issue(product.admin))
+    response = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers={"Authorization": "Bearer " + renewed},
+        json=_onvif_connect_body(probe),
+    )
+    assert response.status_code == 410
+    response = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers=product.headers,
+        json=_onvif_connect_body(probe),
+    )
+    assert response.status_code == 401
+    assert not product.cameras.list_sources()
+
+
+def test_onvif_revocation_during_network_probe_rejects_result_and_discards_private_state(
+    product, onvif
+):
+    async def revoke():
+        await product.sessions.revoke(product.token)
+
+    onvif.callback = revoke
+    response = _onvif_probe(product)
+    assert response.status_code == 401
+    assert not product.app.state.operator_onvif_probes._probes
+    assert not product.cameras.list_sources()
+
+
+def test_onvif_ttl_and_capacity_bound_private_profiles_and_allow_retry(product, onvif, monkeypatch):
+    import k5vision.operator_onvif_api as api
+
+    now = [100.0]
+    monkeypatch.setattr(api, "monotonic", lambda: now[0])
+    original = _onvif_probe(product).json()
+    for _ in range(15):
+        assert _onvif_probe(product).status_code == 200
+    assert _onvif_probe(product).status_code == 429
+    assert len(onvif.probe_calls) == 16
+    now[0] += 120
+    response = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers=product.headers,
+        json=_onvif_connect_body(original),
+    )
+    assert response.status_code == 410
+    assert not product.app.state.operator_onvif_probes._probes
+    assert _onvif_probe(product).status_code == 200
+
+
+def test_onvif_logout_cleanup_discards_private_profiles_even_after_revocation(product, onvif):
+    assert _onvif_probe(product).status_code == 200
+    asyncio.run(product.sessions.revoke(product.token))
+    response = product.client.delete("/api/v1/operator/media-session", headers=product.headers)
+    assert response.status_code == 204
+    assert not product.app.state.operator_onvif_probes._probes
+
+
+def test_onvif_non_h264_profiles_are_public_but_cannot_start_recording(product, onvif):
+    original = onvif.profiles[0]
+    onvif.profiles = (
+        OnvifProfile(original.token, "H265 profile", "H265", 1920, 1080, original.source_uri),
+    )
+    probe = _onvif_probe(product).json()
+    assert probe["profiles"][0]["supported"] is False
+    response = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers=product.headers,
+        json=_onvif_connect_body(probe),
+    )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "camera_profile_unsupported"}
+    assert not product.cameras.list_sources() and not product.service.applied
+
+
+def test_onvif_remote_profile_labels_cannot_reflect_password_or_source_token(product, onvif):
+    original = onvif.profiles[0]
+    onvif.profiles = (
+        OnvifProfile(original.token, original.source_uri, "H264", 1920, 1080, original.source_uri),
+    )
+    result = _onvif_probe(product)
+    assert result.status_code == 200 and result.json()["profiles"][0]["name"] == "Profile 1"
+    assert "camera-password" not in result.text and "rtsp://" not in result.text
+
+
+def test_onvif_failed_worker_application_keeps_probe_for_retry_without_new_camera_identity(
+    product, onvif, monkeypatch
+):
+    probe = _onvif_probe(product).json()
+    original = product.service.apply_sources
+
+    async def unavailable(_sources):
+        raise RuntimeError("private worker configuration")
+
+    monkeypatch.setattr(product.service, "apply_sources", unavailable)
+    response = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers=product.headers,
+        json=_onvif_connect_body(probe),
+    )
+    assert response.status_code == 503 and "private" not in response.text
+    saved = product.cameras.list_sources()[0]
+    assert probe["probe_id"] in product.app.state.operator_onvif_probes._probes
+    monkeypatch.setattr(product.service, "apply_sources", original)
+    response = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers=product.headers,
+        json=_onvif_connect_body(probe),
+    )
+    assert response.status_code == 201
+    assert response.json()["device_id"] == str(saved.device.id)
+    assert len(product.registry.list()) == 1
+
+
+def test_onvif_legacy_reconnect_and_removed_camera_restore_preserve_uuid_and_private_source(
+    product, onvif
+):
+    original_id = product.enroll()
+    for secure, port in ((False, 8081), (True, 8443)):
+        probe = _onvif_probe(product, secure=secure, port=port).json()
+        response = product.client.post(
+            "/api/v1/operator/cameras/connect",
+            headers=product.headers,
+            json=_onvif_connect_body(probe),
+        )
+        assert response.status_code == 201
+        assert response.json()["device_id"] == original_id
+        assert response.json()["management_port"] == port
+        assert response.json()["management_secure"] is secure
+        source = product.cameras.list_sources()[0]
+        assert source.binding.device_id == UUID(original_id)
+        assert source.source_uri == onvif.profiles[0].source_uri
+        assert len(product.registry.list()) == 1
+        assert (
+            product.client.delete(
+                "/api/v1/operator/cameras/" + original_id, headers=product.headers
+            ).status_code
+            == 204
+        )
+
+
+def test_onvif_different_name_cannot_replace_an_existing_endpoint(product, onvif):
+    original_id = product.enroll()
+    original_source = product.cameras.list_sources()[0]
+    probe = _onvif_probe(product, port=80).json()
+    response = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers=product.headers,
+        json=_onvif_connect_body(probe, name="Another name"),
+    )
+    assert response.status_code == 409
+    assert product.cameras.list_sources() == (original_source,)
+    assert str(product.registry.list()[0].id) == original_id
+
+
+def test_onvif_each_active_camera_network_is_discovered_without_loopback_or_down_interfaces(
+    monkeypatch,
+):
+    import k5vision.operator_onvif_api as api
+
+    def ipv4(address):
+        return SimpleNamespace(family=socket.AF_INET, address=address)
+
+    monkeypatch.setattr(
+        api.psutil,
+        "net_if_addrs",
+        lambda: {
+            "camera-ethernet": [ipv4("192.168.50.2"), ipv4("192.168.50.2")],
+            "wifi": [ipv4("10.0.0.5")],
+            "link-local": [ipv4("169.254.20.5")],
+            "loopback": [ipv4("127.0.0.1")],
+            "disabled": [ipv4("192.168.60.2")],
+            "other": [ipv4("0.0.0.0"), ipv4("224.0.0.1"), ipv4("8.8.8.8")],
+        },
+    )
+    monkeypatch.setattr(
+        api.psutil,
+        "net_if_stats",
+        lambda: {
+            name: SimpleNamespace(isup=name != "disabled") for name in api.psutil.net_if_addrs()
+        },
+    )
+    assert set(api._camera_ipv4_interfaces()) == {"192.168.50.2", "10.0.0.5", "169.254.20.5"}
+
+
+def test_onvif_interface_enumeration_failure_retains_default_route_fallback(monkeypatch):
+    import k5vision.operator_onvif_api as api
+
+    def unavailable():
+        raise OSError("private interface information")
+
+    monkeypatch.setattr(api.psutil, "net_if_addrs", unavailable)
+    assert api._camera_ipv4_interfaces() == ()
