@@ -813,6 +813,17 @@ def _vm_clock_phase(
             for camera in cameras
         )
 
+    def displayed_recorder_utc_matches():
+        text = page.locator("#recorder-time-status").inner_text()
+        if not text.startswith("Recorder time: ") or " UTC" not in text:
+            return False
+        try:
+            timestamp = text.removeprefix("Recorder time: ").split(" UTC", 1)[0]
+            displayed = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        except ValueError:
+            return False
+        return abs((displayed - datetime.now(UTC)).total_seconds()) < 10
+
     diagnostic["vm_clock_stage"] = "finalize_closed_segments"
     # Interrupt only our generated publisher. An observed disconnected source
     # closes the real recorder; active, growing files are never hashed as fixed.
@@ -911,6 +922,12 @@ def _vm_clock_phase(
                     process=app,
                     timeout=10,
                 )
+                _wait(
+                    displayed_recorder_utc_matches,
+                    "VM clock visible recorder UTC",
+                    process=app,
+                    timeout=10,
+                )
                 # Observe at least two normal five-second storage-maintenance
                 # cycles and allow pre-step live buffers to drain naturally.
                 _wait(
@@ -948,14 +965,24 @@ def _vm_clock_phase(
                     timeout=15,
                 )
                 now = datetime.now(UTC)
+                first, last = now - timedelta(minutes=2), now + timedelta(minutes=1)
                 phase_query = "?" + urlencode(
                     {
-                        "start": (now - timedelta(minutes=2)).isoformat(),
-                        "end": (now + timedelta(minutes=1)).isoformat(),
+                        "start": first.isoformat(),
+                        "end": last.isoformat(),
                     }
                 )
+
+                def shifted_history(query=phase_query, first=first, last=last):
+                    spans = client.json(route + "/history" + query)["spans"]
+                    return any(
+                        first <= datetime.fromisoformat(span["started_at"]) <= last
+                        and span["duration_seconds"] > 0
+                        for span in spans
+                    )
+
                 _wait(
-                    lambda query=phase_query: client.json(route + "/history" + query)["spans"],
+                    shifted_history,
                     "VM clock shifted recorder UTC history query",
                     process=app,
                     timeout=10,
@@ -1021,12 +1048,17 @@ def _vm_clock_phase(
     page.locator("#live-tab").click()
     browser_helpers._decoded_color(page, "live-video", "red")
     _require(not non_loopback, "VM clock proof attempted an external request while shifted")
-    diagnostic["vm_clock_stage"] = "complete"
     guard_receipt = guard.receipt()
     _require(
-        guard_receipt["clock_restored"] is True and guard_receipt["services_restored"] is True,
+        guard_receipt["reason"] == "closed"
+        and guard_receipt["watchdog_armed"] is True
+        and guard_receipt["privilege_verified"] is True
+        and len(guard_receipt["shifts"]) == 2
+        and guard_receipt["clock_restored"] is True
+        and guard_receipt["services_restored"] is True,
         "VM clock guard did not restore UTC and original guest time services",
     )
+    diagnostic["vm_clock_stage"] = "complete"
     return {
         "schema_version": "1",
         "head_sha": os.environ["K5_DESKTOP_HEAD_SHA"],

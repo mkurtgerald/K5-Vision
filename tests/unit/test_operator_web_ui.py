@@ -304,3 +304,174 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
             browser.close()
         if playwright is not None:
             playwright.stop()
+
+
+@pytest.mark.parametrize(
+    "outcome", ["recover_401", "recover_403", "expired", "repeated_denial", "selection_race"]
+)
+def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
+    """Exercise HTTP cookie loss and HLS errors without asserting decoded media."""
+    browser_api = pytest.importorskip("playwright.sync_api")
+    channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
+    assets = Path(__file__).resolve().parents[2] / "src/k5vision/operator_web"
+    token = "generated-media-recovery-session-token-000000000000000000"
+    account = {"username": "fixture-admin", "role": "administrator", "display_name": "Fixture"}
+    cameras = [
+        {"device_id": camera_id, "name": name, "status": "live", "recording": True}
+        for camera_id, name in [(_CAMERA, "First camera"), (_OTHER, "Second camera")]
+    ]
+    media_calls, logins, errors, pending = [], [], [], []
+    deny_media = {"active": False}
+    playwright = browser = context = None
+
+    def media_urls(camera_id):
+        return {
+            "live_url": f"/media/live/{camera_id}/index.m3u8",
+            "playback_url": f"/media/playback?path={camera_id}",
+        }
+
+    try:
+        playwright = browser_api.sync_playwright().start()
+        browser = playwright.chromium.launch(channel=channel, headless=True)
+        context = browser.new_context()
+        # A small HLS adapter delivers actual intercepted HTTP status codes to
+        # the production error handler. Generated-video decoding is qualified
+        # independently by the media/native integration lanes.
+        context.add_init_script("""(() => {
+          window.__hlsPlayers = [];
+          window.__hlsSources = [];
+          HTMLMediaElement.prototype.play = () => Promise.reject(
+            new DOMException("Generated authorization test", "NotAllowedError")
+          );
+          window.Hls = class {
+            static Events = {
+              ERROR: "error", MEDIA_ATTACHED: "attached", MANIFEST_PARSED: "parsed"
+            };
+            static isSupported() { return true; }
+            constructor() { this.handlers = {}; window.__hlsPlayers.push(this); }
+            on(event, callback) { this.handlers[event] = callback; }
+            attachMedia() { queueMicrotask(() => this.handlers.attached?.()); }
+            loadSource(url) { this.url = url; window.__hlsSources.push(url); void this.reload(); }
+            async reload() {
+              const response = await fetch(this.url, {
+                credentials: "same-origin", cache: "no-store"
+              });
+              if (response.ok) this.handlers.parsed?.();
+              else this.handlers.error?.("error", {
+                fatal: true, response: { code: response.status }
+              });
+            }
+            destroy() { this.destroyed = true; }
+          };
+        })();""")
+        page = context.new_page()
+        page.set_default_timeout(10_000)
+        page.on("pageerror", lambda _error: errors.append("uncaught_script_error"))
+
+        def intercept(route):
+            path, method = urlsplit(route.request.url).path, route.request.method
+            if path.startswith("/operator/"):
+                name = path.rsplit("/", 1)[1] or "index.html"
+                content_type = {
+                    "index.html": "text/html",
+                    "app.js": "application/javascript",
+                    "app.css": "text/css",
+                }[name]
+                route.fulfill(content_type=content_type, body=(assets / name).read_text())
+                return
+            status, data, headers = 200, {}, {}
+            if path == "/api/v1/auth/login":
+                logins.append(True)
+                data = {
+                    "session_token": token, "account": account,
+                    "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                    "expires_in_seconds": 300,
+                }
+            elif path == "/api/v1/auth/me":
+                data = account
+            elif path == "/api/v1/operator/cameras":
+                data = {"worker_status": "ready", "cameras": cameras}
+            elif path == "/api/v1/operator/status":
+                data = {
+                    "worker_status": "ready",
+                    "server_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "clock": {"status": "observing", "sync_verified": False},
+                }
+            elif path.endswith("/media-session") and method == "POST":
+                camera_id = path.split("/")[-2]
+                media_calls.append((camera_id, route.request.all_headers().get("authorization")))
+                if len(media_calls) == 2 and outcome == "selection_race":
+                    pending.append(route)
+                    return
+                if len(media_calls) == 2 and outcome == "expired":
+                    status, data = 401, {"detail": "Unauthorized"}
+                else:
+                    data = media_urls(camera_id)
+                    headers["Set-Cookie"] = (
+                        f"k5_operator_media={token}; Path=/media; HttpOnly; SameSite=Strict"
+                    )
+            elif path.startswith("/media/live/"):
+                cookie = route.request.all_headers().get("cookie", "")
+                if f"k5_operator_media={token}" not in cookie or deny_media["active"]:
+                    status = 403 if outcome == "recover_403" else 401
+            elif path == "/api/v1/operator/media-session" and method == "DELETE":
+                status = 204
+            else:
+                status = 404
+            route.fulfill(
+                status=status, headers=headers, content_type="application/json",
+                body="" if status == 204 else json.dumps(data),
+            )
+
+        page.route("**/*", intercept)
+        page.goto("http://127.0.0.1:8000/operator/")
+        page.locator("#username").fill("fixture-admin")
+        page.locator("#password").fill("generated-human-account-password")
+        page.locator("#sign-in-button").click()
+        expect = browser_api.expect
+        expect(page.locator("#play-live")).to_be_visible()
+        assert len(media_calls) == 1
+        context.clear_cookies()
+        deny_media["active"] = outcome == "repeated_denial"
+        page.evaluate("void window.__hlsPlayers.at(-1).reload()")
+        page.wait_for_function("window.__hlsPlayers[0].destroyed === true")
+
+        if outcome == "expired":
+            expect(page.locator("#sign-in")).to_be_visible()
+            expect(page.locator("#workspace")).not_to_be_visible()
+            expect(page.locator("#sign-in-message")).to_contain_text("Your session has ended")
+        elif outcome == "repeated_denial":
+            expect(page.locator("#live-placeholder-title")).to_have_text("Media access unavailable")
+            expect(page.locator("#retry-live")).to_be_visible()
+            expect(page.locator("#workspace")).to_be_visible()
+            assert page.evaluate("window.__hlsPlayers.length") == 2
+        elif outcome == "selection_race":
+            expect(page.locator("#live-placeholder-title")).to_have_text("Restoring media access")
+            page.locator(".camera-item").filter(has_text="Second camera").click()
+            expect(page.locator("#play-live")).to_be_visible()
+            assert len(pending) == 1
+            pending.pop().fulfill(
+                content_type="application/json", body=json.dumps(media_urls(_CAMERA))
+            )
+            page.evaluate(
+                "window.__hlsPlayers[0].handlers.error('error', {fatal:true, response:{code:401}})"
+            )
+            expect(page.locator("#camera-title")).to_have_text("Second camera")
+            assert page.evaluate("window.__hlsSources") == [
+                media_urls(_CAMERA)["live_url"], media_urls(_OTHER)["live_url"]
+            ]
+        else:
+            expect(page.locator("#play-live")).to_be_visible()
+            expect(page.locator("#workspace")).to_be_visible()
+            assert page.evaluate("window.__hlsPlayers.length") == 2
+        assert len(media_calls) == (3 if outcome == "selection_race" else 2)
+        assert all(authorization == f"Bearer {token}" for _, authorization in media_calls)
+        assert len(logins) == 1
+        assert not errors
+    finally:
+        if context is not None:
+            context.close()
+        if browser is not None:
+            browser.close()
+        if playwright is not None:
+            playwright.stop()

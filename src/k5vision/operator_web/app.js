@@ -18,6 +18,7 @@
     token: "", account: null, cameras: [], workerStatus: "ready", selected: null, media: null,
     view: "live", sessionEpoch: 0, selectionEpoch: 0, requests: new Set(),
     hls: null, nativeLive: false, hlsScript: null, retryTimer: null, retryCount: 0,
+    mediaAuthRefreshUsed: false,
     pollTimer: null, expiryTimer: null, selectionController: null,
     spans: [], selectedSpan: null, historyEpoch: 0, historyRolling: true, signingOut: false,
     dialogMode: "add", cameraSetupEpoch: 0, diagnostics: null, statusUnavailable: false,
@@ -103,7 +104,7 @@
         ...(options.rawBody !== undefined ? { body: options.rawBody } : {}),
       });
       if (!response.ok) {
-        if (response.status === 401 && token && path !== "/api/v1/auth/login" && !state.signingOut) {
+        if (response.status === 401 && token && token === state.token && path !== "/api/v1/auth/login" && !state.signingOut) {
           expireSession();
         }
         let code = "", clock = null;
@@ -197,6 +198,7 @@
     state.removing = false;
     state.selected = null;
     state.media = null;
+    state.mediaAuthRefreshUsed = false;
     state.spans = [];
     state.selectedSpan = null;
     $("workspace").hidden = true;
@@ -477,6 +479,7 @@
     state.historyEpoch += 1;
     state.selected = deviceId;
     state.media = null;
+    state.mediaAuthRefreshUsed = false;
     stopLive(); stopPlayback(); resetHistory();
     if (state.cameraConnectionNotice !== deviceId) {
       state.cameraConnectionNotice = null;
@@ -533,6 +536,38 @@
     livePlaceholder("Reconnecting", reason);
     message("live-state", `Reconnecting · Attempt ${state.retryCount} of ${RETRY_DELAYS.length}`);
     state.retryTimer = setTimeout(() => void startLive(epoch), delay);
+  }
+
+  async function recoverMediaAccess(epoch) {
+    const session = state.sessionEpoch, token = state.token, deviceId = state.selected;
+    if (!token || !deviceId || epoch !== state.selectionEpoch || state.view !== "live" || state.signingOut) return;
+    const current = () => session === state.sessionEpoch && token === state.token
+      && epoch === state.selectionEpoch && deviceId === state.selected
+      && state.view === "live" && !state.signingOut;
+    stopLive(false);
+    if (state.mediaAuthRefreshUsed) {
+      livePlaceholder("Media access unavailable", "Media access could not be restored. Select reconnect to try again.", true);
+      message("live-state", "Live view unavailable · Select reconnect to try again");
+      return;
+    }
+    state.mediaAuthRefreshUsed = true;
+    livePlaceholder("Restoring media access", "Checking your existing camera access…");
+    message("live-state", "Restoring media access…");
+    try {
+      const media = await request(`/api/v1/operator/cameras/${encodeURIComponent(deviceId)}/media-session`, {
+        method: "POST", signal: state.selectionController?.signal,
+      });
+      if (!current()) return;
+      state.media = {
+        live_url: safeMediaUrl(media.live_url, "/media/live/"),
+        playback_url: safeMediaUrl(media.playback_url, "/media/playback"),
+      };
+      await startLive(epoch);
+    } catch (error) {
+      if (error.name === "AbortError" || !current()) return;
+      livePlaceholder("Media access unavailable", apiMessage(error, "Media access could not be restored. Select reconnect to try again."), true);
+      message("live-state", "Live view unavailable · Select reconnect to try again");
+    }
   }
 
   function canSamplePerson() {
@@ -659,7 +694,7 @@
         state.hls = hls;
         hls.on(window.Hls.Events.ERROR, (_event, data) => {
           if (!data.fatal || hls !== state.hls || epoch !== state.selectionEpoch) return;
-          if (data.response?.code === 401 || data.response?.code === 403) { expireSession(); return; }
+          if (data.response?.code === 401 || data.response?.code === 403) { void recoverMediaAccess(epoch); return; }
           if (data.details === "manifestIncompatibleCodecsError") {
             stopLive();
             livePlaceholder("Video format unavailable", "Select an H.264 stream in your camera settings, then reconnect.", true);

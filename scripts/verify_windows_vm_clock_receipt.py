@@ -161,9 +161,9 @@ def _vm_clock(value, *, expected_head, installer_sha256):
         actual = _number(phase.get("actual_step_seconds"), offset - 2, offset + 2)
         _require(abs(actual - shifts[index]["actual_step_seconds"]) <= 0.01)
         _number(phase.get("held_offset_seconds"), offset - 2, offset + 2)
-        held_seconds = _number(phase.get("monotonic_elapsed_seconds"), 0, 90)
+        held_seconds = _number(phase.get("monotonic_elapsed_seconds"), 10, 90)
         end = shifts[index + 1]["before"]["elapsed_seconds"] if index == 0 else elapsed
-        _require(0 < held_seconds <= end - shifts[index]["before"]["elapsed_seconds"] + 0.002)
+        _require(held_seconds <= end - shifts[index]["before"]["elapsed_seconds"] + 0.002)
         _require(phase.get("clock_alert_direction") == ("forward" if offset > 0 else "backward"))
         for field in (
             "same_human_session",
