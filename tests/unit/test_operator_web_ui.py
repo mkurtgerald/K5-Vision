@@ -1037,8 +1037,10 @@ def test_timeline_gap_clears_previous_clip_and_download_without_losing_history(l
             page.locator("#password").fill("generated-human-account-password")
             page.locator("#sign-in-button").click()
             page.locator(f'[data-camera-id="{_CAMERA}"] [data-wall-action="recordings"]').click()
-            page.locator("#history-start").fill(start.strftime("%Y-%m-%dT%H:%M:%S"))
-            page.locator("#history-end").fill(end.strftime("%Y-%m-%dT%H:%M:%S"))
+            page.locator("#history-start").fill(
+                start.strftime("%Y-%m-%dT%H:%M:%S").removesuffix(":00")
+            )
+            page.locator("#history-end").fill(end.strftime("%Y-%m-%dT%H:%M:%S").removesuffix(":00"))
             page.locator("#history-form").evaluate("form => form.requestSubmit()")
             expect = browser_api.expect
             expect(page.locator("#history-count")).to_have_text("2")
