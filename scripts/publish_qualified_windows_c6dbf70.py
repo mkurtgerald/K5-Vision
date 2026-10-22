@@ -137,7 +137,11 @@ class GitHub:
             "Authorization": "Bearer " + self.token,
             "User-Agent": "K5-qualified-delivery",
             "X-GitHub-Api-Version": "2022-11-28",
-            "Accept": "application/octet-stream" if binary else "application/vnd.github+json",
+            "Accept": (
+                "application/octet-stream"
+                if binary and "/releases/assets/" in path
+                else "application/vnd.github+json"
+            ),
         }
         if payload is not None:
             data = json.dumps(payload, allow_nan=False).encode()
@@ -153,7 +157,14 @@ class GitHub:
         except urllib.error.HTTPError as error:
             if missing and error.code == 404:
                 return None
-            raise AdmissionError("GitHub request failed: HTTP " + str(error.code)) from None
+            raise AdmissionError(
+                "GitHub "
+                + method
+                + " "
+                + path.split("?", 1)[0]
+                + " failed: HTTP "
+                + str(error.code)
+            ) from None
         require(len(result) <= limit, "GitHub response exceeded its byte limit")
         return result if binary else json.loads(result)
 
