@@ -3,7 +3,7 @@ name: Native Windows Desktop Installer
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta]
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta, codex/windows-onvif-onboarding]
     paths:
       - .github/workflows/operator-desktop-windows.yml
       - .github/actions/provision-operator-tools/**
@@ -66,7 +66,7 @@ jobs:
       - name: Verify ONVIF authentication, multicast and honest video status
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_web_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify camera administration and atomic reconnect on Windows
         shell: pwsh
@@ -157,8 +157,13 @@ jobs:
               $witness.receipt.onvif_time_health_displayed -isnot [bool] -or
               $witness.receipt.onvif_time_health_displayed -ne $true -or
               $witness.receipt.recorder_time_health_displayed -isnot [bool] -or
-              $witness.receipt.recorder_time_health_displayed -ne $true) {
-            throw "ONVIF camera-onboarding GUI qualification is incomplete"
+              $witness.receipt.recorder_time_health_displayed -ne $true -or
+              $witness.receipt.camera_count -ne 4 -or
+              $witness.receipt.four_camera_wall -ne $true -or
+              $witness.receipt.native_default_browser_handoff -ne $true -or
+              $witness.receipt.timeline_seek_playback -ne $true -or
+              $witness.receipt.actual_recording_export -ne $true) {
+            throw "Four-camera surveillance workspace qualification is incomplete"
           }
           $release = Join-Path $env:GITHUB_WORKSPACE "desktop-build/release"
           New-Item -ItemType Directory -Path $release | Out-Null
@@ -174,10 +179,11 @@ jobs:
             launcher_sha256=(Get-FileHash -LiteralPath desktop-build/payload/K5Vision.exe -Algorithm SHA256).Hash.ToLowerInvariant();
             payload_manifest_sha256=(Get-FileHash -LiteralPath desktop-build/payload/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant();
             runtime='CPython 3.12.10 embedded amd64'; installer='Inno Setup 6.4.3';
-            scope='Native Windows ONVIF camera-onboarding recording operator'; no_terminal_required=$true;
+            scope='Native Windows ONVIF surveillance workspace'; no_terminal_required=$true;
             no_external_python_required=$true; no_runtime_package_downloads=$true
             workers_bundled=$false; first_launch_internet_required=$true
             onvif_camera_onboarding=$true; manual_stream_uri_required=$false
+            surveillance_workspace=$true; four_camera_wall=$true; actual_recording_export=$true
           }
           $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $release "desktop-package.json") -Encoding utf8
       - name: Upload qualified graphical Windows installer

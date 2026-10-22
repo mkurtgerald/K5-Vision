@@ -26,6 +26,7 @@ class MediaMTXSource:
     binding: MediaMTXBinding
     device: Device = field(repr=False)
     source_uri: str = field(repr=False)
+    recording_enabled: bool = True
 
     def __post_init__(self) -> None:
         valid = False
@@ -36,6 +37,7 @@ class MediaMTXSource:
             userinfo = source.netloc.rsplit("@", 1)[0] if "@" in source.netloc else None
             valid = (
                 isinstance(self.binding, MediaMTXBinding)
+                and type(self.recording_enabled) is bool
                 and isinstance(self.device, Device)
                 and self.device.id == self.binding.device_id
                 and self.device.kind
@@ -148,7 +150,7 @@ def generate_mediamtx_configuration(
             "sourceOnDemand": False,
             "rtspTransport": "tcp",
             "useAbsoluteTimestamp": False,
-            "record": True,
+            "record": source.recording_enabled,
             "recordPath": recording_path,
             "recordFormat": "fmp4",
             "recordPartDuration": "1s",

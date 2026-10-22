@@ -1,4 +1,4 @@
-"""Opt-in, bounded two-camera qualification through the real operator browser.
+"""Opt-in, bounded four-camera qualification through the real operator browser.
 
 The native Windows gate uses installed Edge and the real donor workers. Linux
 Chromium is a useful regression only. All camera content is generated; this
@@ -20,10 +20,10 @@ import shutil
 import socket
 import subprocess
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import pytest
 
@@ -34,6 +34,8 @@ _PLAYWRIGHT_VERSION = "1.58.0"
 _CAMERAS = (
     ("Generated red camera", "127.0.0.1", "red"),
     ("Generated blue camera", "127.0.0.2", "blue"),
+    ("Generated green camera", "127.0.0.1", "lime"),
+    ("Generated yellow camera", "127.0.0.2", "yellow"),
 )
 pytestmark = pytest.mark.skipif(
     os.getenv("K5_OPERATOR_BROWSER_ACCEPTANCE") != "1"
@@ -358,20 +360,26 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
 
 def _decoded_color(page, video_id, color):
     """Require advancing decoded frames, then inspect actual same-origin pixels."""
+    return _decoded_video(page, "#" + video_id, color)
+
+
+def _decoded_video(page, selector, color):
+    """Check a particular visible video, including independent camera-wall tiles."""
     __tracebackhide__ = True
     page.wait_for_function(
-        """id => {
-          const video = document.getElementById(id);
-          return video.readyState >= 2 && !video.paused && video.videoWidth === 320 &&
+        """selector => {
+          const video = document.querySelector(selector);
+          return video && video.getBoundingClientRect().width > 0 &&
+            video.readyState >= 2 && !video.paused && video.videoWidth === 320 &&
             video.videoHeight === 240 && video.currentTime > 0.15 &&
             video.getVideoPlaybackQuality().totalVideoFrames >= 4;
         }""",
-        arg=video_id,
+        arg=selector,
         timeout=25_000,
     )
     decoded = page.evaluate(
-        """id => {
-          const video = document.getElementById(id);
+        """selector => {
+          const video = document.querySelector(selector);
           const canvas = document.createElement('canvas');
           canvas.width = canvas.height = 1;
           const context = canvas.getContext('2d');
@@ -381,16 +389,328 @@ def _decoded_color(page, video_id, color):
             rgb: Array.from(context.getImageData(0, 0, 1, 1).data).slice(0, 3)
           };
         }""",
-        video_id,
+        selector,
     )
     red, green, blue = decoded["rgb"]
-    isolated = (
-        red > 180 and green < 70 and blue < 70
-        if color == "red"
-        else (blue > 180 and red < 70 and green < 70)
-    )
+    isolated = {
+        "red": red > 180 and green < 70 and blue < 70,
+        "blue": blue > 180 and red < 70 and green < 70,
+        "lime": green > 180 and red < 70 and blue < 70,
+        "yellow": red > 180 and green > 180 and blue < 70,
+    }.get(color, False)
     _require(isolated, "Decoded video did not match the selected generated camera")
     return decoded["frames"]
+
+
+def _open_camera_watch(page, device_id):
+    page.locator("#wall-tab").click()
+    tile = page.locator(f'#wall-panel [data-camera-id="{device_id}"]')
+    tile.locator("[data-wall-action='watch']").click()
+    page.locator("#live-panel").wait_for(state="visible")
+
+
+def _open_camera_recordings(page, device_id):
+    page.locator("#wall-tab").click()
+    tile = page.locator(f'#wall-panel [data-camera-id="{device_id}"]')
+    tile.locator("[data-wall-action='recordings']").click()
+    page.locator("#history-panel").wait_for(state="visible")
+
+
+def _wall_frames(page, device_ids, colors, *, layout=None):
+    """Require all selected wall tiles visible and advancing concurrently."""
+    __tracebackhide__ = True
+    _require(len(device_ids) == len(colors) and 1 <= len(device_ids) <= 9, "Invalid wall proof")
+    page.locator("#wall-tab").click()
+    layout = layout or ("4" if len(device_ids) <= 4 else "9")
+    if page.locator("#wall-layout").input_value() != layout:
+        page.locator("#wall-layout").select_option(layout)
+    selectors = [f'#wall-panel [data-camera-id="{device}"] video' for device in device_ids]
+    if layout == "4" and len(device_ids) == 4:
+        page.evaluate("""() => {
+          window.scrollTo(0,0);
+          document.querySelector('.main-content').scrollTop=0;
+        }""")
+        page.wait_for_function(
+            """selectors => selectors.every(selector => {
+              const video=document.querySelector(selector);
+              if(!video) return false;
+              const bounds=video.getBoundingClientRect();
+              return bounds.width>0 && bounds.height>0 && bounds.top>=-1 && bounds.left>=-1 &&
+                bounds.bottom<=innerHeight+1 && bounds.right<=innerWidth+1;
+            })""",
+            arg=selectors,
+            timeout=15_000,
+        )
+    before = [
+        _decoded_video(page, selector, color)
+        for selector, color in zip(selectors, colors, strict=True)
+    ]
+    page.wait_for_function(
+        """({selectors,before}) => selectors.every((selector,index) => {
+          const video = document.querySelector(selector);
+          return video && video.getBoundingClientRect().width > 0 && !video.paused &&
+            video.readyState >= 2 &&
+            video.getVideoPlaybackQuality().totalVideoFrames >= before[index]+4;
+        })""",
+        arg={"selectors": selectors, "before": before},
+        timeout=20_000,
+    )
+    return [
+        _decoded_video(page, selector, color)
+        for selector, color in zip(selectors, colors, strict=True)
+    ]
+
+
+def _wall_layout_proof(page, device_ids, colors):
+    """Exercise real 1/4/9 layouts without claiming nine generated cameras."""
+    page.locator("#wall-tab").click()
+    page.locator("#wall-layout").select_option("1")
+    page.wait_for_function("() => document.querySelectorAll('#wall-panel video').length===1")
+    visible_id = page.locator("#wall-panel [data-camera-id]").get_attribute("data-camera-id")
+    by_id = dict(zip(device_ids, colors, strict=True))
+    _require(visible_id in by_id, "Single-camera wall selected an unknown source")
+    _decoded_video(page, f'#wall-panel [data-camera-id="{visible_id}"] video', by_id[visible_id])
+    page.locator("#wall-layout").select_option("9")
+    page.wait_for_function("() => document.querySelectorAll('#wall-panel video').length===4")
+    _wall_frames(page, device_ids, colors, layout="9")
+    _wall_frames(page, device_ids, colors, layout="4")
+    return [1, 4, 9]
+
+
+def _timeline_play(page, color):
+    """Seek via actual timeline pointer coordinates, then decode selected video."""
+    __tracebackhide__ = True
+    available = page.locator("#recording-timeline .k5-timeline-recording").first
+    available.wait_for(state="attached", timeout=15_000)
+    first = float(available.get_attribute("data-start"))
+    last = float(available.get_attribute("data-end"))
+    _require(last - first >= 2000, "Timeline fixture has no playable two-second interval")
+    # Narrow the actual UTC form to make a seconds-long fixture selectable by
+    # a real pointer instead of seeking a sub-pixel range in a 24-hour window.
+    start = datetime.fromtimestamp(first / 1000, UTC) - timedelta(seconds=2)
+    end = datetime.fromtimestamp(last / 1000, UTC) + timedelta(seconds=2)
+    page.locator("#history-start").fill(start.strftime("%Y-%m-%dT%H:%M:%S"))
+    page.locator("#history-end").fill(end.strftime("%Y-%m-%dT%H:%M:%S"))
+    with page.expect_response(lambda response: "/history?" in response.url) as loaded:
+        page.locator("#load-history").click()
+    _require(loaded.value.status == 200, "Timeline UTC window could not be loaded")
+    slider = page.locator("#recording-timeline [role='slider']")
+    slider.wait_for(state="visible")
+    page.wait_for_function(
+        """({first,last}) => {
+          const slider=document.querySelector('#recording-timeline [role=slider]');
+          return Number(slider?.getAttribute('aria-valuemin'))===first &&
+            Number(slider?.getAttribute('aria-valuemax'))===last;
+        }""",
+        arg={
+            "first": int(start.replace(microsecond=0).timestamp() * 1000),
+            "last": int(end.replace(microsecond=0).timestamp() * 1000),
+        },
+    )
+    minimum = float(slider.get_attribute("aria-valuemin"))
+    maximum = float(slider.get_attribute("aria-valuemax"))
+    chosen = first + min(1000, (last - first) / 4)
+    bounds = slider.bounding_box()
+    _require(bounds and maximum > minimum, "Actual timeline track is unavailable")
+    slider.click(
+        position={
+            "x": (chosen - minimum) / (maximum - minimum) * bounds["width"],
+            "y": bounds["height"] / 2,
+        }
+    )
+    page.wait_for_function(
+        """chosen => {
+          const input=document.getElementById('playback-start');
+          return !input.disabled && Math.abs(Date.parse(input.value+'Z')-chosen)<300;
+        }""",
+        arg=chosen,
+    )
+    page.locator("#playback-duration").fill("2")
+    page.locator("#play-recording").click()
+    return _decoded_color(page, "playback-video", color)
+
+
+def _download_recording(page, ffprobe, export_path, helpers, color):
+    """Save the actual browser download and independently decode its MP4 file."""
+    __tracebackhide__ = True
+    page.locator("#playback-duration").fill("2")
+    with page.expect_download(timeout=20_000) as pending:
+        page.locator("#download-recording").click()
+    download = pending.value
+    _require(download.failure() is None, "Actual recording download failed")
+    download.save_as(export_path)
+    _require(0 < export_path.stat().st_size <= 16 * 1024**2, "Recording export exceeded its bound")
+    frames = helpers._decoded_frames(ffprobe, export_path)
+    ffmpeg = helpers._tool("K5_DONOR_FFMPEG")
+    pixel = subprocess.run(
+        [
+            str(ffmpeg),
+            "-v",
+            "error",
+            "-i",
+            str(export_path),
+            "-vf",
+            "scale=1:1",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=10,
+        check=False,
+    )
+    _require(pixel.returncode == 0 and len(pixel.stdout) == 3, "Saved export pixel decode failed")
+    red, green, blue = pixel.stdout
+    _require(
+        {
+            "red": red > 180 and green < 70 and blue < 70,
+            "blue": blue > 180 and red < 70 and green < 70,
+            "lime": green > 180 and red < 70 and blue < 70,
+            "yellow": red > 180 and green > 180 and blue < 70,
+        }.get(color, False),
+        "Saved export did not match the selected camera",
+    )
+    return frames
+
+
+def _camera_recording_bytes(product, device_ids):
+    paths = {
+        str(source.binding.device_id): source.binding.path_name
+        for source in product.service._sources
+    }
+    return [
+        sum(
+            path.stat().st_size
+            for path in (product.service.recording_root / paths[device]).glob("*.mp4")
+        )
+        for device in device_ids
+    ]
+
+
+def _publish_generated(helpers, ffmpeg, video, source, private):
+    return helpers._start(
+        [
+            str(ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-re",
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(video),
+            "-t",
+            "180",
+            "-c",
+            "copy",
+            "-f",
+            "rtsp",
+            "-rtsp_transport",
+            "tcp",
+            source,
+        ],
+        private,
+    )
+
+
+def _credential_uri(uri, username, password):
+    source = urlsplit(uri)
+    _require(
+        source.scheme == "rtsp" and source.username is None, "Generated RTSP source was refused"
+    )
+    return source._replace(
+        netloc=quote(username, safe="") + ":" + quote(password, safe="") + "@" + source.netloc
+    ).geturl()
+
+
+def _assert_rtsp_read_auth(ffprobe, anonymous_uri, camera_username, password):
+    """Exercise native RTSP read authentication without retaining private stderr."""
+    __tracebackhide__ = True
+
+    def probe(uri):
+        __tracebackhide__ = True
+        try:
+            result = subprocess.run(
+                [
+                    str(ffprobe),
+                    "-v",
+                    "error",
+                    "-rtsp_transport",
+                    "tcp",
+                    "-analyzeduration",
+                    "1000000",
+                    "-probesize",
+                    "1000000",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=codec_name,width,height",
+                    "-of",
+                    "json",
+                    uri,
+                ],
+                capture_output=True,
+                timeout=8,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            raise RuntimeError(
+                "Bounded generated RTSP authentication probe did not finish"
+            ) from None
+        _require(
+            len(result.stdout) <= 4096 and len(result.stderr) <= 16384,
+            "Generated RTSP authentication probe exceeded its output bound",
+        )
+        return result
+
+    for uri in (
+        anonymous_uri,
+        _credential_uri(anonymous_uri, camera_username, secrets.token_urlsafe(24)),
+    ):
+        refused = probe(uri)
+        _require(
+            refused.returncode != 0 and b"401" in refused.stderr,
+            "Generated camera admitted an unauthorized RTSP reader",
+        )
+    accepted = probe(_credential_uri(anonymous_uri, camera_username, password))
+    _require(accepted.returncode == 0, "Generated camera refused its valid RTSP read account")
+    streams = json.loads(accepted.stdout).get("streams")
+    _require(
+        isinstance(streams, list)
+        and len(streams) == 1
+        and (streams[0].get("codec_name"), streams[0].get("width"), streams[0].get("height"))
+        == ("h264", 320, 240),
+        "Authenticated camera read did not expose the generated H264 video",
+    )
+    return {
+        "authenticated_camera_read": True,
+        "rtsp_anonymous_read_rejected": True,
+        "rtsp_wrong_password_rejected": True,
+    }
+
+
+def _toggle_camera_recording(page, camera_id, enabled):
+    __tracebackhide__ = True
+    control = page.locator("#toggle-recording")
+    route = "/api/v1/operator/cameras/" + camera_id + "/recording"
+    with page.expect_response(
+        lambda response: response.request.method == "PUT" and response.url.endswith(route)
+    ) as changed:
+        control.click()
+    _require(changed.value.status == 200, "Camera recording control did not save its choice")
+    page.wait_for_function(
+        """enabled => {
+          const button=document.getElementById('toggle-recording');
+          return !button.disabled && button.dataset.enabled===String(enabled) &&
+            button.getAttribute('aria-pressed')===String(enabled);
+        }""",
+        arg=enabled,
+    )
 
 
 def _assert_no_browser_storage(page):
@@ -419,7 +739,7 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
     """Delay only the previous selection to reproduce the real enrollment race.
 
     This browser behavior regression uses intercepted responses. It supplements
-    the independent real two-camera fixture; it is not native media acceptance.
+    the independent real four-camera fixture; it is not native media acceptance.
     """
     __tracebackhide__ = True
     browser_api = pytest.importorskip("playwright.sync_api")
@@ -448,6 +768,10 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
                     "index.html": "text/html",
                     "app.js": "application/javascript",
                     "app.css": "text/css",
+                    "wall.js": "application/javascript",
+                    "wall.css": "text/css",
+                    "timeline.js": "application/javascript",
+                    "timeline.css": "text/css",
                 }[name]
                 route.fulfill(
                     status=200, content_type=content_type, body=(assets / name).read_text()
@@ -512,6 +836,8 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
                     "host": host,
                     "status": "connecting",
                     "recording": False,
+                    "recording_enabled": True,
+                    "recording_state": "waiting",
                     "analytics_status": "disabled",
                 }
                 cameras.append(data)
@@ -667,6 +993,8 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                 "lavfi",
                 "-i",
                 f"color=c={color}:s=320x240:r=15",
+                "-vf",
+                "noise=alls=8:allf=t+u",
                 "-t",
                 "12",
                 "-an",
@@ -695,8 +1023,8 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         _require(result.returncode == 0, "Generated H264 camera fixture could not be created")
         _require(helpers._decoded_frames(ffprobe, video) == 180, "Generated fixture was invalid")
         videos.append(video)
-    reservations, ports = helpers._reserve_ports(8)
-    upstream_ports, product_ports = ports[:2], ports[2:]
+    reservations, ports = helpers._reserve_ports(10)
+    upstream_ports, product_ports = ports[:4], ports[4:]
     processes, publishers, onvif_cameras = [], [], []
     product = None
     browser = context = anonymous = playwright = None
@@ -706,6 +1034,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
     request_failures = {}
     request_counts, response_counts, browser_capabilities = {}, {}, {}
     enrollment_index = 0
+    history_diagnostic = {}
     started = time.monotonic()
     receipt = {
         "schema_version": "1",
@@ -719,7 +1048,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         "long_duration_acceptance": False,
         "hardware_capacity_acceptance": False,
         "host_clock_step_acceptance": False,
-        "camera_count": 2,
+        "camera_count": 4,
         "width": 320,
         "height": 240,
         "frames_per_second": 15,
@@ -729,12 +1058,49 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         for listener in reservations:
             listener.close()
         stage = "upstreams_starting"
-        sources = []
+        sources, publisher_sources = [], []
         for camera_index, ((_, host, color), port) in enumerate(
             zip(_CAMERAS, upstream_ports, strict=True)
         ):
             source = f"rtsp://{host}:{port}/generated"
             sources.append(source)
+            fixture = _onvif_helpers().OnvifCameraFixture(
+                host=host,
+                stream_uri=source,
+                clock_skew_seconds=1200 if camera_index == 0 else -1200,
+                clock_mode="NTP",
+            )
+            onvif_cameras.append(fixture)
+            users = [
+                {
+                    "user": "any",
+                    "ips": ["127.0.0.0/8", "::1"],
+                    "permissions": [
+                        {"action": action, "path": "generated"} for action in ("publish", "read")
+                    ],
+                }
+            ]
+            publisher_source = source
+            if camera_index == 0:
+                publisher_password = secrets.token_urlsafe(32)
+                publisher_source = _credential_uri(
+                    source, "generated-publisher", publisher_password
+                )
+                users = [
+                    {
+                        "user": fixture.username,
+                        "pass": fixture.password,
+                        "ips": ["127.0.0.0/8", "::1"],
+                        "permissions": [{"action": "read", "path": "generated"}],
+                    },
+                    {
+                        "user": "generated-publisher",
+                        "pass": publisher_password,
+                        "ips": ["127.0.0.0/8", "::1"],
+                        "permissions": [{"action": "publish", "path": "generated"}],
+                    },
+                ]
+            publisher_sources.append(publisher_source)
             config = private / f"private {color} upstream.json"
             helpers._private_write(
                 config,
@@ -743,16 +1109,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                         "logLevel": "warn",
                         "rtspAddress": f"{host}:{port}",
                         "rtspTransports": ["tcp"],
-                        "authInternalUsers": [
-                            {
-                                "user": "any",
-                                "ips": ["127.0.0.0/8", "::1"],
-                                "permissions": [
-                                    {"action": action, "path": "generated"}
-                                    for action in ("publish", "read")
-                                ],
-                            }
-                        ],
+                        "authInternalUsers": users,
                         "api": False,
                         "playback": False,
                         "hls": False,
@@ -776,41 +1133,15 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                     return False
 
             runtime._wait(upstream_ready, label="Generated camera upstream listener", timeout=10)
-            onvif_cameras.append(
-                _onvif_helpers().OnvifCameraFixture(
-                    host=host,
-                    stream_uri=source,
-                    clock_skew_seconds=1200 if camera_index == 0 else -1200,
-                    clock_mode="NTP",
-                )
-            )
-        for video, source in zip(videos, sources, strict=True):
+        for video, source in zip(videos, publisher_sources, strict=True):
             stage = "generated_publishers_starting"
-            publisher = helpers._start(
-                [
-                    str(ffmpeg),
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-re",
-                    "-stream_loop",
-                    "-1",
-                    "-i",
-                    str(video),
-                    "-t",
-                    "90",
-                    "-c",
-                    "copy",
-                    "-f",
-                    "rtsp",
-                    "-rtsp_transport",
-                    "tcp",
-                    source,
-                ],
-                private,
-            )
+            publisher = _publish_generated(helpers, ffmpeg, video, source, private)
             processes.append(publisher)
             publishers.append(publisher)
+        stage = "authenticated_rtsp_read_controls"
+        rtsp_auth_proof = _assert_rtsp_read_auth(
+            ffprobe, sources[0], onvif_cameras[0].username, onvif_cameras[0].password
+        )
         stage = "product_starting"
         product = runtime._Product(
             identity, identity.directory / "recordings", media, caddy, product_ports
@@ -831,7 +1162,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             channel=channel, headless=True, args=["--autoplay-policy=no-user-gesture-required"]
         )
         receipt["browser_version"] = browser.version
-        context = browser.new_context(viewport={"width": 1440, "height": 960})
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
         anonymous = browser.new_context()
         page = context.new_page()
         page.set_default_timeout(10_000)
@@ -942,8 +1273,9 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             if enrollment_index == 1:
                 receipt["bounded_discovery_executed"] = discovered
             camera_ids.append(camera["device_id"])
-        _require(len(set(camera_ids)) == 2, "Distinct generated cameras were merged")
+        _require(len(set(camera_ids)) == 4, "Distinct generated cameras were merged")
         receipt["ui_two_camera_enrollment"] = True
+        receipt["ui_four_camera_enrollment"] = True
         receipt["onvif_credential_profile_enrollment"] = True
         receipt["onvif_wrong_password_rejected"] = True
         receipt["no_manual_stream_uri"] = True
@@ -965,13 +1297,166 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
 
         def both_live():
             views = client.json("/api/v1/operator/cameras")["cameras"]
-            return len(views) == 2 and all(v["status"] == "live" and v["recording"] for v in views)
+            return len(views) == 4 and all(v["status"] == "live" and v["recording"] for v in views)
 
         stage = "concurrent_recording"
         runtime._wait(
-            both_live, label="Concurrent two-camera recording", product=product, timeout=20
+            both_live, label="Concurrent four-camera recording", product=product, timeout=20
         )
         receipt["simultaneous_recording"] = True
+        receipt.update(rtsp_auth_proof)
+        stage = "concurrent_camera_wall_decode"
+        receipt["wall_layouts"] = _wall_layout_proof(
+            page, camera_ids, [camera[2] for camera in _CAMERAS]
+        )
+        receipt["wall_decoded_frames"] = _wall_frames(
+            page, camera_ids, [camera[2] for camera in _CAMERAS]
+        )
+        receipt["wall_viewport_fit"] = True
+        receipt["wall_viewport"] = [page.viewport_size["width"], page.viewport_size["height"]]
+        screenshot = os.environ.get("K5_OPERATOR_WALL_SCREENSHOT")
+        if screenshot:
+            target = Path(screenshot)
+            _require(
+                target.is_absolute() and target.suffix.lower() == ".png" and target.parent.is_dir(),
+                "Generated camera-wall screenshot path is invalid",
+            )
+            # Explicit local inspection only: four generated scenes, no setup
+            # dialog, camera credentials, real-camera pixels or account header.
+            viewport = page.viewport_size
+            try:
+                page.set_viewport_size({"width": 1440, "height": 900})
+                page.evaluate("""() => {
+                  window.scrollTo(0,0);
+                  document.querySelector('.main-content').scrollTop=0;
+                }""")
+                page.screenshot(
+                    path=str(target.with_name(target.stem + "-workspace.png")), timeout=5000
+                )
+                page.screenshot(
+                    path=str(target.with_name(target.stem + "-workspace-full.png")),
+                    full_page=True,
+                    timeout=5000,
+                )
+            finally:
+                page.set_viewport_size(viewport)
+            page.locator("#wall-panel").screenshot(path=str(target), timeout=5000)
+        receipt["four_camera_wall"] = True
+        recording_before = _camera_recording_bytes(product, camera_ids)
+        runtime._wait(
+            lambda: all(
+                after > before
+                for after, before in zip(
+                    _camera_recording_bytes(product, camera_ids), recording_before, strict=True
+                )
+            ),
+            label="Each camera records new bytes independently",
+            product=product,
+            timeout=15,
+        )
+        receipt["per_camera_recording_bytes_before"] = recording_before
+        receipt["per_camera_recording_bytes_after"] = _camera_recording_bytes(product, camera_ids)
+        stage = "pause_one_camera_recording"
+        _open_camera_watch(page, camera_ids[0])
+        _toggle_camera_recording(page, camera_ids[0], False)
+
+        def paused_camera_live():
+            views = {v["device_id"]: v for v in client.json("/api/v1/operator/cameras")["cameras"]}
+            return (
+                views[camera_ids[0]]["status"] == "live"
+                and views[camera_ids[0]]["recording_enabled"] is False
+                and views[camera_ids[0]]["recording_state"] == "paused"
+                and all(views[device]["recording"] for device in camera_ids[1:])
+            )
+
+        runtime._wait(
+            paused_camera_live, label="Paused recording keeps its live source", product=product
+        )
+        _require(
+            bool(client.json(f"/api/v1/operator/cameras/{camera_ids[0]}/history")["spans"]),
+            "Pausing recording hid retained history",
+        )
+        paused_progress = _camera_recording_bytes(product, camera_ids)
+        frames_before_pause = _decoded_color(page, "live-video", "red")
+        pause_observed = time.monotonic()
+        runtime._wait(
+            lambda: (
+                time.monotonic() - pause_observed >= 3
+                and all(
+                    after > before
+                    for after, before in zip(
+                        _camera_recording_bytes(product, camera_ids)[1:],
+                        paused_progress[1:],
+                        strict=True,
+                    )
+                )
+            ),
+            label="Other cameras keep recording while one is paused",
+            product=product,
+            timeout=15,
+        )
+        _require(
+            _camera_recording_bytes(product, camera_ids)[0] == paused_progress[0],
+            "Paused camera continued writing recording bytes",
+        )
+        page.wait_for_function(
+            """before => document.getElementById('live-video')
+              .getVideoPlaybackQuality().totalVideoFrames > before""",
+            arg=frames_before_pause,
+        )
+        receipt["pause_live_decoded_frames_before"] = frames_before_pause
+        receipt["pause_live_decoded_frames_after"] = _decoded_color(page, "live-video", "red")
+        receipt["pause_recording_bytes_before"] = paused_progress[0]
+        receipt["pause_recording_bytes_after"] = _camera_recording_bytes(product, camera_ids)[0]
+        receipt["pause_other_recording_bytes_before"] = paused_progress[1:]
+        receipt["pause_other_recording_bytes_after"] = _camera_recording_bytes(product, camera_ids)[
+            1:
+        ]
+        receipt["recording_pause_live_continues"] = True
+        receipt["recording_pause_others_continue"] = True
+        stage = "recording_preference_restart"
+        product.stop()
+        product = runtime._Product(
+            identity, identity.directory / "recordings", media, caddy, product_ports
+        )
+        client = runtime._Client(product_ports[0])
+        runtime._wait(
+            lambda: product.server.started and client.get("/operator/")[0] == 200,
+            label="Product restart with paused recording",
+            product=product,
+        )
+        page.reload(wait_until="domcontentloaded")
+        page.locator("#username").fill(username)
+        page.locator("#password").fill(password)
+        with page.expect_response(
+            lambda response: response.url.endswith("/api/v1/auth/login")
+        ) as login:
+            page.locator("#sign-in-button").click()
+        _require(login.value.status == 200, "Returning operator could not sign in")
+        client.token = login.value.json()["session_token"]
+        runtime._wait(
+            paused_camera_live, label="Recording choice persisted across restart", product=product
+        )
+        _require(
+            _camera_recording_bytes(product, camera_ids)[0] == paused_progress[0],
+            "Product restart resumed a camera whose recording was paused",
+        )
+        receipt["recording_preference_persisted"] = True
+        receipt["paused_recording_bytes_after_restart"] = _camera_recording_bytes(
+            product, camera_ids
+        )[0]
+        _open_camera_watch(page, camera_ids[0])
+        _decoded_color(page, "live-video", "red")
+        _toggle_camera_recording(page, camera_ids[0], True)
+        runtime._wait(
+            lambda: _camera_recording_bytes(product, camera_ids)[0] > paused_progress[0],
+            label="Resumed camera records fresh bytes",
+            product=product,
+            timeout=15,
+        )
+        receipt["recording_resume_growth"] = True
+        receipt["resumed_recording_bytes"] = _camera_recording_bytes(product, camera_ids)[0]
+        receipt["ui_recording_controls"] = True
         live_frames, live_urls = [], []
         # Reverse order and switch repeatedly to detect stale media selection.
         for index in (1, 0, 1):
@@ -981,7 +1466,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             with page.expect_response(
                 lambda response, route=media_route: response.url.endswith(route)
             ) as media_session:
-                page.locator(".camera-item").filter(has_text=name).click()
+                _open_camera_watch(page, camera_ids[index])
             _require(media_session.value.status == 200, "Camera media session failed")
             live_url = media_session.value.json()["live_url"]
             live_urls.append(live_url)
@@ -996,19 +1481,88 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         receipt["camera_switch_pixel_isolation"] = True
         receipt["anonymous_media_denied"] = True
         stage = "independent_outage"
+        _wall_frames(page, camera_ids, [camera[2] for camera in _CAMERAS])
+        unaffected = [
+            page.locator(f'#wall-panel [data-camera-id="{device}"] video').element_handle()
+            for device in camera_ids[1:]
+        ]
+        unaffected_before = [
+            node.evaluate("video => video.getVideoPlaybackQuality().totalVideoFrames")
+            for node in unaffected
+        ]
+        unaffected_last = list(unaffected_before)
+        outage_bytes = _camera_recording_bytes(product, camera_ids)[1:]
+
+        def unaffected_advance():
+            counts = []
+            for index, node in enumerate(unaffected):
+                status = node.evaluate(
+                    """video => ({connected:video.isConnected,
+                      frames:video.getVideoPlaybackQuality().totalVideoFrames})"""
+                )
+                _require(
+                    status["connected"] and status["frames"] >= unaffected_last[index],
+                    "One camera outage reset an unaffected wall player",
+                )
+                unaffected_last[index] = status["frames"]
+                counts.append(status["frames"])
+            return all(
+                after >= before + 4 for after, before in zip(counts, unaffected_before, strict=True)
+            )
+
         helpers._stop_owned(publishers[0])
 
         def first_outage_only():
+            unaffected_advance()
             views = client.json("/api/v1/operator/cameras")["cameras"]
             states = {v["device_id"]: v for v in views}
-            return states[camera_ids[0]]["status"] == "disconnected" and (
-                states[camera_ids[1]]["status"] == "live" and states[camera_ids[1]]["recording"]
+            return states[camera_ids[0]]["status"] == "disconnected" and all(
+                states[device]["status"] == "live" and states[device]["recording"]
+                for device in camera_ids[1:]
             )
 
         runtime._wait(first_outage_only, label="Independent camera outage", product=product)
+        runtime._wait(
+            unaffected_advance,
+            label="Unaffected existing wall videos advance without reset",
+            product=product,
+        )
+        receipt["wall_outage_other_decoded_frames"] = unaffected_last
+        receipt["wall_outage_other_decoded_frames_before"] = unaffected_before
+        runtime._wait(
+            lambda: all(
+                after > before
+                for after, before in zip(
+                    _camera_recording_bytes(product, camera_ids)[1:], outage_bytes, strict=True
+                )
+            ),
+            label="Camera outage preserves other recording writers",
+            product=product,
+            timeout=15,
+        )
+        receipt["wall_outage_other_recording_bytes_before"] = outage_bytes
+        receipt["wall_outage_other_recording_bytes_after"] = _camera_recording_bytes(
+            product, camera_ids
+        )[1:]
         receipt["one_camera_outage_isolated"] = True
+        stage = "wall_camera_reconnect"
+        publishers[0] = _publish_generated(
+            helpers, ffmpeg, videos[0], publisher_sources[0], private
+        )
+        processes.append(publishers[0])
+        runtime._wait(
+            both_live,
+            label="Interrupted camera reconnects independently",
+            product=product,
+            timeout=20,
+        )
+        receipt["wall_reconnected_decoded_frames"] = _wall_frames(
+            page, camera_ids, [camera[2] for camera in _CAMERAS]
+        )
+        receipt["wall_outage_recovery"] = True
         stage = "recording_finalization"
-        helpers._stop_owned(publishers[1])
+        for publisher in publishers:
+            helpers._stop_owned(publisher)
         runtime._wait(
             lambda: all(
                 v["status"] == "disconnected"
@@ -1018,29 +1572,48 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             product=product,
         )
         playback_frames, playback_urls = [], []
-        for index, (name, _, color) in enumerate(_CAMERAS):
+        export_frames = []
+        for index, (_name, _, color) in enumerate(_CAMERAS):
             stage = "history_inventory"
-            page.locator(".camera-item").filter(has_text=name).click()
-            if index == 0:
-                page.locator("#history-tab").click()
+            _open_camera_recordings(page, camera_ids[index])
             page.locator(".history-item").first.wait_for(state="visible", timeout=15_000)
+            page.locator("#last-24-hours").click()
             actual_time = client.json("/api/v1/operator/status")["server_utc"]
             server_now = datetime.fromisoformat(actual_time.replace("Z", "+00:00"))
+            page.wait_for_function(
+                """server => {
+                  const first=Date.parse(document.getElementById('history-start').value+'Z');
+                  const last=Date.parse(document.getElementById('history-end').value+'Z');
+                  return last-first===86400000 && Math.abs(last-server)<15000;
+                }""",
+                arg=server_now.timestamp() * 1000,
+            )
             displayed_end = datetime.fromisoformat(
                 page.locator("#history-end").input_value()
             ).replace(tzinfo=UTC)
             displayed_start = datetime.fromisoformat(
                 page.locator("#history-start").input_value()
             ).replace(tzinfo=UTC)
+            history_diagnostic.update(
+                camera_index=index,
+                history_end_difference_seconds=round(
+                    (displayed_end - server_now).total_seconds(), 3
+                ),
+                history_window_seconds=(displayed_end - displayed_start).total_seconds(),
+            )
             _require(
                 abs((displayed_end - server_now).total_seconds()) < 15
                 and (displayed_end - displayed_start).total_seconds() == 86400,
                 "Rolling history followed skewed browser Date instead of real recorder UTC",
             )
-            page.locator(".history-item").first.click()
-            page.locator("#play-recording").click()
             stage = "playback_decode"
-            playback_frames.append(_decoded_color(page, "playback-video", color))
+            playback_frames.append(_timeline_play(page, color))
+            stage = "actual_recording_export"
+            export_frames.append(
+                _download_recording(
+                    page, ffprobe, private / f"exported {color}.mp4", helpers, color
+                )
+            )
             playback_url = page.locator("#download-recording").get_attribute("href")
             _require(
                 playback_url and playback_url.startswith("/media/playback?"),
@@ -1057,6 +1630,9 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             )
             _assert_no_browser_storage(page)
         receipt["playback_decoded_frames"] = playback_frames
+        receipt["timeline_seek_playback"] = True
+        receipt["export_decoded_frames"] = export_frames
+        receipt["actual_download_saved_and_decoded"] = True
         receipt["recording_pixel_isolation"] = True
         receipt["ui_history_and_gaps"] = True
         receipt["server_utc_rolling_history"] = True
@@ -1070,7 +1646,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         receipt["script_visible_credentials_absent"] = True
         recording_root = identity.directory / "recordings"
         saved_files = sorted(recording_root.rglob("*.mp4"))
-        _require(len(saved_files) >= 2, "Two-camera recording files were absent")
+        _require(len(saved_files) >= 4, "Four-camera recording files were absent")
 
         def digests():
             results = []
@@ -1082,6 +1658,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         saved_digests = digests()
         saved_history = client.json(f"/api/v1/operator/cameras/{camera_ids[1]}/history")["spans"]
         stage = "removal_cancel"
+        _open_camera_recordings(page, camera_ids[1])
         page.locator("#remove-camera-button").click()
         page.locator("#remove-camera-dialog").wait_for(state="visible")
         _require(
@@ -1091,7 +1668,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         page.locator("#cancel-remove-camera").click()
         page.locator("#remove-camera-dialog").wait_for(state="hidden")
         _require(
-            len(client.json("/api/v1/operator/cameras")["cameras"]) == 2,
+            len(client.json("/api/v1/operator/cameras")["cameras"]) == 4,
             "Cancelling removal changed camera enrollment",
         )
         receipt["ui_removal_cancel_preserved_camera"] = True
@@ -1106,7 +1683,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             page.locator("#confirm-remove-camera").click()
         _require(removed.value.status == 204, "Confirmed camera removal failed")
         page.locator("#remove-camera-dialog").wait_for(state="hidden")
-        page.wait_for_function("() => document.getElementById('camera-count').textContent === '1'")
+        page.wait_for_function("() => document.getElementById('camera-count').textContent === '3'")
         _require(
             client.get(removal_route + "/history")[0] == 404,
             "Removed camera history remained exposed in the workspace",
@@ -1136,6 +1713,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             client.json(removal_route + "/history")["spans"] == saved_history,
             "Re-enrolling a camera did not restore its retained history",
         )
+        _open_camera_recordings(page, camera_ids[1])
         page.wait_for_function(
             "name => document.getElementById('camera-title').textContent === name",
             arg=_CAMERAS[1][0],
@@ -1146,6 +1724,19 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         stage = "reenrollment_playback_decode"
         _decoded_color(page, "playback-video", "blue")
         receipt["ui_reenrollment_restored_history"] = True
+        stage = "wall_before_logout"
+        for index in range(len(_CAMERAS)):
+            publishers[index] = _publish_generated(
+                helpers, ffmpeg, videos[index], publisher_sources[index], private
+            )
+            processes.append(publishers[index])
+        runtime._wait(
+            both_live, label="Four live sources before wall sign-out", product=product, timeout=20
+        )
+        receipt["logout_wall_decoded_frames"] = _wall_frames(
+            page, camera_ids, [camera[2] for camera in _CAMERAS]
+        )
+        logout_recording_before = _camera_recording_bytes(product, camera_ids)
         stage = "logout_revocation"
         page.locator("#sign-out-button").click()
         page.locator("#sign-in").wait_for(state="visible")
@@ -1160,9 +1751,25 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         )
         _require(
             page.locator("#live-video").get_attribute("src") is None
-            and page.locator("#playback-video").get_attribute("src") is None,
+            and page.locator("#playback-video").get_attribute("src") is None
+            and page.locator("#wall-panel video").count() == 0,
             "Sign-out did not reset visible media",
         )
+        receipt["logout_destroyed_wall_tiles"] = True
+        runtime._wait(
+            lambda: all(
+                after > before
+                for after, before in zip(
+                    _camera_recording_bytes(product, camera_ids),
+                    logout_recording_before,
+                    strict=True,
+                )
+            ),
+            label="Signing out stops wall players and preserves background recording",
+            product=product,
+            timeout=15,
+        )
+        receipt["logout_background_recording_continues"] = True
         _assert_no_browser_storage(page)
         _require(not script_errors, "Operator browser raised an uncaught script error")
         receipt["logout_revoked_media_and_session"] = True
@@ -1220,6 +1827,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             "response_counts": response_counts,
             "browser_capabilities": browser_capabilities,
             "enrollment_index": enrollment_index,
+            **history_diagnostic,
             "cleanup_failure_codes": cleanup_failures,
             "product_thread_alive": bool(product and product.thread.is_alive()),
             "product_thread_failed": bool(product and product.failed),

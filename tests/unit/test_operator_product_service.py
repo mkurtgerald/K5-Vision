@@ -6,6 +6,7 @@ import json
 import os
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -550,6 +551,157 @@ def test_partial_disk_pause_retries_until_every_camera_stops_recording(native, m
                 )
             )
         finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_recording_preference_patches_only_writer_and_survives_worker_restart(native, monkeypatch):
+    mutations = _fake_mutations(native, monkeypatch)
+    _fast_maintenance(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first, second = _source(1), _source(2)
+        try:
+            await service.start((first, second))
+            media, gateway = service._media, service._gateway
+            original = json.loads(service._media_file.read_text())
+            paused = replace(first, recording_enabled=False)
+            await service.apply_recording_preferences((paused, second))
+            assert mutations == [("PATCH", f"/v3/config/paths/patch/{first.binding.path_name}")]
+            assert (service._media, service._gateway) == (media, gateway)
+            assert media.paths[first.binding.path_name] == {
+                **original["paths"][first.binding.path_name],
+                "record": False,
+            }
+            assert (
+                media.paths[second.binding.path_name] == original["paths"][second.binding.path_name]
+            )
+            assert service._sources == (paused, second)
+            generation = service.media_generation
+            media.returncode = 19
+            await _until(
+                lambda: service.media_generation > generation and service.status() == "ready"
+            )
+            assert service._media.paths[first.binding.path_name]["record"] is False
+            assert service._media.paths[second.binding.path_name]["record"] is True
+            await service.apply_recording_preferences((first, second))
+            assert service._media.paths[first.binding.path_name]["record"] is True
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_storage_recovery_never_resumes_an_operator_paused_camera(native, monkeypatch):
+    _fast_maintenance(native, monkeypatch)
+    _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first, second = replace(_source(1), recording_enabled=False), _source(2)
+        try:
+            await service.start((first, second))
+            _Storage.allowed = False
+            await _until(lambda: service.status() == "disk_full")
+            assert all(not value["record"] for value in service._media.paths.values())
+            _Storage.allowed = True
+            await _until(lambda: service.status() == "ready")
+            assert service._media.paths[first.binding.path_name]["record"] is False
+            assert service._media.paths[second.binding.path_name]["record"] is True
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["ambiguous_patch", "configuration_write"])
+def test_failed_recording_preference_compensates_old_writer_and_saved_configuration(
+    native, monkeypatch, failure
+):
+    _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first, second = _source(1), _source(2)
+        try:
+            await service.start((first, second))
+            original = service._media_file.read_bytes()
+            original_operation = (
+                service._mutation if failure == "ambiguous_patch" else service._write_media
+            )
+            failed = False
+
+            def operation(*args, **kwargs):
+                nonlocal failed
+                result = original_operation(*args, **kwargs)
+                if not failed:
+                    failed = True
+                    raise RuntimeError("private worker diagnostics")
+                return result
+
+            monkeypatch.setattr(
+                service, "_mutation" if failure == "ambiguous_patch" else "_write_media", operation
+            )
+            with pytest.raises(OperatorProductError) as error:
+                await service.apply_recording_preferences(
+                    (replace(first, recording_enabled=False), second)
+                )
+            assert "private" not in str(error.value)
+            assert service._sources == (first, second)
+            assert all(value["record"] for value in service._media.paths.values())
+            assert service._media_file.read_bytes() == original
+            assert service.status() == "ready"
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_recording_preference_joins_late_patch_and_restores_previous_intent(
+    native, monkeypatch
+):
+    _fake_mutations(native, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+
+    async def scenario():
+        service = native.service
+        first = _source(1)
+        try:
+            await service.start((first,))
+            mutation = service._mutation
+            first_call = True
+
+            def held_patch(*args, **kwargs):
+                nonlocal first_call
+                if first_call:
+                    first_call = False
+                    entered.set()
+                    assert release.wait(3)
+                mutation(*args, **kwargs)
+
+            monkeypatch.setattr(service, "_mutation", held_patch)
+            change = asyncio.create_task(
+                service.apply_recording_preferences((replace(first, recording_enabled=False),))
+            )
+            await _until(entered.is_set)
+            change.cancel()
+            await asyncio.sleep(0.02)
+            assert not change.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await change
+            assert service._sources == (first,)
+            assert service._media.paths[first.binding.path_name]["record"] is True
+            assert (
+                json.loads(service._media_file.read_text())["paths"][first.binding.path_name][
+                    "record"
+                ]
+                is True
+            )
+        finally:
+            release.set()
             await service.stop()
 
     asyncio.run(scenario())

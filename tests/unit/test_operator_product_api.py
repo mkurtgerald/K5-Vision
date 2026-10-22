@@ -70,6 +70,16 @@ class _Service:
         self.worker_status = "ready"
         self.max_recording_bytes = 20 * 1024**3
         self.storage = None
+        self.media_generation = 0
+        self.progress = {
+            "observed_bytes": 4096,
+            "last_progress_age_seconds": 0,
+            "inspection_complete": True,
+            "observed": True,
+        }
+        self.preference_calls = []
+        self.preference_callback = None
+        self.preference_error = None
 
     def status(self):
         return self.worker_status
@@ -83,6 +93,17 @@ class _Service:
 
     async def apply_sources(self, sources):
         self.applied.append(sources)
+
+    def recording_progress(self, _binding):
+        return dict(self.progress)
+
+    async def apply_recording_preferences(self, sources):
+        self.preference_calls.append(sources)
+        if self.preference_error:
+            raise self.preference_error
+        self.provider.recording = sources[0].recording_enabled
+        if self.preference_callback:
+            await self.preference_callback()
 
 
 class _Analytics:
@@ -213,11 +234,221 @@ def test_enrollment_persists_private_source_and_public_rows_hide_execution_mater
         "management_secure": False,
         "status": "live",
         "recording": True,
+        "recording_enabled": True,
+        "recording_state": "recording",
+        "recording_status": {
+            "reason": "disk_progress",
+            "observed_bytes": 4096,
+            "last_progress_age_seconds": 0,
+        },
+        "connection_error": None,
         "analytics_status": "disabled",
     }
     assert "private-test-value" not in response.text
     assert "rtsp://" not in response.text
     assert product.cameras.get(UUID(device_id)).binding == sources[0].binding
+
+
+def test_recording_pause_resume_preserves_live_source_history_and_persistent_choice(product):
+    identifier = product.enroll()
+    original = product.cameras.get(UUID(identifier))
+    route = f"/api/v1/operator/cameras/{identifier}/recording"
+    paused = product.client.put(route, headers=product.headers, json={"enabled": False})
+    assert paused.status_code == 200
+    assert paused.headers["cache-control"] == "no-store"
+    assert paused.json()["status"] == "live"
+    assert paused.json()["recording_enabled"] is False
+    assert paused.json()["recording_state"] == "paused"
+    assert paused.json()["recording_status"]["reason"] == "operator_paused"
+    source = product.cameras.get(UUID(identifier))
+    assert source.binding == original.binding and source.source_uri == original.source_uri
+    assert source.recording_enabled is False
+    assert (
+        product.client.get(
+            f"/api/v1/operator/cameras/{identifier}/history", headers=product.headers
+        ).status_code
+        == 200
+    )
+    assert (
+        product.client.get(
+            "/api/v1/operator/media-auth",
+            headers=product.media_headers(f"/media/live/{source.binding.path_name}/index.m3u8"),
+        ).status_code
+        == 200
+    )
+    # Repeating an already committed choice does not touch a running writer.
+    assert (
+        product.client.put(route, headers=product.headers, json={"enabled": False}).status_code
+        == 200
+    )
+    assert len(product.service.preference_calls) == 1
+    resumed = product.client.put(route, headers=product.headers, json={"enabled": True})
+    assert resumed.status_code == 200
+    assert resumed.json()["recording_enabled"] is True
+    assert product.cameras.get(UUID(identifier)).recording_enabled is True
+    assert len(product.service.preference_calls) == 2
+
+
+@pytest.mark.parametrize("role", [UserRole.VIEWER, UserRole.OPERATOR])
+def test_recording_choice_requires_current_admin_and_local_origin(product, role):
+    identifier = product.enroll()
+    route = f"/api/v1/operator/cameras/{identifier}/recording"
+    account, _, _ = product.users.create_with_bootstrap(
+        UserCreate(username="recording-reader", display_name="Reader", role=role), actor="test"
+    )
+    token, _ = asyncio.run(product.sessions.issue(account))
+    assert (
+        product.client.put(
+            route, headers={"Authorization": "Bearer " + token}, json={"enabled": False}
+        ).status_code
+        == 403
+    )
+    assert product.client.put(route, json={"enabled": False}).status_code == 401
+    assert (
+        product.client.put(
+            route,
+            headers={**product.headers, "Origin": "https://outside.invalid"},
+            json={"enabled": False},
+        ).status_code
+        == 403
+    )
+    assert not product.service.preference_calls
+    assert product.cameras.get(UUID(identifier)).recording_enabled is True
+
+
+@pytest.mark.parametrize(
+    "payload", [{"enabled": 1}, {"enabled": "false"}, {"enabled": False, "secret": "private"}]
+)
+def test_recording_choice_rejects_coercion_and_unknown_fields(product, payload):
+    identifier = product.enroll()
+    response = product.client.put(
+        f"/api/v1/operator/cameras/{identifier}/recording",
+        headers=product.headers,
+        json=payload,
+    )
+    assert response.status_code == 422
+    assert "private" not in response.text
+    assert not product.service.preference_calls
+
+
+def test_recording_choice_worker_failure_leaves_saved_intent_unchanged(product):
+    identifier = product.enroll()
+    product.service.preference_error = RuntimeError("rtsp://private-material")
+    response = product.client.put(
+        f"/api/v1/operator/cameras/{identifier}/recording",
+        headers=product.headers,
+        json={"enabled": False},
+    )
+    assert response.status_code == 503
+    assert "private" not in response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert product.cameras.get(UUID(identifier)).recording_enabled is True
+
+
+def test_recording_choice_store_failure_compensates_running_writer(product, monkeypatch):
+    identifier = product.enroll()
+
+    def refused(*_args):
+        raise RuntimeError("private storage material")
+
+    monkeypatch.setattr(product.cameras, "set_recording_enabled", refused)
+    response = product.client.put(
+        f"/api/v1/operator/cameras/{identifier}/recording",
+        headers=product.headers,
+        json={"enabled": False},
+    )
+    assert response.status_code == 503 and "private" not in response.text
+    assert [sources[0].recording_enabled for sources in product.service.preference_calls] == [
+        False,
+        True,
+    ]
+    assert product.service.provider.recording is True
+    assert product.cameras.get(UUID(identifier)).recording_enabled is True
+
+
+def test_recording_choice_reauthenticates_after_native_work_and_compensates(product):
+    identifier = product.enroll()
+
+    async def revoke():
+        await product.sessions.revoke(product.token)
+
+    product.service.preference_callback = revoke
+    response = product.client.put(
+        f"/api/v1/operator/cameras/{identifier}/recording",
+        headers=product.headers,
+        json={"enabled": False},
+    )
+    assert response.status_code == 401
+    assert product.cameras.get(UUID(identifier)).recording_enabled is True
+    assert product.service.provider.recording is True
+
+
+def test_never_live_camera_has_monotonic_deadline_and_recovers_without_reenrollment(
+    product, monkeypatch
+):
+    clock = SimpleNamespace(value=100.0)
+    monkeypatch.setattr("k5vision.operator_product_api.monotonic", lambda: clock.value)
+    product.service.provider.online = product.service.provider.available = False
+    identifier = product.enroll()
+
+    def row():
+        return product.client.get("/api/v1/operator/cameras", headers=product.headers).json()[
+            "cameras"
+        ][0]
+
+    assert row()["status"] == "connecting"
+    clock.value = 129.999
+    assert row()["status"] == "connecting"
+    clock.value = 130.0
+    assert row()["status"] == "disconnected"
+    assert row()["connection_error"] == "stream_unavailable"
+    product.service.provider.online = product.service.provider.available = True
+    assert row()["status"] == "live" and row()["connection_error"] is None
+    product.service.provider.online = product.service.provider.available = False
+    assert row()["status"] == "disconnected"
+    product.service.media_generation += 1
+    assert row()["status"] == "connecting"
+    clock.value += 30
+    assert row()["status"] == "disconnected"
+    assert product.cameras.get(UUID(identifier)) is not None
+
+
+def test_recording_claim_requires_recent_complete_disk_progress(product, monkeypatch):
+    clock = SimpleNamespace(value=100.0)
+    monkeypatch.setattr("k5vision.operator_product_api.monotonic", lambda: clock.value)
+    product.service.progress["last_progress_age_seconds"] = None
+    identifier = product.enroll()
+
+    def row():
+        return product.client.get("/api/v1/operator/cameras", headers=product.headers).json()[
+            "cameras"
+        ][0]
+
+    assert row()["recording_state"] == "waiting"
+    clock.value += 45
+    assert row()["recording_state"] == "stalled"
+    product.service.progress["last_progress_age_seconds"] = 0
+    assert row()["recording_state"] == "recording"
+    product.service.progress["last_progress_age_seconds"] = 46
+    assert row()["recording_state"] == "stalled"
+    product.service.progress["inspection_complete"] = False
+    assert row()["recording_state"] == "error"
+    product.service.progress["inspection_complete"] = True
+    product.service.worker_status = "disk_full"
+    assert row()["recording_state"] == "paused"
+    assert row()["recording_status"]["reason"] == "storage_paused"
+    product.service.worker_status = "ready"
+    route = f"/api/v1/operator/cameras/{identifier}/recording"
+    assert (
+        product.client.put(route, headers=product.headers, json={"enabled": False}).status_code
+        == 200
+    )
+    clock.value += 10
+    product.service.progress["last_progress_age_seconds"] = 5
+    resumed = product.client.put(route, headers=product.headers, json={"enabled": True})
+    assert resumed.json()["recording_state"] == "waiting"
+    product.service.progress["last_progress_age_seconds"] = 0
+    assert row()["recording_state"] == "recording"
 
 
 @pytest.mark.parametrize(

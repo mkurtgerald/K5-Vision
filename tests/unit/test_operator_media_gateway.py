@@ -14,7 +14,15 @@ from k5vision.operator_media_gateway import generate_operator_gateway_configurat
 def assets(tmp_path):
     root = tmp_path / "packaged UI with spaces"
     root.mkdir()
-    for name in ("index.html", "app.js", "app.css"):
+    for name in (
+        "index.html",
+        "app.js",
+        "app.css",
+        "wall.js",
+        "wall.css",
+        "timeline.js",
+        "timeline.css",
+    ):
         (root / name).write_text("fixture", encoding="utf-8")
     return root
 
@@ -96,6 +104,10 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
         "/operator/index.html",
         "/operator/app.css",
         "/operator/app.js",
+        "/operator/wall.css",
+        "/operator/wall.js",
+        "/operator/timeline.css",
+        "/operator/timeline.js",
     ]
     javascript = routes[3]["handle"][0]
     assert javascript["rewrite"]["uri"] == "/_k5_assets/hls.min.js"

@@ -22,6 +22,32 @@ _CAMERA = "e4fd401d-ae8e-4ac2-9f92-e8287f241532"
 _OTHER = "2cad3cbb-c56a-4368-b3e6-e5032576b77a"
 
 
+def _operator_asset(route, assets):
+    """Serve the assembled production UI modules, including the default wall."""
+    path = urlsplit(route.request.url).path
+    if not path.startswith("/operator/"):
+        return False
+    name = path.rsplit("/", 1)[1] or "index.html"
+    if name not in {
+        "index.html",
+        "app.js",
+        "app.css",
+        "wall.js",
+        "wall.css",
+        "timeline.js",
+        "timeline.css",
+    }:
+        route.fulfill(status=404)
+        return True
+    content_type = {
+        ".html": "text/html",
+        ".js": "application/javascript",
+        ".css": "text/css",
+    }[Path(name).suffix]
+    route.fulfill(content_type=content_type, body=(assets / name).read_text())
+    return True
+
+
 @pytest.mark.parametrize("mode", ["add", "reconnect"])
 @pytest.mark.parametrize("browser_shift_seconds", [0, 172800, -172800])
 def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
@@ -38,6 +64,9 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
         "management_secure": False,
         "status": "live",
         "recording": True,
+        "recording_enabled": True,
+        "recording_state": "recording",
+        "recording_status": {"reason": "observed"},
         "analytics_status": "disabled",
     }
     cameras = [camera] if mode == "reconnect" else []
@@ -54,6 +83,8 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
     account = {"username": "fixture-admin", "role": "administrator", "display_name": "Fixture"}
     calls, script_errors = {"profiles": 0, "connect": 0}, []
     history_queries = []
+    held_camera_lists = []
+    hold_camera_list = {"next": False}
     clock_response = {"failed": False, "missing": False}
     playwright = browser = context = None
     try:
@@ -63,6 +94,9 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
         context.add_init_script(
             """(() => {
               const shift = __SHIFT__;
+              // Playback itself is qualified by the actual media acceptance.
+              // Keep the authentic media-session DTO while disabling transport.
+              window.Hls = {isSupported: () => false};
               const RealDate = Date;
               window.Date = class extends RealDate {
                 constructor(...args) { super(...(args.length ? args : [RealDate.now() + shift])); }
@@ -76,14 +110,7 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
 
         def intercept(route):
             path, method = urlsplit(route.request.url).path, route.request.method
-            if path.startswith("/operator/"):
-                name = path.rsplit("/", 1)[1] or "index.html"
-                content_type = {
-                    "index.html": "text/html",
-                    "app.js": "application/javascript",
-                    "app.css": "text/css",
-                }[name]
-                route.fulfill(content_type=content_type, body=(assets / name).read_text())
+            if _operator_asset(route, assets):
                 return
             status, data = 200, {}
             if path == "/api/v1/auth/login":
@@ -108,6 +135,21 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
                     data.pop("server_utc")
             elif path == "/api/v1/operator/cameras":
                 data = {**service, "cameras": cameras}
+                if hold_camera_list["next"]:
+                    hold_camera_list["next"] = False
+                    held_camera_lists.append(
+                        (route, {**service, "cameras": [dict(item) for item in cameras]})
+                    )
+                    return
+            elif path.endswith("/recording") and method == "PUT":
+                enabled = route.request.post_data_json["enabled"]
+                camera.update(
+                    recording=enabled,
+                    recording_enabled=enabled,
+                    recording_state="recording" if enabled else "paused",
+                    recording_status={"reason": "observed" if enabled else "operator_paused"},
+                )
+                data = camera
             elif path == "/api/v1/operator/camera-profiles":
                 calls["profiles"] += 1
                 data = {
@@ -152,11 +194,21 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
                 payload = route.request.post_data_json
                 assert payload["name"] == camera["name"]
                 assert payload["probe_id"] == "p" * 32 and payload["profile_id"] == "s" * 32
-                camera.update(status="connecting", recording=False)
+                camera.update(
+                    status="connecting",
+                    recording=False,
+                    recording_enabled=True,
+                    recording_state="waiting",
+                    recording_status={"reason": "awaiting_data"},
+                )
                 cameras[:] = [camera]
                 status, data = 201, camera
             elif path.endswith("/media-session") and path != "/api/v1/operator/media-session":
-                status, data = 503, {"detail": "Camera video is not available"}
+                camera_id = path.split("/")[-2]
+                data = {
+                    "live_url": f"/media/live/{camera_id}/index.m3u8",
+                    "playback_url": f"/media/playback?path={camera_id}",
+                }
             elif path.endswith("/history"):
                 history_queries.append(parse_qs(urlsplit(route.request.url).query))
                 data = {"spans": []}
@@ -180,10 +232,13 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
         page.locator("#sign-in-button").click()
         expect = browser_api.expect
         expect(page.locator("#workspace")).to_be_visible()
+        expect(page.locator("#wall-panel")).to_be_visible()
         expect(page.locator("#recorder-time-status")).to_contain_text("UTC")
         expect(page.locator("#recorder-time-status")).to_contain_text(
             "Time synchronization is not verified"
         )
+        if mode == "reconnect":
+            page.locator(f'[data-camera-id="{_CAMERA}"] [data-wall-action="watch"]').click()
         page.locator(
             "#update-source-button" if mode == "reconnect" else "#add-camera-button"
         ).click()
@@ -220,28 +275,44 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
         expect(notice).to_contain_text("Camera saved. Waiting for its video stream.")
         expect(notice).to_contain_text("Live video and recording are not confirmed yet.")
         expect(page.locator("#connection-badge")).to_have_text("Connecting")
-        expect(page.locator("#recording-badge")).not_to_be_visible()
+        expect(page.locator("#recording-badge")).to_have_text("Waiting for video")
 
         def refresh(expected):
             page.locator("#refresh-cameras").click()
             expect(notice).to_contain_text(expected)
 
-        camera.update(status="live", recording=False)
-        refresh("Camera stream is reaching K5. Recording is not active.")
-        expect(page.locator("#recording-badge")).not_to_be_visible()
-        camera["recording"] = True
-        refresh("Camera stream is reaching K5. Recording is enabled.")
-        expect(page.locator("#recording-badge")).to_have_text("Recording enabled")
+        camera.update(
+            status="live",
+            recording=False,
+            recording_enabled=False,
+            recording_state="paused",
+            recording_status={"reason": "operator_paused"},
+        )
+        refresh("Recording is paused for this camera.")
+        expect(page.locator("#recording-badge")).to_have_text("Recording paused")
+        camera.update(
+            recording=True,
+            recording_enabled=True,
+            recording_state="waiting",
+            recording_status={"reason": "awaiting_data"},
+        )
+        refresh("Waiting to confirm new recording data on disk.")
+        expect(page.locator("#recording-badge")).to_have_text("Checking recording")
+        expect(page.locator("#summary-recording")).to_have_text("0")
+        camera.update(recording_state="recording", recording_status={"reason": "observed"})
+        refresh("New recording data has been observed on disk.")
+        expect(page.locator("#recording-badge")).to_have_text("Recording")
+        expect(page.locator("#summary-recording")).to_have_text("1")
         service["worker_status"] = "disk_full"
         refresh("Recording is paused because storage needs attention.")
-        expect(page.locator("#recording-badge")).to_have_text("Recording paused")
+        expect(page.locator("#recording-badge")).to_have_text("Storage paused")
         service["worker_status"] = "unavailable"
         refresh("The media service is unavailable.")
         service["worker_status"] = "ready"
-        camera.update(status="disconnected", recording=False)
+        camera.update(status="disconnected", recording=False, recording_state="waiting")
         refresh("its video stream is disconnected.")
-        camera.update(status="live", recording=True)
-        refresh("Camera stream is reaching K5. Recording is enabled.")
+        camera.update(status="live", recording=True, recording_state="recording")
+        refresh("New recording data has been observed on disk.")
         service["clock"].update(status="changed", last_step_seconds=-3600, change_count=1)
         page.locator("#refresh-cameras").click()
         expect(page.locator("#recorder-time-warning")).to_contain_text(
@@ -275,6 +346,25 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
             assert len(history_queries) == before + 1
         clock_response.update(failed=False, missing=False)
 
+        if mode == "add" and browser_shift_seconds == 0:
+            # An older poll can finish after the user's pause PUT and its fresh
+            # list response. Releasing it must not undo the confirmed choice.
+            hold_camera_list["next"] = True
+            page.locator("#refresh-cameras").click()
+            page.wait_for_timeout(50)
+            assert len(held_camera_lists) == 1
+            page.locator("#toggle-recording").click()
+            expect(page.locator("#recording-badge")).to_have_text("Recording paused")
+            old_route, old_snapshot = held_camera_lists.pop()
+            old_route.fulfill(content_type="application/json", body=json.dumps(old_snapshot))
+            page.evaluate("""async () => {
+              await new Promise(requestAnimationFrame); await new Promise(requestAnimationFrame);
+            }""")
+            assert page.locator("#toggle-recording").get_attribute("data-enabled") == "false"
+            assert page.locator("#recording-badge").inner_text() == "Recording paused"
+            page.locator("#toggle-recording").click()
+            expect(page.locator("#recording-badge")).to_have_text("Recording")
+
         other = {
             **camera,
             "device_id": _OTHER,
@@ -307,7 +397,8 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
 
 
 @pytest.mark.parametrize(
-    "outcome", ["recover_401", "recover_403", "expired", "repeated_denial", "selection_race"]
+    "outcome",
+    ["recover_401", "recover_403", "expired", "repeated_denial", "selection_race", "logout_race"],
 )
 def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
     """Exercise HTTP cookie loss and HLS errors without asserting decoded media."""
@@ -322,6 +413,7 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
     ]
     media_calls, logins, errors, pending = [], [], [], []
     deny_media = {"active": False}
+    recovery = {"armed": False, "calls": 0}
     playwright = browser = context = None
 
     def media_urls(camera_id):
@@ -370,14 +462,7 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
 
         def intercept(route):
             path, method = urlsplit(route.request.url).path, route.request.method
-            if path.startswith("/operator/"):
-                name = path.rsplit("/", 1)[1] or "index.html"
-                content_type = {
-                    "index.html": "text/html",
-                    "app.js": "application/javascript",
-                    "app.css": "text/css",
-                }[name]
-                route.fulfill(content_type=content_type, body=(assets / name).read_text())
+            if _operator_asset(route, assets):
                 return
             status, data, headers = 200, {}, {}
             if path == "/api/v1/auth/login":
@@ -398,13 +483,18 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
                     "server_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                     "clock": {"status": "observing", "sync_verified": False},
                 }
+            elif path == "/api/v1/auth/logout" and outcome == "logout_race":
+                pending.append(route)
+                return
             elif path.endswith("/media-session") and method == "POST":
                 camera_id = path.split("/")[-2]
                 media_calls.append((camera_id, route.request.all_headers().get("authorization")))
-                if len(media_calls) == 2 and outcome == "selection_race":
+                if recovery["armed"]:
+                    recovery["calls"] += 1
+                if recovery["calls"] == 1 and outcome == "selection_race":
                     pending.append(route)
                     return
-                if len(media_calls) == 2 and outcome == "expired":
+                if recovery["calls"] == 1 and outcome == "expired":
                     status, data = 401, {"detail": "Unauthorized"}
                 else:
                     data = media_urls(camera_id)
@@ -432,12 +522,36 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
         page.locator("#password").fill("generated-human-account-password")
         page.locator("#sign-in-button").click()
         expect = browser_api.expect
+        expect(page.locator("#wall-panel")).to_be_visible()
+        page.wait_for_function("window.__hlsPlayers.length === 2")
+        page.locator(f'[data-camera-id="{_CAMERA}"] [data-wall-action="watch"]').click()
         expect(page.locator("#play-live")).to_be_visible()
-        assert len(media_calls) == 1
+        baseline_calls = len(media_calls)
+        baseline_players = page.evaluate("window.__hlsPlayers.length")
+        baseline_sources = page.evaluate("window.__hlsSources")
+        assert media_calls[-1][0] == _CAMERA
+        assert baseline_sources[-1] == media_urls(_CAMERA)["live_url"]
+        page.evaluate("window.__selectedHlsIndex = window.__hlsPlayers.length - 1")
+        if outcome == "logout_race":
+            page.locator("#sign-out-button").click()
+            assert len(pending) == 1
+            page.locator("#wall-tab").click()
+            page.evaluate("""async () => {
+              await new Promise(requestAnimationFrame); await new Promise(requestAnimationFrame);
+            }""")
+            assert page.locator(".camera-wall-tile").count() == 0
+            assert len(media_calls) == baseline_calls
+            assert page.evaluate("window.__hlsPlayers.every(player => player.destroyed)")
+            pending.pop().fulfill(status=204, body="")
+            expect(page.locator("#sign-in")).to_be_visible()
+            assert len(logins) == 1
+            assert not errors
+            return
+        recovery["armed"] = True
         context.clear_cookies()
         deny_media["active"] = outcome == "repeated_denial"
         page.evaluate("void window.__hlsPlayers.at(-1).reload()")
-        page.wait_for_function("window.__hlsPlayers[0].destroyed === true")
+        page.wait_for_function("window.__hlsPlayers[window.__selectedHlsIndex].destroyed === true")
 
         if outcome == "expired":
             expect(page.locator("#sign-in")).to_be_visible()
@@ -447,7 +561,7 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
             expect(page.locator("#live-placeholder-title")).to_have_text("Media access unavailable")
             expect(page.locator("#retry-live")).to_be_visible()
             expect(page.locator("#workspace")).to_be_visible()
-            assert page.evaluate("window.__hlsPlayers.length") == 2
+            assert page.evaluate("window.__hlsPlayers.length") == baseline_players + 1
         elif outcome == "selection_race":
             expect(page.locator("#live-placeholder-title")).to_have_text("Restoring media access")
             page.locator(".camera-item").filter(has_text="Second camera").click()
@@ -457,18 +571,19 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
                 content_type="application/json", body=json.dumps(media_urls(_CAMERA))
             )
             page.evaluate(
-                "window.__hlsPlayers[0].handlers.error('error', {fatal:true, response:{code:401}})"
+                "window.__hlsPlayers[window.__selectedHlsIndex].handlers.error("
+                "'error', {fatal:true, response:{code:401}})"
             )
             expect(page.locator("#camera-title")).to_have_text("Second camera")
             assert page.evaluate("window.__hlsSources") == [
-                media_urls(_CAMERA)["live_url"],
+                *baseline_sources,
                 media_urls(_OTHER)["live_url"],
             ]
         else:
             expect(page.locator("#play-live")).to_be_visible()
             expect(page.locator("#workspace")).to_be_visible()
-            assert page.evaluate("window.__hlsPlayers.length") == 2
-        assert len(media_calls) == (3 if outcome == "selection_race" else 2)
+            assert page.evaluate("window.__hlsPlayers.length") == baseline_players + 1
+        assert len(media_calls) == baseline_calls + (2 if outcome == "selection_race" else 1)
         assert all(authorization == f"Bearer {token}" for _, authorization in media_calls)
         assert len(logins) == 1
         assert not errors
@@ -479,3 +594,154 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
             browser.close()
         if playwright is not None:
             playwright.stop()
+
+
+@pytest.mark.parametrize("late_error", ["AbortError", "NotAllowedError"])
+def test_timeline_gap_clears_previous_clip_and_download_without_losing_history(late_error):
+    """Use assembled UI events; actual encoded playback is qualified separately."""
+    browser_api = pytest.importorskip("playwright.sync_api")
+    channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
+    assets = Path(__file__).resolve().parents[2] / "src/k5vision/operator_web"
+    account = {"username": "fixture-admin", "role": "administrator"}
+    start = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=1)
+    end = start + timedelta(minutes=1)
+    spans = [
+        {
+            "recording_id": "generated-clip-1",
+            "started_at": (start + timedelta(seconds=5)).isoformat(),
+            "duration_seconds": 10,
+        },
+        {
+            "recording_id": "generated-clip-2",
+            "started_at": (start + timedelta(seconds=40)).isoformat(),
+            "duration_seconds": 10,
+        },
+    ]
+    camera = {
+        "device_id": _CAMERA,
+        "name": "Generated history camera",
+        "status": "live",
+        "recording_enabled": True,
+        "recording_state": "recording",
+    }
+    with browser_api.sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel=channel, headless=True)
+        context = browser.new_context()
+        context.add_init_script("""(() => {
+          window.Hls = {isSupported: () => false};
+          window.playbackStarts = 0;
+          HTMLMediaElement.prototype.play = function () {
+            if (this.id === 'playback-video') {
+              window.playbackStarts += 1;
+              return new Promise((_, reject) => { window.rejectOldPlayback = reject; });
+            }
+            return Promise.resolve();
+          };
+          HTMLMediaElement.prototype.pause = function () {};
+          HTMLMediaElement.prototype.load = function () {};
+        })();""")
+        page = context.new_page()
+        page.set_default_timeout(10_000)
+        errors = []
+        page.on("pageerror", lambda _error: errors.append("uncaught_history_script_error"))
+
+        def intercept(route):
+            if _operator_asset(route, assets):
+                return
+            path = urlsplit(route.request.url).path
+            status, data = 200, {}
+            if path == "/api/v1/auth/login":
+                data = {
+                    "session_token": "generated-gap-selection-session-token-000000000000000",
+                    "account": account,
+                    "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                    "expires_in_seconds": 300,
+                }
+            elif path == "/api/v1/auth/me":
+                data = account
+            elif path == "/api/v1/operator/status":
+                data = {
+                    "worker_status": "ready",
+                    "server_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "clock": {"status": "observing", "sync_verified": False},
+                }
+            elif path == "/api/v1/operator/cameras":
+                data = {"worker_status": "ready", "cameras": [camera]}
+            elif path.endswith("/media-session"):
+                data = {
+                    "live_url": f"/media/live/{_CAMERA}/index.m3u8",
+                    "playback_url": f"/media/playback?path={_CAMERA}",
+                }
+            elif path.endswith("/history"):
+                data = {"spans": spans}
+            else:
+                status = 204 if path == "/media/playback" else 404
+            route.fulfill(
+                status=status,
+                content_type="application/json",
+                body="" if status == 204 else json.dumps(data),
+            )
+
+        try:
+            page.route("**/*", intercept)
+            page.goto("http://127.0.0.1:8000/operator/")
+            page.locator("#username").fill("fixture-admin")
+            page.locator("#password").fill("generated-human-account-password")
+            page.locator("#sign-in-button").click()
+            page.locator(f'[data-camera-id="{_CAMERA}"] [data-wall-action="recordings"]').click()
+            page.locator("#history-start").fill(start.strftime("%Y-%m-%dT%H:%M:%S"))
+            page.locator("#history-end").fill(end.strftime("%Y-%m-%dT%H:%M:%S"))
+            page.locator("#history-form").evaluate("form => form.requestSubmit()")
+            expect = browser_api.expect
+            expect(page.locator("#history-count")).to_have_text("2")
+            expect(page.locator("#recording-timeline")).to_have_attribute(
+                "data-window-start", str(int(start.timestamp() * 1000))
+            )
+            first = page.locator(".history-item").first
+            first.click()
+            expect(first).to_have_attribute("aria-pressed", "true")
+            expect(page.locator("#play-recording")).to_be_enabled()
+            expect(page.locator("#clip-mark-in")).to_be_enabled()
+            expect(page.locator("#clip-mark-out")).to_be_enabled()
+            link = page.locator("#download-recording")
+            old_href = link.get_attribute("href")
+            assert old_href and old_href.startswith("/media/playback?")
+            assert page.locator("#playback-video").get_attribute("src") == old_href
+            assert page.evaluate("window.playbackStarts") == 1
+
+            # The selected minute starts with a real five-second recording gap.
+            # Keyboard Home exercises the production timeline's seek callback.
+            track = page.get_by_role("slider", name="Recording time in UTC")
+            track.focus()
+            track.press("Home")
+            expect(page.locator("#playback-message")).to_contain_text("No playable recording")
+            expect(page.locator("#selected-recording")).to_have_text("No interval selected")
+            for identifier in (
+                "playback-start",
+                "playback-duration",
+                "play-recording",
+                "clip-mark-in",
+                "clip-mark-out",
+            ):
+                expect(page.locator("#" + identifier)).to_be_disabled()
+            assert page.locator("#playback-start").input_value() == ""
+            assert page.locator("#playback-video").get_attribute("src") is None
+            assert link.get_attribute("href") is None
+            assert link.get_attribute("download") is None
+            expect(link).to_have_attribute("aria-disabled", "true")
+            expect(link).to_have_attribute("tabindex", "-1")
+            assert page.locator(".history-item[aria-pressed=true]").count() == 0
+            assert page.locator(".history-item").count() == 2
+            assert page.locator(".k5-timeline-recording").count() == 2
+            expect(track).to_have_attribute("aria-disabled", "false")
+            assert page.evaluate("window.playbackStarts") == 1
+            page.evaluate(
+                "name => window.rejectOldPlayback(new DOMException('Stopped old playback', name))",
+                late_error,
+            )
+            expect(page.locator("#playback-message")).to_contain_text("No playable recording")
+            assert link.get_attribute("href") is None
+            assert not errors
+        finally:
+            context.close()
+            browser.close()

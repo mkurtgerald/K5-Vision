@@ -140,6 +140,18 @@ class OperatorCameraStore:
                     connection.execute("COMMIT")
                 self._admit_files()
                 self._read_sources(connection)
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS camera_recording "
+                        "(device_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL "
+                        "CHECK (enabled IN (0, 1)))"
+                    )
+                    connection.execute("COMMIT")
+                finally:
+                    self._rollback(connection)
+                self._admit_files()
+                self._read_sources(connection)
                 self._connection = connection
         except Exception:
             failed = True
@@ -191,7 +203,9 @@ class OperatorCameraStore:
             raise OperatorCameraStoreError("Private camera state is unavailable")
         return self._connection
 
-    def _validated_source(self, device: Device, source_uri: str) -> MediaMTXSource:
+    def _validated_source(
+        self, device: Device, source_uri: str, recording_enabled: bool = True
+    ) -> MediaMTXSource:
         failed = False
         try:
             if not isinstance(device, Device):
@@ -199,7 +213,7 @@ class OperatorCameraStore:
             # Device models are mutable; store and return an independent copy.
             admitted = Device.model_validate(device.model_dump(mode="json"))
             source = MediaMTXSource(
-                MediaMTXBinding(self._site_id, admitted.id), admitted, source_uri
+                MediaMTXBinding(self._site_id, admitted.id), admitted, source_uri, recording_enabled
             )
             if len(_device_json(admitted).encode("utf-8")) > _MAX_DEVICE_JSON_BYTES:
                 raise ValueError
@@ -209,8 +223,10 @@ class OperatorCameraStore:
             raise OperatorCameraStoreError("Camera source selection is invalid")
         return source
 
-    def _source(self, device: Device, source_uri: str) -> MediaMTXSource:
-        source = self._validated_source(device, source_uri)
+    def _source(
+        self, device: Device, source_uri: str, recording_enabled: bool = True
+    ) -> MediaMTXSource:
+        source = self._validated_source(device, source_uri, recording_enabled)
         failed = False
         try:
             if self._registry is not None:
@@ -241,6 +257,25 @@ class OperatorCameraStore:
             if len(rows) > MAX_OPERATOR_CAMERAS:
                 raise ValueError
             sources = []
+            preferences = {}
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='camera_recording'"
+            ).fetchone():
+                settings = connection.execute(
+                    "SELECT device_id, enabled FROM camera_recording LIMIT ?",
+                    (MAX_OPERATOR_CAMERAS + 1,),
+                ).fetchall()
+                if len(settings) > MAX_OPERATOR_CAMERAS:
+                    raise ValueError
+                for setting in settings:
+                    identifier, enabled = setting["device_id"], setting["enabled"]
+                    if (
+                        str(UUID(identifier)) != identifier
+                        or type(enabled) is not int
+                        or enabled not in (0, 1)
+                    ):
+                        raise ValueError
+                    preferences[identifier] = bool(enabled)
             for row in rows:
                 device_json = row["device_json"]
                 if (
@@ -252,7 +287,9 @@ class OperatorCameraStore:
                 device = Device.model_validate(value)
                 if str(device.id) != row["device_id"]:
                     raise ValueError
-                sources.append(self._source(device, row["source_uri"]))
+                sources.append(
+                    self._source(device, row["source_uri"], preferences.get(str(device.id), True))
+                )
             result = tuple(sources)
         except Exception:
             failed = True
@@ -273,6 +310,31 @@ class OperatorCameraStore:
             (source for source in self.list_sources() if source.binding.device_id == device_id),
             None,
         )
+
+    def set_recording_enabled(self, device_id: UUID, enabled: bool) -> MediaMTXSource:
+        """Persist operator intent without changing the camera or removing its history."""
+        if not isinstance(device_id, UUID) or type(enabled) is not bool:
+            raise OperatorCameraStoreError("Recording preference is invalid")
+        with self._lock:
+            connection = self._admit()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                source = next(
+                    value
+                    for value in self._read_sources(connection)
+                    if value.binding.device_id == device_id
+                )
+                connection.execute(
+                    "INSERT INTO camera_recording (device_id, enabled) VALUES (?, ?) "
+                    "ON CONFLICT(device_id) DO UPDATE SET enabled=excluded.enabled",
+                    (str(device_id), int(enabled)),
+                )
+                self._admit()
+                connection.execute("COMMIT")
+                return MediaMTXSource(source.binding, source.device, source.source_uri, enabled)
+            except Exception:
+                self._rollback(connection)
+                raise OperatorCameraStoreError("Recording preference could not be saved") from None
 
     @staticmethod
     def _rollback(connection: sqlite3.Connection) -> None:
@@ -296,6 +358,15 @@ class OperatorCameraStore:
                     and len(existing) >= MAX_OPERATOR_CAMERAS
                 ):
                     raise OperatorCameraCapacityError
+                enabled = next(
+                    (
+                        item.recording_enabled
+                        for item in existing
+                        if item.binding.device_id == source.binding.device_id
+                    ),
+                    True,
+                )
+                source = MediaMTXSource(source.binding, source.device, source.source_uri, enabled)
                 connection.execute(
                     """INSERT INTO camera_sources (device_id, device_json, source_uri)
                         VALUES (?, ?, ?) ON CONFLICT(device_id) DO UPDATE
@@ -384,7 +455,12 @@ class OperatorCameraStore:
                         tags.add("k5-onvif-https")
                     data["tags"] = sorted(tags)
                     # Validate the replacement and its private URI before a write begins.
-                    source = self._validated_source(Device.model_validate(data), source_uri)
+                    previous = self.get(device_id)
+                    source = self._validated_source(
+                        Device.model_validate(data),
+                        source_uri,
+                        True if previous is None else previous.recording_enabled,
+                    )
                     if connection.in_transaction or connection.execute(
                         "PRAGMA main.journal_mode"
                     ).fetchone()[0].lower() not in {"delete", "truncate", "persist"}:
@@ -496,6 +572,9 @@ class OperatorCameraStore:
                 self._read_sources(connection)
                 connection.execute(
                     "DELETE FROM camera_sources WHERE device_id = ?", (str(device_id),)
+                )
+                connection.execute(
+                    "DELETE FROM camera_recording WHERE device_id = ?", (str(device_id),)
                 )
                 connection.execute("COMMIT")
             except Exception:

@@ -97,6 +97,75 @@ def test_atomic_upsert_reload_remove_and_independent_device_objects(identity) ->
     last.close()
 
 
+def test_recording_choice_survives_source_update_restart_and_onvif_reconnect(identity) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    history = identity.directory / "recordings" / previous.binding.path_name / "retained.mp4"
+    history.parent.mkdir(parents=True)
+    history.write_bytes(b"retained video")
+    try:
+        assert previous.recording_enabled is True
+        paused = store.set_recording_enabled(device.id, False)
+        assert paused.recording_enabled is False
+        assert paused.binding == previous.binding and paused.source_uri == previous.source_uri
+        updated = store.upsert(device, _uri(device, "new-profile"))
+        assert updated.recording_enabled is False
+        store.close()
+        store = OperatorCameraStore(identity.directory, identity.site_id, registry=registry)
+        assert store.get(device.id).recording_enabled is False
+        reconnected = store.reconnect_onvif(device.id, _uri(device, "onvif"), 8443, True)
+        assert reconnected.recording_enabled is False
+        assert reconnected.binding == previous.binding
+        assert history.read_bytes() == b"retained video"
+        store.remove(device.id)
+        assert not store._connection.execute("SELECT * FROM camera_recording").fetchall()
+        # Removing a camera clears only its saved preference, never its footage.
+        assert history.read_bytes() == b"retained video"
+        assert store.reconnect_onvif(device.id, _uri(device), 8443, True).recording_enabled is True
+    finally:
+        store.close()
+        registry.close()
+
+
+def test_existing_source_database_migrates_with_recording_enabled(identity) -> None:
+    device = _device()
+    store = OperatorCameraStore(identity.directory, identity.site_id)
+    source = store.upsert(device, _uri(device))
+    store.close()
+    # Prior releases have only the original three-column camera source schema.
+    _change(identity, "DROP TABLE camera_recording")
+    store = OperatorCameraStore(identity.directory, identity.site_id)
+    try:
+        restored = store.get(device.id)
+        assert restored == source and restored.recording_enabled is True
+        assert store.set_recording_enabled(device.id, False).recording_enabled is False
+    finally:
+        store.close()
+
+
+def test_recording_preference_write_failure_preserves_prior_choice_and_source(identity) -> None:
+    device = _device()
+    store = OperatorCameraStore(identity.directory, identity.site_id)
+    source = store.upsert(device, _uri(device))
+    _change(
+        identity,
+        "CREATE TRIGGER refuse_preference BEFORE INSERT ON camera_recording "
+        "BEGIN SELECT RAISE(ABORT, 'source-fixture-private-secret'); END",
+    )
+    try:
+        with pytest.raises(OperatorCameraStoreError) as error:
+            store.set_recording_enabled(device.id, False)
+        assert _SECRET not in str(error.value)
+        assert not store._connection.in_transaction
+        assert store.get(device.id) == source
+        for invalid in (1, "false", None):
+            with pytest.raises(OperatorCameraStoreError):
+                store.set_recording_enabled(device.id, invalid)
+        with pytest.raises(OperatorCameraStoreError):
+            store.set_recording_enabled(UUID(int=99), False)
+    finally:
+        store.close()
+
+
 def test_store_checks_the_existing_site_scoped_device_registry(identity, tmp_path) -> None:
     registry = DeviceRegistry(database_path=tmp_path / "devices.sqlite3", site_id=identity.site_id)
     device = registry.enroll(
