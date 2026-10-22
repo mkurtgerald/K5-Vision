@@ -951,14 +951,101 @@ def _assert_rtsp_read_auth(ffprobe, anonymous_uri, camera_username, password):
     }
 
 
-def _toggle_camera_recording(page, camera_id, enabled):
+def _recording_control_diagnostic(response, enabled, diagnostic):
+    """Keep fixed control outcomes, never response text, input values or addresses."""
+    diagnostic.update(
+        recording_control_requested_enabled=enabled,
+        recording_control_http_status=0,
+        recording_control_content_type="unavailable",
+        recording_control_body_bytes=0,
+        recording_control_error_code="unavailable",
+        recording_control_validation=[],
+        recording_control_request_enabled=None,
+        recording_control_request_boolean=False,
+    )
+    if response is None:
+        return
+    diagnostic["recording_control_http_status"] = response.status
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    diagnostic["recording_control_content_type"] = (
+        content_type
+        if content_type in {"application/json", "text/plain", "text/html", ""}
+        else "other"
+    )
+    try:
+        request = response.request.post_data_json
+        value = request.get("enabled") if type(request) is dict else None
+        diagnostic["recording_control_request_enabled"] = value if type(value) is bool else None
+        diagnostic["recording_control_request_boolean"] = type(value) is bool
+    except Exception:
+        diagnostic["recording_control_request_boolean"] = False
+    if response.status == 200:
+        diagnostic["recording_control_error_code"] = "none"
+        return
+    try:
+        body = response.body()
+        diagnostic["recording_control_body_bytes"] = len(body)
+        if not body:
+            diagnostic["recording_control_error_code"] = "empty_body"
+            return
+        if len(body) > 4096 or content_type != "application/json":
+            diagnostic["recording_control_error_code"] = "unrecognized_response"
+            return
+        data = json.loads(body)
+        detail = data.get("detail") if type(data) is dict else None
+        codes = {
+            "Recording preference could not be applied": "recording_preference_unavailable",
+            "Camera configuration unavailable": "camera_configuration_unavailable",
+            "Media unavailable": "media_unavailable",
+            "Camera state unavailable": "camera_state_unavailable",
+            "Insufficient camera administration permission": "administration_denied",
+            "Unauthorized": "unauthorized",
+            "Not authenticated": "unauthorized",
+            "Not Found": "not_found",
+        }
+        if type(detail) is str:
+            diagnostic["recording_control_error_code"] = codes.get(detail, "unrecognized_error")
+        elif type(detail) is list:
+            allowed_types = {
+                "missing",
+                "bool_type",
+                "bool_parsing",
+                "extra_forbidden",
+                "uuid_parsing",
+                "json_invalid",
+                "value_error",
+            }
+            diagnostic["recording_control_error_code"] = "validation_error"
+            diagnostic["recording_control_validation"] = [
+                {
+                    "type": item.get("type") if item.get("type") in allowed_types else "other",
+                    "loc": [
+                        part
+                        if part in {"body", "query", "path", "enabled", "device_id"}
+                        else "other"
+                        for part in item.get("loc", [])[:4]
+                    ],
+                }
+                for item in detail[:8]
+                if type(item) is dict and type(item.get("loc")) is list
+            ]
+        else:
+            diagnostic["recording_control_error_code"] = "unrecognized_error"
+    except Exception:
+        diagnostic["recording_control_error_code"] = "unrecognized_response"
+
+
+def _toggle_camera_recording(page, camera_id, enabled, *, diagnostic=None):
     __tracebackhide__ = True
+    diagnostic = {} if diagnostic is None else diagnostic
+    _recording_control_diagnostic(None, enabled, diagnostic)
     control = page.locator("#toggle-recording")
     route = "/api/v1/operator/cameras/" + camera_id + "/recording"
     with page.expect_response(
         lambda response: response.request.method == "PUT" and response.url.endswith(route)
     ) as changed:
         control.click()
+    _recording_control_diagnostic(changed.value, enabled, diagnostic)
     _require(changed.value.status == 200, "Camera recording control did not save its choice")
     page.wait_for_function(
         """enabled => {
@@ -1293,6 +1380,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
     enrollment_index = 0
     history_diagnostic = {}
     outage_diagnostic = {}
+    recording_diagnostic = {}
     started = time.monotonic()
     receipt = {
         "schema_version": "1",
@@ -1620,7 +1708,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         receipt["per_camera_recording_bytes_after"] = _camera_recording_bytes(product, camera_ids)
         stage = "pause_one_camera_recording"
         _open_camera_watch(page, camera_ids[0])
-        _toggle_camera_recording(page, camera_ids[0], False)
+        _toggle_camera_recording(page, camera_ids[0], False, diagnostic=recording_diagnostic)
 
         def paused_camera_live():
             views = {v["device_id"]: v for v in client.json("/api/v1/operator/cameras")["cameras"]}
@@ -1709,7 +1797,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         )[0]
         _open_camera_watch(page, camera_ids[0])
         _decoded_color(page, "live-video", "red")
-        _toggle_camera_recording(page, camera_ids[0], True)
+        _toggle_camera_recording(page, camera_ids[0], True, diagnostic=recording_diagnostic)
         runtime._wait(
             lambda: _camera_recording_bytes(product, camera_ids)[0] > paused_progress[0],
             label="Resumed camera records fresh bytes",
@@ -2152,6 +2240,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             "enrollment_index": enrollment_index,
             **history_diagnostic,
             **outage_diagnostic,
+            **recording_diagnostic,
             "cleanup_failure_codes": cleanup_failures,
             "product_thread_alive": bool(product and product.thread.is_alive()),
             "product_thread_failed": bool(product and product.failed),

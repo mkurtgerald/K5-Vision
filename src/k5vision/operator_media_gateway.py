@@ -22,6 +22,9 @@ _UNTRUSTED_HEADERS = ["Forwarded", "X-Forwarded-*", "X-K5-*"]
 def _transport() -> dict:
     return {
         "protocol": "http",
+        # Uvicorn closes idle control connections after five seconds. Retire
+        # them first, so a mutation cannot race a stale pooled connection.
+        "keep_alive": {"idle_timeout": "2s"},
         "dial_timeout": "2s",
         "response_header_timeout": "10s",
         "read_timeout": "15s",

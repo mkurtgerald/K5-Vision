@@ -48,6 +48,167 @@ def _operator_asset(route, assets):
     return True
 
 
+def test_late_camera_connection_completion_preserves_explicit_wall_choice():
+    """A held reconnect refresh must not override a later explicit wall choice.
+
+    API responses isolate the UI race; this is not a decoded-media qualification.
+    All lists requested after the successful connection are held until navigation.
+    """
+    browser_api = pytest.importorskip("playwright.sync_api")
+    channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
+    assets = Path(__file__).resolve().parents[2] / "src/k5vision/operator_web"
+    identifiers = (
+        _CAMERA,
+        _OTHER,
+        "23d89cf4-6d30-421e-b833-569420d1a44b",
+        "54d00da5-2973-469e-a5aa-d9448944ce0f",
+    )
+    cameras = [
+        {
+            "device_id": identifier,
+            "name": f"Generated navigation camera {index}",
+            "host": f"127.0.0.{index + 1}",
+            "management_port": 80,
+            "management_secure": False,
+            "status": "live",
+            "recording": True,
+            "recording_enabled": True,
+            "recording_state": "recording",
+            "recording_status": {"reason": "observed"},
+            "analytics_status": "disabled",
+        }
+        for index, identifier in enumerate(identifiers)
+    ]
+    account = {"username": "fixture-admin", "role": "administrator", "display_name": "Fixture"}
+    pending, errors = [], []
+    hold = {"lists": False}
+    playwright = browser = context = None
+    try:
+        playwright = browser_api.sync_playwright().start()
+        browser = playwright.chromium.launch(channel=channel, headless=True)
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        context.add_init_script("window.Hls = {isSupported: () => false};")
+        page = context.new_page()
+        page.set_default_timeout(10_000)
+        now = datetime.now(UTC)
+        page.on("pageerror", lambda _error: errors.append("uncaught_script_error"))
+
+        def intercept(route):
+            if _operator_asset(route, assets):
+                return
+            path = urlsplit(route.request.url).path
+            status, data = 200, {}
+            if path == "/api/v1/auth/login":
+                data = {
+                    "session_token": "generated-navigation-session-token-000000000000000000",
+                    "account": account,
+                    "expires_at": (now + timedelta(minutes=5)).isoformat(),
+                    "expires_in_seconds": 300,
+                }
+            elif path == "/api/v1/auth/me":
+                data = account
+            elif path == "/api/v1/operator/status":
+                data = {"worker_status": "ready", "server_utc": now.isoformat()}
+            elif path == "/api/v1/operator/cameras":
+                data = {"cameras": cameras, "worker_status": "ready"}
+                if hold["lists"]:
+                    pending.append(route)
+                    return
+            elif path == "/api/v1/operator/camera-profiles":
+                data = {
+                    "probe_id": "p" * 32,
+                    "expires_in_seconds": 120,
+                    "profiles": [
+                        {
+                            "id": "s" * 32,
+                            "name": "Generated main stream",
+                            "codec": "H264",
+                            "width": 320,
+                            "height": 240,
+                            "supported": True,
+                        }
+                    ],
+                }
+            elif path == "/api/v1/operator/cameras/connect":
+                hold["lists"] = True
+                status, data = 201, cameras[0]
+            elif path.endswith("/media-session"):
+                identifier = path.split("/")[-2]
+                data = {
+                    "live_url": f"/media/live/{identifier}/index.m3u8",
+                    "playback_url": f"/media/playback?path={identifier}",
+                }
+            elif path.endswith("/history"):
+                data = {"spans": []}
+            else:
+                status = 404
+            route.fulfill(status=status, content_type="application/json", body=json.dumps(data))
+
+        page.route("**/*", intercept)
+        page.goto("http://127.0.0.1:8000/operator/")
+        page.locator("#username").fill("fixture-admin")
+        page.locator("#password").fill("generated-human-account-password")
+        page.locator("#sign-in-button").click()
+        expect = browser_api.expect
+        expect(page.locator("#wall-panel")).to_be_visible()
+        expect(page.locator("#wall-panel video")).to_have_count(4)
+        page.locator(f'[data-camera-id="{_CAMERA}"] [data-wall-action="watch"]').click()
+        expect(page.locator("#live-panel")).to_be_visible()
+        page.locator("#update-source-button").click()
+        page.locator("#new-camera-username").fill("fixture-camera-account")
+        page.locator("#new-camera-password").fill("generated-camera-password")
+        page.locator("#test-camera-connection").click()
+        expect(page.locator("#save-camera")).to_be_enabled()
+        with page.expect_request(
+            lambda request: (
+                hold["lists"] and urlsplit(request.url).path == "/api/v1/operator/cameras"
+            )
+        ):
+            page.locator("#save-camera").click()
+        expect(page.locator("#add-camera-dialog")).to_be_hidden()
+        assert pending
+        page.locator("#wall-tab").click()
+        expect(page.locator("#wall-panel")).to_be_visible()
+        expect(page.locator("#wall-panel video")).to_have_count(4)
+        players = [
+            page.locator(f'#wall-panel [data-camera-id="{identifier}"] video').element_handle()
+            for identifier in identifiers
+        ]
+        with page.expect_response(
+            lambda response: urlsplit(response.url).path == "/api/v1/operator/cameras"
+        ):
+            hold["lists"] = False
+            while pending:
+                pending.pop().fulfill(
+                    content_type="application/json",
+                    body=json.dumps({"cameras": cameras, "worker_status": "ready"}),
+                )
+        # Two real animation frames run all response promise continuations and
+        # deferred wall layout work, without a fixed delay to hide the race.
+        page.evaluate(
+            "() => new Promise(resolve => "
+            "requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+        )
+        expect(page.locator("#wall-panel")).to_be_visible()
+        expect(page.locator("#live-panel")).to_be_hidden()
+        assert all(
+            player.evaluate(
+                "(video,id) => video.isConnected && "
+                'document.querySelector(`[data-camera-id="${id}"] video`)===video',
+                identifier,
+            )
+            for identifier, player in zip(identifiers, players, strict=True)
+        )
+        assert not errors
+    finally:
+        if context is not None:
+            context.close()
+        if browser is not None:
+            browser.close()
+        if playwright is not None:
+            playwright.stop()
+
+
 @pytest.mark.parametrize("mode", ["add", "reconnect"])
 @pytest.mark.parametrize("browser_shift_seconds", [0, 172800, -172800])
 def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(

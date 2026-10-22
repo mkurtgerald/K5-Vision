@@ -28,7 +28,7 @@
     removeTarget: null, removing: false,
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
     personFrameId: 0,
-    recordingBusy: false, cameraListEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
+    recordingBusy: false, cameraListEpoch: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
     playbackStart: null, playbackEpoch: 0, selectedStatus: null,
   };
   let wall = null, timeline = null;
@@ -581,6 +581,7 @@
 
   async function selectCamera(deviceId) {
     if (!state.token || state.signingOut) return;
+    state.navigationEpoch += 1;
     if (state.view === "wall") setView("live", false);
     state.selectionController?.abort();
     state.selectionController = new AbortController();
@@ -843,6 +844,7 @@
   function setView(view, load = true) {
     if (state.signingOut) return;
     if (!["wall", "live", "history"].includes(view)) return;
+    state.navigationEpoch += 1;
     state.view = view;
     $("recorder-overview").open = view !== "wall";
     $("wall-panel").hidden = view !== "wall";
@@ -1628,13 +1630,15 @@
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       closeAddCamera();
       const completedEpoch = state.cameraSetupEpoch;
+      const navigationEpoch = state.navigationEpoch;
       const deviceId = created.device_id || created.camera?.device_id;
       const cameraStatus = created.camera || created;
       state.cameraConnectionNotice = deviceId || null;
       const connection = cameraConnectionStatus(cameraStatus, state.workerStatus);
       notice(connection.text, connection.error, "camera_connection");
       await refreshCameras();
-      if (deviceId && completedEpoch === state.cameraSetupEpoch) await selectCamera(deviceId);
+      if (deviceId && epoch === state.sessionEpoch && completedEpoch === state.cameraSetupEpoch &&
+        navigationEpoch === state.navigationEpoch) await selectCamera(deviceId);
     } catch (error) {
       if (controller.signal.aborted || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       if (error.status === 410 || error.code === "camera_probe_expired") clearCameraProbe();

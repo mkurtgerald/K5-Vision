@@ -1115,10 +1115,12 @@ def _desktop_nvr_journey(
     before_live = browser_helpers._decoded_color(page, "live-video", "red")
     live = page.locator("#live-video").element_handle()
     recording_route = f"/api/v1/operator/cameras/{camera_ids[0]}/recording"
+    browser_helpers._recording_control_diagnostic(None, False, diagnostic)
     with page.expect_response(
         lambda response: response.request.method == "PUT" and response.url.endswith(recording_route)
     ) as paused:
         page.locator("#toggle-recording").click()
+    browser_helpers._recording_control_diagnostic(paused.value, False, diagnostic)
     _require(paused.value.status == 200, "Installed pause recording action failed")
     _wait(
         lambda: page.locator("#toggle-recording").get_attribute("data-enabled") == "false",
@@ -1155,10 +1157,12 @@ def _desktop_nvr_journey(
         bool(client.json(f"/api/v1/operator/cameras/{camera_ids[0]}/history")["spans"]),
         "Pausing recording removed installed recording history",
     )
+    browser_helpers._recording_control_diagnostic(None, True, diagnostic)
     with page.expect_response(
         lambda response: response.request.method == "PUT" and response.url.endswith(recording_route)
     ) as resumed:
         page.locator("#toggle-recording").click()
+    browser_helpers._recording_control_diagnostic(resumed.value, True, diagnostic)
     _require(resumed.value.status == 200, "Installed resume recording action failed")
     _wait(
         lambda: sizes()[0] > paused_bytes,
@@ -1188,12 +1192,14 @@ def _desktop_nvr_journey(
     diagnostic["nvr_stage"] = "persist_paused_choice"
     browser_helpers._open_camera_watch(page, camera_ids[3])
     preference_route = f"/api/v1/operator/cameras/{camera_ids[3]}/recording"
+    browser_helpers._recording_control_diagnostic(None, False, diagnostic)
     with page.expect_response(
         lambda response: (
             response.request.method == "PUT" and response.url.endswith(preference_route)
         )
     ) as preference:
         page.locator("#toggle-recording").click()
+    browser_helpers._recording_control_diagnostic(preference.value, False, diagnostic)
     _require(preference.value.status == 200, "Installed persisted recording choice failed")
     _wait(
         lambda: page.locator("#toggle-recording").get_attribute("data-enabled") == "false",
