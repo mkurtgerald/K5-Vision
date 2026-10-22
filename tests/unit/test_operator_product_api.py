@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,7 +23,10 @@ from k5vision.domain.devices import DeviceCreate, DeviceProtocol
 from k5vision.domain.users import UserAccount, UserCreate, UserPatch, UserRole
 from k5vision.identity_state import initialize_identity_state
 from k5vision.media.mediamtx_provider import (
+    MEDIAMTX_VERSION,
     MediaMTXBinding,
+    MediaMTXCredentials,
+    MediaMTXProvider,
     MediaPathConfiguration,
     MediaPathState,
     MediaPlaybackSpan,
@@ -54,6 +59,18 @@ class _Provider:
 
     async def path_configuration(self, binding):
         return MediaPathConfiguration(binding.device_id, "main", self.recording, False, "fmp4")
+
+    async def path_snapshot(self, bindings):
+        result = {}
+        for binding in bindings:
+            try:
+                result[binding] = (
+                    await self.path_state(binding),
+                    await self.path_configuration(binding),
+                )
+            except MediaWorkerError as error:
+                result[binding] = error.code
+        return result
 
     async def playback_spans(self, binding, *, start, end):
         self.history_queries.append((binding, start, end))
@@ -429,6 +446,7 @@ def test_recording_claim_requires_recent_complete_disk_progress(product, monkeyp
     assert row()["recording_state"] == "stalled"
     product.service.progress["last_progress_age_seconds"] = 0
     assert row()["recording_state"] == "recording"
+
     product.service.progress["last_progress_age_seconds"] = 46
     assert row()["recording_state"] == "stalled"
     product.service.progress["inspection_complete"] = False
@@ -449,6 +467,121 @@ def test_recording_claim_requires_recent_complete_disk_progress(product, monkeyp
     assert resumed.json()["recording_state"] == "waiting"
     product.service.progress["last_progress_age_seconds"] = 0
     assert row()["recording_state"] == "recording"
+
+
+def test_camera_poll_keeps_worker_capacity_for_concurrent_history(product):
+    """Hold an actual bounded native read while a separate history request runs."""
+    for index in range(1, 5):
+        response = product.client.post(
+            "/api/v1/operator/cameras",
+            headers=product.headers,
+            json={
+                "name": f"Camera {index}",
+                "host": f"127.0.0.{index}",
+                "source_uri": f"rtsp://127.0.0.{index}/live",
+            },
+        )
+        assert response.status_code == 201
+    sources = product.cameras.list_sources()
+    entered, release = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    state_calls, configuration_calls = [], []
+
+    def state(source):
+        return {
+            "name": source.binding.path_name,
+            "available": True,
+            "online": True,
+            "tracks2": [],
+            "readers": [],
+            "inboundBytes": 123,
+            "outboundBytes": 456,
+        }
+
+    def configuration(source):
+        return {
+            "name": source.binding.path_name,
+            "record": True,
+            "recordFormat": "fmp4",
+            "sourceOnDemand": False,
+        }
+
+    def request(request, _timeout, _limit):
+        path = request.full_url.split("?", 1)[0].split(":9997", 1)[-1]
+        if "/v3/paths/" in path:
+            with lock:
+                state_calls.append(path)
+                if path == "/v3/paths/list" or len(state_calls) == 4:
+                    entered.set()
+            assert release.wait(5), "Controlled native state read was not released"
+            if path == "/v3/paths/list":
+                result = {
+                    "itemCount": 4,
+                    "pageCount": 1,
+                    "items": [state(source) for source in sources],
+                }
+            else:
+                result = state(
+                    next(
+                        source
+                        for source in sources
+                        if source.binding.path_name == path.rsplit("/", 1)[-1]
+                    )
+                )
+        elif "/v3/config/paths/" in path:
+            with lock:
+                configuration_calls.append(path)
+            if path == "/v3/config/paths/list":
+                result = {
+                    "itemCount": 4,
+                    "pageCount": 1,
+                    "items": [configuration(source) for source in sources],
+                }
+            else:
+                result = configuration(sources[0])
+        elif "/list?" in request.full_url:
+            result = [{"start": "2026-10-11T12:00:00Z", "duration": 12.5}]
+        else:
+            result = {"version": MEDIAMTX_VERSION, "started": "2026-10-11T12:00:00Z"}
+        return json.dumps(result).encode()
+
+    history_failure_codes = []
+
+    class ObservedProvider(MediaMTXProvider):
+        async def playback_spans(self, *args, **kwargs):
+            try:
+                return await super().playback_spans(*args, **kwargs)
+            except MediaWorkerError as error:
+                history_failure_codes.append(error.code.value)
+                raise
+
+    provider = ObservedProvider(
+        site_id=product.service.site_id,
+        api_origin="http://127.0.0.1:9997",
+        playback_origin="http://127.0.0.1:9996",
+        credentials=MediaMTXCredentials("worker", "x" * 43),
+        requester=request,
+    )
+    provider._version_admitted = True
+    product.service.provider = provider
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        poll = executor.submit(
+            product.client.get, "/api/v1/operator/cameras", headers=product.headers
+        )
+        try:
+            assert entered.wait(5), "Camera poll did not reach the native read"
+            history = product.client.get(
+                f"/api/v1/operator/cameras/{sources[0].binding.device_id}/history",
+                headers=product.headers,
+                params={"start": "2026-10-11T12:00:00Z", "end": "2026-10-11T12:01:00Z"},
+            )
+            assert history.status_code == 200, history_failure_codes
+            assert history.json()["spans"][0]["duration_seconds"] == 12.5
+        finally:
+            release.set()
+        assert poll.result(timeout=5).status_code == 200
+    assert state_calls == ["/v3/paths/list"]
+    assert configuration_calls == ["/v3/config/paths/list"]
 
 
 @pytest.mark.parametrize(

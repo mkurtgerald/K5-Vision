@@ -23,7 +23,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import pytest
 
@@ -522,23 +522,119 @@ def _wall_layout_proof(page, device_ids, colors):
     return [1, 4, 9]
 
 
-def _timeline_play(page, color):
+def _playable_timeline_span(intervals):
+    """Choose footage that can contain a real seek followed by a two-second clip."""
+    return next(
+        (
+            (first, last)
+            for first, last in intervals
+            if math.isfinite(first) and math.isfinite(last) and last - first >= 4000
+        ),
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("intervals", "expected"),
+    [
+        (((1000, 2200), (3000, 8000)), (3000, 8000)),
+        (((1000, 2200), (3000, 6000)), None),
+    ],
+)
+def test_timeline_clip_selects_playable_span_after_short_recording_fragment(intervals, expected):
+    assert _playable_timeline_span(intervals) == expected
+
+
+def _timeline_play(page, color, *, device_id, diagnostic=None):
     """Seek via actual timeline pointer coordinates, then decode selected video."""
     __tracebackhide__ = True
-    available = page.locator("#recording-timeline .k5-timeline-recording").first
-    available.wait_for(state="attached", timeout=15_000)
-    first = float(available.get_attribute("data-start"))
-    last = float(available.get_attribute("data-end"))
-    _require(last - first >= 2000, "Timeline fixture has no playable two-second interval")
+    diagnostic = {} if diagnostic is None else diagnostic
+    diagnostic.update(
+        timeline_span_count=0,
+        timeline_first_span_seconds=None,
+        timeline_selected_span_seconds=None,
+        timeline_seek_offset_seconds=None,
+        timeline_history_http_status=None,
+        timeline_history_response_bound=False,
+        timeline_history_error_code=None,
+        timeline_reason="waiting_recorded_spans",
+    )
+    available = page.locator("#recording-timeline .k5-timeline-recording")
+    available.first.wait_for(state="attached", timeout=15_000)
+    intervals = available.evaluate_all("""ranges => ranges.map(range => [
+      Number(range.getAttribute('data-start')),Number(range.getAttribute('data-end'))
+    ])""")
+    diagnostic.update(
+        timeline_span_count=len(intervals), timeline_reason="invalid_recorded_span_metadata"
+    )
+    _require(
+        bool(intervals)
+        and all(
+            type(value) in (int, float) and math.isfinite(value)
+            for interval in intervals
+            for value in interval
+        ),
+        "Timeline recorded interval metadata is invalid",
+    )
+    diagnostic.update(
+        timeline_first_span_seconds=round((intervals[0][1] - intervals[0][0]) / 1000, 3),
+        timeline_reason="no_playable_span",
+    )
+    selected = _playable_timeline_span(intervals)
+    _require(selected is not None, "Timeline fixture has no playable four-second interval")
+    first, last = selected
+    diagnostic["timeline_selected_span_seconds"] = round((last - first) / 1000, 3)
     # Narrow the actual UTC form to make a seconds-long fixture selectable by
     # a real pointer instead of seeking a sub-pixel range in a 24-hour window.
     start = datetime.fromtimestamp(first / 1000, UTC) - timedelta(seconds=2)
     end = datetime.fromtimestamp(last / 1000, UTC) + timedelta(seconds=2)
     page.locator("#history-start").fill(start.strftime("%Y-%m-%dT%H:%M:%S"))
     page.locator("#history-end").fill(end.strftime("%Y-%m-%dT%H:%M:%S"))
-    with page.expect_response(lambda response: "/history?" in response.url) as loaded:
+    expected_start, expected_end = (
+        datetime.fromisoformat(page.locator(selector).input_value()).replace(tzinfo=UTC)
+        for selector in ("#history-start", "#history-end")
+    )
+    expected_path = f"/api/v1/operator/cameras/{quote(str(device_id), safe='')}/history"
+
+    def selected_history_response(response):
+        parsed = urlsplit(response.url)
+        if parsed.path != expected_path or response.request.method != "GET":
+            return False
+        query = parse_qs(parsed.query)
+        if set(query) != {"start", "end"} or any(len(value) != 1 for value in query.values()):
+            return False
+        try:
+            observed = tuple(
+                datetime.fromisoformat(query[key][0].replace("Z", "+00:00"))
+                for key in ("start", "end")
+            )
+        except ValueError:
+            return False
+        return observed == (expected_start, expected_end)
+
+    diagnostic["timeline_reason"] = "waiting_selected_history_response"
+    with page.expect_response(selected_history_response) as loaded:
         page.locator("#load-history").click()
+    error_code = "none"
+    if loaded.value.status != 200:
+        error_code = "unrecognized_error_response"
+        try:
+            length = loaded.value.header_value("content-length")
+            if length is not None and 0 < int(length) <= 1024:
+                error_code = {
+                    "Media unavailable": "media_unavailable",
+                    "Playback inventory unavailable": "playback_inventory_unavailable",
+                }.get(loaded.value.json().get("detail"), "unrecognized_error_response")
+        except Exception:
+            pass
+    diagnostic.update(
+        timeline_history_http_status=loaded.value.status,
+        timeline_history_response_bound=True,
+        timeline_history_error_code=error_code,
+        timeline_reason="history_http_failed",
+    )
     _require(loaded.value.status == 200, "Timeline UTC window could not be loaded")
+    diagnostic["timeline_reason"] = "waiting_history_window"
     slider = page.locator("#recording-timeline [role='slider']")
     slider.wait_for(state="visible")
     page.wait_for_function(
@@ -554,9 +650,11 @@ def _timeline_play(page, color):
     )
     minimum = float(slider.get_attribute("aria-valuemin"))
     maximum = float(slider.get_attribute("aria-valuemax"))
-    chosen = first + min(1000, (last - first) / 4)
+    chosen = first + 1000
     bounds = slider.bounding_box()
+    diagnostic["timeline_reason"] = "timeline_track_unavailable"
     _require(bounds and maximum > minimum, "Actual timeline track is unavailable")
+    diagnostic["timeline_reason"] = "waiting_timeline_pointer_seek"
     slider.click(
         position={
             "x": (chosen - minimum) / (maximum - minimum) * bounds["width"],
@@ -570,9 +668,26 @@ def _timeline_play(page, color):
         }""",
         arg=chosen,
     )
+    actual_chosen = (
+        datetime.fromisoformat(page.locator("#playback-start").input_value())
+        .replace(tzinfo=UTC)
+        .timestamp()
+        * 1000
+    )
+    diagnostic.update(
+        timeline_seek_offset_seconds=round((actual_chosen - first) / 1000, 3),
+        timeline_reason="clip_outside_recorded_span",
+    )
+    _require(
+        actual_chosen >= first and actual_chosen + 2000 <= last,
+        "Timeline playback clip crosses its recorded interval",
+    )
     page.locator("#playback-duration").fill("2")
     page.locator("#play-recording").click()
-    return _decoded_color(page, "playback-video", color)
+    diagnostic["timeline_reason"] = "playback_decode_or_pixel_check"
+    frames = _decoded_color(page, "playback-video", color)
+    diagnostic["timeline_reason"] = "none"
+    return frames
 
 
 def _download_recording(page, ffprobe, export_path, helpers, color):
@@ -1714,7 +1829,11 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                 "Rolling history followed skewed browser Date instead of real recorder UTC",
             )
             stage = "playback_decode"
-            playback_frames.append(_timeline_play(page, color))
+            playback_frames.append(
+                _timeline_play(
+                    page, color, device_id=camera_ids[index], diagnostic=history_diagnostic
+                )
+            )
             stage = "actual_recording_export"
             export_frames.append(
                 _download_recording(

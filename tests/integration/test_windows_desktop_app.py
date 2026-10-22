@@ -95,6 +95,12 @@ class _Windows:
             "IsWindowVisible": ([wintypes.HWND], wintypes.BOOL),
             "IsWindow": ([wintypes.HWND], wintypes.BOOL),
             "IsWindowEnabled": ([wintypes.HWND], wintypes.BOOL),
+            "SetForegroundWindow": ([wintypes.HWND], wintypes.BOOL),
+            "GetForegroundWindow": ([], wintypes.HWND),
+            "keybd_event": (
+                [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t],
+                None,
+            ),
             "GetDlgItem": ([wintypes.HWND, ctypes.c_int], wintypes.HWND),
             "GetDlgCtrlID": ([wintypes.HWND], ctypes.c_int),
             "PostMessageW": (
@@ -396,8 +402,10 @@ def _start_app(installed, profile, port, cohort):
     return process
 
 
-def _default_browser_handoff(api, form, port):
+def _default_browser_handoff(api, form, port, *, diagnostic=None):
     """Click the real native action and inspect the browser's actual address bar."""
+    diagnostic = {} if diagnostic is None else diagnostic
+    diagnostic["browser_handoff_stage"] = "opening_browser"
     previous_windows = set(api.windows())
     previous_processes = {process.pid for process in psutil.process_iter()}
     opened = None
@@ -421,33 +429,59 @@ def _default_browser_handoff(api, form, port):
             return None
 
         opened = _wait(browser_window, "Actual default-browser K5 window", timeout=25)
+        diagnostic["browser_handoff_stage"] = "browser_window_found"
         process = psutil.Process(api.pid(opened))
         owned = [
             item
             for item in (process, *process.children(recursive=True))
             if item.pid not in previous_processes
         ]
+        if api.api.GetForegroundWindow() != opened:
+            api.api.SetForegroundWindow(opened)
+        _wait(
+            lambda: api.api.GetForegroundWindow() == opened,
+            "Actual default-browser foreground ownership",
+            timeout=3,
+        )
+        # Focus the address bar in the exact new window rather than traversing
+        # the entire browser accessibility tree, which can block on providers.
+        # Never send input unless this owned window is still in the foreground.
+        _require(
+            api.api.GetForegroundWindow() == opened,
+            "Actual default-browser foreground ownership changed",
+        )
+        try:
+            api.api.keybd_event(0x11, 0, 0, 0)  # Control down
+            api.api.keybd_event(0x4C, 0, 0, 0)  # L down
+        finally:
+            api.api.keybd_event(0x4C, 0, 0x0002, 0)  # L up
+            api.api.keybd_event(0x11, 0, 0x0002, 0)  # Control up
+        diagnostic["browser_handoff_stage"] = "address_bar_focused"
         environment = dict(os.environ)
         environment["K5_ACCEPTANCE_BROWSER_HWND"] = str(opened)
+        environment["K5_ACCEPTANCE_BROWSER_PID"] = str(process.pid)
         environment["K5_ACCEPTANCE_BROWSER_URL"] = f"http://127.0.0.1:{port}/operator/"
         script = """
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
-$handle = [IntPtr]::new([long]$env:K5_ACCEPTANCE_BROWSER_HWND)
-$element = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
-$property = [System.Windows.Automation.AutomationElement]::ControlTypeProperty
-$editType = [System.Windows.Automation.ControlType]::Edit
-$condition = [System.Windows.Automation.PropertyCondition]::new($property, $editType)
-$edits = $element.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
 $expected = $env:K5_ACCEPTANCE_BROWSER_URL.TrimEnd('/')
+$expectedProcess = [int]$env:K5_ACCEPTANCE_BROWSER_PID
 $matched = $false
-foreach ($edit in $edits) {
+$timer = [System.Diagnostics.Stopwatch]::StartNew()
+while (-not $matched -and $timer.Elapsed.TotalSeconds -lt 5) {
   try {
-    $pattern = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-    $value = $pattern.Current.Value.TrimEnd('/')
-    if ($value -eq $expected -or $value -eq $expected.Substring(7)) { $matched = $true }
+    $edit = [System.Windows.Automation.AutomationElement]::FocusedElement
+    if ($null -ne $edit -and $edit.Current.ProcessId -eq $expectedProcess) {
+      $pattern = $null
+      $valuePattern = [System.Windows.Automation.ValuePattern]::Pattern
+      if ($edit.TryGetCurrentPattern($valuePattern, [ref]$pattern)) {
+        $value = $pattern.Current.Value.TrimEnd('/')
+        if ($value -eq $expected -or $value -eq $expected.Substring(7)) { $matched = $true }
+      }
+    }
   } catch { }
+  if (-not $matched) { Start-Sleep -Milliseconds 100 }
 }
 if (-not $matched) { exit 2 }
 [Console]::WriteLine('K5_BROWSER_URL_MATCHED')
@@ -465,10 +499,12 @@ if (-not $matched) { exit 2 }
             timeout=15,
             check=False,
         )
+        diagnostic["browser_handoff_probe_exit_code"] = result.returncode
         _require(
             result.returncode == 0 and result.stdout.strip() == b"K5_BROWSER_URL_MATCHED",
             "Native Open cameras did not hand off the exact operator URL to the default browser",
         )
+        diagnostic["browser_handoff_stage"] = "exact_operator_url_verified"
         return True
     finally:
         if opened and api.api.IsWindow(opened):
@@ -594,6 +630,12 @@ def _failure_detail(error):
         ("Manual stream field remained", "manual_stream_field"),
         ("Browser sent a manual camera stream address", "manual_stream_request"),
         ("Camera stream address entered the DOM", "stream_uri_dom"),
+        ("Timeline fixture has no playable", "timeline_interval_unavailable"),
+        ("Timeline recorded interval metadata is invalid", "timeline_interval_invalid"),
+        ("Timeline UTC window could not be loaded", "timeline_history_response"),
+        ("Actual timeline track is unavailable", "timeline_track_unavailable"),
+        ("Timeline playback clip crosses its recorded interval", "timeline_clip_outside_span"),
+        ("Decoded video did not match the selected generated camera", "decoded_camera_mismatch"),
     ):
         if marker in text:
             return code
@@ -1102,7 +1144,9 @@ def _desktop_nvr_journey(
 
     diagnostic["nvr_stage"] = "timeline_and_export"
     browser_helpers._open_camera_recordings(page, camera_ids[0])
-    evidence["timeline_playback_decoded_frames"] = browser_helpers._timeline_play(page, "red")
+    evidence["timeline_playback_decoded_frames"] = browser_helpers._timeline_play(
+        page, "red", device_id=camera_ids[0], diagnostic=diagnostic
+    )
     export = parent / "saved installed red recording.mp4"
     evidence["export_decoded_frames"] = browser_helpers._download_recording(
         page, ffprobe, export, helpers, "red"
@@ -1573,7 +1617,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             process=app,
             timeout=10,
         )
-        receipt["native_default_browser_handoff"] = _default_browser_handoff(api, form, port)
+        receipt["native_default_browser_handoff"] = _default_browser_handoff(
+            api, form, port, diagnostic=readiness_diagnostic
+        )
         identity = identity_state.load_identity_state(profile / "identity")
         python_processes = [
             process

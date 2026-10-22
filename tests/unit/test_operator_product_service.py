@@ -53,6 +53,9 @@ class _Provider:
     async def info(self):
         return None
 
+    async def aclose(self):
+        return None
+
 
 class _Storage:
     allowed = True
@@ -287,6 +290,33 @@ def test_cancelled_stop_joins_flush_before_cleanup_or_return(native, monkeypatch
             assert media.stopped == gateway.stopped == 0
         finally:
             release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+        assert media.stopped == gateway.stopped == 1
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_stop_joins_provider_before_authenticated_worker_is_released(native, monkeypatch):
+    async def scenario():
+        service = native.service
+        await service.start(())
+        media, gateway = service._media, service._gateway
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def close_provider():
+            entered.set()
+            await release.wait()
+            assert media.stopped == gateway.stopped == 0
+
+        monkeypatch.setattr(service.provider, "aclose", close_provider)
+        cleanup = asyncio.create_task(service.stop())
+        await entered.wait()
+        cleanup.cancel()
+        await asyncio.sleep(0)
+        assert not cleanup.done()
+        assert media.stopped == gateway.stopped == 0
+        release.set()
         with pytest.raises(asyncio.CancelledError):
             await cleanup
         assert media.stopped == gateway.stopped == 1

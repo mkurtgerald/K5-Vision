@@ -582,6 +582,22 @@ class OperatorProductService:
             except Exception:
                 pass
         cancelled = False
+        cleanup_failed = False
+        close_provider = asyncio.create_task(self.provider.aclose())
+        # A canceled camera-list reader may leave its shared snapshot owner
+        # finishing a native read. Close and join that boundary before the
+        # worker's authenticated listener can be released or reused.
+        while not close_provider.done():
+            try:
+                await asyncio.shield(close_provider)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        try:
+            close_provider.result()
+        except Exception:
+            cleanup_failed = True
         if self._paths and self._media is not None and self._media.poll() is None:
             flush = asyncio.create_task(
                 asyncio.to_thread(self._flush_recordings, tuple(self._paths))
@@ -599,7 +615,6 @@ class OperatorProductService:
                 flush.result()
             except Exception:
                 pass
-        cleanup_failed = False
         for process in (self._gateway, self._media):
             if process is not None:
                 try:

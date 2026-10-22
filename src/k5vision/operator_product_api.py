@@ -363,7 +363,7 @@ def install_operator_product_api(
                 return source
         raise HTTPException(404, "Camera not found")
 
-    async def camera_view(source: MediaMTXSource) -> dict:
+    async def camera_view(source: MediaMTXSource, *, worker_snapshot=None) -> dict:
         nonlocal media_generation
         now = monotonic()
         generation = getattr(service, "media_generation", 0)
@@ -400,8 +400,13 @@ def install_operator_product_api(
                 result["recording_status"]["reason"] = "operator_paused"
             return result
         try:
-            state = await service.provider.path_state(source.binding)
-            configuration = await service.provider.path_configuration(source.binding)
+            if isinstance(worker_snapshot, MediaWorkerErrorCode):
+                raise MediaWorkerError(worker_snapshot)
+            if worker_snapshot is None:
+                state = await service.provider.path_state(source.binding)
+                configuration = await service.provider.path_configuration(source.binding)
+            else:
+                state, configuration = worker_snapshot
             now = monotonic()
             if state.online and state.available:
                 seen_live.add(source.binding.device_id)
@@ -483,14 +488,23 @@ def install_operator_product_api(
     @app.get(_PREFIX + "/cameras", tags=["operator"])
     async def list_cameras(_session: tuple[UserAccount, str] = read_session):
         selected = selections()
-        semaphore = asyncio.Semaphore(4)
-
-        async def view(source):
-            async with semaphore:
-                return await camera_view(source)
+        snapshot = {}
+        if selected and service.status() in {"ready", "disk_full"}:
+            try:
+                snapshot = await service.provider.path_snapshot(
+                    tuple(source.binding for source in selected)
+                )
+            except MediaWorkerError as error:
+                snapshot = {source.binding: error.code for source in selected}
 
         return {
-            "cameras": await asyncio.gather(*(view(source) for source in selected)),
+            "cameras": [
+                await camera_view(
+                    source,
+                    worker_snapshot=snapshot.get(source.binding, MediaWorkerErrorCode.UNAVAILABLE),
+                )
+                for source in selected
+            ],
             "worker_status": service.status(),
         }
 
