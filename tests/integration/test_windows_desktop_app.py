@@ -17,6 +17,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from ctypes import wintypes
@@ -82,6 +83,7 @@ class _Windows:
 
     def __init__(self):
         self.api = ctypes.WinDLL("user32", use_last_error=True)
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         self.callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         signatures = {
             "EnumWindows": ([self.callback, wintypes.LPARAM], wintypes.BOOL),
@@ -101,6 +103,13 @@ class _Windows:
                 [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t],
                 None,
             ),
+            "OpenClipboard": ([wintypes.HWND], wintypes.BOOL),
+            "CloseClipboard": ([], wintypes.BOOL),
+            "EmptyClipboard": ([], wintypes.BOOL),
+            "GetClipboardData": ([wintypes.UINT], wintypes.HANDLE),
+            "SetClipboardData": ([wintypes.UINT, wintypes.HANDLE], wintypes.HANDLE),
+            "IsClipboardFormatAvailable": ([wintypes.UINT], wintypes.BOOL),
+            "CountClipboardFormats": ([], ctypes.c_int),
             "GetDlgItem": ([wintypes.HWND, ctypes.c_int], wintypes.HWND),
             "GetDlgCtrlID": ([wintypes.HWND], ctypes.c_int),
             "PostMessageW": (
@@ -123,6 +132,94 @@ class _Windows:
         for name, (arguments, result) in signatures.items():
             function = getattr(self.api, name)
             function.argtypes, function.restype = arguments, result
+        for name, arguments, result in (
+            ("GlobalAlloc", [wintypes.UINT, ctypes.c_size_t], wintypes.HANDLE),
+            ("GlobalSize", [wintypes.HANDLE], ctypes.c_size_t),
+            ("GlobalLock", [wintypes.HANDLE], ctypes.c_void_p),
+            ("GlobalUnlock", [wintypes.HANDLE], wintypes.BOOL),
+            ("GlobalFree", [wintypes.HANDLE], wintypes.HANDLE),
+        ):
+            function = getattr(self.kernel, name)
+            function.argtypes, function.restype = arguments, result
+
+    def clipboard_text(self, owner):
+        """Read bounded Unicode text; never expose clipboard contents in errors."""
+        if not self.api.OpenClipboard(owner):
+            raise OSError("Native clipboard is busy")
+        try:
+            if not self.api.IsClipboardFormatAvailable(13):  # CF_UNICODETEXT
+                if self.api.CountClipboardFormats():
+                    raise RuntimeError("Native clipboard has no preservable Unicode text")
+                return None
+            handle = self.api.GetClipboardData(13)
+            size = self.kernel.GlobalSize(handle) if handle else 0
+            if not 2 <= size <= 65_536 or size % 2:
+                raise RuntimeError("Native clipboard Unicode data exceeds its bound")
+            pointer = self.kernel.GlobalLock(handle)
+            if not pointer:
+                raise OSError("Native clipboard Unicode data is unavailable")
+            try:
+                data = ctypes.string_at(pointer, size)
+            finally:
+                self.kernel.GlobalUnlock(handle)
+            terminator = next(
+                (index for index in range(0, size - 1, 2) if data[index : index + 2] == b"\0\0"),
+                None,
+            )
+            if terminator is None:
+                raise RuntimeError("Native clipboard Unicode data is unterminated")
+            try:
+                text = data[:terminator].decode("utf-16-le")
+            except UnicodeError:
+                raise RuntimeError("Native clipboard Unicode data is invalid") from None
+            return text
+        finally:
+            self.api.CloseClipboard()
+
+    def set_clipboard_text(self, owner, text):
+        """Transfer a movable Unicode allocation to Windows, or restore empty state."""
+        handle = None
+        try:
+            if text is not None:
+                encoded = text.encode("utf-16-le") + b"\0\0"
+                if len(encoded) > 65_536:
+                    raise RuntimeError("Native clipboard Unicode data exceeds its bound")
+                handle = self.kernel.GlobalAlloc(0x0002, len(encoded))  # GMEM_MOVEABLE
+                if not handle:
+                    raise OSError("Native clipboard allocation failed")
+                pointer = self.kernel.GlobalLock(handle)
+                if not pointer:
+                    raise OSError("Native clipboard allocation is unavailable")
+                try:
+                    ctypes.memmove(pointer, encoded, len(encoded))
+                finally:
+                    self.kernel.GlobalUnlock(handle)
+            if not self.api.OpenClipboard(owner):
+                raise OSError("Native clipboard is busy")
+            try:
+                if not self.api.EmptyClipboard():
+                    raise OSError("Native clipboard reset failed")
+                if handle:
+                    if not self.api.SetClipboardData(13, handle):
+                        raise OSError("Native clipboard update failed")
+                    handle = None  # Windows now owns the HGLOBAL.
+            finally:
+                self.api.CloseClipboard()
+        finally:
+            if handle:
+                self.kernel.GlobalFree(handle)
+
+    def shortcut(self, owner, key):
+        _require(
+            self.api.GetForegroundWindow() == owner,
+            "Actual default-browser foreground ownership changed",
+        )
+        try:
+            self.api.keybd_event(0x11, 0, 0, 0)
+            self.api.keybd_event(key, 0, 0, 0)
+        finally:
+            self.api.keybd_event(key, 0, 0x0002, 0)
+            self.api.keybd_event(0x11, 0, 0x0002, 0)
 
     def text(self, window):
         value = ctypes.create_unicode_buffer(512)
@@ -402,6 +499,118 @@ def _start_app(installed, profile, port, cohort):
     return process
 
 
+def _native_browser_clipboard_probe(
+    form, opened, port, *, observer_deadline, expected_pid, diagnostic
+):
+    """Run only in the parent's hidden, disposable, hard-timeout observer process."""
+    diagnostic["browser_handoff_stage"] = "validating_observer_owner"
+    api = _Windows()
+    _require(
+        api.api.IsWindow(form)
+        and api.api.IsWindow(opened)
+        and api.pid(opened) == expected_pid
+        and 0 < observer_deadline - time.monotonic() <= 15,
+        "Native default-browser observer ownership or deadline is invalid",
+    )
+    prior_clipboard = None
+    clipboard_touched = False
+    clipboard_restore_failed = False
+    try:
+        # The observer has one 15-second budget, including reserved restoration
+        # time. The installed product never reads or writes the clipboard.
+        probe_deadline = observer_deadline - 3
+        diagnostic["browser_handoff_stage"] = "focusing_browser"
+        if api.api.GetForegroundWindow() != opened:
+            api.api.SetForegroundWindow(opened)
+        _wait(
+            lambda: api.api.GetForegroundWindow() == opened,
+            "Actual default-browser foreground ownership",
+            timeout=min(3, max(0, probe_deadline - time.monotonic())),
+        )
+        diagnostic["browser_handoff_stage"] = "saving_clipboard"
+        # A tuple lets an originally empty clipboard be a successful read.
+        prior_clipboard = _wait(
+            lambda: (api.clipboard_text(opened),),
+            "Actual default-browser prior clipboard custody",
+            timeout=max(0, probe_deadline - time.monotonic()),
+        )[0]
+        diagnostic["browser_handoff_prior_unicode_saved"] = prior_clipboard is not None
+        sentinel = "K5-BROWSER-OBSERVER-" + secrets.token_hex(24)
+        diagnostic["browser_handoff_stage"] = "seeding_clipboard"
+        clipboard_touched = True
+
+        def seed_clipboard():
+            api.set_clipboard_text(opened, sentinel)
+            return api.clipboard_text(opened) == sentinel
+
+        _wait(
+            seed_clipboard,
+            "Actual default-browser unique clipboard sentinel",
+            timeout=max(0, probe_deadline - time.monotonic()),
+        )
+        diagnostic.update(
+            browser_handoff_clipboard_seeded=True,
+            browser_handoff_copy_attempts=0,
+            browser_handoff_clipboard_changed=False,
+            browser_handoff_exact_url_match=False,
+            browser_handoff_clipboard_restored=False,
+        )
+        expected = f"http://127.0.0.1:{port}/operator"
+
+        def copied_address_matches():
+            diagnostic["browser_handoff_stage"] = "copy_attempt"
+            diagnostic["browser_handoff_copy_attempts"] += 1
+            api.shortcut(opened, 0x4C)  # Ctrl+L focuses the actual address bar.
+            time.sleep(0.1)
+            api.shortcut(opened, 0x43)  # Ctrl+C copies its actual current value.
+            diagnostic["browser_handoff_stage"] = "clipboard_read"
+            copied = api.clipboard_text(opened)
+            diagnostic["browser_handoff_clipboard_changed"] = (
+                copied is not None and copied != sentinel
+            )
+            matched = copied is not None and copied.rstrip("/") in {
+                expected,
+                expected.removeprefix("http://"),
+            }
+            diagnostic["browser_handoff_exact_url_match"] = matched
+            return matched
+
+        _wait(
+            copied_address_matches,
+            "Native Open cameras exact operator URL clipboard proof",
+            timeout=max(0, probe_deadline - time.monotonic()),
+        )
+        diagnostic["browser_handoff_stage"] = "exact_operator_url_verified"
+        return True
+    finally:
+        if clipboard_touched:
+
+            def restore_clipboard():
+                # The product form remains owned and alive even if the new
+                # browser window closes while the observer is running.
+                api.set_clipboard_text(form, prior_clipboard)
+                restored = api.clipboard_text(form) == prior_clipboard
+                diagnostic["browser_handoff_clipboard_restored"] = restored
+                return restored
+
+            try:
+                _wait(
+                    restore_clipboard,
+                    "Actual default-browser prior Unicode clipboard restoration",
+                    timeout=min(3, max(0, observer_deadline - time.monotonic())),
+                )
+            except BaseException:
+                clipboard_restore_failed = True
+            finally:
+                api.api.keybd_event(0x43, 0, 0x0002, 0)
+                api.api.keybd_event(0x4C, 0, 0x0002, 0)
+                api.api.keybd_event(0x11, 0, 0x0002, 0)
+        _require(
+            not clipboard_restore_failed,
+            "Actual default-browser prior Unicode clipboard restoration failed",
+        )
+
+
 def _default_browser_handoff(api, form, port, *, diagnostic=None):
     """Click the real native action and inspect the browser's actual address bar."""
     diagnostic = {} if diagnostic is None else diagnostic
@@ -436,77 +645,121 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
             for item in (process, *process.children(recursive=True))
             if item.pid not in previous_processes
         ]
-        if api.api.GetForegroundWindow() != opened:
-            api.api.SetForegroundWindow(opened)
-        _wait(
-            lambda: api.api.GetForegroundWindow() == opened,
-            "Actual default-browser foreground ownership",
-            timeout=3,
-        )
-        # Focus the address bar in the exact new window rather than traversing
-        # the entire browser accessibility tree, which can block on providers.
-        # Never send input unless this owned window is still in the foreground.
-        _require(
-            api.api.GetForegroundWindow() == opened,
-            "Actual default-browser foreground ownership changed",
-        )
-        try:
-            api.api.keybd_event(0x11, 0, 0, 0)  # Control down
-            api.api.keybd_event(0x4C, 0, 0, 0)  # L down
-        finally:
-            api.api.keybd_event(0x4C, 0, 0x0002, 0)  # L up
-            api.api.keybd_event(0x11, 0, 0x0002, 0)  # Control up
-        diagnostic["browser_handoff_stage"] = "address_bar_focused"
         environment = dict(os.environ)
-        environment["K5_ACCEPTANCE_BROWSER_HWND"] = str(opened)
-        environment["K5_ACCEPTANCE_BROWSER_PID"] = str(process.pid)
-        environment["K5_ACCEPTANCE_BROWSER_URL"] = f"http://127.0.0.1:{port}/operator/"
-        script = """
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
-$expected = $env:K5_ACCEPTANCE_BROWSER_URL.TrimEnd('/')
-$expectedProcess = [int]$env:K5_ACCEPTANCE_BROWSER_PID
-$matched = $false
-$timer = [System.Diagnostics.Stopwatch]::StartNew()
-while (-not $matched -and $timer.Elapsed.TotalSeconds -lt 5) {
-  try {
-    $edit = [System.Windows.Automation.AutomationElement]::FocusedElement
-    if ($null -ne $edit -and $edit.Current.ProcessId -eq $expectedProcess) {
-      $pattern = $null
-      $valuePattern = [System.Windows.Automation.ValuePattern]::Pattern
-      if ($edit.TryGetCurrentPattern($valuePattern, [ref]$pattern)) {
-        $value = $pattern.Current.Value.TrimEnd('/')
-        if ($value -eq $expected -or $value -eq $expected.Substring(7)) { $matched = $true }
-      }
-    }
-  } catch { }
-  if (-not $matched) { Start-Sleep -Milliseconds 100 }
-}
-if (-not $matched) { exit 2 }
-[Console]::WriteLine('K5_BROWSER_URL_MATCHED')
+        environment.update(
+            K5_BROWSER_OBSERVER_MODULE=str(Path(__file__).resolve()),
+            K5_BROWSER_OBSERVER_FORM=str(form),
+            K5_BROWSER_OBSERVER_WINDOW=str(opened),
+            K5_BROWSER_OBSERVER_PID=str(process.pid),
+            K5_BROWSER_OBSERVER_PORT=str(port),
+            # Reserve one second for bounded JSON output and process exit.
+            K5_BROWSER_OBSERVER_DEADLINE=str(time.monotonic() + 14),
+        )
+        script = """import json, os, runpy
+module = runpy.run_path(os.environ['K5_BROWSER_OBSERVER_MODULE'])
+diagnostic = {}
+passed = False
+try:
+    passed = module['_native_browser_clipboard_probe'](
+        int(os.environ['K5_BROWSER_OBSERVER_FORM']),
+        int(os.environ['K5_BROWSER_OBSERVER_WINDOW']),
+        int(os.environ['K5_BROWSER_OBSERVER_PORT']),
+        observer_deadline=float(os.environ['K5_BROWSER_OBSERVER_DEADLINE']),
+        expected_pid=int(os.environ['K5_BROWSER_OBSERVER_PID']),
+        diagnostic=diagnostic,
+    ) is True
+except BaseException:
+    pass
+print(json.dumps({'schema_version': 1, 'passed': passed, 'diagnostic': diagnostic}))
 """
-        powershell = Path(os.environ["SYSTEMROOT"]) / (
-            "System32/WindowsPowerShell/v1.0/powershell.exe"
-        )
-        result = subprocess.run(
-            [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-            timeout=15,
-            check=False,
-        )
+        diagnostic["browser_handoff_stage"] = "observer_process"
+        diagnostic["browser_handoff_observer_timed_out"] = False
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=15,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            diagnostic.update(
+                browser_handoff_stage="observer_process_timeout",
+                browser_handoff_observer_timed_out=True,
+                browser_handoff_clipboard_restored=False,
+            )
+            raise
         diagnostic["browser_handoff_probe_exit_code"] = result.returncode
         _require(
-            result.returncode == 0 and result.stdout.strip() == b"K5_BROWSER_URL_MATCHED",
+            result.returncode == 0 and 0 < len(result.stdout) <= 4096,
+            "Native default-browser observer returned no bounded result",
+        )
+        try:
+            payload = json.loads(result.stdout)
+        except (ValueError, UnicodeError):
+            payload = None
+        _require(
+            type(payload) is dict
+            and set(payload) == {"schema_version", "passed", "diagnostic"}
+            and type(payload["schema_version"]) is int
+            and payload["schema_version"] == 1
+            and type(payload["passed"]) is bool
+            and type(payload["diagnostic"]) is dict,
+            "Native default-browser observer returned an invalid result",
+        )
+        observed = payload["diagnostic"]
+        boolean_keys = {
+            "browser_handoff_prior_unicode_saved",
+            "browser_handoff_clipboard_seeded",
+            "browser_handoff_clipboard_changed",
+            "browser_handoff_exact_url_match",
+            "browser_handoff_clipboard_restored",
+        }
+        stages = {
+            "validating_observer_owner",
+            "focusing_browser",
+            "saving_clipboard",
+            "seeding_clipboard",
+            "copy_attempt",
+            "clipboard_read",
+            "exact_operator_url_verified",
+        }
+        _require(
+            set(observed)
+            <= boolean_keys | {"browser_handoff_stage", "browser_handoff_copy_attempts"}
+            and all(type(observed[key]) is bool for key in boolean_keys & observed.keys())
+            and observed.get("browser_handoff_stage") in stages
+            and (
+                "browser_handoff_copy_attempts" not in observed
+                or type(observed["browser_handoff_copy_attempts"]) is int
+                and 0 <= observed["browser_handoff_copy_attempts"] <= 120
+            ),
+            "Native default-browser observer exceeded its finite diagnostic contract",
+        )
+        diagnostic.update(observed)
+        _require(
+            payload["passed"]
+            and all(
+                observed.get(key) is True
+                for key in (
+                    "browser_handoff_clipboard_seeded",
+                    "browser_handoff_clipboard_changed",
+                    "browser_handoff_exact_url_match",
+                    "browser_handoff_clipboard_restored",
+                )
+            ),
             "Native Open cameras did not hand off the exact operator URL to the default browser",
         )
-        diagnostic["browser_handoff_stage"] = "exact_operator_url_verified"
         return True
     finally:
+        # A timed-out observer is killed and joined by subprocess.run. Release
+        # keys here too; never perform an unbounded clipboard read in the parent.
+        api.api.keybd_event(0x43, 0, 0x0002, 0)
+        api.api.keybd_event(0x4C, 0, 0x0002, 0)
+        api.api.keybd_event(0x11, 0, 0x0002, 0)
         if opened and api.api.IsWindow(opened):
             api.close(opened)
         _, alive = psutil.wait_procs(owned, timeout=5)

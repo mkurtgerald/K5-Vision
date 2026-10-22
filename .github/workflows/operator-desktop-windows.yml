@@ -33,6 +33,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  focused-windows:
+    name: Windows focused checks (${{ matrix.lane }})
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [setup, onvif, cameras]
+    env:
+      K5_BETA_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+    steps:
+      - name: Checkout exact desktop revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up native development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install acceptance dependencies only in development Python
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Desktop development install failed" }
+      - name: Verify desktop setup and process ownership on Windows
+        if: matrix.lane == 'setup'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_desktop_setup.py tests/unit/test_desktop_payload.py tests/unit/test_desktop_receipt.py tests/unit/test_operator_native_process.py tests/unit/test_operator_product_service.py tests/unit/test_operator_time.py tests/unit/test_operator_recording_storage.py tests/test_auth_session_clock.py tests/unit/test_mediamtx_provider.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify ONVIF authentication, multicast and honest video status
+        if: matrix.lane == 'onvif'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify camera administration and atomic reconnect on Windows
+        if: matrix.lane == 'cameras'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_product_state.py tests/test_device_registry.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   native-desktop:
     name: Build and exercise actual graphical Windows installation
     runs-on: windows-2025
@@ -58,21 +106,6 @@ jobs:
         run: |
           python -m pip install -e ".[dev]" "playwright==1.58.0"
           if ($LASTEXITCODE -ne 0) { throw "Desktop development install failed" }
-      - name: Verify desktop setup and process ownership on Windows
-        shell: pwsh
-        run: |
-          python -m pytest tests/unit/test_desktop_setup.py tests/unit/test_desktop_payload.py tests/unit/test_desktop_receipt.py tests/unit/test_operator_native_process.py tests/unit/test_operator_product_service.py tests/unit/test_operator_time.py tests/unit/test_operator_recording_storage.py tests/test_auth_session_clock.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify ONVIF authentication, multicast and honest video status
-        shell: pwsh
-        run: |
-          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify camera administration and atomic reconnect on Windows
-        shell: pwsh
-        run: |
-          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_product_state.py tests/test_device_registry.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Provision immutable native acceptance tools
         uses: ./.github/actions/provision-operator-tools
       - name: Build exact offline operator runtime and file manifest
@@ -206,7 +239,7 @@ jobs:
 
   vm-clock:
     name: Exercise real clock corrections on a second disposable Windows VM
-    needs: native-desktop
+    needs: [native-desktop, focused-windows]
     runs-on: windows-2025
     timeout-minutes: 15
     env:
