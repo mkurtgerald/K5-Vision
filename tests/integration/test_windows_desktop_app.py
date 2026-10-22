@@ -404,39 +404,71 @@ class _BrowserLaunchWatch:
     def __init__(self, previous, expected):
         self.previous = previous
         self.expected = expected
+        self.port = urlsplit(expected).port
         self.argument_matched = False
         self.observed = set()
+        self.origin_ancestries = []
+        self.action_started = threading.Event()
         self.failed = False
         self.ready = threading.Event()
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self._observe, daemon=True)
+
+    def _sample(self):
+        candidates = []
+        for process in psutil.process_iter(attrs=["name"]):
+            try:
+                if (process.info["name"] or "").casefold() not in {"msedge.exe", "chrome.exe"}:
+                    continue
+                candidates.append(process)
+                identity = (process.pid, process.create_time())
+                if identity not in self.previous:
+                    self.observed.add(identity)
+                    if len(self.observed) > 64:
+                        self.failed = True
+                        return
+                    if self.expected in process.cmdline():
+                        self.argument_matched = True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        # Capture short-lived URI forwarders before slower socket queries.
+        for process in candidates:
+            try:
+                if not process.is_running():
+                    continue
+                # Read only matching-origin traffic, including a preexisting
+                # browser's network-service process after OS URI forwarding.
+                # The later visible window must match this retained ancestry.
+                if any(
+                    connection.status == psutil.CONN_ESTABLISHED
+                    and connection.raddr
+                    and connection.raddr.ip == "127.0.0.1"
+                    and connection.raddr.port == self.port
+                    for connection in process.net_connections(kind="tcp")
+                ):
+                    ancestry = frozenset(
+                        (item.pid, item.create_time()) for item in [process, *process.parents()[:8]]
+                    )
+                    if ancestry not in self.origin_ancestries:
+                        if len(self.origin_ancestries) >= 64:
+                            self.failed = True
+                            return
+                        self.origin_ancestries.append(ancestry)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+    def origin_for(self, identity):
+        return any(identity in ancestry for ancestry in self.origin_ancestries)
 
     def _observe(self):
         try:
             self.ready.set()
             deadline = time.monotonic() + 40
             while not self.stop.is_set() and time.monotonic() < deadline:
-                for process in psutil.process_iter(attrs=["name"]):
-                    try:
-                        if (process.info["name"] or "").casefold() not in {
-                            "msedge.exe",
-                            "chrome.exe",
-                        }:
-                            continue
-                        identity = (process.pid, process.create_time())
-                        if identity in self.previous:
-                            continue
-                        self.observed.add(identity)
-                        if len(self.observed) > 64:
-                            self.failed = True
-                            return
-                        # Match one complete OS-dispatched argument, never a
-                        # substring. No observer launches or navigates a browser.
-                        if self.expected in process.cmdline():
-                            self.argument_matched = True
-                            return
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        continue
+                if self.action_started.is_set():
+                    self._sample()
+                if self.failed:
+                    return
                 self.stop.wait(0.005)
         except BaseException:
             self.failed = True
@@ -445,6 +477,57 @@ class _BrowserLaunchWatch:
         self.stop.set()
         self.thread.join(timeout=2)
         return not self.thread.is_alive() and not self.failed
+
+
+def test_browser_origin_is_retained_when_connection_closes_before_window_visibility(monkeypatch):
+    expected = "http://127.0.0.1:54321/operator/"
+    phase = {"connected": False}
+
+    def browser(pid, birth, *, parents=(), dispatch=False, network=False):
+        def command_line():
+            assert dispatch, "Preexisting browser command lines must never be read"
+            return ["msedge.exe", expected]
+
+        return SimpleNamespace(
+            pid=pid,
+            info={"name": "msedge.exe"},
+            create_time=lambda: birth,
+            is_running=lambda: True,
+            cmdline=command_line,
+            parents=lambda: list(parents),
+            net_connections=lambda kind: (
+                [
+                    SimpleNamespace(
+                        status=psutil.CONN_ESTABLISHED,
+                        raddr=SimpleNamespace(ip="127.0.0.1", port=54321),
+                    )
+                ]
+                if network and phase["connected"]
+                else []
+            ),
+        )
+
+    existing_root = browser(100, 1)
+    network_service = browser(101, 2, parents=(existing_root,), network=True)
+    dispatch = browser(102, 3, dispatch=True)
+    monkeypatch.setattr(
+        psutil, "process_iter", lambda attrs: [existing_root, network_service, dispatch]
+    )
+    watcher = _BrowserLaunchWatch({(100, 1), (101, 2)}, expected)
+    watcher.action_started.set()
+    # Dispatch precedes the connection. The old watcher returned here and
+    # never observed the request that completed before window visibility.
+    watcher._sample()
+    assert watcher.argument_matched and not watcher.origin_for((100, 1))
+    phase["connected"] = True
+    watcher._sample()
+    phase["connected"] = False
+    # A scan starting only when the window appears now sees no connection.
+    assert network_service.net_connections(kind="tcp") == []
+    assert watcher.origin_for((100, 1))
+    assert not watcher.origin_for((100, 999))  # Reused PID has a different birth.
+    assert not watcher.origin_for((999, 1))  # Unrelated browser cannot qualify.
+    assert len(watcher.origin_ancestries) == 1 and not watcher.failed
 
 
 def _default_browser_handoff(api, form, port, *, diagnostic=None):
@@ -465,6 +548,7 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
         _require(watcher.ready.wait(timeout=2), "Native browser launch observer did not arm")
         _require(not watcher.failed, "Native browser launch observer failed to arm")
         diagnostic["browser_handoff_stage"] = "opening_browser"
+        watcher.action_started.set()
         api.click(api.control(form, _OPEN))
 
         def browser_window():
@@ -484,6 +568,7 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
 
         opened = _wait(browser_window, "Actual default-browser K5 window", timeout=25)
         process = psutil.Process(api.pid(opened))
+        window_identity = (process.pid, process.create_time())
         diagnostic["browser_handoff_stage"] = "origin_connection"
         origin_connected = False
 
@@ -492,6 +577,7 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
             diagnostic.update(
                 native_launch_argument_matched=watcher.argument_matched,
                 browser_handoff_new_browser_processes=len(watcher.observed),
+                browser_handoff_cached_origin_records=len(watcher.origin_ancestries),
                 page_window_visible=bool(
                     api.api.IsWindow(opened)
                     and api.api.IsWindowVisible(opened)
@@ -500,6 +586,7 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
                 ),
             )
             _require(not watcher.failed, "Native browser launch observer failed")
+            origin_connected = origin_connected or watcher.origin_for(window_identity)
             scope = [process, *process.children(recursive=True)]
             diagnostic["browser_handoff_connection_processes"] = len(scope)
             for item in scope:
