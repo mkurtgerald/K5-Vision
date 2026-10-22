@@ -358,12 +358,87 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
         page.remove_listener("request", observe)
 
 
-def _decoded_color(page, video_id, color):
+def _wall_state(page):
+    """Bounded source-free DOM evidence; never inspect media URLs or camera text."""
+    try:
+        return page.wait_for_function(
+            """() => {
+              const number=value=>Number.isFinite(value)?value:null;
+              const rect=element=>{
+                if(!element)return null;
+                const r=element.getBoundingClientRect();
+                return Object.fromEntries(['top','right','bottom','left','width','height']
+                  .map(key=>[key,number(r[key])]));
+              };
+              const visible=element=>Boolean(element&&!element.hidden&&
+                getComputedStyle(element).visibility!=='hidden'&&
+                element.getBoundingClientRect().width>0&&element.getBoundingClientRect().height>0);
+              const grid=document.querySelector('#wall-panel .camera-wall-grid');
+              const layout=document.getElementById('wall-layout')?.value;
+              return {
+                available:true,viewport:{width:innerWidth,height:innerHeight},
+                scroll:{window:scrollY,main:document.querySelector('.main-content')?.scrollTop??null},
+                panel_visible:visible(document.getElementById('wall-panel')),
+                layout:['1','4','9'].includes(layout)?layout:'unknown',
+                visible_warning_count:Array.from(document.querySelectorAll('.warning,[role=alert]'))
+                  .filter(visible).length,
+                clock_warning_visible:visible(document.getElementById('recorder-time-warning')),
+                worker_warning_visible:visible(document.getElementById('worker-message')),
+                grid:{bounds:rect(grid),offset_height:grid?.offsetHeight??null,
+                  client_height:grid?.clientHeight??null,
+                  computed_height:grid?number(parseFloat(getComputedStyle(grid).height)):null,
+                  inline_wall_height:grid?number(parseFloat(
+                    grid.style.getPropertyValue('--wall-height'))):null},
+                tile_count:grid?.querySelectorAll('[data-camera-id]').length??0,
+                tiles:Array.from(grid?.querySelectorAll('[data-camera-id]')??[]).slice(0,9)
+                  .map((tile,index)=>{
+                    const video=tile.querySelector('video');
+                    const status=tile.querySelector('.camera-wall-status')?.dataset.state;
+                    return {index,connected:tile.isConnected,bounds:rect(tile),
+                      surface:rect(tile.querySelector('.camera-wall-surface')),
+                      actions:rect(tile.querySelector('.camera-wall-tile-actions')),
+                      status:['live','connecting','unavailable'].includes(status)?status:'unknown',
+                      overlay_visible:visible(tile.querySelector('.camera-wall-overlay')),
+                      video:video?{bounds:rect(video),connected:video.isConnected,
+                        ready_state:video.readyState,network_state:video.networkState,
+                        paused:video.paused,ended:video.ended,muted:video.muted,
+                        default_muted:video.defaultMuted,autoplay:video.autoplay,
+                        plays_inline:video.playsInline,error_code:video.error?.code??null,
+                        frames:number(video.getVideoPlaybackQuality().totalVideoFrames),
+                        width:video.videoWidth,height:video.videoHeight,
+                        current_time:number(video.currentTime)}:null};
+                  })
+              };
+            }""",
+            timeout=2000,
+        ).json_value()
+    except BaseException as error:
+        return {
+            "available": False,
+            "probe_error_code": "timeout"
+            if type(error).__name__ == "TimeoutError"
+            else "unavailable",
+        }
+
+
+def _decoded_color(page, video_id, color, *, diagnostic=None):
     """Require advancing decoded frames, then inspect actual same-origin pixels."""
-    return _decoded_video(page, "#" + video_id, color)
+    return _decoded_video(page, "#" + video_id, color, diagnostic=diagnostic)
 
 
-def _decoded_video(page, selector, color):
+def _decoded_video(page, selector, color, *, diagnostic=None):
+    """Retain bounded player evidence without masking a failed media assertion."""
+    __tracebackhide__ = True
+    diagnostic = {} if diagnostic is None else diagnostic
+    diagnostic.update(video_phase="readiness", video_decoded_frames=None, video_rgb=None)
+    try:
+        return _decoded_video_proof(page, selector, color, diagnostic)
+    except BaseException:
+        diagnostic["wall_state"] = _wall_state(page)
+        raise
+
+
+def _decoded_video_proof(page, selector, color, diagnostic):
     """Check a particular visible video, including independent camera-wall tiles."""
     __tracebackhide__ = True
     page.wait_for_function(
@@ -377,6 +452,7 @@ def _decoded_video(page, selector, color):
         arg=selector,
         timeout=25_000,
     )
+    diagnostic["video_phase"] = "pixels"
     decoded = page.evaluate(
         """selector => {
           const video = document.querySelector(selector);
@@ -391,6 +467,7 @@ def _decoded_video(page, selector, color):
         }""",
         selector,
     )
+    diagnostic.update(video_decoded_frames=decoded["frames"], video_rgb=decoded["rgb"])
     red, green, blue = decoded["rgb"]
     isolated = {
         "red": red > 180 and green < 70 and blue < 70,
@@ -399,6 +476,7 @@ def _decoded_video(page, selector, color):
         "yellow": red > 180 and green > 180 and blue < 70,
     }.get(color, False)
     _require(isolated, "Decoded video did not match the selected generated camera")
+    diagnostic["video_phase"] = "complete"
     return decoded["frames"]
 
 
@@ -416,15 +494,29 @@ def _open_camera_recordings(page, device_id):
     page.locator("#history-panel").wait_for(state="visible")
 
 
-def _wall_frames(page, device_ids, colors, *, layout=None):
+def _wall_frames(page, device_ids, colors, *, layout=None, diagnostic=None):
+    """Preserve the exact failing phase and a bounded source-free wall snapshot."""
+    __tracebackhide__ = True
+    diagnostic = {} if diagnostic is None else diagnostic
+    diagnostic.update(wall_phase="navigate", wall_video_index=None)
+    try:
+        return _wall_frames_proof(page, device_ids, colors, layout, diagnostic)
+    except BaseException:
+        diagnostic["wall_state"] = _wall_state(page)
+        raise
+
+
+def _wall_frames_proof(page, device_ids, colors, layout, diagnostic):
     """Require all selected wall tiles visible and advancing concurrently."""
     __tracebackhide__ = True
     _require(len(device_ids) == len(colors) and 1 <= len(device_ids) <= 9, "Invalid wall proof")
     page.locator("#wall-tab").click()
+    diagnostic["wall_phase"] = "layout"
     layout = layout or ("4" if len(device_ids) <= 4 else "9")
     if page.locator("#wall-layout").input_value() != layout:
         page.locator("#wall-layout").select_option(layout)
     selectors = [f'#wall-panel [data-camera-id="{device}"] video' for device in device_ids]
+    diagnostic["wall_phase"] = "geometry"
     if layout == "4" and len(device_ids) == 4:
         page.evaluate("""() => {
           window.scrollTo(0,0);
@@ -486,10 +578,13 @@ def _wall_frames(page, device_ids, colors, *, layout=None):
             arg=selectors,
             timeout=15_000,
         )
-    before = [
-        _decoded_video(page, selector, color)
-        for selector, color in zip(selectors, colors, strict=True)
-    ]
+    before = []
+    for index, (selector, color) in enumerate(zip(selectors, colors, strict=True)):
+        diagnostic.update(wall_phase="individual_decode", wall_video_index=index)
+        before.append(_decoded_video(page, selector, color, diagnostic=diagnostic))
+    diagnostic.update(
+        wall_phase="concurrent_progress", wall_video_index=None, wall_frames_before=before
+    )
     page.wait_for_function(
         """({selectors,before}) => selectors.every((selector,index) => {
           const video = document.querySelector(selector);
@@ -500,10 +595,12 @@ def _wall_frames(page, device_ids, colors, *, layout=None):
         arg={"selectors": selectors, "before": before},
         timeout=20_000,
     )
-    return [
-        _decoded_video(page, selector, color)
-        for selector, color in zip(selectors, colors, strict=True)
-    ]
+    decoded = []
+    for index, (selector, color) in enumerate(zip(selectors, colors, strict=True)):
+        diagnostic.update(wall_phase="final_pixels", wall_video_index=index)
+        decoded.append(_decoded_video(page, selector, color, diagnostic=diagnostic))
+    diagnostic.update(wall_phase="complete", wall_video_index=None, wall_frames_after=decoded)
+    return decoded
 
 
 def _wall_layout_proof(page, device_ids, colors):

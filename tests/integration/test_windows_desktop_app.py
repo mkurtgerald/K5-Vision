@@ -1569,7 +1569,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     username, password = "fixture-admin", secrets.token_urlsafe(32)
     processes, reservations = [], []
     cohort = _Cohort(api)
-    playwright = browser = context = onvif_camera = None
+    playwright = browser = context = page = onvif_camera = None
     onvif_cameras, sources, publishers = [], [], []
     primary_publisher_credentials = ("generated-fixture-publisher", secrets.token_urlsafe(24))
     form = None
@@ -1756,10 +1756,11 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         browser_helpers._assert_no_browser_storage(page)
         route = "/api/v1/operator/cameras/" + camera_id
         page.locator("#add-camera-dialog").wait_for(state="hidden")
-        stage = "actual_four_camera_wall"
+        stage = "actual_wall_initial_four"
         receipt["wall_decoded_frames"] = browser_helpers._wall_frames(
-            page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS]
+            page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS], diagnostic=nvr_diagnostic
         )
+        stage = "actual_wall_layout_one"
         page.locator("#wall-layout").select_option("1")
         _wait(
             lambda: page.locator("#wall-panel video").count() == 1,
@@ -1772,7 +1773,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             page,
             f'#wall-panel [data-camera-id="{first_id}"] video',
             _DESKTOP_CAMERAS[camera_ids.index(first_id)][2],
+            diagnostic=nvr_diagnostic,
         )
+        stage = "actual_wall_layout_nine"
         page.locator("#wall-layout").select_option("9")
         _wait(
             lambda: page.locator("#wall-panel video").count() == 4,
@@ -1780,11 +1783,16 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             process=app,
         )
         for device, (_, _, color) in zip(camera_ids, _DESKTOP_CAMERAS, strict=True):
+            nvr_diagnostic["wall_journey_camera_index"] = camera_ids.index(device)
             browser_helpers._decoded_video(
-                page, f'#wall-panel [data-camera-id="{device}"] video', color
+                page,
+                f'#wall-panel [data-camera-id="{device}"] video',
+                color,
+                diagnostic=nvr_diagnostic,
             )
+        stage = "actual_wall_restore_four"
         receipt["wall_decoded_frames"] = browser_helpers._wall_frames(
-            page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS]
+            page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS], diagnostic=nvr_diagnostic
         )
         receipt["wall_layouts"] = [1, 4, 9]
         receipt["wall_viewport_fit"] = True
@@ -2031,6 +2039,33 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "Error": "browser_error",
         }.get(type(error).__name__, "qualification_error")
     finally:
+        if failure is not None and page is not None:
+            try:
+                nvr_diagnostic["wall_state_at_failure"] = browser_helpers._wall_state(page)
+            except BaseException:
+                nvr_diagnostic["wall_state_probe_failed"] = True
+        if failure is not None and stage.startswith("actual_wall"):
+            try:
+                status, body, _ = client.get("/api/v1/operator/cameras")
+                nvr_diagnostic["wall_camera_api_http_status"] = status
+                if status == 200 and len(body) <= 32_768:
+                    views = json.loads(body).get("cameras")
+                    if type(views) is list and len(views) <= 9:
+                        for field, allowed in (
+                            ("status", {"live", "connecting", "disconnected", "unavailable"}),
+                            (
+                                "recording_state",
+                                {"waiting", "recording", "paused", "stalled", "error"},
+                            ),
+                        ):
+                            counts = {}
+                            for camera in views:
+                                value = camera.get(field)
+                                key = value if value in allowed else "unknown"
+                                counts[key] = counts.get(key, 0) + 1
+                            nvr_diagnostic["wall_camera_" + field + "_counts"] = counts
+            except BaseException:
+                nvr_diagnostic["wall_camera_api_probe_failed"] = True
         try:
             desktop_status = _desktop_status(api, form) if form else "unavailable"
             desktop_probe = _desktop_probe(api, form) if form else {"available": False}
