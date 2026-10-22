@@ -25,7 +25,7 @@ _TRUE = (
     "other_recording_while_paused timeline_seek_playback actual_recording_export "
     "recording_choice_persisted logout_destroys_wall authenticated_camera_read "
     "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected authenticated_camera_restart_live "
-    "wall_viewport_fit"
+    "wall_viewport_fit native_launch_argument_matched browser_origin_connected page_window_visible"
 ).split()
 _FALSE = (
     "physical_camera_acceptance capacity_acceptance endurance_acceptance windows_service "
@@ -239,6 +239,7 @@ def verify(report: Path, *, expected_head: str, installer_sha256: str) -> dict:
     _require(receipt.get("schema_version") == "1" and receipt.get("platform") == "Windows")
     _require(all(receipt.get(field) is True for field in _TRUE))
     _require(all(receipt.get(field) is False for field in _FALSE))
+    _require(receipt.get("native_browser_handoff_observation") == "os_dispatch_origin_and_window")
     _nvr_journey(receipt)
     _require(receipt.get("browser_channel") == "msedge")
     _require(receipt.get("playwright_version") == "1.58.0")

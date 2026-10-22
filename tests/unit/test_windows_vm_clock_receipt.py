@@ -39,7 +39,7 @@ _NVR_FLAGS = (
     "other_recording_while_paused timeline_seek_playback actual_recording_export "
     "recording_choice_persisted logout_destroys_wall authenticated_camera_read "
     "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected authenticated_camera_restart_live "
-    "wall_viewport_fit"
+    "wall_viewport_fit native_launch_argument_matched browser_origin_connected page_window_visible"
 ).split()
 
 
@@ -157,6 +157,7 @@ def _receipt() -> dict:
         "export_decoded_frames": 4,
         "export_bytes": 4096,
         "authenticated_camera_restart_frames": 4,
+        "native_browser_handoff_observation": "os_dispatch_origin_and_window",
         "vm_clock": {
             "schema_version": "1",
             "head_sha": _HEAD,
@@ -206,6 +207,24 @@ def test_vm_clock_receipt_requires_real_installed_nvr_journey_as_well_as_clock_s
 ):
     receipt = _receipt()
     del receipt[field]
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("invalid", [None, "address_bar_copy", "url_argument_only", True])
+def test_vm_clock_receipt_requires_the_declared_os_dispatch_observation(tmp_path, invalid):
+    receipt = _receipt()
+    receipt["native_browser_handoff_observation"] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize(
+    "field", ["native_launch_argument_matched", "browser_origin_connected", "page_window_visible"]
+)
+def test_vm_clock_receipt_refuses_unexecuted_browser_handoff_proofs(tmp_path, field):
+    receipt = _receipt()
+    receipt[field] = 1
     with pytest.raises(ValueError):
         _verify(_report(tmp_path, receipt))
 
