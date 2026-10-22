@@ -807,7 +807,8 @@ def install_operator_product_api(
         response.set_cookie(
             _COOKIE,
             session[1],
-            max_age=8 * 60 * 60,
+            # A browser wall-clock correction must not expire media access
+            # ahead of its authoritative, monotonic human-session deadline.
             path="/media",
             httponly=True,
             secure=request.url.scheme == "https",

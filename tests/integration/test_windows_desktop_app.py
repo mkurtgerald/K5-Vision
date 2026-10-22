@@ -1600,8 +1600,8 @@ def _vm_clock_phase(
         "VM clock restoration lost retained recording history",
     )
     page.locator("#history-tab").click()
-    page.locator("#history-start").fill(historical_start.strftime("%Y-%m-%dT%H:%M:%S"))
-    page.locator("#history-end").fill(historical_end.strftime("%Y-%m-%dT%H:%M:%S"))
+    page.locator("#history-start").fill(browser_helpers._datetime_local_value(historical_start))
+    page.locator("#history-end").fill(browser_helpers._datetime_local_value(historical_end))
     page.locator("#history-form").evaluate("form => form.requestSubmit()")
     page.locator(".history-item").first.wait_for(state="visible", timeout=15_000)
     page.locator(".history-item").first.click()

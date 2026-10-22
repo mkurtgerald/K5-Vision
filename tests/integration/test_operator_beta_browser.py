@@ -113,6 +113,23 @@ def _failure_code(error):
     }.get(kind, "qualification_error")
 
 
+def _browser_error_code(error):
+    """Classify observer errors without retaining private exception contents."""
+    detail = str(error).lower()
+    if "getresponsebody" in detail and ("resource" in detail or "body" in detail):
+        return "response_body_unavailable"
+    for marker, code in (
+        ("malformed value", "malformed_input_value"),
+        ("has been closed", "browser_closed"),
+        ("has been detached", "detached_element"),
+        ("execution context was destroyed", "execution_context_destroyed"),
+        ("err_aborted", "request_aborted"),
+    ):
+        if marker in detail:
+            return code
+    return "browser_error"
+
+
 def _runtime_helpers():
     spec = importlib.util.spec_from_file_location(
         "k5_beta_browser_runtime_helpers",
@@ -631,6 +648,12 @@ def _playable_timeline_span(intervals):
     )
 
 
+def _datetime_local_value(value):
+    """Match Chromium's canonical minute form while preserving second truncation."""
+    value = value.strftime("%Y-%m-%dT%H:%M:%S")
+    return value[:-3] if value.endswith(":00") else value
+
+
 @pytest.mark.parametrize(
     ("intervals", "expected"),
     [
@@ -685,8 +708,10 @@ def _timeline_play(page, color, *, device_id, diagnostic=None):
     # a real pointer instead of seeking a sub-pixel range in a 24-hour window.
     start = datetime.fromtimestamp(first / 1000, UTC) - timedelta(seconds=2)
     end = datetime.fromtimestamp(last / 1000, UTC) + timedelta(seconds=2)
-    page.locator("#history-start").fill(start.strftime("%Y-%m-%dT%H:%M:%S"))
-    page.locator("#history-end").fill(end.strftime("%Y-%m-%dT%H:%M:%S"))
+    diagnostic["timeline_reason"] = "filling_utc_window"
+    page.locator("#history-start").fill(_datetime_local_value(start))
+    page.locator("#history-end").fill(_datetime_local_value(end))
+    diagnostic["timeline_reason"] = "waiting_history_response"
     expected_start, expected_end = (
         datetime.fromisoformat(page.locator(selector).input_value()).replace(tzinfo=UTC)
         for selector in ("#history-start", "#history-end")
@@ -1381,6 +1406,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
     history_diagnostic = {}
     outage_diagnostic = {}
     recording_diagnostic = {}
+    switch_diagnostic = {}
     started = time.monotonic()
     receipt = {
         "schema_version": "1",
@@ -1811,16 +1837,28 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         # Reverse order and switch repeatedly to detect stale media selection.
         for index in (1, 0, 1):
             stage = "camera_switch_session"
+            switch_diagnostic.update(
+                camera_switch_index=index, camera_switch_operation="focused_camera_click"
+            )
             name, _, color = _CAMERAS[index]
             media_route = f"/api/v1/operator/cameras/{camera_ids[index]}/media-session"
+            page.locator("#live-panel").wait_for(state="visible")
             with page.expect_response(
-                lambda response, route=media_route: response.url.endswith(route)
+                lambda response, route=media_route: (
+                    response.request.method == "POST" and response.url.endswith(route)
+                )
             ) as media_session:
-                _open_camera_watch(page, camera_ids[index])
+                # Switch directly from the focused view. Opening Wall here
+                # creates same-route tile grants that navigation then aborts;
+                # those responses cannot qualify this focused camera's grant.
+                page.locator(".camera-item").filter(has_text=name).click()
+            switch_diagnostic["camera_switch_operation"] = "focused_response_status"
             _require(media_session.value.status == 200, "Camera media session failed")
+            switch_diagnostic["camera_switch_operation"] = "focused_response_body"
             live_url = media_session.value.json()["live_url"]
             live_urls.append(live_url)
             stage = "live_decode"
+            switch_diagnostic["camera_switch_operation"] = "focused_pixel_decode"
             live_frames.append(_decoded_color(page, "live-video", color))
             _require(
                 anonymous.request.get(client.origin + live_url).status == 401,
@@ -2195,6 +2233,8 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         stage = "product_closing"
     except BaseException as error:
         failure = _failure_code(error)
+        if type(error).__name__ == "Error":
+            switch_diagnostic["browser_observer_error_code"] = _browser_error_code(error)
     finally:
         cleanup_failures = []
         for label, resource in (
@@ -2241,6 +2281,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             **history_diagnostic,
             **outage_diagnostic,
             **recording_diagnostic,
+            **switch_diagnostic,
             "cleanup_failure_codes": cleanup_failures,
             "product_thread_alive": bool(product and product.thread.is_alive()),
             "product_thread_failed": bool(product and product.failed),

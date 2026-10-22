@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import http.cookiejar
 import json
 import os
 import socket
@@ -9,9 +10,11 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlencode
+from urllib.request import Request
 from uuid import UUID, uuid4
 
 import pytest
@@ -653,7 +656,7 @@ def test_media_cookie_is_host_only_strict_http_only_and_origin_checked(product):
     assert response.status_code == 200
     cookie = response.headers["set-cookie"]
     assert "HttpOnly" in cookie and "SameSite=strict" in cookie and "Path=/media" in cookie
-    assert "Max-Age=28800" in cookie and "Domain=" not in cookie
+    assert all(field not in cookie for field in ("Max-Age=", "Expires=", "Domain="))
     assert response.json()["analytics_url"] is None
     assert response.json()["live_url"].startswith("/media/live/k5_")
     assert response.json()["playback_url"].startswith("/media/playback?path=k5_")
@@ -662,6 +665,65 @@ def test_media_cookie_is_host_only_strict_http_only_and_origin_checked(product):
     cleared = product.client.delete("/api/v1/operator/media-session", headers=product.headers)
     assert cleared.status_code == 204
     assert "Max-Age=0" in cleared.headers["set-cookie"]
+
+
+@pytest.mark.parametrize("wall_step", [172800, -172800])
+@pytest.mark.parametrize("end_session", ["expiry", "revoke"])
+def test_media_cookie_survives_host_clock_steps_but_never_extends_human_session(
+    product, monkeypatch, wall_step, end_session
+):
+    identifier = product.enroll()
+    response = product.client.post(
+        f"/api/v1/operator/cameras/{identifier}/media-session", headers=product.headers
+    )
+    assert response.status_code == 200
+    deadline = next(iter(product.sessions._sessions.values())).deadline
+    steady = SimpleNamespace(value=deadline - 1)
+    monkeypatch.setattr("k5vision.auth_sessions.monotonic", lambda: steady.value)
+    wall = SimpleNamespace(value=datetime.now(UTC).timestamp())
+    monkeypatch.setattr(http.cookiejar, "time", SimpleNamespace(time=lambda: wall.value))
+    headers = Message()
+    headers["Set-Cookie"] = response.headers["set-cookie"]
+    jar = http.cookiejar.CookieJar()
+    jar.extract_cookies(
+        SimpleNamespace(info=lambda: headers),
+        Request(
+            str(
+                product.client.base_url.join(f"/api/v1/operator/cameras/{identifier}/media-session")
+            )
+        ),
+    )
+
+    def admitted_cookie():
+        request = Request(str(product.client.base_url.join(response.json()["live_url"])))
+        jar.add_cookie_header(request)
+        return request.get_header("Cookie", "")
+
+    before = admitted_cookie()
+    assert before
+    wall.value += wall_step
+    # Use the jar's actual browser-path selection; no copied token or renewal
+    # can conceal browser expiry while the authoritative session remains valid.
+    after = admitted_cookie()
+    same_cookie = after == before
+    assert same_cookie, "Media cookie changed after the host clock correction"
+    auth_headers = {
+        "Cookie": after,
+        "X-Forwarded-Method": "GET",
+        "X-Forwarded-Uri": response.json()["live_url"],
+    }
+    assert (
+        product.client.get("/api/v1/operator/media-auth", headers=auth_headers).status_code == 200
+    )
+    if end_session == "expiry":
+        steady.value = deadline
+    else:
+        asyncio.run(product.sessions.revoke(product.token))
+    unchanged_cookie = admitted_cookie() == after
+    assert unchanged_cookie, "Server expiry or revocation unexpectedly rewrote the client cookie"
+    assert (
+        product.client.get("/api/v1/operator/media-auth", headers=auth_headers).status_code == 401
+    )
 
 
 def test_logout_can_clear_revoked_media_cookie_but_cross_origin_cannot(product):

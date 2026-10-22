@@ -6,6 +6,7 @@ Windows acceptance remain independently qualified by the integration lanes.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from datetime import UTC, datetime, timedelta
@@ -20,6 +21,35 @@ pytestmark = pytest.mark.skipif(
 )
 _CAMERA = "e4fd401d-ae8e-4ac2-9f92-e8287f241532"
 _OTHER = "2cad3cbb-c56a-4368-b3e6-e5032576b77a"
+
+
+def test_datetime_local_minute_boundary_accepts_shared_formatter_and_floors_microseconds():
+    """Chromium canonicalizes zero seconds, which strict fill() must preserve."""
+    browser_api = pytest.importorskip("playwright.sync_api")
+    helper_path = Path(__file__).resolve().parents[1] / "integration/test_operator_beta_browser.py"
+    spec = importlib.util.spec_from_file_location("k5_datetime_local_browser_helper", helper_path)
+    assert spec is not None and spec.loader is not None
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
+    with browser_api.sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel=channel, headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content('<input id="time" type="datetime-local" step=".001">')
+            field = page.locator("#time")
+            minute = datetime(2026, 10, 22, 22, 50, 0, 987654, tzinfo=UTC)
+            with pytest.raises(browser_api.Error, match="Malformed value"):
+                field.fill(minute.strftime("%Y-%m-%dT%H:%M:%S"))
+            nonzero = minute.replace(second=1)
+            field.fill(nonzero.strftime("%Y-%m-%dT%H:%M:%S"))
+            assert field.input_value() == "2026-10-22T22:50:01"
+            for desired in (minute, nonzero):
+                field.fill(helper._datetime_local_value(desired))
+                actual = datetime.fromisoformat(field.input_value()).replace(tzinfo=UTC)
+                assert actual == desired.replace(microsecond=0)
+        finally:
+            browser.close()
 
 
 def _operator_asset(route, assets):
@@ -46,6 +76,163 @@ def _operator_asset(route, assets):
     }[Path(name).suffix]
     route.fulfill(content_type=content_type, body=(assets / name).read_text())
     return True
+
+
+def test_focused_camera_switch_observes_its_own_grant_without_wall_response_ambiguity():
+    """Observe the real UI requests, without manufacturing a CDP resource error."""
+    browser_api = pytest.importorskip("playwright.sync_api")
+    channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
+    assets = Path(__file__).resolve().parents[2] / "src/k5vision/operator_web"
+    identifiers = (
+        _CAMERA,
+        _OTHER,
+        "23d89cf4-6d30-421e-b833-569420d1a44b",
+        "54d00da5-2973-469e-a5aa-d9448944ce0f",
+    )
+    cameras = [
+        {
+            "device_id": identifier,
+            "name": f"Generated observer camera {index}",
+            "host": f"127.0.0.{index + 1}",
+            "status": "live",
+            "recording": True,
+            "recording_enabled": True,
+            "recording_state": "recording",
+            "analytics_status": "disabled",
+        }
+        for index, identifier in enumerate(identifiers)
+    ]
+    account = {"username": "fixture-admin", "role": "administrator", "display_name": "Fixture"}
+    phase = {"mode": "normal", "target": _CAMERA}
+    grants, pending, errors = [], [], []
+    playwright = browser = context = None
+    try:
+        playwright = browser_api.sync_playwright().start()
+        browser = playwright.chromium.launch(channel=channel, headless=True)
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        context.add_init_script("window.Hls = {isSupported: () => false};")
+        page = context.new_page()
+        page.set_default_timeout(10_000)
+        page.on("pageerror", lambda _error: errors.append("uncaught_script_error"))
+
+        def fulfill_grant(route, kind):
+            identifier = urlsplit(route.request.url).path.split("/")[-2]
+            route.fulfill(
+                content_type="application/json",
+                headers={"x-ui-test-grant": kind},
+                body=json.dumps(
+                    {
+                        "live_url": f"/media/live/{identifier}/index.m3u8",
+                        "playback_url": f"/media/playback?path={identifier}",
+                    }
+                ),
+            )
+
+        def intercept(route):
+            if _operator_asset(route, assets):
+                return
+            path = urlsplit(route.request.url).path
+            data, status = {}, 200
+            if path == "/api/v1/auth/login":
+                data = {
+                    "session_token": "generated-observer-session-token-000000000000000000",
+                    "account": account,
+                    "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                    "expires_in_seconds": 300,
+                }
+            elif path == "/api/v1/auth/me":
+                data = account
+            elif path == "/api/v1/operator/status":
+                data = {"worker_status": "ready", "server_utc": datetime.now(UTC).isoformat()}
+            elif path == "/api/v1/operator/cameras":
+                data = {"cameras": cameras, "worker_status": "ready"}
+            elif path.endswith("/media-session") and route.request.method == "POST":
+                identifier = path.split("/")[-2]
+                current = [grant for grant in grants if grant[0] == phase["mode"]]
+                target_seen = any(grant[1] == phase["target"] for grant in current)
+                kind = "normal" if phase["mode"] == "normal" else "wall"
+                if phase["mode"] == "direct" or identifier == phase["target"] and target_seen:
+                    kind = "focused"
+                grants.append((phase["mode"], identifier, kind))
+                if kind == "focused":
+                    pending.append(route)
+                else:
+                    fulfill_grant(route, kind)
+                return
+            elif path.endswith("/history"):
+                data = {"spans": []}
+            else:
+                status = 404
+            route.fulfill(status=status, content_type="application/json", body=json.dumps(data))
+
+        def target_response(response):
+            return response.request.method == "POST" and urlsplit(response.url).path == (
+                f"/api/v1/operator/cameras/{phase['target']}/media-session"
+            )
+
+        page.route("**/*", intercept)
+        page.goto("http://127.0.0.1:8000/operator/")
+        page.locator("#username").fill("fixture-admin")
+        page.locator("#password").fill("generated-human-account-password")
+        page.locator("#sign-in-button").click()
+        expect = browser_api.expect
+        expect(page.locator("#wall-panel video")).to_have_count(4)
+        page.locator(".camera-item").filter(has_text=cameras[1]["name"]).click()
+        expect(page.locator("#live-panel")).to_be_visible()
+        phase.update(mode="wall_then_watch", target=_CAMERA)
+        with page.expect_response(target_response) as ambiguous:
+            with page.expect_response(
+                lambda response: (
+                    response.request.method == "POST"
+                    and urlsplit(response.url).path.endswith("/media-session")
+                    and len([grant for grant in grants if grant[0] == "wall_then_watch"]) == 4
+                )
+            ):
+                page.locator("#wall-tab").click()
+            with page.expect_request(
+                lambda request: (
+                    request.method == "POST"
+                    and urlsplit(request.url).path
+                    == f"/api/v1/operator/cameras/{_CAMERA}/media-session"
+                )
+            ):
+                page.locator(
+                    f'#wall-panel [data-camera-id="{_CAMERA}"] [data-wall-action="watch"]'
+                ).click()
+        assert ambiguous.value.header_value("x-ui-test-grant") == "wall"
+        assert len(pending) == 1
+        assert [grant[2] for grant in grants if grant[0] == "wall_then_watch"].count("wall") == 4
+        with page.expect_response(target_response):
+            fulfill_grant(pending.pop(), "focused")
+        expect(page.locator("#live-panel")).to_be_visible()
+
+        phase.update(mode="direct", target=_OTHER)
+        with page.expect_response(target_response) as focused:
+            with page.expect_request(
+                lambda request: (
+                    request.method == "POST"
+                    and urlsplit(request.url).path
+                    == f"/api/v1/operator/cameras/{_OTHER}/media-session"
+                )
+            ):
+                page.locator(".camera-item").filter(has_text=cameras[1]["name"]).click()
+            assert len(pending) == 1
+            assert [grant for grant in grants if grant[0] == "direct"] == [
+                ("direct", _OTHER, "focused")
+            ]
+            fulfill_grant(pending.pop(), "focused_direct")
+        assert focused.value.header_value("x-ui-test-grant") == "focused_direct"
+        assert focused.value.json()["live_url"] == f"/media/live/{_OTHER}/index.m3u8"
+        expect(page.locator("#wall-panel")).to_be_hidden()
+        expect(page.locator("#live-panel")).to_be_visible()
+        assert not errors
+    finally:
+        if context is not None:
+            context.close()
+        if browser is not None:
+            browser.close()
+        if playwright is not None:
+            playwright.stop()
 
 
 def test_late_camera_connection_completion_preserves_explicit_wall_choice():
