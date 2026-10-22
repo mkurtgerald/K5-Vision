@@ -516,6 +516,10 @@ class OperatorProductService:
                         self._storage_status = result
                         paused = not result.recording_allowed
                         if paused != self._disk_full:
+                            # Publishing disk_full/ready acknowledges the whole
+                            # writer policy, not just the sampled desired flag.
+                            # Native PATCHes yield between camera paths.
+                            self._ready = False
                             self._disk_full = paused
                             self._needs_reconcile = True
                             preferences = {

@@ -616,6 +616,54 @@ def test_storage_recovery_never_resumes_an_operator_paused_camera(native, monkey
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("initially_allowed", [True, False])
+def test_storage_policy_is_not_acknowledged_until_all_writer_patches_finish(
+    native, monkeypatch, initially_allowed
+):
+    _fast_maintenance(native, monkeypatch)
+    _fake_mutations(native, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    _Storage.allowed = initially_allowed
+
+    async def scenario():
+        service = native.service
+        first, second = replace(_source(1), recording_enabled=False), _source(2)
+        try:
+            await service.start((first, second))
+            mutation = service._mutation
+            blocked = False
+
+            def held_patch(*args, **kwargs):
+                nonlocal blocked
+                if not blocked:
+                    blocked = True
+                    entered.set()
+                    assert release.wait(3)
+                mutation(*args, **kwargs)
+
+            monkeypatch.setattr(service, "_mutation", held_patch)
+            _Storage.allowed = not initially_allowed
+            await _until(entered.is_set)
+            # The storage sample has changed, but a native writer still has
+            # the previous policy. Neither ready nor disk_full is an ack yet.
+            assert service.status() == "unavailable"
+            assert service._needs_reconcile is True
+            release.set()
+            expected = "disk_full" if initially_allowed else "ready"
+            await _until(lambda: service.status() == expected)
+            assert service._needs_reconcile is False
+            assert service._media.paths[first.binding.path_name]["record"] is False
+            assert service._media.paths[second.binding.path_name]["record"] is (
+                not initially_allowed
+            )
+            assert json.loads(service._media_file.read_text())["paths"] == service._media.paths
+        finally:
+            release.set()
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("failure", ["ambiguous_patch", "configuration_write"])
 def test_failed_recording_preference_compensates_old_writer_and_saved_configuration(
     native, monkeypatch, failure

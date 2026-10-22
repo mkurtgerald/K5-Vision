@@ -944,7 +944,7 @@ def _desktop_nvr_journey(
         "camera_recording_bytes_before": before,
         "camera_recording_bytes_after": sizes(),
     }
-    diagnostic["nvr_stage"] = "isolated_outage"
+    diagnostic["nvr_stage"] = "outage_wall_admission"
     browser_helpers._wall_frames(page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS])
     unaffected = [0, 2, 3]
     selectors = [
@@ -955,30 +955,74 @@ def _desktop_nvr_journey(
         handle.evaluate("v => v.getVideoPlaybackQuality().totalVideoFrames") for handle in handles
     ]
     others_before = sizes(unaffected)
+    diagnostic.update(
+        nvr_outage_other_frames_before=frames,
+        nvr_outage_other_recording_bytes_before=others_before,
+    )
+    diagnostic["nvr_stage"] = "outage_stop_source"
     helpers._stop_owned(publishers[1])
+    diagnostic["nvr_outage_publisher_exit_code"] = publishers[1].poll()
+
+    def sample_survivors():
+        samples = [
+            handle.evaluate(
+                "v => ({connected:v.isConnected,paused:v.paused,"
+                "frames:v.getVideoPlaybackQuality().totalVideoFrames})"
+            )
+            for handle in handles
+        ]
+        diagnostic.update(
+            nvr_outage_other_connected=[sample["connected"] for sample in samples],
+            nvr_outage_other_paused=[sample["paused"] for sample in samples],
+            nvr_outage_other_frames=[sample["frames"] for sample in samples],
+            nvr_outage_other_recording_bytes=sizes(unaffected),
+        )
+        return samples
 
     def isolated_offline():
+        samples = sample_survivors()
         views = {
             camera["device_id"]: camera
             for camera in client.json("/api/v1/operator/cameras")["cameras"]
         }
+        statuses = [views[device]["status"] for device in camera_ids]
+        diagnostic["nvr_outage_camera_statuses"] = [
+            status if status in {"live", "connecting", "disconnected", "unavailable"} else "unknown"
+            for status in statuses
+        ]
         _require(
-            all(handle.evaluate("v => v.isConnected") for handle in handles),
+            all(sample["connected"] for sample in samples),
             "One camera outage destroyed an unrelated installed wall player",
         )
         return views[camera_ids[1]]["status"] == "disconnected" and all(
             views[camera_ids[index]]["status"] == "live" for index in unaffected
         )
 
+    diagnostic["nvr_stage"] = "outage_camera_status"
     _wait(isolated_offline, "Installed isolated camera outage", process=app, timeout=20)
-    page.wait_for_function(
-        """({videos,before}) => videos.every((video,index) => video.isConnected &&
-          !video.paused && video.getVideoPlaybackQuality().totalVideoFrames >= before[index]+4)""",
-        arg={"videos": handles, "before": frames},
-        timeout=15_000,
-    )
+    diagnostic["nvr_stage"] = "outage_other_live_progress"
+
+    def other_live_progress():
+        samples = sample_survivors()
+        return all(
+            sample["connected"] and not sample["paused"] and sample["frames"] >= before + 4
+            for sample, before in zip(samples, frames, strict=True)
+        )
+
+    _wait(other_live_progress, "Other installed wall videos advance", process=app, timeout=15)
+    diagnostic["nvr_stage"] = "outage_other_recording_progress"
+
+    def other_recording_progress():
+        sample_survivors()
+        return all(
+            after > before
+            for after, before in zip(
+                diagnostic["nvr_outage_other_recording_bytes"], others_before, strict=True
+            )
+        )
+
     _wait(
-        lambda: all_progress(others_before, unaffected),
+        other_recording_progress,
         "Other installed cameras record during outage",
         process=app,
     )
@@ -986,6 +1030,7 @@ def _desktop_nvr_journey(
     evidence["outage_other_live_frames_after"] = [
         handle.evaluate("v => v.getVideoPlaybackQuality().totalVideoFrames") for handle in handles
     ]
+    diagnostic["nvr_stage"] = "outage_camera_reconnect"
     publishers[1] = _publish_fixture(parent, ffmpeg, sources[1], helpers, color="blue")
     processes.append(publishers[1])
     browser_helpers._decoded_video(

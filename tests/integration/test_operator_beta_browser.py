@@ -430,13 +430,58 @@ def _wall_frames(page, device_ids, colors, *, layout=None):
           window.scrollTo(0,0);
           document.querySelector('.main-content').scrollTop=0;
         }""")
+        geometry_path = os.environ.get("K5_OPERATOR_WALL_GEOMETRY")
+        if geometry_path:
+            destination = Path(geometry_path)
+            _require(
+                destination.is_absolute()
+                and destination.suffix == ".json"
+                and destination.parent.is_dir(),
+                "Wall geometry requires an absolute JSON artifact path",
+            )
+            page.evaluate(
+                "() => new Promise(resolve => "
+                "requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+            )
+            geometry = page.evaluate("""() => {
+              const rect = element => {
+                if (!element) return null;
+                const bounds=element.getBoundingClientRect();
+                return Object.fromEntries(['x','y','width','height','top','right','bottom','left']
+                  .map(key => [key,bounds[key]]));
+              };
+              const grid=document.querySelector('#wall-panel .camera-wall-grid');
+              return {
+                viewport:{width:innerWidth,height:innerHeight},
+                scroll:{window:scrollY,main:document.querySelector('.main-content').scrollTop},
+                grid:{bounds:rect(grid),offset_height:grid.offsetHeight,
+                  client_height:grid.clientHeight,computed_height:getComputedStyle(grid).height,
+                  inline_wall_height:grid.style.getPropertyValue('--wall-height')},
+                tiles:Array.from(grid.querySelectorAll('[data-camera-id]')).map(tile=>({
+                  bounds:rect(tile),surface:rect(tile.querySelector('.camera-wall-surface')),
+                  video:rect(tile.querySelector('video')),
+                  actions:rect(tile.querySelector('.camera-wall-tile-actions'))
+                }))
+              };
+            }""")
+            destination.write_text(json.dumps(geometry, indent=2), encoding="utf-8")
         page.wait_for_function(
             """selectors => selectors.every(selector => {
               const video=document.querySelector(selector);
               if(!video) return false;
               const bounds=video.getBoundingClientRect();
+              const article=video.closest('[data-camera-id]');
+              const tile=article?.getBoundingClientRect();
+              const actions=article?.querySelector('.camera-wall-tile-actions')
+                ?.getBoundingClientRect();
               return bounds.width>0 && bounds.height>0 && bounds.top>=-1 && bounds.left>=-1 &&
-                bounds.bottom<=innerHeight+1 && bounds.right<=innerWidth+1;
+                bounds.bottom<=innerHeight+1 && bounds.right<=innerWidth+1 && tile &&
+                tile.width>0 && tile.height>0 && tile.top>=-1 && tile.left>=-1 &&
+                tile.bottom<=innerHeight+1 && tile.right<=innerWidth+1 && actions &&
+                actions.width>0 && actions.height>0 && actions.top>=Math.max(-1,tile.top-1) &&
+                actions.left>=Math.max(-1,tile.left-1) &&
+                actions.bottom<=Math.min(innerHeight+1,tile.bottom+1) &&
+                actions.right<=Math.min(innerWidth+1,tile.right+1);
             })""",
             arg=selectors,
             timeout=15_000,
@@ -1035,6 +1080,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
     request_counts, response_counts, browser_capabilities = {}, {}, {}
     enrollment_index = 0
     history_diagnostic = {}
+    outage_diagnostic = {}
     started = time.monotonic()
     receipt = {
         "schema_version": "1",
@@ -1330,6 +1376,10 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                   window.scrollTo(0,0);
                   document.querySelector('.main-content').scrollTop=0;
                 }""")
+                page.evaluate(
+                    "() => new Promise(resolve => "
+                    "requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+                )
                 page.screenshot(
                     path=str(target.with_name(target.stem + "-workspace.png")), timeout=5000
                 )
@@ -1480,8 +1530,11 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         receipt["live_decoded_frames"] = live_frames
         receipt["camera_switch_pixel_isolation"] = True
         receipt["anonymous_media_denied"] = True
-        stage = "independent_outage"
-        _wall_frames(page, camera_ids, [camera[2] for camera in _CAMERAS])
+        stage = "wall_before_outage"
+        outage_diagnostic["outage_reason"] = "waiting_wall_decode"
+        outage_diagnostic["outage_wall_frames"] = _wall_frames(
+            page, camera_ids, [camera[2] for camera in _CAMERAS]
+        )
         unaffected = [
             page.locator(f'#wall-panel [data-camera-id="{device}"] video').element_handle()
             for device in camera_ids[1:]
@@ -1492,36 +1545,83 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         ]
         unaffected_last = list(unaffected_before)
         outage_bytes = _camera_recording_bytes(product, camera_ids)[1:]
+        outage_diagnostic.update(
+            outage_reason="none",
+            outage_other_frames_before=unaffected_before,
+            outage_other_recording_bytes_before=outage_bytes,
+        )
 
         def unaffected_advance():
             counts = []
+            connected = []
             for index, node in enumerate(unaffected):
                 status = node.evaluate(
                     """video => ({connected:video.isConnected,
                       frames:video.getVideoPlaybackQuality().totalVideoFrames})"""
                 )
+                counts.append(status["frames"])
+                connected.append(status["connected"])
+                outage_diagnostic.update(
+                    outage_other_frames=counts,
+                    outage_other_connected=connected,
+                    outage_publisher_exit_codes=[process.poll() for process in publishers],
+                )
+                if not status["connected"]:
+                    outage_diagnostic["outage_reason"] = "unaffected_player_detached"
+                elif status["frames"] < unaffected_last[index]:
+                    outage_diagnostic["outage_reason"] = "unaffected_frames_reset"
                 _require(
                     status["connected"] and status["frames"] >= unaffected_last[index],
                     "One camera outage reset an unaffected wall player",
                 )
                 unaffected_last[index] = status["frames"]
-                counts.append(status["frames"])
             return all(
                 after >= before + 4 for after, before in zip(counts, unaffected_before, strict=True)
             )
 
+        stage = "stop_camera_for_outage"
         helpers._stop_owned(publishers[0])
 
         def first_outage_only():
+            outage_diagnostic["outage_recording_bytes"] = _camera_recording_bytes(
+                product, camera_ids
+            )
             unaffected_advance()
-            views = client.json("/api/v1/operator/cameras")["cameras"]
+            outage_diagnostic["outage_api_status"] = None
+            outage_diagnostic["outage_reason"] = "camera_status_transport"
+            status, body, _ = client.get("/api/v1/operator/cameras")
+            outage_diagnostic["outage_api_status"] = status
+            outage_diagnostic["outage_reason"] = "camera_status_http"
+            _require(status == 200, "Camera status request failed during source outage")
+            outage_diagnostic["outage_reason"] = "camera_status_json"
+            views = json.loads(body)["cameras"]
             states = {v["device_id"]: v for v in views}
-            return states[camera_ids[0]]["status"] == "disconnected" and all(
+            outage_diagnostic["outage_camera_states"] = [
+                states.get(device, {}).get("status", "missing")
+                if states.get(device, {}).get("status", "missing")
+                in ("live", "connecting", "disconnected", "error", "missing")
+                else "unknown"
+                for device in camera_ids
+            ]
+            outage_diagnostic["outage_camera_recording"] = [
+                bool(states.get(device, {}).get("recording")) for device in camera_ids
+            ]
+            outage_diagnostic["outage_reason"] = "missing_camera_view"
+            _require(
+                all(device in states for device in camera_ids),
+                "A camera vanished from the operator view during source outage",
+            )
+            isolated = states[camera_ids[0]]["status"] == "disconnected" and all(
                 states[device]["status"] == "live" and states[device]["recording"]
                 for device in camera_ids[1:]
             )
+            outage_diagnostic["outage_reason"] = "none" if isolated else "waiting_camera_states"
+            return isolated
 
+        stage = "camera_outage_state"
         runtime._wait(first_outage_only, label="Independent camera outage", product=product)
+        stage = "outage_survivor_continuity"
+        outage_diagnostic["outage_reason"] = "waiting_unaffected_frame_advance"
         runtime._wait(
             unaffected_advance,
             label="Unaffected existing wall videos advance without reset",
@@ -1529,13 +1629,19 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         )
         receipt["wall_outage_other_decoded_frames"] = unaffected_last
         receipt["wall_outage_other_decoded_frames_before"] = unaffected_before
+        stage = "outage_survivor_recording_growth"
+
+        def unaffected_recording_growth():
+            progress = _camera_recording_bytes(product, camera_ids)[1:]
+            outage_diagnostic.update(
+                outage_reason="waiting_unaffected_recording_growth",
+                outage_other_recording_bytes=progress,
+                outage_publisher_exit_codes=[process.poll() for process in publishers],
+            )
+            return all(after > before for after, before in zip(progress, outage_bytes, strict=True))
+
         runtime._wait(
-            lambda: all(
-                after > before
-                for after, before in zip(
-                    _camera_recording_bytes(product, camera_ids)[1:], outage_bytes, strict=True
-                )
-            ),
+            unaffected_recording_growth,
             label="Camera outage preserves other recording writers",
             product=product,
             timeout=15,
@@ -1545,6 +1651,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             product, camera_ids
         )[1:]
         receipt["one_camera_outage_isolated"] = True
+        outage_diagnostic["outage_reason"] = "none"
         stage = "wall_camera_reconnect"
         publishers[0] = _publish_generated(
             helpers, ffmpeg, videos[0], publisher_sources[0], private
@@ -1828,6 +1935,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             "browser_capabilities": browser_capabilities,
             "enrollment_index": enrollment_index,
             **history_diagnostic,
+            **outage_diagnostic,
             "cleanup_failure_codes": cleanup_failures,
             "product_thread_alive": bool(product and product.thread.is_alive()),
             "product_thread_failed": bool(product and product.failed),

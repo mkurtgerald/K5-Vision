@@ -41,7 +41,8 @@
       wallLayoutPending = false;
       const grid = $("wall-panel").querySelector(".camera-wall-grid");
       if (grid && state.view === "wall" && !$("workspace").hidden) {
-        grid.style.setProperty("--wall-height", `${Math.max(280, window.innerHeight - grid.getBoundingClientRect().top - 24)}px`);
+        const top = grid.getBoundingClientRect().top + window.scrollY;
+        grid.style.setProperty("--wall-height", `${Math.max(280, window.innerHeight - top - 24)}px`);
       }
     });
   }
