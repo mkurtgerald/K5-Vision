@@ -1,0 +1,47 @@
+name: Publish qualified Windows c6dbf70
+
+"on":
+  push:
+    branches:
+      - codex/publish-qualified-windows-c6dbf70
+    paths:
+      - .github/workflows/publish-qualified-windows-c6dbf70.yml
+      - scripts/publish_qualified_windows_c6dbf70.py
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-qualified-windows-c6dbf70
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out delivery helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: delivery-source
+          persist-credentials: false
+      - name: Check out exact qualified source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: c6dbf70abc9a7bede7a07602e52e5d5a7fb753a0
+          path: qualified-source
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Admit, publish, and verify qualified Windows assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python delivery-source/scripts/publish_qualified_windows_c6dbf70.py
+          --source qualified-source
+          --output admitted
+          --publish
+          --verify-public
