@@ -1,0 +1,47 @@
+name: Publish qualified surveillance workspace 66464f3
+
+"on":
+  push:
+    branches:
+      - codex/publish-qualified-surveillance-66464f3
+    paths:
+      - .github/workflows/publish-qualified-surveillance-66464f3.yml
+      - scripts/publish_qualified_surveillance_66464f3.py
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-qualified-surveillance-66464f3
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out delivery helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: delivery-source
+          persist-credentials: false
+      - name: Check out exact qualified source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 66464f3037adac1651a90a1bb19e0128593cbc65
+          path: qualified-source
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Admit, publish, and verify qualified Windows assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python delivery-source/scripts/publish_qualified_surveillance_66464f3.py
+          --source qualified-source
+          --output admitted
+          --publish
+          --verify-public
