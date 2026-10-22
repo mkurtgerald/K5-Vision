@@ -295,9 +295,14 @@ def test_timeout_keeps_worker_slot_until_real_read_completes() -> None:
             with pytest.raises(MediaWorkerError) as busy:
                 await provider.info()
             assert busy.value.code is MediaWorkerErrorCode.BUSY
+            pending = tuple(provider._requests)
+            assert len(pending) == 1 and not pending[0].done()
         finally:
             released.set()
-        await asyncio.sleep(0.03)
+        # Release acknowledges only the thread's input event. Join its actual
+        # completion before asserting the capacity slot is reusable on Windows.
+        await asyncio.wait_for(asyncio.shield(pending[0]), timeout=2)
+        assert not provider._requests
         assert (await provider.info()).version == MEDIAMTX_VERSION
 
     asyncio.run(scenario())

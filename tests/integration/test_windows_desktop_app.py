@@ -17,12 +17,14 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from ctypes import wintypes
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import quote, urlencode, urlsplit
 from uuid import UUID, uuid4
 
@@ -548,12 +550,108 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
         _require(watcher_finished, "Native browser launch observer did not finish")
 
 
-def _stop_app(process, form, api, cohort):
+def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
+    """Wait for owned process identities, never a historical PID's later occupant."""
+    __tracebackhide__ = True
+    diagnostic = {} if diagnostic is None else diagnostic
+    started = time.monotonic()
+    deadline = started + timeout
+    checks = 0
+    names = {
+        "k5vision.exe": "desktop",
+        "python.exe": "python",
+        "pythonw.exe": "python",
+        "mediamtx.exe": "mediamtx",
+        "caddy.exe": "caddy",
+    }
+    while True:
+        tracked = cohort.snapshot()
+        counts = {kind: 0 for kind in ("desktop", "python", "mediamtx", "caddy", "other")}
+        for process in tracked:
+            try:
+                # psutil.wait_procs()/Process.wait() can reopen a recycled PID
+                # without checking its original creation identity. is_running()
+                # verifies (PID, creation time) and rejects that later occupant.
+                if process.is_running():
+                    counts[names.get(process.name().casefold(), "other")] += 1
+            except psutil.NoSuchProcess:
+                continue
+        checks += 1
+        diagnostic.update(
+            stop_owned_identity_count=len(tracked),
+            stop_live_owned_counts=counts,
+            stop_identity_checks=checks,
+            stop_wait_seconds=round(time.monotonic() - started, 3),
+        )
+        if not any(counts.values()):
+            return
+        remaining = deadline - time.monotonic()
+        _require(remaining > 0, "Owned desktop/backend/native processes survived stop and quit")
+        time.sleep(min(0.05, remaining))
+
+
+def test_owned_cleanup_rejects_historical_pid_reuse_without_waiting_on_its_new_occupant():
+    historical = psutil.Process(os.getpid())
+    # Represent an earlier owner of this same PID, using the real psutil
+    # identity check. No running process is killed or falsely called owned.
+    historical._ident = (historical.pid, historical.create_time() - 1)
+    assert historical.is_running() is False
+    _, old_wait_alive = psutil.wait_procs([historical], timeout=0)
+    assert len(old_wait_alive) == 1
+    diagnostic = {}
+    _wait_owned_cleanup(
+        SimpleNamespace(snapshot=lambda: [historical]), timeout=0.1, diagnostic=diagnostic
+    )
+    assert not any(diagnostic["stop_live_owned_counts"].values())
+
+
+def test_owned_cleanup_still_fails_for_a_live_owned_process():
+    process = psutil.Process(os.getpid())
+    diagnostic = {}
+    started = time.monotonic()
+    with pytest.raises(pytest.fail.Exception, match="processes survived stop and quit"):
+        _wait_owned_cleanup(
+            SimpleNamespace(snapshot=lambda: [process]), timeout=0.1, diagnostic=diagnostic
+        )
+    assert 0.1 <= time.monotonic() - started < 2
+    assert sum(diagnostic["stop_live_owned_counts"].values()) == 1
+
+
+def test_owned_cleanup_accepts_a_delayed_real_owned_process_exit():
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
+    )
+    owned = psutil.Process(process.pid)
+
+    def release():
+        process.stdin.close()
+        process.wait(timeout=3)
+
+    timer = threading.Timer(0.1, release)
+    timer.start()
+    diagnostic = {}
+    try:
+        _wait_owned_cleanup(
+            SimpleNamespace(snapshot=lambda: [owned]), timeout=3, diagnostic=diagnostic
+        )
+        assert not any(diagnostic["stop_live_owned_counts"].values())
+        assert diagnostic["stop_identity_checks"] >= 2
+    finally:
+        timer.join(timeout=4)
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=3)
+
+
+def _stop_app(process, form, api, cohort, *, diagnostic=None):
     __tracebackhide__ = True
     api.click(api.control(form, _STOP))
     _require(process.wait(timeout=40) == 0, "Desktop stop and quit did not finish successfully")
-    _, alive = psutil.wait_procs(cohort.snapshot(), timeout=10)
-    _require(not alive, "Owned desktop/backend/native processes survived stop and quit")
+    _wait_owned_cleanup(cohort, diagnostic=diagnostic)
 
 
 def _recording_bytes(profile, camera_directory=None):
@@ -1935,7 +2033,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         _require(current_python_pids == previous_python_pids, "Second click duplicated backend")
         receipt["second_click_reopens_single_instance"] = True
         stage = "graceful_stop_and_quit"
-        _stop_app(app, reopened, api, cohort)
+        _stop_app(app, reopened, api, cohort, diagnostic=nvr_diagnostic)
         receipt["graceful_owned_process_cleanup"] = True
         saved_files = sorted((profile / "recordings").rglob("*.mp4"))
         _require(bool(saved_files), "Desktop retained no recorded media")
@@ -2014,7 +2112,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         context = None
         browser.close()
         browser = None
-        _stop_app(app, form, api, cohort)
+        _stop_app(app, form, api, cohort, diagnostic=nvr_diagnostic)
         stage = "uninstall_preserves_profile"
         uninstaller = installed / "unins000.exe"
         _require(uninstaller.is_file(), "Native GUI uninstaller was not installed")
