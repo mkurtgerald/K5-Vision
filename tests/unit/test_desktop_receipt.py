@@ -49,7 +49,9 @@ _NVR_FLAGS = (
     "other_recording_while_paused timeline_seek_playback actual_recording_export "
     "recording_choice_persisted logout_destroys_wall authenticated_camera_read "
     "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected authenticated_camera_restart_live "
-    "wall_viewport_fit native_launch_argument_matched browser_origin_connected page_window_visible"
+    "wall_viewport_fit native_launch_argument_matched browser_origin_connected page_window_visible "
+    "direct_rtsp_enrollment direct_rtsp_wrong_password_rejected direct_rtsp_persisted "
+    "direct_rtsp_fresh_enrollment direct_rtsp_multi_channel_same_endpoint"
 ).split()
 
 
@@ -84,6 +86,13 @@ def _receipt() -> dict:
         "export_decoded_frames": 4,
         "export_bytes": 4096,
         "authenticated_camera_restart_frames": 4,
+        "direct_rtsp_live_decoded_frames": 4,
+        "direct_rtsp_history_decoded_frames": 4,
+        "direct_rtsp_recording_bytes_before": 0,
+        "direct_rtsp_recording_bytes_after": 10,
+        "direct_rtsp_fresh_live_decoded_frames": 4,
+        "direct_rtsp_fresh_recording_bytes_before": 0,
+        "direct_rtsp_fresh_recording_bytes_after": 10,
         "native_browser_handoff_observation": "os_dispatch_origin_and_window",
     }
 
@@ -195,6 +204,24 @@ def test_desktop_receipt_rejects_missing_executed_nvr_journey(tmp_path, field):
         _VERIFIER.verify(_report(tmp_path, receipt))
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "direct_rtsp_enrollment",
+        "direct_rtsp_wrong_password_rejected",
+        "direct_rtsp_persisted",
+        "direct_rtsp_fresh_enrollment",
+        "direct_rtsp_multi_channel_same_endpoint",
+    ],
+)
+@pytest.mark.parametrize("invalid", [False, 1, None])
+def test_desktop_receipt_requires_executed_direct_rtsp_setup(tmp_path, field, invalid):
+    receipt = _receipt()
+    receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _VERIFIER.verify(_report(tmp_path, receipt))
+
+
 @pytest.mark.parametrize("invalid", [None, "address_bar_copy", "url_argument_only", True])
 def test_desktop_receipt_requires_the_declared_os_dispatch_observation(tmp_path, invalid):
     receipt = _receipt()
@@ -231,6 +258,17 @@ def test_desktop_receipt_refuses_unexecuted_browser_handoff_proofs(tmp_path, fie
         ("export_bytes", 16 * 1024**2 + 1),
         ("authenticated_camera_restart_frames", 3),
         ("authenticated_camera_restart_frames", True),
+        ("direct_rtsp_live_decoded_frames", 3),
+        ("direct_rtsp_live_decoded_frames", True),
+        ("direct_rtsp_history_decoded_frames", None),
+        ("direct_rtsp_history_decoded_frames", 0),
+        ("direct_rtsp_recording_bytes_before", -1),
+        ("direct_rtsp_recording_bytes_before", False),
+        ("direct_rtsp_recording_bytes_after", 0),
+        ("direct_rtsp_recording_bytes_after", 0.5),
+        ("direct_rtsp_fresh_live_decoded_frames", 3),
+        ("direct_rtsp_fresh_recording_bytes_before", False),
+        ("direct_rtsp_fresh_recording_bytes_after", 0),
     ],
 )
 def test_desktop_receipt_requires_four_live_recording_and_export_proofs(tmp_path, field, value):
@@ -257,7 +295,10 @@ def _browser_receipt():
         "recording_preference_persisted recording_resume_growth ui_recording_controls "
         "timeline_seek_playback actual_download_saved_and_decoded logout_destroyed_wall_tiles "
         "logout_background_recording_continues authenticated_camera_read "
-        "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected wall_viewport_fit"
+        "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected wall_viewport_fit "
+        "direct_rtsp_enrollment direct_rtsp_fresh_enrollment "
+        "direct_rtsp_multi_channel_same_endpoint direct_rtsp_wrong_password_rejected "
+        "direct_rtsp_reconnect_preserved_identity direct_rtsp_history_and_export"
     ).split()
     return {
         **dict.fromkeys(required_true, True),
@@ -307,6 +348,14 @@ def _browser_receipt():
         "paused_recording_bytes_after_restart": 30,
         "resumed_recording_bytes": 40,
         "logout_wall_decoded_frames": [4, 5, 6, 7],
+        "direct_rtsp_live_decoded_frames": 4,
+        "direct_rtsp_playback_decoded_frames": 4,
+        "direct_rtsp_export_decoded_frames": 1,
+        "direct_rtsp_recording_bytes_before": 0,
+        "direct_rtsp_recording_bytes_after": 10,
+        "direct_rtsp_fresh_live_decoded_frames": 4,
+        "direct_rtsp_fresh_recording_bytes_before": 0,
+        "direct_rtsp_fresh_recording_bytes_after": 10,
     }
 
 

@@ -1095,3 +1095,213 @@ def test_timeline_gap_clears_previous_clip_and_download_without_losing_history(l
         finally:
             context.close()
             browser.close()
+
+
+@pytest.mark.parametrize("mode", ["add", "reconnect", "onvif_to_rtsp"])
+def test_direct_rtsp_enrollment_tests_privately_and_connects_only_an_opaque_probe(mode):
+    """Exercise the actual form, keeping network/media acceptance independent."""
+    browser_api = pytest.importorskip("playwright.sync_api")
+    channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
+    assets = Path(__file__).resolve().parents[2] / "src/k5vision/operator_web"
+    camera = {
+        "device_id": _CAMERA,
+        "name": "Generated direct stream",
+        "host": "127.0.0.1",
+        "connection_type": "onvif" if mode == "onvif_to_rtsp" else "rtsp",
+        "management_port": 80,
+        "management_secure": False,
+        "status": "connecting",
+        "recording": False,
+        "recording_enabled": True,
+        "recording_state": "waiting",
+        "recording_status": {"reason": "awaiting_data"},
+        "analytics_status": "disabled",
+    }
+    account = {"username": "fixture-admin", "role": "administrator", "display_name": "Fixture"}
+    cameras = [] if mode == "add" else [camera]
+    probes, connects, errors = [], [], []
+    with browser_api.sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel=channel, headless=True)
+        try:
+            context = browser.new_context(viewport={"width": 1440, "height": 900})
+            context.add_init_script("window.Hls = {isSupported: () => false};")
+            page = context.new_page()
+            page.set_default_timeout(10_000)
+            page.on("pageerror", lambda _error: errors.append("uncaught_script_error"))
+
+            def intercept(route):
+                if _operator_asset(route, assets):
+                    return
+                path, method = urlsplit(route.request.url).path, route.request.method
+                data, status = {}, 200
+                if path == "/api/v1/auth/login":
+                    data = {
+                        "session_token": "generated-rtsp-session-token-000000000000000000",
+                        "account": account,
+                        "expires_in_seconds": 300,
+                        "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                    }
+                elif path == "/api/v1/auth/me":
+                    data = account
+                elif path == "/api/v1/operator/status":
+                    data = {
+                        "worker_status": "ready",
+                        "server_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                        "clock": {
+                            "status": "observing",
+                            "last_step_seconds": 0,
+                            "change_count": 0,
+                            "last_change_at": None,
+                            "sync_verified": False,
+                        },
+                    }
+                elif path == "/api/v1/operator/cameras":
+                    data = {"cameras": cameras, "worker_status": "ready"}
+                elif path == "/api/v1/operator/camera-stream-probe":
+                    probes.append(route.request.post_data_json)
+                    data = {
+                        "probe_id": str(len(probes)) * 32,
+                        "expires_in_seconds": 1 if len(probes) == 2 else 120,
+                        "profiles": [
+                            {
+                                "id": "s" * 32,
+                                "name": "Direct stream",
+                                "codec": "H264",
+                                "width": 320,
+                                "height": 240,
+                                "supported": True,
+                            }
+                        ],
+                        "clock": {"status": "unavailable", "sync_verified": False},
+                    }
+                    if len(probes) == 1:
+                        status, data = 422, {"detail": "stream_auth_failed"}
+                elif path == "/api/v1/operator/cameras/stream-connect":
+                    connects.append(route.request.post_data_json)
+                    camera["connection_type"] = "rtsp"
+                    cameras[:] = [camera]
+                    data, status = camera, 201
+                elif path.endswith("/media-session") and method == "POST":
+                    data = {
+                        "live_url": f"/media/live/{_CAMERA}/index.m3u8",
+                        "playback_url": f"/media/playback?path={_CAMERA}",
+                    }
+                elif path.endswith("/history"):
+                    data = {"spans": []}
+                elif path in {"/api/v1/auth/logout", "/api/v1/operator/media-session"}:
+                    status = 204
+                else:
+                    status = 404
+                route.fulfill(
+                    status=status,
+                    content_type="application/json",
+                    body="" if status == 204 else json.dumps(data),
+                )
+
+            page.route("**/*", intercept)
+            page.goto("http://127.0.0.1:8000/operator/")
+            page.locator("#username").fill("fixture-admin")
+            page.locator("#password").fill("generated-human-password")
+            page.locator("#sign-in-button").click()
+            expect = browser_api.expect
+            expect(page.locator("#wall-panel")).to_be_visible()
+            expect(page.locator("#recorder-time-status")).to_contain_text("UTC")
+            if mode != "add":
+                page.locator(f'[data-camera-id="{_CAMERA}"] [data-wall-action="watch"]').click()
+            page.locator("#add-camera-button" if mode == "add" else "#update-source-button").click()
+            if mode == "add":
+                expect(page.locator("#camera-connection-type")).to_have_value("onvif")
+                page.locator("#new-camera-name").fill(camera["name"])
+            else:
+                expect(page.locator("#new-camera-name")).to_have_attribute("readonly", "")
+                expect(page.locator("#camera-connection-type")).to_have_value(
+                    camera["connection_type"]
+                )
+            page.locator("#camera-connection-type").select_option("rtsp")
+            expect(page.locator("#camera-onvif-settings")).to_be_hidden()
+            expect(page.locator("#camera-discovery-section")).to_be_hidden()
+            expect(page.locator("#new-camera-host")).to_be_disabled()
+            expect(page.locator("#new-camera-port")).to_be_disabled()
+            expect(page.locator("#camera-stream-settings")).to_be_visible()
+            page.locator("#new-camera-stream-uri").fill("https://127.0.0.1/not-a-stream")
+            page.locator("#test-camera-connection").click()
+            expect(page.locator("#add-camera-message")).to_contain_text(
+                "Enter an rtsp:// or rtsps://"
+            )
+            assert probes == []
+
+            source = "rtsp://127.0.0.1:8554/private-generated-path?token=private-generated-token"
+            for attempt in range(1, 5):
+                page.locator("#new-camera-stream-uri").fill(source)
+                page.locator("#new-camera-username").fill("private-generated-camera-user")
+                page.locator("#new-camera-password").fill("private-generated-camera-password")
+                page.locator("#test-camera-connection").click()
+                expect(page.locator("#new-camera-stream-uri")).to_have_value("")
+                expect(page.locator("#new-camera-username")).to_have_value("")
+                expect(page.locator("#new-camera-password")).to_have_value("")
+                expect(page.locator("#camera-clock-status")).to_contain_text(
+                    "RTSP does not provide a camera clock check"
+                )
+                expect(page.locator("#camera-clock-status")).to_contain_text("recorder UTC")
+                for secret in (
+                    "private-generated-path",
+                    "private-generated-token",
+                    "private-generated-camera-user",
+                    "private-generated-camera-password",
+                ):
+                    assert secret not in page.locator("body").inner_text()
+                if attempt == 1:
+                    expect(page.locator("#add-camera-message")).to_contain_text(
+                        "Stream authentication failed"
+                    )
+                    expect(page.locator("#save-camera")).to_be_disabled()
+                    continue
+                expect(page.locator("#save-camera")).to_be_enabled()
+                expect(page.locator("#add-camera-message")).to_contain_text(
+                    "video is confirmed after connecting"
+                )
+                if attempt == 2:
+                    expect(page.locator("#add-camera-message")).to_contain_text(
+                        "The connection test expired"
+                    )
+                    expect(page.locator("#save-camera")).to_be_disabled()
+                elif attempt == 3:
+                    page.locator("#new-camera-stream-uri").fill(source + "-changed")
+                    expect(page.locator("#save-camera")).to_be_disabled()
+                    expect(page.locator("#add-camera-message")).to_contain_text(
+                        "Test the connection again"
+                    )
+                else:
+                    page.locator("#save-camera").click()
+            expect(page.locator("#add-camera-dialog")).to_be_hidden()
+            assert len(probes) == 4 and len(connects) == 1
+            assert all(
+                payload
+                == {
+                    "source_uri": source,
+                    "username": "private-generated-camera-user",
+                    "password": "private-generated-camera-password",
+                }
+                for payload in probes
+            )
+            expected = {"name": camera["name"], "probe_id": "4" * 32, "profile_id": "s" * 32}
+            if mode != "add":
+                expected["device_id"] = _CAMERA
+            assert connects == [expected]
+            expect(page.locator("#workspace-message")).to_contain_text(
+                "Waiting for its video stream"
+            )
+            page.locator("#update-source-button").click()
+            expect(page.locator("#camera-connection-type")).to_have_value("rtsp")
+            expect(page.locator("#new-camera-stream-uri")).to_have_value("")
+            page.locator("#new-camera-stream-uri").fill(source)
+            page.locator("#new-camera-password").fill("private-generated-camera-password")
+            page.locator("#cancel-add-camera").click()
+            page.locator("#add-camera-button").click()
+            expect(page.locator("#camera-connection-type")).to_have_value("onvif")
+            expect(page.locator("#new-camera-stream-uri")).to_have_value("")
+            expect(page.locator("#new-camera-password")).to_have_value("")
+            page.locator("#cancel-add-camera").click()
+            assert errors == []
+        finally:
+            browser.close()

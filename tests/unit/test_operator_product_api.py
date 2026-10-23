@@ -252,6 +252,7 @@ def test_enrollment_persists_private_source_and_public_rows_hide_execution_mater
         "host": "127.0.0.1",
         "management_port": 80,
         "management_secure": False,
+        "connection_type": "rtsp",
         "status": "live",
         "recording": True,
         "recording_enabled": True,
@@ -1895,3 +1896,268 @@ def test_onvif_interface_enumeration_failure_retains_default_route_fallback(monk
 
     monkeypatch.setattr(api.psutil, "net_if_addrs", unavailable)
     assert api._camera_ipv4_interfaces() == ()
+
+
+class _RtspConnector:
+    def __init__(self):
+        self.calls = []
+        self.callback = None
+        self.error = None
+
+    async def probe(self, selected):
+        self.calls.append(selected)
+        if self.callback:
+            await self.callback()
+        if self.error:
+            raise self.error
+
+
+@pytest.fixture
+def rtsp(product):
+    connector = _RtspConnector()
+    product.app.state.operator_rtsp_connector = connector
+    return connector
+
+
+def _rtsp_probe(product, **changes):
+    return product.client.post(
+        "/api/v1/operator/camera-stream-probe",
+        headers=product.headers,
+        json={
+            "source_uri": "rtsp://127.0.0.1:8554/live?private-token",
+            "username": "camera",
+            "password": "private-password",
+            **changes,
+        },
+    )
+
+
+def _rtsp_connect(product, probe, **changes):
+    return product.client.post(
+        "/api/v1/operator/cameras/stream-connect",
+        headers=product.headers,
+        json={
+            "name": "Front door",
+            "probe_id": probe["probe_id"],
+            "profile_id": probe["profiles"][0]["id"],
+            **changes,
+        },
+    )
+
+
+def test_rtsp_test_connect_retains_private_source_and_consumes_opaque_handle(product, rtsp):
+    tested = _rtsp_probe(product)
+    assert tested.status_code == 200 and tested.headers["cache-control"] == "no-store"
+    assert not any(
+        value in tested.text for value in ("private-token", "private-password", "rtsp://")
+    )
+    probe = tested.json()
+    assert probe["profiles"][0]["codec"] == "H264" and probe["clock"]["sync_verified"] is False
+    connected = _rtsp_connect(product, probe)
+    assert connected.status_code == 201
+    assert connected.json()["management_port"] == 8554
+    assert connected.json()["connection_type"] == "rtsp"
+    source = product.cameras.list_sources()[0]
+    assert source.source_uri == "rtsp://camera:private-password@127.0.0.1:8554/live?private-token"
+    assert source.device.protocols == {DeviceProtocol.RTSP}
+    assert _rtsp_connect(product, probe).status_code == 410
+    assert len(rtsp.calls) == 1
+
+
+def test_rtsp_channels_at_same_host_and_port_are_independent_and_credentials_do_not_change_uuid(
+    product, rtsp
+):
+    first = _rtsp_connect(product, _rtsp_probe(product).json()).json()
+    second = _rtsp_connect(
+        product,
+        _rtsp_probe(product, source_uri="rtsp://127.0.0.1:8554/second").json(),
+        name="Second channel",
+    ).json()
+    assert first["device_id"] != second["device_id"]
+    retry = _rtsp_connect(product, _rtsp_probe(product, password="new-password").json())
+    assert retry.status_code == 201 and retry.json()["device_id"] == first["device_id"]
+    assert len(product.cameras.list_sources()) == 2
+
+
+def test_rtsp_reconnect_preserves_onvif_identity_path_and_pause_choice(product, rtsp, onvif):
+    onvif_row = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers=product.headers,
+        json=_onvif_connect_body(_onvif_probe(product).json()),
+    ).json()
+    identifier = UUID(onvif_row["device_id"])
+    old = product.cameras.get(identifier)
+    product.cameras.set_recording_enabled(identifier, False)
+    connected = _rtsp_connect(product, _rtsp_probe(product).json(), device_id=str(identifier))
+    assert connected.status_code == 201 and connected.json()["device_id"] == str(identifier)
+    new = product.cameras.get(identifier)
+    assert new.binding.path_name == old.binding.path_name and new.recording_enabled is False
+    assert new.device.management_port == 8554 and new.device.protocols == {DeviceProtocol.RTSP}
+    assert len(product.registry.list()) == 1
+
+
+@pytest.mark.parametrize(
+    "changes", [{"name": "Different"}, {"source_uri": "rtsp://127.0.0.2/live"}]
+)
+def test_rtsp_explicit_reconnect_cannot_rebind_other_name_or_host(product, rtsp, changes):
+    identifier = product.enroll()
+    probe_changes = {k: v for k, v in changes.items() if k == "source_uri"}
+    probe = _rtsp_probe(product, **probe_changes).json()
+    response = _rtsp_connect(
+        product,
+        probe,
+        device_id=identifier,
+        **{k: v for k, v in changes.items() if k == "name"},
+    )
+    assert response.status_code == 422
+    assert product.cameras.list_sources()[0].source_uri.endswith("@127.0.0.1/live")
+
+
+@pytest.mark.parametrize("failing", [False, True])
+def test_rtsp_session_revocation_during_probe_rejects_result_and_discards_secret(
+    product, rtsp, failing
+):
+    from k5vision.operator_rtsp import RtspError
+
+    async def revoke():
+        await product.sessions.revoke(product.token)
+
+    rtsp.callback = revoke
+    rtsp.error = RtspError("auth_failed") if failing else None
+    response = _rtsp_probe(product)
+    assert response.status_code == 401 and not product.app.state.operator_rtsp_probes._probes
+    assert not product.cameras.list_sources()
+
+
+def test_rtsp_probe_is_bound_to_session_and_logout_clears_pending_secrets(product, rtsp):
+    probe = _rtsp_probe(product).json()
+    other, _ = asyncio.run(product.sessions.issue(product.admin))
+    response = product.client.post(
+        "/api/v1/operator/cameras/stream-connect",
+        headers={"Authorization": "Bearer " + other},
+        json={
+            "name": "Front door",
+            "probe_id": probe["probe_id"],
+            "profile_id": probe["profiles"][0]["id"],
+        },
+    )
+    assert response.status_code == 410
+    product.client.delete("/api/v1/operator/media-session", headers=product.headers)
+    assert not product.app.state.operator_rtsp_probes._probes
+
+
+@pytest.mark.parametrize("route", ["camera-stream-probe", "cameras/stream-connect"])
+def test_rtsp_mutations_reject_cross_origin_no_session_and_non_admin(product, rtsp, route):
+    url = "/api/v1/operator/" + route
+    assert product.client.post(url, json={}).status_code == 401
+    assert (
+        product.client.post(
+            url, headers={**product.headers, "Origin": "https://outside.invalid"}, json={}
+        ).status_code
+        == 403
+    )
+    user = product.users.create(
+        UserCreate(username="rtsp-viewer", display_name="Viewer", role=UserRole.VIEWER),
+        actor="test",
+    )
+    token, _ = asyncio.run(product.sessions.issue(user))
+    assert (
+        product.client.post(url, headers={"Authorization": "Bearer " + token}, json={}).status_code
+        == 403
+    )
+    assert not rtsp.calls
+
+
+@pytest.mark.parametrize(
+    "body,status",
+    [
+        (b'{"source_uri":"rtsp://user:private-secret@127.0.0.1/", "username":{}}', 422),
+        (b'{"source_uri":"rtsp://user:private-secret@127.0.0.1/"', 422),
+        (b'{"password":"private-secret' + b"x" * 16384, 413),
+    ],
+)
+def test_rtsp_invalid_or_oversized_bodies_never_echo_source_secrets(product, rtsp, body, status):
+    response = product.client.post(
+        "/api/v1/operator/camera-stream-probe",
+        headers={**product.headers, "Content-Type": "application/json"},
+        content=body,
+    )
+    assert response.status_code == status and "private-secret" not in response.text
+    assert not rtsp.calls
+
+
+@pytest.mark.parametrize(
+    "code,status",
+    [
+        ("auth_failed", 422),
+        ("unsupported", 422),
+        ("unreachable", 503),
+        ("invalid_response", 502),
+    ],
+)
+def test_rtsp_connection_failures_are_sanitized_and_release_capacity(product, rtsp, code, status):
+    from k5vision.operator_rtsp import RtspError
+
+    rtsp.error = RtspError(code)
+    response = _rtsp_probe(product)
+    assert response.status_code == status and not product.app.state.operator_rtsp_probes._probes
+    assert "private-password" not in response.text and "private-token" not in response.text
+
+
+def test_rtsp_capacity_rejects_new_same_endpoint_channel_before_registry_commit(product, rtsp):
+    for index in range(64):
+        tested = _rtsp_probe(product, source_uri=f"rtsp://127.0.0.1:8554/channel/{index}").json()
+        result = _rtsp_connect(product, tested, name=f"Channel {index}")
+        assert result.status_code == 201
+    assert len(product.registry.list()) == len(product.cameras.list_sources()) == 64
+    before = [device.id for device in product.registry.list()]
+    rejected = _rtsp_connect(
+        product,
+        _rtsp_probe(product, source_uri="rtsp://127.0.0.1:8554/new-channel").json(),
+        name="New channel",
+    )
+    assert rejected.status_code == 409
+    assert [device.id for device in product.registry.list()] == before
+    assert len(product.cameras.list_sources()) == 64
+    # A retry of an already admitted channel remains possible at capacity.
+    retried = _rtsp_connect(
+        product,
+        _rtsp_probe(product, source_uri="rtsp://127.0.0.1:8554/channel/0").json(),
+        name="Channel 0",
+    )
+    assert retried.status_code == 201 and retried.json()["device_id"] == str(before[0])
+
+
+def test_rtsp_failed_worker_application_retries_same_private_handle_and_identity(product, rtsp):
+    probe = _rtsp_probe(product).json()
+    original = product.service.apply_sources
+
+    async def unavailable(_sources):
+        raise RuntimeError("private-source-must-not-escape")
+
+    product.service.apply_sources = unavailable
+    failed = _rtsp_connect(product, probe)
+    assert failed.status_code == 503 and "private-source" not in failed.text
+    identifier = product.cameras.list_sources()[0].device.id
+    assert probe["probe_id"] in product.app.state.operator_rtsp_probes._probes
+    product.service.apply_sources = original
+    retried = _rtsp_connect(product, probe)
+    assert retried.status_code == 201 and retried.json()["device_id"] == str(identifier)
+    assert len(product.registry.list()) == len(product.cameras.list_sources()) == 1
+
+
+def test_rtsp_probe_ttl_capacity_and_logout_are_monotonic(product, rtsp, monkeypatch):
+    import k5vision.operator_onvif_api as api
+
+    clock = [100.0]
+    monkeypatch.setattr(api, "monotonic", lambda: clock[0])
+    first = _rtsp_probe(product).json()
+    for _ in range(15):
+        assert _rtsp_probe(product).status_code == 200
+    assert _rtsp_probe(product).status_code == 429 and len(rtsp.calls) == 16
+    clock[0] = 221.0
+    assert _rtsp_connect(product, first).status_code == 410
+    assert not product.app.state.operator_rtsp_probes._probes
+    assert _rtsp_probe(product).status_code == 200
+    product.client.delete("/api/v1/operator/media-session", headers=product.headers)
+    assert not product.app.state.operator_rtsp_probes._probes

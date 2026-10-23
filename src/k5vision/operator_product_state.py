@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import weakref
@@ -413,6 +414,24 @@ class OperatorCameraStore:
         management_port: int,
         secure: bool,
     ) -> MediaMTXSource:
+        return self._reconnect_source(device_id, source_uri, management_port, secure, True, "")
+
+    def reconnect_stream(
+        self, device_id: UUID, source_uri: str, management_port: int, stream_key: str
+    ) -> MediaMTXSource:
+        return self._reconnect_source(
+            device_id, source_uri, management_port, False, False, stream_key
+        )
+
+    def _reconnect_source(
+        self,
+        device_id: UUID,
+        source_uri: str,
+        management_port: int,
+        secure: bool,
+        onvif: bool,
+        stream_key: str,
+    ) -> MediaMTXSource:
         """Migrate an enrolled endpoint and source in one durable SQLite transaction.
 
         Attaching the canonical file to the private rollback-journal database
@@ -428,6 +447,8 @@ class OperatorCameraStore:
                     or type(management_port) is not int
                     or not 1 <= management_port <= 65535
                     or type(secure) is not bool
+                    or type(onvif) is not bool
+                    or (stream_key != "" and re.fullmatch(r"[0-9a-f]{64}", stream_key) is None)
                     or self._registry is None
                 ):
                     raise ValueError
@@ -449,9 +470,11 @@ class OperatorCameraStore:
                     data["management_port"] = management_port
                     data["protocols"] = sorted(
                         existing_device.protocols | {DeviceProtocol.ONVIF, DeviceProtocol.RTSP}
+                        if onvif
+                        else {DeviceProtocol.RTSP}
                     )
                     tags = existing_device.tags - {"k5-onvif-https"}
-                    if secure:
+                    if onvif and secure:
                         tags.add("k5-onvif-https")
                     data["tags"] = sorted(tags)
                     # Validate the replacement and its private URI before a write begins.
@@ -487,7 +510,7 @@ class OperatorCameraStore:
                             raise OperatorCameraCapacityError
                         row = connection.execute(
                             """SELECT id, name, host, management_port, kind,
-                                      protocols_json, tags_json
+                                      protocols_json, tags_json, stream_key
                                FROM operator_registry.devices WHERE site_id = ? AND id = ?""",
                             (self._site_id, str(device_id)),
                         ).fetchone()
@@ -496,14 +519,16 @@ class OperatorCameraStore:
                         try:
                             updated = connection.execute(
                                 """UPDATE operator_registry.devices
-                                   SET management_port = ?, protocols_json = ?, tags_json = ?
+                                   SET management_port = ?, protocols_json = ?, tags_json = ?,
+                                       stream_key = ?
                                    WHERE site_id = ? AND id = ? AND name = ? AND host = ?
                                      AND management_port = ? AND kind = ?
-                                     AND protocols_json = ? AND tags_json = ?""",
+                                     AND protocols_json = ? AND tags_json = ? AND stream_key = ?""",
                                 (
                                     management_port,
                                     registry._protocols_json(source.device),
                                     registry._tags_json(source.device),
+                                    stream_key,
                                     self._site_id,
                                     str(device_id),
                                     row["name"],
@@ -512,6 +537,7 @@ class OperatorCameraStore:
                                     row["kind"],
                                     row["protocols_json"],
                                     row["tags_json"],
+                                    row["stream_key"],
                                 ),
                             )
                         except sqlite3.IntegrityError as exc:

@@ -925,6 +925,7 @@ def _generate_fixture(
     color="red",
     camera_credentials=None,
     publisher_credentials=None,
+    extra_stream_paths=(),
 ):
     __tracebackhide__ = True
     video = parent / f"generated {color} camera.mp4"
@@ -967,12 +968,15 @@ def _generate_fixture(
     )
     _require(generated.returncode == 0, "Generated desktop camera fixture could not be created")
     upstream_config = parent / f"generated {color} upstream.json"
+    stream_paths = ("generated", *extra_stream_paths)
     users = [
         {
             "user": "any",
             "ips": ["127.0.0.0/8", "::1"],
             "permissions": [
-                {"action": action, "path": "generated"} for action in ("publish", "read")
+                {"action": action, "path": path}
+                for path in stream_paths
+                for action in ("publish", "read")
             ],
         }
     ]
@@ -983,13 +987,13 @@ def _generate_fixture(
                 "user": camera_credentials[0],
                 "pass": camera_credentials[1],
                 "ips": ["127.0.0.0/8", "::1"],
-                "permissions": [{"action": "read", "path": "generated"}],
+                "permissions": [{"action": "read", "path": path} for path in stream_paths],
             },
             {
                 "user": publisher_credentials[0],
                 "pass": publisher_credentials[1],
                 "ips": ["127.0.0.0/8", "::1"],
-                "permissions": [{"action": "publish", "path": "generated"}],
+                "permissions": [{"action": "publish", "path": path} for path in stream_paths],
             },
         ]
     helpers._private_write(
@@ -1009,7 +1013,7 @@ def _generate_fixture(
                 "moq": False,
                 "metrics": False,
                 "pprof": False,
-                "paths": {"generated": {"source": "publisher"}},
+                "paths": {path: {"source": "publisher"} for path in stream_paths},
             }
         ),
     )
@@ -1181,6 +1185,7 @@ def _desktop_nvr_journey(
     browser_helpers,
     app,
     diagnostic,
+    history_not_before,
 ):
     """Exercise operator actions against four real installed recording paths."""
     __tracebackhide__ = True
@@ -1362,7 +1367,11 @@ def _desktop_nvr_journey(
     diagnostic["nvr_stage"] = "timeline_and_export"
     browser_helpers._open_camera_recordings(page, camera_ids[0])
     evidence["timeline_playback_decoded_frames"] = browser_helpers._timeline_play(
-        page, "red", device_id=camera_ids[0], diagnostic=diagnostic
+        page,
+        "red",
+        device_id=camera_ids[0],
+        diagnostic=diagnostic,
+        not_before=history_not_before,
     )
     export = parent / "saved installed red recording.mp4"
     evidence["export_decoded_frames"] = browser_helpers._download_recording(
@@ -1875,6 +1884,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 if index == 0
                 else None,
                 publisher_credentials=primary_publisher_credentials if index == 0 else None,
+                extra_stream_paths=("direct-channel",) if index == 0 else (),
             )
             processes.extend(generated)
             publishers.append(generated[-1])
@@ -1944,6 +1954,92 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["bounded_discovery_executed"] = discovery_completed
         receipt["generated_camera_discovered"] = False
         receipt.update(browser_helpers._onvif_clock_proof(onvif_camera))
+        stage = "actual_direct_rtsp_enrollment"
+        direct_stream = browser_helpers._rtsp_enroll(
+            page,
+            name=_DESKTOP_CAMERAS[0][0],
+            source_uri=source_uri,
+            username=onvif_camera.username,
+            password=onvif_camera.password,
+            device_id=camera_id,
+            reject_wrong=True,
+        )
+        _require(
+            direct_stream.get("device_id") == camera_id
+            and direct_stream.get("connection_type") == "rtsp",
+            "Installed direct RTSP setup changed the camera identity or connection type",
+        )
+        receipt["direct_rtsp_enrollment"] = True
+        receipt["direct_rtsp_wrong_password_rejected"] = True
+        direct_rtsp_started_utc = int(datetime.now(UTC).timestamp() * 1000)
+        stage = "actual_fresh_rtsp_add"
+        fresh_uri = urlsplit(source_uri)._replace(path="/direct-channel").geturl()
+        fresh_publisher = _publish_fixture(
+            parent,
+            ffmpeg,
+            fresh_uri,
+            helpers,
+            credentials=primary_publisher_credentials,
+        )
+        processes.append(fresh_publisher)
+        fresh_stream = browser_helpers._rtsp_enroll(
+            page,
+            name="Generated direct RTSP channel",
+            source_uri=fresh_uri,
+            username=onvif_camera.username,
+            password=onvif_camera.password,
+        )
+        fresh_id = fresh_stream.get("device_id")
+        _require(
+            fresh_id not in camera_ids
+            and fresh_stream.get("host") == direct_stream.get("host")
+            and fresh_stream.get("management_port") == direct_stream.get("management_port")
+            and fresh_stream.get("connection_type") == "rtsp",
+            "Fresh direct RTSP channel did not preserve independent same-endpoint identity",
+        )
+        five_cameras = client.json("/api/v1/operator/cameras")["cameras"]
+        _require(
+            len(five_cameras) == 5
+            and {camera["device_id"] for camera in five_cameras} == {*camera_ids, fresh_id},
+            "Adding a direct RTSP channel replaced another enrolled camera",
+        )
+        page.locator(".camera-item").filter(has_text="Generated direct RTSP channel").click()
+        page.locator("#live-panel").wait_for(state="visible")
+        receipt["direct_rtsp_fresh_live_decoded_frames"] = browser_helpers._decoded_color(
+            page, "live-video", "red"
+        )
+        fresh_directory = (
+            profile / "recordings" / MediaMTXBinding(identity.site_id, UUID(fresh_id)).path_name
+        )
+        fresh_before = _recording_bytes(profile, fresh_directory)
+        _wait(
+            lambda: _recording_bytes(profile, fresh_directory) > fresh_before,
+            "Fresh installed RTSP channel records new bytes",
+            process=app,
+        )
+        receipt["direct_rtsp_fresh_recording_bytes_before"] = fresh_before
+        receipt["direct_rtsp_fresh_recording_bytes_after"] = _recording_bytes(
+            profile, fresh_directory
+        )
+        receipt["direct_rtsp_fresh_enrollment"] = True
+        receipt["direct_rtsp_multi_channel_same_endpoint"] = True
+        page.locator("#remove-camera-button").click()
+        page.locator("#remove-camera-dialog").wait_for(state="visible")
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "DELETE"
+                and response.url.endswith("/api/v1/operator/cameras/" + fresh_id)
+            )
+        ) as fresh_removed:
+            page.locator("#confirm-remove-camera").click()
+        _require(fresh_removed.value.status == 204, "Fresh installed RTSP channel removal failed")
+        page.locator("#remove-camera-dialog").wait_for(state="hidden")
+        _require(
+            {camera["device_id"] for camera in client.json("/api/v1/operator/cameras")["cameras"]}
+            == set(camera_ids),
+            "Fresh direct RTSP cleanup changed the four-camera inventory",
+        )
+        helpers._stop_owned(fresh_publisher)
         browser_helpers._assert_no_browser_storage(page)
         route = "/api/v1/operator/cameras/" + camera_id
         page.locator("#add-camera-dialog").wait_for(state="hidden")
@@ -1993,6 +2089,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         browser_helpers._open_camera_watch(page, camera_id)
         stage = "actual_browser_live_decode"
         receipt["live_decoded_frames"] = browser_helpers._decoded_color(page, "live-video", "red")
+        receipt["direct_rtsp_live_decoded_frames"] = receipt["live_decoded_frames"]
         receipt["actual_edge_login_enrollment_live"] = True
         _wait(lambda: _recording_bytes(profile) > 0, "Desktop recording bytes", process=app)
         stage = "installed_nvr_workspace"
@@ -2013,8 +2110,12 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 browser_helpers=browser_helpers,
                 app=app,
                 diagnostic=nvr_diagnostic,
+                history_not_before=direct_rtsp_started_utc,
             )
         )
+        receipt["direct_rtsp_recording_bytes_before"] = receipt["camera_recording_bytes_before"][0]
+        receipt["direct_rtsp_recording_bytes_after"] = receipt["camera_recording_bytes_after"][0]
+        receipt["direct_rtsp_history_decoded_frames"] = receipt["timeline_playback_decoded_frames"]
         if vm_clock_enabled:
             stage = "actual_vm_clock_changes"
             receipt["vm_clock"] = _vm_clock_phase(
@@ -2149,6 +2250,14 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "Desktop restart did not preserve camera enrollment",
         )
         _require(bool(client.json(route + "/history")["spans"]), "Restart lost recording history")
+        _require(
+            next(camera for camera in cameras if camera["device_id"] == camera_id).get(
+                "connection_type"
+            )
+            == "rtsp",
+            "Native restart lost the direct RTSP source selection",
+        )
+        receipt["direct_rtsp_persisted"] = True
         _require(
             next(camera for camera in cameras if camera["device_id"] == camera_ids[3]).get(
                 "recording_enabled"

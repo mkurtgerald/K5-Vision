@@ -369,10 +369,120 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
             fixture.qualified_requests(), "Actual authenticated ONVIF SOAP flow was incomplete"
         )
         _require(not source_requests, "Browser sent a manual camera stream address")
-        _require("rtsp://" not in page.content().lower(), "Camera stream address entered the DOM")
+        _require(fixture._stream_uri not in page.content(), "Camera stream address entered the DOM")
         return camera, discovery_completed
     finally:
         page.remove_listener("request", observe)
+
+
+def _rtsp_enroll(
+    page, *, name, source_uri, username="", password="", device_id=None, reject_wrong=False
+):
+    """Use the actual direct-stream form and require an opaque successful probe."""
+    __tracebackhide__ = True
+    if device_id is None:
+        page.locator("#add-camera-button").click()
+        page.locator("#new-camera-name").fill(name)
+    else:
+        _open_camera_watch(page, device_id)
+        page.locator("#update-source-button").click()
+        _require(
+            page.locator("#new-camera-name").input_value() == name,
+            "Direct-stream reconnect selected the wrong retained camera",
+        )
+    page.locator("#camera-connection-type").select_option("rtsp")
+
+    def test_connection(secret):
+        page.locator("#new-camera-stream-uri").fill(source_uri)
+        page.locator("#new-camera-username").fill(username)
+        page.locator("#new-camera-password").fill(secret)
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST"
+                and response.url.endswith("/api/v1/operator/camera-stream-probe")
+            ),
+            timeout=20_000,
+        ) as tested:
+            page.locator("#test-camera-connection").click()
+        return tested.value
+
+    if reject_wrong:
+        rejected = test_connection("deliberately-wrong-stream-password")
+        _require(
+            rejected.status in {400, 401, 403, 422, 502, 503},
+            "Direct-stream probe admitted the wrong camera password",
+        )
+        _require(
+            page.locator("#save-camera").is_disabled(),
+            "Wrong direct-stream credentials enabled Connect",
+        )
+        page.wait_for_function(
+            """() => document.getElementById('add-camera-message').textContent
+              .toLowerCase().includes('stream authentication failed')"""
+        )
+        page.wait_for_function(
+            """() => ['new-camera-stream-uri','new-camera-username','new-camera-password']
+              .every(id => document.getElementById(id).value === '')"""
+        )
+        _require(
+            all(
+                value not in rejected.text() for value in (source_uri, username, password) if value
+            ),
+            "Rejected direct-stream probe exposed private camera material",
+        )
+    tested = test_connection(password)
+    _require(tested.status == 200, "Actual direct-stream connection probe failed")
+    payload = tested.json()
+    _require(
+        set(payload) == {"probe_id", "expires_in_seconds", "profiles", "clock"},
+        "Direct-stream probe left its opaque public contract",
+    )
+    _require(
+        payload["clock"].get("status") == "unavailable"
+        and payload["clock"].get("sync_verified") is False,
+        "Direct-stream probe claimed a camera clock measurement",
+    )
+    _require(
+        all(value not in tested.text() for value in (source_uri, username, password) if value),
+        "Direct-stream probe exposed private camera material",
+    )
+    supported = [
+        profile
+        for profile in payload["profiles"]
+        if profile.get("codec") == "H264" and profile.get("supported") is True
+    ]
+    _require(len(supported) == 1, "Direct-stream probe did not offer exactly one H264 stream")
+    page.locator("#camera-profile").select_option(supported[0]["id"])
+    page.wait_for_function(
+        """() => ['new-camera-stream-uri','new-camera-username','new-camera-password']
+          .every(id => document.getElementById(id).value === '')"""
+    )
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "POST"
+            and response.url.endswith("/api/v1/operator/cameras/stream-connect")
+        )
+    ) as connected:
+        page.locator("#save-camera").click()
+    _require(connected.value.status == 201, "Direct-stream camera connection failed")
+    camera = connected.value.json()
+    _require(camera.get("connection_type") == "rtsp", "Direct-stream connection type was lost")
+    _require(
+        all(
+            value not in connected.value.text()
+            for value in (source_uri, username, password, '"source_uri"')
+            if value
+        ),
+        "Direct-stream connection response exposed private camera material",
+    )
+    _require(
+        '"source_uri"' not in (connected.value.request.post_data or ""),
+        "Direct-stream Connect resent private source material instead of the opaque probe",
+    )
+    page.locator("#add-camera-dialog").wait_for(state="hidden")
+    _require(source_uri not in page.content(), "Direct-stream source remained in the DOM")
+    _assert_no_browser_storage(page)
+    return camera
 
 
 def _wall_state(page):
@@ -665,7 +775,7 @@ def test_timeline_clip_selects_playable_span_after_short_recording_fragment(inte
     assert _playable_timeline_span(intervals) == expected
 
 
-def _timeline_play(page, color, *, device_id, diagnostic=None):
+def _timeline_play(page, color, *, device_id, diagnostic=None, not_before=None):
     """Seek via actual timeline pointer coordinates, then decode selected video."""
     __tracebackhide__ = True
     diagnostic = {} if diagnostic is None else diagnostic
@@ -700,6 +810,8 @@ def _timeline_play(page, color, *, device_id, diagnostic=None):
         timeline_first_span_seconds=round((intervals[0][1] - intervals[0][0]) / 1000, 3),
         timeline_reason="no_playable_span",
     )
+    if not_before is not None:
+        intervals = [(max(first, not_before), last) for first, last in intervals]
     selected = _playable_timeline_span(intervals)
     _require(selected is not None, "Timeline fixture has no playable four-second interval")
     first, last = selected
@@ -1463,13 +1575,19 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                         "user": fixture.username,
                         "pass": fixture.password,
                         "ips": ["127.0.0.0/8", "::1"],
-                        "permissions": [{"action": "read", "path": "generated"}],
+                        "permissions": [
+                            {"action": "read", "path": path}
+                            for path in ("generated", "direct-channel")
+                        ],
                     },
                     {
                         "user": "generated-publisher",
                         "pass": publisher_password,
                         "ips": ["127.0.0.0/8", "::1"],
-                        "permissions": [{"action": "publish", "path": "generated"}],
+                        "permissions": [
+                            {"action": "publish", "path": path}
+                            for path in ("generated", "direct-channel")
+                        ],
                     },
                 ]
             publisher_sources.append(publisher_source)
@@ -1491,7 +1609,14 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                         "moq": False,
                         "metrics": False,
                         "pprof": False,
-                        "paths": {"generated": {"source": "publisher"}},
+                        "paths": {
+                            path: {"source": "publisher"}
+                            for path in (
+                                ("generated", "direct-channel")
+                                if camera_index == 0
+                                else ("generated",)
+                            )
+                        },
                     }
                 ),
             )
@@ -1510,6 +1635,14 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             publisher = _publish_generated(helpers, ffmpeg, video, source, private)
             processes.append(publisher)
             publishers.append(publisher)
+        secondary_source = urlsplit(sources[0])._replace(path="/direct-channel").geturl()
+        secondary_publisher_source = (
+            urlsplit(publisher_sources[0])._replace(path="/direct-channel").geturl()
+        )
+        secondary_publisher = _publish_generated(
+            helpers, ffmpeg, videos[0], secondary_publisher_source, private
+        )
+        processes.append(secondary_publisher)
         stage = "authenticated_rtsp_read_controls"
         rtsp_auth_proof = _assert_rtsp_read_auth(
             ffprobe, sources[0], onvif_cameras[0].username, onvif_cameras[0].password
@@ -1671,6 +1804,119 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             views = client.json("/api/v1/operator/cameras")["cameras"]
             return len(views) == 4 and all(v["status"] == "live" and v["recording"] for v in views)
 
+        stage = "direct_rtsp_reconnect"
+        stream_camera = _rtsp_enroll(
+            page,
+            name=_CAMERAS[0][0],
+            source_uri=sources[0],
+            username=onvif_cameras[0].username,
+            password=onvif_cameras[0].password,
+            device_id=camera_ids[0],
+            reject_wrong=True,
+        )
+        _require(
+            stream_camera["device_id"] == camera_ids[0],
+            "Direct-stream reconnect changed the retained camera identity",
+        )
+        stage = "direct_rtsp_live_and_recording"
+        runtime._wait(
+            both_live,
+            label="Direct-stream reconnect preserves all four recording sources",
+            product=product,
+            timeout=20,
+        )
+        _open_camera_watch(page, camera_ids[0])
+        receipt["direct_rtsp_live_decoded_frames"] = _decoded_color(page, "live-video", "red")
+        stream_recording_before = _camera_recording_bytes(product, camera_ids)[0]
+        stream_recording_started = time.monotonic()
+        stream_recording_utc = (
+            datetime.fromisoformat(
+                client.json("/api/v1/operator/status")["server_utc"].replace("Z", "+00:00")
+            ).timestamp()
+            * 1000
+        )
+        runtime._wait(
+            lambda: (
+                time.monotonic() - stream_recording_started >= 6
+                and _camera_recording_bytes(product, camera_ids)[0] > stream_recording_before
+            ),
+            label="Direct-stream camera records a new playable interval",
+            product=product,
+            timeout=15,
+        )
+        receipt["direct_rtsp_recording_bytes_before"] = stream_recording_before
+        receipt["direct_rtsp_recording_bytes_after"] = _camera_recording_bytes(product, camera_ids)[
+            0
+        ]
+        receipt["direct_rtsp_enrollment"] = True
+        receipt["direct_rtsp_wrong_password_rejected"] = True
+        receipt["direct_rtsp_reconnect_preserved_identity"] = True
+        stage = "direct_rtsp_fresh_channel_enrollment"
+        fresh_name = "Generated direct RTSP channel"
+        fresh_camera = _rtsp_enroll(
+            page,
+            name=fresh_name,
+            source_uri=secondary_source,
+            username=onvif_cameras[0].username,
+            password=onvif_cameras[0].password,
+        )
+        fresh_id = fresh_camera["device_id"]
+        _require(fresh_id not in camera_ids, "Different RTSP channel reused a camera identity")
+        first_endpoint, second_endpoint = urlsplit(sources[0]), urlsplit(secondary_source)
+        _require(
+            (first_endpoint.hostname, first_endpoint.port)
+            == (second_endpoint.hostname, second_endpoint.port)
+            and first_endpoint.path != second_endpoint.path,
+            "Fresh direct-stream fixture did not exercise two channels at one endpoint",
+        )
+
+        def fresh_channel_live():
+            views = client.json("/api/v1/operator/cameras")["cameras"]
+            return len(views) == 5 and all(
+                view["status"] == "live" and view["recording"] for view in views
+            )
+
+        runtime._wait(
+            fresh_channel_live,
+            label="Fresh RTSP channel and existing cameras record independently",
+            product=product,
+            timeout=20,
+        )
+        page.locator(".camera-item").filter(has_text=fresh_name).click()
+        page.locator("#live-panel").wait_for(state="visible")
+        receipt["direct_rtsp_fresh_live_decoded_frames"] = _decoded_color(page, "live-video", "red")
+        fresh_before = _camera_recording_bytes(product, [fresh_id])[0]
+        runtime._wait(
+            lambda: _camera_recording_bytes(product, [fresh_id])[0] > fresh_before,
+            label="Fresh RTSP channel writes new recording bytes",
+            product=product,
+            timeout=15,
+        )
+        receipt["direct_rtsp_fresh_recording_bytes_before"] = fresh_before
+        receipt["direct_rtsp_fresh_recording_bytes_after"] = _camera_recording_bytes(
+            product, [fresh_id]
+        )[0]
+        page.locator("#remove-camera-button").click()
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "DELETE"
+                and response.url.endswith(f"/api/v1/operator/cameras/{fresh_id}")
+            )
+        ) as removed_fresh:
+            page.locator("#confirm-remove-camera").click()
+        _require(
+            removed_fresh.value.status == 204, "Temporary direct-stream channel removal failed"
+        )
+        page.locator("#remove-camera-dialog").wait_for(state="hidden")
+        page.wait_for_function("() => document.getElementById('camera-count').textContent === '4'")
+        helpers._stop_owned(secondary_publisher)
+        _require(
+            {view["device_id"] for view in client.json("/api/v1/operator/cameras")["cameras"]}
+            == set(camera_ids),
+            "Fresh channel cleanup changed the four-camera qualification inventory",
+        )
+        receipt["direct_rtsp_fresh_enrollment"] = True
+        receipt["direct_rtsp_multi_channel_same_endpoint"] = True
         stage = "concurrent_recording"
         runtime._wait(
             both_live, label="Concurrent four-camera recording", product=product, timeout=20
@@ -2054,7 +2300,11 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             stage = "playback_decode"
             playback_frames.append(
                 _timeline_play(
-                    page, color, device_id=camera_ids[index], diagnostic=history_diagnostic
+                    page,
+                    color,
+                    device_id=camera_ids[index],
+                    diagnostic=history_diagnostic,
+                    not_before=stream_recording_utc if index == 0 else None,
                 )
             )
             stage = "actual_recording_export"
@@ -2082,6 +2332,9 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         receipt["timeline_seek_playback"] = True
         receipt["export_decoded_frames"] = export_frames
         receipt["actual_download_saved_and_decoded"] = True
+        receipt["direct_rtsp_playback_decoded_frames"] = playback_frames[0]
+        receipt["direct_rtsp_export_decoded_frames"] = export_frames[0]
+        receipt["direct_rtsp_history_and_export"] = True
         receipt["recording_pixel_isolation"] = True
         receipt["ui_history_and_gaps"] = True
         receipt["server_utc_rolling_history"] = True

@@ -75,6 +75,7 @@ def _product_path(path: str) -> bool:
             _PREFIX + "/media-session",
             _PREFIX + "/camera-discovery",
             _PREFIX + "/camera-profiles",
+            _PREFIX + "/camera-stream-probe",
         }
     )
 
@@ -382,6 +383,9 @@ def install_operator_product_api(
             "host": str(source.device.host),
             "management_port": source.device.management_port,
             "management_secure": "k5-onvif-https" in source.device.tags,
+            "connection_type": "onvif"
+            if DeviceProtocol.ONVIF in source.device.protocols
+            else "rtsp",
             "status": "unavailable",
             "recording": False,
             "recording_enabled": source.recording_enabled,
@@ -517,6 +521,8 @@ def install_operator_product_api(
         management_port: int = 80,
         management_secure: bool = False,
         onvif: bool = False,
+        stream_key: str | None = None,
+        reconnect_id: UUID | None = None,
         before_store=None,
     ):
         try:
@@ -543,6 +549,27 @@ def install_operator_product_api(
                 before_store()
             try:
                 existing = selections()
+                known_stream = (
+                    registry.find_stream(str(request.host), management_port, stream_key)
+                    if stream_key is not None
+                    else None
+                )
+                if (
+                    stream_key is not None
+                    and reconnect_id is None
+                    and len(existing) >= 64
+                    and not any(
+                        known_stream is not None and source.device.id == known_stream.id
+                        for source in existing
+                    )
+                ):
+                    raise HTTPException(409, "Camera capacity reached")
+                if reconnect_id is not None:
+                    previous = selection(reconnect_id)
+                    if previous.device.name != request.name or previous.device.host != request.host:
+                        raise HTTPException(
+                            422, "Stream must match the selected camera name and host"
+                        )
                 reconnect = (
                     registry.find_name_host(request.name, str(request.host)) if onvif else []
                 )
@@ -551,6 +578,7 @@ def install_operator_product_api(
                 if (
                     len(existing) >= 64
                     and not reconnect
+                    and reconnect_id is None
                     and not any(
                         source.device.host == request.host
                         and source.device.management_port == request.management_port
@@ -558,7 +586,11 @@ def install_operator_product_api(
                     )
                 ):
                     raise HTTPException(409, "Camera capacity reached")
-                if reconnect:
+                if reconnect_id is not None:
+                    source = cameras.reconnect_stream(
+                        reconnect_id, source_uri, management_port, stream_key
+                    )
+                elif reconnect:
                     source = cameras.reconnect_onvif(
                         reconnect[0].id,
                         source_uri,
@@ -566,7 +598,11 @@ def install_operator_product_api(
                         secure=management_secure,
                     )
                 else:
-                    device = registry.enroll(request).device
+                    device = (
+                        registry.enroll_stream(request, stream_key).device
+                        if stream_key is not None
+                        else registry.enroll(request).device
+                    )
                     source = cameras.upsert(device, source_uri)
                 seen_live.discard(source.binding.device_id)
                 connection_started[source.binding.device_id] = monotonic()
@@ -597,6 +633,11 @@ def install_operator_product_api(
     from k5vision.operator_onvif_api import install_operator_onvif_api
 
     onvif_probes = install_operator_onvif_api(
+        app, require_admin=require_admin, authenticate=authenticate, enroll=enroll_camera_source
+    )
+    from k5vision.operator_rtsp_api import install_operator_rtsp_api
+
+    rtsp_probes = install_operator_rtsp_api(
         app, require_admin=require_admin, authenticate=authenticate, enroll=enroll_camera_source
     )
 
@@ -827,6 +868,7 @@ def install_operator_product_api(
         scheme, separator, token = (values[0] if len(values) == 1 else "").partition(" ")
         if separator and scheme.lower() == "bearer" and _SESSION_TOKEN.fullmatch(token) is not None:
             onvif_probes.clear_token(token)
+            rtsp_probes.clear_token(token)
         if (
             analytics is not None
             and separator

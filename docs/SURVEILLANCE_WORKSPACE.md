@@ -5,7 +5,7 @@ sign in. The native window launches and supervises the engine; the browser
 workspace contains the live views, recordings and camera controls. Engine ready
 does not mean a camera is already recording.
 
-For installation and ONVIF account/profile setup, follow the
+For installation, ONVIF account/profile setup and direct RTSP stream setup, follow the
 [Windows desktop guide](WINDOWS_DESKTOP_BETA.md). Download installers from
 [public GitHub Releases](https://github.com/mkurtgerald/K5-Vision/releases) and
 check the release's matching Windows qualification receipt for this workflow.
@@ -20,7 +20,8 @@ Leaving a page or view stops its browser players, while background recording
 continues according to each camera's recording choice.
 
 If video is disconnected, check the camera's power and network, then retry.
-Use **Reconnect camera** to retest its ONVIF account and profile when necessary.
+Use **Reconnect camera** to retest its ONVIF account/profile or direct RTSP stream
+when necessary.
 Keep the original camera name and host when restoring a removed camera's identity
 and retained history.
 

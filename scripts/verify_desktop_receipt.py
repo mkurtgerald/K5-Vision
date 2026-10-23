@@ -25,7 +25,9 @@ _TRUE = (
     "other_recording_while_paused timeline_seek_playback actual_recording_export "
     "recording_choice_persisted logout_destroys_wall authenticated_camera_read "
     "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected authenticated_camera_restart_live "
-    "wall_viewport_fit native_launch_argument_matched browser_origin_connected page_window_visible"
+    "wall_viewport_fit native_launch_argument_matched browser_origin_connected page_window_visible "
+    "direct_rtsp_enrollment direct_rtsp_wrong_password_rejected direct_rtsp_persisted "
+    "direct_rtsp_fresh_enrollment direct_rtsp_multi_channel_same_endpoint"
 ).split()
 _FALSE = (
     "physical_camera_acceptance capacity_acceptance endurance_acceptance windows_service "
@@ -53,6 +55,21 @@ def _nvr_journey(receipt):
     _require(type(viewport) is list and len(viewport) == 2)
     _require(all(type(size) is int for size in viewport) and viewport == [1440, 900])
     _integers(receipt.get("wall_decoded_frames"), 4, 4)
+    for field in (
+        "direct_rtsp_live_decoded_frames",
+        "direct_rtsp_history_decoded_frames",
+        "direct_rtsp_fresh_live_decoded_frames",
+    ):
+        value = receipt.get(field)
+        _require(type(value) is int and 4 <= value <= 100000)
+    direct_before = receipt.get("direct_rtsp_recording_bytes_before")
+    direct_after = receipt.get("direct_rtsp_recording_bytes_after")
+    _require(type(direct_before) is int and 0 <= direct_before <= 2**63 - 1)
+    _require(type(direct_after) is int and direct_before < direct_after <= 2**63 - 1)
+    fresh_before = receipt.get("direct_rtsp_fresh_recording_bytes_before")
+    fresh_after = receipt.get("direct_rtsp_fresh_recording_bytes_after")
+    _require(type(fresh_before) is int and 0 <= fresh_before <= 2**63 - 1)
+    _require(type(fresh_after) is int and fresh_before < fresh_after <= 2**63 - 1)
     for prefix, count, minimum in (
         ("camera_recording_bytes", 4, 0),
         ("outage_other_live_frames", 3, 4),

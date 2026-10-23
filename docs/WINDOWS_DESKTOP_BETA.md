@@ -36,6 +36,22 @@ The camera must be reachable from this PC and have ONVIF and H.264 enabled.
 Camera credentials may differ from your K5 account. An accepted camera account
 does not establish that video or recording has begun.
 
+### Connect a direct RTSP stream
+
+For a camera or encoder with a known stream address, select **Add camera** and
+choose **RTSP stream** as the connection type. Enter a name and the full
+`rtsp://` or `rtsps://` address using the device's numeric IP address. Enter its
+username and password if the stream requires an account. Select **Test
+connection**, then **Connect camera** after K5 confirms an H.264 stream.
+Different stream paths on the same device and port can be added separately.
+
+Direct streams use the same camera wall, recording controls, UTC history and MP4
+export as ONVIF cameras. Use **Reconnect camera** to test a replacement stream
+address or account while preserving the selected camera's history and recording
+preference. RTSP does not expose the camera's management clock; check its time
+and NTP settings through the camera's own settings. K5 continues to show the
+recorder's time diagnostics.
+
 ## Watch, review and save
 
 On **Camera wall**, choose **1 camera**, **2 × 2** or **3 × 3** and use

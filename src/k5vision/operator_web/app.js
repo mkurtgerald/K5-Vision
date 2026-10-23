@@ -13,6 +13,7 @@
     "discovery_unavailable", "camera_auth_failed", "camera_unreachable",
     "camera_unsupported", "camera_invalid_response", "camera_busy",
     "camera_probe_expired", "camera_profile_unsupported",
+    "stream_invalid", "stream_auth_failed", "stream_unsupported", "stream_unreachable", "stream_invalid_response",
   ]);
   const state = {
     token: "", account: null, cameras: [], workerStatus: "ready", selected: null, media: null,
@@ -23,6 +24,7 @@
     spans: [], selectedSpan: null, historyEpoch: 0, historyRolling: true, signingOut: false,
     dialogMode: "add", cameraSetupEpoch: 0, diagnostics: null, statusUnavailable: false,
     cameraSetupBusy: false, cameraSetupController: null, cameraProbe: null, cameraProbeTimer: null,
+    cameraSetupTarget: null,
     cameraConnectionNotice: null,
     recorderTime: null, sessionExpiresAt: null, sessionExpirySteady: null,
     removeTarget: null, removing: false,
@@ -1316,6 +1318,28 @@
     return state.account?.role === "administrator" && Boolean(state.token) && !state.signingOut;
   }
 
+  function cameraSetupType() {
+    return $("camera-connection-type").value === "rtsp" ? "rtsp" : "onvif";
+  }
+
+  function renderCameraSetupType() {
+    const direct = cameraSetupType() === "rtsp", updating = state.dialogMode === "update";
+    $("camera-onvif-settings").hidden = direct;
+    $("camera-stream-settings").hidden = !direct;
+    $("camera-discovery-section").hidden = direct || updating;
+    $("camera-setup-description").textContent = direct
+      ? updating ? "Enter the replacement RTSP stream address for this camera. Reconnecting keeps its identity and recording history."
+        : "Connect a camera or video source directly using its RTSP stream address, with an optional camera account."
+      : updating ? "Sign in to this camera and test its available video streams. Reconnecting keeps its identity and recording history."
+        : "Find an ONVIF camera on your network, then sign in to the camera. K5 finds its available video streams for you.";
+    $("camera-account-help").textContent = direct
+      ? "Leave the account blank for a stream that does not require authentication. The stream address, username and password are cleared after testing."
+      : "Use the account configured on this camera. Its password is cleared after testing.";
+    $("camera-profile-help").textContent = direct
+      ? "This stream reports H.264 video for live viewing and continuous recording. K5 does not change the source settings."
+      : "Choose an H.264 stream for live video and continuous recording. K5 does not change camera settings.";
+  }
+
   function clearCameraProbe() {
     clearTimeout(state.cameraProbeTimer);
     state.cameraProbeTimer = null;
@@ -1357,18 +1381,24 @@
     $("camera-clock-status").hidden = false;
   }
 
+  function renderStreamClock() {
+    message("camera-clock-status", "RTSP does not provide a camera clock check. Recording history uses recorder UTC. Verify Windows time synchronization and the camera’s NTP settings.", true);
+    $("camera-clock-status").hidden = false;
+  }
+
   function setCameraSetupBusy(busy, action = "") {
     state.cameraSetupBusy = busy;
+    const direct = cameraSetupType() === "rtsp";
     $("add-camera-form").setAttribute("aria-busy", String(busy));
-    for (const id of [
-      "new-camera-name", "new-camera-host", "new-camera-port", "new-camera-secure",
-      "new-camera-username", "new-camera-password",
-    ]) $(id).disabled = busy;
-    $("find-cameras").disabled = busy || !canManageCameras() || state.dialogMode === "update";
+    for (const id of ["new-camera-name", "new-camera-username", "new-camera-password"]) $(id).disabled = busy;
+    for (const id of ["new-camera-host", "new-camera-port", "new-camera-secure"]) $(id).disabled = busy || direct;
+    $("new-camera-stream-uri").disabled = busy || !direct;
+    $("camera-connection-type").disabled = busy;
+    $("find-cameras").disabled = busy || direct || !canManageCameras() || state.dialogMode === "update";
     $("test-camera-connection").disabled = busy || !canManageCameras();
     $("camera-profile").disabled = busy || !state.cameraProbe;
     const selected = state.cameraProbe?.profiles.find((profile) => profile.id === $("camera-profile").value);
-    $("save-camera").disabled = busy || !canManageCameras() || !selected?.supported;
+    $("save-camera").disabled = busy || !canManageCameras() || !selected?.supported || state.cameraProbe?.kind !== cameraSetupType();
     $("find-cameras").textContent = action === "discovery" ? "Finding cameras…" : "Find cameras on this network";
     $("test-camera-connection").textContent = action === "profiles" ? "Testing camera…" : "Test connection";
     $("save-camera").textContent = action === "connect" ? "Connecting camera…" : state.dialogMode === "update" ? "Reconnect camera" : "Connect camera";
@@ -1381,12 +1411,14 @@
     state.cameraSetupController = null;
     clearCameraProbe();
     $("add-camera-form").reset();
+    state.cameraSetupTarget = null;
     $("new-camera-name").readOnly = false;
     $("new-camera-host").readOnly = false;
     $("discovered-cameras").replaceChildren();
     message("camera-discovery-message", "If Windows Firewall blocks discovery, enter the camera’s IP address below.");
     message("add-camera-message", "");
     state.dialogMode = "add";
+    renderCameraSetupType();
     setCameraSetupBusy(false);
   }
 
@@ -1416,14 +1448,42 @@
       camera_probe_expired: "The connection test expired. Enter the camera password and test again.",
       camera_profile_unsupported: "Choose an H.264 stream. Other video formats are not supported yet.",
     };
+    if (cameraSetupType() === "rtsp") {
+      Object.assign(messages, {
+        camera_auth_failed: "Stream authentication failed. Check the camera username and password, then test again.",
+        camera_unreachable: "The stream could not be reached. Check the camera address, stream port and path, and confirm RTSP is enabled.",
+        camera_unsupported: "The stream does not report supported H.264 video. Choose an H.264 stream and test again.",
+        camera_invalid_response: "The source did not return a usable RTSP stream. Check its address and stream settings.",
+        camera_probe_expired: "The connection test expired. Enter the stream address and account, then test again.",
+      });
+      messages.stream_invalid = "Enter an rtsp:// or rtsps:// stream address with the camera’s numeric IP address and stream path. Use either the URL account or the separate account fields.";
+      for (const name of ["auth_failed", "unsupported", "unreachable", "invalid_response"]) {
+        messages[`stream_${name}`] = messages[`camera_${name}`];
+      }
+    }
     return messages[error.code] || (error.status === 410
       ? messages.camera_probe_expired
       : error.status === 409 ? "This camera is already configured. Select it in the camera list to reconnect."
-        : error.status === 422 ? "Check the camera’s IP address, camera settings port and account, then test again."
+        : error.status === 422 ? cameraSetupType() === "rtsp"
+          ? "Check the RTSP address, numeric camera IP, stream port and account, then test again. Reconnecting uses the same camera IP address."
+          : "Check the camera’s IP address, camera settings port and account, then test again."
           : apiMessage(error, "The camera connection did not complete. Check the camera settings and try again."));
   }
 
   function cameraConnection() {
+    if (cameraSetupType() === "rtsp") {
+      const source_uri = $("new-camera-stream-uri").value.trim();
+      try {
+        const parsed = new URL(source_uri);
+        if (!source_uri || source_uri.length > 4096 || /[\s\\]/.test(source_uri) ||
+          !["rtsp:", "rtsps:"].includes(parsed.protocol) || !parsed.hostname || parsed.hash) throw new SelectionError();
+      } catch {
+        message("add-camera-message", "Enter an rtsp:// or rtsps:// stream address with the camera’s numeric IP address and stream path.", true);
+        $("new-camera-stream-uri").focus();
+        return null;
+      }
+      return { source_uri, username: $("new-camera-username").value, password: $("new-camera-password").value };
+    }
     const host = $("new-camera-host").value.trim();
     if (!host || /[\s/?#@\\]/.test(host) || host.includes("://")) {
       message("add-camera-message", "Enter the camera’s numeric IP address, without a web or video address.", true);
@@ -1446,13 +1506,12 @@
     if (mode === "update") stopPersonView();
     resetCameraSetup();
     state.dialogMode = mode;
+    state.cameraSetupTarget = camera?.device_id || null;
+    $("camera-connection-type").value = camera?.connection_type === "rtsp" ? "rtsp" : "onvif";
     $("new-camera-name").readOnly = mode === "update";
     $("new-camera-host").readOnly = mode === "update";
     $("add-camera-title").textContent = mode === "update" ? "Reconnect camera" : "Add a camera";
-    $("camera-setup-description").textContent = mode === "update"
-      ? "Sign in to this camera and test its available video streams. Reconnecting keeps its identity and recording history."
-      : "Find an ONVIF camera on your network, then sign in to the camera. K5 finds its available video streams for you.";
-    $("camera-discovery-section").hidden = mode === "update";
+    renderCameraSetupType();
     if (camera) {
       $("new-camera-name").value = camera.name;
       $("new-camera-host").value = camera.host;
@@ -1461,7 +1520,7 @@
     }
     setCameraSetupBusy(false);
     $("add-camera-dialog").showModal();
-    $(mode === "update" ? "new-camera-username" : "find-cameras").focus();
+    $(cameraSetupType() === "rtsp" ? "new-camera-stream-uri" : mode === "update" ? "new-camera-username" : "find-cameras").focus();
   }
   $("add-camera-button").addEventListener("click", () => openCameraSetup("add"));
   $("update-source-button").addEventListener("click", () => openCameraSetup("update"));
@@ -1474,10 +1533,20 @@
   $("add-camera-dialog").addEventListener("close", () => {
     if ($("add-camera-dialog").open) return;
     $("new-camera-password").value = "";
+    $("new-camera-username").value = "";
+    $("new-camera-stream-uri").value = "";
   });
   for (const id of [
-    "new-camera-name", "new-camera-host", "new-camera-port", "new-camera-username", "new-camera-password",
+    "new-camera-name", "new-camera-host", "new-camera-port", "new-camera-username", "new-camera-password", "new-camera-stream-uri",
   ]) $(id).addEventListener("input", cameraSetupChanged);
+  $("camera-connection-type").addEventListener("change", () => {
+    cameraSetupChanged();
+    $("new-camera-stream-uri").value = "";
+    $("new-camera-username").value = "";
+    $("new-camera-password").value = "";
+    renderCameraSetupType();
+    setCameraSetupBusy(false);
+  });
   $("new-camera-secure").addEventListener("change", () => {
     if ($("new-camera-secure").checked && $("new-camera-port").value === "80") $("new-camera-port").value = "443";
     else if (!$("new-camera-secure").checked && $("new-camera-port").value === "443") $("new-camera-port").value = "80";
@@ -1540,20 +1609,22 @@
     if (!canManageCameras() || state.cameraSetupBusy) return;
     const credentials = cameraConnection();
     if (!credentials) return;
+    const kind = cameraSetupType(), direct = kind === "rtsp";
     clearCameraProbe();
     const epoch = state.sessionEpoch, setupEpoch = state.cameraSetupEpoch;
     const controller = new AbortController();
     state.cameraSetupController = controller;
     setCameraSetupBusy(true, "profiles");
-    message("add-camera-message", "Signing in to the camera and reading its video streams…");
+    message("add-camera-message", direct ? "Checking the RTSP stream and its video format…" : "Signing in to the camera and reading its video streams…");
     try {
-      const tested = await request("/api/v1/operator/camera-profiles", {
+      const tested = await request(direct ? "/api/v1/operator/camera-stream-probe" : "/api/v1/operator/camera-profiles", {
         method: "POST", body: credentials, signal: controller.signal,
       });
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       if (typeof tested.probe_id !== "string" || !tested.probe_id || tested.probe_id.length > 256 || tested.probe_id.includes("://") ||
         !Array.isArray(tested.profiles) || tested.profiles.length > 64) throw new SelectionError();
-      renderCameraClock(tested.clock);
+      if (direct) renderStreamClock();
+      else renderCameraClock(tested.clock);
       const profiles = tested.profiles.filter((profile) =>
         typeof profile.id === "string" && profile.id && profile.id.length <= 256 && !profile.id.includes("://") &&
         ["H264", "H265", "MJPEG", "UNKNOWN"].includes(profile.codec)
@@ -1576,10 +1647,12 @@
       }
       $("camera-profile-section").hidden = false;
       if (!first) {
-        message("add-camera-message", "The camera account was accepted, but no H.264 stream is available. Enable H.264 in the camera settings, then test again.", true);
+        message("add-camera-message", direct
+          ? "The stream does not report supported H.264 video. Choose an H.264 stream and test again."
+          : "The camera account was accepted, but no H.264 stream is available. Enable H.264 in the camera settings, then test again.", true);
         return;
       }
-      state.cameraProbe = { id: tested.probe_id, profiles };
+      state.cameraProbe = { id: tested.probe_id, profiles, kind };
       $("camera-profile").value = first.id;
       const lifetime = Number.isInteger(tested.expires_in_seconds) && tested.expires_in_seconds > 0
         ? Math.min(tested.expires_in_seconds, 120) : 120;
@@ -1589,18 +1662,31 @@
         state.cameraSetupController?.abort();
         state.cameraSetupController = null;
         clearCameraProbe();
-        message("add-camera-message", "The connection test expired. Enter the camera password and test again.", true);
+        message("add-camera-message", direct
+          ? "The connection test expired. Enter the stream address and account, then test again."
+          : "The connection test expired. Enter the camera password and test again.", true);
         setCameraSetupBusy(false);
       }, lifetime * 1000);
-      message("add-camera-message", "Camera account accepted. Choose an H.264 stream; video is checked after connecting.");
+      message("add-camera-message", direct
+        ? "RTSP stream reports H.264 video. Connect to start live viewing and recording; video is confirmed after connecting."
+        : "Camera account accepted. Choose an H.264 stream; video is checked after connecting.");
     } catch (error) {
       if (controller.signal.aborted || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
-      renderCameraClock(error.clock);
+      if (direct) renderStreamClock();
+      else renderCameraClock(error.clock);
       message("add-camera-message", cameraSetupError(error), true);
     } finally {
       credentials.password = "";
+      if (direct) {
+        credentials.source_uri = "";
+        credentials.username = "";
+      }
       if (epoch === state.sessionEpoch && setupEpoch === state.cameraSetupEpoch) {
         $("new-camera-password").value = "";
+        if (direct) {
+          $("new-camera-stream-uri").value = "";
+          $("new-camera-username").value = "";
+        }
         state.cameraSetupController = null;
         setCameraSetupBusy(false);
         if (state.cameraProbe) $("camera-profile").focus();
@@ -1614,17 +1700,19 @@
     const epoch = state.sessionEpoch;
     const setupEpoch = state.cameraSetupEpoch;
     const updating = state.dialogMode === "update";
+    const direct = state.cameraProbe.kind === "rtsp";
     const profile = state.cameraProbe.profiles.find((item) => item.id === $("camera-profile").value && item.supported);
     if (!profile) return;
     const camera = {
       name: $("new-camera-name").value.trim(), probe_id: state.cameraProbe.id, profile_id: profile.id,
+      ...(direct && updating ? { device_id: state.cameraSetupTarget } : {}),
     };
     const controller = new AbortController();
     state.cameraSetupController = controller;
     setCameraSetupBusy(true, "connect");
     message("add-camera-message", updating ? "Reconnecting live video and recording…" : "Connecting your camera…");
     try {
-      const created = await request("/api/v1/operator/cameras/connect", {
+      const created = await request(direct ? "/api/v1/operator/cameras/stream-connect" : "/api/v1/operator/cameras/connect", {
         method: "POST", body: camera, signal: controller.signal,
       });
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;

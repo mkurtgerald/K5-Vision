@@ -87,7 +87,10 @@ _TRUE = {
         "recording_preference_persisted recording_resume_growth ui_recording_controls "
         "timeline_seek_playback actual_download_saved_and_decoded logout_destroyed_wall_tiles "
         "logout_background_recording_continues authenticated_camera_read "
-        "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected wall_viewport_fit"
+        "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected wall_viewport_fit "
+        "direct_rtsp_enrollment direct_rtsp_fresh_enrollment "
+        "direct_rtsp_multi_channel_same_endpoint direct_rtsp_wrong_password_rejected "
+        "direct_rtsp_reconnect_preserved_identity direct_rtsp_history_and_export"
     ).split(),
     "person": (
         "single_flight_busy independent_view_workers third_view_capacity_denied "
@@ -122,6 +125,19 @@ def _browser_nvr_journey(receipt):
     viewport = receipt.get("wall_viewport")
     _require(type(viewport) is list and len(viewport) == 2)
     _require(all(type(size) is int for size in viewport) and viewport == [1440, 900])
+    for field, minimum in (
+        ("direct_rtsp_live_decoded_frames", 4),
+        ("direct_rtsp_playback_decoded_frames", 4),
+        ("direct_rtsp_export_decoded_frames", 1),
+        ("direct_rtsp_recording_bytes_before", 0),
+        ("direct_rtsp_recording_bytes_after", 1),
+    ):
+        value = receipt.get(field)
+        _require(type(value) is int and minimum <= value <= 2**63 - 1)
+    _require(
+        receipt["direct_rtsp_recording_bytes_after"]
+        > receipt["direct_rtsp_recording_bytes_before"]
+    )
     for field in (
         "real_camera_acceptance",
         "analytics_acceptance",
