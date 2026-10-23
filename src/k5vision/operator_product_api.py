@@ -7,7 +7,9 @@ import hashlib
 import ipaddress
 import math
 import re
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlsplit
 from uuid import UUID
@@ -15,7 +17,7 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress
+from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress, StrictBool
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -73,6 +75,7 @@ def _product_path(path: str) -> bool:
             _PREFIX + "/media-session",
             _PREFIX + "/camera-discovery",
             _PREFIX + "/camera-profiles",
+            _PREFIX + "/camera-stream-probe",
         }
     )
 
@@ -151,6 +154,12 @@ class _CameraEnrollment(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     host: IPvAnyAddress
     source_uri: str = Field(min_length=1, max_length=4096, repr=False)
+
+
+class _RecordingPreference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: StrictBool
 
 
 def _unauthorized() -> HTTPException:
@@ -264,6 +273,10 @@ def install_operator_product_api(
     mutations = asyncio.Lock()
     person_slots = asyncio.Semaphore(4)
     seen_live: set[UUID] = set()
+    connection_started: dict[UUID, float] = {}
+    recording_started: dict[UUID, float] = {}
+    recording_changed: dict[UUID, float] = {}
+    media_generation = getattr(service, "media_generation", 0)
     app.add_middleware(_BoundedProductBody)
     previous_validation_handler = app.exception_handlers.get(
         RequestValidationError, request_validation_exception_handler
@@ -351,33 +364,121 @@ def install_operator_product_api(
                 return source
         raise HTTPException(404, "Camera not found")
 
-    async def camera_view(source: MediaMTXSource) -> dict:
+    async def camera_view(source: MediaMTXSource, *, worker_snapshot=None) -> dict:
+        nonlocal media_generation
+        now = monotonic()
+        generation = getattr(service, "media_generation", 0)
+        if generation != media_generation:
+            seen_live.clear()
+            connection_started.clear()
+            recording_started.clear()
+            recording_changed.clear()
+            recording_changed.update((item.binding.device_id, now) for item in selections())
+            media_generation = generation
+        identifier = source.binding.device_id
+        connection_started.setdefault(identifier, now)
         result = {
             "device_id": str(source.binding.device_id),
             "name": source.device.name,
             "host": str(source.device.host),
             "management_port": source.device.management_port,
             "management_secure": "k5-onvif-https" in source.device.tags,
+            "connection_type": "onvif"
+            if DeviceProtocol.ONVIF in source.device.protocols
+            else "rtsp",
             "status": "unavailable",
             "recording": False,
+            "recording_enabled": source.recording_enabled,
+            "recording_state": "error",
+            "recording_status": {
+                "reason": "worker_unavailable",
+                "observed_bytes": 0,
+                "last_progress_age_seconds": None,
+            },
+            "connection_error": None,
             "analytics_status": person_status,
         }
         if service.status() not in {"ready", "disk_full"}:
+            if not source.recording_enabled:
+                result["recording_state"] = "paused"
+                result["recording_status"]["reason"] = "operator_paused"
             return result
         try:
-            state = await service.provider.path_state(source.binding)
-            configuration = await service.provider.path_configuration(source.binding)
+            if isinstance(worker_snapshot, MediaWorkerErrorCode):
+                raise MediaWorkerError(worker_snapshot)
+            if worker_snapshot is None:
+                state = await service.provider.path_state(source.binding)
+                configuration = await service.provider.path_configuration(source.binding)
+            else:
+                state, configuration = worker_snapshot
+            now = monotonic()
             if state.online and state.available:
                 seen_live.add(source.binding.device_id)
                 result["status"] = "live"
                 result["recording"] = configuration.recording_enabled
-            elif source.binding.device_id in seen_live or state.available:
+            elif (
+                identifier in seen_live
+                or state.available
+                or now - connection_started[identifier] >= 30
+            ):
                 result["status"] = "disconnected"
             else:
                 result["status"] = "connecting"
         except MediaWorkerError as exc:
+            now = monotonic()
             if exc.code is MediaWorkerErrorCode.NOT_FOUND:
-                result["status"] = "connecting"
+                result["status"] = (
+                    "disconnected"
+                    if identifier in seen_live or now - connection_started[identifier] >= 30
+                    else "connecting"
+                )
+        if result["status"] == "disconnected":
+            result["connection_error"] = "stream_unavailable"
+        if not source.recording_enabled:
+            recording_started.pop(identifier, None)
+            result["recording_state"], reason = "paused", "operator_paused"
+        elif service.status() == "disk_full":
+            result["recording_state"], reason = "paused", "storage_paused"
+        elif result["status"] == "unavailable":
+            result["recording_state"], reason = "error", "worker_unavailable"
+        elif result["status"] != "live":
+            recording_started.pop(identifier, None)
+            result["recording_state"], reason = "waiting", "camera_unavailable"
+        elif result["recording"] is not True:
+            result["recording_state"], reason = "error", "configuration_mismatch"
+        else:
+            began = recording_started.setdefault(identifier, now)
+            try:
+                progress = service.recording_progress(source.binding)
+                size, age = progress["observed_bytes"], progress["last_progress_age_seconds"]
+                if type(size) is not int or not 0 <= size <= 2**63 - 1:
+                    raise ValueError
+                if age is not None and (
+                    type(age) not in (int, float) or not math.isfinite(age) or age < 0
+                ):
+                    raise ValueError
+                result["recording_status"].update(
+                    observed_bytes=size,
+                    last_progress_age_seconds=None if age is None else min(86400, age),
+                )
+                if progress.get("inspection_complete") is not True:
+                    result["recording_state"], reason = "error", "storage_inspection"
+                elif (
+                    age is not None
+                    and age <= 45
+                    and (
+                        identifier not in recording_changed
+                        or now - age >= recording_changed[identifier]
+                    )
+                ):
+                    result["recording_state"], reason = "recording", "disk_progress"
+                elif now - began >= 45:
+                    result["recording_state"], reason = "stalled", "no_disk_progress"
+                else:
+                    result["recording_state"], reason = "waiting", "awaiting_disk_progress"
+            except Exception:
+                result["recording_state"], reason = "error", "storage_inspection"
+        result["recording_status"]["reason"] = reason
         return result
 
     read_session = Depends(require_session)
@@ -391,14 +492,23 @@ def install_operator_product_api(
     @app.get(_PREFIX + "/cameras", tags=["operator"])
     async def list_cameras(_session: tuple[UserAccount, str] = read_session):
         selected = selections()
-        semaphore = asyncio.Semaphore(4)
-
-        async def view(source):
-            async with semaphore:
-                return await camera_view(source)
+        snapshot = {}
+        if selected and service.status() in {"ready", "disk_full"}:
+            try:
+                snapshot = await service.provider.path_snapshot(
+                    tuple(source.binding for source in selected)
+                )
+            except MediaWorkerError as error:
+                snapshot = {source.binding: error.code for source in selected}
 
         return {
-            "cameras": await asyncio.gather(*(view(source) for source in selected)),
+            "cameras": [
+                await camera_view(
+                    source,
+                    worker_snapshot=snapshot.get(source.binding, MediaWorkerErrorCode.UNAVAILABLE),
+                )
+                for source in selected
+            ],
             "worker_status": service.status(),
         }
 
@@ -411,6 +521,8 @@ def install_operator_product_api(
         management_port: int = 80,
         management_secure: bool = False,
         onvif: bool = False,
+        stream_key: str | None = None,
+        reconnect_id: UUID | None = None,
         before_store=None,
     ):
         try:
@@ -437,6 +549,27 @@ def install_operator_product_api(
                 before_store()
             try:
                 existing = selections()
+                known_stream = (
+                    registry.find_stream(str(request.host), management_port, stream_key)
+                    if stream_key is not None
+                    else None
+                )
+                if (
+                    stream_key is not None
+                    and reconnect_id is None
+                    and len(existing) >= 64
+                    and not any(
+                        known_stream is not None and source.device.id == known_stream.id
+                        for source in existing
+                    )
+                ):
+                    raise HTTPException(409, "Camera capacity reached")
+                if reconnect_id is not None:
+                    previous = selection(reconnect_id)
+                    if previous.device.name != request.name or previous.device.host != request.host:
+                        raise HTTPException(
+                            422, "Stream must match the selected camera name and host"
+                        )
                 reconnect = (
                     registry.find_name_host(request.name, str(request.host)) if onvif else []
                 )
@@ -445,6 +578,7 @@ def install_operator_product_api(
                 if (
                     len(existing) >= 64
                     and not reconnect
+                    and reconnect_id is None
                     and not any(
                         source.device.host == request.host
                         and source.device.management_port == request.management_port
@@ -452,7 +586,11 @@ def install_operator_product_api(
                     )
                 ):
                     raise HTTPException(409, "Camera capacity reached")
-                if reconnect:
+                if reconnect_id is not None:
+                    source = cameras.reconnect_stream(
+                        reconnect_id, source_uri, management_port, stream_key
+                    )
+                elif reconnect:
                     source = cameras.reconnect_onvif(
                         reconnect[0].id,
                         source_uri,
@@ -460,8 +598,16 @@ def install_operator_product_api(
                         secure=management_secure,
                     )
                 else:
-                    device = registry.enroll(request).device
+                    device = (
+                        registry.enroll_stream(request, stream_key).device
+                        if stream_key is not None
+                        else registry.enroll(request).device
+                    )
                     source = cameras.upsert(device, source_uri)
+                seen_live.discard(source.binding.device_id)
+                connection_started[source.binding.device_id] = monotonic()
+                recording_started.pop(source.binding.device_id, None)
+                recording_changed[source.binding.device_id] = monotonic()
                 await service.apply_sources(selections())
             except DeviceRegistryConflictError:
                 raise HTTPException(409, "Camera endpoint already enrolled") from None
@@ -489,6 +635,61 @@ def install_operator_product_api(
     onvif_probes = install_operator_onvif_api(
         app, require_admin=require_admin, authenticate=authenticate, enroll=enroll_camera_source
     )
+    from k5vision.operator_rtsp_api import install_operator_rtsp_api
+
+    rtsp_probes = install_operator_rtsp_api(
+        app, require_admin=require_admin, authenticate=authenticate, enroll=enroll_camera_source
+    )
+
+    @app.put(_PREFIX + "/cameras/{device_id}/recording", tags=["operator"])
+    async def recording_preference(
+        device_id: UUID,
+        payload: _RecordingPreference,
+        response: Response,
+        session: tuple[UserAccount, str] = admin_session,
+    ):
+        response.headers["Cache-Control"] = "no-store"
+        async with mutations:
+            current, _ = await authenticate(session[1])
+            if current.id != session[0].id or current.role is not UserRole.ADMINISTRATOR:
+                raise HTTPException(403, "Insufficient camera administration permission")
+            source = selection(device_id)
+            if source.recording_enabled == payload.enabled:
+                return await camera_view(source)
+            previous = selections()
+            updated = tuple(
+                replace(item, recording_enabled=payload.enabled)
+                if item.binding.device_id == device_id
+                else item
+                for item in previous
+            )
+            try:
+                await service.apply_recording_preferences(updated)
+                current, _ = await authenticate(session[1])
+                if current.id != session[0].id or current.role is not UserRole.ADMINISTRATOR:
+                    raise HTTPException(403, "Insufficient camera administration permission")
+                source = cameras.set_recording_enabled(device_id, payload.enabled)
+            except BaseException as error:
+                rollback = asyncio.create_task(service.apply_recording_preferences(previous))
+                try:
+                    await asyncio.shield(rollback)
+                except asyncio.CancelledError:
+                    try:
+                        await asyncio.shield(rollback)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                if isinstance(error, (HTTPException, asyncio.CancelledError)):
+                    raise
+                raise HTTPException(
+                    503,
+                    "Recording preference could not be applied",
+                    headers={"Cache-Control": "no-store"},
+                ) from None
+            recording_started.pop(device_id, None)
+            recording_changed[device_id] = monotonic()
+            return await camera_view(source)
 
     @app.delete(_PREFIX + "/cameras/{device_id}", status_code=204, tags=["operator"])
     async def remove_camera(device_id: UUID, _session: tuple[UserAccount, str] = admin_session):
@@ -497,6 +698,9 @@ def install_operator_product_api(
             try:
                 cameras.remove(device_id)
                 seen_live.discard(device_id)
+                connection_started.pop(device_id, None)
+                recording_started.pop(device_id, None)
+                recording_changed.pop(device_id, None)
                 await service.apply_sources(selections())
             except (RuntimeError, OSError, ValueError):
                 raise HTTPException(503, "Camera configuration unavailable") from None
@@ -644,7 +848,8 @@ def install_operator_product_api(
         response.set_cookie(
             _COOKIE,
             session[1],
-            max_age=8 * 60 * 60,
+            # A browser wall-clock correction must not expire media access
+            # ahead of its authoritative, monotonic human-session deadline.
             path="/media",
             httponly=True,
             secure=request.url.scheme == "https",
@@ -663,6 +868,7 @@ def install_operator_product_api(
         scheme, separator, token = (values[0] if len(values) == 1 else "").partition(" ")
         if separator and scheme.lower() == "bearer" and _SESSION_TOKEN.fullmatch(token) is not None:
             onvif_probes.clear_token(token)
+            rtsp_probes.clear_token(token)
         if (
             analytics is not None
             and separator

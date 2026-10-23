@@ -19,7 +19,15 @@ _TRUE = (
     "restart_preserves_account_camera_history uninstall_preserves_profile_and_media "
     "no_console_windows owned_cleanup onvif_credential_profile_enrollment no_manual_stream_uri "
     "onvif_wrong_password_rejected onvif_clock_skew_compensated "
-    "onvif_time_health_displayed recorder_time_health_displayed host_clock_step_acceptance"
+    "onvif_time_health_displayed recorder_time_health_displayed host_clock_step_acceptance "
+    "four_camera_wall native_default_browser_handoff four_camera_recording_progress "
+    "isolated_camera_outage_reconnect pause_resume_preserves_live_history "
+    "other_recording_while_paused timeline_seek_playback actual_recording_export "
+    "recording_choice_persisted logout_destroys_wall authenticated_camera_read "
+    "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected authenticated_camera_restart_live "
+    "wall_viewport_fit native_launch_argument_matched browser_origin_connected page_window_visible "
+    "direct_rtsp_enrollment direct_rtsp_wrong_password_rejected direct_rtsp_persisted "
+    "direct_rtsp_fresh_enrollment direct_rtsp_multi_channel_same_endpoint"
 ).split()
 _FALSE = (
     "physical_camera_acceptance capacity_acceptance endurance_acceptance windows_service "
@@ -43,6 +51,55 @@ def _number(value, minimum, maximum):
 def _integer(value, minimum, maximum):
     _require(type(value) is int and minimum <= value <= maximum)
     return value
+
+
+def _integers(value, count, minimum):
+    _require(type(value) is list and len(value) == count)
+    for item in value:
+        _integer(item, minimum, 2**63 - 1)
+    return value
+
+
+def _nvr_journey(receipt):
+    _require(_integer(receipt.get("camera_count"), 4, 4) == 4)
+    layouts = receipt.get("wall_layouts")
+    _require(type(layouts) is list and len(layouts) == 3)
+    _require(all(type(count) is int for count in layouts) and layouts == [1, 4, 9])
+    viewport = receipt.get("wall_viewport")
+    _require(type(viewport) is list and len(viewport) == 2)
+    _require(all(type(size) is int for size in viewport) and viewport == [1440, 900])
+    _integers(receipt.get("wall_decoded_frames"), 4, 4)
+    for field in (
+        "direct_rtsp_live_decoded_frames",
+        "direct_rtsp_history_decoded_frames",
+        "direct_rtsp_fresh_live_decoded_frames",
+    ):
+        _integer(receipt.get(field), 4, 100000)
+    direct_before = _integer(receipt.get("direct_rtsp_recording_bytes_before"), 0, 2**63 - 1)
+    direct_after = _integer(receipt.get("direct_rtsp_recording_bytes_after"), 1, 2**63 - 1)
+    _require(direct_after > direct_before)
+    fresh_before = _integer(receipt.get("direct_rtsp_fresh_recording_bytes_before"), 0, 2**63 - 1)
+    fresh_after = _integer(receipt.get("direct_rtsp_fresh_recording_bytes_after"), 1, 2**63 - 1)
+    _require(fresh_after > fresh_before)
+    for prefix, count, minimum in (
+        ("camera_recording_bytes", 4, 0),
+        ("outage_other_live_frames", 3, 4),
+        ("tray_camera_recording_bytes", 3, 1),
+    ):
+        before = _integers(receipt.get(prefix + "_before"), count, minimum)
+        after = _integers(receipt.get(prefix + "_after"), count, minimum)
+        growth = 4 if prefix == "outage_other_live_frames" else 1
+        _require(all(end >= start + growth for start, end in zip(before, after, strict=True)))
+    for field, minimum, maximum in (
+        ("paused_recording_bytes", 1, 2**63 - 1),
+        ("resumed_recording_bytes", 1, 2**63 - 1),
+        ("timeline_playback_decoded_frames", 4, 100000),
+        ("export_decoded_frames", 1, 100000),
+        ("export_bytes", 1, 16 * 1024**2),
+        ("authenticated_camera_restart_frames", 4, 100000),
+    ):
+        _integer(receipt.get(field), minimum, maximum)
+    _require(receipt["resumed_recording_bytes"] > receipt["paused_recording_bytes"])
 
 
 def _utc(value):
@@ -196,6 +253,8 @@ def verify(report: Path, *, expected_head: str, installer_sha256: str) -> dict:
     _require(receipt.get("schema_version") == "1" and receipt.get("platform") == "Windows")
     _require(all(receipt.get(field) is True for field in _TRUE))
     _require(all(receipt.get(field) is False for field in _FALSE))
+    _require(receipt.get("native_browser_handoff_observation") == "os_dispatch_origin_and_window")
+    _nvr_journey(receipt)
     _require(receipt.get("browser_channel") == "msedge")
     _require(receipt.get("playwright_version") == "1.58.0")
     _require(

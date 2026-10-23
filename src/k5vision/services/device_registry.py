@@ -12,12 +12,40 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
-from k5vision.domain.devices import Device, DeviceCreate
+from k5vision.domain.devices import Device, DeviceCreate, DeviceProtocol
 
 DEFAULT_DEVICE_CAPACITY = 1024
 MAX_DEVICE_CAPACITY = 100_000
 MAX_DEVICE_PAGE_SIZE = 100
 _SITE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_STREAM_KEY_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_DEVICE_COLUMNS = (
+    "row_id",
+    "site_id",
+    "id",
+    "name",
+    "host",
+    "management_port",
+    "kind",
+    "protocols_json",
+    "tags_json",
+)
+_CREATE_DEVICES = """
+    CREATE TABLE devices (
+        row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        site_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        host TEXT NOT NULL,
+        management_port INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        protocols_json TEXT NOT NULL,
+        tags_json TEXT NOT NULL,
+        stream_key TEXT NOT NULL DEFAULT '',
+        UNIQUE(site_id, id),
+        UNIQUE(site_id, host, management_port, stream_key)
+    )
+"""
 
 
 class DeviceRegistryCapacityError(RuntimeError):
@@ -96,23 +124,7 @@ class DeviceRegistry:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.execute("PRAGMA synchronous = FULL")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS devices (
-                    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    site_id TEXT NOT NULL,
-                    id TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    host TEXT NOT NULL,
-                    management_port INTEGER NOT NULL,
-                    kind TEXT NOT NULL,
-                    protocols_json TEXT NOT NULL,
-                    tags_json TEXT NOT NULL,
-                    UNIQUE(site_id, id),
-                    UNIQUE(site_id, host, management_port)
-                )
-                """
-            )
+            self._initialize_schema(connection)
             if self._database_path != ":memory:":
                 database_identity = Path(self._database_path).lstat()
         except (OSError, sqlite3.Error) as exc:
@@ -121,6 +133,57 @@ class DeviceRegistry:
             raise DeviceRegistryStorageError("device registry is unavailable") from exc
         self._connection = connection
         self._database_identity = database_identity
+
+    @staticmethod
+    def _initialize_schema(connection: sqlite3.Connection) -> None:
+        """Migrate endpoint identity atomically without replacing the canonical file.
+
+        The empty stream key preserves ordinary device enrollment. Direct stream
+        keys distinguish channels sharing one real camera address and port; the
+        key contains only an opaque digest, never stream paths or credentials.
+        """
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            columns = tuple(row["name"] for row in connection.execute("PRAGMA table_info(devices)"))
+            if not columns:
+                connection.execute(_CREATE_DEVICES)
+            elif columns == _DEVICE_COLUMNS:
+                # Keep deleted high-water row IDs as well as all live IDs/order.
+                sequence = connection.execute(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'devices'"
+                ).fetchone()
+                connection.execute("ALTER TABLE devices RENAME TO devices_before_streams")
+                connection.execute(_CREATE_DEVICES)
+                connection.execute(
+                    """INSERT INTO devices (
+                           row_id, site_id, id, name, host, management_port,
+                           kind, protocols_json, tags_json
+                       ) SELECT row_id, site_id, id, name, host, management_port,
+                                kind, protocols_json, tags_json
+                         FROM devices_before_streams ORDER BY row_id"""
+                )
+                if sequence is not None:
+                    connection.execute(
+                        "UPDATE sqlite_sequence SET seq = ? WHERE name = 'devices'",
+                        (sequence["seq"],),
+                    )
+                    if (
+                        connection.execute(
+                            "SELECT 1 FROM sqlite_sequence WHERE name = 'devices'"
+                        ).fetchone()
+                        is None
+                    ):
+                        connection.execute(
+                            "INSERT INTO sqlite_sequence (name, seq) VALUES ('devices', ?)",
+                            (sequence["seq"],),
+                        )
+                connection.execute("DROP TABLE devices_before_streams")
+            elif columns != (*_DEVICE_COLUMNS, "stream_key"):
+                raise sqlite3.DatabaseError("unsupported device registry schema")
+            connection.execute("COMMIT")
+        finally:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
 
     def _require_connection(self) -> sqlite3.Connection:
         connection = self._connection
@@ -160,6 +223,19 @@ class DeviceRegistry:
 
     def enroll(self, request: DeviceCreate) -> DeviceRegistration:
         """Enroll one endpoint transactionally or return its identical existing record."""
+        return self._enroll(request, "")
+
+    def enroll_stream(self, request: DeviceCreate, stream_key: str) -> DeviceRegistration:
+        """Enroll one RTSP channel using a credential-free opaque source identity."""
+        if (
+            not isinstance(stream_key, str)
+            or _STREAM_KEY_PATTERN.fullmatch(stream_key) is None
+            or request.protocols != {DeviceProtocol.RTSP}
+        ):
+            raise ValueError("direct stream requires an RTSP device and opaque stream key")
+        return self._enroll(request, stream_key)
+
+    def _enroll(self, request: DeviceCreate, stream_key: str) -> DeviceRegistration:
         with self._lock:
             connection = self._require_connection()
             try:
@@ -168,9 +244,9 @@ class DeviceRegistry:
                     """
                     SELECT id, name, host, management_port, kind, protocols_json, tags_json
                     FROM devices
-                    WHERE site_id = ? AND host = ? AND management_port = ?
+                    WHERE site_id = ? AND host = ? AND management_port = ? AND stream_key = ?
                     """,
-                    (self._site_id, str(request.host), request.management_port),
+                    (self._site_id, str(request.host), request.management_port, stream_key),
                 ).fetchone()
 
                 if row is not None:
@@ -200,9 +276,10 @@ class DeviceRegistry:
                         management_port,
                         kind,
                         protocols_json,
-                        tags_json
+                        tags_json,
+                        stream_key
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         self._site_id,
@@ -213,6 +290,7 @@ class DeviceRegistry:
                         device.kind.value,
                         self._protocols_json(device),
                         self._tags_json(device),
+                        stream_key,
                     ),
                 )
                 connection.execute("COMMIT")
@@ -266,6 +344,23 @@ class DeviceRegistry:
                     WHERE site_id = ? AND id = ?
                     """,
                     (self._site_id, str(device_id)),
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise DeviceRegistryStorageError("device registry read failed") from exc
+        return None if row is None else self._decode_device(row)
+
+    def find_stream(self, host: str, management_port: int, stream_key: str) -> Device | None:
+        """Find an exact private stream identity within this registry's site."""
+        if not isinstance(stream_key, str) or _STREAM_KEY_PATTERN.fullmatch(stream_key) is None:
+            raise ValueError("direct stream requires an opaque stream key")
+        with self._lock:
+            connection = self._require_connection()
+            try:
+                row = connection.execute(
+                    """SELECT id, name, host, management_port, kind, protocols_json, tags_json
+                       FROM devices WHERE site_id = ? AND host = ? AND management_port = ?
+                         AND stream_key = ?""",
+                    (self._site_id, host, management_port, stream_key),
                 ).fetchone()
             except sqlite3.Error as exc:
                 raise DeviceRegistryStorageError("device registry read failed") from exc

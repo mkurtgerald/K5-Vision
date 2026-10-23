@@ -107,6 +107,32 @@ input[type="date"], input[type="datetime-local"] { font-size: 12px; }
 .view-tabs { display: flex; gap: 23px; margin: 23px 0 24px; border-bottom: 1px solid var(--border); }
 .tab { background: transparent; color: var(--muted); padding: 13px 0; font-size: 13px; font-weight: 500; border: 0; border-bottom: 2px solid transparent; }
 .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.tab:disabled { opacity: .4; cursor: default; }
+.workspace-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 28px; }
+.workspace-summary > div { display: flex; flex-direction: column; gap: 8px; padding: 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 9px; min-width: 0; }
+.workspace-summary .summary-label { color: var(--muted); font-size: 9px; letter-spacing: 1.2px; }
+.workspace-summary strong { font-size: 25px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.workspace-summary .muted { font-size: 11px; line-height: 1.4; }
+.recorder-overview { margin-bottom: 16px; }
+.recorder-overview > summary { cursor: pointer; color: var(--muted); font-size: 12px; padding: 0 0 10px; }
+.recorder-overview[open] > summary { margin-bottom: 4px; }
+.camera-indicators { flex-wrap: wrap; justify-content: flex-end; }
+.recording-actions, .clip-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0; }
+.recording-actions .field-help { margin: 0; }
+.clip-controls .muted { font-size: 11px; }
+.main-content:has(> #wall-panel:not([hidden])) .view-heading { display: none; }
+.main-content:has(> #wall-panel:not([hidden])) .workspace-summary { margin-bottom: 16px; }
+.main-content:has(> #wall-panel:not([hidden])) .workspace-summary > div { padding: 12px; gap: 5px; }
+.main-content:has(> #wall-panel:not([hidden])) .system-status { margin-top: 0; padding: 8px 12px; }
+.main-content:has(> #wall-panel:not([hidden])) .system-status > div { display: flex; flex-wrap: wrap; gap: 5px 14px; }
+.main-content:has(> #wall-panel:not([hidden])) .view-tabs { margin: 12px 0; }
+@media (min-width: 851px) {
+  .camera-wall-grid { height: var(--wall-height, auto); grid-auto-rows: minmax(0, 1fr); }
+  .camera-wall-tile { display: flex; flex-direction: column; }
+  .camera-wall-tile .camera-wall-surface { flex: 1; min-height: 0; aspect-ratio: auto; }
+  .camera-wall-tile-heading, .camera-wall-tile-actions { flex-shrink: 0; }
+}
+.recording-badge.waiting { color: var(--amber); }
 .video-surface { position: relative; aspect-ratio: 16 / 9; background: #05090f; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
 .video-surface video { display: block; width: 100%; height: 100%; object-fit: contain; background: #05090f; }
 .video-placeholder { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 25px; text-align: center; background: #080d16; }
@@ -175,10 +201,12 @@ dialog::backdrop { background: #05080ebd; backdrop-filter: blur(5px); }
   .history-toolbar { align-items: flex-start; flex-direction: column; gap: 12px; }
 }
 @media (max-width: 850px) {
+  .workspace-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .workspace-body { grid-template-columns: 210px minmax(0, 1fr); }
   .topbar { padding: 0 19px; }
   .main-content { padding: 25px 18px; }
   .view-heading { align-items: flex-start; flex-direction: column; }
+  .camera-indicators { justify-content: flex-start; }
   .history-content { grid-template-columns: 1fr; }
   .history-list { max-height: 220px; }
   .interval-form { flex-wrap: wrap; }

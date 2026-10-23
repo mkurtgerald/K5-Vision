@@ -3,7 +3,7 @@ name: Native Windows Desktop Installer
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta]
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta, codex/windows-onvif-onboarding]
     paths:
       - .github/workflows/operator-desktop-windows.yml
       - .github/actions/provision-operator-tools/**
@@ -33,6 +33,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  focused-windows:
+    name: Windows focused checks (${{ matrix.lane }})
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [setup, onvif, cameras]
+    env:
+      K5_BETA_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+    steps:
+      - name: Checkout exact desktop revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up native development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install acceptance dependencies only in development Python
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Desktop development install failed" }
+      - name: Verify desktop setup and process ownership on Windows
+        if: matrix.lane == 'setup'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_desktop_setup.py tests/unit/test_desktop_payload.py tests/unit/test_desktop_receipt.py tests/unit/test_operator_native_process.py tests/unit/test_operator_product_service.py tests/unit/test_operator_time.py tests/unit/test_operator_recording_storage.py tests/test_auth_session_clock.py tests/unit/test_mediamtx_provider.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify ONVIF and RTSP authentication, discovery and honest video status
+        if: matrix.lane == 'onvif'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_rtsp.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify camera administration and atomic reconnect on Windows
+        if: matrix.lane == 'cameras'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_product_state.py tests/test_device_registry.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   native-desktop:
     name: Build and exercise actual graphical Windows installation
     runs-on: windows-2025
@@ -58,21 +106,6 @@ jobs:
         run: |
           python -m pip install -e ".[dev]" "playwright==1.58.0"
           if ($LASTEXITCODE -ne 0) { throw "Desktop development install failed" }
-      - name: Verify desktop setup and process ownership on Windows
-        shell: pwsh
-        run: |
-          python -m pytest tests/unit/test_desktop_setup.py tests/unit/test_desktop_payload.py tests/unit/test_desktop_receipt.py tests/unit/test_operator_native_process.py tests/unit/test_operator_product_service.py tests/unit/test_operator_time.py tests/unit/test_operator_recording_storage.py tests/test_auth_session_clock.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify ONVIF authentication, multicast and honest video status
-        shell: pwsh
-        run: |
-          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_web_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify camera administration and atomic reconnect on Windows
-        shell: pwsh
-        run: |
-          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_product_state.py tests/test_device_registry.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Provision immutable native acceptance tools
         uses: ./.github/actions/provision-operator-tools
       - name: Build exact offline operator runtime and file manifest
@@ -157,8 +190,17 @@ jobs:
               $witness.receipt.onvif_time_health_displayed -isnot [bool] -or
               $witness.receipt.onvif_time_health_displayed -ne $true -or
               $witness.receipt.recorder_time_health_displayed -isnot [bool] -or
-              $witness.receipt.recorder_time_health_displayed -ne $true) {
-            throw "ONVIF camera-onboarding GUI qualification is incomplete"
+              $witness.receipt.recorder_time_health_displayed -ne $true -or
+              $witness.receipt.camera_count -ne 4 -or
+              $witness.receipt.four_camera_wall -ne $true -or
+              $witness.receipt.native_default_browser_handoff -ne $true -or
+              $witness.receipt.timeline_seek_playback -ne $true -or
+              $witness.receipt.direct_rtsp_enrollment -isnot [bool] -or
+              $witness.receipt.direct_rtsp_enrollment -ne $true -or
+              $witness.receipt.direct_rtsp_fresh_enrollment -ne $true -or
+              $witness.receipt.direct_rtsp_multi_channel_same_endpoint -ne $true -or
+              $witness.receipt.actual_recording_export -ne $true) {
+            throw "Four-camera surveillance workspace qualification is incomplete"
           }
           $release = Join-Path $env:GITHUB_WORKSPACE "desktop-build/release"
           New-Item -ItemType Directory -Path $release | Out-Null
@@ -174,10 +216,12 @@ jobs:
             launcher_sha256=(Get-FileHash -LiteralPath desktop-build/payload/K5Vision.exe -Algorithm SHA256).Hash.ToLowerInvariant();
             payload_manifest_sha256=(Get-FileHash -LiteralPath desktop-build/payload/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant();
             runtime='CPython 3.12.10 embedded amd64'; installer='Inno Setup 6.4.3';
-            scope='Native Windows ONVIF camera-onboarding recording operator'; no_terminal_required=$true;
+            scope='Native Windows ONVIF surveillance workspace'; no_terminal_required=$true;
             no_external_python_required=$true; no_runtime_package_downloads=$true
             workers_bundled=$false; first_launch_internet_required=$true
             onvif_camera_onboarding=$true; manual_stream_uri_required=$false
+            direct_rtsp_enrollment=$true
+            surveillance_workspace=$true; four_camera_wall=$true; actual_recording_export=$true
           }
           $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $release "desktop-package.json") -Encoding utf8
       - name: Upload qualified graphical Windows installer
@@ -200,7 +244,7 @@ jobs:
 
   vm-clock:
     name: Exercise real clock corrections on a second disposable Windows VM
-    needs: native-desktop
+    needs: [native-desktop, focused-windows]
     runs-on: windows-2025
     timeout-minutes: 15
     env:

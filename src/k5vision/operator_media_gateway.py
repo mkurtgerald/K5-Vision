@@ -14,7 +14,7 @@ from pathlib import Path
 
 from k5vision.media.mediamtx_provider import MediaMTXCredentials
 
-_ASSETS = ("index.html", "app.css", "app.js")
+_ASSETS = ("index.html", "app.css", "app.js", "wall.css", "wall.js", "timeline.css", "timeline.js")
 _AUTH_ROUTE = "/api/v1/operator/media-auth"
 _UNTRUSTED_HEADERS = ["Forwarded", "X-Forwarded-*", "X-K5-*"]
 
@@ -22,6 +22,9 @@ _UNTRUSTED_HEADERS = ["Forwarded", "X-Forwarded-*", "X-K5-*"]
 def _transport() -> dict:
     return {
         "protocol": "http",
+        # Uvicorn closes idle control connections after five seconds. Retire
+        # them first, so a mutation cannot race a stale pooled connection.
+        "keep_alive": {"idle_timeout": "2s"},
         "dial_timeout": "2s",
         "response_header_timeout": "10s",
         "read_timeout": "15s",
@@ -210,7 +213,10 @@ def generate_operator_gateway_configuration(
         },
         {
             "match": [
-                {"method": ["GET", "HEAD"], "path": ["/operator/app.css", "/operator/app.js"]}
+                {
+                    "method": ["GET", "HEAD"],
+                    "path": ["/operator/" + name for name in _ASSETS if name != "index.html"],
+                }
             ],
             "handle": [
                 {"handler": "rewrite", "strip_path_prefix": "/operator"},

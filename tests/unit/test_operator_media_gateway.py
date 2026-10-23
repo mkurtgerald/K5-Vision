@@ -14,7 +14,15 @@ from k5vision.operator_media_gateway import generate_operator_gateway_configurat
 def assets(tmp_path):
     root = tmp_path / "packaged UI with spaces"
     root.mkdir()
-    for name in ("index.html", "app.js", "app.css"):
+    for name in (
+        "index.html",
+        "app.js",
+        "app.css",
+        "wall.js",
+        "wall.css",
+        "timeline.js",
+        "timeline.css",
+    ):
         (root / name).write_text("fixture", encoding="utf-8")
     return root
 
@@ -35,6 +43,27 @@ def _configuration(assets, **changes):
 
 def test_fixed_gateway_authorizes_each_media_request_before_private_proxy(assets):
     document = json.loads(_configuration(assets))
+
+    def proxies(value):
+        if isinstance(value, dict):
+            if value.get("handler") == "reverse_proxy":
+                yield value
+            for child in value.values():
+                yield from proxies(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from proxies(child)
+
+    worker_proxies = list(proxies(document))
+    assert len(worker_proxies) == 6
+    for proxy in worker_proxies:
+        # Every route must retire pooled connections before Uvicorn's 5s
+        # idle limit; a failed mutation is never replayed as a workaround.
+        transport = proxy["transport"]
+        assert transport["keep_alive"] == {"idle_timeout": "2s"}
+        assert transport["max_conns_per_host"] == 32
+        assert transport["read_timeout"] == "15s" and transport["write_timeout"] == "10s"
+        assert not any(key.startswith("lb_try") for key in proxy)
     assert document["admin"] == {"disabled": True}
     server = document["apps"]["http"]["servers"]["operator"]
     assert server["listen"] == ["127.0.0.1:18080"]
@@ -96,6 +125,10 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
         "/operator/index.html",
         "/operator/app.css",
         "/operator/app.js",
+        "/operator/wall.css",
+        "/operator/wall.js",
+        "/operator/timeline.css",
+        "/operator/timeline.js",
     ]
     javascript = routes[3]["handle"][0]
     assert javascript["rewrite"]["uri"] == "/_k5_assets/hls.min.js"

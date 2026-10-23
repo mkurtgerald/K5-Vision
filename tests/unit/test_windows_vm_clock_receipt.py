@@ -33,6 +33,16 @@ _FALSE = (
     "mocked_gui user_terminal_required"
 ).split()
 _MISSING = object()
+_NVR_FLAGS = (
+    "four_camera_wall native_default_browser_handoff four_camera_recording_progress "
+    "isolated_camera_outage_reconnect pause_resume_preserves_live_history "
+    "other_recording_while_paused timeline_seek_playback actual_recording_export "
+    "recording_choice_persisted logout_destroys_wall authenticated_camera_read "
+    "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected authenticated_camera_restart_live "
+    "wall_viewport_fit native_launch_argument_matched browser_origin_connected page_window_visible "
+    "direct_rtsp_enrollment direct_rtsp_wrong_password_rejected direct_rtsp_persisted "
+    "direct_rtsp_fresh_enrollment direct_rtsp_multi_channel_same_endpoint"
+).split()
 
 
 def _guard_receipt() -> dict:
@@ -123,6 +133,7 @@ def _receipt() -> dict:
         "schema_version": "1",
         "platform": "Windows",
         **dict.fromkeys(_TRUE, True),
+        **dict.fromkeys(_NVR_FLAGS, True),
         **dict.fromkeys(_FALSE, False),
         "browser_channel": "msedge",
         "playwright_version": "1.58.0",
@@ -132,6 +143,30 @@ def _receipt() -> dict:
         "onvif_clock_offset_seconds": 1200,
         "onvif_time_read_count": 1,
         "duration_seconds": 300.5,
+        "camera_count": 4,
+        "wall_layouts": [1, 4, 9],
+        "wall_viewport": [1440, 900],
+        "wall_decoded_frames": [4, 5, 6, 7],
+        "camera_recording_bytes_before": [0, 1, 2, 3],
+        "camera_recording_bytes_after": [10, 11, 12, 13],
+        "outage_other_live_frames_before": [4, 5, 6],
+        "outage_other_live_frames_after": [8, 9, 10],
+        "tray_camera_recording_bytes_before": [10, 11, 12],
+        "tray_camera_recording_bytes_after": [20, 21, 22],
+        "paused_recording_bytes": 40,
+        "resumed_recording_bytes": 50,
+        "timeline_playback_decoded_frames": 4,
+        "export_decoded_frames": 4,
+        "export_bytes": 4096,
+        "authenticated_camera_restart_frames": 4,
+        "direct_rtsp_live_decoded_frames": 12,
+        "direct_rtsp_history_decoded_frames": 4,
+        "direct_rtsp_recording_bytes_before": 0,
+        "direct_rtsp_recording_bytes_after": 10,
+        "direct_rtsp_fresh_live_decoded_frames": 4,
+        "direct_rtsp_fresh_recording_bytes_before": 0,
+        "direct_rtsp_fresh_recording_bytes_after": 10,
+        "native_browser_handoff_observation": "os_dispatch_origin_and_window",
         "vm_clock": {
             "schema_version": "1",
             "head_sha": _HEAD,
@@ -173,6 +208,88 @@ def test_vm_clock_receipt_accepts_real_bidirectional_installer_bound_witness(tmp
     receipt = _receipt()
 
     assert _verify(_report(tmp_path, receipt)) == receipt
+
+
+@pytest.mark.parametrize("field", _NVR_FLAGS)
+def test_vm_clock_receipt_requires_real_installed_nvr_journey_as_well_as_clock_steps(
+    tmp_path, field
+):
+    receipt = _receipt()
+    del receipt[field]
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "direct_rtsp_enrollment",
+        "direct_rtsp_wrong_password_rejected",
+        "direct_rtsp_persisted",
+        "direct_rtsp_fresh_enrollment",
+        "direct_rtsp_multi_channel_same_endpoint",
+    ],
+)
+@pytest.mark.parametrize("invalid", [False, 1, None])
+def test_vm_clock_receipt_requires_executed_direct_rtsp_setup(tmp_path, field, invalid):
+    receipt = _receipt()
+    receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("invalid", [None, "address_bar_copy", "url_argument_only", True])
+def test_vm_clock_receipt_requires_the_declared_os_dispatch_observation(tmp_path, invalid):
+    receipt = _receipt()
+    receipt["native_browser_handoff_observation"] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize(
+    "field", ["native_launch_argument_matched", "browser_origin_connected", "page_window_visible"]
+)
+def test_vm_clock_receipt_refuses_unexecuted_browser_handoff_proofs(tmp_path, field):
+    receipt = _receipt()
+    receipt[field] = 1
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("camera_count", 2),
+        ("wall_layouts", [1, 4]),
+        ("wall_viewport", [1440, 720]),
+        ("wall_decoded_frames", [4, 4]),
+        ("camera_recording_bytes_after", [10, 11, 2, 13]),
+        ("outage_other_live_frames_after", [7, 9, 10]),
+        ("tray_camera_recording_bytes_after", [20, 11, 22]),
+        ("resumed_recording_bytes", 40),
+        ("timeline_playback_decoded_frames", 0),
+        ("export_decoded_frames", 0),
+        ("export_bytes", 16 * 1024**2 + 1),
+        ("authenticated_camera_restart_frames", 3),
+        ("authenticated_camera_restart_frames", True),
+        ("direct_rtsp_live_decoded_frames", 3),
+        ("direct_rtsp_live_decoded_frames", True),
+        ("direct_rtsp_history_decoded_frames", None),
+        ("direct_rtsp_history_decoded_frames", 0),
+        ("direct_rtsp_recording_bytes_before", -1),
+        ("direct_rtsp_recording_bytes_before", False),
+        ("direct_rtsp_recording_bytes_after", 0),
+        ("direct_rtsp_recording_bytes_after", 0.5),
+        ("direct_rtsp_fresh_live_decoded_frames", 3),
+        ("direct_rtsp_fresh_recording_bytes_before", False),
+        ("direct_rtsp_fresh_recording_bytes_after", 0),
+    ],
+)
+def test_vm_clock_receipt_rejects_old_or_nonadvancing_nvr_media_proof(tmp_path, field, value):
+    receipt = _receipt()
+    receipt[field] = value
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
 
 
 @pytest.mark.parametrize("outcome", ["skipped", "failure", "error"])

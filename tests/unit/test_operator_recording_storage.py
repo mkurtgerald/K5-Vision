@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -563,3 +565,259 @@ def test_explicit_disabled_age_retention_keeps_stable_files_under_quota(
 def test_retention_bounds_are_explicit_and_finite(root, retention):
     with pytest.raises(ValueError):
         RecordingStorage(root, retention_seconds=retention)
+
+
+def test_progress_waits_for_complete_baseline_and_real_growth(root, monkeypatch, clock):
+    _free(monkeypatch, 500)
+    file = _segment(root, 1, size=10)
+    path_name = file.parent.name
+    storage = RecordingStorage(root, max_bytes=100, min_free_bytes=0, retention_seconds=0)
+    assert storage.recording_progress(path_name) == {
+        "observed_bytes": 0,
+        "last_progress_age_seconds": None,
+        "inspection_complete": False,
+        "observed": False,
+    }
+    storage.inspect()
+    assert storage.recording_progress(path_name) == {
+        "observed_bytes": 10,
+        "last_progress_age_seconds": None,
+        "inspection_complete": True,
+        "observed": True,
+    }
+    clock.now += 20
+    storage.inspect()
+    assert storage.recording_progress(path_name)["last_progress_age_seconds"] is None
+    file.write_bytes(b"x" * 20)
+    clock.now += 1
+    storage.inspect()
+    assert storage.recording_progress(path_name)["last_progress_age_seconds"] == 0
+    clock.now += 5
+    storage.inspect()
+    assert storage.recording_progress(path_name)["last_progress_age_seconds"] == 5
+
+    def no_scan(*args, **kwargs):
+        raise AssertionError("Cached progress must not inspect the filesystem")
+
+    monkeypatch.setattr(storage_module.os, "scandir", no_scan)
+    monkeypatch.setattr(Path, "lstat", no_scan)
+    clock.now += 3
+    sample = storage.recording_progress(path_name)
+    assert sample["observed_bytes"] == 20 and sample["last_progress_age_seconds"] == 8
+    assert str(root) not in repr(sample) and file.name not in repr(sample)
+
+
+def test_progress_unknown_path_uses_global_inspection_without_claiming_observation(
+    root, monkeypatch, clock
+):
+    _free(monkeypatch, 500)
+    path_name = "k5_" + "a" * 64
+    storage = RecordingStorage(root, min_free_bytes=0)
+    storage.inspect()
+    assert storage.recording_progress(path_name) == {
+        "observed_bytes": 0,
+        "last_progress_age_seconds": None,
+        "inspection_complete": True,
+        "observed": False,
+    }
+    _segment(root, 1, size=10, camera=int("a" * 64, 16))
+    clock.now += 1
+    storage.inspect()
+    sample = storage.recording_progress(path_name)
+    assert sample["observed"] is True and sample["observed_bytes"] == 10
+    assert sample["last_progress_age_seconds"] is None
+
+
+def test_progress_includes_active_segment_outside_prune_candidates(root, monkeypatch, clock):
+    _free(monkeypatch, 500)
+    active = _segment(root, 1, size=10)
+    storage = RecordingStorage(root, max_bytes=5, min_free_bytes=0, retention_seconds=0)
+    storage.inspect()
+    with active.open("ab") as writer:
+        writer.write(b"growing")
+        writer.flush()
+        clock.now += 15
+        result = storage.prune()
+    assert result.deleted_segments == 0 and active.exists()
+    assert storage.recording_progress(active.parent.name) == {
+        "observed_bytes": 17,
+        "last_progress_age_seconds": 0,
+        "inspection_complete": True,
+        "observed": True,
+    }
+
+
+def test_progress_detects_growth_even_when_total_bytes_fall(root, monkeypatch, clock):
+    _free(monkeypatch, 500)
+    closed = _segment(root, 1, size=40)
+    active = _segment(root, 2, size=5)
+    storage = RecordingStorage(root, max_bytes=100, min_free_bytes=0, retention_seconds=0)
+    storage.inspect()
+    closed.unlink()
+    active.write_bytes(b"x" * 10)
+    clock.now += 5
+    storage.inspect()
+    sample = storage.recording_progress(active.parent.name)
+    assert sample["observed_bytes"] == 10
+    assert sample["last_progress_age_seconds"] == 0
+
+
+def test_pruning_is_not_progress_but_a_new_nonempty_segment_is(root, monkeypatch, clock):
+    _free(monkeypatch, 500)
+    closed = _segment(root, 1, size=20, age=60)
+    newest = _segment(root, 2, size=5, age=30)
+    storage = RecordingStorage(root, max_bytes=10, min_free_bytes=0, retention_seconds=0)
+    storage.inspect()
+    clock.now += 10
+    assert storage.prune().deleted_segments == 1
+    assert not closed.exists()
+    sample = storage.recording_progress(newest.parent.name)
+    assert sample["observed_bytes"] == 5 and sample["last_progress_age_seconds"] is None
+    empty = _segment(root, 3, size=0)
+    clock.now += 5
+    storage.inspect()
+    assert storage.recording_progress(newest.parent.name)["last_progress_age_seconds"] is None
+    created = _segment(root, 4, size=2)
+    clock.now += 2
+    storage.inspect()
+    sample = storage.recording_progress(newest.parent.name)
+    assert sample["observed_bytes"] == 7 and sample["last_progress_age_seconds"] == 0
+    assert empty.exists() and created.exists()
+
+
+@pytest.mark.parametrize("jump", [-365 * 86400, 365 * 86400])
+def test_progress_age_ignores_wall_clock_and_metadata_only_changes(root, monkeypatch, clock, jump):
+    _free(monkeypatch, 500)
+    active = _segment(root, 1, size=5)
+    storage = RecordingStorage(root, min_free_bytes=0, retention_seconds=0)
+    storage.inspect()
+    active.write_bytes(b"x" * 10)
+    clock.now += 2
+    storage.inspect()
+    shifted = time.time() + jump
+    monkeypatch.setattr(storage_module.time, "time", lambda: shifted)
+    os.utime(active, (shifted, shifted))
+    clock.now += 7
+    storage.inspect()
+    assert storage.recording_progress(active.parent.name)["last_progress_age_seconds"] == 7
+
+
+@pytest.mark.parametrize("failure", ["budget", "ownership"])
+def test_incomplete_scan_invalidates_progress_until_new_complete_observations(
+    root, monkeypatch, clock, failure
+):
+    _free(monkeypatch, 500)
+    active = _segment(root, 1, size=5)
+    storage = RecordingStorage(root, min_free_bytes=0, retention_seconds=0)
+    storage.inspect()
+    active.write_bytes(b"x" * 10)
+    clock.now += 1
+    storage.inspect()
+    assert storage.recording_progress(active.parent.name)["last_progress_age_seconds"] == 0
+    with monkeypatch.context() as refused:
+        if failure == "budget":
+            refused.setattr(storage_module, "MAX_STORAGE_ENTRIES", 1)
+        else:
+            original = identity_state._windows_admission
+
+            def deny_file(path, **kwargs):
+                if path == active:
+                    raise identity_state.IdentityStateError("private-ownership-material")
+                return original(path, **kwargs)
+
+            refused.setattr(identity_state, "_windows_admission", deny_file)
+        assert not storage.inspect().recording_allowed
+    sample = storage.recording_progress(active.parent.name)
+    assert sample["inspection_complete"] is False and sample["observed"] is False
+    assert sample["last_progress_age_seconds"] is None
+    storage.inspect()
+    sample = storage.recording_progress(active.parent.name)
+    assert sample["observed"] is True and sample["observed_bytes"] == 10
+    assert sample["last_progress_age_seconds"] is None
+    active.write_bytes(b"x" * 11)
+    clock.now += 1
+    storage.inspect()
+    assert storage.recording_progress(active.parent.name)["last_progress_age_seconds"] == 0
+
+
+def test_replaced_camera_directory_requires_a_new_progress_baseline(root, monkeypatch, clock):
+    _free(monkeypatch, 500)
+    active = _segment(root, 1, size=5)
+    storage = RecordingStorage(root, min_free_bytes=0, retention_seconds=0)
+    storage.inspect()
+    active.write_bytes(b"x" * 10)
+    clock.now += 1
+    storage.inspect()
+    active.parent.rename(root / "preserved-history")
+    replacement = _segment(root, 1, size=20)
+    clock.now += 1
+    storage.inspect()
+    sample = storage.recording_progress(replacement.parent.name)
+    assert sample["observed_bytes"] == 20 and sample["last_progress_age_seconds"] is None
+
+
+def test_progress_cache_is_bounded_and_queried_paths_replace_historic_directories(
+    root, monkeypatch, clock
+):
+    _free(monkeypatch, 500)
+    files = [_segment(root, 1, size=1, camera=index) for index in range(1, 66)]
+    storage = RecordingStorage(root, min_free_bytes=0, retention_seconds=0)
+    storage.inspect()
+    assert len(storage._progress) == 64
+    uncached = next(file for file in files if file.parent.name not in storage._progress)
+    assert storage.recording_progress(uncached.parent.name)["observed"] is False
+    assert len(storage._progress) == 64
+    storage.inspect()
+    assert storage.recording_progress(uncached.parent.name)["observed"] is True
+    assert storage.recording_progress(uncached.parent.name)["last_progress_age_seconds"] is None
+    uncached.write_bytes(b"xx")
+    clock.now += 1
+    storage.inspect()
+    assert storage.recording_progress(uncached.parent.name)["last_progress_age_seconds"] == 0
+    assert len(storage._progress) == 64
+
+
+@pytest.mark.parametrize("path_name", ["../private-source", "k5_" + "a" * 63, None])
+def test_progress_refuses_noncanonical_path_names_without_disclosure(root, path_name):
+    storage = RecordingStorage(root)
+    with pytest.raises(ValueError, match="^Invalid recording path name$"):
+        storage.recording_progress(path_name)
+
+
+def test_cached_progress_remains_available_during_slow_maintenance(root, monkeypatch, clock):
+    _free(monkeypatch, 500)
+    active = _segment(root, 1, size=10)
+    storage = RecordingStorage(root, min_free_bytes=0, retention_seconds=0)
+    storage.inspect()
+    entered, release = Event(), Event()
+    original = storage_module._file_info
+
+    def slow_inspection(path):
+        entered.set()
+        assert release.wait(5)
+        return original(path)
+
+    monkeypatch.setattr(storage_module, "_file_info", slow_inspection)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        inspection = pool.submit(storage.inspect)
+        try:
+            assert entered.wait(3)
+            cached = pool.submit(storage.recording_progress, active.parent.name).result(timeout=3)
+            assert cached["observed_bytes"] == 10 and cached["inspection_complete"] is True
+        finally:
+            release.set()
+        assert inspection.result(timeout=3).recording_allowed
+
+
+@pytest.mark.parametrize("next_tick", [float("nan"), float("inf"), 1000.0])
+def test_progress_never_returns_nonfinite_or_negative_age(root, monkeypatch, clock, next_tick):
+    _free(monkeypatch, 500)
+    active = _segment(root, 1, size=5)
+    storage = RecordingStorage(root, min_free_bytes=0, retention_seconds=0)
+    storage.inspect()
+    active.write_bytes(b"x" * 10)
+    clock.now += 1
+    storage.inspect()
+    clock.now = next_tick
+    sample = storage.recording_progress(active.parent.name)
+    assert sample["observed_bytes"] == 10 and sample["last_progress_age_seconds"] is None

@@ -139,7 +139,9 @@ def make_launcher(apps, deliveries, *, fail=None):
         return BoundedPlaybackWindowsOperatorControl(
             pause_control=pause,
             application_factory=lambda: app,
-            poll_interval_seconds=0,
+            # Descriptor admission runs in a real worker. A synthetic zero-time
+            # pump can exhaust the finite cycle budget before that worker runs.
+            poll_interval_seconds=0.001,
         )
 
     def playback_factory(path, descriptor, start, end, rate, *, pause_control):
