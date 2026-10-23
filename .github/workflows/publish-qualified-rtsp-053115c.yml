@@ -1,0 +1,47 @@
+name: Publish qualified ONVIF and RTSP beta 053115c
+
+"on":
+  push:
+    branches:
+      - codex/publish-qualified-rtsp-053115c
+    paths:
+      - .github/workflows/publish-qualified-rtsp-053115c.yml
+      - scripts/publish_qualified_rtsp_053115c.py
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-qualified-rtsp-053115c
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out delivery helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: delivery-source
+          persist-credentials: false
+      - name: Check out exact qualified source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 053115ca728ba9b4572bd441a403d086065ead23
+          path: qualified-source
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Admit, publish, and verify qualified Windows assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python delivery-source/scripts/publish_qualified_rtsp_053115c.py
+          --source qualified-source
+          --output admitted
+          --publish
+          --verify-public
