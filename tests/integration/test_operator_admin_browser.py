@@ -30,6 +30,17 @@ from k5vision import identity_state
 _TOOLS = ("K5_MEDIAMTX_DONOR_EXE", "K5_CADDY_DONOR_EXE", "K5_DONOR_FFMPEG", "K5_DONOR_FFPROBE")
 _PLAYWRIGHT_VERSION = "1.58.0"
 _BROWSER_HELPERS = None
+_ADMIN_FAILURE_CODE = None
+_ADMIN_RESTART_DIAGNOSTIC = {}
+_FAILURE_MESSAGES = {
+    "Restart changed a durable user identity": "restart_user_identity",
+    "Restart changed the user's durable role, enabled state or access mode": "restart_role_state",
+    "Restart changed the user's selected camera grants": "restart_camera_grants",
+    "Restarted viewer inventory exceeded its persisted grants": "restart_viewer_inventory",
+    "Restart granted the viewer an unassigned camera": "restart_viewer_boundary",
+    "Generated user could not sign in through the UI": "user_ui_login",
+    "Delayed initial inventory navigated away from administration": "late_login_navigation",
+}
 pytestmark = pytest.mark.skipif(
     os.getenv("K5_OPERATOR_BROWSER_ACCEPTANCE") != "1"
     or not all(os.getenv(name) for name in _TOOLS),
@@ -51,8 +62,10 @@ def _browser_helpers():
 
 
 def _require(value, message):
+    global _ADMIN_FAILURE_CODE
     __tracebackhide__ = True
     if not value:
+        _ADMIN_FAILURE_CODE = _FAILURE_MESSAGES.get(message, "admin_assertion")
         pytest.fail(message, pytrace=False)
 
 
@@ -243,11 +256,11 @@ def _return_to_cameras(page):
     page.locator("#wall-tab").click()
 
 
-def _visible_live(page, identifier, color):
+def _visible_live(page, identifier, color, *, diagnostic=None):
     __tracebackhide__ = True
     helpers = _browser_helpers()
     helpers._open_camera_watch(page, identifier)
-    return helpers._decoded_color(page, "live-video", color)
+    return helpers._decoded_color(page, "live-video", color, diagnostic=diagnostic)
 
 
 def run_admin_journey(
@@ -508,13 +521,27 @@ def assert_admin_restart(page, *, private_state, camera_ids, client=None):
     __tracebackhide__ = True
     del client
     users = private_state["users"]
+    _ADMIN_RESTART_DIAGNOSTIC.clear()
+    _ADMIN_RESTART_DIAGNOSTIC["phase"] = "admin_user_listing"
     _open_admin(page)
-    for user in users:
+    for index, user in enumerate(users):
+        _ADMIN_RESTART_DIAGNOSTIC.update(phase="account_readback", account_index=index)
         row = page.locator(f'#admin-users-list [data-user-id="{user["id"]}"]')
         row.wait_for(state="visible")
         _require(user["username"] in row.inner_text(), "Restart changed a durable user identity")
         row.locator('[data-user-action="edit"]').click()
         page.locator("#admin-user-dialog").wait_for(state="visible")
+        role = page.locator("#admin-role").input_value()
+        access_mode = page.locator("#admin-access-mode").input_value()
+        _ADMIN_RESTART_DIAGNOSTIC.update(
+            role=role if role in {"administrator", "operator", "viewer"} else "invalid",
+            access_mode=access_mode if access_mode in {"all", "selected"} else "invalid",
+            enabled=page.locator("#admin-enabled").is_checked(),
+            available_camera_count=page.locator(
+                "#admin-camera-choices input[type=checkbox]"
+            ).count(),
+            expected_camera_count=len(user["camera_access"]["camera_ids"]),
+        )
         _require(
             page.locator("#admin-role").input_value() == user["role"]
             and page.locator("#admin-enabled").is_checked() is user["enabled"]
@@ -524,6 +551,7 @@ def assert_admin_restart(page, *, private_state, camera_ids, client=None):
         selected = page.locator("#admin-camera-choices input[type=checkbox]:checked").evaluate_all(
             "items => items.map(item => item.value)"
         )
+        _ADMIN_RESTART_DIAGNOSTIC["selected_camera_count"] = len(selected)
         _require(
             set(selected) == set(user["camera_access"]["camera_ids"]),
             "Restart changed the user's selected camera grants",
@@ -537,16 +565,26 @@ def assert_admin_restart(page, *, private_state, camera_ids, client=None):
         lambda error: script_errors.append(_browser_helpers()._script_error_code(error)),
     )
     try:
+        _ADMIN_RESTART_DIAGNOSTIC["phase"] = "viewer_login"
         user = users[0]
         token = _login(viewer, _origin(page), user["username"], user["password"])
         status, inventory = _api(viewer, token, "GET", "/api/v1/operator/cameras")
+        _ADMIN_RESTART_DIAGNOSTIC.update(
+            phase="viewer_inventory",
+            inventory_http_status=status,
+            inventory_camera_count=len(inventory.get("cameras", []))
+            if isinstance(inventory, dict)
+            else 0,
+        )
         _require(
             status == 200
             and {camera["device_id"] for camera in inventory["cameras"]}
             == set(user["camera_access"]["camera_ids"]),
             "Restarted viewer inventory exceeded its persisted grants",
         )
-        frames = _visible_live(viewer, camera_ids[0], "red")
+        _ADMIN_RESTART_DIAGNOSTIC["phase"] = "viewer_video"
+        frames = _visible_live(viewer, camera_ids[0], "red", diagnostic=_ADMIN_RESTART_DIAGNOSTIC)
+        _ADMIN_RESTART_DIAGNOSTIC["decoded_frames"] = frames
         status, _ = _api(viewer, token, "GET", f"/api/v1/operator/cameras/{camera_ids[1]}/history")
         _require(status == 404, "Restart granted the viewer an unassigned camera")
         _require(not script_errors, "Restarted limited-account browser raised a script error")
@@ -768,17 +806,36 @@ def test_real_browser_admin_users_roles_camera_access_and_restart(
             _open_admin(page)
             page.screenshot(path=preview, full_page=True)
             _return_to_cameras(page)
+        # The standalone fixture owns an in-process ASGI server. Close its
+        # browser clients before replacing it, then prove persistence with a
+        # fresh browser session. The installed-Windows journey separately
+        # exercises native shutdown and owned-process cleanup.
+        stage = "admin_browser_closing_for_restart"
+        context.close()
+        context = None
         stage = "admin_product_restart"
         product.stop()
+        stage = "admin_product_recreating"
         product = runtime._Product(
             identity, identity.directory / "recordings", media, caddy, product_ports
         )
+        stage = "admin_product_startup"
         runtime._wait(
             lambda: product.server.started and client.get("/operator/")[0] == 200,
             label="Admin product restart",
             product=product,
         )
+        stage = "admin_browser_recreating"
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        page = context.new_page()
+        page.set_default_timeout(12_000)
+        page.on(
+            "pageerror",
+            lambda error: script_errors.append(browser_helpers._script_error_code(error)),
+        )
+        stage = "admin_restarted_login"
         client.token = _login(page, client.origin, username, password)
+        stage = "admin_restarted_permissions"
         receipt.update(
             assert_admin_restart(page, private_state=private_state, camera_ids=camera_ids)
         )
@@ -813,6 +870,8 @@ def test_real_browser_admin_users_roles_camera_access_and_restart(
         diagnostic = {
             "stage": stage,
             "failure_code": failure,
+            "assertion_code": _ADMIN_FAILURE_CODE,
+            "restart": dict(_ADMIN_RESTART_DIAGNOSTIC),
             "script_error_codes": script_errors[:16],
             "cleanup_failure_codes": cleanup_failures,
         }

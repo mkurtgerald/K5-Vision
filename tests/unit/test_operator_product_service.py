@@ -967,7 +967,18 @@ def test_product_lifespan_uses_existing_human_identity_and_closes_its_camera_sto
             headers={"Authorization": "Bearer " + login.json()["session_token"]},
         )
         assert result.status_code == 200
-        assert result.json() == {"cameras": [], "worker_status": "ready"}
+        assert result.json() == {
+            "cameras": [],
+            "worker_status": "ready",
+            "capabilities": {
+                "account": login.json()["account"],
+                "can_view_history": True,
+                "can_export": True,
+                "can_manage_cameras": True,
+                "can_manage_users": True,
+                "camera_access": {"mode": "all", "camera_ids": []},
+            },
+        }
     assert calls == [("start", ()), ("stop", ())]
     assert app.state.operator_camera_store.closed
     _assert_profile_lease_available(tmp_path / "identity")
@@ -1065,7 +1076,18 @@ def test_second_product_application_cannot_start_workers_for_an_active_identity(
         assert not first.state.operator_camera_store.closed
         response = client.get("/api/v1/operator/cameras", headers=headers)
         assert response.status_code == 200
-        assert response.json() == {"cameras": [], "worker_status": "ready"}
+        assert response.json() == {
+            "cameras": [],
+            "worker_status": "ready",
+            "capabilities": {
+                "account": login.json()["account"],
+                "can_view_history": True,
+                "can_export": True,
+                "can_manage_cameras": True,
+                "can_manage_users": True,
+                "camera_access": {"mode": "all", "camera_ids": []},
+            },
+        }
         probe = OperatorProfileLock(tmp_path / "identity")
         try:
             with pytest.raises(OperatorProfileLockError):

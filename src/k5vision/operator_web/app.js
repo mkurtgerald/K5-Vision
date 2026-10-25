@@ -595,6 +595,7 @@
   async function refreshCameras(selectFirst = false) {
     if (!state.token) return;
     const epoch = state.sessionEpoch;
+    const navigationEpoch = state.navigationEpoch;
     const cameraListEpoch = ++state.cameraListEpoch;
     try {
       const data = await request("/api/v1/operator/cameras");
@@ -608,7 +609,8 @@
       if (state.selected && !currentCamera() && state.view !== "admin") {
         clearCameraSelection("Camera unavailable", "Select another camera or refresh the camera list.");
       }
-      if (selectFirst && !state.selected && state.cameras.length && state.view !== "wall") await selectCamera(state.cameras[0].device_id);
+      if (selectFirst && !state.selected && state.cameras.length &&
+        navigationEpoch === state.navigationEpoch && ["live", "history"].includes(state.view)) await selectCamera(state.cameras[0].device_id);
       return true;
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.sessionEpoch || cameraListEpoch !== state.cameraListEpoch) return;
@@ -1341,6 +1343,10 @@
       $("account-name").textContent = account.display_name || account.username;
       $("account-role").textContent = account.role;
       renderAccountControls();
+      state.historyRolling = true;
+      resetHistory();
+      setView("wall", false);
+      const navigationEpoch = state.navigationEpoch;
       $("sign-in").hidden = true;
       $("workspace").hidden = false;
       state.sessionExpiresAt = Date.parse(result.expires_at);
@@ -1349,8 +1355,7 @@
       scheduleSessionExpiry();
       await Promise.all([refreshCameras(true), refreshDiagnostics()]);
       if (epoch !== state.sessionEpoch) return;
-      setLastDay(); resetHistory();
-      setView("wall", false);
+      if (navigationEpoch === state.navigationEpoch) setLastDay();
       scheduleCameraPoll();
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;

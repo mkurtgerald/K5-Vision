@@ -36,7 +36,7 @@ def workspace():
     browser_api = pytest.importorskip("playwright.sync_api")
 
     @contextmanager
-    def launch(role="administrator"):
+    def launch(role="administrator", *, hold_initial_cameras=False):
         account = {
             "id": _ADMIN_ID,
             "username": "fixture-admin",
@@ -66,6 +66,8 @@ def workspace():
             "hold_create": False,
             "held": None,
             "expire": False,
+            "hold_initial_cameras": hold_initial_cameras,
+            "held_inventory": None,
         }
         channel = os.getenv(
             "K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium"
@@ -142,6 +144,13 @@ def workspace():
                         {"worker_status": "ready", "server_utc": datetime.now(UTC).isoformat()},
                     )
                 if path == "/api/v1/operator/cameras":
+                    if state["hold_initial_cameras"]:
+                        state["hold_initial_cameras"] = False
+                        state["held_inventory"] = (
+                            route,
+                            {"cameras": cameras, "worker_status": "ready"},
+                        )
+                        return None
                     return (
                         respond(route, {"detail": "Unauthorized"}, 401)
                         if state["expire"]
@@ -311,6 +320,7 @@ def test_viewer_controls_are_read_only_and_admin_request_cannot_reveal_after_exp
         assert page.locator("#download-recording").is_hidden()
         assert page.locator("#clip-mark-in").is_hidden()
         assert not errors
+
     with workspace() as (page, state, _account, errors):
         _login(page)
         page.locator("#admin-tab").click()
@@ -330,4 +340,45 @@ def test_viewer_controls_are_read_only_and_admin_request_cannot_reveal_after_exp
         assert page.locator("#admin-credential-dialog").is_hidden()
         assert page.locator("#admin-temporary-credential").input_value() == ""
         assert page.locator("#admin-users-list").inner_text() == ""
+        assert not errors
+
+
+def test_late_initial_camera_inventory_preserves_administration_and_open_permissions_editor(
+    workspace,
+):
+    """A slow first inventory must not undo the administrator's later navigation."""
+    with workspace(hold_initial_cameras=True) as (page, state, _account, errors):
+        viewer_id = "4a45619d-74db-4e60-a003-c4929c98cf49"
+        state["users"].append(
+            {
+                "id": viewer_id,
+                "username": "persisted-viewer",
+                "display_name": "Persisted viewer",
+                "role": "viewer",
+                "enabled": True,
+                "credential_status": "active",
+                "camera_access": {"mode": "selected", "camera_ids": [_CAMERA]},
+            }
+        )
+        _login(page)
+        page.locator("#admin-tab").click()
+        viewer = page.locator(f'#admin-users-list tr[data-user-id="{viewer_id}"]')
+        viewer.locator('[data-user-action="edit"]').click()
+        selection = page.locator(f'#admin-camera-choices input[value="{_CAMERA}"]')
+        assert selection.is_checked()
+        assert "Unavailable camera" in page.locator("#admin-camera-choices").inner_text()
+        route, inventory = state["held_inventory"]
+        route.fulfill(content_type="application/json", body=json.dumps(inventory))
+        page.locator("#admin-camera-choices").filter(
+            has_text="Generated entrance camera"
+        ).wait_for()
+        assert page.locator("#admin-panel").is_visible()
+        assert page.locator("#camera-workspace").is_hidden()
+        assert page.locator("#admin-user-dialog").is_visible()
+        assert page.locator("#admin-display-name").input_value() == "Persisted viewer"
+        assert selection.is_checked()
+        assert not any(
+            method == "POST" and path.endswith("/media-session")
+            for method, path, _body in state["requests"]
+        )
         assert not errors

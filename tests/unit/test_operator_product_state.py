@@ -13,6 +13,7 @@ import pytest
 
 from k5vision import identity_state
 from k5vision.domain.devices import Device, DeviceCreate, DeviceProtocol
+from k5vision.domain.users import UserCreate, UserPatch, UserRole
 from k5vision.operator_product_state import (
     MAX_OPERATOR_CAMERAS,
     OperatorCameraCapacityError,
@@ -20,6 +21,7 @@ from k5vision.operator_product_state import (
     OperatorCameraStoreError,
 )
 from k5vision.services.device_registry import DeviceRegistry, DeviceRegistryConflictError
+from k5vision.services.user_registry import UserRegistry
 
 _SECRET = "source-fixture-private-secret"
 
@@ -654,3 +656,191 @@ def test_closed_store_has_no_reusable_handle_and_preserves_state(identity) -> No
         with pytest.raises(OperatorCameraStoreError):
             operation()
     assert _database(identity).exists()
+
+
+@pytest.mark.parametrize(
+    "lifecycle",
+    [
+        "expired-pending",
+        "reset-original-pending",
+        "reset-original-expired",
+        "demote-original",
+        "disable-original",
+    ],
+)
+def test_user_credential_lifecycle_preserves_identity_camera_store_and_restart(
+    identity, monkeypatch, lifecycle
+):
+    import k5vision.services.user_registry as users_module
+
+    elapsed = [1000.0]
+    monkeypatch.setattr(users_module, "monotonic", lambda: elapsed[0])
+    devices, store, device, source = _registered_store(identity)
+    paused = store.set_recording_enabled(device.id, False)
+    history = identity.directory / "recordings" / source.binding.path_name / "retained.mp4"
+    history.parent.mkdir(parents=True)
+    retained = b"existing recording retained during account lifecycle"
+    history.write_bytes(retained)
+    users = UserRegistry(database_path=identity.database_path, site_id=identity.site_id)
+    original = users.list()[0]
+    backup, code, _ = users.create_with_bootstrap(
+        UserCreate(
+            username="backup.admin", display_name="Backup admin", role=UserRole.ADMINISTRATOR
+        ),
+        actor=original.username,
+    )
+    users.activate_bootstrap_password(
+        username=backup.username,
+        temporary_credential=code,
+        new_password="backup administrator fixture password",
+        actor="bootstrap-user",
+    )
+    temporary = None
+    target = original
+    try:
+        if lifecycle == "expired-pending":
+            target, temporary, _ = users.create_with_bootstrap(
+                UserCreate(
+                    username="pending.viewer", display_name="Pending viewer", role=UserRole.VIEWER
+                ),
+                actor=backup.username,
+                ttl_seconds=60,
+            )
+        elif lifecycle.startswith("reset-original"):
+            _, temporary, _ = users.reset_bootstrap(
+                original.id, actor=backup.username, ttl_seconds=60
+            )
+            assert users.credential_status(original.id) == "pending"
+            assert identity_state.load_identity_state(identity.directory) == identity
+        elif lifecycle == "demote-original":
+            users.update(original.id, UserPatch(role=UserRole.OPERATOR), actor=backup.username)
+        else:
+            users.update(original.id, UserPatch(enabled=False), actor=backup.username)
+        if "expired" in lifecycle:
+            elapsed[0] += 60
+            assert users.credential_status(target.id) == "expired"
+            assert (
+                users.activate_bootstrap_password(
+                    username=target.username,
+                    temporary_credential=temporary,
+                    new_password="replacement user fixture password",
+                    actor="bootstrap-user",
+                )
+                is None
+            )
+        assert identity_state.load_identity_state(identity.directory) == identity
+        assert store.list_sources() == (paused,)
+        assert history.read_bytes() == retained
+    finally:
+        users.close()
+        store.close()
+        devices.close()
+    assert identity_state.load_identity_state(identity.directory) == identity
+    reopened_devices = DeviceRegistry(
+        database_path=identity.directory / "devices.sqlite3", site_id=identity.site_id
+    )
+    reopened = OperatorCameraStore(identity.directory, identity.site_id, registry=reopened_devices)
+    try:
+        assert reopened.list_sources() == (paused,)
+        assert history.read_bytes() == retained
+    finally:
+        reopened.close()
+        reopened_devices.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "expiry", "valid"),
+    [
+        ("expired-bootstrap", "2035-01-01T00:00:00+00:00", True),
+        ("unknown-bootstrap", "2035-01-01T00:00:00+00:00", False),
+        ("expired-bootstrap", "2035-01-01T00:00:00", False),
+        ("expired-bootstrap", "invalid-expiry", False),
+        ("expired-bootstrap", None, False),
+    ],
+)
+def test_expired_credential_identity_admission_preserves_kind_and_expiry_checks(
+    identity, kind, expiry, valid
+):
+    users = UserRegistry(database_path=identity.database_path, site_id=identity.site_id)
+    pending, _, _ = users.create_with_bootstrap(
+        UserCreate(username="pending.viewer", display_name="Pending viewer", role=UserRole.VIEWER),
+        actor="fixture-admin",
+    )
+    users.close()
+    with sqlite3.connect(identity.database_path) as connection:
+        connection.execute(
+            "UPDATE user_credentials SET credential_kind = ?, expires_at = ? WHERE user_id = ?",
+            (kind, expiry, str(pending.id)),
+        )
+    if valid:
+        assert identity_state.load_identity_state(identity.directory) == identity
+    else:
+        with pytest.raises(identity_state.IdentityStateError):
+            identity_state.load_identity_state(identity.directory)
+
+
+def test_identity_requires_a_current_initialized_admin_beyond_historical_setup(identity):
+    with sqlite3.connect(identity.database_path) as connection:
+        connection.execute("UPDATE users SET role = 'viewer'")
+    with pytest.raises(identity_state.IdentityStateError):
+        identity_state.load_identity_state(identity.directory)
+
+
+@pytest.mark.parametrize("grants", ["absent", "selected"])
+def test_identity_admits_legacy_or_valid_camera_grants_without_rewriting(identity, grants):
+    users = UserRegistry(database_path=identity.database_path, site_id=identity.site_id)
+    viewer, _, _ = users.create_with_bootstrap(
+        UserCreate(username="restricted.viewer", display_name="Viewer", role=UserRole.VIEWER),
+        actor="fixture-admin",
+        camera_access={"mode": "selected", "camera_ids": [UUID(int=3)]},
+    )
+    users.close()
+    if grants == "absent":
+        with sqlite3.connect(identity.database_path) as connection:
+            connection.execute("DROP TABLE user_camera_access")
+    before = identity.database_path.read_bytes()
+    assert identity_state.load_identity_state(identity.directory) == identity
+    assert identity.database_path.read_bytes() == before
+    reopened = UserRegistry(database_path=identity.database_path, site_id=identity.site_id)
+    try:
+        assert reopened.get_camera_access(viewer.id) == (
+            {"mode": "all", "camera_ids": []}
+            if grants == "absent"
+            else {"mode": "selected", "camera_ids": [UUID(int=3)]}
+        )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("site_id", "foreign-site"),
+        ("user_id", str(UUID(int=99))),
+        ("mode", "unknown"),
+        ("camera_ids_json", "not-json"),
+        ("camera_ids_json", '["invalid-camera"]'),
+        ("camera_ids_json", '{"mode":"all"}'),
+        ("camera_ids_json", " " * 8193),
+        ("camera_ids_json", json.dumps([str(UUID(int=index)) for index in range(65)])),
+        ("camera_ids_json", json.dumps([str(UUID(int=3)), str(UUID(int=3))])),
+    ],
+)
+def test_identity_refuses_foreign_or_invalid_camera_grants(identity, column, value):
+    users = UserRegistry(database_path=identity.database_path, site_id=identity.site_id)
+    viewer, _, _ = users.create_with_bootstrap(
+        UserCreate(username="restricted.viewer", display_name="Viewer", role=UserRole.VIEWER),
+        actor="fixture-admin",
+        camera_access={"mode": "selected", "camera_ids": []},
+    )
+    users.close()
+    assert column in {"site_id", "user_id", "mode", "camera_ids_json"}
+    with sqlite3.connect(identity.database_path) as connection:
+        connection.execute(
+            f"UPDATE user_camera_access SET {column} = ? WHERE user_id = ?",
+            (value, str(viewer.id)),
+        )
+    before = identity.database_path.read_bytes()
+    with pytest.raises(identity_state.IdentityStateError):
+        identity_state.load_identity_state(identity.directory)
+    assert identity.database_path.read_bytes() == before
