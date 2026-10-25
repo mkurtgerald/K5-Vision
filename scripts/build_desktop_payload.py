@@ -327,6 +327,9 @@ def build(args: argparse.Namespace) -> None:
                 "scope": "ONVIF camera-onboarding recording operator",
                 "onvif_camera_onboarding": True,
                 "direct_rtsp_enrollment": True,
+                "admin_user_management": True,
+                "role_permissions": True,
+                "camera_access_controls": True,
                 "manual_stream_uri_required": False,
                 "python": donors["python"],
                 "worker_downloads": workers,
@@ -352,6 +355,7 @@ def build(args: argparse.Namespace) -> None:
             "import k5vision.operator_product; import k5vision.operator_product_api; "
             "import k5vision.operator_onvif; import k5vision.operator_time; "
             "import k5vision.operator_rtsp; import k5vision.operator_rtsp_api; "
+            "import k5vision.operator_admin_api; "
             "import importlib.util; "
             "assert importlib.util.find_spec('onvif') is None; "
             "assert importlib.util.find_spec('zeep') is None; "

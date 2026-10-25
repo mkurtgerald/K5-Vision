@@ -180,6 +180,22 @@ class _Harness:
         }
 
 
+def _initialized_session(product, account):
+    """Model real login: a pending bootstrap account cannot own a product session."""
+    if (
+        product.users.get(account.id) is not None
+        and product.users.credential_status(account.id) != "active"
+    ):
+        _, temporary, _ = product.users.reset_bootstrap(account.id, actor="test")
+        assert product.users.activate_bootstrap_password(
+            username=account.username,
+            temporary_credential=temporary,
+            new_password="initialized-product-test-password",
+            actor="test",
+        )
+    return asyncio.run(product.sessions.issue(account))
+
+
 @pytest.fixture
 def product(tmp_path, monkeypatch, request):
     # Managed execution presents the two system ancestors as nobody-owned;
@@ -317,7 +333,7 @@ def test_recording_choice_requires_current_admin_and_local_origin(product, role)
     account, _, _ = product.users.create_with_bootstrap(
         UserCreate(username="recording-reader", display_name="Reader", role=role), actor="test"
     )
-    token, _ = asyncio.run(product.sessions.issue(account))
+    token, _ = _initialized_session(product, account)
     assert (
         product.client.put(
             route, headers={"Authorization": "Bearer " + token}, json={"enabled": False}
@@ -631,7 +647,7 @@ def test_read_roles_cannot_mutate_camera_sources(product, role):
     account, _, _ = product.users.create_with_bootstrap(
         UserCreate(username="read-user", display_name="Reader", role=role), actor="test"
     )
-    token, _ = asyncio.run(product.sessions.issue(account))
+    token, _ = _initialized_session(product, account)
     headers = {"Authorization": "Bearer " + token}
     assert product.client.get("/api/v1/operator/cameras", headers=headers).status_code == 200
     response = product.client.post(
@@ -797,11 +813,11 @@ def test_logout_revokes_cookie_and_durable_disable_and_role_changes_take_effect(
     product.users.update(
         product.admin.id, UserPatch(enabled=True, role=UserRole.VIEWER), actor="test"
     )
-    assert product.client.get("/api/v1/operator/media-auth", headers=headers).status_code == 200
+    assert product.client.get("/api/v1/operator/media-auth", headers=headers).status_code == 401
     response = product.client.delete(
         f"/api/v1/operator/cameras/{device_id}", headers=product.headers
     )
-    assert response.status_code == 403
+    assert response.status_code == 401
     asyncio.run(product.sessions.revoke(product.token))
     assert product.client.get("/api/v1/operator/media-auth", headers=headers).status_code == 401
 
@@ -972,7 +988,7 @@ def test_durable_account_lookup_and_sessions_are_site_scoped(product):
             UserCreate(username="peer-admin", display_name="Peer", role=UserRole.ADMINISTRATOR),
             actor="test",
         )
-        peer_token, _ = asyncio.run(product.sessions.issue(account))
+        peer_token, _ = _initialized_session(product, account)
         response = product.client.get(
             "/api/v1/operator/cameras", headers={"Authorization": "Bearer " + peer_token}
         )
@@ -1036,7 +1052,7 @@ def test_status_supports_viewer_and_reports_unknown_storage_without_guessing(pro
         UserCreate(username="storage-viewer", display_name="Viewer", role=UserRole.VIEWER),
         actor="test",
     )
-    token, _ = asyncio.run(product.sessions.issue(viewer))
+    token, _ = _initialized_session(product, viewer)
     product.service.worker_status = "unavailable"
     response = product.client.get(
         "/api/v1/operator/status", headers={"Authorization": "Bearer " + token}
@@ -1560,7 +1576,7 @@ def test_onvif_all_mutations_require_administrator_before_connector_use(product,
     account = product.users.create(
         UserCreate(username="onvif-reader", display_name="Reader", role=role), actor="test"
     )
-    token, _ = asyncio.run(product.sessions.issue(account))
+    token, _ = _initialized_session(product, account)
     for route, payload in (
         ("camera-discovery", {}),
         ("camera-profiles", {"host": "127.0.0.1"}),
@@ -1681,7 +1697,7 @@ def test_onvif_probe_is_bound_to_original_user_and_session(product, onvif):
         UserCreate(username="onvif-admin", display_name="Admin", role=UserRole.ADMINISTRATOR),
         actor="test",
     )
-    peer_token, _ = asyncio.run(product.sessions.issue(peer))
+    peer_token, _ = _initialized_session(product, peer)
     response = product.client.post(
         "/api/v1/operator/cameras/connect",
         headers={"Authorization": "Bearer " + peer_token},
@@ -2060,7 +2076,7 @@ def test_rtsp_mutations_reject_cross_origin_no_session_and_non_admin(product, rt
         UserCreate(username="rtsp-viewer", display_name="Viewer", role=UserRole.VIEWER),
         actor="test",
     )
-    token, _ = asyncio.run(product.sessions.issue(user))
+    token, _ = _initialized_session(product, user)
     assert (
         product.client.post(url, headers={"Authorization": "Bearer " + token}, json={}).status_code
         == 403

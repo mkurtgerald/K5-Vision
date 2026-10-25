@@ -27,7 +27,10 @@ _TRUE = (
     "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected authenticated_camera_restart_live "
     "wall_viewport_fit native_launch_argument_matched browser_origin_connected page_window_visible "
     "direct_rtsp_enrollment direct_rtsp_wrong_password_rejected direct_rtsp_persisted "
-    "direct_rtsp_fresh_enrollment direct_rtsp_multi_channel_same_endpoint"
+    "direct_rtsp_fresh_enrollment direct_rtsp_multi_channel_same_endpoint "
+    "admin_user_management role_permissions camera_access_controls admin_user_creation "
+    "admin_bootstrap_password_change admin_password_reset admin_disable_reenable "
+    "admin_live_media_revocation admin_audit_visible admin_state_persisted"
 ).split()
 _FALSE = (
     "physical_camera_acceptance capacity_acceptance endurance_acceptance windows_service "
@@ -46,7 +49,25 @@ def _integers(value, count, minimum):
     return value
 
 
+def _admin_journey(receipt):
+    for field in (
+        "admin_viewer_live_decoded_frames",
+        "admin_operator_live_decoded_frames",
+        "admin_restart_viewer_live_decoded_frames",
+    ):
+        value = receipt.get(field)
+        _require(type(value) is int and 4 <= value <= 100000)
+    _require(type(receipt.get("admin_user_count_created")) is int)
+    _require(receipt["admin_user_count_created"] == 2)
+    events = receipt.get("admin_audit_event_count")
+    _require(type(events) is int and 3 <= events <= 100)
+    denials = receipt.get("admin_denied_http_statuses")
+    _require(type(denials) is list and 6 <= len(denials) <= 32)
+    _require(all(type(value) is int and value in {401, 403, 404} for value in denials))
+
+
 def _nvr_journey(receipt):
+    _admin_journey(receipt)
     _require(type(receipt.get("camera_count")) is int and receipt["camera_count"] == 4)
     layouts = receipt.get("wall_layouts")
     _require(type(layouts) is list and len(layouts) == 3)

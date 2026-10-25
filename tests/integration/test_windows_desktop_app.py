@@ -1744,6 +1744,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     api = _Windows()
     runtime = _helpers("test_operator_product_runtime")
     browser_helpers = _helpers("test_operator_beta_browser")
+    admin_helpers = _helpers("test_operator_admin_browser")
     helpers = runtime._helpers()
     browser_api = pytest.importorskip("playwright.sync_api")
     _require(version("playwright") == "1.58.0", "Expected reviewed Playwright version is absent")
@@ -2139,6 +2140,47 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 publisher_credentials=primary_publisher_credentials,
             )
             receipt["host_clock_step_acceptance"] = True
+        stage = "installed_user_administration"
+
+        def admin_progress(phase):
+            if phase in {
+                "admin_create_accounts",
+                "admin_activate_viewer",
+                "admin_activate_operator",
+                "admin_revoke_camera_access",
+                "admin_disable_and_reenable",
+                "admin_reset_password",
+                "admin_visible_audit",
+            }:
+                nvr_diagnostic["admin_stage"] = phase
+
+        admin_evidence, admin_private_state = admin_helpers.run_admin_journey(
+            page,
+            admin_username=username,
+            admin_password=password,
+            camera_ids=camera_ids,
+            colors=tuple(color for _, _, color in _DESKTOP_CAMERAS),
+            client=client,
+            progress=admin_progress,
+        )
+        for field in (
+            "admin_user_management",
+            "role_permissions",
+            "camera_access_controls",
+            "admin_user_creation",
+            "admin_bootstrap_password_change",
+            "admin_password_reset",
+            "admin_disable_reenable",
+            "admin_live_media_revocation",
+            "admin_audit_visible",
+            "admin_viewer_live_decoded_frames",
+            "admin_operator_live_decoded_frames",
+            "admin_user_count_created",
+            "admin_audit_event_count",
+            "admin_denied_http_statuses",
+        ):
+            _require(field in admin_evidence, "Installed user administration proof is incomplete")
+            receipt[field] = admin_evidence[field]
         stage = "wall_logout_resource_cleanup"
         browser_helpers._wall_frames(page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS])
         wall_videos = page.locator("#wall-panel video").element_handles()
@@ -2292,6 +2334,17 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             page.locator("#wall-panel [data-camera-id]").count() == 4,
             "Relaunched installed workspace lost its camera wall",
         )
+        stage = "durable_user_administration_restart"
+        admin_restarted = admin_helpers.assert_admin_restart(
+            page,
+            private_state=admin_private_state,
+            camera_ids=camera_ids,
+            client=client,
+        )
+        for field in ("admin_state_persisted", "admin_restart_viewer_live_decoded_frames"):
+            _require(field in admin_restarted, "Restarted user administration proof is incomplete")
+            receipt[field] = admin_restarted[field]
+        stage = "relaunch_recording_preference_ui"
         browser_helpers._open_camera_watch(page, camera_ids[3])
         _wait(
             lambda: page.locator("#toggle-recording").get_attribute("data-enabled") == "false",

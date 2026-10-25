@@ -1,9 +1,13 @@
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from threading import Barrier
 from uuid import uuid4
 
 import pytest
 
+import k5vision.services.user_registry as registry_module
+from k5vision.auth_sessions import UserSessionManager
 from k5vision.domain.users import UserCreate, UserPatch, UserRole
 from k5vision.services.user_registry import (
     UserRegistry,
@@ -35,6 +39,373 @@ def _initialized_administrator(registry: UserRegistry, username: str):
         == account
     )
     return account
+
+
+def test_camera_grants_are_atomic_private_site_scoped_and_persistent(tmp_path):
+    path = tmp_path / "users.sqlite3"
+    registry = UserRegistry(database_path=path, site_id="site-a")
+    one, two = uuid4(), uuid4()
+    user, temporary, _ = registry.create_with_bootstrap(
+        _user(), actor="admin", camera_access={"mode": "selected", "camera_ids": [one, two]}
+    )
+    assert registry.get_camera_access(user.id) == {
+        "mode": "selected",
+        "camera_ids": sorted([one, two], key=str),
+    }
+    assert registry.credential_status(user.id) == "pending"
+    before = registry.audit_events()
+    registry.set_camera_access(user.id, mode="selected", camera_ids=[two], actor="admin")
+    assert registry.audit_events()[-1].changed_fields == ("camera_access",)
+    count = len(registry.audit_events())
+    registry.set_camera_access(user.id, mode="selected", camera_ids=[two], actor="admin")
+    assert len(registry.audit_events()) == count
+    assert temporary not in str(before)
+    registry.close()
+    reopened = UserRegistry(database_path=path, site_id="site-a")
+    assert reopened.get_camera_access(user.id) == {"mode": "selected", "camera_ids": [two]}
+    other = UserRegistry(database_path=path, site_id="site-b")
+    assert other.get_camera_access(user.id) is None
+    assert other.set_camera_access(user.id, mode="all", camera_ids=[], actor="admin") is None
+    other.close()
+    reopened.close()
+
+
+def test_invalid_initial_grants_roll_back_user_credential_and_audit(tmp_path):
+    registry = UserRegistry(database_path=tmp_path / "users.sqlite3")
+    request = _user().model_copy(update={"role": UserRole.ADMINISTRATOR})
+    with pytest.raises(ValueError):
+        registry.create_with_bootstrap(
+            request, actor="admin", camera_access={"mode": "selected", "camera_ids": []}
+        )
+    assert registry.list() == []
+    assert registry.audit_events() == []
+    assert registry._connection.execute("SELECT COUNT(*) FROM user_credentials").fetchone()[0] == 0
+    registry.close()
+
+
+def test_invalid_combined_update_preserves_role_grants_and_audit(tmp_path):
+    registry = UserRegistry(database_path=tmp_path / "users.sqlite3")
+    user, _, _ = registry.create_with_bootstrap(
+        _user(), actor="admin", camera_access={"mode": "selected", "camera_ids": []}
+    )
+    audit = registry.audit_events()
+    with pytest.raises(ValueError):
+        registry.update(
+            user.id,
+            UserPatch(role=UserRole.ADMINISTRATOR),
+            actor="admin",
+            camera_access={"mode": "selected", "camera_ids": []},
+        )
+    assert registry.get(user.id) == user
+    assert registry.get_camera_access(user.id) == {"mode": "selected", "camera_ids": []}
+    assert registry.audit_events() == audit
+    registry.update(user.id, UserPatch(role=UserRole.ADMINISTRATOR), actor="admin")
+    assert registry.get_camera_access(user.id) == {"mode": "all", "camera_ids": []}
+    registry.close()
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        {"mode": "selected", "camera_ids": ["invalid"]},
+        {"mode": "all", "camera_ids": [uuid4()]},
+        {"mode": "selected", "camera_ids": [uuid4() for _ in range(65)]},
+        {"mode": "invalid", "camera_ids": []},
+    ],
+)
+def test_camera_grants_reject_invalid_or_unbounded_selection(tmp_path, selection):
+    registry = UserRegistry(database_path=tmp_path / "users.sqlite3")
+    user = registry.create(_user(), actor="admin")
+    before = registry.audit_events()
+    with pytest.raises(ValueError):
+        registry.set_camera_access(user.id, actor="admin", **selection)
+    assert registry.get_camera_access(user.id) == {"mode": "all", "camera_ids": []}
+    assert registry.audit_events() == before
+    registry.close()
+
+
+def test_reset_replaces_password_and_old_temporary_credentials_without_disclosure(tmp_path):
+    path = tmp_path / "users.sqlite3"
+    registry = UserRegistry(database_path=path)
+    user, first, _ = registry.create_with_bootstrap(_user(), actor="admin")
+    registry.activate_bootstrap_password(
+        username=user.username,
+        temporary_credential=first,
+        new_password="first initialized password",
+        actor="bootstrap-user",
+    )
+    assert registry.credential_status(user.id) == "active"
+    same, second, _ = registry.reset_bootstrap(user.id, actor="admin")
+    assert same == user and first != second
+    assert registry.credential_status(user.id) == "pending"
+    assert (
+        registry.verify_password(username=user.username, password="first initialized password")
+        is None
+    )
+    assert (
+        registry.activate_bootstrap_password(
+            username=user.username,
+            temporary_credential=first,
+            new_password="replacement initialized password",
+            actor="bootstrap-user",
+        )
+        is None
+    )
+    assert (
+        registry.activate_bootstrap_password(
+            username=user.username,
+            temporary_credential=second,
+            new_password="replacement initialized password",
+            actor="bootstrap-user",
+        )
+        == user
+    )
+    assert registry.credential_status(user.id) == "active"
+    assert (
+        registry.verify_password(
+            username=user.username, password="replacement initialized password"
+        )
+        == user
+    )
+    assert registry.audit_events()[-2].action == "password-reset"
+    assert first.encode() not in path.read_bytes() and second.encode() not in path.read_bytes()
+    registry.close()
+
+
+def test_last_initialized_administrator_cannot_be_reset(tmp_path):
+    registry = UserRegistry(database_path=tmp_path / "users.sqlite3")
+    admin = _initialized_administrator(registry, "primary.admin")
+    audit = registry.audit_events()
+    with pytest.raises(UserRegistryLastAdministratorError):
+        registry.reset_bootstrap(admin.id, actor="primary.admin")
+    assert registry.audit_events() == audit
+    assert (
+        registry.verify_password(
+            username=admin.username, password="local administrator test password"
+        )
+        == admin
+    )
+    registry.close()
+
+
+def test_concurrent_admin_resets_leave_one_initialized_administrator(tmp_path):
+    path = tmp_path / "users.sqlite3"
+    registry = UserRegistry(database_path=path)
+    one = _initialized_administrator(registry, "primary.admin")
+    two = _initialized_administrator(registry, "other.admin")
+    registry.close()
+    barrier = Barrier(2)
+
+    def reset(user):
+        current = UserRegistry(database_path=path)
+        try:
+            barrier.wait()
+            current.reset_bootstrap(user.id, actor="admin")
+            return True
+        except UserRegistryLastAdministratorError:
+            return False
+        finally:
+            current.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(reset, [one, two]))
+    assert sorted(results) == [False, True]
+    reopened = UserRegistry(database_path=path)
+    assert sorted([reopened.credential_status(one.id), reopened.credential_status(two.id)]) == [
+        "active",
+        "pending",
+    ]
+    reopened.close()
+
+
+def test_verified_old_password_snapshot_cannot_issue_session_after_reset_and_activation(tmp_path):
+    registry = UserRegistry(database_path=tmp_path / "users.sqlite3")
+    user, temporary, _ = registry.create_with_bootstrap(_user(), actor="admin")
+    registry.activate_bootstrap_password(
+        username=user.username,
+        temporary_credential=temporary,
+        new_password="first initialized password",
+        actor="bootstrap-user",
+    )
+    old_account, old_version = registry.verify_password_snapshot(
+        username=user.username, password="first initialized password"
+    )
+    _, reset, _ = registry.reset_bootstrap(user.id, actor="admin")
+    registry.activate_bootstrap_password(
+        username=user.username,
+        temporary_credential=reset,
+        new_password="new initialized password",
+        actor="bootstrap-user",
+    )
+
+    async def run():
+        sessions = UserSessionManager(resolve_account=registry.resolve_session)
+        stale, _ = await sessions.issue(old_account, credential_version=old_version)
+        assert await sessions.resolve(stale) is None
+        current, version = registry.verify_password_snapshot(
+            username=user.username, password="new initialized password"
+        )
+        valid, _ = await sessions.issue(current, credential_version=version)
+        assert await sessions.resolve(valid) == user
+        registry.update(user.id, UserPatch(enabled=False), actor="admin")
+        assert await sessions.resolve(valid) is None
+
+    asyncio.run(run())
+    registry.close()
+
+
+@pytest.mark.parametrize("expiry_method", ["utc", "elapsed", "restart-rollback"])
+def test_expired_bootstrap_never_revives_after_clock_rollback_or_restart(
+    tmp_path, monkeypatch, expiry_method
+):
+    state = {"utc": datetime(2035, 1, 1, tzinfo=UTC), "tick": 100.0}
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return state["utc"]
+
+    monkeypatch.setattr(registry_module, "datetime", Clock)
+    monkeypatch.setattr(registry_module, "monotonic", lambda: state["tick"])
+    path = tmp_path / "users.sqlite3"
+    registry = UserRegistry(database_path=path)
+    user, temporary, _ = registry.create_with_bootstrap(_user(), actor="admin", ttl_seconds=60)
+    if expiry_method == "utc":
+        state["utc"] += timedelta(seconds=120)
+        registry.close()
+        registry = UserRegistry(database_path=path)
+    elif expiry_method == "elapsed":
+        state["tick"] += 61
+    else:
+        state["utc"] += timedelta(seconds=30)
+        assert registry.credential_status(user.id) == "pending"
+        registry.close()
+        registry = UserRegistry(database_path=path)
+        state["utc"] -= timedelta(seconds=20)
+    assert registry.credential_status(user.id) == "expired"
+    state["utc"] -= timedelta(days=2)
+    registry.close()
+    reopened = UserRegistry(database_path=path)
+    assert reopened.credential_status(user.id) == "expired"
+    assert (
+        reopened.activate_bootstrap_password(
+            username=user.username,
+            temporary_credential=temporary,
+            new_password="a replacement password",
+            actor="bootstrap-user",
+        )
+        is None
+    )
+    reopened.close()
+
+
+def test_latest_audit_page_uses_event_identity_not_adjustable_wall_time(tmp_path):
+    registry = UserRegistry(database_path=tmp_path / "users.sqlite3")
+    user = registry.create(_user(), actor="admin")
+    registry.update(user.id, UserPatch(display_name="Renamed user"), actor="admin")
+    assert [event.action for event in registry.audit_events(newest_first=True, limit=1)] == [
+        "updated"
+    ]
+    registry.close()
+
+
+def test_valid_bootstrap_survives_small_ntp_backstep_with_trusted_elapsed_budget(
+    tmp_path, monkeypatch
+):
+    state = {"utc": datetime(2035, 1, 1, tzinfo=UTC), "tick": 100.0}
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return state["utc"]
+
+    monkeypatch.setattr(registry_module, "datetime", Clock)
+    monkeypatch.setattr(registry_module, "monotonic", lambda: state["tick"])
+    registry = UserRegistry(database_path=tmp_path / "users.sqlite3")
+    user, temporary, _ = registry.create_with_bootstrap(_user(), actor="admin", ttl_seconds=60)
+    state["utc"] += timedelta(seconds=10)
+    state["tick"] += 10
+    assert registry.credential_status(user.id) == "pending"
+    state["utc"] -= timedelta(seconds=5)
+    state["tick"] += 1
+    assert (
+        registry.activate_bootstrap_password(
+            username=user.username,
+            temporary_credential=temporary,
+            new_password="replacement user password",
+            actor="bootstrap-user",
+        )
+        == user
+    )
+    registry.close()
+
+
+@pytest.mark.parametrize("offset_seconds", [172800, -172800])
+def test_valid_bootstrap_uses_elapsed_lifetime_through_realistic_clock_corrections(
+    tmp_path, monkeypatch, offset_seconds
+):
+    state = {"utc": datetime(2035, 1, 1, tzinfo=UTC), "tick": 100.0}
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return state["utc"]
+
+    monkeypatch.setattr(registry_module, "datetime", Clock)
+    monkeypatch.setattr(registry_module, "monotonic", lambda: state["tick"])
+    registry = UserRegistry(database_path=tmp_path / "users.sqlite3")
+    user, temporary, _ = registry.create_with_bootstrap(_user(), actor="admin", ttl_seconds=60)
+    state["utc"] += timedelta(seconds=offset_seconds)
+    state["tick"] += 15
+    assert registry.credential_status(user.id) == "pending"
+    assert (
+        registry.activate_bootstrap_password(
+            username=user.username,
+            temporary_credential=temporary,
+            new_password="replacement user password",
+            actor="bootstrap-user",
+        )
+        == user
+    )
+    registry.close()
+
+
+def test_elapsed_bootstrap_expiry_is_permanent_through_clock_corrections_and_restart(
+    tmp_path, monkeypatch
+):
+    state = {"utc": datetime(2035, 1, 1, tzinfo=UTC), "tick": 100.0}
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return state["utc"]
+
+    monkeypatch.setattr(registry_module, "datetime", Clock)
+    monkeypatch.setattr(registry_module, "monotonic", lambda: state["tick"])
+    path = tmp_path / "users.sqlite3"
+    registry = UserRegistry(database_path=path)
+    user, temporary, _ = registry.create_with_bootstrap(_user(), actor="admin", ttl_seconds=60)
+    state["utc"] += timedelta(days=2)
+    state["tick"] = 120
+    assert registry.credential_status(user.id) == "pending"
+    state["utc"] -= timedelta(days=4)
+    state["tick"] = 159
+    assert registry.credential_status(user.id) == "pending"
+    state["tick"] = 160
+    assert registry.credential_status(user.id) == "expired"
+    registry.close()
+    reopened = UserRegistry(database_path=path)
+    assert reopened.credential_status(user.id) == "expired"
+    assert (
+        reopened.activate_bootstrap_password(
+            username=user.username,
+            temporary_credential=temporary,
+            new_password="replacement user password",
+            actor="bootstrap-user",
+        )
+        is None
+    )
+    reopened.close()
 
 
 def test_user_registry_persists_site_scope_and_audit(tmp_path) -> None:

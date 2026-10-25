@@ -14,7 +14,17 @@ from pathlib import Path
 
 from k5vision.media.mediamtx_provider import MediaMTXCredentials
 
-_ASSETS = ("index.html", "app.css", "app.js", "wall.css", "wall.js", "timeline.css", "timeline.js")
+_ASSETS = (
+    "index.html",
+    "app.css",
+    "app.js",
+    "wall.css",
+    "wall.js",
+    "timeline.css",
+    "timeline.js",
+    "admin.css",
+    "admin.js",
+)
 _AUTH_ROUTE = "/api/v1/operator/media-auth"
 _UNTRUSTED_HEADERS = ["Forwarded", "X-Forwarded-*", "X-K5-*"]
 

@@ -12,6 +12,14 @@ check the release's matching Windows qualification receipt for this workflow.
 
 ## Watch the site
 
+Administrators can choose **Administration** to create and manage K5 accounts,
+assign roles and cameras, enable or disable access, issue one-time password setup
+credentials and review account activity. Viewers can watch and play assigned
+cameras; operators can also export clips. Camera and recording configuration and
+user administration require an administrator account. The
+[Windows desktop guide](WINDOWS_DESKTOP_BETA.md#administer-users-and-camera-access)
+describes account setup and the last-administrator protection.
+
 Choose **Camera wall** and a layout: **1 camera**, **2 × 2** or **3 × 3**.
 Use **Previous** and **Next** to page through additional cameras. Each tile names
 its camera and shows connection and recording state. Choose **Watch** for the

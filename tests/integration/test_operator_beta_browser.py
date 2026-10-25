@@ -1253,6 +1253,8 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
                     "wall.css": "text/css",
                     "timeline.js": "application/javascript",
                     "timeline.css": "text/css",
+                    "admin.js": "application/javascript",
+                    "admin.css": "text/css",
                 }[name]
                 route.fulfill(
                     status=200, content_type=content_type, body=(assets / name).read_text()

@@ -16,6 +16,10 @@ on:
       - tests/unit/test_windows_vm_clock*.py
       - scripts/verify_windows_vm_clock_receipt.py
       - tests/integration/test_operator_beta_browser.py
+      - tests/integration/test_operator_admin_browser.py
+      - tests/unit/test_operator_admin*.py
+      - tests/test_user_admin_api.py
+      - tests/test_user_registry.py
       - tests/integration/onvif_camera_fixture.py
       - tests/unit/test_desktop*.py
       - tests/unit/test_operator_onvif*.py
@@ -72,13 +76,13 @@ jobs:
         if: matrix.lane == 'onvif'
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_rtsp.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_rtsp.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_admin_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify camera administration and atomic reconnect on Windows
         if: matrix.lane == 'cameras'
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_product_state.py tests/test_device_registry.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_admin_api.py tests/unit/test_operator_product_state.py tests/test_device_registry.py tests/test_user_registry.py tests/test_user_admin_api.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   native-desktop:
@@ -199,6 +203,10 @@ jobs:
               $witness.receipt.direct_rtsp_enrollment -ne $true -or
               $witness.receipt.direct_rtsp_fresh_enrollment -ne $true -or
               $witness.receipt.direct_rtsp_multi_channel_same_endpoint -ne $true -or
+              $witness.receipt.admin_user_management -ne $true -or
+              $witness.receipt.role_permissions -ne $true -or
+              $witness.receipt.camera_access_controls -ne $true -or
+              $witness.receipt.admin_state_persisted -ne $true -or
               $witness.receipt.actual_recording_export -ne $true) {
             throw "Four-camera surveillance workspace qualification is incomplete"
           }
@@ -221,6 +229,7 @@ jobs:
             workers_bundled=$false; first_launch_internet_required=$true
             onvif_camera_onboarding=$true; manual_stream_uri_required=$false
             direct_rtsp_enrollment=$true
+            admin_user_management=$true; role_permissions=$true; camera_access_controls=$true
             surveillance_workspace=$true; four_camera_wall=$true; actual_recording_export=$true
           }
           $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $release "desktop-package.json") -Encoding utf8

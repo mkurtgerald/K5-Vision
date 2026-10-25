@@ -44,6 +44,61 @@ def _user_payload(username: str = "operator.one") -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize(
+    ("path", "body", "secrets"),
+    [
+        (
+            "/api/v1/auth/login",
+            {"username": "operator.one", "password": "PRIVATE-LOGIN-MARKER" * 20},
+            ["PRIVATE-LOGIN-MARKER"],
+        ),
+        (
+            "/api/v1/auth/bootstrap-password",
+            {
+                "username": "operator.one",
+                "temporary_credential": "PRIVATE-TEMP-MARKER!",
+                "new_password": "PRIVATE!",
+            },
+            ["PRIVATE-TEMP-MARKER", "PRIVATE!"],
+        ),
+    ],
+)
+def test_invalid_authentication_payloads_never_echo_credentials(path, body, secrets):
+    with TestClient(create_app()) as client:
+        response = client.post(path, json=body)
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid account request"}
+    assert response.headers["Cache-Control"] == "no-store"
+    assert all(value not in response.text for value in secrets)
+
+
+def test_bootstrap_password_must_change_and_sensitive_success_is_uncacheable():
+    with TestClient(create_app()) as client:
+        created = client.post("/api/v1/users", json=_user_payload(), headers=_headers())
+        assert created.status_code == 201
+        assert created.headers["Cache-Control"] == "no-store"
+        code = created.json()["temporary_credential"]
+        unchanged = client.post(
+            "/api/v1/auth/bootstrap-password",
+            json={"username": "operator.one", "temporary_credential": code, "new_password": code},
+        )
+        assert unchanged.status_code == 422 and code not in unchanged.text
+        activated = client.post(
+            "/api/v1/auth/bootstrap-password",
+            json={
+                "username": "operator.one",
+                "temporary_credential": code,
+                "new_password": "a complete replacement password",
+            },
+        )
+        assert activated.status_code == 204 and activated.headers["Cache-Control"] == "no-store"
+        logged_in = client.post(
+            "/api/v1/auth/login",
+            json={"username": "operator.one", "password": "a complete replacement password"},
+        )
+        assert logged_in.status_code == 200 and logged_in.headers["Cache-Control"] == "no-store"
+
+
 def test_user_admin_api_fails_closed_without_admin_authentication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

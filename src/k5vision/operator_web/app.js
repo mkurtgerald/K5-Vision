@@ -15,6 +15,10 @@
     "camera_probe_expired", "camera_profile_unsupported",
     "stream_invalid", "stream_auth_failed", "stream_unsupported", "stream_unreachable", "stream_invalid_response",
   ]);
+  const ADMIN_ERROR_CODES = new Set([
+    "admin_last_administrator", "admin_username_exists", "admin_capacity",
+    "admin_invalid_request", "admin_user_not_found", "admin_unavailable",
+  ]);
   const state = {
     token: "", account: null, cameras: [], workerStatus: "ready", selected: null, media: null,
     view: "wall", sessionEpoch: 0, selectionEpoch: 0, requests: new Set(),
@@ -33,7 +37,7 @@
     recordingBusy: false, cameraListEpoch: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
     playbackStart: null, playbackEpoch: 0, selectedStatus: null,
   };
-  let wall = null, timeline = null;
+  let wall = null, timeline = null, administration = null;
   let wallLayoutPending = false;
 
   function fitCameraWall() {
@@ -66,6 +70,45 @@
       container: $("recording-timeline"), onSeek: seekRecording,
     });
     return timeline;
+  }
+
+  function adminWorkspace() {
+    if (!administration) {
+      if (!window.K5Admin?.create) throw new Error("Account administration did not load");
+      administration = window.K5Admin.create({
+        request,
+        getSession: () => state.signingOut ? null : ({ token: state.token, epoch: state.sessionEpoch, account: state.account }),
+        getCameras: () => state.cameras,
+        onSelfChanged: (account, permissionsChanged) => {
+          if (!permissionsChanged) {
+            state.account = { ...state.account, ...account };
+            $("account-name").textContent = account.display_name || account.username;
+            renderAccountControls();
+            return;
+          }
+          const token = state.token;
+          clearWorkspace("Your account permissions changed. Sign in again.");
+          void clearMediaCookie(token);
+        },
+      });
+    }
+    return administration;
+  }
+
+  function canExport() {
+    return ["administrator", "operator"].includes(state.account?.role) && !state.signingOut;
+  }
+
+  function renderAccountControls() {
+    const account = state.account;
+    $("admin-tab").hidden = account?.role !== "administrator";
+    $("add-camera-button").hidden = account?.role !== "administrator";
+    $("account-role").title = account?.role === "administrator" ? "Manage users, cameras and recordings"
+      : account?.role === "operator" ? "View assigned cameras and export footage" : "Watch assigned live and recorded video";
+    $("download-recording").hidden = !canExport();
+    $("clip-mark-in").hidden = !canExport();
+    $("clip-mark-out").hidden = !canExport();
+    $("clip-selection-label").hidden = !canExport();
   }
 
   class ApiError extends Error {
@@ -145,7 +188,7 @@
           expireSession();
         }
         let code = "", clock = null;
-        if (path.startsWith("/api/v1/operator/camera")) {
+        if (path.startsWith("/api/v1/operator/camera") || path.startsWith("/api/v1/operator/admin/")) {
           try {
             const detail = (await response.json()).detail;
             const candidate = typeof detail === "string" ? detail : detail?.code;
@@ -153,6 +196,7 @@
               code = candidate;
               clock = cameraClockReport(detail?.clock);
             }
+            if (path.startsWith("/api/v1/operator/admin/") && ADMIN_ERROR_CODES.has(candidate)) code = candidate;
           } catch (_) { /* Unknown response text never becomes a user-facing error. */ }
         }
         throw new ApiError(response.status, code, clock);
@@ -250,6 +294,8 @@
   }
 
   function clearWorkspace(reason = "") {
+    administration?.hide();
+    resetActivation();
     state.sessionEpoch += 1;
     state.selectionEpoch += 1;
     state.historyEpoch += 1;
@@ -282,6 +328,10 @@
     state.recordingBusy = false;
     state.selectedStatus = null;
     state.view = "wall";
+    $("admin-panel").hidden = true;
+    $("camera-workspace").hidden = false;
+    $("admin-tab").hidden = true;
+    $("admin-tab").setAttribute("aria-pressed", "false");
     state.historyRangeMs = DAY;
     state.spans = [];
     state.selectedSpan = null;
@@ -324,6 +374,7 @@
   async function signOut() {
     if (state.signingOut) return;
     state.signingOut = true;
+    administration?.hide();
     closeAddCamera();
     const token = state.token;
     state.sessionEpoch += 1;
@@ -552,8 +603,9 @@
       state.workerStatus = ["ready", "unavailable", "disk_full"].includes(data.worker_status) ? data.worker_status : "ready";
       renderWorkerStatus();
       state.cameras = data.cameras.filter((camera) => camera && typeof camera.device_id === "string" && typeof camera.name === "string");
+      administration?.refreshCameras();
       renderCameras();
-      if (state.selected && !currentCamera()) {
+      if (state.selected && !currentCamera() && state.view !== "admin") {
         clearCameraSelection("Camera unavailable", "Select another camera or refresh the camera list.");
       }
       if (selectFirst && !state.selected && state.cameras.length && state.view !== "wall") await selectCamera(state.cameras[0].device_id);
@@ -584,7 +636,7 @@
   async function selectCamera(deviceId) {
     if (!state.token || state.signingOut) return;
     state.navigationEpoch += 1;
-    if (state.view === "wall") setView("live", false);
+    if (["wall", "admin"].includes(state.view)) setView("live", false);
     state.selectionController?.abort();
     state.selectionController = new AbortController();
     const epoch = ++state.selectionEpoch;
@@ -845,9 +897,15 @@
 
   function setView(view, load = true) {
     if (state.signingOut) return;
-    if (!["wall", "live", "history"].includes(view)) return;
+    if (!["wall", "live", "history", "admin"].includes(view)) return;
+    if (view === "admin" && state.account?.role !== "administrator") return;
+    const previous = state.view;
     state.navigationEpoch += 1;
     state.view = view;
+    $("camera-workspace").hidden = view === "admin";
+    $("admin-panel").hidden = view !== "admin";
+    $("admin-tab").setAttribute("aria-pressed", String(view === "admin"));
+    if (previous === "admin" && view !== "admin") administration?.hide();
     $("recorder-overview").open = view !== "wall";
     $("wall-panel").hidden = view !== "wall";
     $("live-panel").hidden = view !== "live";
@@ -857,7 +915,14 @@
       if (view === value) $(`${value}-tab`).setAttribute("aria-current", "page");
       else $(`${value}-tab`).removeAttribute("aria-current");
     }
-    if (view === "wall") {
+    if (view === "admin") {
+      state.selectionEpoch += 1;
+      state.historyEpoch += 1;
+      state.selectionController?.abort();
+      wall?.hide(); stopLive(); stopPlayback();
+      try { adminWorkspace().show(); }
+      catch (_) { message("admin-message", "Administration could not load. Refresh the workspace to try again.", true); }
+    } else if (view === "wall") {
       if (state.cameraConnectionNotice) notice("");
       state.selectionEpoch += 1;
       state.selectionController?.abort();
@@ -1151,11 +1216,12 @@
     const url = new URL(state.media.playback_url, location.origin);
     url.searchParams.set("start", new Date(start).toISOString());
     url.searchParams.set("duration", String(duration));
-    url.searchParams.set("format", "mp4");
+    url.searchParams.set("format", canExport() ? "mp4" : "fmp4");
     return { url: url.pathname + url.search, start, duration };
   }
 
   function updateDownload() {
+    if (!canExport()) { disableDownload(); return; }
     try {
       const selection = playbackSelection();
       const link = $("download-recording");
@@ -1188,6 +1254,73 @@
     }
   }
 
+  let activationEpoch = 0, activationController = null;
+
+  function resetActivation() {
+    activationEpoch += 1;
+    activationController?.abort(); activationController = null;
+    $("activate-account-form").reset();
+    $("activate-account-form").hidden = true;
+    $("sign-in-form").hidden = false;
+    $("activate-account-button").hidden = false;
+    $("activate-account-submit").disabled = false;
+    $("activate-account-submit").textContent = "Set password";
+    message("activation-message", "");
+  }
+
+  $("activate-account-button").addEventListener("click", () => {
+    if (state.token) return;
+    resetActivation();
+    $("activation-username").value = $("username").value.trim();
+    $("sign-in-form").hidden = true;
+    $("activate-account-button").hidden = true;
+    $("activate-account-form").hidden = false;
+    message("sign-in-message", "");
+    $("activation-username").focus();
+  });
+  $("activation-cancel").addEventListener("click", resetActivation);
+  $("activate-account-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (state.token || $("activate-account-submit").disabled) return;
+    if ($("activation-password").value !== $("activation-confirm").value) {
+      message("activation-message", "The new passwords do not match.", true); return;
+    }
+    const body = {
+      username: $("activation-username").value.trim(),
+      temporary_credential: $("activation-credential").value,
+      new_password: $("activation-password").value,
+    };
+    $("activation-credential").value = "";
+    $("activation-password").value = "";
+    $("activation-confirm").value = "";
+    const version = ++activationEpoch;
+    activationController?.abort(); activationController = new AbortController();
+    $("activate-account-submit").disabled = true;
+    $("activate-account-submit").textContent = "Setting password…";
+    message("activation-message", "");
+    try {
+      await request("/api/v1/auth/bootstrap-password", { method: "POST", body, signal: activationController.signal });
+      if (version !== activationEpoch) return;
+      const username = body.username;
+      resetActivation();
+      $("username").value = username;
+      message("sign-in-message", "Password set. Sign in with your new password.");
+      $("password").focus();
+    } catch (error) {
+      if (error.name === "AbortError" || version !== activationEpoch) return;
+      message("activation-message", error.status === 401
+        ? "The temporary code is invalid or expired. Ask your administrator for a new code."
+        : error.status === 422 ? "Use a new password of 12–256 characters, different from your temporary code. Enter the code and password again."
+          : apiMessage(error, "Password setup is unavailable. Enter your code again and retry."), true);
+    } finally {
+      body.temporary_credential = ""; body.new_password = "";
+      if (version === activationEpoch) {
+        $("activate-account-submit").disabled = false;
+        $("activate-account-submit").textContent = "Set password";
+      }
+    }
+  });
+
   $("sign-in-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const epoch = ++state.sessionEpoch;
@@ -1207,7 +1340,7 @@
       state.account = account;
       $("account-name").textContent = account.display_name || account.username;
       $("account-role").textContent = account.role;
-      $("add-camera-button").hidden = account.role !== "administrator";
+      renderAccountControls();
       $("sign-in").hidden = true;
       $("workspace").hidden = false;
       state.sessionExpiresAt = Date.parse(result.expires_at);
@@ -1235,6 +1368,8 @@
   });
 
   $("sign-out-button").addEventListener("click", () => void signOut());
+  $("admin-tab").addEventListener("click", () => setView("admin"));
+  $("admin-return-button").addEventListener("click", () => setView("wall"));
   $("refresh-cameras").addEventListener("click", () => void Promise.all([refreshCameras(true), refreshDiagnostics()]));
   $("camera-search").addEventListener("input", renderCameras);
   $("wall-tab").addEventListener("click", () => setView("wall"));
@@ -1805,7 +1940,7 @@
     $(id).addEventListener("click", () => $("connection-help-dialog").close());
   }
 
-  window.addEventListener("pagehide", () => { wall?.hide(); stopLive(); stopPlayback(); });
+  window.addEventListener("pagehide", () => { administration?.hide(); resetActivation(); wall?.hide(); stopLive(); stopPlayback(); });
   window.addEventListener("resize", fitCameraWall);
   $("recorder-overview").addEventListener("toggle", fitCameraWall);
   setLastDay();

@@ -69,6 +69,7 @@ def _product_path(path: str) -> bool:
     return (
         path == _PREFIX + "/cameras"
         or path.startswith(_PREFIX + "/cameras/")
+        or path.startswith(_PREFIX + "/admin/")
         or path
         in {
             _PREFIX + "/media-auth",
@@ -146,6 +147,37 @@ class _BoundedProductBody:
             return await receive()
 
         await self.app(scope, replay, send)
+
+
+class _ProductRoutesOnly:
+    """The installed workspace exposes its scoped camera API, not legacy adapters.
+
+    Legacy control-plane device/recording APIs have different selection semantics.
+    They remain available in the standalone control plane, but cannot bypass
+    workspace grants when both compositions share an application instance.
+    """
+
+    _LEGACY = (
+        "/api/v1/devices",
+        "/api/v1/operator/live",
+        "/api/v1/operator/recordings",
+        "/api/v1/operator/recording-sessions",
+        "/api/v1/operator/playback-controls",
+    )
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = scope.get("path", "")
+        if scope["type"] == "http" and any(
+            path == prefix or path.startswith(prefix + "/") for prefix in self._LEGACY
+        ):
+            await JSONResponse(
+                {"detail": "Not found"}, status_code=404, headers={"Cache-Control": "no-store"}
+            )(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 class _CameraEnrollment(BaseModel):
@@ -278,6 +310,7 @@ def install_operator_product_api(
     recording_changed: dict[UUID, float] = {}
     media_generation = getattr(service, "media_generation", 0)
     app.add_middleware(_BoundedProductBody)
+    app.add_middleware(_ProductRoutesOnly)
     previous_validation_handler = app.exception_handlers.get(
         RequestValidationError, request_validation_exception_handler
     )
@@ -285,7 +318,12 @@ def install_operator_product_api(
     @app.exception_handler(RequestValidationError)
     async def product_validation_error(request: Request, exc: RequestValidationError):
         if _product_path(request.url.path):
-            return JSONResponse({"detail": "Invalid operator request"}, status_code=422)
+            detail = (
+                "admin_invalid_request"
+                if request.url.path.startswith(_PREFIX + "/admin/")
+                else "Invalid operator request"
+            )
+            return JSONResponse({"detail": detail}, status_code=422)
         return await previous_validation_handler(request, exc)
 
     async def authenticate(token: str) -> tuple[UserAccount, str]:
@@ -294,9 +332,18 @@ def install_operator_product_api(
             raise _unauthorized()
         try:
             current = users.get(principal.id)
+            credential_active = (
+                current is not None and users.credential_status(current.id) == "active"
+            )
         except UserRegistryStorageError:
             raise HTTPException(503, "Operator identity unavailable") from None
-        if current is None or not current.enabled or current.role not in _READ_ROLES:
+        if (
+            current is None
+            or not current.enabled
+            or current.role not in _READ_ROLES
+            or current.role is not principal.role
+            or not credential_active
+        ):
             raise _unauthorized()
         return current, token
 
@@ -363,6 +410,40 @@ def install_operator_product_api(
             if source.binding.device_id == device_id:
                 return source
         raise HTTPException(404, "Camera not found")
+
+    def access_policy(account: UserAccount) -> dict:
+        try:
+            value = users.get_camera_access(account.id)
+            if value is None:
+                raise _unauthorized()
+            return value
+        except UserRegistryStorageError:
+            raise HTTPException(503, "Operator identity unavailable") from None
+
+    def permitted(account: UserAccount, device_id: UUID) -> bool:
+        if account.role is UserRole.ADMINISTRATOR:
+            return True
+        access = access_policy(account)
+        return access["mode"] == "all" or device_id in access["camera_ids"]
+
+    def authorized_selection(account: UserAccount, device_id: UUID) -> MediaMTXSource:
+        if not permitted(account, device_id):
+            raise HTTPException(404, "Camera not found")
+        return selection(device_id)
+
+    def capabilities(account: UserAccount) -> dict:
+        access = access_policy(account)
+        return {
+            "account": account.model_dump(mode="json"),
+            "can_manage_users": account.role is UserRole.ADMINISTRATOR,
+            "can_manage_cameras": account.role is UserRole.ADMINISTRATOR,
+            "can_export": account.role is not UserRole.VIEWER,
+            "can_view_history": True,
+            "camera_access": {
+                "mode": access["mode"],
+                "camera_ids": [str(value) for value in access["camera_ids"]],
+            },
+        }
 
     async def camera_view(source: MediaMTXSource, *, worker_snapshot=None) -> dict:
         nonlocal media_generation
@@ -484,14 +565,36 @@ def install_operator_product_api(
     read_session = Depends(require_session)
     admin_session = Depends(require_admin)
 
+    from k5vision.operator_admin_api import install_operator_admin_api
+
+    install_operator_admin_api(
+        app,
+        users=users,
+        sessions=sessions,
+        registry=registry,
+        require_admin=require_admin,
+        authenticate=authenticate,
+        mutations=mutations,
+    )
+
+    @app.get(_PREFIX + "/capabilities", tags=["operator"])
+    async def current_capabilities(
+        response: Response, session: tuple[UserAccount, str] = read_session
+    ):
+        response.headers["Cache-Control"] = "no-store"
+        return capabilities(session[0])
+
     @app.get(_PREFIX + "/status", tags=["operator"])
     async def operator_status(response: Response, _session: tuple[UserAccount, str] = read_session):
         response.headers["Cache-Control"] = "no-store"
         return {**service.diagnostics(), "analytics_status": person_status}
 
     @app.get(_PREFIX + "/cameras", tags=["operator"])
-    async def list_cameras(_session: tuple[UserAccount, str] = read_session):
-        selected = selections()
+    async def list_cameras(response: Response, session: tuple[UserAccount, str] = read_session):
+        response.headers["Cache-Control"] = "no-store"
+        selected = tuple(
+            source for source in selections() if permitted(session[0], source.binding.device_id)
+        )
         snapshot = {}
         if selected and service.status() in {"ready", "disk_full"}:
             try:
@@ -500,6 +603,11 @@ def install_operator_product_api(
                 )
             except MediaWorkerError as error:
                 snapshot = {source.binding: error.code for source in selected}
+
+        current, _ = await authenticate(session[1])
+        selected = tuple(
+            source for source in selections() if permitted(current, source.binding.device_id)
+        )
 
         return {
             "cameras": [
@@ -510,6 +618,7 @@ def install_operator_product_api(
                 for source in selected
             ],
             "worker_status": service.status(),
+            "capabilities": capabilities(current),
         }
 
     async def enroll_camera_source(
@@ -709,11 +818,13 @@ def install_operator_product_api(
     @app.get(_PREFIX + "/cameras/{device_id}/history", tags=["operator"])
     async def camera_history(
         device_id: UUID,
+        response: Response,
         start: str | None = None,
         end: str | None = None,
-        _session: tuple[UserAccount, str] = read_session,
+        session: tuple[UserAccount, str] = read_session,
     ):
-        source = selection(device_id)
+        response.headers["Cache-Control"] = "no-store"
+        source = authorized_selection(session[0], device_id)
         try:
             first, last = _interval(start, end)
         except (ValueError, OverflowError):
@@ -726,6 +837,8 @@ def install_operator_product_api(
             spans = await service.provider.playback_spans(source.binding, start=first, end=last)
         except MediaWorkerError:
             raise HTTPException(503, "Playback inventory unavailable") from None
+        current, _ = await authenticate(session[1])
+        authorized_selection(current, device_id)
         return {
             "spans": [
                 {
@@ -753,7 +866,7 @@ def install_operator_product_api(
         origin = urlsplit(request.headers["origin"])
         if origin.scheme != request.url.scheme or origin.hostname != request.url.hostname:
             raise HTTPException(403, "Invalid operator origin")
-        selection(device_id)
+        authorized_selection(session[0], device_id)
         if analytics is None:
             raise HTTPException(503, "Person view is not configured")
         try:
@@ -827,8 +940,8 @@ def install_operator_product_api(
                 value = result.as_dict()
             except Exception:
                 raise HTTPException(503, "Person view unavailable") from None
-            await authenticate(session[1])
-            selection(device_id)
+            current, _ = await authenticate(session[1])
+            authorized_selection(current, device_id)
             response.headers["Cache-Control"] = "no-store"
             return value
         finally:
@@ -844,7 +957,7 @@ def install_operator_product_api(
         session: tuple[UserAccount, str] = read_session,
     ):
         admit_origin(request)
-        source = selection(device_id)
+        source = authorized_selection(session[0], device_id)
         response.set_cookie(
             _COOKIE,
             session[1],
@@ -904,7 +1017,7 @@ def install_operator_product_api(
                 tokens.append(value)
         if len(tokens) != 1:
             raise _unauthorized()
-        await authenticate(tokens[0])
+        current, _ = await authenticate(tokens[0])
         methods = request.headers.getlist("x-forwarded-method")
         uris = request.headers.getlist("x-forwarded-uri")
         if methods != ["GET"] or len(uris) != 1:
@@ -913,8 +1026,15 @@ def install_operator_product_api(
             path = _media_selection(uris[0])
         except (ValueError, OverflowError):
             raise _unauthorized() from None
-        if not any(source.binding.path_name == path for source in selections()):
+        if not any(
+            source.binding.path_name == path and permitted(current, source.binding.device_id)
+            for source in selections()
+        ):
             raise _unauthorized()
+        if current.role is UserRole.VIEWER and urlsplit(uris[0]).path == "/media/playback":
+            values = dict(parse_qsl(urlsplit(uris[0]).query))
+            if values.get("format", "fmp4") == "mp4":
+                raise HTTPException(403, "MP4 export requires an operator or administrator")
         if service.status() not in {"ready", "disk_full"}:
             raise HTTPException(503, "Media unavailable")
         return Response(status_code=200)

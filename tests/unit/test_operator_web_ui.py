@@ -66,6 +66,8 @@ def _operator_asset(route, assets):
         "wall.css",
         "timeline.js",
         "timeline.css",
+        "admin.js",
+        "admin.css",
     }:
         route.fulfill(status=404)
         return True

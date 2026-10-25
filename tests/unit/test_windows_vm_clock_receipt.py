@@ -41,7 +41,10 @@ _NVR_FLAGS = (
     "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected authenticated_camera_restart_live "
     "wall_viewport_fit native_launch_argument_matched browser_origin_connected page_window_visible "
     "direct_rtsp_enrollment direct_rtsp_wrong_password_rejected direct_rtsp_persisted "
-    "direct_rtsp_fresh_enrollment direct_rtsp_multi_channel_same_endpoint"
+    "direct_rtsp_fresh_enrollment direct_rtsp_multi_channel_same_endpoint "
+    "admin_user_management role_permissions camera_access_controls admin_user_creation "
+    "admin_bootstrap_password_change admin_password_reset admin_disable_reenable "
+    "admin_live_media_revocation admin_audit_visible admin_state_persisted"
 ).split()
 
 
@@ -167,6 +170,12 @@ def _receipt() -> dict:
         "direct_rtsp_fresh_recording_bytes_before": 0,
         "direct_rtsp_fresh_recording_bytes_after": 10,
         "native_browser_handoff_observation": "os_dispatch_origin_and_window",
+        "admin_viewer_live_decoded_frames": 4,
+        "admin_operator_live_decoded_frames": 5,
+        "admin_restart_viewer_live_decoded_frames": 4,
+        "admin_user_count_created": 2,
+        "admin_audit_event_count": 6,
+        "admin_denied_http_statuses": [403, 404, 403, 401, 401, 404],
         "vm_clock": {
             "schema_version": "1",
             "head_sha": _HEAD,
@@ -351,5 +360,53 @@ def test_vm_clock_receipt_rejects_incomplete_simulated_or_unbound_evidence(tmp_p
     else:
         target[path[-1]] = value
 
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "admin_user_management",
+        "role_permissions",
+        "camera_access_controls",
+        "admin_user_creation",
+        "admin_bootstrap_password_change",
+        "admin_password_reset",
+        "admin_disable_reenable",
+        "admin_live_media_revocation",
+        "admin_audit_visible",
+        "admin_state_persisted",
+    ],
+)
+@pytest.mark.parametrize("invalid", [False, 1, None])
+def test_native_receipt_rejects_unexecuted_user_administration(tmp_path, field, invalid):
+    receipt = _receipt()
+    receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("admin_viewer_live_decoded_frames", 3),
+        ("admin_operator_live_decoded_frames", True),
+        ("admin_restart_viewer_live_decoded_frames", 0),
+        ("admin_user_count_created", 1),
+        ("admin_user_count_created", True),
+        ("admin_audit_event_count", 2),
+        ("admin_audit_event_count", 101),
+        ("admin_denied_http_statuses", [403] * 5),
+        ("admin_denied_http_statuses", [403] * 33),
+        ("admin_denied_http_statuses", [403, 404, 403, 401, 401, 200]),
+        ("admin_denied_http_statuses", [403, 404, 403, 401, 401, True]),
+    ],
+)
+def test_native_receipt_requires_bounded_live_and_authorization_observations(
+    tmp_path, field, invalid
+):
+    receipt = _receipt()
+    receipt[field] = invalid
     with pytest.raises(ValueError):
         _verify(_report(tmp_path, receipt))

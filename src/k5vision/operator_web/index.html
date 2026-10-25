@@ -8,8 +8,10 @@
     <link rel="stylesheet" href="/operator/app.css">
     <link rel="stylesheet" href="/operator/wall.css">
     <link rel="stylesheet" href="/operator/timeline.css">
+    <link rel="stylesheet" href="/operator/admin.css">
     <script defer src="/operator/wall.js"></script>
     <script defer src="/operator/timeline.js"></script>
+    <script defer src="/operator/admin.js"></script>
     <script defer src="/operator/app.js"></script>
   </head>
   <body>
@@ -27,6 +29,18 @@
           <p id="sign-in-message" class="form-message" role="status" aria-live="polite"></p>
           <button id="sign-in-button" class="button primary wide" type="submit">Sign in <span aria-hidden="true">→</span></button>
         </form>
+        <button id="activate-account-button" class="button quiet wide" type="button">Set password with a temporary code</button>
+        <form id="activate-account-form" autocomplete="off" hidden>
+          <h2>Set your password</h2>
+          <p class="field-help">Use the one-time code supplied by your administrator to activate your account or reset your password.</p>
+          <label for="activation-username">Username</label><input id="activation-username" autocomplete="username" required minlength="3" maxlength="64">
+          <label for="activation-credential">Temporary code</label><input id="activation-credential" type="password" required minlength="32" maxlength="128" autocomplete="off">
+          <label for="activation-password">New password</label><input id="activation-password" type="password" required minlength="12" maxlength="256" autocomplete="new-password">
+          <label for="activation-confirm">Confirm new password</label><input id="activation-confirm" type="password" required minlength="12" maxlength="256" autocomplete="new-password">
+          <p id="activation-message" class="form-message" role="status" aria-live="polite"></p>
+          <button id="activate-account-submit" class="button primary wide" type="submit">Set password</button>
+          <button id="activation-cancel" class="button quiet wide" type="button">Back to sign in</button>
+        </form>
         <p class="sign-in-footnote">K5 Vision · Local operator access</p>
       </div>
     </section>
@@ -34,10 +48,10 @@
     <div id="workspace" class="workspace" hidden>
       <header class="topbar">
         <div class="brand"><span class="brand-mark" aria-hidden="true">K5</span><span>Vision</span><span class="brand-divider"></span><span class="workspace-label">Surveillance workspace</span></div>
-        <div class="user-menu"><span id="account-name"></span><span id="account-role" class="role-tag"></span><button id="sign-out-button" class="button quiet" type="button">Sign out</button></div>
+        <div class="user-menu"><button id="admin-tab" class="button secondary" type="button" aria-pressed="false" hidden>Administration</button><span id="account-name"></span><span id="account-role" class="role-tag"></span><button id="sign-out-button" class="button quiet" type="button">Sign out</button></div>
       </header>
 
-      <div class="workspace-body">
+      <div id="camera-workspace" class="workspace-body">
         <aside class="camera-sidebar" aria-label="Cameras">
           <div class="sidebar-heading"><h2>Cameras <span id="camera-count" class="count">0</span></h2><button id="refresh-cameras" class="icon-button" type="button" title="Refresh cameras" aria-label="Refresh cameras">↻</button></div>
           <button id="add-camera-button" class="button secondary wide" type="button" hidden><span aria-hidden="true">＋</span> Add camera</button>
@@ -122,7 +136,49 @@
           </section>
         </main>
       </div>
+      <section id="admin-panel" class="admin-workspace" aria-labelledby="admin-title" hidden>
+        <div class="admin-heading"><div><p class="eyebrow">ADMINISTRATION</p><h1 id="admin-title">People and access</h1><p class="muted">Manage accounts, camera permissions and account activity.</p></div><button id="admin-return-button" class="button secondary" type="button">Back to cameras</button></div>
+        <p id="admin-message" class="form-message" role="status" aria-live="polite"></p>
+        <nav class="view-tabs" aria-label="Administration"><button id="admin-users-tab" class="tab active" type="button" aria-current="page">Users and permissions</button><button id="admin-audit-tab" class="tab" type="button">Account activity</button></nav>
+        <section id="admin-users-panel" aria-label="User administration">
+          <div class="admin-toolbar"><div><h2>Users</h2><p class="field-help">Administrators manage the site. Operators can view and export footage. Viewers can watch live and recorded video.</p></div><div class="admin-actions"><button id="admin-refresh-users" class="button secondary" type="button">Refresh</button><button id="admin-create-user" class="button primary" type="button">Create user</button></div></div>
+          <div class="admin-table-wrap"><table class="admin-table"><thead><tr><th scope="col">Account</th><th scope="col">Role</th><th scope="col">Status</th><th scope="col">Camera access</th><th scope="col">Actions</th></tr></thead><tbody id="admin-users-list"></tbody></table></div>
+          <p id="admin-users-empty" class="field-help" hidden>No user accounts were returned. Select Refresh to try again.</p>
+          <div class="admin-pagination"><button id="admin-users-previous" class="button secondary" type="button" disabled>Previous users</button><span id="admin-users-page" class="muted"></span><button id="admin-users-next" class="button secondary" type="button" disabled>Next users</button></div>
+        </section>
+        <section id="admin-audit-panel" aria-label="Account activity" hidden>
+          <div class="admin-toolbar"><div><h2>Account activity</h2><p class="field-help">Account changes and password activation are recorded in UTC. Passwords and temporary codes are excluded.</p></div><button id="admin-refresh-audit" class="button secondary" type="button">Refresh activity</button></div>
+          <div class="admin-table-wrap"><table class="admin-table"><thead><tr><th scope="col">When · UTC</th><th scope="col">Actor</th><th scope="col">Account</th><th scope="col">Action</th><th scope="col">Changed fields</th></tr></thead><tbody id="admin-audit-list"></tbody></table></div>
+          <p id="admin-audit-empty" class="field-help" hidden>No account activity was returned.</p>
+          <div class="admin-pagination"><button id="admin-audit-previous" class="button secondary" type="button" disabled>Previous activity</button><span id="admin-audit-page" class="muted"></span><button id="admin-audit-next" class="button secondary" type="button" disabled>Next activity</button></div>
+        </section>
+      </section>
     </div>
+
+    <dialog id="admin-user-dialog" class="admin-dialog" aria-labelledby="admin-user-title">
+      <form id="admin-user-form" autocomplete="off">
+        <div class="dialog-heading"><h2 id="admin-user-title">Create user</h2><button id="admin-close-user" class="icon-button" type="button" aria-label="Close user editor">×</button></div>
+        <div class="admin-form-columns"><div><label for="admin-username">Username</label><input id="admin-username" required minlength="3" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,63}" autocomplete="off"><p class="field-help">3–64 letters, numbers, dots, underscores or hyphens.</p></div><div><label for="admin-display-name">Display name</label><input id="admin-display-name" required maxlength="128"></div></div>
+        <label for="admin-role">Role</label><select id="admin-role"><option value="viewer">Viewer · Live and recorded video</option><option value="operator" selected>Operator · View and export footage</option><option value="administrator">Administrator · Manage site and users</option></select>
+        <label class="admin-checkbox" for="admin-enabled"><input id="admin-enabled" type="checkbox" checked>Account enabled</label>
+        <fieldset id="admin-access-fieldset" class="admin-access-fieldset"><legend>Camera access</legend><label for="admin-access-mode">Allow this account to access</label><select id="admin-access-mode"><option value="selected">Selected cameras</option><option value="all">All cameras, including cameras added later</option></select><div id="admin-camera-choices" class="admin-camera-choices"></div><p id="admin-access-help" class="field-help">Choose the cameras this user may view. Selecting none gives this account no camera access.</p></fieldset>
+        <p id="admin-own-change" class="notice warning" hidden>Changing your own role or disabling your account signs you out. Another activated administrator must remain available.</p>
+        <p id="admin-user-message" class="form-message" role="status" aria-live="polite"></p>
+        <div class="dialog-actions"><button id="admin-cancel-user" class="button secondary" type="button">Cancel</button><button id="admin-save-user" class="button primary" type="submit">Create user</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="admin-credential-dialog" class="admin-dialog" aria-labelledby="admin-credential-title">
+      <div class="dialog-heading"><h2 id="admin-credential-title">Temporary sign-in code</h2><button id="admin-close-credential" class="icon-button" type="button" aria-label="Close temporary code">×</button></div>
+      <p class="muted">Give this one-time code to <strong id="admin-credential-username"></strong>. They must choose <strong>Set password with a temporary code</strong> on the sign-in screen.</p>
+      <label for="admin-temporary-credential">Temporary code · shown only now</label><input id="admin-temporary-credential" readonly autocomplete="off" spellcheck="false">
+      <p id="admin-credential-expiry" class="field-help"></p><p class="field-help">The code is cleared when you close this window or sign out. Reset the password to issue a replacement code.</p>
+      <div class="dialog-actions"><button id="admin-credential-done" class="button primary" type="button">Done</button></div>
+    </dialog>
+
+    <dialog id="admin-reset-dialog" class="admin-dialog" aria-labelledby="admin-reset-title">
+      <form id="admin-reset-form"><div class="dialog-heading"><h2 id="admin-reset-title">Reset password?</h2><button id="admin-close-reset" class="icon-button" type="button" aria-label="Close password reset">×</button></div><p class="muted">Resetting <strong id="admin-reset-username"></strong> replaces their password with a new one-time code and signs out their current sessions.</p><p id="admin-reset-message" class="form-message" role="status" aria-live="polite"></p><div class="dialog-actions"><button id="admin-cancel-reset" class="button secondary" type="button">Cancel</button><button id="admin-confirm-reset" class="button destructive" type="submit">Reset password</button></div></form>
+    </dialog>
 
     <dialog id="add-camera-dialog" aria-labelledby="add-camera-title">
       <form id="add-camera-form" autocomplete="off">

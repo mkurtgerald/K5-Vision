@@ -40,6 +40,12 @@ _TESTS = {
             "operator_beta_browser_receipt",
         )
     ],
+    "admin": [
+        (
+            "test_real_browser_admin_users_roles_camera_access_and_restart",
+            "operator_admin_browser_receipt",
+        ),
+    ],
     "person": [
         (
             "test_native_person_broker_positive_blank_capacity_and_cleanup",
@@ -52,6 +58,12 @@ _TESTS = {
     ],
 }
 _TRUE = {
+    "admin": (
+        "admin_user_management role_permissions camera_access_controls admin_user_creation "
+        "admin_bootstrap_password_change admin_password_reset admin_disable_reenable "
+        "admin_live_media_revocation admin_audit_visible admin_state_persisted "
+        "generated_media_only owned_cleanup"
+    ).split(),
     "launcher": (
         "preprovisioned_identity wheel_install isolated_wheel_import health "
         "administrator_login worker_ready owned_tree_cleanup"
@@ -135,8 +147,7 @@ def _browser_nvr_journey(receipt):
         value = receipt.get(field)
         _require(type(value) is int and minimum <= value <= 2**63 - 1)
     _require(
-        receipt["direct_rtsp_recording_bytes_after"]
-        > receipt["direct_rtsp_recording_bytes_before"]
+        receipt["direct_rtsp_recording_bytes_after"] > receipt["direct_rtsp_recording_bytes_before"]
     )
     for field in (
         "real_camera_acceptance",
@@ -235,6 +246,37 @@ def verify(lane: str, path: Path) -> list[dict]:
         elif lane == "install":
             _require(str(receipt.get("powershell_version", "")).startswith("5.1"))
             _require(receipt.get("windows_service") is False)
+        elif lane == "admin":
+            for field in (
+                "physical_camera_acceptance",
+                "capacity_acceptance",
+                "endurance_acceptance",
+                "host_clock_step_acceptance",
+                "user_terminal_required",
+            ):
+                _require(receipt.get(field) is False)
+            _require(receipt.get("browser_channel") == "msedge")
+            _require(receipt.get("playwright_version") == "1.58.0")
+            _require(bool(receipt.get("browser_version")))
+            _require(type(receipt.get("camera_count")) is int and receipt["camera_count"] == 2)
+            for field in (
+                "admin_viewer_live_decoded_frames",
+                "admin_operator_live_decoded_frames",
+                "admin_restart_viewer_live_decoded_frames",
+            ):
+                value = receipt.get(field)
+                _require(type(value) is int and 4 <= value <= 100000)
+            _require(type(receipt.get("admin_user_count_created")) is int)
+            _require(receipt["admin_user_count_created"] == 2)
+            events = receipt.get("admin_audit_event_count")
+            _require(type(events) is int and 3 <= events <= 100000)
+            denied = receipt.get("admin_denied_http_statuses")
+            _require(type(denied) is list and 6 <= len(denied) <= 32)
+            _require(all(type(status) is int and status in {401, 403, 404} for status in denied))
+            _require(receipt.get("browser_script_errors") == 0)
+            duration = receipt.get("duration_seconds")
+            _require(type(duration) in (int, float) and math.isfinite(duration))
+            _require(0 < duration < 180)
         elif lane == "browser":
             _require(receipt.get("host_clock_step_acceptance") is False)
             _require(type(receipt.get("browser_date_skew_seconds")) is int)

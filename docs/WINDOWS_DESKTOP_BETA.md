@@ -52,6 +52,33 @@ preference. RTSP does not expose the camera's management clock; check its time
 and NTP settings through the camera's own settings. K5 continues to show the
 recorder's time diagnostics.
 
+## Administer users and camera access
+
+Sign in as an administrator and choose **Administration**. The screen lists K5
+accounts, their role, account status, password setup status and camera access.
+Create an account with a display name and username, choose its role and assign
+all cameras or a selected set. The temporary credential appears once; give it
+privately to the new user.
+
+On the sign-in screen, the user chooses the password setup option, enters their
+username and temporary credential, and sets their own password. They can then
+sign in normally. Temporary credentials expire and work once. Administrators can
+issue a replacement when needed, enable or disable an account, change its role
+or camera access, and review the account activity log. Resetting a password or
+changing access ends the affected user's current session.
+
+| Role | Available controls |
+| --- | --- |
+| Viewer | Live viewing and recorded playback for assigned cameras |
+| Operator | Viewer access plus MP4 clip export |
+| Administrator | All cameras, recording and camera configuration, user management and account activity |
+
+Camera assignments also apply to direct media requests. Administrators always
+retain access to all cameras. K5 protects the last enabled administrator with an
+activated password; activate another administrator before disabling, demoting or
+resetting that account. The account activity log records administrative changes
+without showing passwords or temporary credentials.
+
 ## Watch, review and save
 
 On **Camera wall**, choose **1 camera**, **2 × 2** or **3 × 3** and use
@@ -98,7 +125,9 @@ Reinstalling can use it again.
 
 A release claiming this workspace must pass the real Windows installer and GUI
 journey, wall viewing, recording controls, UTC timeline, decoded playback and MP4
-download checks for that exact installer. Its clock gate must also cover real
+download checks for that exact installer. User-administration releases also
+require graphical account creation, password setup, role and camera restrictions,
+active-session revocation, account activity and restart persistence. Its clock gate must also cover real
 forward/back Windows clock corrections and retained-file integrity. Earlier
 clock-only evidence does not qualify the new workspace.
 

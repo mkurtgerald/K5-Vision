@@ -22,6 +22,8 @@ def assets(tmp_path):
         "wall.css",
         "timeline.js",
         "timeline.css",
+        "admin.js",
+        "admin.css",
     ):
         (root / name).write_text("fixture", encoding="utf-8")
     return root
@@ -129,6 +131,8 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
         "/operator/wall.js",
         "/operator/timeline.css",
         "/operator/timeline.js",
+        "/operator/admin.css",
+        "/operator/admin.js",
     ]
     javascript = routes[3]["handle"][0]
     assert javascript["rewrite"]["uri"] == "/_k5_assets/hls.min.js"
