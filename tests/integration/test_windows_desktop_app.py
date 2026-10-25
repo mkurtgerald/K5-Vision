@@ -2327,9 +2327,24 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             )
         ) as returned_login:
             page.locator("#sign-in-button").click()
+        nvr_diagnostic["restart_login_http_status"] = returned_login.value.status
         _require(returned_login.value.status == 200, "Relaunched installed workspace login failed")
         client.token = returned_login.value.json()["session_token"]
         page.locator("#wall-panel").wait_for(state="visible")
+
+        def restarted_wall_ready():
+            identifiers = page.locator("#wall-panel [data-camera-id]").evaluate_all(
+                "tiles => tiles.map(tile => tile.getAttribute('data-camera-id'))"
+            )
+            nvr_diagnostic["restart_wall_observed_tile_count"] = len(identifiers)
+            return len(identifiers) == 4 and set(identifiers) == set(camera_ids)
+
+        _wait(
+            restarted_wall_ready,
+            "Relaunched installed camera inventory",
+            process=app,
+            timeout=10,
+        )
         _require(
             page.locator("#wall-panel [data-camera-id]").count() == 4,
             "Relaunched installed workspace lost its camera wall",
