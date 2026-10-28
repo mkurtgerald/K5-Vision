@@ -787,25 +787,41 @@ def _probe_profiles(client: _Client, base: str, host: str, username: str, passwo
     return tuple(replace(profile, clock=client.clock) for profile in results)
 
 
-def _namespace_contexts(body: bytes) -> dict[int, dict[str, str]]:
-    """Resolve QName-valued XML text against each element's actual namespace scope."""
+def _xml_with_namespace_contexts(body: bytes) -> tuple[ET.Element, dict[int, dict[str, str]]]:
+    """Parse bounded XML once and retain each element's in-scope namespace bindings."""
+    if len(body) > _MAX_RESPONSE or b"\x00" in body:
+        raise OnvifError("invalid_response")
+    text = body.decode("utf-8-sig")
+    if re.search(r"<!\s*(?:DOCTYPE|ENTITY)", text, flags=re.IGNORECASE):
+        raise OnvifError("invalid_response")
     contexts: dict[int, dict[str, str]] = {}
     current: dict[str, str] = {}
     stack: list[dict[str, str]] = []
     pending: dict[str, str] = {}
+    root: ET.Element | None = None
+    depth, count = -1, 0
     for event, value in ET.iterparse(io.BytesIO(body), events=("start-ns", "start", "end")):
         if event == "start-ns":
             prefix, uri = value
             pending[prefix or ""] = uri
         elif event == "start":
+            depth += 1
+            count += 1
+            if count > 8192 or depth > 48:
+                raise OnvifError("invalid_response")
             stack.append(current)
             current = current.copy()
             current.update(pending)
             pending.clear()
-            contexts[id(value)] = current
+            contexts[id(value)] = current.copy()
+            if root is None:
+                root = value
         else:
+            depth -= 1
             current = stack.pop()
-    return contexts
+    if root is None:
+        raise OnvifError("invalid_response")
+    return root, contexts
 
 
 def _is_onvif_video_transmitter(
@@ -829,11 +845,10 @@ def _is_onvif_video_transmitter(
 
 
 def _discovery_candidates(body: bytes, sender: str) -> list[dict]:
-    root = _xml(body)
+    root, namespace_contexts = _xml_with_namespace_contexts(body)
     matches = [item for item in root.iter() if _local(item) == "ProbeMatch"]
     if not matches:
         return []
-    namespace_contexts = _namespace_contexts(body)
     candidates = []
     for match in matches:
         if not _is_onvif_video_transmitter(match, namespace_contexts):
