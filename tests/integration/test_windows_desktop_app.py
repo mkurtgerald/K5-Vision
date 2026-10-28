@@ -207,6 +207,21 @@ class _Windows:
         )
         self.message(window, 0x00F5)  # BM_CLICK
 
+    def post_click(self, window):
+        """Queue a real button event whose handler may perform lengthy installation."""
+        __tracebackhide__ = True
+        _require(
+            bool(window)
+            and self.api.IsWindow(window)
+            and self.api.IsWindowVisible(window)
+            and self.api.IsWindowEnabled(window),
+            "Expected enabled desktop button is unavailable",
+        )
+        _require(
+            bool(self.api.PostMessageW(window, 0x00F5, 0, 0)),  # BM_CLICK
+            "Native desktop button click could not be queued",
+        )
+
     def close(self, form):
         __tracebackhide__ = True
         # A real title-bar X sends WM_SYSCOMMAND/SC_CLOSE, setting WinForms'
@@ -314,9 +329,11 @@ def _uncheck_launch(api, controls):
     return False
 
 
-def _install_gui(setup, installed, api):
+def _install_gui(setup, installed, api, *, diagnostic=None):
     """Drive the actual Inno wizard without suppressing its user interface."""
     __tracebackhide__ = True
+    diagnostic = {} if diagnostic is None else diagnostic
+    diagnostic.update(installer_action="starting", installer_install_posted=False)
     process = subprocess.Popen(
         [
             str(setup),
@@ -345,24 +362,43 @@ def _install_gui(setup, installed, api):
                 ]
                 captions = {_normalized_caption(api.text(window)): window for window in controls}
                 if "i accept the agreement" in captions:
+                    diagnostic["installer_action"] = "accept_license"
                     api.click(captions["i accept the agreement"])
                 if "launch k5 vision" in captions and not launch_unchecked:
+                    diagnostic["installer_action"] = "uncheck_launch"
                     checkbox = captions["launch k5 vision"]
                     if api.message(checkbox, 0x00F0) == 1:  # BM_GETCHECK / BST_CHECKED
                         api.click(checkbox)
                     launch_unchecked = True
                 if "finish" in captions and not launch_unchecked:
+                    diagnostic["installer_action"] = "uncheck_launch"
                     launch_unchecked = _uncheck_launch(api, controls)
                     _require(launch_unchecked, "Installer launch checklist was unavailable")
                 for caption in ("finish", "install", "next >", "next"):
                     if caption in captions:
-                        api.click(captions[caption])
+                        if caption == "install":
+                            if not diagnostic["installer_install_posted"]:
+                                diagnostic["installer_action"] = "install_dispatch"
+                                # Inno extracts the entire offline payload inside
+                                # its Install handler. A synchronous BM_CLICK's
+                                # five-second reply deadline is not an extraction
+                                # deadline. Queue it once, then observe the real
+                                # wizard and process under the existing 90s gate.
+                                api.post_click(captions[caption])
+                                diagnostic["installer_install_posted"] = True
+                                diagnostic["installer_action"] = "install_wait"
+                        else:
+                            diagnostic["installer_action"] = (
+                                "finish" if caption == "finish" else "next"
+                            )
+                            api.click(captions[caption])
                         clicked.add(caption)
                         break
             time.sleep(0.2)
         _require(process.returncode == 0, "Actual GUI installer did not complete successfully")
         _require("install" in clicked and "finish" in clicked, "Installer wizard was not exercised")
         _require(launch_unchecked, "Installer launch option was not available to the user")
+        diagnostic["installer_action"] = "completed"
     finally:
         if process.poll() is None:
             children = psutil.Process(process.pid).children(recursive=True)
@@ -826,6 +862,7 @@ def _failure_detail(error):
         ("readiness deadline expired", "readiness_deadline"),
         ("Native desktop control did not respond", "native_control_deadline"),
         ("Expected enabled desktop button is unavailable", "native_control_unavailable"),
+        ("Native desktop button click could not be queued", "native_control_post_failed"),
         ("Owned desktop/backend/native processes survived", "owned_process_survived"),
         ("Desktop opened a console window", "console_window"),
         ("Bounded camera discovery did not complete", "onvif_discovery_failed"),
@@ -2065,7 +2102,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         "playwright_version": "1.58.0",
     }
     try:
-        _install_gui(setup, installed, api)
+        _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
         _require((installed / "K5Vision.exe").is_file(), "Installed desktop executable is absent")
         _require((installed / "runtime/python.exe").is_file(), "Embedded Python was not installed")
         receipt["actual_gui_installer"] = True
