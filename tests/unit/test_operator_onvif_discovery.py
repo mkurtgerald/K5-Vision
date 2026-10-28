@@ -22,6 +22,8 @@ _GROUP, _INTERFACE, _PORT = "239.255.255.250", "127.0.0.1", 3702
 _SOAP = "http://www.w3.org/2003/05/soap-envelope"
 _WSA = "http://schemas.xmlsoap.org/ws/2004/08/addressing"
 _WSD = "http://schemas.xmlsoap.org/ws/2005/04/discovery"
+_NETWORK = "http://www.onvif.org/ver10/network/wsdl"
+_WSDP = "http://schemas.xmlsoap.org/ws/2006/02/devprof"
 _NAME, _CAMERA_PORT = "Generated UDP camera", 34567
 _CAPABILITY_ERRORS = {
     errno.EACCES,
@@ -49,22 +51,24 @@ def _text(root, name):
     )
 
 
-def _response(message_id, endpoint):
+def _response(message_id, endpoint, device_type="dn:NetworkVideoTransmitter"):
+    types = f"<d:Types>{device_type}</d:Types>" if device_type else ""
     return (
-        f'<s:Envelope xmlns:s="{_SOAP}" xmlns:a="{_WSA}" xmlns:d="{_WSD}">'
+        f'<s:Envelope xmlns:s="{_SOAP}" xmlns:a="{_WSA}" xmlns:d="{_WSD}" '
+        f'xmlns:dn="{_NETWORK}" xmlns:wsdp="{_WSDP}">'
         f"<s:Header><a:Action>{_WSD}/ProbeMatches</a:Action>"
         f"<a:RelatesTo>{message_id}</a:RelatesTo></s:Header>"
         "<s:Body><d:ProbeMatches><d:ProbeMatch>"
         "<a:EndpointReference><a:Address>urn:uuid:00000000-0000-0000-0000-000000000001"
         "</a:Address></a:EndpointReference>"
-        f"<d:Scopes>onvif://www.onvif.org/name/{quote(_NAME)}</d:Scopes>"
+        f"{types}<d:Scopes>onvif://www.onvif.org/name/{quote(_NAME)}</d:Scopes>"
         f"<d:XAddrs>{endpoint}</d:XAddrs><d:MetadataVersion>1</d:MetadataVersion>"
         "</d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>"
     ).encode()
 
 
 @contextmanager
-def _multicast_camera(endpoints, *, malformed_first=False):
+def _multicast_camera(endpoints, *, malformed_first=False, device_types=None):
     """Join the real loopback multicast group and answer its actual Probe."""
     wire = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     try:
@@ -82,7 +86,14 @@ def _multicast_camera(endpoints, *, malformed_first=False):
             pytest.skip("Operating system does not provide multicast loopback capability")
         raise
     state = SimpleNamespace(
-        received=False, action="", message_id="", sent=0, errors=[], stopped=False, closed=False
+        received=False,
+        action="",
+        message_id="",
+        requested_types="",
+        sent=0,
+        errors=[],
+        stopped=False,
+        closed=False,
     )
     stopping = threading.Event()
 
@@ -107,7 +118,16 @@ def _multicast_camera(endpoints, *, malformed_first=False):
                 if action != _WSD + "/Probe" or not message_id.startswith("urn:uuid:"):
                     continue
                 state.received, state.action, state.message_id = True, action, message_id
-                responses = [_response(message_id, endpoint) for endpoint in endpoints]
+                state.requested_types = _text(root, "Types")
+                response_types = (
+                    ["dn:NetworkVideoTransmitter"] * len(endpoints)
+                    if device_types is None
+                    else device_types
+                )
+                responses = [
+                    _response(message_id, endpoint, device_type)
+                    for endpoint, device_type in zip(endpoints, response_types, strict=True)
+                ]
                 if malformed_first:
                     responses.insert(0, b"<incomplete-discovery-packet")
                 for response in responses:
@@ -140,6 +160,7 @@ def test_real_udp_multicast_probe_returns_only_public_camera_metadata(record_tes
             OnvifConnector(discovery_timeout_seconds=0.3).discover(interface=_INTERFACE)
         )
         assert peer.received and peer.action == _WSD + "/Probe"
+        assert peer.requested_types == "dn:NetworkVideoTransmitter"
         assert peer.message_id.startswith("urn:uuid:") and peer.sent == 3
         assert candidates == [
             {"host": _INTERFACE, "port": _CAMERA_PORT, "secure": False, "name": _NAME}
@@ -179,4 +200,34 @@ def test_real_udp_discovery_refuses_hostname_foreign_sender_host_and_credential_
         )
         assert peer.received and peer.sent == 3
         assert candidates == []
+    assert peer.stopped and peer.closed
+
+
+def test_real_udp_discovery_filters_printers_and_requires_exact_onvif_video_type():
+    endpoints = [
+        f"http://{_INTERFACE}:{_CAMERA_PORT + offset}/wsd/endpoint"
+        for offset in range(4)
+    ]
+    with _multicast_camera(
+        endpoints,
+        device_types=[
+            "wsdp:Device",
+            "wsdp:NetworkVideoTransmitter",
+            "",
+            "dn:NetworkVideoTransmitter",
+        ],
+    ) as peer:
+        candidates = asyncio.run(
+            OnvifConnector(discovery_timeout_seconds=0.3).discover(interface=_INTERFACE)
+        )
+        assert peer.received
+        assert peer.requested_types == "dn:NetworkVideoTransmitter"
+        assert candidates == [
+            {
+                "host": _INTERFACE,
+                "port": _CAMERA_PORT + 3,
+                "secure": False,
+                "name": _NAME,
+            }
+        ]
     assert peer.stopped and peer.closed
