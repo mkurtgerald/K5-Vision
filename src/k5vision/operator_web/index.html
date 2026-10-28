@@ -6,6 +6,14 @@
     <meta name="color-scheme" content="dark">
     <title>K5 Vision · Operator</title>
     <link rel="stylesheet" href="/operator/app.css">
+    <link rel="stylesheet" href="/operator/wall.css">
+    <link rel="stylesheet" href="/operator/timeline.css">
+    <link rel="stylesheet" href="/operator/admin.css">
+    <link rel="stylesheet" href="/operator/analytics.css">
+    <script defer src="/operator/wall.js"></script>
+    <script defer src="/operator/timeline.js"></script>
+    <script defer src="/operator/admin.js"></script>
+    <script defer src="/operator/analytics.js"></script>
     <script defer src="/operator/app.js"></script>
   </head>
   <body>
@@ -23,17 +31,29 @@
           <p id="sign-in-message" class="form-message" role="status" aria-live="polite"></p>
           <button id="sign-in-button" class="button primary wide" type="submit">Sign in <span aria-hidden="true">→</span></button>
         </form>
+        <button id="activate-account-button" class="button quiet wide" type="button">Set password with a temporary code</button>
+        <form id="activate-account-form" autocomplete="off" hidden>
+          <h2>Set your password</h2>
+          <p class="field-help">Use the one-time code supplied by your administrator to activate your account or reset your password.</p>
+          <label for="activation-username">Username</label><input id="activation-username" autocomplete="username" required minlength="3" maxlength="64">
+          <label for="activation-credential">Temporary code</label><input id="activation-credential" type="password" required minlength="32" maxlength="128" autocomplete="off">
+          <label for="activation-password">New password</label><input id="activation-password" type="password" required minlength="12" maxlength="256" autocomplete="new-password">
+          <label for="activation-confirm">Confirm new password</label><input id="activation-confirm" type="password" required minlength="12" maxlength="256" autocomplete="new-password">
+          <p id="activation-message" class="form-message" role="status" aria-live="polite"></p>
+          <button id="activate-account-submit" class="button primary wide" type="submit">Set password</button>
+          <button id="activation-cancel" class="button quiet wide" type="button">Back to sign in</button>
+        </form>
         <p class="sign-in-footnote">K5 Vision · Local operator access</p>
       </div>
     </section>
 
     <div id="workspace" class="workspace" hidden>
       <header class="topbar">
-        <div class="brand"><span class="brand-mark" aria-hidden="true">K5</span><span>Vision</span><span class="brand-divider"></span><span class="workspace-label">Operator</span></div>
-        <div class="user-menu"><span id="account-name"></span><span id="account-role" class="role-tag"></span><button id="sign-out-button" class="button quiet" type="button">Sign out</button></div>
+        <div class="brand"><span class="brand-mark" aria-hidden="true">K5</span><span>Vision</span><span class="brand-divider"></span><span class="workspace-label">Surveillance workspace</span></div>
+        <div class="user-menu"><button id="admin-tab" class="button secondary" type="button" aria-pressed="false" hidden>Administration</button><span id="account-name"></span><span id="account-role" class="role-tag"></span><button id="sign-out-button" class="button quiet" type="button">Sign out</button></div>
       </header>
 
-      <div class="workspace-body">
+      <div id="camera-workspace" class="workspace-body">
         <aside class="camera-sidebar" aria-label="Cameras">
           <div class="sidebar-heading"><h2>Cameras <span id="camera-count" class="count">0</span></h2><button id="refresh-cameras" class="icon-button" type="button" title="Refresh cameras" aria-label="Refresh cameras">↻</button></div>
           <button id="add-camera-button" class="button secondary wide" type="button" hidden><span aria-hidden="true">＋</span> Add camera</button>
@@ -45,10 +65,20 @@
         </aside>
 
         <main class="main-content">
+          <details id="recorder-overview" class="recorder-overview">
+            <summary>Recorder overview · recording and storage</summary>
+          <section class="workspace-summary" aria-label="Recorder overview">
+            <div><span class="summary-label">CAMERAS ONLINE</span><strong id="summary-online">—</strong><span id="summary-camera-total" class="muted">Waiting for cameras</span></div>
+            <div><span class="summary-label">RECORDING CONFIRMED</span><strong id="summary-recording">—</strong><span id="summary-recording-detail" class="muted">Waiting for recording activity</span></div>
+            <div><span class="summary-label">RECORDED VIDEO</span><strong id="summary-storage">—</strong><span id="summary-storage-detail" class="muted">Checking storage</span></div>
+            <div><span class="summary-label">FREE DISK SPACE</span><strong id="summary-free">—</strong><span class="muted">Recording continues with this window closed</span></div>
+          </section>
+          </details>
           <div class="view-heading">
-            <div><p class="eyebrow">CAMERA WORKSPACE</p><h1 id="camera-title">Select a camera</h1><p id="camera-subtitle" class="muted">Live view and recording history in one place.</p></div>
-            <div class="camera-indicators"><span id="connection-badge" class="status-badge" hidden></span><span id="recording-badge" class="recording-badge" hidden>Recording</span><button id="update-source-button" class="button secondary" type="button" hidden>Reconnect camera</button><button id="remove-camera-button" class="button quiet danger" type="button" hidden>Remove camera</button></div>
+            <div><p class="eyebrow">SURVEILLANCE WORKSPACE</p><h1 id="camera-title">All cameras</h1><p id="camera-subtitle" class="muted">Live cameras, recording activity and your recorded video.</p></div>
+            <div class="camera-indicators"><span id="connection-badge" class="status-badge" hidden></span><span id="recording-badge" class="recording-badge" hidden>Checking recording</span><button id="toggle-recording" class="button secondary" type="button" hidden>Pause recording</button><button id="recent-recordings" class="button secondary" type="button" hidden>Latest recording</button><button id="update-source-button" class="button quiet" type="button" hidden>Reconnect camera</button><button id="remove-camera-button" class="button quiet danger" type="button" hidden>Remove camera</button></div>
           </div>
+          <p id="recording-state-detail" class="field-help" role="status" aria-live="polite" hidden></p>
           <div class="system-status" aria-label="Service and recording storage"><div><span id="service-status" role="status" aria-live="polite">Checking media service…</span><span id="storage-status" class="muted">Checking recording storage…</span></div><button id="connection-help-button" class="button quiet" type="button">Connection help</button></div>
           <p id="recorder-time-status" class="field-help" role="status" aria-live="polite">Checking recorder time…</p>
           <div id="recorder-time-warning" class="notice warning" role="status" aria-live="polite" hidden></div>
@@ -56,11 +86,14 @@
           <div id="workspace-message" class="notice" role="status" aria-live="polite" hidden></div>
 
           <nav class="view-tabs" aria-label="Camera view">
-            <button id="live-tab" class="tab active" type="button" aria-current="page">Live view</button>
+            <button id="wall-tab" class="tab active" type="button" aria-current="page">Camera wall</button>
+            <button id="live-tab" class="tab" type="button">Live view</button>
             <button id="history-tab" class="tab" type="button">History</button>
           </nav>
 
-          <section id="live-panel" aria-label="Live view">
+          <section id="wall-panel" aria-label="Live camera wall"></section>
+
+          <section id="live-panel" aria-label="Live view" hidden>
             <div class="video-surface">
               <video id="live-video" autoplay muted playsinline controls preload="none" aria-label="Live camera video"></video>
               <div id="live-placeholder" class="video-placeholder"><div class="camera-glyph" aria-hidden="true">▣</div><h2 id="live-placeholder-title">Choose a camera to begin</h2><p id="live-placeholder-description">Your live feed will appear here.</p><button id="retry-live" class="button secondary" type="button" hidden>Reconnect</button></div>
@@ -77,7 +110,7 @@
           <section id="history-panel" aria-label="Recording history" hidden>
             <div class="history-toolbar">
               <div class="history-toolbar-title"><h2>Recording history</h2><p class="muted">Available video and gaps · All times UTC</p></div>
-              <div class="day-picker"><label for="history-day">Jump to day</label><input id="history-day" type="date"><button id="last-24-hours" class="button secondary" type="button">Last 24 hours</button></div>
+              <div class="day-picker"><label for="history-day">Jump to day</label><input id="history-day" type="date"><button id="history-15-minutes" class="button secondary" type="button">15 min</button><button id="history-last-hour" class="button secondary" type="button">1 hour</button><button id="last-24-hours" class="button secondary" type="button">24 hours</button></div>
             </div>
             <form id="history-form" class="interval-form">
               <div><label for="history-start">From · UTC</label><input id="history-start" type="datetime-local" step="1" required></div>
@@ -85,46 +118,111 @@
               <button id="load-history" class="button primary" type="submit">Show history</button>
             </form>
             <p id="history-message" class="form-message" role="status" aria-live="polite"></p>
+            <div class="recording-actions"><button id="play-latest-recording" class="button secondary" type="button">Play latest recording</button><span class="field-help">Choose a recorded interval or seek on the timeline. Gaps contain no video.</span></div>
+            <div id="recording-timeline"></div>
             <div class="history-content">
               <div class="history-list-panel"><div class="section-heading"><h3>Available intervals</h3><span id="history-count" class="count">0</span></div><div id="history-list" class="history-list"></div></div>
               <div class="playback-panel">
                 <div class="video-surface playback-surface"><video id="playback-video" controls playsinline preload="metadata" aria-label="Recorded camera video"></video><div id="playback-placeholder" class="video-placeholder"><div class="camera-glyph" aria-hidden="true">◷</div><h2>Select a recording</h2><p>Choose an available interval to play video.</p></div></div>
+                <div class="playback-transport" role="group" aria-label="Recording playback controls">
+                  <button id="playback-previous" class="button quiet" type="button" title="Previous available recording" disabled>Previous footage</button>
+                  <button id="playback-back" class="button secondary" type="button" aria-label="Back 10 seconds" disabled>−10s</button>
+                  <button id="playback-toggle" class="button primary" type="button" aria-label="Play or pause recording" disabled>Play</button>
+                  <button id="playback-forward" class="button secondary" type="button" aria-label="Forward 10 seconds" disabled>+10s</button>
+                  <button id="playback-next" class="button quiet" type="button" title="Next available recording" disabled>Next footage</button>
+                  <label class="playback-speed-label" for="playback-speed">Speed <select id="playback-speed" aria-label="Playback speed"><option value="0.25">¼×</option><option value="0.5">½×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+                  <time id="playback-clock" aria-label="Recorded time in UTC">Choose recorded footage</time>
+                </div>
                 <p id="selected-recording" class="selected-recording muted">No interval selected</p>
                 <form id="playback-form" class="playback-form">
-                  <div><label for="playback-start">Start · UTC</label><input id="playback-start" type="datetime-local" step="0.001" required disabled></div>
-                  <div class="duration-field"><label for="playback-duration">Seconds</label><input id="playback-duration" type="number" min="1" max="300" step="1" value="60" required disabled></div>
-                  <button id="play-recording" class="button primary" type="submit" disabled>Play</button>
-                  <a id="download-recording" class="button secondary disabled" aria-disabled="true" tabindex="-1">Download</a>
+                  <div><label for="playback-start">Go to · UTC</label><input id="playback-start" type="datetime-local" step="0.001" required disabled></div>
+                  <button id="play-recording" class="button secondary" type="submit" disabled>Seek and play</button>
                 </form>
-                <p id="playback-message" class="form-message" role="status" aria-live="polite">Preview up to 5 minutes. Select a new start time to seek.</p>
+                <p id="playback-message" class="form-message" role="status" aria-live="polite">Choose recorded footage. Playback continues through adjacent recordings and stops at gaps.</p>
+                <details id="export-panel" class="export-panel" open><summary>Export MP4 clip</summary>
+                  <div class="clip-controls"><button id="clip-mark-in" class="button quiet" type="button" disabled>Mark clip start</button><button id="clip-mark-out" class="button quiet" type="button" disabled>Mark clip end</button><span id="clip-selection-label" class="muted">Select contiguous recorded footage · Up to 1 hour / 256 MB per clip.</span></div>
+                  <div class="playback-form export-form"><div><label for="clip-start">Clip start · UTC</label><input id="clip-start" type="datetime-local" step="0.001" disabled></div><div class="duration-field"><label for="playback-duration">Seconds</label><input id="playback-duration" type="number" min="1" max="3600" step="1" value="60" disabled></div><a id="download-recording" class="button secondary disabled" aria-disabled="true" tabindex="-1">Prepare MP4 clip</a></div>
+                  <p id="export-message" class="form-message" role="status" aria-live="polite">Choose clip start and duration, then prepare the MP4.</p>
+                </details>
               </div>
             </div>
+            <div id="analytics-panel"></div>
           </section>
         </main>
       </div>
+      <section id="admin-panel" class="admin-workspace" aria-labelledby="admin-title" hidden>
+        <div class="admin-heading"><div><p class="eyebrow">ADMINISTRATION</p><h1 id="admin-title">People and access</h1><p class="muted">Manage accounts, camera permissions and account activity.</p></div><button id="admin-return-button" class="button secondary" type="button">Back to cameras</button></div>
+        <p id="admin-message" class="form-message" role="status" aria-live="polite"></p>
+        <nav class="view-tabs" aria-label="Administration"><button id="admin-users-tab" class="tab active" type="button" aria-current="page">Users and permissions</button><button id="admin-audit-tab" class="tab" type="button">Account activity</button></nav>
+        <section id="admin-users-panel" aria-label="User administration">
+          <div class="admin-toolbar"><div><h2>Users</h2><p class="field-help">Administrators manage the site. Operators can view and export footage. Viewers can watch live and recorded video.</p></div><div class="admin-actions"><button id="admin-refresh-users" class="button secondary" type="button">Refresh</button><button id="admin-create-user" class="button primary" type="button">Create user</button></div></div>
+          <div class="admin-table-wrap"><table class="admin-table"><thead><tr><th scope="col">Account</th><th scope="col">Role</th><th scope="col">Status</th><th scope="col">Camera access</th><th scope="col">Actions</th></tr></thead><tbody id="admin-users-list"></tbody></table></div>
+          <p id="admin-users-empty" class="field-help" hidden>No user accounts were returned. Select Refresh to try again.</p>
+          <div class="admin-pagination"><button id="admin-users-previous" class="button secondary" type="button" disabled>Previous users</button><span id="admin-users-page" class="muted"></span><button id="admin-users-next" class="button secondary" type="button" disabled>Next users</button></div>
+        </section>
+        <section id="admin-audit-panel" aria-label="Account activity" hidden>
+          <div class="admin-toolbar"><div><h2>Account activity</h2><p class="field-help">Account changes and password activation are recorded in UTC. Passwords and temporary codes are excluded.</p></div><button id="admin-refresh-audit" class="button secondary" type="button">Refresh activity</button></div>
+          <div class="admin-table-wrap"><table class="admin-table"><thead><tr><th scope="col">When · UTC</th><th scope="col">Actor</th><th scope="col">Account</th><th scope="col">Action</th><th scope="col">Changed fields</th></tr></thead><tbody id="admin-audit-list"></tbody></table></div>
+          <p id="admin-audit-empty" class="field-help" hidden>No account activity was returned.</p>
+          <div class="admin-pagination"><button id="admin-audit-previous" class="button secondary" type="button" disabled>Previous activity</button><span id="admin-audit-page" class="muted"></span><button id="admin-audit-next" class="button secondary" type="button" disabled>Next activity</button></div>
+        </section>
+      </section>
     </div>
+
+    <dialog id="admin-user-dialog" class="admin-dialog" aria-labelledby="admin-user-title">
+      <form id="admin-user-form" autocomplete="off">
+        <div class="dialog-heading"><h2 id="admin-user-title">Create user</h2><button id="admin-close-user" class="icon-button" type="button" aria-label="Close user editor">×</button></div>
+        <div class="admin-form-columns"><div><label for="admin-username">Username</label><input id="admin-username" required minlength="3" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,63}" autocomplete="off"><p class="field-help">3–64 letters, numbers, dots, underscores or hyphens.</p></div><div><label for="admin-display-name">Display name</label><input id="admin-display-name" required maxlength="128"></div></div>
+        <label for="admin-role">Role</label><select id="admin-role"><option value="viewer">Viewer · Live and recorded video</option><option value="operator" selected>Operator · View and export footage</option><option value="administrator">Administrator · Manage site and users</option></select>
+        <label class="admin-checkbox" for="admin-enabled"><input id="admin-enabled" type="checkbox" checked>Account enabled</label>
+        <fieldset id="admin-access-fieldset" class="admin-access-fieldset"><legend>Camera access</legend><label for="admin-access-mode">Allow this account to access</label><select id="admin-access-mode"><option value="selected">Selected cameras</option><option value="all">All cameras, including cameras added later</option></select><div id="admin-camera-choices" class="admin-camera-choices"></div><p id="admin-access-help" class="field-help">Choose the cameras this user may view. Selecting none gives this account no camera access.</p></fieldset>
+        <p id="admin-own-change" class="notice warning" hidden>Changing your own role or disabling your account signs you out. Another activated administrator must remain available.</p>
+        <p id="admin-user-message" class="form-message" role="status" aria-live="polite"></p>
+        <div class="dialog-actions"><button id="admin-cancel-user" class="button secondary" type="button">Cancel</button><button id="admin-save-user" class="button primary" type="submit">Create user</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="admin-credential-dialog" class="admin-dialog" aria-labelledby="admin-credential-title">
+      <div class="dialog-heading"><h2 id="admin-credential-title">Temporary sign-in code</h2><button id="admin-close-credential" class="icon-button" type="button" aria-label="Close temporary code">×</button></div>
+      <p class="muted">Give this one-time code to <strong id="admin-credential-username"></strong>. They must choose <strong>Set password with a temporary code</strong> on the sign-in screen.</p>
+      <label for="admin-temporary-credential">Temporary code · shown only now</label><input id="admin-temporary-credential" readonly autocomplete="off" spellcheck="false">
+      <p id="admin-credential-expiry" class="field-help"></p><p class="field-help">The code is cleared when you close this window or sign out. Reset the password to issue a replacement code.</p>
+      <div class="dialog-actions"><button id="admin-credential-done" class="button primary" type="button">Done</button></div>
+    </dialog>
+
+    <dialog id="admin-reset-dialog" class="admin-dialog" aria-labelledby="admin-reset-title">
+      <form id="admin-reset-form"><div class="dialog-heading"><h2 id="admin-reset-title">Reset password?</h2><button id="admin-close-reset" class="icon-button" type="button" aria-label="Close password reset">×</button></div><p class="muted">Resetting <strong id="admin-reset-username"></strong> replaces their password with a new one-time code and signs out their current sessions.</p><p id="admin-reset-message" class="form-message" role="status" aria-live="polite"></p><div class="dialog-actions"><button id="admin-cancel-reset" class="button secondary" type="button">Cancel</button><button id="admin-confirm-reset" class="button destructive" type="submit">Reset password</button></div></form>
+    </dialog>
 
     <dialog id="add-camera-dialog" aria-labelledby="add-camera-title">
       <form id="add-camera-form" autocomplete="off">
         <div class="dialog-heading"><div><p class="eyebrow">CAMERA SETUP</p><h2 id="add-camera-title">Add a camera</h2></div><button id="close-add-camera" class="icon-button" type="button" aria-label="Close camera setup">×</button></div>
         <p id="camera-setup-description" class="muted">Find an ONVIF camera on your network, then sign in to the camera. K5 finds its available video streams for you.</p>
+        <label for="camera-connection-type">Connection type</label>
+        <select id="camera-connection-type" name="connection_type"><option value="onvif">ONVIF camera</option><option value="rtsp">RTSP stream</option></select>
         <div id="camera-discovery-section" class="camera-discovery-section">
           <button id="find-cameras" class="button secondary wide" type="button">Find cameras on this network</button>
           <p id="camera-discovery-message" class="field-help" role="status" aria-live="polite">If Windows Firewall blocks discovery, enter the camera’s IP address below.</p>
           <div id="discovered-cameras" class="discovered-cameras" aria-label="Cameras found on your network"></div>
         </div>
         <label for="new-camera-name">Camera name</label><input id="new-camera-name" name="name" placeholder="Front entrance" required maxlength="128">
+        <div id="camera-onvif-settings">
         <label for="new-camera-host">Camera IP address</label><input id="new-camera-host" name="host" placeholder="192.168.1.20" required maxlength="45" spellcheck="false" aria-describedby="camera-address-help">
         <p id="camera-address-help" class="field-help">Choose a camera above, or enter the IP address used to open its settings.</p>
         <div class="camera-connection-row">
           <div><label for="new-camera-port">Camera settings port</label><input id="new-camera-port" name="port" type="number" min="1" max="65535" value="80" required inputmode="numeric"></div>
           <label class="camera-secure-option" for="new-camera-secure"><input id="new-camera-secure" name="secure" type="checkbox">Use HTTPS for camera settings</label>
         </div>
+        </div>
+        <div id="camera-stream-settings" hidden>
+          <label for="new-camera-stream-uri">RTSP stream URL</label><input id="new-camera-stream-uri" name="source_uri" type="text" placeholder="rtsp://192.168.1.20:554/stream" maxlength="4096" autocomplete="off" spellcheck="false" aria-describedby="camera-stream-help">
+          <p id="camera-stream-help" class="field-help">Enter an rtsp:// or rtsps:// address with the camera’s numeric IP address and stream path. Use the optional camera account below. The address and account are cleared after testing.</p>
+        </div>
         <div class="camera-credentials-row">
           <div><label for="new-camera-username">Camera username</label><input id="new-camera-username" name="camera_username" placeholder="Camera username" maxlength="128" autocomplete="off" spellcheck="false"></div>
           <div><label for="new-camera-password">Camera password</label><input id="new-camera-password" name="camera_password" type="password" maxlength="256" autocomplete="off"></div>
         </div>
-        <p class="field-help">Use the account configured on this camera. Its password is cleared after testing.</p>
+        <p id="camera-account-help" class="field-help">Use the account configured on this camera. Its password is cleared after testing.</p>
         <button id="test-camera-connection" class="button secondary wide camera-test-button" type="button">Test connection</button>
         <p id="camera-clock-status" class="field-help" role="status" aria-live="polite" hidden></p>
         <div id="camera-profile-section" hidden>

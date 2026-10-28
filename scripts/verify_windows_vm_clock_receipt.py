@@ -19,11 +19,32 @@ _TRUE = (
     "restart_preserves_account_camera_history uninstall_preserves_profile_and_media "
     "no_console_windows owned_cleanup onvif_credential_profile_enrollment no_manual_stream_uri "
     "onvif_wrong_password_rejected onvif_clock_skew_compensated "
-    "onvif_time_health_displayed recorder_time_health_displayed host_clock_step_acceptance"
+    "onvif_time_health_displayed recorder_time_health_displayed host_clock_step_acceptance "
+    "four_camera_wall native_default_browser_handoff four_camera_recording_progress "
+    "isolated_camera_outage_reconnect pause_resume_preserves_live_history "
+    "other_recording_while_paused timeline_seek_playback actual_recording_export "
+    "recording_choice_persisted logout_destroys_wall authenticated_camera_read "
+    "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected authenticated_camera_restart_live "
+    "wall_viewport_fit native_launch_argument_matched browser_origin_connected page_window_visible "
+    "direct_rtsp_enrollment direct_rtsp_wrong_password_rejected direct_rtsp_persisted "
+    "direct_rtsp_fresh_enrollment direct_rtsp_multi_channel_same_endpoint "
+    "admin_user_management role_permissions camera_access_controls admin_user_creation "
+    "admin_bootstrap_password_change admin_password_reset admin_disable_reenable "
+    "admin_live_media_revocation admin_audit_visible admin_state_persisted "
+    "historical_navigation_default_24h historical_navigation_real_media "
+    "playback_rapid_seek_latest_wins playback_controls_and_zoom "
+    "playback_contiguous_chunk_handoff playback_gap_requires_explicit_navigation "
+    "playback_export_selection_independent export_normal_windows_download "
+    "export_download_survives_browser_close export_download_survives_product_restart "
+    "export_download_opened_in_edge "
+    "product_analytics_enablement analytics_bundled_native_inference analytics_gui_configuration "
+    "analytics_person_event_recorded analytics_event_utc_playback analytics_public_fixture_only "
+    "analytics_browser_closed_detection analytics_role_camera_permissions "
+    "analytics_settings_events_persisted"
 ).split()
 _FALSE = (
     "physical_camera_acceptance capacity_acceptance endurance_acceptance windows_service "
-    "mocked_gui user_terminal_required"
+    "mocked_gui user_terminal_required analytics_mock_inference analytics_accuracy_acceptance"
 ).split()
 _UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z\Z")
 _OFFSETS = (172800, -172800)
@@ -43,6 +64,99 @@ def _number(value, minimum, maximum):
 def _integer(value, minimum, maximum):
     _require(type(value) is int and minimum <= value <= maximum)
     return value
+
+
+def _integers(value, count, minimum):
+    _require(type(value) is list and len(value) == count)
+    for item in value:
+        _integer(item, minimum, 2**63 - 1)
+    return value
+
+
+def _admin_journey(receipt):
+    for field in (
+        "admin_viewer_live_decoded_frames",
+        "admin_operator_live_decoded_frames",
+        "admin_restart_viewer_live_decoded_frames",
+    ):
+        value = receipt.get(field)
+        _require(type(value) is int and 4 <= value <= 100000)
+    _require(type(receipt.get("admin_user_count_created")) is int)
+    _require(receipt["admin_user_count_created"] == 2)
+    events = receipt.get("admin_audit_event_count")
+    _require(type(events) is int and 3 <= events <= 100)
+    denials = receipt.get("admin_denied_http_statuses")
+    _require(type(denials) is list and 6 <= len(denials) <= 32)
+    _require(all(type(value) is int and value in {401, 403, 404} for value in denials))
+
+
+def _nvr_journey(receipt):
+    _admin_journey(receipt)
+    _require(_integer(receipt.get("camera_count"), 4, 4) == 4)
+    layouts = receipt.get("wall_layouts")
+    _require(type(layouts) is list and len(layouts) == 3)
+    _require(all(type(count) is int for count in layouts) and layouts == [1, 4, 9])
+    viewport = receipt.get("wall_viewport")
+    _require(type(viewport) is list and len(viewport) == 2)
+    _require(all(type(size) is int for size in viewport) and viewport == [1440, 900])
+    _integers(receipt.get("wall_decoded_frames"), 4, 4)
+    for field in (
+        "direct_rtsp_live_decoded_frames",
+        "direct_rtsp_history_decoded_frames",
+        "direct_rtsp_fresh_live_decoded_frames",
+    ):
+        _integer(receipt.get(field), 4, 100000)
+    direct_before = _integer(receipt.get("direct_rtsp_recording_bytes_before"), 0, 2**63 - 1)
+    direct_after = _integer(receipt.get("direct_rtsp_recording_bytes_after"), 1, 2**63 - 1)
+    _require(direct_after > direct_before)
+    fresh_before = _integer(receipt.get("direct_rtsp_fresh_recording_bytes_before"), 0, 2**63 - 1)
+    fresh_after = _integer(receipt.get("direct_rtsp_fresh_recording_bytes_after"), 1, 2**63 - 1)
+    _require(fresh_after > fresh_before)
+    for prefix, count, minimum in (
+        ("camera_recording_bytes", 4, 0),
+        ("outage_other_live_frames", 3, 4),
+        ("tray_camera_recording_bytes", 3, 1),
+    ):
+        before = _integers(receipt.get(prefix + "_before"), count, minimum)
+        after = _integers(receipt.get(prefix + "_after"), count, minimum)
+        growth = 4 if prefix == "outage_other_live_frames" else 1
+        _require(all(end >= start + growth for start, end in zip(before, after, strict=True)))
+    for field, minimum, maximum in (
+        ("paused_recording_bytes", 1, 2**63 - 1),
+        ("resumed_recording_bytes", 1, 2**63 - 1),
+        ("timeline_playback_decoded_frames", 4, 100000),
+        ("export_decoded_frames", 1, 100000),
+        ("export_bytes", 1, 16 * 1024**2),
+        ("authenticated_camera_restart_frames", 4, 100000),
+    ):
+        _integer(receipt.get(field), minimum, maximum)
+    _require(receipt["resumed_recording_bytes"] > receipt["paused_recording_bytes"])
+    for field, expected in (
+        ("historical_recorded_seconds", 10800),
+        ("historical_recording_file_count", 18),
+        ("historical_recording_gap_seconds", 600),
+        ("historical_fixture_fps", 1),
+    ):
+        _require(type(receipt.get(field)) is int and receipt[field] == expected)
+    _number(receipt.get("playback_chunk_seconds"), 60, 300)
+    _integer(receipt.get("playback_continuation_decoded_frames"), 4, 100000)
+    _integer(receipt.get("export_download_restart_decoded_frames"), 4, 100000)
+    _require(receipt.get("analytics_model_revision") == "6697dead54ed1cdd664b0313189c2cb52ee6335e")
+    for field, minimum, maximum in (
+        ("analytics_event_playback_decoded_frames", 4, 100000),
+        ("analytics_positive_person_count", 1, 32),
+        ("analytics_processed_frames", 1, 100000),
+        ("analytics_background_event_count_before", 1, 100000),
+        ("analytics_background_event_count_after", 2, 100000),
+    ):
+        _integer(receipt.get(field), minimum, maximum)
+    _require(
+        receipt["analytics_background_event_count_after"]
+        > receipt["analytics_background_event_count_before"]
+    )
+    denials = receipt.get("analytics_denied_http_statuses")
+    _require(type(denials) is list and all(type(value) is int for value in denials))
+    _require(denials == [404, 404, 403, 404, 404, 403, 401, 401])
 
 
 def _utc(value):
@@ -131,6 +245,7 @@ def _vm_clock(value, *, expected_head, installer_sha256):
     _require(value.get("head_sha") == expected_head)
     _require(value.get("installer_sha256") == installer_sha256)
     _require(value.get("method") == "windows_SetSystemTime")
+    _require(value.get("analytics_events_utc_preserved") is True)
     _require(value.get("simulated_time") is False and value.get("browser_clock_only") is False)
     offsets = value.get("offset_seconds")
     _require(type(offsets) is list and len(offsets) == 2)
@@ -169,6 +284,8 @@ def _vm_clock(value, *, expected_head, installer_sha256):
             "same_human_session",
             "recorder_utc_verified",
             "history_utc_query_verified",
+            "analytics_event_utc_preserved",
+            "analytics_event_recording_covered",
             "closed_segment_hashes_preserved",
             "utc_restored",
         ):
@@ -196,6 +313,8 @@ def verify(report: Path, *, expected_head: str, installer_sha256: str) -> dict:
     _require(receipt.get("schema_version") == "1" and receipt.get("platform") == "Windows")
     _require(all(receipt.get(field) is True for field in _TRUE))
     _require(all(receipt.get(field) is False for field in _FALSE))
+    _require(receipt.get("native_browser_handoff_observation") == "os_dispatch_origin_and_window")
+    _nvr_journey(receipt)
     _require(receipt.get("browser_channel") == "msedge")
     _require(receipt.get("playwright_version") == "1.58.0")
     _require(

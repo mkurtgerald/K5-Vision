@@ -24,6 +24,7 @@ from k5vision import identity_state
 MAX_STORAGE_ENTRIES = 100_000
 MAX_STORAGE_SECONDS = 5.0
 MIN_CLOSED_AGE_SECONDS = 10.0
+MAX_PROGRESS_PATHS = 64
 _PATH_NAME = re.compile(r"k5_[0-9a-f]{64}")
 _SEGMENT_NAME = re.compile(
     r"(?P<stamp>[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{6})"
@@ -57,6 +58,14 @@ class _Observation:
     signature: tuple[int, ...]
     stable_since: float
     change_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PathProgress:
+    directory_identity: tuple[int, int] | None = None
+    total_bytes: int = 0
+    last_progress: float | None = None
+    files: dict[str, tuple[int, ...]] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +159,9 @@ class RecordingStorage:
         self._retention_seconds = retention_seconds
         self._observations: dict[Path, _Observation] = {}
         self._scan_generation = 0
+        self._progress: dict[str, _PathProgress] = {}
+        self._progress_complete = False
+        self._progress_lock = threading.Lock()
         self._lock = threading.RLock()
 
     @staticmethod
@@ -184,6 +196,12 @@ class RecordingStorage:
         free = 0
         candidates = []
         observed: dict[Path, _Observation] = {}
+        # Keep queried paths ahead of historic removed-camera directories. The
+        # same entry/time budgets bound both retention and progress observations.
+        with self._progress_lock:
+            previous_progress_by_path = dict(self._progress)
+            previous_progress_complete = self._progress_complete
+        progress = {name: _PathProgress() for name in previous_progress_by_path}
         generation = self._scan_generation + 1
         try:
             _budget(deadline)
@@ -199,6 +217,17 @@ class RecordingStorage:
                         continue
                     directory = self._root / entry.name
                     directory_identity = self._directory(directory)
+                    identity = (directory_identity.st_dev, directory_identity.st_ino)
+                    track_progress = entry.name in progress or len(progress) < MAX_PROGRESS_PATHS
+                    previous_progress = previous_progress_by_path.get(entry.name)
+                    comparable = (
+                        previous_progress_complete
+                        and previous_progress is not None
+                        and previous_progress.directory_identity == identity
+                    )
+                    directory_total = 0
+                    signatures = {}
+                    progressed = False
                     segments = []
                     with os.scandir(directory) as files:
                         for file in files:
@@ -226,6 +255,22 @@ class RecordingStorage:
                             )
                             observed[path] = observation
                             total += info.st_size
+                            directory_total += info.st_size
+                            if track_progress:
+                                signatures[file.name] = signature
+                                previous_signature = (
+                                    previous_progress.files.get(file.name) if comparable else None
+                                )
+                                if (
+                                    comparable
+                                    and info.st_size > 0
+                                    and (
+                                        previous_signature is None
+                                        or previous_signature[:4] != signature[:4]
+                                        or info.st_size > previous_signature[4]
+                                    )
+                                ):
+                                    progressed = True
                             segments.append(
                                 _Segment(
                                     path,
@@ -236,6 +281,18 @@ class RecordingStorage:
                                 )
                             )
                     identity_state._same_directory(directory, directory_identity)
+                    if track_progress:
+                        now = time.monotonic()
+                        if not math.isfinite(now):
+                            raise _IncompleteStorage
+                        last_progress = previous_progress.last_progress if comparable else None
+                        if progressed:
+                            last_progress = now
+                        elif last_progress is not None and now < last_progress:
+                            last_progress = None
+                        progress[entry.name] = _PathProgress(
+                            identity, directory_total, last_progress, signatures
+                        )
                     if segments:
                         now = time.monotonic()
                         newest = max(
@@ -275,12 +332,71 @@ class RecordingStorage:
             _budget(deadline)
             self._observations = observed
             self._scan_generation = generation
+            with self._progress_lock:
+                # Queries made while scanning may nominate current cameras in
+                # place of historical directories. Preserve those bounded slots.
+                updated = {name: progress.get(name, _PathProgress()) for name in self._progress}
+                for name, sample in progress.items():
+                    if len(updated) >= MAX_PROGRESS_PATHS:
+                        break
+                    updated.setdefault(name, sample)
+                self._progress = updated
+                self._progress_complete = True
             return _Scan(total, free, ordered, True)
         except Exception:
             # An interrupted or untrusted scan breaks the observation history.
             self._observations.clear()
             self._scan_generation = 0
+            self._invalidate_progress()
             return _Scan(total, free, (), False)
+
+    def _invalidate_progress(self) -> None:
+        with self._progress_lock:
+            self._progress = {name: _PathProgress() for name in self._progress}
+            self._progress_complete = False
+
+    def recording_progress(self, path_name: str) -> dict:
+        """Read cached owned-byte growth; never inspect the filesystem here.
+
+        Historical bytes establish a baseline, not evidence of fresh recording.
+        Growth or a new nonempty segment across complete scans starts a monotonic
+        progress age. Missing/incomplete observations cannot claim progress.
+        Queries remember at most 64 camera paths for the next maintenance scan.
+        """
+        if type(path_name) is not str or _PATH_NAME.fullmatch(path_name) is None:
+            raise ValueError("Invalid recording path name")
+        with self._progress_lock:
+            sample = self._progress.pop(path_name, None)
+            if sample is None:
+                if len(self._progress) >= MAX_PROGRESS_PATHS:
+                    self._progress.pop(next(iter(self._progress)))
+                sample = _PathProgress()
+            self._progress[path_name] = sample
+            age = None
+            if sample.last_progress is not None:
+                elapsed = time.monotonic() - sample.last_progress
+                if math.isfinite(elapsed) and elapsed >= 0:
+                    age = elapsed
+            return {
+                "observed_bytes": sample.total_bytes,
+                "last_progress_age_seconds": age,
+                "inspection_complete": self._progress_complete,
+                "observed": sample.directory_identity is not None,
+            }
+
+    def recording_files(self, path_name: str) -> dict[str, tuple[int, ...]] | None:
+        """Internal immutable inventory from the last complete owned scan.
+
+        This supplies background frame sampling without rescanning retained media.
+        Values are identity/size signatures, never file contents or source URIs.
+        Consumers must independently admit and verify any file they actually open.
+        """
+        self.recording_progress(path_name)  # Nominate this bounded camera slot.
+        with self._progress_lock:
+            sample = self._progress.get(path_name)
+            if not self._progress_complete or sample is None or sample.directory_identity is None:
+                return None
+            return dict(sample.files)
 
     def _status(self, scan: _Scan, deleted: int = 0) -> StorageStatus:
         return StorageStatus(
@@ -359,11 +475,13 @@ class RecordingStorage:
                     # ordinary races; do not delete another target.
                     continue
                 except Exception:
+                    self._invalidate_progress()
                     return StorageStatus(total, free, False, deleted)
                 deleted += 1
                 total -= current.st_size
                 try:
                     free = _free_bytes(self._root)
                 except Exception:
+                    self._invalidate_progress()
                     return StorageStatus(total, free, False, deleted)
             return self._status(self._scan(deadline, remaining_entries), deleted)

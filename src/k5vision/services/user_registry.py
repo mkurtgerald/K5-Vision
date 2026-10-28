@@ -11,6 +11,7 @@ import threading
 from datetime import UTC, datetime, timedelta
 from hmac import compare_digest
 from pathlib import Path
+from time import monotonic
 from uuid import UUID
 
 from k5vision.domain.users import UserAccount, UserAuditEvent, UserCreate, UserPatch, UserRole
@@ -94,6 +95,7 @@ class UserRegistry:
         self._database_path = path
         self._lock = threading.RLock()
         self._connection: sqlite3.Connection | None = None
+        self._bootstrap_deadlines: dict[UUID, tuple[bytes, float]] = {}
         self._open()
 
     @property
@@ -171,6 +173,23 @@ class UserRegistry:
                 )
                 """
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS user_camera_access (
+                       site_id TEXT NOT NULL,
+                       user_id TEXT NOT NULL,
+                       mode TEXT NOT NULL,
+                       camera_ids_json TEXT NOT NULL,
+                       PRIMARY KEY(site_id, user_id)
+                   )"""
+            )
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(user_credentials)")
+            }
+            for name in ("issued_at", "last_checked_at"):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE user_credentials ADD COLUMN {name} TEXT")
+            connection.execute("COMMIT")
         except (OSError, sqlite3.Error) as exc:
             if connection is not None:
                 connection.close()
@@ -363,10 +382,14 @@ class UserRegistry:
         *,
         actor: str,
         ttl_seconds: int = DEFAULT_BOOTSTRAP_TTL_SECONDS,
+        camera_access: dict | None = None,
     ) -> tuple[UserAccount, str, datetime]:
         """Create one user plus a short-lived credential without storing its plaintext."""
         normalized_actor = self._validate_actor(actor)
-        if not MIN_BOOTSTRAP_TTL_SECONDS <= ttl_seconds <= MAX_BOOTSTRAP_TTL_SECONDS:
+        if (
+            type(ttl_seconds) is not int
+            or not MIN_BOOTSTRAP_TTL_SECONDS <= ttl_seconds <= MAX_BOOTSTRAP_TTL_SECONDS
+        ):
             raise ValueError(
                 f"ttl_seconds must be between {MIN_BOOTSTRAP_TTL_SECONDS} "
                 f"and {MAX_BOOTSTRAP_TTL_SECONDS}"
@@ -375,13 +398,16 @@ class UserRegistry:
         temporary_credential = secrets.token_urlsafe(32)
         salt = secrets.token_bytes(_SALT_BYTES)
         verifier = _derive_credential(temporary_credential, salt)
-        expires_at = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
+        issued_at = datetime.now(UTC)
+        expires_at = issued_at + timedelta(seconds=ttl_seconds)
 
         with self._lock:
             connection = self._require_connection()
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 user = self._insert_user(connection, request, actor=normalized_actor)
+                if camera_access is not None:
+                    self._write_camera_access(connection, user, camera_access, normalized_actor)
                 connection.execute(
                     """
                     INSERT INTO user_credentials (
@@ -391,8 +417,8 @@ class UserRegistry:
                         credential_kind,
                         salt,
                         verifier,
-                        expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        expires_at, issued_at, last_checked_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         self._site_id,
@@ -402,6 +428,8 @@ class UserRegistry:
                         salt,
                         verifier,
                         expires_at.isoformat(),
+                        issued_at.isoformat(),
+                        issued_at.isoformat(),
                     ),
                 )
                 self._append_audit(
@@ -412,8 +440,9 @@ class UserRegistry:
                     changed_fields=("credential_state",),
                 )
                 connection.execute("COMMIT")
+                self._bootstrap_deadlines[user.id] = (verifier, monotonic() + ttl_seconds)
                 return user, temporary_credential, expires_at
-            except (UserRegistryCapacityError, UserRegistryConflictError):
+            except (UserRegistryCapacityError, UserRegistryConflictError, ValueError):
                 if connection.in_transaction:
                     connection.execute("ROLLBACK")
                 raise
@@ -421,6 +450,279 @@ class UserRegistry:
                 if connection.in_transaction:
                     connection.execute("ROLLBACK")
                 raise UserRegistryStorageError("user registry update failed") from exc
+
+    @staticmethod
+    def _camera_access_value(user: UserAccount, access: dict) -> dict:
+        if not isinstance(access, dict) or set(access) != {"mode", "camera_ids"}:
+            raise ValueError("camera access requires mode and camera_ids")
+        mode, identifiers = access["mode"], access["camera_ids"]
+        if mode not in {"all", "selected"} or type(identifiers) not in {list, tuple}:
+            raise ValueError("camera access selection is invalid")
+        if len(identifiers) > 64:
+            raise ValueError("camera access selection exceeds capacity")
+        try:
+            cameras = [item if isinstance(item, UUID) else UUID(item) for item in identifiers]
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("camera access selection is invalid") from None
+        if len(set(cameras)) != len(cameras) or (mode == "all" and cameras):
+            raise ValueError("camera access selection is invalid")
+        if user.role is UserRole.ADMINISTRATOR and mode != "all":
+            raise ValueError("administrators require access to all cameras")
+        return {"mode": mode, "camera_ids": sorted(cameras, key=str)}
+
+    def _read_camera_access(self, connection: sqlite3.Connection, user: UserAccount) -> dict:
+        row = connection.execute(
+            "SELECT mode, camera_ids_json FROM user_camera_access "
+            "WHERE site_id = ? AND user_id = ?",
+            (self._site_id, str(user.id)),
+        ).fetchone()
+        if row is None or user.role is UserRole.ADMINISTRATOR:
+            return {"mode": "all", "camera_ids": []}
+        try:
+            return self._camera_access_value(
+                user, {"mode": row["mode"], "camera_ids": json.loads(row["camera_ids_json"])}
+            )
+        except (ValueError, TypeError, json.JSONDecodeError):
+            raise UserRegistryStorageError("user camera access contains invalid state") from None
+
+    def _write_camera_access(
+        self, connection: sqlite3.Connection, user: UserAccount, access: dict, actor: str
+    ) -> dict:
+        admitted = self._camera_access_value(user, access)
+        previous = self._read_camera_access(connection, user)
+        connection.execute(
+            """INSERT INTO user_camera_access (site_id, user_id, mode, camera_ids_json)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(site_id, user_id) DO UPDATE SET
+                 mode = excluded.mode, camera_ids_json = excluded.camera_ids_json""",
+            (
+                self._site_id,
+                str(user.id),
+                admitted["mode"],
+                json.dumps([str(item) for item in admitted["camera_ids"]], separators=(",", ":")),
+            ),
+        )
+        if admitted != previous:
+            self._append_audit(
+                connection,
+                user_id=user.id,
+                action="camera-access-updated",
+                actor=actor,
+                changed_fields=("camera_access",),
+            )
+        return admitted
+
+    def get_camera_access(self, user_id: UUID) -> dict | None:
+        """Return bounded site-owned camera grants; legacy accounts retain all access."""
+        with self._lock:
+            user = self.get(user_id)
+            if user is None:
+                return None
+            try:
+                return self._read_camera_access(self._require_connection(), user)
+            except sqlite3.Error:
+                raise UserRegistryStorageError("user camera access is unavailable") from None
+
+    def set_camera_access(
+        self, user_id: UUID, *, mode: str, camera_ids: list[UUID], actor: str
+    ) -> dict | None:
+        """Commit an administrator's explicit camera selection and audit together."""
+        actor = self._validate_actor(actor)
+        with self._lock:
+            connection = self._require_connection()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                user = self.get(user_id)
+                if user is None:
+                    connection.execute("COMMIT")
+                    return None
+                result = self._write_camera_access(
+                    connection, user, {"mode": mode, "camera_ids": camera_ids}, actor
+                )
+                connection.execute("COMMIT")
+                return result
+            except (ValueError, UserRegistryStorageError):
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            except sqlite3.Error:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise UserRegistryStorageError("user camera access update failed") from None
+
+    def _other_administrator(self, connection: sqlite3.Connection, user_id: UUID) -> bool:
+        return (
+            connection.execute(
+                """SELECT 1 FROM users JOIN user_credentials
+                 ON user_credentials.site_id = users.site_id AND user_credentials.user_id = users.id
+               WHERE users.site_id = ? AND users.id != ? AND users.role = ? AND users.enabled = 1
+                 AND user_credentials.credential_kind = 'password'
+                 AND user_credentials.scheme = ? AND user_credentials.expires_at IS NULL LIMIT 1""",
+                (self._site_id, str(user_id), UserRole.ADMINISTRATOR.value, _CREDENTIAL_SCHEME),
+            ).fetchone()
+            is not None
+        )
+
+    def reset_bootstrap(
+        self, user_id: UUID, *, actor: str, ttl_seconds: int = DEFAULT_BOOTSTRAP_TTL_SECONDS
+    ) -> tuple[UserAccount, str, datetime] | None:
+        """Replace access with one new expiring credential; preserve another usable admin."""
+        actor = self._validate_actor(actor)
+        if (
+            type(ttl_seconds) is not int
+            or not MIN_BOOTSTRAP_TTL_SECONDS <= ttl_seconds <= MAX_BOOTSTRAP_TTL_SECONDS
+        ):
+            raise ValueError("bootstrap credential lifetime is invalid")
+        temporary = secrets.token_urlsafe(32)
+        salt = secrets.token_bytes(_SALT_BYTES)
+        verifier = _derive_credential(temporary, salt)
+        issued = datetime.now(UTC)
+        expires = issued + timedelta(seconds=ttl_seconds)
+        with self._lock:
+            connection = self._require_connection()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                user = self.get(user_id)
+                if user is None:
+                    connection.execute("COMMIT")
+                    return None
+                if (
+                    user.enabled
+                    and user.role is UserRole.ADMINISTRATOR
+                    and self.credential_status(user.id) == "active"
+                    and not self._other_administrator(connection, user.id)
+                ):
+                    raise UserRegistryLastAdministratorError(
+                        "Activate another enabled administrator before resetting this administrator"
+                    )
+                connection.execute(
+                    """INSERT INTO user_credentials
+                         (site_id, user_id, scheme, credential_kind, salt, verifier,
+                          expires_at, issued_at, last_checked_at)
+                       VALUES (?, ?, ?, 'bootstrap', ?, ?, ?, ?, ?)
+                       ON CONFLICT(site_id, user_id) DO UPDATE SET
+                         scheme = excluded.scheme, credential_kind = excluded.credential_kind,
+                         salt = excluded.salt, verifier = excluded.verifier,
+                         expires_at = excluded.expires_at, issued_at = excluded.issued_at,
+                         last_checked_at = excluded.last_checked_at""",
+                    (
+                        self._site_id,
+                        str(user.id),
+                        _CREDENTIAL_SCHEME,
+                        salt,
+                        verifier,
+                        expires.isoformat(),
+                        issued.isoformat(),
+                        issued.isoformat(),
+                    ),
+                )
+                self._append_audit(
+                    connection,
+                    user_id=user.id,
+                    action="password-reset",
+                    actor=actor,
+                    changed_fields=("credential_state",),
+                )
+                connection.execute("COMMIT")
+                self._bootstrap_deadlines[user.id] = (verifier, monotonic() + ttl_seconds)
+                return user, temporary, expires
+            except (UserRegistryConflictError, UserRegistryStorageError, ValueError):
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            except sqlite3.Error:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise UserRegistryStorageError("password reset failed") from None
+
+    def _bootstrap_eligible(
+        self, connection: sqlite3.Connection, row: sqlite3.Row, now: datetime
+    ) -> bool:
+        try:
+            expiry = datetime.fromisoformat(row["expires_at"])
+            issued = datetime.fromisoformat(row["issued_at"]) if row["issued_at"] else None
+            checked = (
+                datetime.fromisoformat(row["last_checked_at"]) if row["last_checked_at"] else issued
+            )
+            if any(
+                value is not None and (value.tzinfo is None or value.utcoffset() is None)
+                for value in (expiry, issued, checked)
+            ):
+                raise ValueError
+            user_id, verifier = UUID(row["id"]), bytes(row["verifier"])
+            known = self._bootstrap_deadlines.get(user_id)
+            reconstruct = known is None or known[0] != verifier
+            if reconstruct:
+                lifetime = (
+                    MAX_BOOTSTRAP_TTL_SECONDS
+                    if issued is None
+                    else (expiry - issued).total_seconds()
+                )
+                remaining = min((expiry - now).total_seconds(), lifetime, MAX_BOOTSTRAP_TTL_SECONDS)
+                known = (verifier, monotonic() + max(0, remaining))
+                self._bootstrap_deadlines[user_id] = known
+            expired = known[1] <= monotonic() or (
+                reconstruct and (expiry <= now or (checked is not None and now < checked))
+            )
+            if expired:
+                connection.execute(
+                    """UPDATE user_credentials SET credential_kind = 'expired-bootstrap'
+                       WHERE site_id = ? AND user_id = ? AND credential_kind = 'bootstrap'
+                         AND verifier = ?""",
+                    (self._site_id, str(user_id), verifier),
+                )
+                self._bootstrap_deadlines.pop(user_id, None)
+                return False
+            connection.execute(
+                """UPDATE user_credentials SET last_checked_at = ?
+                   WHERE site_id = ? AND user_id = ? AND credential_kind = 'bootstrap'
+                     AND verifier = ?""",
+                (
+                    max(now, checked).isoformat() if checked is not None else now.isoformat(),
+                    self._site_id,
+                    str(user_id),
+                    verifier,
+                ),
+            )
+            return True
+        except (ValueError, TypeError, OverflowError):
+            raise UserRegistryStorageError(
+                "user credential registry contains invalid state"
+            ) from None
+
+    def credential_status(self, user_id: UUID) -> str | None:
+        """Return only the provisioning state, never verifiers or plaintext credentials."""
+        with self._lock:
+            connection = self._require_connection()
+            try:
+                row = connection.execute(
+                    """SELECT users.id, user_credentials.* FROM users LEFT JOIN user_credentials
+                         ON user_credentials.site_id = users.site_id
+                           AND user_credentials.user_id = users.id
+                       WHERE users.site_id = ? AND users.id = ?""",
+                    (self._site_id, str(user_id)),
+                ).fetchone()
+                if row is None:
+                    return None
+                if row["scheme"] is None:
+                    return "uninitialized"
+                if row["scheme"] != _CREDENTIAL_SCHEME:
+                    raise UserRegistryStorageError(
+                        "user credential registry contains invalid state"
+                    )
+                if row["credential_kind"] == "password" and row["expires_at"] is None:
+                    return "active"
+                if row["credential_kind"] == "expired-bootstrap":
+                    return "expired"
+                if row["credential_kind"] == "bootstrap":
+                    return (
+                        "pending"
+                        if self._bootstrap_eligible(connection, row, datetime.now(UTC))
+                        else "expired"
+                    )
+                raise UserRegistryStorageError("user credential registry contains invalid state")
+            except sqlite3.Error:
+                raise UserRegistryStorageError("user credential state is unavailable") from None
 
     def activate_bootstrap_password(
         self,
@@ -433,9 +735,9 @@ class UserRegistry:
         """Atomically replace a valid one-time bootstrap verifier with a password verifier."""
         normalized_username = self._validate_username(username)
         normalized_actor = self._validate_actor(actor)
-        if not 12 <= len(new_password) <= 256:
+        if type(new_password) is not str or not 12 <= len(new_password) <= 256:
             raise ValueError("new_password must be between 12 and 256 characters")
-        if compare_digest(new_password, temporary_credential):
+        if compare_digest(new_password.encode(), temporary_credential.encode()):
             raise ValueError("new_password must differ from the bootstrap credential")
 
         new_salt = secrets.token_bytes(_SALT_BYTES)
@@ -458,7 +760,9 @@ class UserRegistry:
                         user_credentials.credential_kind,
                         user_credentials.salt,
                         user_credentials.verifier,
-                        user_credentials.expires_at
+                        user_credentials.expires_at,
+                        user_credentials.issued_at,
+                        user_credentials.last_checked_at
                     FROM users
                     LEFT JOIN user_credentials
                       ON user_credentials.site_id = users.site_id
@@ -484,17 +788,9 @@ class UserRegistry:
                             "user credential registry contains invalid state"
                         )
                     if row["credential_kind"] == "bootstrap":
-                        try:
-                            expires_at = datetime.fromisoformat(row["expires_at"])
-                        except (TypeError, ValueError) as exc:
-                            raise UserRegistryStorageError(
-                                "user credential registry contains invalid state"
-                            ) from exc
-                        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
-                            raise UserRegistryStorageError(
-                                "user credential registry contains invalid state"
-                            )
-                        eligible = bool(bool(row["enabled"]) and expires_at > now)
+                        eligible = bool(row["enabled"]) and self._bootstrap_eligible(
+                            connection, row, now
+                        )
 
                 candidate = _derive_credential(temporary_credential, salt)
                 if not eligible or not compare_digest(candidate, expected):
@@ -508,7 +804,8 @@ class UserRegistry:
                 connection.execute(
                     """
                     UPDATE user_credentials
-                    SET scheme = ?, credential_kind = ?, salt = ?, verifier = ?, expires_at = NULL
+                    SET scheme = ?, credential_kind = ?, salt = ?, verifier = ?, expires_at = NULL,
+                        issued_at = NULL, last_checked_at = NULL
                     WHERE site_id = ? AND user_id = ?
                     """,
                     (
@@ -528,6 +825,7 @@ class UserRegistry:
                     changed_fields=("credential_state",),
                 )
                 connection.execute("COMMIT")
+                self._bootstrap_deadlines.pop(user.id, None)
                 return user
             except UserRegistryStorageError:
                 if connection.in_transaction:
@@ -540,6 +838,13 @@ class UserRegistry:
 
     def verify_password(self, *, username: str, password: str) -> UserAccount | None:
         """Verify an enabled initialized account without exposing credential metadata."""
+        verified = self.verify_password_snapshot(username=username, password=password)
+        return None if verified is None else verified[0]
+
+    def verify_password_snapshot(
+        self, *, username: str, password: str
+    ) -> tuple[UserAccount, bytes] | None:
+        """Bind a login to the exact password verifier that passed authentication."""
         normalized_username = self._validate_username(username)
         if not 1 <= len(password) <= 256:
             return None
@@ -587,9 +892,50 @@ class UserRegistry:
         candidate = _derive_credential(password, salt)
         if not eligible or not compare_digest(candidate, expected) or row is None:
             return None
-        return self._decode_user(row)
+        return self._decode_user(row), hashlib.sha256(salt + expected).digest()
 
-    def update(self, user_id: UUID, patch: UserPatch, *, actor: str) -> UserAccount | None:
+    def resolve_session(
+        self, account: UserAccount, credential_version: bytes | None
+    ) -> UserAccount | None:
+        """Read current authority and reject a session after any password replacement."""
+        if type(credential_version) is not bytes or len(credential_version) != 32:
+            return None
+        with self._lock:
+            try:
+                row = (
+                    self._require_connection()
+                    .execute(
+                        """SELECT users.id, users.username, users.display_name,
+                                  users.role, users.enabled,
+                              user_credentials.scheme, user_credentials.credential_kind,
+                              user_credentials.salt, user_credentials.verifier,
+                              user_credentials.expires_at
+                       FROM users JOIN user_credentials ON user_credentials.site_id = users.site_id
+                         AND user_credentials.user_id = users.id
+                       WHERE users.site_id = ? AND users.id = ?""",
+                        (self._site_id, str(account.id)),
+                    )
+                    .fetchone()
+                )
+                if (
+                    row is None
+                    or not row["enabled"]
+                    or row["scheme"] != _CREDENTIAL_SCHEME
+                    or row["credential_kind"] != "password"
+                    or row["expires_at"] is not None
+                ):
+                    return None
+                current = self._decode_user(row)
+                if current.role != account.role:
+                    return None
+                version = hashlib.sha256(bytes(row["salt"]) + bytes(row["verifier"])).digest()
+                return current if compare_digest(version, credential_version) else None
+            except (sqlite3.Error, ValueError, TypeError):
+                raise UserRegistryStorageError("user session authority is unavailable") from None
+
+    def update(
+        self, user_id: UUID, patch: UserPatch, *, actor: str, camera_access: dict | None = None
+    ) -> UserAccount | None:
         """Apply a small permitted user change and audit it transactionally."""
         normalized_actor = self._validate_actor(actor)
         with self._lock:
@@ -617,6 +963,8 @@ class UserRegistry:
                         values[field_name] = value
                         changed.append(field_name)
                 updated = UserAccount(**values)
+                if camera_access is not None:
+                    self._camera_access_value(updated, camera_access)
                 if (
                     current.enabled
                     and current.role is UserRole.ADMINISTRATOR
@@ -671,9 +1019,18 @@ class UserRegistry:
                         actor=normalized_actor,
                         changed_fields=tuple(changed),
                     )
+                if camera_access is not None:
+                    self._write_camera_access(connection, updated, camera_access, normalized_actor)
+                elif (
+                    updated.role is UserRole.ADMINISTRATOR
+                    and current.role is not UserRole.ADMINISTRATOR
+                ):
+                    self._write_camera_access(
+                        connection, updated, {"mode": "all", "camera_ids": []}, normalized_actor
+                    )
                 connection.execute("COMMIT")
                 return updated
-            except UserRegistryLastAdministratorError:
+            except (UserRegistryLastAdministratorError, ValueError, UserRegistryStorageError):
                 if connection.in_transaction:
                     connection.execute("ROLLBACK")
                 raise
@@ -710,12 +1067,15 @@ class UserRegistry:
         *,
         offset: int = 0,
         limit: int = MAX_USER_AUDIT_PAGE_SIZE,
+        newest_first: bool = False,
     ) -> list[UserAuditEvent]:
         """Return a bounded page of credential-free administrative audit records."""
         if offset < 0:
             raise ValueError("offset must be non-negative")
         if not 1 <= limit <= MAX_USER_AUDIT_PAGE_SIZE:
             raise ValueError(f"limit must be between 1 and {MAX_USER_AUDIT_PAGE_SIZE}")
+        if type(newest_first) is not bool:
+            raise ValueError("audit ordering must be boolean")
         with self._lock:
             connection = self._require_connection()
             try:
@@ -724,9 +1084,9 @@ class UserRegistry:
                     SELECT event_id, user_id, action, actor, changed_fields_json, occurred_at
                     FROM user_audit
                     WHERE site_id = ?
-                    ORDER BY event_id
-                    LIMIT ? OFFSET ?
-                    """,
+                    ORDER BY event_id """
+                    + ("DESC" if newest_first else "ASC")
+                    + " LIMIT ? OFFSET ?",
                     (self._site_id, limit, offset),
                 ).fetchall()
             except sqlite3.Error as exc:
@@ -756,3 +1116,4 @@ class UserRegistry:
             self._connection = None
             if connection is not None:
                 connection.close()
+            self._bootstrap_deadlines.clear()

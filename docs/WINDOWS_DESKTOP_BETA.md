@@ -1,126 +1,137 @@
-# Test K5 Vision on Windows
+# Open the camera wall on Windows
 
-Download **K5VisionSetup.exe** from the qualified desktop build. Double-click it,
-accept the displayed software terms, and choose **Install**. Leave **Launch K5
-Vision** selected on the final screen and choose **Finish**. The installer creates
-a Start menu entry and offers a desktop shortcut.
+Use K5 Vision to watch cameras together, check whether recording is actually
+advancing, find footage on a UTC timeline and save an MP4 clip. The native Windows
+application starts the camera engine and stays in the notification area;
+**Open camera wall** opens the viewing and recording workspace in your browser.
 
-The application includes its own runtime. First launch downloads and verifies its
-native recording workers automatically, so it needs Internet access once. Later
-launches reuse the verified private cache. Setup and
-normal use require no PowerShell, Command Prompt, separate Python installation,
-manual package downloads, Docker or WSL. Use Windows 10/11 on an x64 computer and a
-current Edge or Chrome browser. This candidate is an unsigned testing build.
+Download the Windows installer from [public GitHub Releases](https://github.com/mkurtgerald/K5-Vision/releases).
+Use the release notes and matching source revision, installer hash and Windows
+qualification receipt to identify its supported features. The new workspace
+requires its own passing receipt; an earlier installer does not qualify it.
 
-On first launch, choose an administrator username, enter a password of at least
-12 characters twice, and select **Create account**. K5 Vision opens the camera
-dashboard in your browser. Sign in with that account, then:
+## Install and connect cameras
 
-1. Open **Add a camera**, choose **Find cameras on this network**, and select
-   your camera from the results.
-2. Choose a camera name and enter the camera's ONVIF username and password.
-   These are the camera's
-   credentials, which may differ from your K5 Vision account.
-3. Select **Test connection** to check the camera account and load its video
-   profiles. K5 reads the camera's time to handle a different clock without
-   changing the camera or Windows clock.
-4. Choose an H.264 **Video stream** and select **Connect camera**.
+Use Windows 10/11 x64 and a current Edge or Chrome browser. The installer includes
+its own runtime; first launch needs Internet access to download and verify the
+native recording workers. The engine and workers run on this Windows PC.
+Normal setup needs no terminal, separate Python
+installation, manual packages, Docker or WSL. The testing installer is unsigned.
 
-K5 Vision obtains the stream address from the camera and checks for video.
-Saving the camera settings does not establish that video or recording has started;
-check the camera's live view and recording status. You do not need to look up or
-type an RTSP URL. RTSP remains the standard camera transport used by the recording
-worker.
+1. Double-click **K5VisionSetup.exe**, accept its software terms and choose
+   **Install**. Leave **Launch K5 Vision** selected when choosing **Finish**.
+2. In the first-run window, choose an administrator username and enter a password
+   of at least 12 characters twice. Select **Create account**.
+3. Choose **Open camera wall** if the workspace has not opened, then sign in.
+   Engine readiness means K5 is available; check each camera's recording state
+   before relying on new footage.
+4. Select **Add camera**, then **Find cameras on this network**. Choose a camera,
+   give it a name, and enter its ONVIF account. If discovery finds nothing, enter
+   its numeric IP in the same screen. Set the camera settings port or HTTPS
+   option if required.
+5. Select **Test connection**, choose an H.264 **Video stream**, then **Connect
+   camera**. K5 obtains the stream address automatically; no RTSP URL is needed.
 
-The computer and camera must be on a reachable local network, and ONVIF must be
-enabled in the camera's settings. If discovery does not find it, enter the
-camera's numeric IP address in the camera connection screen and continue with
-its credentials and profile. This also obtains the stream address automatically.
-If the camera uses a different settings port or HTTPS, choose those options in
-the same screen.
-If the camera only offers H.265, enable an H.264 profile in its settings and
-retry.
+The camera must be reachable from this PC and have ONVIF and H.264 enabled.
+Camera credentials may differ from your K5 account. An accepted camera account
+does not establish that video or recording has begun.
 
-If you used the earlier operator candidate, K5 Vision uses its existing account,
-cameras and recordings. It does not replace or reset an existing account profile.
+### Connect a direct RTSP stream
 
-## Camera and recording time
+For a camera or encoder with a known stream address, select **Add camera** and
+choose **RTSP stream** as the connection type. Enter a name and the full
+`rtsp://` or `rtsps://` address using the device's numeric IP address. Enter its
+username and password if the stream requires an account. Select **Test
+connection**, then **Connect camera** after K5 confirms an H.264 stream.
+Different stream paths on the same device and port can be added separately.
 
-The time-critical increment is pending qualification on its exact Windows build.
-Its connection test reports the camera's time difference from this PC, when it
-can read the camera's UTC time. A positive difference means the camera is ahead;
-a negative difference means it is behind. The report includes an uncertainty
-allowance for the camera's whole-second clock and network round trip. An
-unavailable reading stays unavailable.
+Direct streams use the same camera wall, recording controls, UTC history and MP4
+export as ONVIF cameras. Use **Reconnect camera** to test a replacement stream
+address or account while preserving the selected camera's history and recording
+preference. RTSP does not expose the camera's management clock; check its time
+and NTP settings through the camera's own settings. K5 continues to show the
+recorder's time diagnostics.
 
-This is relative clock alignment. A small difference does not prove that either
-clock has the correct UTC time. A camera reporting NTP mode only reports its
-configuration; K5 does not verify its time server or declare NTP synchronization.
-K5 uses the measured camera time for the camera account check and can re-read it
-once if authentication fails after a clock change. An incorrect password still
-fails. K5 does not set either clock or change NTP settings.
+## Administer users and camera access
 
-Configure automatic time through **Windows Settings → Time & language → Date &
-time** and the camera's own date/time or NTP settings. Use the site's approved
-time source. If absolute recording time matters, verify Windows against that
-source independently; an accepted camera account is not proof of accurate
-recording timestamps or a correct camera overlay clock.
+Sign in as an administrator and choose **Administration**. The screen lists K5
+accounts, their role, account status, password setup status and camera access.
+Create an account with a display name and username, choose its role and assign
+all cameras or a selected set. The temporary credential appears once; give it
+privately to the new user.
 
-History uses UTC. The new increment anchors its rolling history window to the
-recorder's reported UTC and reports a detected PC clock step. Investigate that
-warning even when video continues. The recording worker's timestamps can move
-when Windows time changes; do not infer continuous or accurate chronology from
-successful playback alone. Required clock, history and retention checks are in
-the [field time matrix](WINDOWS_BETA_FIELD_TEST.md#time-acceptance-matrix).
+On the sign-in screen, the user chooses the password setup option, enters their
+username and temporary credential, and sets their own password. They can then
+sign in normally. Temporary credentials expire and work once. Administrators can
+issue a replacement when needed, enable or disable an account, change its role
+or camera access, and review the account activity log. Resetting a password or
+changing access ends the affected user's current session.
 
-## Keep recording while the window is closed
+| Role | Available controls |
+| --- | --- |
+| Viewer | Live viewing and recorded playback for assigned cameras |
+| Operator | Viewer access plus MP4 clip export |
+| Administrator | All cameras, recording and camera configuration, user management and account activity |
 
-Closing the browser or the K5 Vision window keeps the recorder running. K5 Vision
-stays in the Windows notification area. Double-click the Start or desktop shortcut
-again to reopen the application, or use its tray menu to open the camera dashboard.
+Camera assignments also apply to direct media requests. Administrators always
+retain access to all cameras. K5 protects the last enabled administrator with an
+activated password; activate another administrator before disabling, demoting or
+resetting that account. The account activity log records administrative changes
+without showing passwords or temporary credentials.
 
-Select **Stop and quit** in the application or tray menu to stop recording and
-close the owned workers. Windows sign-out and shutdown also end recording. This
-candidate runs for the signed-in Windows user; it is not a boot service.
+## Watch, review and save
 
-## Upgrade or remove the application
+On **Camera wall**, choose **1 camera**, **2 × 2** or **3 × 3** and use
+**Previous** / **Next** for more cameras. A tile's **Watch** opens its single-camera
+view; **Recordings** opens its history. Paging or changing views does not stop
+the recorder.
 
-Choose **Stop and quit** before running another K5 Vision setup. The installer
-refuses a running recorder and holds an installation lease while application
-files change. It preserves the account and recording profile.
+Administrators can **Pause recording** or **Resume recording** for a selected
+camera. The choice persists after restart; live viewing and retained history stay
+available. **Recording** means K5 has observed new recording data on disk.
+Waiting, stalled, operator-paused and storage-paused states require different
+actions; the [workspace guide](SURVEILLANCE_WORKSPACE.md) explains them.
 
-Remove K5 Vision through **Windows Settings → Apps → Installed apps**. Removal
-preserves accounts, saved cameras and recordings. Reinstalling can use that same
-profile. The default private data directory is
-`%LOCALAPPDATA%\K5VisionOperatorState`; application files live separately in
-`%LOCALAPPDATA%\K5VisionDesktop`.
+Choose **Latest recording**, or open **History** and use **15 min**, **1 hour**,
+**24 hours** or an explicit UTC interval. Select a recorded interval or scrub the
+timeline to play it; a gap contains no video. Use **Mark clip start** and
+**Mark clip end**, or edit the start and length, then **Save MP4 clip**. Each clip
+must stay inside one available interval and be at most five minutes.
 
-## Qualification scope
+## Time and background operation
 
-The desktop gate must exercise the real installer, account screen, bundled
-runtime, ONVIF discovery, camera credentials, H.264 profile selection, automatic
-stream resolution, Edge video, recording while closed, single-instance reopening,
-stop, restart and uninstall on Windows. A skipped test does not qualify a
-download. Earlier manual-enrollment desktop evidence does not establish that the
-new ONVIF flow passed; use the qualified build's exact commit and receipt.
-The clock-skew gate uses a generated camera whose clock differs from Windows and
-requires successful authenticated enrollment and decoded video from the installed
-application. It exercises the read-only clock lookup and rejects a wrong camera
-password. That gate alone does not establish actual clock synchronization, NTP
-availability, absolute UTC accuracy, DST behavior or recording retention across
-a PC clock correction. The time-critical increment requires its own new passing
-Windows receipt; earlier candidate evidence does not qualify it.
+Camera time readings show a relative camera-minus-PC offset and uncertainty.
+A small offset or a camera reporting NTP mode does not verify correct UTC or
+synchronization. K5 reads clocks for authentication and diagnostics; it does not
+set Windows time, camera time or NTP settings. Configure approved time sources
+through Windows **Date & time** and the camera's own settings.
 
-A separate automated gate is being added on a disposable GitHub-hosted Windows
-VM. It installs the exact same EXE artifact, arms an independent recovery
-watchdog, temporarily controls the guest's time services, and moves its UTC clock
-forward and backward by 48 hours. It must verify session lifetime, advancing live
-video, recording, closed-file hashes and UTC history, then restore UTC and the
-time services before uploading evidence. This gate is **pending**; only its
-exact-build workflow receipt can establish a pass. It does not qualify physical
-camera clocks, NTP accuracy, capacity or endurance, and adds no tester setup step.
+History labels are UTC, and rolling windows follow the recorder's reported time.
+Investigate clock-step warnings: recording timestamps can move when Windows time
+changes. Successful playback alone does not establish accurate chronology.
+See the [field time matrix](WINDOWS_BETA_FIELD_TEST.md#time-acceptance-matrix).
 
-The recording candidate includes the reviewed ONVIF connector; separately
-provisioned person detection remains outside the bundled desktop runtime.
-Physical-camera compatibility, measured capacity and long-duration recording
-remain the [field beta gates](WINDOWS_BETA_FIELD_TEST.md).
+Closing the browser or native window leaves the engine running in the
+notification area. Reopen the Start/Desktop shortcut or choose **Open camera
+wall** from the tray. **Stop and quit**, Windows sign-out and shutdown stop the
+engine. This is a signed-in-user application, not a boot service.
+
+## Upgrade, removal and release limits
+
+Choose **Stop and quit** before installing an update. Setup refuses a running
+recorder and preserves the account, cameras and recordings. Removing K5 through
+**Windows Settings → Apps → Installed apps** also preserves that private profile.
+Reinstalling can use it again.
+
+A release claiming this workspace must pass the real Windows installer and GUI
+journey, wall viewing, recording controls, UTC timeline, decoded playback and MP4
+download checks for that exact installer. User-administration releases also
+require graphical account creation, password setup, role and camera restrictions,
+active-session revocation, account activity and restart persistence. Its clock gate must also cover real
+forward/back Windows clock corrections and retained-file integrity. Earlier
+clock-only evidence does not qualify the new workspace.
+
+Physical-camera compatibility, independent NTP/UTC accuracy, measured capacity
+and endurance still require [field qualification](WINDOWS_BETA_FIELD_TEST.md).
+This increment does not deliver a boot service, bundled AI workflow, PTZ controls,
+event search or recording-storage configuration.

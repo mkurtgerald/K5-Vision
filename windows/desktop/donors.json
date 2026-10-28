@@ -76,11 +76,43 @@
       "license": "BSD-3-Clause"
     },
     {
+      "name": "numpy",
+      "version": "2.2.6",
+      "filename": "numpy-2.2.6-cp312-cp312-win_amd64.whl",
+      "sha256": "c1f9540be57940698ed329904db803cf7a402f3fc200bfe599334c9bd84a40b2",
+      "bytes": 12614190,
+      "license": "BSD-3-Clause and retained OpenBLAS/GCC runtime notices"
+    },
+    {
+      "name": "opencv-python-headless",
+      "version": "5.0.0.93",
+      "filename": "opencv_python_headless-5.0.0.93-cp37-abi3-win_amd64.whl",
+      "sha256": "829717b6a95554f273e49e357cee3b3a2a26b6f4842fbc1bed2b45bdd8f87e0e",
+      "bytes": 43825962,
+      "license": "MIT/Apache-2.0; FFmpeg LGPL-2.1-or-later and retained native notices"
+    },
+    {
       "name": "opentelemetry-api",
       "version": "1.45.1",
       "filename": "opentelemetry_api-1.45.1-py3-none-any.whl",
       "sha256": "b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb",
       "bytes": 60256,
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "openvino",
+      "version": "2026.3.1",
+      "filename": "openvino-2026.3.1-22476-cp312-cp312-win_amd64.whl",
+      "sha256": "b686302a47abf7c87b48cb265b3a894f787a1b6380f4ab9f5a511de838ba3c64",
+      "bytes": 75818370,
+      "license": "Apache-2.0 and retained native third-party notices"
+    },
+    {
+      "name": "openvino-telemetry",
+      "version": "2025.2.0",
+      "filename": "openvino_telemetry-2025.2.0-py3-none-any.whl",
+      "sha256": "bcb667e83a44f202ecf4cfa49281715c6d7e21499daec04ff853b7f964833599",
+      "bytes": 25227,
       "license": "Apache-2.0"
     },
     {
@@ -116,20 +148,20 @@
       "license": "BSD-3-Clause"
     },
     {
-      "name": "typing_extensions",
-      "version": "4.16.0",
-      "filename": "typing_extensions-4.16.0-py3-none-any.whl",
-      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
-      "bytes": 45571,
-      "license": "PSF-2.0"
-    },
-    {
       "name": "typing-inspection",
       "version": "0.4.4",
       "filename": "typing_inspection-0.4.4-py3-none-any.whl",
       "sha256": "65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147",
       "bytes": 14750,
       "license": "MIT"
+    },
+    {
+      "name": "typing_extensions",
+      "version": "4.16.0",
+      "filename": "typing_extensions-4.16.0-py3-none-any.whl",
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+      "bytes": 45571,
+      "license": "PSF-2.0"
     },
     {
       "name": "uvicorn",
@@ -139,5 +171,86 @@
       "bytes": 87427,
       "license": "BSD-3-Clause"
     }
-  ]
+  ],
+  "decoder": {
+    "distribution": "opencv-python-headless",
+    "version": "5.0.0.93",
+    "upstream_binary_source_commit": "06dc20cad65dc7fcf784f70c95d46750520889a7",
+    "binary": {
+      "path": "runtime/Lib/site-packages/cv2/opencv_videoio_ffmpeg500_64.dll",
+      "bytes": 30876160,
+      "sha256": "7aabff029d1fa47cf56ede4dbbe05dc62da3208f07cd16471d4c966a33f9aa31"
+    },
+    "retained_notice": {
+      "path": "runtime/Lib/site-packages/cv2/LICENSE-3RD-PARTY.txt",
+      "bytes": 183251,
+      "sha256": "c1d60169b55cee56452b227c2fd2a7b9ddda3dd3741065f1c6201072be73fadb"
+    },
+    "license": "LGPL-2.1-or-later",
+    "replacement_permitted": true,
+    "sources": [
+      {
+        "filename": "FFmpeg-n7.1.tar.gz",
+        "component": "FFmpeg/FFmpeg",
+        "source_commit": "b08d7969c550a804a59511c7b83f2dd8cc0499b8",
+        "url": "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/b08d7969c550a804a59511c7b83f2dd8cc0499b8",
+        "bytes": 15900622,
+        "sha256": "02fa6d9827da3b6786e4df821218cc036db2b4481e7f48267c2dcda695633afc"
+      },
+      {
+        "filename": "OpenCV-FFmpeg-build.tar.gz",
+        "component": "opencv/opencv_3rdparty",
+        "source_commit": "06dc20cad65dc7fcf784f70c95d46750520889a7",
+        "url": "https://codeload.github.com/opencv/opencv_3rdparty/tar.gz/06dc20cad65dc7fcf784f70c95d46750520889a7",
+        "bytes": 25729765,
+        "sha256": "6ed03e7468a3d91b62e24aa5ad2183924f231dd81a3442da221d7ddf315220b8",
+        "retain_text_sources": true
+      },
+      {
+        "filename": "OpenCV-FFmpeg-wrapper.tar.gz",
+        "component": "opencv/opencv",
+        "source_commit": "a0a660fcb1e58a295e6caa6aee64ed4d369b0181",
+        "url": "https://codeload.github.com/opencv/opencv/tar.gz/a0a660fcb1e58a295e6caa6aee64ed4d369b0181",
+        "bytes": 81508684,
+        "sha256": "5d97bddd4c5d2895dddafe6aff211b9fc1add564887263b7c062f2699660bf1d",
+        "retain_text_sources": true
+      },
+      {
+        "filename": "libvpx-v1.16.0.tar.gz",
+        "component": "webmproject/libvpx",
+        "source_commit": "1024874c5919305883187e2953de8fcb4c3d7fa6",
+        "url": "https://codeload.github.com/webmproject/libvpx/tar.gz/1024874c5919305883187e2953de8fcb4c3d7fa6",
+        "bytes": 5637178,
+        "sha256": "274c00c0b21f03a9152e324b1989f73b74268aa8545b39ef5faccc50fdb56393"
+      },
+      {
+        "filename": "OpenH264-v2.5.0.tar.gz",
+        "component": "cisco/openh264",
+        "source_commit": "8c7008aeb6335e7d36ab0d9a023a63f82a8eaac0",
+        "url": "https://codeload.github.com/cisco/openh264/tar.gz/8c7008aeb6335e7d36ab0d9a023a63f82a8eaac0",
+        "bytes": 60304002,
+        "sha256": "0a12daa5a7fefc3acf5f6485fe21159399351cd4b83af80dde525fa520f17820",
+        "retain_text_sources": true
+      },
+      {
+        "filename": "libaom-v3.14.1.tar.gz",
+        "component": "aomedia/aom",
+        "source_commit": "03087864cf4bea6abb0d28f95cf7843511413d8f",
+        "url": "https://codeload.github.com/libsdl-org/aom/tar.gz/03087864cf4bea6abb0d28f95cf7843511413d8f",
+        "bytes": 6385757,
+        "sha256": "b17564e4ff3a36992d17b6ea934a0151f9e38674e630bd91312170859d2be6a2",
+        "source_repository": "https://aomedia.googlesource.com/aom",
+        "archive_mirror": "https://github.com/libsdl-org/aom"
+      }
+    ]
+  },
+  "cpp_runtime": {
+    "source_path": "runtime/Lib/site-packages/numpy.libs/msvcp140-263139962577ecda4cd9469ca360a746.dll",
+    "path": "runtime/msvcp140.dll",
+    "bytes": 575056,
+    "sha256": "a4c2229bdc2a2a630acdc095b4d86008e5c3e3bc7773174354f3da4f5beb9cde",
+    "source_distribution": "numpy",
+    "source_version": "2.2.6",
+    "license": "Microsoft Distributable Code; retained installation terms"
+  }
 }

@@ -628,6 +628,7 @@ namespace K5VisionDesktop
         private readonly Options options;
         private readonly string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
         private readonly Label status = new Label();
+        private readonly Label workspaceHelp = new Label();
         private readonly TextBox diagnostic = new TextBox();
         private readonly Panel setup = new Panel();
         private readonly TextBox username = new TextBox();
@@ -666,6 +667,12 @@ namespace K5VisionDesktop
             status.Location = new Point(30, 78); status.Size = new Size(500, 62);
             status.Text = "Preparing K5 Vision…"; status.Name = "Status"; SetId(status, 1006);
             Controls.Add(status);
+            workspaceHelp.Location = new Point(30, 158); workspaceHelp.Size = new Size(500, 100);
+            workspaceHelp.Text = "This window starts K5 Vision and keeps it running in the notification area. " +
+                "Open the camera wall in your browser for live viewing, recordings and camera controls. " +
+                "Closing either window keeps the camera engine running.";
+            workspaceHelp.ForeColor = Color.FromArgb(75, 89, 108); workspaceHelp.Visible = false;
+            Controls.Add(workspaceHelp);
             diagnostic.Visible = false; diagnostic.ReadOnly = true; diagnostic.Name = "Diagnostic";
             SetId(diagnostic, 1010); Controls.Add(diagnostic);
             GC.KeepAlive(diagnostic.Handle);
@@ -680,14 +687,19 @@ namespace K5VisionDesktop
             create.Location = new Point(0, 185); create.Size = new Size(166, 36); SetId(create, 1003);
             create.Click += delegate { CreateAccount(); };
             setup.Controls.Add(create); Controls.Add(setup);
-            open.Text = "Open cameras"; open.Name = "OpenOperator";
-            open.Location = new Point(30, 389); open.Size = new Size(166, 36); open.Enabled = false; SetId(open, 1004);
+            open.Text = "Open camera wall"; open.Name = "OpenOperator";
+            open.Location = new Point(30, 383); open.Size = new Size(220, 42); open.Enabled = false; SetId(open, 1004);
+            open.FlatStyle = FlatStyle.Flat; open.FlatAppearance.BorderSize = 0;
+            open.BackColor = Color.FromArgb(27, 109, 159); open.ForeColor = Color.White;
+            open.FlatAppearance.MouseOverBackColor = Color.FromArgb(22, 91, 134);
+            open.FlatAppearance.MouseDownBackColor = Color.FromArgb(17, 74, 110);
+            open.UseVisualStyleBackColor = false; open.Font = new Font("Segoe UI", 10, FontStyle.Bold);
             open.Click += delegate { OpenDashboard(); }; Controls.Add(open);
             quit.Text = "Stop and quit"; quit.Name = "StopRecording";
             quit.Location = new Point(350, 389); quit.Size = new Size(166, 36); SetId(quit, 1005);
             quit.Click += delegate { StopAndQuit(); }; Controls.Add(quit);
             ContextMenuStrip menu = new ContextMenuStrip();
-            menu.Items.Add("Open cameras", null, delegate { ShowOwner(); OpenDashboard(); });
+            menu.Items.Add("Open camera wall", null, delegate { ShowOwner(); OpenDashboard(); });
             menu.Items.Add("Show K5 Vision", null, delegate { ShowOwner(); });
             menu.Items.Add("Stop and quit", null, delegate { StopAndQuit(); });
             tray.Icon = SystemIcons.Application; Icon = SystemIcons.Application;
@@ -698,7 +710,7 @@ namespace K5VisionDesktop
             {
                 if (openEvent.WaitOne(0)) { ShowOwner(); if (!options.NoBrowser) OpenDashboard(); }
                 if (ready && backend != null && backend.Process.HasExited)
-                { phase = "failed"; ready = false; open.Enabled = false; status.Text = "Recording stopped unexpectedly. Close and reopen K5 Vision to try again. Your recordings have been kept."; ShowOwner(); }
+                { phase = "failed"; ready = false; open.Enabled = false; workspaceHelp.Visible = false; status.Text = "Recording stopped unexpectedly. Close and reopen K5 Vision to try again. Your recordings have been kept."; ShowOwner(); }
                 UpdateDiagnostic();
             };
             timer.Start();
@@ -839,8 +851,9 @@ namespace K5VisionDesktop
                 await startup;
                 if (exiting) return;
                 phase = "running"; ready = true; busy = false; open.Enabled = true;
-                status.Text = "Recording service is running. You can close this window; K5 Vision stays in the tray.";
-                tray.Text = "K5 Vision — recording service running";
+                workspaceHelp.Visible = true;
+                status.Text = "Recording service is running. Camera engine ready. Select Open camera wall to add cameras and check live video and recording.";
+                tray.Text = "K5 Vision — camera engine ready";
                 if (!options.NoBrowser) OpenDashboard();
             }
             catch { failed = true; }
@@ -866,7 +879,7 @@ namespace K5VisionDesktop
         private void Fail(string message)
         {
             if (exiting || IsDisposed) return;
-            phase = "failed"; busy = false; ready = false; open.Enabled = false; create.Enabled = false;
+            phase = "failed"; busy = false; ready = false; open.Enabled = false; create.Enabled = false; workspaceHelp.Visible = false;
             status.Text = message; ShowOwner();
         }
 

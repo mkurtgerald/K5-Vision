@@ -142,6 +142,14 @@ def trusted_payload_variants(source: Path):
         "k5vision/operator_web/index.html",
         "k5vision/operator_web/app.css",
         "k5vision/operator_web/app.js",
+        "k5vision/operator_web/wall.css",
+        "k5vision/operator_web/wall.js",
+        "k5vision/operator_web/timeline.css",
+        "k5vision/operator_web/timeline.js",
+        "k5vision/operator_web/admin.css",
+        "k5vision/operator_web/admin.js",
+        "k5vision/operator_web/analytics.css",
+        "k5vision/operator_web/analytics.js",
     }
     result = {}
     for name, exact in alpha.source_payload(source).items():
@@ -577,9 +585,19 @@ def test_trusted_checkout_variants_reject_mixed_endings_and_tamper(tmp_path):
         "operator_web/index.html": b"<!doctype html>\n<html></html>\n",
         "operator_web/app.css": b"body {\n  color: white;\n}\n",
         "operator_web/app.js": b'"use strict";\nconst version = 1;\n',
+        "operator_web/wall.css": b".wall {\n  display: grid;\n}\n",
+        "operator_web/wall.js": b'"use strict";\nconst wall = 1;\n',
+        "operator_web/timeline.css": b".timeline {\n  display: flex;\n}\n",
+        "operator_web/timeline.js": b'"use strict";\nconst timeline = 1;\n',
+        "operator_web/admin.css": b".administration {\n  display: block;\n}\n",
+        "operator_web/admin.js": b'"use strict";\nconst administration = 1;\n',
+        "operator_web/analytics.css": b".analytics-panel {\n  display: block;\n}\n",
+        "operator_web/analytics.js": b'"use strict";\nconst analytics = 1;\n',
         "data/other.txt": b"unclassified\ntext\n",
         "data/unknown-manifest.json": b'{\n"unclassified": true\n}\n',
         "operator_web/other.html": b"unclassified\nasset\n",
+        "operator_web/other.js": b"unclassified\nscript\n",
+        "operator_web/other.css": b"unclassified\nstylesheet\n",
         "data/payload.bin": b"\x00\xff\n\x01\n",
     }
     for name, data in files.items():
@@ -596,6 +614,14 @@ def test_trusted_checkout_variants_reject_mixed_endings_and_tamper(tmp_path):
         "operator_web/index.html",
         "operator_web/app.css",
         "operator_web/app.js",
+        "operator_web/wall.css",
+        "operator_web/wall.js",
+        "operator_web/timeline.css",
+        "operator_web/timeline.js",
+        "operator_web/admin.css",
+        "operator_web/admin.js",
+        "operator_web/analytics.css",
+        "operator_web/analytics.js",
     )
     for name in trusted_text:
         data = files[name]

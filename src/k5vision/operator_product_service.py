@@ -152,6 +152,7 @@ class OperatorProductService:
         self._storage_status = None
         self._health_failures = {"media": 0, "gateway": 0}
         self._clock = HostClockObserver()
+        self._media_generation = 0
         self._media_file = self.state_root / "operator-mediamtx.json"
         self._gateway_file = self.state_root / "operator-gateway.json"
 
@@ -213,6 +214,28 @@ class OperatorProductService:
             **self._clock.snapshot(),
         }
 
+    @property
+    def media_generation(self) -> int:
+        """A new worker gets a fresh bounded connection-readiness window."""
+        return self._media_generation
+
+    def recording_progress(self, binding) -> dict:
+        """Return cached disk evidence; operator polling never scans recordings."""
+        if self._storage is None:
+            return {
+                "observed_bytes": 0,
+                "last_progress_age_seconds": None,
+                "inspection_complete": False,
+                "observed": False,
+            }
+        return self._storage.recording_progress(binding.path_name)
+
+    def recording_files(self, binding) -> dict[str, tuple[int, ...]] | None:
+        """Private cached inventory for the recorder-owned analytics sampler."""
+        if self._storage is None:
+            return None
+        return self._storage.recording_files(binding.path_name)
+
     def _check_gateway(self) -> None:
         """Probe the owned loopback HTTP listener without redirects or a proxy."""
         request = Request(f"http://127.0.0.1:{self.public_port}/operator/")
@@ -262,6 +285,7 @@ class OperatorProductService:
         self._media = OwnedNativeProcess(
             [str(self.media_executable), str(self._media_file)], cwd=self.state_root
         )
+        self._media_generation += 1
 
     async def _spawn(self, operation) -> None:
         # Join an in-flight constructor before cleanup can snapshot ownership.
@@ -374,6 +398,78 @@ class OperatorProductService:
                 self._ready = False
                 raise
 
+    def _change_recording_preferences(self, sources: tuple[MediaMTXSource, ...]) -> None:
+        previous = self._sources
+        before = {source.binding.path_name: source for source in previous}
+        after = {source.binding.path_name: source for source in sources}
+        if (
+            len(after) != len(sources)
+            or set(before) != set(after)
+            or any(
+                before[path].device != source.device
+                or before[path].source_uri != source.source_uri
+                or before[path].binding != source.binding
+                for path, source in after.items()
+            )
+        ):
+            raise OperatorProductError("Recording selection changed during the request")
+        if not self._ready or self._media is None or self._media.poll() is not None:
+            raise OperatorProductError("Recording worker is unavailable")
+        changed = [
+            path
+            for path in before
+            if before[path].recording_enabled != after[path].recording_enabled
+        ]
+        applied = []
+        try:
+            for path in changed:
+                # Record-only PATCH keeps the camera source and its live readers.
+                applied.append(path)
+                self._mutation(
+                    "PATCH",
+                    f"/v3/config/paths/patch/{path}",
+                    {"record": after[path].recording_enabled and not self._disk_full},
+                )
+            self._sources = tuple(sources)
+            self._write_media()
+        except BaseException:
+            self._sources = previous
+            failed = False
+            for path in reversed(applied):
+                try:
+                    self._mutation(
+                        "PATCH",
+                        f"/v3/config/paths/patch/{path}",
+                        {"record": before[path].recording_enabled and not self._disk_full},
+                    )
+                except Exception:
+                    failed = True
+            try:
+                self._write_media()
+            except Exception:
+                failed = True
+            if failed:
+                # Recovery restarts with the previous durable intent; never
+                # advertise a successful preference when compensation failed.
+                self._needs_reconcile = True
+                self._ready = False
+            raise OperatorProductError("Recording preference could not be applied") from None
+
+    async def apply_recording_preferences(self, sources: tuple[MediaMTXSource, ...]) -> None:
+        """Join the native mutation before cancellation can attempt compensation."""
+        async with self._lock:
+            previous = self._sources
+            try:
+                await self._spawn(lambda: self._change_recording_preferences(tuple(sources)))
+            except asyncio.CancelledError:
+                try:
+                    await self._spawn(lambda: self._change_recording_preferences(previous))
+                except Exception:
+                    self._sources = previous
+                    self._needs_reconcile = True
+                    self._ready = False
+                raise
+
     async def _maintain(self) -> None:
         last_storage = 0.0
         last_health = 0.0
@@ -426,14 +522,22 @@ class OperatorProductService:
                         self._storage_status = result
                         paused = not result.recording_allowed
                         if paused != self._disk_full:
+                            # Publishing disk_full/ready acknowledges the whole
+                            # writer policy, not just the sampled desired flag.
+                            # Native PATCHes yield between camera paths.
+                            self._ready = False
                             self._disk_full = paused
                             self._needs_reconcile = True
+                            preferences = {
+                                source.binding.path_name: source.recording_enabled
+                                for source in self._sources
+                            }
                             for path in self._paths:
                                 await asyncio.to_thread(
                                     self._mutation,
                                     "PATCH",
                                     f"/v3/config/paths/patch/{path}",
-                                    {"record": not paused},
+                                    {"record": preferences.get(path, False) and not paused},
                                 )
                             await asyncio.to_thread(self._write_media)
                             self._needs_reconcile = False
@@ -484,6 +588,22 @@ class OperatorProductService:
             except Exception:
                 pass
         cancelled = False
+        cleanup_failed = False
+        close_provider = asyncio.create_task(self.provider.aclose())
+        # A canceled camera-list reader may leave its shared snapshot owner
+        # finishing a native read. Close and join that boundary before the
+        # worker's authenticated listener can be released or reused.
+        while not close_provider.done():
+            try:
+                await asyncio.shield(close_provider)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        try:
+            close_provider.result()
+        except Exception:
+            cleanup_failed = True
         if self._paths and self._media is not None and self._media.poll() is None:
             flush = asyncio.create_task(
                 asyncio.to_thread(self._flush_recordings, tuple(self._paths))
@@ -501,7 +621,6 @@ class OperatorProductService:
                 flush.result()
             except Exception:
                 pass
-        cleanup_failed = False
         for process in (self._gateway, self._media):
             if process is not None:
                 try:

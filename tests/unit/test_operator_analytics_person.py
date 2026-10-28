@@ -47,6 +47,41 @@ def test_absent_optional_config_does_not_admit_or_construct_native(monkeypatch):
     assert module.load_person_configuration({}) is None
 
 
+def test_absent_installed_model_preserves_source_only_installations(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "__file__", str(tmp_path / "operator_analytics_person.py"))
+    monkeypatch.setattr(module, "validate_person_runtime", lambda _config: pytest.fail("admitted"))
+    assert module.load_installed_person_configuration({}) is None
+
+
+def test_installed_model_is_admitted_without_environment_or_external_configuration(
+    admitted, tmp_path, monkeypatch
+):
+    _config, _manifest, files = admitted
+    root = tmp_path / "data" / "person-models"
+    root.mkdir(parents=True)
+    for name, content in files.items():
+        (root / name).write_bytes(content)
+    monkeypatch.setattr(module, "__file__", str(tmp_path / "operator_analytics_person.py"))
+    assert module.load_installed_person_configuration({}) == module.OperatorPersonConfiguration(
+        root
+    )
+    (root / "person.bin").write_bytes(b"tampered")
+    with pytest.raises(module.OperatorPersonConfigurationError, match="admission"):
+        module.load_installed_person_configuration({})
+
+
+def test_explicit_engineering_configuration_takes_precedence_over_installed_model(
+    admitted, tmp_path, monkeypatch
+):
+    config, _manifest, _files = admitted
+    path = tmp_path / "explicit-person.json"
+    path.write_text(json.dumps(document(config.artifact_root)))
+    monkeypatch.setattr(module, "__file__", str(tmp_path / "operator_analytics_person.py"))
+    assert (
+        module.load_installed_person_configuration({module.PERSON_CONFIG_ENV: str(path)}) == config
+    )
+
+
 def test_explicit_local_configuration_admits_exact_model_and_dependency_versions(
     admitted, tmp_path
 ):

@@ -3,7 +3,7 @@ name: Native Windows Beta Sprint
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-desktop-beta]
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-desktop-beta, codex/windows-onvif-onboarding]
     paths:
       - .github/workflows/operator-beta-windows.yml
       - .github/actions/provision-operator-tools/**
@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [product, launcher, install, browser, person]
+        lane: [product, launcher, install, browser, person, admin]
     env:
       K5_BETA_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
@@ -64,7 +64,7 @@ jobs:
           python -m pip install -e ".[dev]"
           if ($LASTEXITCODE -ne 0) { throw "Development install failed" }
       - name: Install browser driver for acceptance only
-        if: matrix.lane == 'browser' || matrix.lane == 'person'
+        if: matrix.lane == 'browser' || matrix.lane == 'person' || matrix.lane == 'admin'
         shell: pwsh
         run: |
           python -m pip install "playwright==1.58.0"
@@ -75,6 +75,12 @@ jobs:
         run: |
           python -m pip install "openvino==2026.3.1" "numpy==2.2.6" "openvino-telemetry==2025.2.0"
           if ($LASTEXITCODE -ne 0) { throw "Person runtime installation failed" }
+      - name: Install the packaged MP4 decoder for browser acceptance
+        if: matrix.lane == 'browser'
+        shell: pwsh
+        run: |
+          python -m pip install "opencv-python-headless==5.0.0.93" "numpy==2.2.6"
+          if ($LASTEXITCODE -ne 0) { throw "Browser export decoder installation failed" }
       - name: Provision immutable native development workers
         uses: ./.github/actions/provision-operator-tools
       - name: Build candidate wheel
@@ -103,6 +109,7 @@ jobs:
             "product" { @(
               "tests/unit/test_mediamtx_provider.py", "tests/unit/test_operator_media_gateway.py",
               "tests/unit/test_operator_product_state.py", "tests/unit/test_operator_product_api.py",
+              "tests/unit/test_operator_admin_api.py",
               "tests/unit/test_operator_product_service.py", "tests/unit/test_operator_recording_storage.py",
               "tests/unit/test_operator_native_process.py", "tests/unit/test_operator_profile_lock.py",
               "tests/unit/test_operator_analytics.py", "tests/unit/test_operator_analytics_person.py",
@@ -113,6 +120,7 @@ jobs:
             "launcher" { @("tests/integration/test_operator_windows_launcher.py") }
             "install" { @("tests/integration/test_windows_operator_install.py") }
             "browser" { @("tests/integration/test_operator_beta_browser.py") }
+            "admin" { @("tests/integration/test_operator_admin_browser.py") }
             "person" { @("tests/integration/test_operator_beta_capacity.py", "tests/integration/test_operator_person_view_runtime.py") }
             default { throw "Unknown beta lane" }
           }

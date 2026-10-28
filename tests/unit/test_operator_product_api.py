@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import http.cookiejar
 import json
 import os
 import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlencode
+from urllib.request import Request
 from uuid import UUID, uuid4
 
 import pytest
@@ -21,7 +26,10 @@ from k5vision.domain.devices import DeviceCreate, DeviceProtocol
 from k5vision.domain.users import UserAccount, UserCreate, UserPatch, UserRole
 from k5vision.identity_state import initialize_identity_state
 from k5vision.media.mediamtx_provider import (
+    MEDIAMTX_VERSION,
     MediaMTXBinding,
+    MediaMTXCredentials,
+    MediaMTXProvider,
     MediaPathConfiguration,
     MediaPathState,
     MediaPlaybackSpan,
@@ -55,6 +63,18 @@ class _Provider:
     async def path_configuration(self, binding):
         return MediaPathConfiguration(binding.device_id, "main", self.recording, False, "fmp4")
 
+    async def path_snapshot(self, bindings):
+        result = {}
+        for binding in bindings:
+            try:
+                result[binding] = (
+                    await self.path_state(binding),
+                    await self.path_configuration(binding),
+                )
+            except MediaWorkerError as error:
+                result[binding] = error.code
+        return result
+
     async def playback_spans(self, binding, *, start, end):
         self.history_queries.append((binding, start, end))
         if self.error:
@@ -70,6 +90,16 @@ class _Service:
         self.worker_status = "ready"
         self.max_recording_bytes = 20 * 1024**3
         self.storage = None
+        self.media_generation = 0
+        self.progress = {
+            "observed_bytes": 4096,
+            "last_progress_age_seconds": 0,
+            "inspection_complete": True,
+            "observed": True,
+        }
+        self.preference_calls = []
+        self.preference_callback = None
+        self.preference_error = None
 
     def status(self):
         return self.worker_status
@@ -83,6 +113,17 @@ class _Service:
 
     async def apply_sources(self, sources):
         self.applied.append(sources)
+
+    def recording_progress(self, _binding):
+        return dict(self.progress)
+
+    async def apply_recording_preferences(self, sources):
+        self.preference_calls.append(sources)
+        if self.preference_error:
+            raise self.preference_error
+        self.provider.recording = sources[0].recording_enabled
+        if self.preference_callback:
+            await self.preference_callback()
 
 
 class _Analytics:
@@ -137,6 +178,22 @@ class _Harness:
             "X-Forwarded-Method": method,
             "X-Forwarded-Uri": uri,
         }
+
+
+def _initialized_session(product, account):
+    """Model real login: a pending bootstrap account cannot own a product session."""
+    if (
+        product.users.get(account.id) is not None
+        and product.users.credential_status(account.id) != "active"
+    ):
+        _, temporary, _ = product.users.reset_bootstrap(account.id, actor="test")
+        assert product.users.activate_bootstrap_password(
+            username=account.username,
+            temporary_credential=temporary,
+            new_password="initialized-product-test-password",
+            actor="test",
+        )
+    return asyncio.run(product.sessions.issue(account))
 
 
 @pytest.fixture
@@ -211,13 +268,340 @@ def test_enrollment_persists_private_source_and_public_rows_hide_execution_mater
         "host": "127.0.0.1",
         "management_port": 80,
         "management_secure": False,
+        "connection_type": "rtsp",
         "status": "live",
         "recording": True,
+        "recording_enabled": True,
+        "recording_state": "recording",
+        "recording_status": {
+            "reason": "disk_progress",
+            "observed_bytes": 4096,
+            "last_progress_age_seconds": 0,
+        },
+        "connection_error": None,
         "analytics_status": "disabled",
     }
     assert "private-test-value" not in response.text
     assert "rtsp://" not in response.text
     assert product.cameras.get(UUID(device_id)).binding == sources[0].binding
+
+
+def test_recording_pause_resume_preserves_live_source_history_and_persistent_choice(product):
+    identifier = product.enroll()
+    original = product.cameras.get(UUID(identifier))
+    route = f"/api/v1/operator/cameras/{identifier}/recording"
+    paused = product.client.put(route, headers=product.headers, json={"enabled": False})
+    assert paused.status_code == 200
+    assert paused.headers["cache-control"] == "no-store"
+    assert paused.json()["status"] == "live"
+    assert paused.json()["recording_enabled"] is False
+    assert paused.json()["recording_state"] == "paused"
+    assert paused.json()["recording_status"]["reason"] == "operator_paused"
+    source = product.cameras.get(UUID(identifier))
+    assert source.binding == original.binding and source.source_uri == original.source_uri
+    assert source.recording_enabled is False
+    assert (
+        product.client.get(
+            f"/api/v1/operator/cameras/{identifier}/history", headers=product.headers
+        ).status_code
+        == 200
+    )
+    assert (
+        product.client.get(
+            "/api/v1/operator/media-auth",
+            headers=product.media_headers(f"/media/live/{source.binding.path_name}/index.m3u8"),
+        ).status_code
+        == 200
+    )
+    # Repeating an already committed choice does not touch a running writer.
+    assert (
+        product.client.put(route, headers=product.headers, json={"enabled": False}).status_code
+        == 200
+    )
+    assert len(product.service.preference_calls) == 1
+    resumed = product.client.put(route, headers=product.headers, json={"enabled": True})
+    assert resumed.status_code == 200
+    assert resumed.json()["recording_enabled"] is True
+    assert product.cameras.get(UUID(identifier)).recording_enabled is True
+    assert len(product.service.preference_calls) == 2
+
+
+@pytest.mark.parametrize("role", [UserRole.VIEWER, UserRole.OPERATOR])
+def test_recording_choice_requires_current_admin_and_local_origin(product, role):
+    identifier = product.enroll()
+    route = f"/api/v1/operator/cameras/{identifier}/recording"
+    account, _, _ = product.users.create_with_bootstrap(
+        UserCreate(username="recording-reader", display_name="Reader", role=role), actor="test"
+    )
+    token, _ = _initialized_session(product, account)
+    assert (
+        product.client.put(
+            route, headers={"Authorization": "Bearer " + token}, json={"enabled": False}
+        ).status_code
+        == 403
+    )
+    assert product.client.put(route, json={"enabled": False}).status_code == 401
+    assert (
+        product.client.put(
+            route,
+            headers={**product.headers, "Origin": "https://outside.invalid"},
+            json={"enabled": False},
+        ).status_code
+        == 403
+    )
+    assert not product.service.preference_calls
+    assert product.cameras.get(UUID(identifier)).recording_enabled is True
+
+
+@pytest.mark.parametrize(
+    "payload", [{"enabled": 1}, {"enabled": "false"}, {"enabled": False, "secret": "private"}]
+)
+def test_recording_choice_rejects_coercion_and_unknown_fields(product, payload):
+    identifier = product.enroll()
+    response = product.client.put(
+        f"/api/v1/operator/cameras/{identifier}/recording",
+        headers=product.headers,
+        json=payload,
+    )
+    assert response.status_code == 422
+    assert "private" not in response.text
+    assert not product.service.preference_calls
+
+
+def test_recording_choice_worker_failure_leaves_saved_intent_unchanged(product):
+    identifier = product.enroll()
+    product.service.preference_error = RuntimeError("rtsp://private-material")
+    response = product.client.put(
+        f"/api/v1/operator/cameras/{identifier}/recording",
+        headers=product.headers,
+        json={"enabled": False},
+    )
+    assert response.status_code == 503
+    assert "private" not in response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert product.cameras.get(UUID(identifier)).recording_enabled is True
+
+
+def test_recording_choice_store_failure_compensates_running_writer(product, monkeypatch):
+    identifier = product.enroll()
+
+    def refused(*_args):
+        raise RuntimeError("private storage material")
+
+    monkeypatch.setattr(product.cameras, "set_recording_enabled", refused)
+    response = product.client.put(
+        f"/api/v1/operator/cameras/{identifier}/recording",
+        headers=product.headers,
+        json={"enabled": False},
+    )
+    assert response.status_code == 503 and "private" not in response.text
+    assert [sources[0].recording_enabled for sources in product.service.preference_calls] == [
+        False,
+        True,
+    ]
+    assert product.service.provider.recording is True
+    assert product.cameras.get(UUID(identifier)).recording_enabled is True
+
+
+def test_recording_choice_reauthenticates_after_native_work_and_compensates(product):
+    identifier = product.enroll()
+
+    async def revoke():
+        await product.sessions.revoke(product.token)
+
+    product.service.preference_callback = revoke
+    response = product.client.put(
+        f"/api/v1/operator/cameras/{identifier}/recording",
+        headers=product.headers,
+        json={"enabled": False},
+    )
+    assert response.status_code == 401
+    assert product.cameras.get(UUID(identifier)).recording_enabled is True
+    assert product.service.provider.recording is True
+
+
+def test_never_live_camera_has_monotonic_deadline_and_recovers_without_reenrollment(
+    product, monkeypatch
+):
+    clock = SimpleNamespace(value=100.0)
+    monkeypatch.setattr("k5vision.operator_product_api.monotonic", lambda: clock.value)
+    product.service.provider.online = product.service.provider.available = False
+    identifier = product.enroll()
+
+    def row():
+        return product.client.get("/api/v1/operator/cameras", headers=product.headers).json()[
+            "cameras"
+        ][0]
+
+    assert row()["status"] == "connecting"
+    clock.value = 129.999
+    assert row()["status"] == "connecting"
+    clock.value = 130.0
+    assert row()["status"] == "disconnected"
+    assert row()["connection_error"] == "stream_unavailable"
+    product.service.provider.online = product.service.provider.available = True
+    assert row()["status"] == "live" and row()["connection_error"] is None
+    product.service.provider.online = product.service.provider.available = False
+    assert row()["status"] == "disconnected"
+    product.service.media_generation += 1
+    assert row()["status"] == "connecting"
+    clock.value += 30
+    assert row()["status"] == "disconnected"
+    assert product.cameras.get(UUID(identifier)) is not None
+
+
+def test_recording_claim_requires_recent_complete_disk_progress(product, monkeypatch):
+    clock = SimpleNamespace(value=100.0)
+    monkeypatch.setattr("k5vision.operator_product_api.monotonic", lambda: clock.value)
+    product.service.progress["last_progress_age_seconds"] = None
+    identifier = product.enroll()
+
+    def row():
+        return product.client.get("/api/v1/operator/cameras", headers=product.headers).json()[
+            "cameras"
+        ][0]
+
+    assert row()["recording_state"] == "waiting"
+    clock.value += 45
+    assert row()["recording_state"] == "stalled"
+    product.service.progress["last_progress_age_seconds"] = 0
+    assert row()["recording_state"] == "recording"
+
+    product.service.progress["last_progress_age_seconds"] = 46
+    assert row()["recording_state"] == "stalled"
+    product.service.progress["inspection_complete"] = False
+    assert row()["recording_state"] == "error"
+    product.service.progress["inspection_complete"] = True
+    product.service.worker_status = "disk_full"
+    assert row()["recording_state"] == "paused"
+    assert row()["recording_status"]["reason"] == "storage_paused"
+    product.service.worker_status = "ready"
+    route = f"/api/v1/operator/cameras/{identifier}/recording"
+    assert (
+        product.client.put(route, headers=product.headers, json={"enabled": False}).status_code
+        == 200
+    )
+    clock.value += 10
+    product.service.progress["last_progress_age_seconds"] = 5
+    resumed = product.client.put(route, headers=product.headers, json={"enabled": True})
+    assert resumed.json()["recording_state"] == "waiting"
+    product.service.progress["last_progress_age_seconds"] = 0
+    assert row()["recording_state"] == "recording"
+
+
+def test_camera_poll_keeps_worker_capacity_for_concurrent_history(product):
+    """Hold an actual bounded native read while a separate history request runs."""
+    for index in range(1, 5):
+        response = product.client.post(
+            "/api/v1/operator/cameras",
+            headers=product.headers,
+            json={
+                "name": f"Camera {index}",
+                "host": f"127.0.0.{index}",
+                "source_uri": f"rtsp://127.0.0.{index}/live",
+            },
+        )
+        assert response.status_code == 201
+    sources = product.cameras.list_sources()
+    entered, release = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    state_calls, configuration_calls = [], []
+
+    def state(source):
+        return {
+            "name": source.binding.path_name,
+            "available": True,
+            "online": True,
+            "tracks2": [],
+            "readers": [],
+            "inboundBytes": 123,
+            "outboundBytes": 456,
+        }
+
+    def configuration(source):
+        return {
+            "name": source.binding.path_name,
+            "record": True,
+            "recordFormat": "fmp4",
+            "sourceOnDemand": False,
+        }
+
+    def request(request, _timeout, _limit):
+        path = request.full_url.split("?", 1)[0].split(":9997", 1)[-1]
+        if "/v3/paths/" in path:
+            with lock:
+                state_calls.append(path)
+                if path == "/v3/paths/list" or len(state_calls) == 4:
+                    entered.set()
+            assert release.wait(5), "Controlled native state read was not released"
+            if path == "/v3/paths/list":
+                result = {
+                    "itemCount": 4,
+                    "pageCount": 1,
+                    "items": [state(source) for source in sources],
+                }
+            else:
+                result = state(
+                    next(
+                        source
+                        for source in sources
+                        if source.binding.path_name == path.rsplit("/", 1)[-1]
+                    )
+                )
+        elif "/v3/config/paths/" in path:
+            with lock:
+                configuration_calls.append(path)
+            if path == "/v3/config/paths/list":
+                result = {
+                    "itemCount": 4,
+                    "pageCount": 1,
+                    "items": [configuration(source) for source in sources],
+                }
+            else:
+                result = configuration(sources[0])
+        elif "/list?" in request.full_url:
+            result = [{"start": "2026-10-11T12:00:00Z", "duration": 12.5}]
+        else:
+            result = {"version": MEDIAMTX_VERSION, "started": "2026-10-11T12:00:00Z"}
+        return json.dumps(result).encode()
+
+    history_failure_codes = []
+
+    class ObservedProvider(MediaMTXProvider):
+        async def playback_spans(self, *args, **kwargs):
+            try:
+                return await super().playback_spans(*args, **kwargs)
+            except MediaWorkerError as error:
+                history_failure_codes.append(error.code.value)
+                raise
+
+    provider = ObservedProvider(
+        site_id=product.service.site_id,
+        api_origin="http://127.0.0.1:9997",
+        playback_origin="http://127.0.0.1:9996",
+        credentials=MediaMTXCredentials("worker", "x" * 43),
+        requester=request,
+    )
+    provider._version_admitted = True
+    product.service.provider = provider
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        poll = executor.submit(
+            product.client.get, "/api/v1/operator/cameras", headers=product.headers
+        )
+        try:
+            assert entered.wait(5), "Camera poll did not reach the native read"
+            history = product.client.get(
+                f"/api/v1/operator/cameras/{sources[0].binding.device_id}/history",
+                headers=product.headers,
+                params={"start": "2026-10-11T12:00:00Z", "end": "2026-10-11T12:01:00Z"},
+            )
+            assert history.status_code == 200, history_failure_codes
+            assert history.json()["spans"][0]["duration_seconds"] == 12.5
+        finally:
+            release.set()
+        assert poll.result(timeout=5).status_code == 200
+    assert state_calls == ["/v3/paths/list"]
+    assert configuration_calls == ["/v3/config/paths/list"]
 
 
 @pytest.mark.parametrize(
@@ -263,7 +647,7 @@ def test_read_roles_cannot_mutate_camera_sources(product, role):
     account, _, _ = product.users.create_with_bootstrap(
         UserCreate(username="read-user", display_name="Reader", role=role), actor="test"
     )
-    token, _ = asyncio.run(product.sessions.issue(account))
+    token, _ = _initialized_session(product, account)
     headers = {"Authorization": "Bearer " + token}
     assert product.client.get("/api/v1/operator/cameras", headers=headers).status_code == 200
     response = product.client.post(
@@ -289,7 +673,7 @@ def test_media_cookie_is_host_only_strict_http_only_and_origin_checked(product):
     assert response.status_code == 200
     cookie = response.headers["set-cookie"]
     assert "HttpOnly" in cookie and "SameSite=strict" in cookie and "Path=/media" in cookie
-    assert "Max-Age=28800" in cookie and "Domain=" not in cookie
+    assert all(field not in cookie for field in ("Max-Age=", "Expires=", "Domain="))
     assert response.json()["analytics_url"] is None
     assert response.json()["live_url"].startswith("/media/live/k5_")
     assert response.json()["playback_url"].startswith("/media/playback?path=k5_")
@@ -298,6 +682,65 @@ def test_media_cookie_is_host_only_strict_http_only_and_origin_checked(product):
     cleared = product.client.delete("/api/v1/operator/media-session", headers=product.headers)
     assert cleared.status_code == 204
     assert "Max-Age=0" in cleared.headers["set-cookie"]
+
+
+@pytest.mark.parametrize("wall_step", [172800, -172800])
+@pytest.mark.parametrize("end_session", ["expiry", "revoke"])
+def test_media_cookie_survives_host_clock_steps_but_never_extends_human_session(
+    product, monkeypatch, wall_step, end_session
+):
+    identifier = product.enroll()
+    response = product.client.post(
+        f"/api/v1/operator/cameras/{identifier}/media-session", headers=product.headers
+    )
+    assert response.status_code == 200
+    deadline = next(iter(product.sessions._sessions.values())).deadline
+    steady = SimpleNamespace(value=deadline - 1)
+    monkeypatch.setattr("k5vision.auth_sessions.monotonic", lambda: steady.value)
+    wall = SimpleNamespace(value=datetime.now(UTC).timestamp())
+    monkeypatch.setattr(http.cookiejar, "time", SimpleNamespace(time=lambda: wall.value))
+    headers = Message()
+    headers["Set-Cookie"] = response.headers["set-cookie"]
+    jar = http.cookiejar.CookieJar()
+    jar.extract_cookies(
+        SimpleNamespace(info=lambda: headers),
+        Request(
+            str(
+                product.client.base_url.join(f"/api/v1/operator/cameras/{identifier}/media-session")
+            )
+        ),
+    )
+
+    def admitted_cookie():
+        request = Request(str(product.client.base_url.join(response.json()["live_url"])))
+        jar.add_cookie_header(request)
+        return request.get_header("Cookie", "")
+
+    before = admitted_cookie()
+    assert before
+    wall.value += wall_step
+    # Use the jar's actual browser-path selection; no copied token or renewal
+    # can conceal browser expiry while the authoritative session remains valid.
+    after = admitted_cookie()
+    same_cookie = after == before
+    assert same_cookie, "Media cookie changed after the host clock correction"
+    auth_headers = {
+        "Cookie": after,
+        "X-Forwarded-Method": "GET",
+        "X-Forwarded-Uri": response.json()["live_url"],
+    }
+    assert (
+        product.client.get("/api/v1/operator/media-auth", headers=auth_headers).status_code == 200
+    )
+    if end_session == "expiry":
+        steady.value = deadline
+    else:
+        asyncio.run(product.sessions.revoke(product.token))
+    unchanged_cookie = admitted_cookie() == after
+    assert unchanged_cookie, "Server expiry or revocation unexpectedly rewrote the client cookie"
+    assert (
+        product.client.get("/api/v1/operator/media-auth", headers=auth_headers).status_code == 401
+    )
 
 
 def test_logout_can_clear_revoked_media_cookie_but_cross_origin_cannot(product):
@@ -370,11 +813,11 @@ def test_logout_revokes_cookie_and_durable_disable_and_role_changes_take_effect(
     product.users.update(
         product.admin.id, UserPatch(enabled=True, role=UserRole.VIEWER), actor="test"
     )
-    assert product.client.get("/api/v1/operator/media-auth", headers=headers).status_code == 200
+    assert product.client.get("/api/v1/operator/media-auth", headers=headers).status_code == 401
     response = product.client.delete(
         f"/api/v1/operator/cameras/{device_id}", headers=product.headers
     )
-    assert response.status_code == 403
+    assert response.status_code == 401
     asyncio.run(product.sessions.revoke(product.token))
     assert product.client.get("/api/v1/operator/media-auth", headers=headers).status_code == 401
 
@@ -545,7 +988,7 @@ def test_durable_account_lookup_and_sessions_are_site_scoped(product):
             UserCreate(username="peer-admin", display_name="Peer", role=UserRole.ADMINISTRATOR),
             actor="test",
         )
-        peer_token, _ = asyncio.run(product.sessions.issue(account))
+        peer_token, _ = _initialized_session(product, account)
         response = product.client.get(
             "/api/v1/operator/cameras", headers={"Authorization": "Bearer " + peer_token}
         )
@@ -609,7 +1052,7 @@ def test_status_supports_viewer_and_reports_unknown_storage_without_guessing(pro
         UserCreate(username="storage-viewer", display_name="Viewer", role=UserRole.VIEWER),
         actor="test",
     )
-    token, _ = asyncio.run(product.sessions.issue(viewer))
+    token, _ = _initialized_session(product, viewer)
     product.service.worker_status = "unavailable"
     response = product.client.get(
         "/api/v1/operator/status", headers={"Authorization": "Bearer " + token}
@@ -1133,7 +1576,7 @@ def test_onvif_all_mutations_require_administrator_before_connector_use(product,
     account = product.users.create(
         UserCreate(username="onvif-reader", display_name="Reader", role=role), actor="test"
     )
-    token, _ = asyncio.run(product.sessions.issue(account))
+    token, _ = _initialized_session(product, account)
     for route, payload in (
         ("camera-discovery", {}),
         ("camera-profiles", {"host": "127.0.0.1"}),
@@ -1254,7 +1697,7 @@ def test_onvif_probe_is_bound_to_original_user_and_session(product, onvif):
         UserCreate(username="onvif-admin", display_name="Admin", role=UserRole.ADMINISTRATOR),
         actor="test",
     )
-    peer_token, _ = asyncio.run(product.sessions.issue(peer))
+    peer_token, _ = _initialized_session(product, peer)
     response = product.client.post(
         "/api/v1/operator/cameras/connect",
         headers={"Authorization": "Bearer " + peer_token},
@@ -1469,3 +1912,268 @@ def test_onvif_interface_enumeration_failure_retains_default_route_fallback(monk
 
     monkeypatch.setattr(api.psutil, "net_if_addrs", unavailable)
     assert api._camera_ipv4_interfaces() == ()
+
+
+class _RtspConnector:
+    def __init__(self):
+        self.calls = []
+        self.callback = None
+        self.error = None
+
+    async def probe(self, selected):
+        self.calls.append(selected)
+        if self.callback:
+            await self.callback()
+        if self.error:
+            raise self.error
+
+
+@pytest.fixture
+def rtsp(product):
+    connector = _RtspConnector()
+    product.app.state.operator_rtsp_connector = connector
+    return connector
+
+
+def _rtsp_probe(product, **changes):
+    return product.client.post(
+        "/api/v1/operator/camera-stream-probe",
+        headers=product.headers,
+        json={
+            "source_uri": "rtsp://127.0.0.1:8554/live?private-token",
+            "username": "camera",
+            "password": "private-password",
+            **changes,
+        },
+    )
+
+
+def _rtsp_connect(product, probe, **changes):
+    return product.client.post(
+        "/api/v1/operator/cameras/stream-connect",
+        headers=product.headers,
+        json={
+            "name": "Front door",
+            "probe_id": probe["probe_id"],
+            "profile_id": probe["profiles"][0]["id"],
+            **changes,
+        },
+    )
+
+
+def test_rtsp_test_connect_retains_private_source_and_consumes_opaque_handle(product, rtsp):
+    tested = _rtsp_probe(product)
+    assert tested.status_code == 200 and tested.headers["cache-control"] == "no-store"
+    assert not any(
+        value in tested.text for value in ("private-token", "private-password", "rtsp://")
+    )
+    probe = tested.json()
+    assert probe["profiles"][0]["codec"] == "H264" and probe["clock"]["sync_verified"] is False
+    connected = _rtsp_connect(product, probe)
+    assert connected.status_code == 201
+    assert connected.json()["management_port"] == 8554
+    assert connected.json()["connection_type"] == "rtsp"
+    source = product.cameras.list_sources()[0]
+    assert source.source_uri == "rtsp://camera:private-password@127.0.0.1:8554/live?private-token"
+    assert source.device.protocols == {DeviceProtocol.RTSP}
+    assert _rtsp_connect(product, probe).status_code == 410
+    assert len(rtsp.calls) == 1
+
+
+def test_rtsp_channels_at_same_host_and_port_are_independent_and_credentials_do_not_change_uuid(
+    product, rtsp
+):
+    first = _rtsp_connect(product, _rtsp_probe(product).json()).json()
+    second = _rtsp_connect(
+        product,
+        _rtsp_probe(product, source_uri="rtsp://127.0.0.1:8554/second").json(),
+        name="Second channel",
+    ).json()
+    assert first["device_id"] != second["device_id"]
+    retry = _rtsp_connect(product, _rtsp_probe(product, password="new-password").json())
+    assert retry.status_code == 201 and retry.json()["device_id"] == first["device_id"]
+    assert len(product.cameras.list_sources()) == 2
+
+
+def test_rtsp_reconnect_preserves_onvif_identity_path_and_pause_choice(product, rtsp, onvif):
+    onvif_row = product.client.post(
+        "/api/v1/operator/cameras/connect",
+        headers=product.headers,
+        json=_onvif_connect_body(_onvif_probe(product).json()),
+    ).json()
+    identifier = UUID(onvif_row["device_id"])
+    old = product.cameras.get(identifier)
+    product.cameras.set_recording_enabled(identifier, False)
+    connected = _rtsp_connect(product, _rtsp_probe(product).json(), device_id=str(identifier))
+    assert connected.status_code == 201 and connected.json()["device_id"] == str(identifier)
+    new = product.cameras.get(identifier)
+    assert new.binding.path_name == old.binding.path_name and new.recording_enabled is False
+    assert new.device.management_port == 8554 and new.device.protocols == {DeviceProtocol.RTSP}
+    assert len(product.registry.list()) == 1
+
+
+@pytest.mark.parametrize(
+    "changes", [{"name": "Different"}, {"source_uri": "rtsp://127.0.0.2/live"}]
+)
+def test_rtsp_explicit_reconnect_cannot_rebind_other_name_or_host(product, rtsp, changes):
+    identifier = product.enroll()
+    probe_changes = {k: v for k, v in changes.items() if k == "source_uri"}
+    probe = _rtsp_probe(product, **probe_changes).json()
+    response = _rtsp_connect(
+        product,
+        probe,
+        device_id=identifier,
+        **{k: v for k, v in changes.items() if k == "name"},
+    )
+    assert response.status_code == 422
+    assert product.cameras.list_sources()[0].source_uri.endswith("@127.0.0.1/live")
+
+
+@pytest.mark.parametrize("failing", [False, True])
+def test_rtsp_session_revocation_during_probe_rejects_result_and_discards_secret(
+    product, rtsp, failing
+):
+    from k5vision.operator_rtsp import RtspError
+
+    async def revoke():
+        await product.sessions.revoke(product.token)
+
+    rtsp.callback = revoke
+    rtsp.error = RtspError("auth_failed") if failing else None
+    response = _rtsp_probe(product)
+    assert response.status_code == 401 and not product.app.state.operator_rtsp_probes._probes
+    assert not product.cameras.list_sources()
+
+
+def test_rtsp_probe_is_bound_to_session_and_logout_clears_pending_secrets(product, rtsp):
+    probe = _rtsp_probe(product).json()
+    other, _ = asyncio.run(product.sessions.issue(product.admin))
+    response = product.client.post(
+        "/api/v1/operator/cameras/stream-connect",
+        headers={"Authorization": "Bearer " + other},
+        json={
+            "name": "Front door",
+            "probe_id": probe["probe_id"],
+            "profile_id": probe["profiles"][0]["id"],
+        },
+    )
+    assert response.status_code == 410
+    product.client.delete("/api/v1/operator/media-session", headers=product.headers)
+    assert not product.app.state.operator_rtsp_probes._probes
+
+
+@pytest.mark.parametrize("route", ["camera-stream-probe", "cameras/stream-connect"])
+def test_rtsp_mutations_reject_cross_origin_no_session_and_non_admin(product, rtsp, route):
+    url = "/api/v1/operator/" + route
+    assert product.client.post(url, json={}).status_code == 401
+    assert (
+        product.client.post(
+            url, headers={**product.headers, "Origin": "https://outside.invalid"}, json={}
+        ).status_code
+        == 403
+    )
+    user = product.users.create(
+        UserCreate(username="rtsp-viewer", display_name="Viewer", role=UserRole.VIEWER),
+        actor="test",
+    )
+    token, _ = _initialized_session(product, user)
+    assert (
+        product.client.post(url, headers={"Authorization": "Bearer " + token}, json={}).status_code
+        == 403
+    )
+    assert not rtsp.calls
+
+
+@pytest.mark.parametrize(
+    "body,status",
+    [
+        (b'{"source_uri":"rtsp://user:private-secret@127.0.0.1/", "username":{}}', 422),
+        (b'{"source_uri":"rtsp://user:private-secret@127.0.0.1/"', 422),
+        (b'{"password":"private-secret' + b"x" * 16384, 413),
+    ],
+)
+def test_rtsp_invalid_or_oversized_bodies_never_echo_source_secrets(product, rtsp, body, status):
+    response = product.client.post(
+        "/api/v1/operator/camera-stream-probe",
+        headers={**product.headers, "Content-Type": "application/json"},
+        content=body,
+    )
+    assert response.status_code == status and "private-secret" not in response.text
+    assert not rtsp.calls
+
+
+@pytest.mark.parametrize(
+    "code,status",
+    [
+        ("auth_failed", 422),
+        ("unsupported", 422),
+        ("unreachable", 503),
+        ("invalid_response", 502),
+    ],
+)
+def test_rtsp_connection_failures_are_sanitized_and_release_capacity(product, rtsp, code, status):
+    from k5vision.operator_rtsp import RtspError
+
+    rtsp.error = RtspError(code)
+    response = _rtsp_probe(product)
+    assert response.status_code == status and not product.app.state.operator_rtsp_probes._probes
+    assert "private-password" not in response.text and "private-token" not in response.text
+
+
+def test_rtsp_capacity_rejects_new_same_endpoint_channel_before_registry_commit(product, rtsp):
+    for index in range(64):
+        tested = _rtsp_probe(product, source_uri=f"rtsp://127.0.0.1:8554/channel/{index}").json()
+        result = _rtsp_connect(product, tested, name=f"Channel {index}")
+        assert result.status_code == 201
+    assert len(product.registry.list()) == len(product.cameras.list_sources()) == 64
+    before = [device.id for device in product.registry.list()]
+    rejected = _rtsp_connect(
+        product,
+        _rtsp_probe(product, source_uri="rtsp://127.0.0.1:8554/new-channel").json(),
+        name="New channel",
+    )
+    assert rejected.status_code == 409
+    assert [device.id for device in product.registry.list()] == before
+    assert len(product.cameras.list_sources()) == 64
+    # A retry of an already admitted channel remains possible at capacity.
+    retried = _rtsp_connect(
+        product,
+        _rtsp_probe(product, source_uri="rtsp://127.0.0.1:8554/channel/0").json(),
+        name="Channel 0",
+    )
+    assert retried.status_code == 201 and retried.json()["device_id"] == str(before[0])
+
+
+def test_rtsp_failed_worker_application_retries_same_private_handle_and_identity(product, rtsp):
+    probe = _rtsp_probe(product).json()
+    original = product.service.apply_sources
+
+    async def unavailable(_sources):
+        raise RuntimeError("private-source-must-not-escape")
+
+    product.service.apply_sources = unavailable
+    failed = _rtsp_connect(product, probe)
+    assert failed.status_code == 503 and "private-source" not in failed.text
+    identifier = product.cameras.list_sources()[0].device.id
+    assert probe["probe_id"] in product.app.state.operator_rtsp_probes._probes
+    product.service.apply_sources = original
+    retried = _rtsp_connect(product, probe)
+    assert retried.status_code == 201 and retried.json()["device_id"] == str(identifier)
+    assert len(product.registry.list()) == len(product.cameras.list_sources()) == 1
+
+
+def test_rtsp_probe_ttl_capacity_and_logout_are_monotonic(product, rtsp, monkeypatch):
+    import k5vision.operator_onvif_api as api
+
+    clock = [100.0]
+    monkeypatch.setattr(api, "monotonic", lambda: clock[0])
+    first = _rtsp_probe(product).json()
+    for _ in range(15):
+        assert _rtsp_probe(product).status_code == 200
+    assert _rtsp_probe(product).status_code == 429 and len(rtsp.calls) == 16
+    clock[0] = 221.0
+    assert _rtsp_connect(product, first).status_code == 410
+    assert not product.app.state.operator_rtsp_probes._probes
+    assert _rtsp_probe(product).status_code == 200
+    product.client.delete("/api/v1/operator/media-session", headers=product.headers)
+    assert not product.app.state.operator_rtsp_probes._probes

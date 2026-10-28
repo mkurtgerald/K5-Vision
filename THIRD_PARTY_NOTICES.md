@@ -131,19 +131,26 @@ dependencies retain their own package notices.
 
 K5 wrote this adapter independently; no Analytics Lab detector/tracker source is
 copied or imported. That project's separate engineering-wrapper restrictions
-remain unchanged. No model, native runtime, dataset or image is bundled in K5.
+remain unchanged. The separate native Windows surveillance installer now
+bundles this model and its independently reviewed native runtime; datasets and
+demonstration images remain outside that product payload.
 The official Apache OMZ person example used by the ephemeral native witness
 retains Intel/Open Model Zoo attribution and the same license. Do not remove
 applicable native/transitive package notices when provisioning separate wheels.
-Any product redistribution requires the outstanding artifact/native/transitive
-release review. See `docs/OPERATOR_PERSON_DETECTION_REVIEW.md` and the donor ledger
-for exact donor identities, view limits, evidence and unresolved release gates.
+The installed Windows payload retains exact native/transitive notices and
+corresponding FFmpeg source/build material. See
+`docs/WINDOWS_PERSON_ANALYTICS_DEPENDENCIES.md` for its exact input identities,
+source/relinking rights and installed scope. The earlier engineering view
+limits and donor provenance remain in `docs/OPERATOR_PERSON_DETECTION_REVIEW.md`
+and the donor ledger.
 
 ## Native graphical Windows operator candidate
 
 The separate graphical operator installer bundles the unchanged official
-CPython 3.12.10 Windows amd64 embeddable distribution and fifteen pinned binary
-Python distributions for the recording operator with ONVIF camera onboarding.
+CPython 3.12.10 Windows amd64 embeddable distribution and nineteen pinned binary
+Python distributions for the recording operator, account administration and
+independent person detector. The exact model and complete native decoder
+notices/corresponding source material accompany the installation.
 Its first graphical
 launch downloads MediaMTX v1.21.2 and Caddy v2.11.7 directly from their official
 releases, verifies their archive, executable and license hashes, and preserves
@@ -152,7 +159,9 @@ not bundled in the K5 installer. This packaging scope
 supersedes the earlier no-binary-bundling statements only for that explicit
 desktop installer. The reviewed go2rtc ONVIF source adaptation above uses the
 bundled Python standard library; it adds no external ONVIF runtime or WSDL
-package. The installer does not bundle FFmpeg, Analytics Lab, OpenVINO, models,
+package. The installer includes the independent OpenVINO person model/runtime
+and the separately loaded LGPL FFmpeg decoder with corresponding sources. It
+does not include the Analytics Lab wrapper, standalone FFmpeg executable,
 sample images or development/browser tools.
 
 The installed `licenses` directory retains the complete CPython binary-component
@@ -174,3 +183,16 @@ commercial use and redistribution subject to its retained notices and website
 addresses. Sources: https://jrsoftware.org/ and
 https://github.com/jrsoftware/issrc/tree/is-6_4_3. The compiler installer itself
 is an ephemeral development tool and is not included in the product installer.
+
+## Installed Windows OpenCV/FFmpeg decoder
+
+The independent background person detector and completed-export verification
+use OpenCV headless 5.0.0.93. Its unchanged Windows FFmpeg decoder is separately
+loaded and LGPL-2.1-or-later licensed. Complete supplied OpenCV/FFmpeg/native
+notices remain in the bundled `cv2` and distribution-license directories.
+Exact corresponding FFmpeg source, OpenCV wrapper and upstream build material
+are installed in `licenses/sources/`; their hashes and provenance are recorded
+in the dependency inventory. Recipients retain applicable LGPL modification,
+relinking and reverse-engineering-for-debugging rights for their own copies.
+The independent K5 adapter and upstream licenses remain separate. The complete
+input/source record is `docs/WINDOWS_PERSON_ANALYTICS_DEPENDENCIES.md`.

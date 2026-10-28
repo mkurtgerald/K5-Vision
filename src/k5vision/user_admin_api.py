@@ -19,7 +19,10 @@ from time import monotonic
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from k5vision.auth_sessions import (
@@ -273,7 +276,17 @@ def install_user_admin_api(
         except UserRegistryStorageError:
             registry = None
 
-    session_manager = UserSessionManager(ttl_seconds=session_ttl_seconds)
+    def current_account(account: UserAccount, credential_version: bytes | None):
+        try:
+            return (
+                None if registry is None else registry.resolve_session(account, credential_version)
+            )
+        except UserRegistryStorageError:
+            return None
+
+    session_manager = UserSessionManager(
+        ttl_seconds=session_ttl_seconds, resolve_account=current_account
+    )
     limiter = _UserRateLimiter(limit=rate_limit, window_seconds=rate_window_seconds)
     bootstrap_limiter = _UserRateLimiter(
         limit=bootstrap_rate_limit,
@@ -286,6 +299,22 @@ def install_user_admin_api(
     application.add_middleware(_BoundedUserRequestBody, max_bytes=max_request_bytes)
     application.state.user_registry = registry
     application.state.user_session_manager = session_manager
+    previous_validation_handler = application.exception_handlers.get(
+        RequestValidationError, request_validation_exception_handler
+    )
+
+    @application.exception_handler(RequestValidationError)
+    async def user_validation_error(request: Request, exc: RequestValidationError):
+        if request.url.path.startswith("/api/v1/users") or request.url.path in {
+            "/api/v1/auth/login",
+            "/api/v1/auth/bootstrap-password",
+        }:
+            return JSONResponse(
+                {"detail": "Invalid account request"},
+                status_code=422,
+                headers={"Cache-Control": "no-store"},
+            )
+        return await previous_validation_handler(request, exc)
 
     def require_registry() -> UserRegistry:
         if registry is None or site_id is None:
@@ -308,6 +337,7 @@ def install_user_admin_api(
             )
 
         actor: str | None = None
+        human_session = False
         if (
             service_auth_configuration_valid
             and resolved_token is not None
@@ -323,6 +353,7 @@ def install_user_admin_api(
                         detail="Insufficient user administration permission",
                     )
                 actor = principal.username
+                human_session = True
 
         if actor is None:
             if not service_auth_configuration_valid:
@@ -343,6 +374,12 @@ def install_user_admin_api(
                 detail="User administration rate limit exceeded",
                 headers={"Retry-After": str(retry_after)},
             )
+        if human_session:
+            current = await session_manager.resolve(credential)
+            if current is None:
+                raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate": "Bearer"})
+            if current.role is not UserRole.ADMINISTRATOR:
+                raise HTTPException(403, "Insufficient user administration permission")
         return actor
 
     async def require_user_session(
@@ -426,8 +463,10 @@ def install_user_admin_api(
     )
     async def create_user(
         payload: UserCreate,
+        response: Response,
         actor: str = Depends(require_user_admin),
     ) -> UserBootstrapIssue:
+        response.headers["Cache-Control"] = "no-store"
         try:
             account, temporary_credential, expires_at = require_registry().create_with_bootstrap(
                 payload,
@@ -469,6 +508,10 @@ def install_user_admin_api(
                 new_password=payload.new_password,
                 actor=_BOOTSTRAP_AUDIT_ACTOR,
             )
+        except ValueError:
+            raise HTTPException(
+                422, "Invalid account request", headers={"Cache-Control": "no-store"}
+            ) from None
         except UserRegistryStorageError:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -479,7 +522,10 @@ def install_user_admin_api(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or expired bootstrap credential",
             )
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+        await session_manager.revoke_user(activated.id)
+        return Response(
+            status_code=status.HTTP_204_NO_CONTENT, headers={"Cache-Control": "no-store"}
+        )
 
     @application.post(
         "/api/v1/auth/login",
@@ -487,9 +533,10 @@ def install_user_admin_api(
         tags=["authentication"],
         dependencies=login_budget,
     )
-    async def login(payload: UserLogin) -> UserSessionIssue:
+    async def login(payload: UserLogin, response: Response) -> UserSessionIssue:
+        response.headers["Cache-Control"] = "no-store"
         try:
-            account = require_registry().verify_password(
+            verified = require_registry().verify_password_snapshot(
                 username=payload.username,
                 password=payload.password,
             )
@@ -498,14 +545,20 @@ def install_user_admin_api(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="User registry unavailable",
             ) from None
-        if account is None:
+        if verified is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid username or password",
             )
-        session_token, expires_at = await session_manager.issue(account)
+        account, credential_version = verified
+        session_token, expires_at = await session_manager.issue(
+            account, credential_version=credential_version
+        )
+        current = await session_manager.resolve(session_token)
+        if current is None:
+            raise HTTPException(401, "Invalid username or password")
         return UserSessionIssue(
-            account=account,
+            account=current,
             session_token=session_token,
             expires_at=expires_at,
             expires_in_seconds=session_manager.ttl_seconds,
