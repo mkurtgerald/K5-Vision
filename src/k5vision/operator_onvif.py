@@ -32,6 +32,7 @@ import asyncio
 import base64
 import hashlib
 import http.client
+import io
 import ipaddress
 import math
 import re
@@ -55,6 +56,7 @@ _MEDIA = "http://www.onvif.org/ver10/media/wsdl"
 _MEDIA2 = "http://www.onvif.org/ver20/media/wsdl"
 _SOAP = "http://www.w3.org/2003/05/soap-envelope"
 _WSD = "http://schemas.xmlsoap.org/ws/2005/04/discovery"
+_NETWORK = "http://www.onvif.org/ver10/network/wsdl"
 _WSA = "http://schemas.xmlsoap.org/ws/2004/08/addressing"
 _MAX_RESPONSE = 1024 * 1024
 _CLOCK_READ_SECONDS = 2.0
@@ -785,11 +787,56 @@ def _probe_profiles(client: _Client, base: str, host: str, username: str, passwo
     return tuple(replace(profile, clock=client.clock) for profile in results)
 
 
+def _namespace_contexts(body: bytes) -> dict[int, dict[str, str]]:
+    """Resolve QName-valued XML text against each element's actual namespace scope."""
+    contexts: dict[int, dict[str, str]] = {}
+    current: dict[str, str] = {}
+    stack: list[dict[str, str]] = []
+    pending: dict[str, str] = {}
+    for event, value in ET.iterparse(io.BytesIO(body), events=("start-ns", "start", "end")):
+        if event == "start-ns":
+            prefix, uri = value
+            pending[prefix or ""] = uri
+        elif event == "start":
+            stack.append(current)
+            current = current.copy()
+            current.update(pending)
+            pending.clear()
+            contexts[id(value)] = current
+        else:
+            current = stack.pop()
+    return contexts
+
+
+def _is_onvif_video_transmitter(
+    match: ET.Element, namespace_contexts: dict[int, dict[str, str]]
+) -> bool:
+    # WS-Discovery is shared by printers, scanners and other non-camera devices.
+    # Admit only the ONVIF NetworkVideoTransmitter QName, not a matching label.
+    types = next((child for child in match if _local(child) == "Types"), None)
+    if types is None:
+        return False
+    namespaces = namespace_contexts.get(id(types), {})
+    for qname in (types.text or "").split():
+        if ":" in qname:
+            prefix, local_name = qname.split(":", 1)
+            namespace = namespaces.get(prefix)
+        else:
+            local_name, namespace = qname, namespaces.get("")
+        if local_name == "NetworkVideoTransmitter" and namespace == _NETWORK:
+            return True
+    return False
+
+
 def _discovery_candidates(body: bytes, sender: str) -> list[dict]:
     root = _xml(body)
+    matches = [item for item in root.iter() if _local(item) == "ProbeMatch"]
+    if not matches:
+        return []
+    namespace_contexts = _namespace_contexts(body)
     candidates = []
-    for match in root.iter():
-        if _local(match) != "ProbeMatch":
+    for match in matches:
+        if not _is_onvif_video_transmitter(match, namespace_contexts):
             continue
         name = ""
         for scope in _text(match, "Scopes").split():
@@ -828,11 +875,13 @@ def _discover(interface: str | None, budget: float, interface_provider=None) -> 
     if any(":" in address for address in interfaces):
         raise OnvifError("unsupported")
     probe = (
-        f'<s:Envelope xmlns:s="{_SOAP}" xmlns:a="{_WSA}" xmlns:d="{_WSD}">'
+        f'<s:Envelope xmlns:s="{_SOAP}" xmlns:a="{_WSA}" xmlns:d="{_WSD}" '
+        f'xmlns:dn="{_NETWORK}">'
         f"<s:Header><a:Action>{_WSD}/Probe</a:Action>"
         f"<a:MessageID>{uuid4().urn}</a:MessageID>"
         "<a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To></s:Header>"
-        "<s:Body><d:Probe><d:Types/><d:Scopes/></d:Probe></s:Body></s:Envelope>"
+        "<s:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types>"
+        "<d:Scopes/></d:Probe></s:Body></s:Envelope>"
     ).encode()
     deadline = time.monotonic() + budget
     results, seen = [], set()
