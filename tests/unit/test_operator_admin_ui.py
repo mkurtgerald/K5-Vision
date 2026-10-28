@@ -110,6 +110,8 @@ def workspace():
                         "timeline.css",
                         "admin.js",
                         "admin.css",
+                        "analytics.js",
+                        "analytics.css",
                     }:
                         return respond(route, {}, 404)
                     content_type = {

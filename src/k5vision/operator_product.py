@@ -44,21 +44,47 @@ def create_operator_product_app(
     )
     from k5vision.operator_analytics import OperatorAnalyticsBroker
     from k5vision.operator_analytics_person import (
+        PERSON_CONFIG_ENV,
         OperatorPersonConfigurationError,
-        load_person_configuration,
+        load_installed_person_configuration,
+    )
+    from k5vision.operator_events import (
+        OperatorEventsError,
+        OperatorEventService,
+        OperatorEventStore,
     )
 
     analytics = None
+    person_config = None
     analytics_status = "disabled"
     try:
-        person_config = load_person_configuration(os.environ)
-        if person_config is not None:
+        person_config = load_installed_person_configuration(os.environ)
+        if person_config is not None and PERSON_CONFIG_ENV in os.environ:
+            # Preserve the explicitly opted-in engineering sample overlay.
+            # Installed users get recorder-owned events without this second,
+            # browser-supplied inference path or another native CPU allocation.
             analytics = OperatorAnalyticsBroker(person_config)
             analytics_status = "configured"
     except OperatorPersonConfigurationError:
         # An optional rejected detector cannot prevent camera recording. It
         # remains disabled and the operator sees a fixed, source-free status.
         analytics_status = "unavailable"
+    events = None
+    try:
+        event_store = OperatorEventStore(identity.directory, identity.site_id)
+        events = OperatorEventService(
+            store=event_store,
+            cameras=cameras,
+            recording_root=getattr(service, "recording_root", identity.directory / "recordings"),
+            configuration=person_config,
+            unavailable=analytics_status == "unavailable",
+            recording_files=getattr(service, "recording_files", None),
+        )
+    except (OperatorEventsError, OSError, ValueError):
+        # Event-state failures must never prevent camera recording or sign-in.
+        if "event_store" in locals():
+            event_store.close()
+    application.state.operator_events = events
     install_operator_product_api(
         application,
         cameras=cameras,
@@ -72,46 +98,79 @@ def create_operator_product_app(
 
     @asynccontextmanager
     async def lifespan(app):
-        async with previous_lifespan(app):
-            analytics_task = None
+        analytics_task = None
+        cleaned = False
+
+        async def stop_owned():
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
             try:
-                profile_lock.acquire()
-                await service.start(cameras.list_sources())
-                if analytics is not None:
-
-                    async def maintain_analytics():
-                        while True:
-                            await asyncio.sleep(5)
-                            await analytics.expire_idle()
-
-                    analytics_task = asyncio.create_task(
-                        maintain_analytics(), name="operator-transient-person-views"
-                    )
-                if open_browser:
-                    asyncio.get_running_loop().call_later(
-                        0.5, webbrowser.open, f"http://127.0.0.1:{service.public_port}/operator/"
-                    )
-                if ready_callback is not None:
-                    ready_callback()
-                yield
+                if analytics_task is not None:
+                    analytics_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await analytics_task
             finally:
                 try:
-                    if analytics_task is not None:
-                        analytics_task.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await analytics_task
+                    if analytics is not None:
+                        await analytics.aclose()
                 finally:
                     try:
-                        if analytics is not None:
-                            await analytics.aclose()
+                        if events is not None:
+                            await events.aclose()
                     finally:
                         try:
-                            await service.stop()
+                            exports = getattr(application.state, "operator_exports", None)
+                            if exports is not None:
+                                await exports.aclose()
                         finally:
                             try:
-                                cameras.close()
+                                await service.stop()
                             finally:
-                                profile_lock.close()
+                                cameras.close()
+
+        try:
+            profile_lock.acquire()
+        except BaseException:
+            # Another running owner retains its workers and files. Close only
+            # this unstarted composition's metadata handles.
+            if events is not None:
+                await events.aclose()
+            cameras.close()
+            raise
+        try:
+            async with previous_lifespan(app):
+                try:
+                    await service.start(cameras.list_sources())
+                    if events is not None:
+                        await events.start()
+                    if analytics is not None:
+
+                        async def maintain_analytics():
+                            while True:
+                                await asyncio.sleep(5)
+                                await analytics.expire_idle()
+
+                        analytics_task = asyncio.create_task(
+                            maintain_analytics(), name="operator-transient-person-views"
+                        )
+                    if open_browser:
+                        asyncio.get_running_loop().call_later(
+                            0.5,
+                            webbrowser.open,
+                            f"http://127.0.0.1:{service.public_port}/operator/",
+                        )
+                    if ready_callback is not None:
+                        ready_callback()
+                    yield
+                finally:
+                    await stop_owned()
+        finally:
+            try:
+                await stop_owned()
+            finally:
+                profile_lock.close()
 
     application.router.lifespan_context = lifespan
     application.state.operator_product_service = service

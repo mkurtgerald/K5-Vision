@@ -384,6 +384,20 @@ class RecordingStorage:
                 "observed": sample.directory_identity is not None,
             }
 
+    def recording_files(self, path_name: str) -> dict[str, tuple[int, ...]] | None:
+        """Internal immutable inventory from the last complete owned scan.
+
+        This supplies background frame sampling without rescanning retained media.
+        Values are identity/size signatures, never file contents or source URIs.
+        Consumers must independently admit and verify any file they actually open.
+        """
+        self.recording_progress(path_name)  # Nominate this bounded camera slot.
+        with self._progress_lock:
+            sample = self._progress.get(path_name)
+            if not self._progress_complete or sample is None or sample.directory_identity is None:
+                return None
+            return dict(sample.files)
+
     def _status(self, scan: _Scan, deleted: int = 0) -> StorageStatus:
         return StorageStatus(
             total_bytes=scan.total_bytes,

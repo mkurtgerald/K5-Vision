@@ -19,6 +19,23 @@
     "admin_last_administrator", "admin_username_exists", "admin_capacity",
     "admin_invalid_request", "admin_user_not_found", "admin_unavailable",
   ]);
+  const EXPORT_ERRORS = Object.freeze({
+    export_too_large: "This clip exceeds 256 MB. Select a shorter clip.",
+    export_recording_gap: "The clip crosses a recording gap or unavailable footage. Adjust its start or duration.",
+    export_busy: "Other clips are being prepared. Wait a moment, then prepare this clip again.",
+    export_capacity: "The saved clip cache is full. Wait for older clips to expire, then try again.",
+    export_invalid_selection: "Choose a valid recorded UTC start and a clip length from 1 to 3600 seconds.",
+    export_file_unavailable: "The prepared MP4 is no longer available. Prepare the clip again.",
+    export_cache_unavailable: "The MP4 export storage is unavailable. Check storage and restart K5 before trying again.",
+    export_unavailable: "The recording service is unavailable. Check recorder status, then try again.",
+    export_preparation_failed: "K5 could not verify a complete, playable MP4. Check available footage or try a shorter clip.",
+  });
+  const EXPORT_PHASES = Object.freeze({
+    queued: "Waiting to prepare the clip…",
+    downloading: "Preparing the MP4…",
+    validating: "Checking MP4 playback…",
+    persisting: "Saving the prepared MP4…",
+  });
   const state = {
     token: "", account: null, cameras: [], workerStatus: "ready", selected: null, media: null,
     view: "wall", sessionEpoch: 0, selectionEpoch: 0, requests: new Set(),
@@ -35,9 +52,13 @@
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
     personFrameId: 0,
     recordingBusy: false, cameraListEpoch: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
-    playbackStart: null, playbackEpoch: 0, selectedStatus: null,
+    playbackStart: null, playbackEnd: null, playbackPosition: null, playbackEpoch: 0, selectedStatus: null,
+    playbackPrefetch: null, playbackObjectUrl: null, playbackRate: 1,
+    exportEpoch: 0, exportController: null, exportJob: null, exportDownloadAllowed: false,
   };
-  let wall = null, timeline = null, administration = null;
+  let wall = null, timeline = null, administration = null, cameraAnalytics = null;
+  const PLAYBACK_CHUNK_SECONDS = 120;
+  const MAX_PREFETCH_BYTES = 32 * 1024 * 1024;
   let wallLayoutPending = false;
 
   function fitCameraWall() {
@@ -70,6 +91,15 @@
       container: $("recording-timeline"), onSeek: seekRecording,
     });
     return timeline;
+  }
+
+  function analyticsWorkspace() {
+    if (!cameraAnalytics && window.K5Analytics?.create) cameraAnalytics = window.K5Analytics.create({
+      container: $("analytics-panel"), request,
+      getSession: () => state.signingOut ? null : ({ token: state.token, epoch: state.sessionEpoch, account: state.account }),
+      onSeek: ({ cameraId, timestamp }) => void seekEventRecording(timestamp, cameraId),
+    });
+    return cameraAnalytics;
   }
 
   function adminWorkspace() {
@@ -109,6 +139,7 @@
     $("clip-mark-in").hidden = !canExport();
     $("clip-mark-out").hidden = !canExport();
     $("clip-selection-label").hidden = !canExport();
+    $("export-panel").hidden = !canExport();
   }
 
   class ApiError extends Error {
@@ -197,6 +228,7 @@
               clock = cameraClockReport(detail?.clock);
             }
             if (path.startsWith("/api/v1/operator/admin/") && ADMIN_ERROR_CODES.has(candidate)) code = candidate;
+            if (path.includes("/exports") && Object.hasOwn(EXPORT_ERRORS, candidate)) code = candidate;
           } catch (_) { /* Unknown response text never becomes a user-facing error. */ }
         }
         throw new ApiError(response.status, code, clock);
@@ -280,8 +312,19 @@
 
   function stopPlayback() {
     state.playbackEpoch += 1;
+    clearPlaybackPrefetch();
+    if (state.playbackObjectUrl) URL.revokeObjectURL(state.playbackObjectUrl);
+    state.playbackObjectUrl = null;
+    $("playback-video").onloadedmetadata = null;
     resetVideo($("playback-video"));
     state.playbackStart = null;
+    state.playbackEnd = null;
+    state.playbackPosition = null;
+    delete $("playback-video").dataset.utcStart;
+    delete $("playback-video").dataset.utcEnd;
+    $("playback-clock").textContent = "Choose recorded footage";
+    $("playback-clock").removeAttribute("datetime");
+    $("playback-toggle").textContent = "Play";
     $("playback-placeholder").hidden = false;
   }
 
@@ -295,6 +338,8 @@
 
   function clearWorkspace(reason = "") {
     administration?.hide();
+    cameraAnalytics?.clear();
+    cancelExport();
     resetActivation();
     state.sessionEpoch += 1;
     state.selectionEpoch += 1;
@@ -445,6 +490,7 @@
 
   function renderCameraHeading() {
     const camera = currentCamera();
+    analyticsWorkspace()?.selectCamera(camera || null);
     const focused = Boolean(camera && state.view !== "wall");
     const recording = recordingDetails(camera);
     $("camera-title").textContent = state.view === "wall" ? "All cameras" : camera?.name || "Select a camera";
@@ -912,6 +958,8 @@
     $("wall-panel").hidden = view !== "wall";
     $("live-panel").hidden = view !== "live";
     $("history-panel").hidden = view !== "history";
+    analyticsWorkspace()?.setVisible(view === "history");
+    if (view !== "history") { cancelExport(); disableDownload(); }
     for (const value of ["wall", "live", "history"]) {
       $(`${value}-tab`).classList.toggle("active", view === value);
       if (view === value) $(`${value}-tab`).setAttribute("aria-current", "page");
@@ -951,7 +999,10 @@
   }
 
   function utcInput(date, seconds = false) { return date.toISOString().slice(0, seconds ? 23 : 16); }
-  function parseUtc(value) { return new Date(`${value.length === 16 ? value + ":00" : value}Z`); }
+  function parseUtc(value) {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?$/.test(value)) return new Date(NaN);
+    return new Date(`${value.length === 16 ? value + ":00" : value}Z`);
+  }
   function utcMilliseconds(value) {
     return typeof value === "string" && value.length <= 32 &&
       /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/.test(value) ? Date.parse(value) : NaN;
@@ -1007,27 +1058,32 @@
   }
 
   function resetHistory() {
+    cancelExport();
     state.spans = []; state.selectedSpan = null;
+    cameraAnalytics?.setRange(null);
     timeline?.clear();
     $("history-list").replaceChildren();
     $("history-count").textContent = "0";
     $("load-history").disabled = false;
     $("selected-recording").textContent = "No interval selected";
     $("playback-start").value = "";
+    $("clip-start").value = "";
     $("playback-duration").value = "60";
-    for (const id of ["playback-start", "playback-duration", "play-recording"]) $(id).disabled = true;
+    for (const id of ["playback-start", "clip-start", "playback-duration", "play-recording"]) $(id).disabled = true;
     $("clip-mark-in").disabled = true;
     $("clip-mark-out").disabled = true;
-    $("clip-selection-label").textContent = "Select up to 5 minutes from an available interval.";
+    $("clip-selection-label").textContent = "Select contiguous recorded footage · Up to 1 hour / 256 MB per clip.";
+    playbackControls();
     disableDownload();
     message("history-message", state.selected ? "Select a date or interval to see recorded video." : "Select a camera to view its history.");
-    message("playback-message", "Preview up to 5 minutes. Select a new start time to seek.");
+    message("playback-message", "Choose recorded footage. Playback continues through adjacent recordings and stops at gaps.");
   }
 
   function disableDownload() {
     const link = $("download-recording");
     link.removeAttribute("href"); link.removeAttribute("download");
     link.classList.add("disabled"); link.setAttribute("aria-disabled", "true"); link.tabIndex = -1;
+    link.textContent = "Prepare MP4 clip";
   }
 
   async function loadHistory() {
@@ -1064,6 +1120,11 @@
       }).filter((span) => Number.isFinite(span.start) && Number.isFinite(span.end) && span.end > span.start).sort((a, b) => a.start - b.start);
       renderHistory(start.getTime(), end.getTime());
       recordingTimeline().setData({ start: start.getTime(), end: end.getTime(), spans: state.spans });
+      const latest = state.spans[state.spans.length - 1];
+      if (latest) recordingTimeline().setPlayhead(Math.max(latest.start, latest.end - 1000));
+      analyticsWorkspace()?.setRange({ start: start.toISOString(), end: end.toISOString() });
+      for (const id of ["playback-start", "play-recording"]) $(id).disabled = !state.spans.length;
+      playbackControls();
       state.historyFetchedSteady = performance.now();
       message("history-message", state.spans.length
         ? `${state.spans.length} available ${state.spans.length === 1 ? "interval" : "intervals"}. Gaps contain no recorded video.`
@@ -1106,48 +1167,245 @@
     $("history-count").textContent = String(state.spans.length);
   }
 
+  function coverageEnd(start) {
+    const first = state.spans.find((span) => span.start <= start && start < span.end);
+    if (!first) return null;
+    let end = first.end;
+    for (const span of state.spans) {
+      // A one-millisecond tolerance accounts only for JS timestamp rounding.
+      if (span.start > end + 1) break;
+      if (span.end > end) end = span.end;
+    }
+    return end;
+  }
+
+  function chunkAt(start) {
+    if (!state.media || !Number.isFinite(start)) throw new SelectionError("Choose an available recording first.");
+    const requestedStart = start;
+    const span = state.spans.find((item) => item.start <= start && start < item.end);
+    if (!span) throw new SelectionError("No playable recording at this time.");
+    // The recorder already joins files that share compatible stream metadata.
+    // Adjacent list entries can require a fresh decoder (for example after a
+    // camera reconnect); never ask the donor to mux across that boundary.
+    const availableEnd = span.end;
+    if (availableEnd - start < 1000) {
+      start = Math.max(span.start, availableEnd - 1000);
+      if (availableEnd - start < 1000) throw new SelectionError("This recording is shorter than one second and cannot be played.");
+    }
+    const end = Math.min(availableEnd, start + PLAYBACK_CHUNK_SECONDS * 1000);
+    const url = new URL(state.media.playback_url, location.origin);
+    url.searchParams.set("start", new Date(start).toISOString());
+    url.searchParams.set("duration", String((end - start) / 1000));
+    // Fragmented MP4 is authorized for every viewing role. Exports have their own API.
+    url.searchParams.set("format", "fmp4");
+    return { start, end, seekOffset: (requestedStart - start) / 1000, url: url.pathname + url.search };
+  }
+
+  function nextChunkStart(end) {
+    if (!Number.isFinite(end)) return null;
+    if (coverageEnd(end) !== null) return end;
+    const next = state.spans.find((span) => span.start >= end && span.end - span.start >= 1000);
+    return next && next.start - end <= 1 ? next.start : null;
+  }
+
+  function clearPlaybackPrefetch() {
+    const pending = state.playbackPrefetch;
+    state.playbackPrefetch = null;
+    pending?.controller.abort();
+    if (pending?.objectUrl) URL.revokeObjectURL(pending.objectUrl);
+  }
+
+  function prefetchPlayback(epoch) {
+    if (state.playbackPrefetch || epoch !== state.playbackEpoch || !state.token) return;
+    const next = nextChunkStart(state.playbackEnd);
+    if (next === null) return;
+    let chunk;
+    try { chunk = chunkAt(next); } catch (_) { return; }
+    const controller = new AbortController();
+    const pending = { chunk, controller, objectUrl: null, task: null };
+    state.playbackPrefetch = pending;
+    pending.task = (async () => {
+      let reader = null;
+      try {
+        const response = await fetch(chunk.url, {
+          credentials: "same-origin", cache: "no-store",
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]),
+        });
+        if (!response.ok || !response.body) return null;
+        const length = Number(response.headers.get("Content-Length"));
+        if (Number.isFinite(length) && length > MAX_PREFETCH_BYTES) return null;
+        reader = response.body.getReader();
+        const buffers = []; let bytes = 0;
+        while (true) {
+          const item = await reader.read();
+          if (item.done) break;
+          bytes += item.value.byteLength;
+          if (bytes > MAX_PREFETCH_BYTES) return null;
+          buffers.push(item.value);
+        }
+        if (!bytes || epoch !== state.playbackEpoch || controller.signal.aborted || state.playbackPrefetch !== pending) return null;
+        pending.objectUrl = URL.createObjectURL(new Blob(buffers, { type: "video/mp4" }));
+        return pending.objectUrl;
+      } catch (_) { return null; }
+      finally {
+        if (reader) void reader.cancel().catch(() => {});
+        if (!pending.objectUrl) controller.abort();
+      }
+    })();
+  }
+
+  function playbackControls() {
+    const enabled = Boolean(state.token && state.spans.length && state.media && state.view === "history");
+    for (const id of ["playback-previous", "playback-next", "playback-back", "playback-forward"]) $(id).disabled = !enabled;
+    $("playback-toggle").disabled = !enabled || !state.selectedSpan;
+    const at = playbackUtc();
+    if (Number.isFinite(at)) {
+      $("playback-clock").dateTime = new Date(at).toISOString();
+      $("playback-clock").textContent = `${utcLabel(at)} UTC`;
+    }
+    $("playback-toggle").textContent = $("playback-video").paused ? "Play" : "Pause";
+  }
+
+  function markSelectedSpan(span) {
+    state.selectedSpan = span;
+    for (const [index, item] of [...$("history-list").querySelectorAll("button")].entries()) {
+      const selected = state.spans[index] === span;
+      item.classList.toggle("selected", selected);
+      item.setAttribute("aria-pressed", String(selected));
+    }
+    $("selected-recording").textContent = span
+      ? `${utcLabel(span.start)} — ${utcLabel(coverageEnd(span.start))} UTC` : "No interval selected";
+  }
+
+  async function loadPlaybackChunk(chunk, { prepared = null, autoplay = true } = {}) {
+    const epoch = ++state.playbackEpoch;
+    clearPlaybackPrefetch();
+    const video = $("playback-video");
+    video.pause();
+    if (state.playbackObjectUrl) URL.revokeObjectURL(state.playbackObjectUrl);
+    state.playbackObjectUrl = prepared;
+    state.playbackStart = chunk.start;
+    state.playbackEnd = chunk.end;
+    state.playbackPosition = chunk.start;
+    video.dataset.utcStart = new Date(chunk.start).toISOString();
+    video.dataset.utcEnd = new Date(chunk.end).toISOString();
+    video.onloadedmetadata = chunk.seekOffset > 0 ? () => {
+      if (epoch !== state.playbackEpoch || !state.token || state.view !== "history") return;
+      video.onloadedmetadata = null;
+      video.currentTime = chunk.seekOffset;
+      timeline?.setPlayhead(playbackUtc());
+      playbackControls();
+    } : null;
+    video.src = prepared || chunk.url;
+    video.load();
+    video.playbackRate = state.playbackRate;
+    $("playback-placeholder").hidden = true;
+    markSelectedSpan(state.spans.find((span) => span.start <= chunk.start && chunk.start < span.end) || state.selectedSpan);
+    recordingTimeline().setPlayhead(chunk.start + chunk.seekOffset * 1000);
+    playbackControls();
+    message("playback-message", "Loading recorded video…");
+    if (!autoplay) return;
+    try { await video.play(); }
+    catch (error) {
+      if (epoch !== state.playbackEpoch || error.name === "AbortError") return;
+      message("playback-message", error.name === "NotAllowedError"
+        ? "Select Play to begin recorded video."
+        : "Playback is unavailable. Refresh history or select another interval.", true);
+    }
+  }
+
+  async function advancePlayback() {
+    if (!state.token || state.view !== "history" || state.playbackEnd === null) return;
+    const epoch = state.playbackEpoch;
+    const next = nextChunkStart(state.playbackEnd);
+    if (next === null) {
+      const later = state.spans.find((span) => span.start > state.playbackEnd && span.end - span.start >= 1000);
+      message("playback-message", later
+        ? `Recording gap. Next footage starts at ${utcLabel(later.start)} UTC. Select Next footage to continue.`
+        : "End of available footage. Refresh history to see newer recordings.");
+      playbackControls();
+      return;
+    }
+    const pending = state.playbackPrefetch;
+    let prepared = null;
+    if (pending?.chunk.start === next) {
+      message("playback-message", "Continuing recorded video…");
+      prepared = await pending.task;
+      if (epoch !== state.playbackEpoch || state.view !== "history" || !state.token) return;
+      pending.objectUrl = null; // Transfer this bounded buffer to the active player.
+      state.playbackPrefetch = null;
+    }
+    try { await loadPlaybackChunk(chunkAt(next), { prepared }); }
+    catch (_) { message("playback-message", "Next recorded footage is unavailable. Refresh history and try again.", true); }
+  }
+
   function selectSpan(span, button, start = span.start, autoPlay = true) {
     stopPlayback();
-    state.selectedSpan = span;
-    for (const item of $("history-list").querySelectorAll("button")) {
-      item.classList.toggle("selected", item === button);
-      item.setAttribute("aria-pressed", String(item === button));
-    }
+    markSelectedSpan(span);
     $("playback-start").value = utcInput(new Date(start), true);
-    $("playback-start").min = utcInput(new Date(span.start), true);
-    $("playback-start").max = utcInput(new Date(span.end), true);
-    $("playback-duration").value = String(Math.max(1, Math.min(60, Math.floor((span.end - start) / 1000))));
-    for (const id of ["playback-start", "playback-duration", "play-recording"]) $(id).disabled = false;
-    $("clip-mark-in").disabled = false;
-    $("clip-mark-out").disabled = false;
-    $("selected-recording").textContent = `${utcLabel(span.start)} — ${utcLabel(span.end)} UTC`;
-    message("playback-message", "Preview up to 5 minutes. Select a new start time to seek.");
+    $("playback-start").removeAttribute("min");
+    $("playback-start").removeAttribute("max");
+    for (const id of ["playback-start", "clip-start", "playback-duration", "play-recording", "clip-mark-in", "clip-mark-out"]) $(id).disabled = false;
+    if (!$("clip-start").value) {
+      $("clip-start").value = utcInput(new Date(start), true);
+      $("playback-duration").value = String(Math.max(1, Math.min(60, Math.floor((coverageEnd(start) - start) / 1000))));
+    }
     updateDownload();
     recordingTimeline().setPlayhead(start);
-    if (autoPlay && span.end - start >= 1000) void playRecording({ preventDefault() {} });
+    playbackControls();
+    if (autoPlay) {
+      try { void loadPlaybackChunk(chunkAt(start)); }
+      catch (error) { message("playback-message", error instanceof SelectionError ? error.message : "Playback is unavailable.", true); }
+    }
   }
 
   function seekRecording(milliseconds) {
     if (!Number.isFinite(milliseconds) || state.view !== "history" || !state.token) return;
-    const index = state.spans.findIndex((span) => span.start <= milliseconds && span.end - milliseconds >= 1000);
+    const index = state.spans.findIndex((span) => span.start <= milliseconds && milliseconds < span.end);
     if (index < 0) {
       stopPlayback();
-      state.selectedSpan = null;
-      for (const item of $("history-list").querySelectorAll("button")) {
-        item.classList.remove("selected");
-        item.setAttribute("aria-pressed", "false");
-      }
-      $("selected-recording").textContent = "No interval selected";
+      state.playbackPosition = milliseconds;
+      markSelectedSpan(null);
       $("playback-start").value = "";
-      $("playback-duration").value = "60";
-      for (const id of ["playback-start", "playback-duration", "play-recording", "clip-mark-in", "clip-mark-out"]) $(id).disabled = true;
-      $("clip-selection-label").textContent = "Select up to 5 minutes from an available interval.";
-      disableDownload();
-      message("playback-message", `No playable recording at ${utcLabel(milliseconds)} UTC. Choose a recorded interval on the timeline.`, true);
+      for (const id of ["playback-start", "play-recording"]) $(id).disabled = !state.spans.length;
+      for (const id of ["clip-start", "playback-duration", "clip-mark-in", "clip-mark-out"]) $(id).disabled = true;
+      cancelExport(); disableDownload();
+      recordingTimeline().setPlayhead(milliseconds);
+      $("playback-clock").dateTime = new Date(milliseconds).toISOString();
+      $("playback-clock").textContent = `${utcLabel(milliseconds)} UTC · No recording`;
+      message("playback-message", `No playable recording at ${utcLabel(milliseconds)} UTC. Choose a recorded interval or select Next footage.`, true);
+      playbackControls();
       return;
     }
-    const button = $("history-list").querySelector(`[data-recording-index="${index}"]`);
-    selectSpan(state.spans[index], button, milliseconds);
+    selectSpan(state.spans[index], $("history-list").querySelector(`[data-recording-index="${index}"]`), milliseconds);
+  }
+
+  async function seekEventRecording(timestamp, cameraId = state.selected) {
+    const at = typeof timestamp === "number" ? timestamp
+      : typeof timestamp === "string" && timestamp.length <= 40 && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(timestamp) ? Date.parse(timestamp) : NaN;
+    if (!Number.isFinite(at) || !state.token || !state.cameras.some((camera) => camera.device_id === cameraId)) return;
+    const session = state.sessionEpoch;
+    setView("history", false);
+    if (cameraId !== state.selected || !state.media || state.selectionController?.signal.aborted) await selectCamera(cameraId);
+    if (session !== state.sessionEpoch || state.selected !== cameraId || state.view !== "history") return;
+    const first = parseUtc($("history-start").value).getTime(), last = parseUtc($("history-end").value).getTime();
+    if (!Number.isFinite(first) || at < first || at >= last) {
+      const dayStart = new Date(at); dayStart.setUTCHours(0, 0, 0, 0);
+      $("history-start").value = utcInput(dayStart, true);
+      $("history-end").value = utcInput(new Date(dayStart.getTime() + DAY), true);
+      state.historyRolling = false;
+      await loadHistory();
+    }
+    if (session === state.sessionEpoch && state.selected === cameraId && state.view === "history") seekRecording(at);
+  }
+
+  function moveFootage(direction) {
+    const at = playbackUtc();
+    const fallback = Number.isFinite(at) ? at : parseUtc($("history-start").value).getTime();
+    const list = direction > 0 ? state.spans : [...state.spans].reverse();
+    const target = list.find((span) => span.end - span.start >= 1000 && (direction > 0 ? span.start > fallback : span.start < fallback - 1));
+    if (target) seekRecording(target.start);
+    else message("playback-message", direction > 0 ? "No later footage is available in this history window." : "No earlier footage is available in this history window.");
   }
 
   function playLatestSpan() {
@@ -1203,23 +1461,58 @@
   function playbackUtc() {
     const elapsed = $("playback-video").currentTime;
     return Number.isFinite(state.playbackStart) && Number.isFinite(elapsed)
-      ? state.playbackStart + elapsed * 1000 : parseUtc($("playback-start").value).getTime();
+      ? Math.min(state.playbackEnd, state.playbackStart + elapsed * 1000)
+      : Number.isFinite(state.playbackPosition) ? state.playbackPosition : parseUtc($("playback-start").value).getTime();
   }
 
   function playbackSelection() {
-    if (!state.selectedSpan || !state.media) throw new SelectionError("Choose an available recording interval first.");
-    const start = parseUtc($("playback-start").value).getTime();
-    const seconds = Number($("playback-duration").value);
-    const span = state.selectedSpan;
-    if (!Number.isFinite(start) || start < span.start || start >= span.end) throw new SelectionError("Choose a start time inside the selected interval.");
-    if (!Number.isFinite(seconds) || seconds < 1 || seconds > 300 || !Number.isInteger(seconds)) throw new SelectionError("Choose a preview length from 1 to 300 seconds.");
-    const duration = Math.min(seconds, (span.end - start) / 1000);
-    if (duration < 1) throw new SelectionError("Choose a start time at least one second before the interval ends.");
-    const url = new URL(state.media.playback_url, location.origin);
-    url.searchParams.set("start", new Date(start).toISOString());
-    url.searchParams.set("duration", String(duration));
-    url.searchParams.set("format", canExport() ? "mp4" : "fmp4");
-    return { url: url.pathname + url.search, start, duration };
+    if (!state.media || !state.selected) throw new SelectionError("Choose an available recording first.");
+    const start = parseUtc($("clip-start").value).getTime();
+    const duration = Number($("playback-duration").value);
+    if (!Number.isFinite(start) || coverageEnd(start) === null) throw new SelectionError("Choose a clip start inside recorded footage.");
+    if (!Number.isInteger(duration) || duration < 1 || duration > 3600) throw new SelectionError("Choose a clip length from 1 to 3600 seconds.");
+    if (start + duration * 1000 > coverageEnd(start)) throw new SelectionError("The selected clip crosses a recording gap or ends after available footage.");
+    return { start, duration, signature: `${state.selected}:${start}:${duration}` };
+  }
+
+  function cancelExport() {
+    state.exportEpoch += 1;
+    state.exportController?.abort();
+    state.exportController = null;
+    state.exportJob = null;
+    state.exportDownloadAllowed = false;
+  }
+
+  function validateReadyExport(job, selection, cameraId) {
+    if (!job || job.status !== "ready" || !Number.isSafeInteger(job.bytes) || job.bytes <= 0
+      || typeof job.filename !== "string" || !/^[A-Za-z0-9._-]+\.mp4$/.test(job.filename)
+      || Date.parse(job.start) !== selection.start || job.duration !== selection.duration
+      || job.download_url !== `/media/exports/${cameraId}/${job.id}.mp4`) throw new ApiError(409, "export_file_unavailable");
+    safeMediaUrl(job.download_url, "/media/exports/");
+  }
+
+  async function downloadReadyExport() {
+    if (state.exportController || !state.exportJob || state.exportJob.status !== "ready") return;
+    const job = state.exportJob, cameraId = state.selected, session = state.sessionEpoch, epoch = state.exportEpoch;
+    const controller = new AbortController();
+    state.exportController = controller;
+    const active = () => epoch === state.exportEpoch && session === state.sessionEpoch && cameraId === state.selected && state.token && !controller.signal.aborted;
+    try {
+      const selection = playbackSelection();
+      const current = await request(`/api/v1/operator/cameras/${encodeURIComponent(cameraId)}/exports/${encodeURIComponent(job.id)}`, { signal: controller.signal });
+      if (!active()) return;
+      if (current?.id !== job.id) throw new ApiError(409, "export_file_unavailable");
+      validateReadyExport(current, selection, cameraId);
+      state.exportJob = { ...current, signature: selection.signature };
+      state.exportController = null;
+      updateDownload();
+      state.exportDownloadAllowed = true;
+      $("download-recording").click();
+    } catch (error) {
+      if (!active() || error.name === "AbortError") return;
+      cancelExport(); updateDownload();
+      message("export-message", EXPORT_ERRORS[error.code] || apiMessage(error, "The prepared MP4 is no longer available. Prepare the clip again."), true);
+    }
   }
 
   function updateDownload() {
@@ -1227,33 +1520,87 @@
     try {
       const selection = playbackSelection();
       const link = $("download-recording");
-      link.href = selection.url;
-      link.download = `K5-recording-${new Date(selection.start).toISOString().replace(/[:.]/g, "-")}.mp4`;
-      link.classList.remove("disabled"); link.setAttribute("aria-disabled", "false"); link.tabIndex = 0;
-      $("clip-selection-label").textContent = `${utcLabel(selection.start)} → ${utcLabel(selection.start + selection.duration * 1000, false)} UTC · ${durationLabel(selection.duration * 1000)}`;
-    } catch (_) { disableDownload(); }
+      if (state.exportJob?.signature !== selection.signature) cancelExport();
+      const ready = state.exportJob?.status === "ready";
+      link.href = ready ? safeMediaUrl(state.exportJob.download_url, "/media/exports/") : "#";
+      if (ready) link.download = state.exportJob.filename;
+      else link.removeAttribute("download");
+      link.textContent = ready ? "Save MP4 clip" : state.exportJob ? "Preparing MP4…" : "Prepare MP4 clip";
+      link.classList.toggle("disabled", Boolean(state.exportJob && !ready));
+      link.setAttribute("aria-disabled", String(Boolean(state.exportJob && !ready)));
+      link.tabIndex = state.exportJob && !ready ? -1 : 0;
+      $("clip-selection-label").textContent = `${utcLabel(selection.start)} → ${utcLabel(selection.start + selection.duration * 1000, false)} UTC · ${durationLabel(selection.duration * 1000)} · Up to 1 hour / 256 MB per clip`;
+      if (!state.exportJob) message("export-message", "Choose Prepare MP4 clip. K5 checks and prepares the selected footage before downloading.");
+    } catch (error) {
+      cancelExport(); disableDownload();
+      message("export-message", error instanceof SelectionError ? error.message : "The selected clip is unavailable.", true);
+    }
+  }
+
+  async function prepareExport(event) {
+    if (!canExport()) { event.preventDefault(); return; }
+    if (state.exportJob?.status === "ready" && state.exportDownloadAllowed) {
+      state.exportDownloadAllowed = false;
+      message("export-message", "MP4 ready. Your browser handles the download; open Downloads to check the saved file.");
+      return;
+    }
+    event.preventDefault();
+    if (state.exportJob?.status === "ready") { void downloadReadyExport(); return; }
+    if (state.exportController) return;
+    let selection;
+    try { selection = playbackSelection(); }
+    catch (error) { message("export-message", error.message, true); return; }
+    cancelExport();
+    const epoch = state.exportEpoch, session = state.sessionEpoch, cameraId = state.selected;
+    const controller = new AbortController();
+    state.exportController = controller;
+    state.exportJob = { signature: selection.signature, status: "queued" };
+    updateDownload();
+    message("export-message", "Preparing MP4… Recording and playback continue.");
+    const active = () => epoch === state.exportEpoch && session === state.sessionEpoch && cameraId === state.selected && state.token && !controller.signal.aborted;
+    const base = `/api/v1/operator/cameras/${encodeURIComponent(cameraId)}/exports`;
+    try {
+      let job = await request(base, { method: "POST", body: { start: new Date(selection.start).toISOString(), duration: selection.duration }, signal: controller.signal });
+      const deadline = performance.now() + 120000;
+      while (active()) {
+        if (!job || typeof job.id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(job.id) || !["queued", "preparing", "ready", "failed"].includes(job.status)) throw new Error("Invalid export status");
+        if (job.status === "failed") throw new ApiError(409, Object.hasOwn(EXPORT_ERRORS, job.error) ? job.error : "export_preparation_failed");
+        state.exportJob = { ...job, signature: selection.signature };
+        if (job.status === "ready") {
+          validateReadyExport(job, selection, cameraId);
+          state.exportController = null;
+          updateDownload();
+          message("export-message", "MP4 ready. Your browser handles the download; open Downloads to check the saved file.");
+          state.exportDownloadAllowed = true;
+          $("download-recording").click();
+          return;
+        }
+        const phase = EXPORT_PHASES[job.phase] || "Preparing the MP4…";
+        const progress = Number.isSafeInteger(job.bytes) && job.bytes > 0 && job.bytes <= 256 * 1024 * 1024
+          ? ` ${(job.bytes / (1024 * 1024)).toFixed(1)} MB processed.` : "";
+        message("export-message", `${phase}${progress} Recording and playback continue.`);
+        if (performance.now() >= deadline) throw new Error("Export preparation timed out");
+        await new Promise((resolve) => {
+          const timer = setTimeout(done, 500);
+          function done() { clearTimeout(timer); controller.signal.removeEventListener("abort", done); resolve(); }
+          controller.signal.addEventListener("abort", done, { once: true });
+        });
+        if (!active()) return;
+        job = await request(`${base}/${encodeURIComponent(job.id)}`, { signal: controller.signal });
+      }
+    } catch (error) {
+      if (!active() || error.name === "AbortError") return;
+      cancelExport();
+      updateDownload();
+      message("export-message", EXPORT_ERRORS[error.code] || apiMessage(error, "The MP4 could not be prepared. Check that the selected footage is available, then try again."), true);
+    }
   }
 
   async function playRecording(event) {
     event.preventDefault();
-    const epoch = ++state.playbackEpoch;
-    try {
-      const selection = playbackSelection();
-      const video = $("playback-video");
-      state.playbackStart = selection.start;
-      video.src = selection.url;
-      video.load();
-      $("playback-placeholder").hidden = true;
-      message("playback-message", `Loading ${durationLabel(selection.duration * 1000)} of recorded video…`);
-      updateDownload();
-      await video.play();
-    } catch (error) {
-      if (epoch !== state.playbackEpoch || error.name === "AbortError") return;
-      message("playback-message", error.name === "NotAllowedError"
-        ? "Select play in the video controls to begin."
-        : error instanceof SelectionError ? error.message
-          : "Playback is unavailable. Refresh history or select another interval.", true);
-    }
+    const at = parseUtc($("playback-start").value).getTime();
+    if (!Number.isFinite(at)) { message("playback-message", "Choose a valid recorded UTC time.", true); return; }
+    seekRecording(at);
   }
 
   let activationEpoch = 0, activationController = null;
@@ -1429,30 +1776,62 @@
     void loadHistory();
   });
   $("playback-form").addEventListener("submit", (event) => void playRecording(event));
-  $("playback-start").addEventListener("input", updateDownload);
+  $("clip-start").addEventListener("input", updateDownload);
   $("playback-duration").addEventListener("input", updateDownload);
+  $("download-recording").addEventListener("click", (event) => void prepareExport(event));
   $("playback-video").addEventListener("timeupdate", () => {
-    if (Number.isFinite(state.playbackStart)) timeline?.setPlayhead(playbackUtc());
+    if (!Number.isFinite(state.playbackStart)) return;
+    const at = playbackUtc();
+    timeline?.setPlayhead(at);
+    playbackControls();
+    if (state.playbackEnd - at <= 45000) prefetchPlayback(state.playbackEpoch);
+  });
+  $("playback-video").addEventListener("ended", () => void advancePlayback());
+  $("playback-video").addEventListener("pause", playbackControls);
+  $("playback-toggle").addEventListener("click", () => {
+    const video = $("playback-video");
+    if (!video.paused && !video.ended) video.pause();
+    else if (video.ended) void advancePlayback();
+    else if (video.getAttribute("src")) void video.play().catch(() => message("playback-message", "Select play in the video controls to begin.", true));
+    else void playRecording({ preventDefault() {} });
+  });
+  $("playback-back").addEventListener("click", () => seekRecording(playbackUtc() - 10000));
+  $("playback-forward").addEventListener("click", () => seekRecording(playbackUtc() + 10000));
+  $("playback-previous").addEventListener("click", () => moveFootage(-1));
+  $("playback-next").addEventListener("click", () => moveFootage(1));
+  $("playback-speed").addEventListener("change", () => {
+    const rate = Number($("playback-speed").value);
+    if (![0.25, 0.5, 1, 2, 4].includes(rate)) return;
+    state.playbackRate = rate;
+    $("playback-video").playbackRate = rate;
   });
   $("clip-mark-in").addEventListener("click", () => {
-    const at = playbackUtc(), span = state.selectedSpan;
-    if (!span || !Number.isFinite(at) || at < span.start || span.end - at < 1000) return;
-    $("playback-start").value = utcInput(new Date(at), true);
-    $("playback-duration").value = String(Math.max(1, Math.min(Number($("playback-duration").value) || 60, Math.floor((span.end - at) / 1000))));
+    const at = playbackUtc(), end = coverageEnd(at);
+    if (!Number.isFinite(at) || end === null || end - at < 1000) return;
+    $("clip-start").value = utcInput(new Date(at), true);
+    $("playback-duration").value = String(Math.max(1, Math.min(Number($("playback-duration").value) || 60, Math.floor((end - at) / 1000))));
     updateDownload();
   });
   $("clip-mark-out").addEventListener("click", () => {
-    const at = playbackUtc(), start = parseUtc($("playback-start").value).getTime();
+    const at = playbackUtc(), start = parseUtc($("clip-start").value).getTime();
     const duration = Math.floor((at - start) / 1000);
-    if (!state.selectedSpan || !Number.isFinite(duration) || duration < 1 || duration > 300 || at > state.selectedSpan.end) {
-      message("playback-message", "The clip end must be after its start, within the same recorded interval, and at most 5 minutes later.", true);
+    if (!Number.isFinite(duration) || duration < 1 || duration > 3600 || coverageEnd(start) === null || at > coverageEnd(start)) {
+      message("export-message", "Choose a clip end after its start, within one hour of contiguous recorded footage.", true);
       return;
     }
     $("playback-duration").value = String(duration);
     updateDownload();
   });
-  $("playback-video").addEventListener("playing", () => message("playback-message", "Recorded video · Select a new start time to seek to another point."));
-  $("playback-video").addEventListener("error", () => { if (state.token && state.selectedSpan) message("playback-message", "Playback is unavailable. Refresh history or select another interval.", true); });
+  $("playback-video").addEventListener("playing", () => {
+    playbackControls();
+    if (!state.token || state.view !== "history" || state.playbackStart === null) return;
+    message("playback-message", "Recorded video · Continuous across adjacent recordings. Gaps stop playback.");
+    prefetchPlayback(state.playbackEpoch);
+  });
+  $("playback-video").addEventListener("error", () => {
+    if (state.token && state.selectedSpan && state.playbackStart !== null) message("playback-message", "Playback is unavailable. Refresh history or select another interval.", true);
+  });
+  window.K5Playback = Object.freeze({ getUTC: playbackUtc, seekUTC: seekEventRecording });
 
   function canManageCameras() {
     return state.account?.role === "administrator" && Boolean(state.token) && !state.signingOut;
@@ -1945,7 +2324,7 @@
     $(id).addEventListener("click", () => $("connection-help-dialog").close());
   }
 
-  window.addEventListener("pagehide", () => { administration?.hide(); resetActivation(); wall?.hide(); stopLive(); stopPlayback(); });
+  window.addEventListener("pagehide", () => { administration?.hide(); cameraAnalytics?.clear(); cancelExport(); resetActivation(); wall?.hide(); stopLive(); stopPlayback(); });
   window.addEventListener("resize", fitCameraWall);
   $("recorder-overview").addEventListener("toggle", fitCameraWall);
   setLastDay();

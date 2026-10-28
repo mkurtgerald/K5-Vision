@@ -577,6 +577,29 @@ def install_operator_product_api(
         mutations=mutations,
     )
 
+    from k5vision.operator_events_api import install_operator_events_api
+    from k5vision.operator_exports_api import install_operator_exports_api
+
+    install_operator_events_api(
+        app,
+        events=getattr(app.state, "operator_events", None),
+        require_session=require_session,
+        require_admin=require_admin,
+        authenticate=authenticate,
+        authorized_selection=authorized_selection,
+        selections=selections,
+        mutations=mutations,
+    )
+    install_operator_exports_api(
+        app,
+        service=service,
+        state_root=cameras._root,
+        require_session=require_session,
+        authenticate=authenticate,
+        authorized_selection=authorized_selection,
+        admit_origin=admit_origin,
+    )
+
     @app.get(_PREFIX + "/capabilities", tags=["operator"])
     async def current_capabilities(
         response: Response, session: tuple[UserAccount, str] = read_session

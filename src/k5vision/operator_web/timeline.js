@@ -24,6 +24,27 @@
     const title = element("h3", "k5-timeline-title", "Recording timeline");
     const label = element("span", "k5-timeline-time");
     heading.append(title, label);
+    const toolbar = element("div", "k5-timeline-tools");
+    toolbar.setAttribute("role", "group");
+    toolbar.setAttribute("aria-label", "Timeline zoom and position");
+    function tool(action, text, description) {
+      const button = element("button", "button quiet", text);
+      button.type = "button"; button.dataset.timelineAction = action;
+      button.setAttribute("aria-label", description);
+      toolbar.append(button);
+      return button;
+    }
+    const panLeft = tool("pan-left", "←", "Earlier timeline window");
+    const zoomIn = tool("zoom-in", "+", "Zoom timeline in");
+    const scale = element("select", "k5-timeline-scale");
+    scale.setAttribute("aria-label", "Timeline visible duration");
+    for (const [value, text] of [["", "Custom"], [86400000, "24 hours"], [3600000, "1 hour"], [900000, "15 minutes"], [300000, "5 minutes"], [60000, "1 minute"]]) {
+      const option = document.createElement("option"); option.value = String(value); option.textContent = text; scale.append(option);
+    }
+    toolbar.append(scale);
+    const zoomOut = tool("zoom-out", "−", "Zoom timeline out");
+    const panRight = tool("pan-right", "→", "Later timeline window");
+    const fit = tool("fit", "Fit history", "Show the complete history window");
     const track = element("div", "k5-timeline-track");
     track.setAttribute("role", "slider");
     track.setAttribute("aria-label", "Recording time in UTC");
@@ -50,10 +71,10 @@
       "Choose a time or drag, then release to seek. Arrow keys move 1 second; Shift moves 10 seconds. Home and End reach the window edges.");
     help.id = `k5-timeline-help-${++nextId}`;
     track.setAttribute("aria-describedby", help.id);
-    root.append(heading, track, ticks, footer, help);
+    root.append(heading, toolbar, track, ticks, footer, help);
     container.append(root);
 
-    let windowStart = null, windowEnd = null, intervals = [];
+    let windowStart = null, windowEnd = null, fullStart = null, fullEnd = null, intervals = [];
     let current = null, hoverTime = null, drag = null, destroyed = false;
     const enabled = () => !destroyed && windowStart !== null;
     const clamp = (value) => Math.max(windowStart, Math.min(windowEnd, value));
@@ -63,12 +84,12 @@
 
     function renderPosition() {
       const selected = drag ? drag.time : current;
-      playhead.hidden = !enabled() || selected === null;
+      playhead.hidden = !enabled() || selected === null || selected < windowStart || selected > windowEnd;
       hover.hidden = !enabled() || hoverTime === null || drag !== null;
       if (!enabled()) return;
       if (selected !== null) {
         playhead.style.left = `${position(selected)}%`;
-        track.setAttribute("aria-valuenow", String(selected));
+        track.setAttribute("aria-valuenow", String(clamp(selected)));
         track.setAttribute("aria-valuetext", describe(selected));
       }
       if (!hover.hidden) hover.style.left = `${position(hoverTime)}%`;
@@ -95,6 +116,7 @@
     }
 
     function addRange(from, to, available) {
+      from = Math.max(windowStart, from); to = Math.min(windowEnd, to);
       if (to <= from) return;
       const range = element("span", available ? "k5-timeline-recording" : "k5-timeline-gap");
       range.style.left = `${position(from)}%`;
@@ -116,6 +138,7 @@
       if (destroyed) return;
       releaseDrag();
       windowStart = null; windowEnd = null; intervals = [];
+      fullStart = null; fullEnd = null;
       current = null; hoverTime = null;
       ranges.replaceChildren(); ticks.replaceChildren();
       track.tabIndex = -1;
@@ -128,7 +151,52 @@
       empty.hidden = false; hover.hidden = true; playhead.hidden = true;
       label.textContent = "Choose a camera and load history";
       summary.textContent = "Availability has not been loaded";
+      for (const control of toolbar.querySelectorAll("button, select")) control.disabled = true;
     }
+
+    function renderWindow(from, to) {
+      windowStart = from; windowEnd = to;
+      container.dataset.windowStart = String(from);
+      container.dataset.windowEnd = String(to);
+      ranges.replaceChildren();
+      let cursor = from;
+      const visible = intervals.filter((span) => span.end > from && span.start < to);
+      for (const span of visible) {
+        addRange(cursor, span.start, false);
+        cursor = Math.max(cursor, span.end);
+      }
+      addRange(cursor, to, false);
+      for (const span of visible) addRange(span.start, span.end, true);
+      track.setAttribute("aria-valuemin", String(from));
+      track.setAttribute("aria-valuemax", String(to));
+      for (const control of toolbar.querySelectorAll("button, select")) control.disabled = false;
+      panLeft.disabled = from <= fullStart;
+      panRight.disabled = to >= fullEnd;
+      zoomIn.disabled = to - from <= Math.min(60000, fullEnd - fullStart);
+      zoomOut.disabled = to - from >= fullEnd - fullStart;
+      fit.disabled = from === fullStart && to === fullEnd;
+      scale.value = [...scale.options].some((item) => Number(item.value) === to - from) ? String(to - from) : "";
+      summary.textContent = visible.length
+        ? `${visible.length} recording ${visible.length === 1 ? "interval" : "intervals"} · Gaps contain no video`
+        : "No recorded video in this window";
+      renderTicks(); renderPosition();
+    }
+
+    function setViewport(duration, center = current) {
+      if (!enabled() || !Number.isFinite(duration) || duration <= 0) return;
+      const length = Math.max(Math.min(60000, fullEnd - fullStart), Math.min(fullEnd - fullStart, duration));
+      const anchor = validTime(center) ? center : (windowStart + windowEnd) / 2;
+      const from = Math.max(fullStart, Math.min(fullEnd - length, Math.round(anchor - length / 2)));
+      releaseDrag(); hoverTime = null;
+      renderWindow(from, from + length);
+    }
+
+    zoomIn.addEventListener("click", () => setViewport((windowEnd - windowStart) / 2));
+    zoomOut.addEventListener("click", () => setViewport((windowEnd - windowStart) * 2));
+    fit.addEventListener("click", () => { if (enabled()) renderWindow(fullStart, fullEnd); });
+    panLeft.addEventListener("click", () => setViewport(windowEnd - windowStart, windowStart));
+    panRight.addEventListener("click", () => setViewport(windowEnd - windowStart, windowEnd));
+    scale.addEventListener("change", () => { if (scale.value) setViewport(Number(scale.value)); });
 
     function setData(data = {}) {
       if (destroyed) return;
@@ -138,9 +206,8 @@
         return;
       }
       releaseDrag();
+      fullStart = start; fullEnd = end;
       windowStart = start; windowEnd = end;
-      container.dataset.windowStart = String(start);
-      container.dataset.windowEnd = String(end);
       intervals = (Array.isArray(spans) ? spans : [])
         .filter((span) => span && validTime(span.start) && validTime(span.end))
         .map((span) => ({ start: Math.max(start, span.start), end: Math.min(end, span.end) }))
@@ -148,31 +215,17 @@
         .sort((left, right) => left.start - right.start || left.end - right.end);
       current = validTime(current) && current >= start && current <= end ? current : start;
       hoverTime = null;
-      ranges.replaceChildren();
-      // Keep every supplied recording interval separate. Only the gap calculation
-      // uses overlapping coverage, so a real discontinuity is never filled in.
-      let cursor = start;
-      for (const span of intervals) {
-        addRange(cursor, span.start, false);
-        cursor = Math.max(cursor, span.end);
-      }
-      addRange(cursor, end, false);
-      for (const span of intervals) addRange(span.start, span.end, true);
       root.classList.remove("is-empty");
       empty.hidden = true;
       track.tabIndex = 0;
       track.setAttribute("aria-disabled", "false");
-      track.setAttribute("aria-valuemin", String(start));
-      track.setAttribute("aria-valuemax", String(end));
-      summary.textContent = intervals.length
-        ? `${intervals.length} recording ${intervals.length === 1 ? "interval" : "intervals"} · Gaps contain no video`
-        : "No recorded video in this window";
-      renderTicks(); renderPosition();
+      renderWindow(start, end);
     }
 
     function setPlayhead(value) {
-      if (!enabled() || !validTime(value) || value < windowStart || value > windowEnd) return;
+      if (!enabled() || !validTime(value) || value < fullStart || value > fullEnd) return;
       current = value;
+      if (!drag && (value < windowStart || value > windowEnd)) setViewport(windowEnd - windowStart, value);
       renderPosition();
     }
 
@@ -230,7 +283,7 @@
     function keyDown(event) {
       if (!enabled() || drag) return;
       const step = event.shiftKey ? 10000 : 1000;
-      const from = current === null ? windowStart : current;
+      const from = current === null ? windowStart : clamp(current);
       let value;
       if (event.key === "Home") value = windowStart;
       else if (event.key === "End") value = windowEnd;
@@ -263,7 +316,7 @@
       root.remove();
     }
 
-    return Object.freeze({ setData, setPlayhead, clear, destroy });
+    return Object.freeze({ setData, setPlayhead, setViewport, clear, destroy });
   }
 
   window.K5RecordingTimeline = Object.freeze({ create });

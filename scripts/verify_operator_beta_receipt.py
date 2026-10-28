@@ -102,7 +102,11 @@ _TRUE = {
         "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected wall_viewport_fit "
         "direct_rtsp_enrollment direct_rtsp_fresh_enrollment "
         "direct_rtsp_multi_channel_same_endpoint direct_rtsp_wrong_password_rejected "
-        "direct_rtsp_reconnect_preserved_identity direct_rtsp_history_and_export"
+        "direct_rtsp_reconnect_preserved_identity direct_rtsp_history_and_export "
+        "historical_navigation_default_24h historical_navigation_real_media "
+        "playback_rapid_seek_latest_wins playback_controls_and_zoom "
+        "playback_contiguous_chunk_handoff playback_gap_requires_explicit_navigation "
+        "playback_export_selection_independent"
     ).split(),
     "person": (
         "single_flight_busy independent_view_workers third_view_capacity_denied "
@@ -130,6 +134,17 @@ def _integers(value, count, minimum):
 
 
 def _browser_nvr_journey(receipt):
+    for field, expected in (
+        ("historical_recorded_seconds", 10800),
+        ("historical_recording_file_count", 18),
+        ("historical_recording_gap_seconds", 600),
+        ("historical_fixture_fps", 1),
+    ):
+        _require(type(receipt.get(field)) is int and receipt[field] == expected)
+    chunk = receipt.get("playback_chunk_seconds")
+    _require(type(chunk) in (int, float) and math.isfinite(chunk) and 60 <= chunk <= 300)
+    frames = receipt.get("playback_continuation_decoded_frames")
+    _require(type(frames) is int and 4 <= frames <= 100000)
     _require(type(receipt.get("camera_count")) is int and receipt["camera_count"] == 4)
     layouts = receipt.get("wall_layouts")
     _require(type(layouts) is list and len(layouts) == 3)
@@ -303,7 +318,7 @@ def verify(lane: str, path: Path) -> list[dict]:
             _require(receipt.get("browser_script_errors") == 0)
             for field, count in (("live_decoded_frames", 3), ("playback_decoded_frames", 4)):
                 _integers(receipt.get(field), count, 4)
-            _require(0 < receipt.get("duration_seconds", 0) < 180)
+            _require(0 < receipt.get("duration_seconds", 0) < 240)
         elif group == "person-view":
             _require(receipt.get("portable_ancestor_adjustment") is False)
             _require(receipt.get("browser_channel") == "msedge")

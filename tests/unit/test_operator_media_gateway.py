@@ -24,6 +24,8 @@ def assets(tmp_path):
         "timeline.css",
         "admin.js",
         "admin.css",
+        "analytics.js",
+        "analytics.css",
     ):
         (root / name).write_text("fixture", encoding="utf-8")
     return root
@@ -57,7 +59,7 @@ def test_fixed_gateway_authorizes_each_media_request_before_private_proxy(assets
                 yield from proxies(child)
 
     worker_proxies = list(proxies(document))
-    assert len(worker_proxies) == 6
+    assert len(worker_proxies) == 7
     for proxy in worker_proxies:
         # Every route must retire pooled connections before Uvicorn's 5s
         # idle limit; a failed mutation is never replayed as a workaround.
@@ -118,6 +120,7 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
     paths = [path for route in routes for m in route.get("match", []) for path in m.get("path", [])]
     assert paths == [
         "/api/*",
+        "/media/exports/*",
         "/media/hls.js",
         "/media/live/*",
         "/media/playback",
@@ -133,12 +136,34 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
         "/operator/timeline.js",
         "/operator/admin.css",
         "/operator/admin.js",
+        "/operator/analytics.css",
+        "/operator/analytics.js",
     ]
-    javascript = routes[3]["handle"][0]
+    javascript = next(
+        route["handle"][0]
+        for route in routes
+        if route.get("match") == [{"method": ["GET"], "path": ["/media/hls.js"]}]
+    )
     assert javascript["rewrite"]["uri"] == "/_k5_assets/hls.min.js"
     assert javascript["headers"]["request"]["delete"] == ["Cookie", "Authorization"]
     assert routes[-1]["handle"] == [{"handler": "static_response", "status_code": 404}]
     assert "browse" not in _configuration(assets)
+
+
+def test_export_files_only_reach_the_application_authority(assets):
+    document = json.loads(_configuration(assets))
+    routes = document["apps"]["http"]["servers"]["operator"]["routes"]
+    route = next(
+        value
+        for value in routes
+        if value.get("match") == [{"method": ["GET"], "path": ["/media/exports/*"]}]
+    )
+    assert route["terminal"] is True
+    assert len(route["handle"]) == 1
+    proxy = route["handle"][0]
+    assert proxy["handler"] == "reverse_proxy"
+    assert proxy["upstreams"] == [{"dial": "127.0.0.1:18081"}]
+    assert "rewrite" not in proxy and "headers" not in proxy
 
 
 @pytest.mark.parametrize("field", ["public_port", "control_port", "hls_port", "playback_port"])

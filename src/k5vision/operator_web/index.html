@@ -9,9 +9,11 @@
     <link rel="stylesheet" href="/operator/wall.css">
     <link rel="stylesheet" href="/operator/timeline.css">
     <link rel="stylesheet" href="/operator/admin.css">
+    <link rel="stylesheet" href="/operator/analytics.css">
     <script defer src="/operator/wall.js"></script>
     <script defer src="/operator/timeline.js"></script>
     <script defer src="/operator/admin.js"></script>
+    <script defer src="/operator/analytics.js"></script>
     <script defer src="/operator/app.js"></script>
   </head>
   <body>
@@ -122,17 +124,29 @@
               <div class="history-list-panel"><div class="section-heading"><h3>Available intervals</h3><span id="history-count" class="count">0</span></div><div id="history-list" class="history-list"></div></div>
               <div class="playback-panel">
                 <div class="video-surface playback-surface"><video id="playback-video" controls playsinline preload="metadata" aria-label="Recorded camera video"></video><div id="playback-placeholder" class="video-placeholder"><div class="camera-glyph" aria-hidden="true">◷</div><h2>Select a recording</h2><p>Choose an available interval to play video.</p></div></div>
+                <div class="playback-transport" role="group" aria-label="Recording playback controls">
+                  <button id="playback-previous" class="button quiet" type="button" title="Previous available recording" disabled>Previous footage</button>
+                  <button id="playback-back" class="button secondary" type="button" aria-label="Back 10 seconds" disabled>−10s</button>
+                  <button id="playback-toggle" class="button primary" type="button" aria-label="Play or pause recording" disabled>Play</button>
+                  <button id="playback-forward" class="button secondary" type="button" aria-label="Forward 10 seconds" disabled>+10s</button>
+                  <button id="playback-next" class="button quiet" type="button" title="Next available recording" disabled>Next footage</button>
+                  <label class="playback-speed-label" for="playback-speed">Speed <select id="playback-speed" aria-label="Playback speed"><option value="0.25">¼×</option><option value="0.5">½×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+                  <time id="playback-clock" aria-label="Recorded time in UTC">Choose recorded footage</time>
+                </div>
                 <p id="selected-recording" class="selected-recording muted">No interval selected</p>
-                <div class="clip-controls"><button id="clip-mark-in" class="button quiet" type="button" disabled>Mark clip start</button><button id="clip-mark-out" class="button quiet" type="button" disabled>Mark clip end</button><span id="clip-selection-label" class="muted">Select up to 5 minutes from an available interval.</span></div>
                 <form id="playback-form" class="playback-form">
-                  <div><label for="playback-start">Start · UTC</label><input id="playback-start" type="datetime-local" step="0.001" required disabled></div>
-                  <div class="duration-field"><label for="playback-duration">Seconds</label><input id="playback-duration" type="number" min="1" max="300" step="1" value="60" required disabled></div>
-                  <button id="play-recording" class="button primary" type="submit" disabled>Play</button>
-                  <a id="download-recording" class="button secondary disabled" aria-disabled="true" tabindex="-1">Save MP4 clip</a>
+                  <div><label for="playback-start">Go to · UTC</label><input id="playback-start" type="datetime-local" step="0.001" required disabled></div>
+                  <button id="play-recording" class="button secondary" type="submit" disabled>Seek and play</button>
                 </form>
-                <p id="playback-message" class="form-message" role="status" aria-live="polite">Preview up to 5 minutes. Select a new start time to seek.</p>
+                <p id="playback-message" class="form-message" role="status" aria-live="polite">Choose recorded footage. Playback continues through adjacent recordings and stops at gaps.</p>
+                <details id="export-panel" class="export-panel" open><summary>Export MP4 clip</summary>
+                  <div class="clip-controls"><button id="clip-mark-in" class="button quiet" type="button" disabled>Mark clip start</button><button id="clip-mark-out" class="button quiet" type="button" disabled>Mark clip end</button><span id="clip-selection-label" class="muted">Select contiguous recorded footage · Up to 1 hour / 256 MB per clip.</span></div>
+                  <div class="playback-form export-form"><div><label for="clip-start">Clip start · UTC</label><input id="clip-start" type="datetime-local" step="0.001" disabled></div><div class="duration-field"><label for="playback-duration">Seconds</label><input id="playback-duration" type="number" min="1" max="3600" step="1" value="60" disabled></div><a id="download-recording" class="button secondary disabled" aria-disabled="true" tabindex="-1">Prepare MP4 clip</a></div>
+                  <p id="export-message" class="form-message" role="status" aria-live="polite">Choose clip start and duration, then prepare the MP4.</p>
+                </details>
               </div>
             </div>
+            <div id="analytics-panel"></div>
           </section>
         </main>
       </div>

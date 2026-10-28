@@ -68,6 +68,8 @@ def _operator_asset(route, assets):
         "timeline.css",
         "admin.js",
         "admin.css",
+        "analytics.js",
+        "analytics.css",
     }:
         route.fulfill(status=404)
         return True
@@ -1056,9 +1058,11 @@ def test_timeline_gap_clears_previous_clip_and_download_without_losing_history(l
             expect(page.locator("#clip-mark-in")).to_be_enabled()
             expect(page.locator("#clip-mark-out")).to_be_enabled()
             link = page.locator("#download-recording")
-            old_href = link.get_attribute("href")
-            assert old_href and old_href.startswith("/media/playback?")
-            assert page.locator("#playback-video").get_attribute("src") == old_href
+            assert link.get_attribute("href") == "#"
+            expect(link).to_have_attribute("aria-disabled", "false")
+            preview = page.locator("#playback-video").get_attribute("src")
+            assert preview and preview.startswith("/media/playback?")
+            assert parse_qs(urlsplit(preview).query)["format"] == ["fmp4"]
             assert page.evaluate("window.playbackStarts") == 1
 
             # The selected minute starts with a real five-second recording gap.
@@ -1069,13 +1073,15 @@ def test_timeline_gap_clears_previous_clip_and_download_without_losing_history(l
             expect(page.locator("#playback-message")).to_contain_text("No playable recording")
             expect(page.locator("#selected-recording")).to_have_text("No interval selected")
             for identifier in (
-                "playback-start",
+                "clip-start",
                 "playback-duration",
-                "play-recording",
                 "clip-mark-in",
                 "clip-mark-out",
             ):
                 expect(page.locator("#" + identifier)).to_be_disabled()
+            # Direct seeking remains available so an operator can leave a gap.
+            expect(page.locator("#playback-start")).to_be_enabled()
+            expect(page.locator("#play-recording")).to_be_enabled()
             assert page.locator("#playback-start").input_value() == ""
             assert page.locator("#playback-video").get_attribute("src") is None
             assert link.get_attribute("href") is None

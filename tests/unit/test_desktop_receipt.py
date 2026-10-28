@@ -54,8 +54,30 @@ _NVR_FLAGS = (
     "direct_rtsp_fresh_enrollment direct_rtsp_multi_channel_same_endpoint "
     "admin_user_management role_permissions camera_access_controls admin_user_creation "
     "admin_bootstrap_password_change admin_password_reset admin_disable_reenable "
-    "admin_live_media_revocation admin_audit_visible admin_state_persisted"
+    "admin_live_media_revocation admin_audit_visible admin_state_persisted "
+    "historical_navigation_default_24h historical_navigation_real_media "
+    "playback_rapid_seek_latest_wins playback_controls_and_zoom "
+    "playback_contiguous_chunk_handoff playback_gap_requires_explicit_navigation "
+    "playback_export_selection_independent export_normal_windows_download "
+    "export_download_survives_browser_close export_download_survives_product_restart "
+    "export_download_opened_in_edge"
 ).split()
+_ANALYTICS_TRUE = (
+    "product_analytics_enablement analytics_bundled_native_inference analytics_gui_configuration "
+    "analytics_person_event_recorded analytics_event_utc_playback analytics_public_fixture_only "
+    "analytics_browser_closed_detection analytics_role_camera_permissions "
+    "analytics_settings_events_persisted"
+).split()
+_ANALYTICS_FALSE = ("analytics_mock_inference", "analytics_accuracy_acceptance")
+_PLAYBACK_EXPORT_TRUE = (
+    "historical_navigation_default_24h historical_navigation_real_media "
+    "playback_rapid_seek_latest_wins playback_controls_and_zoom "
+    "playback_contiguous_chunk_handoff playback_gap_requires_explicit_navigation "
+    "playback_export_selection_independent export_normal_windows_download "
+    "export_download_survives_browser_close export_download_survives_product_restart "
+    "export_download_opened_in_edge"
+).split()
+_MISSING = object()
 
 
 def _receipt() -> dict:
@@ -64,6 +86,8 @@ def _receipt() -> dict:
         "platform": "Windows",
         **dict.fromkeys(_REQUIRED_TRUE, True),
         **dict.fromkeys(_NVR_FLAGS, True),
+        **dict.fromkeys(_ANALYTICS_TRUE, True),
+        **dict.fromkeys(_ANALYTICS_FALSE, False),
         **dict.fromkeys(_REQUIRED_FALSE, False),
         "browser_channel": "msedge",
         "playwright_version": "1.58.0",
@@ -88,6 +112,20 @@ def _receipt() -> dict:
         "timeline_playback_decoded_frames": 4,
         "export_decoded_frames": 4,
         "export_bytes": 4096,
+        "historical_recorded_seconds": 10800,
+        "historical_recording_file_count": 18,
+        "historical_recording_gap_seconds": 600,
+        "historical_fixture_fps": 1,
+        "playback_chunk_seconds": 120,
+        "playback_continuation_decoded_frames": 4,
+        "export_download_restart_decoded_frames": 4,
+        "analytics_model_revision": "6697dead54ed1cdd664b0313189c2cb52ee6335e",
+        "analytics_event_playback_decoded_frames": 4,
+        "analytics_positive_person_count": 1,
+        "analytics_processed_frames": 1,
+        "analytics_background_event_count_before": 1,
+        "analytics_background_event_count_after": 2,
+        "analytics_denied_http_statuses": [404, 404, 403, 404, 404, 403, 401, 401],
         "authenticated_camera_restart_frames": 4,
         "direct_rtsp_live_decoded_frames": 4,
         "direct_rtsp_history_decoded_frames": 4,
@@ -125,6 +163,25 @@ def test_desktop_receipt_accepts_measured_clock_skew(tmp_path, offset, time_read
     receipt.update(onvif_clock_offset_seconds=offset, onvif_time_read_count=time_reads)
 
     assert _VERIFIER.verify(_report(tmp_path, receipt)) == receipt
+
+
+@pytest.mark.parametrize("seconds", [239.9, 240, 300, 359.999])
+def test_desktop_receipt_accepts_full_playback_export_and_analytics_scope_within_budget(
+    tmp_path, seconds
+):
+    receipt = _receipt()
+    receipt["duration_seconds"] = seconds
+    assert _VERIFIER.verify(_report(tmp_path, receipt)) == receipt
+
+
+@pytest.mark.parametrize(
+    "seconds", [0, -1, 360, 361, True, "300", float("nan"), float("inf"), float("-inf")]
+)
+def test_desktop_receipt_rejects_invalid_or_over_budget_full_product_journey(tmp_path, seconds):
+    receipt = _receipt()
+    receipt["duration_seconds"] = seconds
+    with pytest.raises(ValueError):
+        _VERIFIER.verify(_report(tmp_path, receipt))
 
 
 def test_desktop_receipt_rejects_legacy_evidence_without_clock_proof(tmp_path):
@@ -307,7 +364,11 @@ def _browser_receipt():
         "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected wall_viewport_fit "
         "direct_rtsp_enrollment direct_rtsp_fresh_enrollment "
         "direct_rtsp_multi_channel_same_endpoint direct_rtsp_wrong_password_rejected "
-        "direct_rtsp_reconnect_preserved_identity direct_rtsp_history_and_export"
+        "direct_rtsp_reconnect_preserved_identity direct_rtsp_history_and_export "
+        "historical_navigation_default_24h historical_navigation_real_media "
+        "playback_rapid_seek_latest_wins playback_controls_and_zoom "
+        "playback_contiguous_chunk_handoff playback_gap_requires_explicit_navigation "
+        "playback_export_selection_independent"
     ).split()
     return {
         **dict.fromkeys(required_true, True),
@@ -337,6 +398,12 @@ def _browser_receipt():
         "live_decoded_frames": [4, 4, 4],
         "playback_decoded_frames": [4, 4, 4, 4],
         "duration_seconds": 30.5,
+        "historical_recorded_seconds": 10800,
+        "historical_recording_file_count": 18,
+        "historical_recording_gap_seconds": 600,
+        "historical_fixture_fps": 1,
+        "playback_chunk_seconds": 120,
+        "playback_continuation_decoded_frames": 4,
         "browser_date_skew_seconds": 172800,
         "host_clock_step_acceptance": False,
         "wall_decoded_frames": [4, 5, 6, 7],
@@ -501,3 +568,113 @@ def test_native_receipt_requires_bounded_live_and_authorization_observations(
     receipt[field] = invalid
     with pytest.raises(ValueError):
         _VERIFIER.verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("field", [*_PLAYBACK_EXPORT_TRUE, *_ANALYTICS_TRUE])
+@pytest.mark.parametrize("invalid", [False, 1, None, _MISSING])
+def test_native_receipt_requires_executed_sprint_product_features(tmp_path, field, invalid):
+    receipt = _receipt()
+    if invalid is _MISSING:
+        del receipt[field]
+    else:
+        receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _VERIFIER.verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("field", _ANALYTICS_FALSE)
+@pytest.mark.parametrize("invalid", [True, 0, None, _MISSING])
+def test_native_receipt_requires_real_inference_without_accuracy_claims(tmp_path, field, invalid):
+    receipt = _receipt()
+    if invalid is _MISSING:
+        del receipt[field]
+    else:
+        receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _VERIFIER.verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("historical_recorded_seconds", 7200),
+        ("historical_recording_file_count", 17),
+        ("historical_recording_file_count", 18.0),
+        ("historical_recording_gap_seconds", 0),
+        ("historical_fixture_fps", True),
+        ("playback_chunk_seconds", 59.9),
+        ("playback_chunk_seconds", 301),
+        ("playback_chunk_seconds", float("nan")),
+        ("playback_chunk_seconds", True),
+        ("playback_continuation_decoded_frames", 3),
+        ("export_download_restart_decoded_frames", True),
+        ("export_download_restart_decoded_frames", 3),
+        ("analytics_model_revision", "0" * 40),
+        ("analytics_model_revision", _MISSING),
+        ("analytics_event_playback_decoded_frames", 3),
+        ("analytics_event_playback_decoded_frames", True),
+        ("analytics_positive_person_count", 0),
+        ("analytics_positive_person_count", 33),
+        ("analytics_positive_person_count", 1.0),
+        ("analytics_processed_frames", 0),
+        ("analytics_processed_frames", _MISSING),
+        ("analytics_processed_frames", 100001),
+        ("analytics_background_event_count_before", 0),
+        ("analytics_background_event_count_before", 2),
+        ("analytics_background_event_count_after", 1),
+        ("analytics_background_event_count_after", _MISSING),
+        ("analytics_background_event_count_after", 100001),
+        ("analytics_denied_http_statuses", [404.0, 404, 403, 404, 404, 403, 401, 401]),
+        ("analytics_denied_http_statuses", [True, 404, 403, 404, 404, 403, 401, 401]),
+        ("analytics_denied_http_statuses", ["404", 404, 403, 404, 404, 403, 401, 401]),
+        ("analytics_denied_http_statuses", [404, 404, 403, 404, 404, 403, 401, 200]),
+        ("analytics_denied_http_statuses", [404] * 8),
+        ("analytics_denied_http_statuses", _MISSING),
+    ],
+)
+def test_native_receipt_rejects_unmeasured_or_tampered_sprint_evidence(tmp_path, field, invalid):
+    receipt = _receipt()
+    if invalid is _MISSING:
+        del receipt[field]
+    else:
+        receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _VERIFIER.verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("field", _PLAYBACK_EXPORT_TRUE[:7])
+@pytest.mark.parametrize("invalid", [False, 1, None, _MISSING])
+def test_browser_receipt_requires_actual_history_navigation(tmp_path, field, invalid):
+    receipt = _browser_receipt()
+    if invalid is _MISSING:
+        del receipt[field]
+    else:
+        receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _BETA_VERIFIER.verify("browser", _report(tmp_path, receipt, browser=True))
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("historical_recorded_seconds", 60),
+        ("historical_recording_file_count", 1),
+        ("historical_recording_file_count", True),
+        ("historical_recording_gap_seconds", 0),
+        ("historical_fixture_fps", 30),
+        ("playback_chunk_seconds", 1),
+        ("playback_chunk_seconds", 301),
+        ("playback_chunk_seconds", float("nan")),
+        ("playback_continuation_decoded_frames", 3),
+        ("playback_continuation_decoded_frames", True),
+        ("playback_continuation_decoded_frames", _MISSING),
+    ],
+)
+def test_browser_receipt_refuses_short_fixture_as_hours_of_navigation(tmp_path, field, invalid):
+    receipt = _browser_receipt()
+    if invalid is _MISSING:
+        del receipt[field]
+    else:
+        receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _BETA_VERIFIER.verify("browser", _report(tmp_path, receipt, browser=True))

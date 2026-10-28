@@ -40,6 +40,7 @@ _INPUTS = (
     "K5_CADDY_DONOR_EXE",
     "K5_DONOR_FFMPEG",
     "K5_DONOR_FFPROBE",
+    "K5_OPERATOR_PERSON_FIXTURE",
 )
 pytestmark = pytest.mark.skipif(
     os.name != "nt" or not all(os.getenv(name) for name in _INPUTS),
@@ -1186,6 +1187,7 @@ def _desktop_nvr_journey(
     app,
     diagnostic,
     history_not_before,
+    export_proof,
 ):
     """Exercise operator actions against four real installed recording paths."""
     __tracebackhide__ = True
@@ -1364,6 +1366,13 @@ def _desktop_nvr_journey(
     evidence["paused_recording_bytes"] = paused_bytes
     evidence["resumed_recording_bytes"] = sizes()[0]
 
+    diagnostic["nvr_stage"] = "historical_navigation"
+    seeded = browser_helpers._seed_recorded_history(camera_directories[0], ffmpeg, parent)
+    evidence.update(
+        browser_helpers._recording_navigation_journey(
+            page, device_id=camera_ids[0], seeded=seeded, diagnostic=diagnostic
+        )
+    )
     diagnostic["nvr_stage"] = "timeline_and_export"
     browser_helpers._open_camera_recordings(page, camera_ids[0])
     evidence["timeline_playback_decoded_frames"] = browser_helpers._timeline_play(
@@ -1375,9 +1384,17 @@ def _desktop_nvr_journey(
     )
     export = parent / "saved installed red recording.mp4"
     evidence["export_decoded_frames"] = browser_helpers._download_recording(
-        page, ffprobe, export, helpers, "red"
+        page,
+        ffprobe,
+        export,
+        helpers,
+        "red",
+        normal_directory=parent / "Windows Downloads",
+        evidence=export_proof,
+        diagnostic=diagnostic,
     )
-    evidence["export_bytes"] = export.stat().st_size
+    evidence["export_bytes"] = export_proof["bytes"]
+    evidence["export_normal_windows_download"] = True
     evidence["timeline_seek_playback"] = True
     evidence["actual_recording_export"] = True
 
@@ -1406,6 +1423,222 @@ def _desktop_nvr_journey(
     return evidence
 
 
+def _installed_person_fixture(parent, ffmpeg):
+    """Encode only the admitted Apache public image as a generated camera."""
+    fixture = Path(os.environ["K5_OPERATOR_PERSON_FIXTURE"]).resolve(strict=True)
+    _require(
+        fixture.stat().st_size == 553577
+        and hashlib.sha256(fixture.read_bytes()).hexdigest()
+        == "2be4dfa4d874e5f7929bebd1baf401e2ee630c4bf36cead7a2f8d5421d583959",
+        "Installed analytics public fixture identity was refused",
+    )
+    video = parent / "generated licensed person camera.mp4"
+    generated = subprocess.run(
+        [
+            str(ffmpeg),
+            "-v",
+            "error",
+            "-loop",
+            "1",
+            "-i",
+            str(fixture),
+            "-vf",
+            "scale=320:240",
+            "-r",
+            "15",
+            "-t",
+            "2",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "15",
+            "-keyint_min",
+            "15",
+            "-bf",
+            "0",
+            str(video),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=20,
+        check=False,
+    )
+    _require(generated.returncode == 0, "Installed analytics camera fixture generation failed")
+    return video
+
+
+def _installed_analytics_journey(
+    *,
+    page,
+    client,
+    camera_id,
+    parent,
+    processes,
+    publishers,
+    source_uri,
+    ffmpeg,
+    helpers,
+    browser_helpers,
+    app,
+    publisher_credentials,
+    diagnostic,
+):
+    """Enable the shipped detector in the GUI and play its real recorded event."""
+    __tracebackhide__ = True
+    diagnostic["analytics_stage"] = "admitted_installed_model"
+    _require(
+        "K5_OPERATOR_PERSON_CONFIG" not in os.environ,
+        "Installed analytics qualification must not inject a detector configuration",
+    )
+    _installed_person_fixture(parent, ffmpeg)
+    route = f"/api/v1/operator/cameras/{camera_id}"
+    browser_helpers._open_camera_recordings(page, camera_id)
+    page.locator("#analytics-settings-form").wait_for(state="visible")
+    page.wait_for_function("() => !document.getElementById('analytics-enabled').disabled")
+    page.locator("#analytics-enabled").check()
+    page.locator("#analytics-confidence").fill("50")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlsplit(response.url).path == route + "/analytics"
+        )
+    ) as configured:
+        page.locator("#analytics-save").click()
+    _require(configured.value.status == 200, "Installed analytics could not be enabled in the GUI")
+    settings = configured.value.json()
+    _require(
+        settings.get("enabled") is True
+        and settings.get("confidence_threshold") == 0.5
+        and settings.get("status") in {"starting", "active", "waiting"}
+        and settings.get("source") == "recorded_camera_frames"
+        and settings.get("model") == "person-detection-retail-0013",
+        "Installed analytics did not admit the bundled recording detector",
+    )
+    diagnostic["analytics_stage"] = "positive_camera_recording"
+    helpers._stop_owned(publishers[0])
+    publishers[0] = _publish_fixture(
+        parent,
+        ffmpeg,
+        source_uri,
+        helpers,
+        color="licensed person",
+        credentials=publisher_credentials,
+    )
+    processes.append(publishers[0])
+    detected = {}
+
+    def positive_event():
+        result = client.json(route + "/events")["events"]
+        if not result:
+            return False
+        detected.update(result[0])
+        return (
+            detected.get("camera_id") == camera_id
+            and type(detected.get("person_count")) is int
+            and 1 <= detected["person_count"] <= 32
+            and type(detected.get("confidence")) in (int, float)
+            and 0.5 <= detected["confidence"] <= 1
+        )
+
+    _wait(
+        positive_event,
+        "Installed native detector records a real person event",
+        process=app,
+        timeout=25,
+    )
+    occurred = datetime.fromisoformat(detected["occurred_at"].replace("Z", "+00:00"))
+    _require(
+        abs((datetime.now(UTC) - occurred).total_seconds()) < 30,
+        "Person event was not mapped to the fresh recording's UTC timestamp",
+    )
+    diagnostic["analytics_stage"] = "event_recording_navigation"
+    page.locator("#last-24-hours").click()
+    page.locator("#analytics-refresh").click()
+    event_button = page.locator(f'#analytics-events button[data-event-id="{detected["id"]}"]')
+    event_button.wait_for(state="visible", timeout=15_000)
+    event_button.click()
+    expected_ms = (
+        datetime.fromisoformat(detected["playback_at"].replace("Z", "+00:00")).timestamp() * 1000
+    )
+    page.wait_for_function(
+        """chosen => {
+          const video=document.getElementById('playback-video');
+          return Math.abs(Date.parse(video.dataset.utcStart || '')-chosen)<1000 &&
+            video.readyState>=2 && !video.paused &&
+            video.getVideoPlaybackQuality().totalVideoFrames>=4;
+        }""",
+        arg=expected_ms,
+        timeout=20_000,
+    )
+    event_frames = page.locator("#playback-video").evaluate(
+        "video => video.getVideoPlaybackQuality().totalVideoFrames"
+    )
+    status = client.json(route + "/analytics")
+    _require(
+        status.get("processed_frames", 0) >= 1 and status.get("event_count", 0) >= 1,
+        "Installed detector reported an event without processing recorded frames",
+    )
+    helpers._stop_owned(publishers[0])
+    publishers[0] = _publish_fixture(
+        parent, ffmpeg, source_uri, helpers, credentials=publisher_credentials
+    )
+    processes.append(publishers[0])
+    browser_helpers._open_camera_watch(page, camera_id)
+    browser_helpers._decoded_color(page, "live-video", "red")
+    diagnostic["analytics_stage"] = "complete"
+    return {
+        "product_analytics_enablement": True,
+        "analytics_bundled_native_inference": True,
+        "analytics_gui_configuration": True,
+        "analytics_person_event_recorded": True,
+        "analytics_event_utc_playback": True,
+        "analytics_event_playback_decoded_frames": event_frames,
+        "analytics_positive_person_count": detected["person_count"],
+        "analytics_processed_frames": status["processed_frames"],
+        "analytics_model_revision": "6697dead54ed1cdd664b0313189c2cb52ee6335e",
+        "analytics_mock_inference": False,
+        "analytics_accuracy_acceptance": False,
+        "analytics_public_fixture_only": True,
+    }, detected
+
+
+def _analytics_permission_journey(runtime, *, port, camera_ids, private_state):
+    denied = []
+    for account in private_state["users"]:
+        observer = runtime._Client(port)
+        runtime._login(observer, account["username"], account["password"])
+        allowed = f"/api/v1/operator/cameras/{camera_ids[0]}"
+        restricted = f"/api/v1/operator/cameras/{camera_ids[3]}"
+        for suffix in ("/analytics", "/events"):
+            _require(
+                observer.get(allowed + suffix)[0] == 200, "Assigned camera analytics were denied"
+            )
+            status = observer.get(restricted + suffix)[0]
+            _require(status == 404, "Unassigned camera analytics were exposed")
+            denied.append(status)
+        status = observer.get(
+            allowed + "/analytics",
+            method="PATCH",
+            data={"enabled": False, "confidence_threshold": 0.5},
+        )[0]
+        _require(status == 403, "A limited account changed camera analytics settings")
+        denied.append(status)
+    anonymous = runtime._Client(port)
+    for suffix in ("/analytics", "/events"):
+        status = anonymous.get(f"/api/v1/operator/cameras/{camera_ids[0]}" + suffix)[0]
+        _require(status == 401, "Anonymous analytics access was admitted")
+        denied.append(status)
+    return {"analytics_role_camera_permissions": True, "analytics_denied_http_statuses": denied}
+
+
 def _vm_clock_phase(
     *,
     page,
@@ -1426,6 +1659,7 @@ def _vm_clock_phase(
     publisher,
     camera_directory,
     publisher_credentials,
+    analytics_event,
 ):
     """Actually change only an opted-in disposable Windows guest's UTC clock."""
     __tracebackhide__ = True
@@ -1645,6 +1879,36 @@ def _vm_clock_phase(
                     process=app,
                     timeout=10,
                 )
+                retained_events = client.json(route + "/events")["events"]
+                _require(
+                    any(
+                        event["id"] == analytics_event["id"]
+                        and event["occurred_at"] == analytics_event["occurred_at"]
+                        and event["playback_at"] == analytics_event["playback_at"]
+                        for event in retained_events
+                    ),
+                    "VM clock correction changed the recorded person event's UTC identity",
+                )
+                event_time = datetime.fromisoformat(
+                    analytics_event["occurred_at"].replace("Z", "+00:00")
+                )
+                event_query = "?" + urlencode(
+                    {
+                        "start": (event_time - timedelta(seconds=2)).isoformat(),
+                        "end": (event_time + timedelta(seconds=2)).isoformat(),
+                    }
+                )
+                event_spans = client.json(route + "/history" + event_query)["spans"]
+                _require(
+                    any(
+                        datetime.fromisoformat(span["started_at"])
+                        <= event_time
+                        < datetime.fromisoformat(span["started_at"])
+                        + timedelta(seconds=span["duration_seconds"])
+                        for span in event_spans
+                    ),
+                    "VM clock correction detached a person event from its recorded UTC footage",
+                )
                 _require(_hashes_preserved(closed), "VM clock step changed closed footage hashes")
                 held = guard.snapshot()
                 _require(
@@ -1671,6 +1935,8 @@ def _vm_clock_phase(
                         "clock_alert_direction": direction,
                         "recorder_utc_verified": True,
                         "history_utc_query_verified": True,
+                        "analytics_event_utc_preserved": True,
+                        "analytics_event_recording_covered": True,
                         "live_http_status": live_status,
                         "live_decoded_frames_before": frames_before,
                         "live_decoded_frames_after": frames_after,
@@ -1728,6 +1994,7 @@ def _vm_clock_phase(
         "phases": phases,
         "closed_segments": len(closed),
         "closed_segment_hashes_preserved": True,
+        "analytics_events_utc_preserved": True,
         "retained_playback_decoded_frames": playback_frames,
         "loopback_only": True,
         "guard": guard_receipt,
@@ -1781,6 +2048,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     recording_diagnostic = {}
     vm_clock_diagnostic = {}
     nvr_diagnostic = {}
+    export_proof = {}
     receipt = {
         "schema_version": "1",
         "platform": platform.system(),
@@ -2112,11 +2380,29 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 app=app,
                 diagnostic=nvr_diagnostic,
                 history_not_before=direct_rtsp_started_utc,
+                export_proof=export_proof,
             )
         )
         receipt["direct_rtsp_recording_bytes_before"] = receipt["camera_recording_bytes_before"][0]
         receipt["direct_rtsp_recording_bytes_after"] = receipt["camera_recording_bytes_after"][0]
         receipt["direct_rtsp_history_decoded_frames"] = receipt["timeline_playback_decoded_frames"]
+        stage = "installed_continuous_person_analytics"
+        analytics_evidence, analytics_event = _installed_analytics_journey(
+            page=page,
+            client=client,
+            camera_id=camera_id,
+            parent=parent,
+            processes=processes,
+            publishers=publishers,
+            source_uri=source_uri,
+            ffmpeg=ffmpeg,
+            helpers=helpers,
+            browser_helpers=browser_helpers,
+            app=app,
+            publisher_credentials=primary_publisher_credentials,
+            diagnostic=nvr_diagnostic,
+        )
+        receipt.update(analytics_evidence)
         if vm_clock_enabled:
             stage = "actual_vm_clock_changes"
             receipt["vm_clock"] = _vm_clock_phase(
@@ -2138,6 +2424,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 publisher=publishers[0],
                 camera_directory=camera_directories[0],
                 publisher_credentials=primary_publisher_credentials,
+                analytics_event=analytics_event,
             )
             receipt["host_clock_step_acceptance"] = True
         stage = "installed_user_administration"
@@ -2181,6 +2468,11 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         ):
             _require(field in admin_evidence, "Installed user administration proof is incomplete")
             receipt[field] = admin_evidence[field]
+        receipt.update(
+            _analytics_permission_journey(
+                runtime, port=port, camera_ids=camera_ids, private_state=admin_private_state
+            )
+        )
         stage = "wall_logout_resource_cleanup"
         browser_helpers._wall_frames(page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS])
         wall_videos = page.locator("#wall-panel video").element_handles()
@@ -2206,6 +2498,13 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         context = None
         browser.close()
         browser = None
+        _require(
+            export_proof["path"].is_file()
+            and hashlib.sha256(export_proof["path"].read_bytes()).hexdigest()
+            == export_proof["sha256"],
+            "Closing the browser removed or changed its normal Windows download",
+        )
+        receipt["export_download_survives_browser_close"] = True
         stage = "window_closing_to_tray"
         api.close(form)
         _wait(
@@ -2245,6 +2544,45 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["tray_camera_status"] = recording_diagnostic["camera_status"]
         receipt["tray_camera_recording"] = recording_diagnostic["camera_recording"]
         receipt["recording_continues_after_browser_and_window_close"] = True
+        stage = "analytics_with_browser_closed"
+        analytics_before = client.json(route + "/analytics")["event_count"]
+        browser_closed_at = datetime.now(UTC)
+        helpers._stop_owned(publishers[0])
+        publishers[0] = _publish_fixture(
+            parent,
+            ffmpeg,
+            source_uri,
+            helpers,
+            color="licensed person",
+            credentials=primary_publisher_credentials,
+        )
+        processes.append(publishers[0])
+
+        def background_person_event():
+            status = client.json(route + "/analytics")
+            events = client.json(route + "/events")["events"]
+            return status["event_count"] > analytics_before and any(
+                datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00"))
+                >= browser_closed_at
+                for event in events
+            )
+
+        _wait(
+            background_person_event,
+            "Person detection continues after the browser closes",
+            process=app,
+            timeout=25,
+        )
+        receipt["analytics_browser_closed_detection"] = True
+        receipt["analytics_background_event_count_before"] = analytics_before
+        receipt["analytics_background_event_count_after"] = client.json(route + "/analytics")[
+            "event_count"
+        ]
+        helpers._stop_owned(publishers[0])
+        publishers[0] = _publish_fixture(
+            parent, ffmpeg, source_uri, helpers, credentials=primary_publisher_credentials
+        )
+        processes.append(publishers[0])
         stage = "double_click_reopens_existing_instance"
         previous_python_pids = {
             process.pid
@@ -2313,9 +2651,49 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         )
         _require(all(path.is_file() for path in saved_files), "Restart removed recorded files")
         receipt["restart_preserves_account_camera_history"] = True
+        restored_analytics = client.json(route + "/analytics")
+        restored_events = client.json(route + "/events")["events"]
+        _require(
+            restored_analytics["enabled"] is True
+            and restored_analytics["confidence_threshold"] == 0.5
+            and any(
+                event["id"] == analytics_event["id"]
+                and event["occurred_at"] == analytics_event["occurred_at"]
+                for event in restored_events
+            ),
+            "Native restart lost saved analytics settings or person events",
+        )
+        receipt["analytics_settings_events_persisted"] = True
+        _require(
+            export_proof["path"].is_file()
+            and hashlib.sha256(export_proof["path"].read_bytes()).hexdigest()
+            == export_proof["sha256"],
+            "Restarting K5 removed or changed the user's downloaded MP4",
+        )
+        receipt["export_download_restart_decoded_frames"] = helpers._decoded_frames(
+            ffprobe, export_proof["path"]
+        )
+        receipt["export_download_survives_product_restart"] = True
         stage = "relaunch_recording_preference_ui"
         browser = playwright.chromium.launch(channel="msedge", headless=True)
         context = browser.new_context(viewport={"width": 1440, "height": 900})
+        stage = "open_saved_windows_download_after_restart"
+        downloaded_page = context.new_page()
+        downloaded_page.goto(export_proof["path"].as_uri(), wait_until="domcontentloaded")
+        downloaded_video = downloaded_page.locator("video")
+        downloaded_video.wait_for(state="visible", timeout=10_000)
+        downloaded_video.evaluate("video => { video.muted=true; return video.play(); }")
+        downloaded_page.wait_for_function(
+            """() => {
+              const video=document.querySelector('video');
+              return video?.readyState>=2 && video.videoWidth===320 && video.videoHeight===240 &&
+                video.getVideoPlaybackQuality().totalVideoFrames>=4;
+            }""",
+            timeout=10_000,
+        )
+        downloaded_page.close()
+        receipt["export_download_opened_in_edge"] = True
+        stage = "relaunch_recording_preference_ui"
         page = context.new_page()
         page.set_default_timeout(15_000)
         page.goto(client.origin + "/operator/")
@@ -2503,10 +2881,10 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     _require(not cohort.console_seen and not cohort.failed, "Desktop opened a console window")
     elapsed = time.monotonic() - started
     _require(
-        elapsed < (360 if vm_clock_enabled else 240),
+        elapsed < 360,
         "Desktop qualification exceeded its bounded VM duration"
         if vm_clock_enabled
-        else "Desktop qualification exceeded its bounded four-minute duration",
+        else "Desktop qualification exceeded its bounded six-minute duration",
     )
     receipt["duration_seconds"] = round(elapsed, 2)
     receipt["owned_cleanup"] = True

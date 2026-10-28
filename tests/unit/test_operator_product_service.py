@@ -908,8 +908,8 @@ def _product_application(
     class Cameras:
         closed = False
 
-        def __init__(self, *_args, **_kwargs):
-            pass
+        def __init__(self, root, *_args, **_kwargs):
+            self._root = root
 
         def list_sources(self):
             return ()
@@ -1016,7 +1016,7 @@ def test_rejected_optional_person_configuration_does_not_prevent_recording_start
     def refuse(_environment):
         raise person_module.OperatorPersonConfigurationError("Person configuration was refused.")
 
-    monkeypatch.setattr(person_module, "load_person_configuration", refuse)
+    monkeypatch.setattr(person_module, "load_installed_person_configuration", refuse)
     app, calls = _product_application(native, tmp_path, monkeypatch)
     with TestClient(app) as client:
         assert client.get("/api/v1/health").status_code == 200
@@ -1041,7 +1041,10 @@ def test_configured_person_broker_closes_even_when_recording_startup_fails(
         async def aclose(self):
             closed.append(True)
 
-    monkeypatch.setattr(person_module, "load_person_configuration", lambda _environment: object())
+    monkeypatch.setattr(
+        person_module, "load_installed_person_configuration", lambda _environment: object()
+    )
+    monkeypatch.setenv(person_module.PERSON_CONFIG_ENV, "explicit-engineering-test-configuration")
     monkeypatch.setattr(broker_module, "OperatorAnalyticsBroker", Broker)
     app, calls = _product_application(native, tmp_path, monkeypatch, fail_start=True)
     with pytest.raises(OperatorProductError, match="startup"):

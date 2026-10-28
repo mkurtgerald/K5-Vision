@@ -16,8 +16,14 @@ on:
       - tests/unit/test_windows_vm_clock*.py
       - scripts/verify_windows_vm_clock_receipt.py
       - tests/integration/test_operator_beta_browser.py
+      - tests/integration/recorded_history_fixture.py
+      - scripts/provision_operator_person_acceptance.py
       - tests/integration/test_operator_admin_browser.py
       - tests/unit/test_operator_admin*.py
+      - tests/unit/test_operator_events*.py
+      - tests/unit/test_operator_exports.py
+      - tests/unit/test_operator_analytics_ui.py
+      - tests/unit/test_operator_continuous_playback_ui.py
       - tests/test_user_admin_api.py
       - tests/test_user_registry.py
       - tests/integration/onvif_camera_fixture.py
@@ -76,13 +82,13 @@ jobs:
         if: matrix.lane == 'onvif'
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_rtsp.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_admin_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_rtsp.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_admin_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py tests/unit/test_operator_analytics_ui.py tests/unit/test_operator_continuous_playback_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify camera administration and atomic reconnect on Windows
         if: matrix.lane == 'cameras'
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_admin_api.py tests/unit/test_operator_product_state.py tests/test_device_registry.py tests/test_user_registry.py tests/test_user_admin_api.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_admin_api.py tests/unit/test_operator_product_state.py tests/unit/test_operator_events.py tests/unit/test_operator_events_api.py tests/unit/test_operator_exports.py tests/test_device_registry.py tests/test_user_registry.py tests/test_user_admin_api.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   native-desktop:
@@ -112,6 +118,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Desktop development install failed" }
       - name: Provision immutable native acceptance tools
         uses: ./.github/actions/provision-operator-tools
+      - name: Provision the admitted public person fixture for installed analytics
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Installed analytics fixture admission failed" }
       - name: Build exact offline operator runtime and file manifest
         shell: pwsh
         run: |
@@ -210,6 +221,23 @@ jobs:
               $witness.receipt.actual_recording_export -ne $true) {
             throw "Four-camera surveillance workspace qualification is incomplete"
           }
+          foreach ($feature in @(
+            'historical_navigation_default_24h', 'historical_navigation_real_media',
+            'playback_rapid_seek_latest_wins', 'playback_controls_and_zoom',
+            'playback_contiguous_chunk_handoff', 'playback_gap_requires_explicit_navigation',
+            'playback_export_selection_independent', 'export_normal_windows_download',
+            'export_download_survives_browser_close', 'export_download_survives_product_restart',
+            'export_download_opened_in_edge',
+            'product_analytics_enablement', 'analytics_bundled_native_inference',
+            'analytics_gui_configuration', 'analytics_person_event_recorded',
+            'analytics_event_utc_playback', 'analytics_public_fixture_only',
+            'analytics_browser_closed_detection', 'analytics_role_camera_permissions',
+            'analytics_settings_events_persisted'
+          )) {
+            if ($witness.receipt.$feature -isnot [bool] -or $witness.receipt.$feature -ne $true) {
+              throw "Executed playback, export and analytics qualification is incomplete: $feature"
+            }
+          }
           $release = Join-Path $env:GITHUB_WORKSPACE "desktop-build/release"
           New-Item -ItemType Directory -Path $release | Out-Null
           Copy-Item -LiteralPath $env:K5_DESKTOP_SETUP -Destination (Join-Path $release "K5VisionSetup.exe")
@@ -230,6 +258,7 @@ jobs:
             onvif_camera_onboarding=$true; manual_stream_uri_required=$false
             direct_rtsp_enrollment=$true
             admin_user_management=$true; role_permissions=$true; camera_access_controls=$true
+            person_analytics_bundled=$true; background_person_events=$true
             surveillance_workspace=$true; four_camera_wall=$true; actual_recording_export=$true
           }
           $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $release "desktop-package.json") -Encoding utf8
@@ -279,6 +308,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "VM test dependency install failed" }
       - name: Provision all pinned recording tools before changing guest time
         uses: ./.github/actions/provision-operator-tools
+      - name: Provision the admitted public person fixture before changing guest time
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Installed analytics fixture admission failed" }
       - name: Download the installer exercised by the first VM
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:

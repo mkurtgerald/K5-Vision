@@ -1,13 +1,16 @@
 # Native Windows desktop dependency review
 
-Reviewed on 2026-10-13; ONVIF source slice reviewed on 2026-10-18. This record
-covers the recording-first desktop package:
+Reviewed on 2026-10-13; ONVIF source slice reviewed on 2026-10-18; installed
+person-analytics inputs reviewed on 2026-10-28. This record covers the desktop package:
 an embedded CPython runtime, an exact minimal Python operator environment,
 official first-run native-worker provisioning, and an Inno Setup installer. The user installs
 and starts the application through Windows graphical controls. First launch
 requires Internet access to the pinned official worker downloads; subsequent
-launches reuse the admitted private copies. Development tools and separately
-configured analytics remain outside this package.
+launches reuse the admitted private copies. The independent OpenVINO person
+detector, OpenCV decoder, exact model and native notices/sources are bundled;
+development tools and the separate Analytics Lab engineering wrapper remain
+outside this package. See `WINDOWS_PERSON_ANALYTICS_DEPENDENCIES.md` for the exact
+model/native source and relinking record.
 
 ## CPython runtime
 
@@ -65,6 +68,10 @@ adds no distribution to the exact list below.
 | typing-extensions | 4.16.0 | PSF-2.0 |
 | typing-inspection | 0.4.4 | MIT |
 | uvicorn | 0.54.0 | BSD-3-Clause |
+| OpenVINO | 2026.3.1 | Apache-2.0 and retained native notices |
+| NumPy | 2.2.6 | BSD-3-Clause and retained native/runtime notices |
+| OpenVINO telemetry | 2025.2.0 | Apache-2.0 |
+| OpenCV headless | 5.0.0.93 | MIT/Apache-2.0; FFmpeg LGPL-2.1-or-later and retained native notices |
 
 These declarations were checked against the exact wheel metadata and included
 license files. Click 8.5.0 declares no runtime `Requires-Dist`, so colorama is
@@ -128,11 +135,14 @@ These packages and resources are excluded rather than relicensed by K5.
   acceptance. Earlier manual-enrollment desktop evidence does not qualify the
   new onboarding flow or establish compatibility with a physical camera.
 
-OpenVINO, NumPy, OpenCV, analytics model weights, the Analytics Lab engineering
-wrapper, FFmpeg, GStreamer, Playwright, and browser binaries are not included in
-this desktop recording package. Installing an optional analytics provider later
-requires the separate model/native/transitive review already described in
-`OPERATOR_PERSON_DETECTION_REVIEW.md`.
+The installed person-event detector includes the independently reviewed
+OpenVINO/NumPy/OpenCV runtime, Apache-2.0 person model, runtime-loaded LGPL
+FFmpeg decoder, unchanged notices and corresponding decoder sources described
+in `WINDOWS_PERSON_ANALYTICS_DEPENDENCIES.md`. No Analytics Lab engineering
+wrapper, standalone FFmpeg executable, GStreamer, Playwright or browser binary
+is included in the product runtime. The earlier view-only candidate review in
+`OPERATOR_PERSON_DETECTION_REVIEW.md` remains a historical engineering scope;
+installed product qualification requires the actual shipped runtime.
 
 ## Inno Setup installer
 

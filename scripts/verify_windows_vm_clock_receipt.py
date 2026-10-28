@@ -30,11 +30,21 @@ _TRUE = (
     "direct_rtsp_fresh_enrollment direct_rtsp_multi_channel_same_endpoint "
     "admin_user_management role_permissions camera_access_controls admin_user_creation "
     "admin_bootstrap_password_change admin_password_reset admin_disable_reenable "
-    "admin_live_media_revocation admin_audit_visible admin_state_persisted"
+    "admin_live_media_revocation admin_audit_visible admin_state_persisted "
+    "historical_navigation_default_24h historical_navigation_real_media "
+    "playback_rapid_seek_latest_wins playback_controls_and_zoom "
+    "playback_contiguous_chunk_handoff playback_gap_requires_explicit_navigation "
+    "playback_export_selection_independent export_normal_windows_download "
+    "export_download_survives_browser_close export_download_survives_product_restart "
+    "export_download_opened_in_edge "
+    "product_analytics_enablement analytics_bundled_native_inference analytics_gui_configuration "
+    "analytics_person_event_recorded analytics_event_utc_playback analytics_public_fixture_only "
+    "analytics_browser_closed_detection analytics_role_camera_permissions "
+    "analytics_settings_events_persisted"
 ).split()
 _FALSE = (
     "physical_camera_acceptance capacity_acceptance endurance_acceptance windows_service "
-    "mocked_gui user_terminal_required"
+    "mocked_gui user_terminal_required analytics_mock_inference analytics_accuracy_acceptance"
 ).split()
 _UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z\Z")
 _OFFSETS = (172800, -172800)
@@ -121,6 +131,32 @@ def _nvr_journey(receipt):
     ):
         _integer(receipt.get(field), minimum, maximum)
     _require(receipt["resumed_recording_bytes"] > receipt["paused_recording_bytes"])
+    for field, expected in (
+        ("historical_recorded_seconds", 10800),
+        ("historical_recording_file_count", 18),
+        ("historical_recording_gap_seconds", 600),
+        ("historical_fixture_fps", 1),
+    ):
+        _require(type(receipt.get(field)) is int and receipt[field] == expected)
+    _number(receipt.get("playback_chunk_seconds"), 60, 300)
+    _integer(receipt.get("playback_continuation_decoded_frames"), 4, 100000)
+    _integer(receipt.get("export_download_restart_decoded_frames"), 4, 100000)
+    _require(receipt.get("analytics_model_revision") == "6697dead54ed1cdd664b0313189c2cb52ee6335e")
+    for field, minimum, maximum in (
+        ("analytics_event_playback_decoded_frames", 4, 100000),
+        ("analytics_positive_person_count", 1, 32),
+        ("analytics_processed_frames", 1, 100000),
+        ("analytics_background_event_count_before", 1, 100000),
+        ("analytics_background_event_count_after", 2, 100000),
+    ):
+        _integer(receipt.get(field), minimum, maximum)
+    _require(
+        receipt["analytics_background_event_count_after"]
+        > receipt["analytics_background_event_count_before"]
+    )
+    denials = receipt.get("analytics_denied_http_statuses")
+    _require(type(denials) is list and all(type(value) is int for value in denials))
+    _require(denials == [404, 404, 403, 404, 404, 403, 401, 401])
 
 
 def _utc(value):
@@ -209,6 +245,7 @@ def _vm_clock(value, *, expected_head, installer_sha256):
     _require(value.get("head_sha") == expected_head)
     _require(value.get("installer_sha256") == installer_sha256)
     _require(value.get("method") == "windows_SetSystemTime")
+    _require(value.get("analytics_events_utc_preserved") is True)
     _require(value.get("simulated_time") is False and value.get("browser_clock_only") is False)
     offsets = value.get("offset_seconds")
     _require(type(offsets) is list and len(offsets) == 2)
@@ -247,6 +284,8 @@ def _vm_clock(value, *, expected_head, installer_sha256):
             "same_human_session",
             "recorder_utc_verified",
             "history_utc_query_verified",
+            "analytics_event_utc_preserved",
+            "analytics_event_recording_covered",
             "closed_segment_hashes_preserved",
             "utc_restored",
         ):

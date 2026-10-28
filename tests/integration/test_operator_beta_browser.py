@@ -23,7 +23,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import quote, urlsplit
 
 import pytest
 
@@ -619,6 +619,8 @@ def _open_camera_recordings(page, device_id):
     tile = page.locator(f'#wall-panel [data-camera-id="{device_id}"]')
     tile.locator("[data-wall-action='recordings']").click()
     page.locator("#history-panel").wait_for(state="visible")
+    page.locator(".history-item").first.wait_for(state="visible", timeout=15_000)
+    page.wait_for_function("() => !document.getElementById('load-history').disabled")
 
 
 def _wall_frames(page, device_ids, colors, *, layout=None, diagnostic=None):
@@ -775,6 +777,312 @@ def test_timeline_clip_selects_playable_span_after_short_recording_fragment(inte
     assert _playable_timeline_span(intervals) == expected
 
 
+def _seed_recorded_history(recording_directory, ffmpeg, parent, *, color="red"):
+    """Create real donor-readable historical media, not a mocked history response.
+
+    Eighteen ten-minute files provide three hours of decodable footage with an
+    actual ten-minute gap. One frame per second keeps the finite fixture small;
+    the resulting navigation proof makes no recording-endurance assertion.
+    """
+    template = parent / f"historical {color} fragmented H264.mp4"
+    generated = subprocess.run(
+        [
+            str(ffmpeg),
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={color}:size=320x240:rate=1",
+            "-t",
+            "600",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "1",
+            "-bf",
+            "0",
+            "-movflags",
+            "empty_moov+default_base_moof+frag_keyframe",
+            str(template),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=20,
+        check=False,
+    )
+    _require(generated.returncode == 0, "Historical recording generation failed")
+    spec = importlib.util.spec_from_file_location(
+        "k5_recorded_history_fixture", Path(__file__).with_name("recorded_history_fixture.py")
+    )
+    _require(spec is not None and spec.loader is not None, "Historical archive helper was absent")
+    archive = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(archive)
+    payload = archive.explicit_recording_samples(template.read_bytes())
+    _require(0 < len(payload) <= 1024**2, "Historical recording fixture exceeded its bound")
+    first = (datetime.now(UTC) - timedelta(hours=4)).replace(microsecond=0)
+    recording_directory.mkdir(parents=True, exist_ok=True)
+    files = []
+    for index in range(18):
+        offset = index * 600 + (600 if index >= 12 else 0)
+        timestamp = first + timedelta(seconds=offset)
+        destination = recording_directory / (timestamp.strftime("%Y-%m-%d_%H-%M-%S-%f_%z") + ".mp4")
+        with destination.open("xb") as output:
+            if os.name == "posix":
+                os.fchmod(output.fileno(), 0o600)
+            output.write(payload)
+        files.append(destination)
+    return {
+        "first": first,
+        "last": first + timedelta(seconds=19 * 600),
+        "gap_start": first + timedelta(seconds=12 * 600),
+        "gap_end": first + timedelta(seconds=13 * 600),
+        "files": files,
+        "recorded_seconds": 18 * 600,
+    }
+
+
+def _normal_download_directory(page, directory):
+    """Let the browser save its suggested name without an automation save_as.
+
+    Bind the actual browser context explicitly: an unscoped CDP command changes
+    the default context and can otherwise leave this page writing elsewhere.
+    """
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    session = page.context.new_cdp_session(page)
+    target = session.send("Target.getTargetInfo")["targetInfo"]
+    context_id = target.get("browserContextId")
+    _require(isinstance(context_id, str) and context_id, "Download browser context was absent")
+    session.send(
+        "Browser.setDownloadBehavior",
+        {
+            "behavior": "allow",
+            "browserContextId": context_id,
+            "downloadPath": str(directory),
+            "eventsEnabled": True,
+        },
+    )
+    # Chromium associates download permission with this observer session.
+    # Detaching before completion cancels the user's actual file transfer.
+    return session
+
+
+def _recorded_utc_state(page):
+    return page.locator("#playback-video").evaluate(
+        """video => ({
+          start:Date.parse(video.dataset.utcStart || ''),
+          end:Date.parse(video.dataset.utcEnd || ''),
+          utc:window.K5Playback?.getUTC(),
+          frames:video.getVideoPlaybackQuality().totalVideoFrames,
+          paused:video.paused, rate:video.playbackRate, source:video.getAttribute('src'),
+          ready_state:video.readyState, network_state:video.networkState,
+          width:video.videoWidth, height:video.videoHeight, current_time:video.currentTime,
+          duration:Number.isFinite(video.duration)?video.duration:null,
+          error_code:video.error?.code??null
+        })"""
+    )
+
+
+def _seek_recorded_utc(page, timestamp):
+    page.locator("#playback-start").fill(_datetime_local_value(timestamp))
+    page.locator("#play-recording").click()
+
+
+def _navigation_decode(page, color, diagnostic):
+    try:
+        return _decoded_color(page, "playback-video", color)
+    except BaseException:
+        state = _recorded_utc_state(page)
+        diagnostic["navigation_player"] = {
+            key: state[key]
+            for key in (
+                "frames",
+                "paused",
+                "rate",
+                "ready_state",
+                "network_state",
+                "width",
+                "height",
+                "current_time",
+                "duration",
+                "error_code",
+            )
+        }
+        raise
+
+
+def _recording_navigation_journey(page, *, device_id, seeded, color="red", diagnostic=None):
+    """Use normal controls against hours of real closed recording files."""
+    __tracebackhide__ = True
+    diagnostic = {} if diagnostic is None else diagnostic
+    diagnostic["navigation_stage"] = "default_24_hour_inventory"
+    _open_camera_recordings(page, device_id)
+    page.locator("#last-24-hours").click()
+    page.locator("#recording-timeline select.k5-timeline-scale").select_option("86400000")
+    first_ms = seeded["first"].timestamp() * 1000
+    gap_ms = seeded["gap_start"].timestamp() * 1000
+    after_gap_ms = seeded["gap_end"].timestamp() * 1000
+    page.wait_for_function(
+        """({first,last,seconds}) => {
+          const root=document.getElementById('recording-timeline');
+          const slider=root?.querySelector('[role=slider]');
+          const spans=Array.from(root?.querySelectorAll('.k5-timeline-recording') || [])
+            .map(span => ({start:Number(span.dataset.start),end:Number(span.dataset.end)}))
+            .filter(span => span.start>=first-1000 && span.end<=last+1000);
+          return Number(slider?.getAttribute('aria-valuemax'))-
+              Number(slider?.getAttribute('aria-valuemin'))===86400000 &&
+            spans.some(span => Math.abs(span.start-first)<1000) &&
+            spans.reduce((total,span) => total+span.end-span.start,0)>=seconds*1000-1000;
+        }""",
+        arg={
+            "first": first_ms,
+            "last": seeded["last"].timestamp() * 1000,
+            "seconds": seeded["recorded_seconds"],
+        },
+        timeout=15_000,
+    )
+    timeline_bounds = page.locator("#recording-timeline").bounding_box()
+    diagnostic["navigation_timeline_height"] = (
+        round(timeline_bounds["height"], 2) if timeline_bounds else None
+    )
+    diagnostic["navigation_visible_gap_count"] = page.locator(".history-gap").count()
+    _require(
+        timeline_bounds and timeline_bounds["height"] <= 190,
+        "Recording timeline consumed an oversized part of the playback workspace",
+    )
+    _require(page.locator(".history-gap").count() >= 1, "Historical footage gap was hidden")
+
+    diagnostic["navigation_stage"] = "rapid_direct_seeks"
+    jumps = (
+        seeded["first"] + timedelta(minutes=95),
+        seeded["first"] + timedelta(minutes=5),
+        seeded["first"] + timedelta(minutes=65),
+    )
+    for selected in jumps:
+        _seek_recorded_utc(page, selected)
+    final_ms = jumps[-1].timestamp() * 1000
+    diagnostic["navigation_operation"] = "last_rapid_seek_metadata"
+    page.wait_for_function(
+        """chosen => Math.abs(Date.parse(document.getElementById('playback-video')
+          .dataset.utcStart || '')-chosen)<1000""",
+        arg=final_ms,
+        timeout=15_000,
+    )
+    diagnostic["navigation_operation"] = "last_rapid_seek_decode"
+    _navigation_decode(page, color, diagnostic)
+    final_state = _recorded_utc_state(page)
+    _require(
+        final_ms <= final_state["utc"] < final_ms + 15_000,
+        "A stale playback request overrode the final rapid seek",
+    )
+    source_before_export = final_state["source"]
+    page.locator("#playback-duration").fill("2")
+    _require(
+        _recorded_utc_state(page)["source"] == source_before_export,
+        "Changing the export range replaced the playback stream",
+    )
+
+    diagnostic["navigation_stage"] = "controls_and_zoom"
+    page.locator("#playback-toggle").click()
+    _require(_recorded_utc_state(page)["paused"], "Playback pause control did not pause video")
+    page.locator("#playback-toggle").click()
+    page.wait_for_function("() => !document.getElementById('playback-video').paused")
+    page.locator("#recording-timeline select.k5-timeline-scale").select_option("60000")
+    slider = page.locator("#recording-timeline [role='slider']")
+    _require(
+        float(slider.get_attribute("aria-valuemax")) - float(slider.get_attribute("aria-valuemin"))
+        == 60_000,
+        "Timeline zoom did not change the visible recording scale",
+    )
+    before_skip = _recorded_utc_state(page)["utc"]
+    page.locator("#playback-forward").click()
+    page.wait_for_function(
+        """before => {
+          const start=Date.parse(document.getElementById('playback-video').dataset.utcStart || '');
+          return start>=before+9000 && start<=before+12000;
+        }""",
+        arg=before_skip,
+    )
+    _navigation_decode(page, color, diagnostic)
+    before_skip = _recorded_utc_state(page)["utc"]
+    page.locator("#playback-back").click()
+    page.wait_for_function(
+        """before => {
+          const start=Date.parse(document.getElementById('playback-video').dataset.utcStart || '');
+          return start>=before-11000 && start<=before-8000;
+        }""",
+        arg=before_skip,
+    )
+    _navigation_decode(page, color, diagnostic)
+
+    diagnostic["navigation_stage"] = "bounded_chunk_continuation"
+    initial = _recorded_utc_state(page)
+    _require(
+        60_000 <= initial["end"] - initial["start"] <= 300_000,
+        "Playback was constrained by the two-second export selection",
+    )
+    page.locator("#playback-speed").select_option("4")
+    page.wait_for_function("() => document.getElementById('playback-video').playbackRate===4")
+    page.wait_for_function(
+        """priorEnd => {
+          const video=document.getElementById('playback-video');
+          const start=Date.parse(video.dataset.utcStart || '');
+          return start>=priorEnd-1000 && start<=priorEnd+1000 &&
+            !video.paused && video.readyState>=2 &&
+            video.getVideoPlaybackQuality().totalVideoFrames>=4;
+        }""",
+        arg=initial["end"],
+        timeout=45_000,
+    )
+    continued = _recorded_utc_state(page)
+    _require(
+        initial["end"] <= continued["utc"] < initial["end"] + 30_000,
+        "Playback did not continue at the actual recorded UTC boundary",
+    )
+    _navigation_decode(page, color, diagnostic)
+    page.locator("#playback-speed").select_option("1")
+
+    diagnostic["navigation_stage"] = "explicit_gap_and_next_footage"
+    _seek_recorded_utc(page, seeded["gap_start"] + timedelta(minutes=5))
+    page.wait_for_function(
+        """() => !document.getElementById('playback-video').getAttribute('src') &&
+          /No playable recording|gap/i.test(
+            document.getElementById('playback-message').textContent)"""
+    )
+    _require(_recorded_utc_state(page)["paused"], "Seeking a recording gap silently played footage")
+    page.locator("#playback-next").click()
+    page.wait_for_function(
+        """chosen => Math.abs(Date.parse(document.getElementById('playback-video')
+          .dataset.utcStart || '')-chosen)<1000""",
+        arg=after_gap_ms,
+    )
+    _navigation_decode(page, color, diagnostic)
+    diagnostic["navigation_stage"] = "complete"
+    return {
+        "historical_navigation_default_24h": True,
+        "historical_navigation_real_media": True,
+        "playback_rapid_seek_latest_wins": True,
+        "playback_controls_and_zoom": True,
+        "playback_contiguous_chunk_handoff": True,
+        "playback_gap_requires_explicit_navigation": True,
+        "playback_export_selection_independent": True,
+        "historical_recorded_seconds": seeded["recorded_seconds"],
+        "historical_recording_file_count": len(seeded["files"]),
+        "historical_recording_gap_seconds": int((after_gap_ms - gap_ms) / 1000),
+        "historical_fixture_fps": 1,
+        "playback_chunk_seconds": round((initial["end"] - initial["start"]) / 1000, 3),
+        "playback_continuation_decoded_frames": continued["frames"],
+    }
+
+
 def _timeline_play(page, color, *, device_id, diagnostic=None, not_before=None):
     """Seek via actual timeline pointer coordinates, then decode selected video."""
     __tracebackhide__ = True
@@ -789,11 +1097,19 @@ def _timeline_play(page, color, *, device_id, diagnostic=None, not_before=None):
         timeline_history_error_code=None,
         timeline_reason="waiting_recorded_spans",
     )
-    available = page.locator("#recording-timeline .k5-timeline-recording")
-    available.first.wait_for(state="attached", timeout=15_000)
-    intervals = available.evaluate_all("""ranges => ranges.map(range => [
-      Number(range.getAttribute('data-start')),Number(range.getAttribute('data-end'))
-    ])""")
+    page.locator("#recording-timeline select.k5-timeline-scale").select_option("86400000")
+    # Observe inventory and readiness atomically. Starting a second asynchronous
+    # history refresh here could clear the first response between an attached
+    # wait and evaluate_all, concealing the actual playback/export result.
+    intervals = page.wait_for_function(
+        """() => {
+          const ranges=Array.from(document.querySelectorAll(
+            '#recording-timeline .k5-timeline-recording'));
+          if(document.getElementById('load-history').disabled || !ranges.length) return false;
+          return ranges.map(range => [Number(range.dataset.start),Number(range.dataset.end)]);
+        }""",
+        timeout=15_000,
+    ).json_value()
     diagnostic.update(
         timeline_span_count=len(intervals), timeline_reason="invalid_recorded_span_metadata"
     )
@@ -816,75 +1132,31 @@ def _timeline_play(page, color, *, device_id, diagnostic=None, not_before=None):
     _require(selected is not None, "Timeline fixture has no playable four-second interval")
     first, last = selected
     diagnostic["timeline_selected_span_seconds"] = round((last - first) / 1000, 3)
-    # Narrow the actual UTC form to make a seconds-long fixture selectable by
-    # a real pointer instead of seeking a sub-pixel range in a 24-hour window.
-    start = datetime.fromtimestamp(first / 1000, UTC) - timedelta(seconds=2)
-    end = datetime.fromtimestamp(last / 1000, UTC) + timedelta(seconds=2)
-    diagnostic["timeline_reason"] = "filling_utc_window"
-    page.locator("#history-start").fill(_datetime_local_value(start))
-    page.locator("#history-end").fill(_datetime_local_value(end))
-    diagnostic["timeline_reason"] = "waiting_history_response"
-    expected_start, expected_end = (
-        datetime.fromisoformat(page.locator(selector).input_value()).replace(tzinfo=UTC)
-        for selector in ("#history-start", "#history-end")
+    # Exercise the product's direct UTC jump and actual zoom control. Editing
+    # the history form to a four-second fixture window previously concealed
+    # the real 24-hour navigation problem reported by an operator.
+    chosen = first + 1000
+    diagnostic["timeline_reason"] = "direct_utc_jump"
+    page.locator("#playback-start").fill(
+        _datetime_local_value(datetime.fromtimestamp(chosen / 1000, UTC))
     )
-    expected_path = f"/api/v1/operator/cameras/{quote(str(device_id), safe='')}/history"
-
-    def selected_history_response(response):
-        parsed = urlsplit(response.url)
-        if parsed.path != expected_path or response.request.method != "GET":
-            return False
-        query = parse_qs(parsed.query)
-        if set(query) != {"start", "end"} or any(len(value) != 1 for value in query.values()):
-            return False
-        try:
-            observed = tuple(
-                datetime.fromisoformat(query[key][0].replace("Z", "+00:00"))
-                for key in ("start", "end")
-            )
-        except ValueError:
-            return False
-        return observed == (expected_start, expected_end)
-
-    diagnostic["timeline_reason"] = "waiting_selected_history_response"
-    with page.expect_response(selected_history_response) as loaded:
-        page.locator("#load-history").click()
-    error_code = "none"
-    if loaded.value.status != 200:
-        error_code = "unrecognized_error_response"
-        try:
-            length = loaded.value.header_value("content-length")
-            if length is not None and 0 < int(length) <= 1024:
-                error_code = {
-                    "Media unavailable": "media_unavailable",
-                    "Playback inventory unavailable": "playback_inventory_unavailable",
-                }.get(loaded.value.json().get("detail"), "unrecognized_error_response")
-        except Exception:
-            pass
-    diagnostic.update(
-        timeline_history_http_status=loaded.value.status,
-        timeline_history_response_bound=True,
-        timeline_history_error_code=error_code,
-        timeline_reason="history_http_failed",
-    )
-    _require(loaded.value.status == 200, "Timeline UTC window could not be loaded")
-    diagnostic["timeline_reason"] = "waiting_history_window"
+    page.locator("#play-recording").click()
+    _decoded_color(page, "playback-video", color)
+    diagnostic["timeline_reason"] = "zooming_actual_timeline"
+    page.locator("#recording-timeline select.k5-timeline-scale").select_option("60000")
     slider = page.locator("#recording-timeline [role='slider']")
     slider.wait_for(state="visible")
     page.wait_for_function(
-        """({first,last}) => {
+        """chosen => {
           const slider=document.querySelector('#recording-timeline [role=slider]');
-          return Number(slider?.getAttribute('aria-valuemin'))===first &&
-            Number(slider?.getAttribute('aria-valuemax'))===last;
+          const first=Number(slider?.getAttribute('aria-valuemin'));
+          const last=Number(slider?.getAttribute('aria-valuemax'));
+          return last-first===60000 && first<=chosen && last>chosen;
         }""",
-        arg={
-            "first": int(start.replace(microsecond=0).timestamp() * 1000),
-            "last": int(end.replace(microsecond=0).timestamp() * 1000),
-        },
+        arg=chosen,
     )
     minimum = float(slider.get_attribute("aria-valuemin"))
     maximum = float(slider.get_attribute("aria-valuemax"))
-    chosen = first + 1000
     bounds = slider.bounding_box()
     diagnostic["timeline_reason"] = "timeline_track_unavailable"
     _require(bounds and maximum > minimum, "Actual timeline track is unavailable")
@@ -924,15 +1196,103 @@ def _timeline_play(page, color, *, device_id, diagnostic=None, not_before=None):
     return frames
 
 
-def _download_recording(page, ffprobe, export_path, helpers, color):
-    """Save the actual browser download and independently decode its MP4 file."""
+def _download_recording(
+    page,
+    ffprobe,
+    export_path,
+    helpers,
+    color,
+    *,
+    normal_directory=None,
+    evidence=None,
+    diagnostic=None,
+):
+    """Independently decode the actual browser download, including normal saves."""
     __tracebackhide__ = True
+    diagnostic = {} if diagnostic is None else diagnostic
+
+    def export_response(response):
+        path = urlsplit(response.url).path
+        if "/exports" not in path or not path.startswith("/api/v1/operator/cameras/"):
+            return
+        diagnostic["export_http_status"] = response.status
+        try:
+            value = response.json()
+            status = value.get("status")
+            error = value.get("error")
+            diagnostic["export_job_status"] = (
+                status if status in {"queued", "preparing", "ready", "failed"} else "unknown"
+            )
+            diagnostic["export_job_error"] = (
+                error
+                if error
+                in {
+                    None,
+                    "export_preparation_failed",
+                    "export_file_unavailable",
+                    "export_busy",
+                    "export_recording_gap",
+                }
+                else "unclassified"
+            )
+            diagnostic["export_job_bytes"] = (
+                value.get("bytes") if type(value.get("bytes")) is int else None
+            )
+            phase = value.get("phase")
+            diagnostic["export_job_phase"] = (
+                phase
+                if phase in {"queued", "downloading", "validating", "persisting", "ready", "failed"}
+                else "unknown"
+            )
+        except Exception:
+            diagnostic["export_response_probe_failed"] = True
+
     page.locator("#playback-duration").fill("2")
-    with page.expect_download(timeout=20_000) as pending:
-        page.locator("#download-recording").click()
+    download_observer = None
+    if normal_directory is not None:
+        download_observer = _normal_download_directory(page, normal_directory)
+    page.on("response", export_response)
+    try:
+        diagnostic["export_stage"] = "waiting_actual_browser_download"
+        with page.expect_download(timeout=45_000) as pending:
+            page.locator("#download-recording").click()
+            page.wait_for_function(
+                """() => document.getElementById('download-recording')
+                  .getAttribute('href')?.startsWith('/media/exports/') ||
+                  document.getElementById('export-message').classList.contains('error')""",
+                timeout=30_000,
+            )
+            _require(
+                not page.locator("#export-message").evaluate(
+                    "message => message.classList.contains('error')"
+                ),
+                "Export preparation did not produce a ready browser download",
+            )
+    except BaseException:
+        link = page.locator("#download-recording")
+        diagnostic["export_ready_link"] = (link.get_attribute("href") or "").startswith(
+            "/media/exports/"
+        )
+        diagnostic["export_control_disabled"] = link.get_attribute("aria-disabled") == "true"
+        raise
+    finally:
+        page.remove_listener("response", export_response)
     download = pending.value
     _require(download.failure() is None, "Actual recording download failed")
-    download.save_as(export_path)
+    if normal_directory is None:
+        download.save_as(export_path)
+    else:
+        filename = download.suggested_filename
+        _require(
+            isinstance(filename, str)
+            and re.fullmatch(r"K5-recording-[A-Za-z0-9T_.-]+\.mp4", filename) is not None,
+            "Browser export filename was invalid",
+        )
+        export_path = normal_directory / filename
+        _require(export_path.is_file(), "Browser Downloads entry did not create its named file")
+        _require(not list(normal_directory.glob("*.crdownload")), "Browser export remained partial")
+    if download_observer is not None:
+        download_observer.detach()
     _require(0 < export_path.stat().st_size <= 16 * 1024**2, "Recording export exceeded its bound")
     frames = helpers._decoded_frames(ffprobe, export_path)
     ffmpeg = helpers._tool("K5_DONOR_FFMPEG")
@@ -969,6 +1329,16 @@ def _download_recording(page, ffprobe, export_path, helpers, color):
         }.get(color, False),
         "Saved export did not match the selected camera",
     )
+    if evidence is not None:
+        evidence.update(
+            path=export_path,
+            sha256=hashlib.sha256(export_path.read_bytes()).hexdigest(),
+            bytes=export_path.stat().st_size,
+            url=download.url,
+            decoded_frames=frames,
+            normal_browser_save=normal_directory is not None,
+        )
+    diagnostic["export_stage"] = "saved_and_decoded"
     return frames
 
 
@@ -1255,6 +1625,8 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
                     "timeline.css": "text/css",
                     "admin.js": "application/javascript",
                     "admin.css": "text/css",
+                    "analytics.js": "application/javascript",
+                    "analytics.css": "text/css",
                 }[name]
                 route.fulfill(
                     status=200, content_type=content_type, body=(assets / name).read_text()
@@ -2264,13 +2636,42 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             label="Recording finalization",
             product=product,
         )
+        stage = "historical_recording_navigation"
+        selected_source = next(
+            source
+            for source in product.service._sources
+            if str(source.binding.device_id) == camera_ids[0]
+        )
+        seeded_history = _seed_recorded_history(
+            product.service.recording_root / selected_source.binding.path_name,
+            ffmpeg,
+            private,
+        )
+        receipt.update(
+            _recording_navigation_journey(
+                page,
+                device_id=camera_ids[0],
+                seeded=seeded_history,
+                diagnostic=history_diagnostic,
+            )
+        )
         playback_frames, playback_urls = [], []
         export_frames = []
         for index, (_name, _, color) in enumerate(_CAMERAS):
             stage = "history_inventory"
             _open_camera_recordings(page, camera_ids[index])
             page.locator(".history-item").first.wait_for(state="visible", timeout=15_000)
-            page.locator("#last-24-hours").click()
+            with page.expect_response(
+                lambda response, camera_id=camera_ids[index]: (
+                    response.request.method == "GET"
+                    and urlsplit(response.url).path
+                    == f"/api/v1/operator/cameras/{camera_id}/history"
+                )
+            ) as full_day_history:
+                page.locator("#last-24-hours").click()
+            _require(
+                full_day_history.value.status == 200, "Default UTC history could not be loaded"
+            )
             actual_time = client.json("/api/v1/operator/status")["server_utc"]
             server_now = datetime.fromisoformat(actual_time.replace("Z", "+00:00"))
             page.wait_for_function(
@@ -2312,12 +2713,18 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             stage = "actual_recording_export"
             export_frames.append(
                 _download_recording(
-                    page, ffprobe, private / f"exported {color}.mp4", helpers, color
+                    page,
+                    ffprobe,
+                    private / f"exported {color}.mp4",
+                    helpers,
+                    color,
+                    normal_directory=private / "Browser Downloads" / color,
+                    diagnostic=history_diagnostic,
                 )
             )
             playback_url = page.locator("#download-recording").get_attribute("href")
             _require(
-                playback_url and playback_url.startswith("/media/playback?"),
+                playback_url and playback_url.startswith("/media/exports/"),
                 "Recording download left the admitted media gateway",
             )
             playback_urls.append(playback_url)
@@ -2392,9 +2799,9 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             client.get(removal_route + "/history")[0] == 404,
             "Removed camera history remained exposed in the workspace",
         )
-        for url in (live_urls[0], playback_urls[1]):
+        for url, expected_status in ((live_urls[0], 401), (playback_urls[1], 404)):
             _require(
-                context.request.get(client.origin + url).status == 401,
+                context.request.get(client.origin + url).status == expected_status,
                 "Removed camera media remained authorized",
             )
         _require(
@@ -2558,7 +2965,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
     )
     _require(not cleanup_failures, "Owned browser, product or generated fixture cleanup failed")
     elapsed = time.monotonic() - started
-    _require(elapsed < 180, "Browser qualification exceeded its bounded three-minute duration")
+    _require(elapsed < 240, "Browser qualification exceeded its bounded four-minute duration")
     receipt["duration_seconds"] = round(elapsed, 2)
     receipt["owned_cleanup"] = True
     record_testsuite_property("operator_beta_browser_receipt", json.dumps(receipt, sort_keys=True))

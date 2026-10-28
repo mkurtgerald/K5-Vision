@@ -44,7 +44,28 @@ _NVR_FLAGS = (
     "direct_rtsp_fresh_enrollment direct_rtsp_multi_channel_same_endpoint "
     "admin_user_management role_permissions camera_access_controls admin_user_creation "
     "admin_bootstrap_password_change admin_password_reset admin_disable_reenable "
-    "admin_live_media_revocation admin_audit_visible admin_state_persisted"
+    "admin_live_media_revocation admin_audit_visible admin_state_persisted "
+    "historical_navigation_default_24h historical_navigation_real_media "
+    "playback_rapid_seek_latest_wins playback_controls_and_zoom "
+    "playback_contiguous_chunk_handoff playback_gap_requires_explicit_navigation "
+    "playback_export_selection_independent export_normal_windows_download "
+    "export_download_survives_browser_close export_download_survives_product_restart "
+    "export_download_opened_in_edge"
+).split()
+_ANALYTICS_TRUE = (
+    "product_analytics_enablement analytics_bundled_native_inference analytics_gui_configuration "
+    "analytics_person_event_recorded analytics_event_utc_playback analytics_public_fixture_only "
+    "analytics_browser_closed_detection analytics_role_camera_permissions "
+    "analytics_settings_events_persisted"
+).split()
+_ANALYTICS_FALSE = ("analytics_mock_inference", "analytics_accuracy_acceptance")
+_PLAYBACK_EXPORT_TRUE = (
+    "historical_navigation_default_24h historical_navigation_real_media "
+    "playback_rapid_seek_latest_wins playback_controls_and_zoom "
+    "playback_contiguous_chunk_handoff playback_gap_requires_explicit_navigation "
+    "playback_export_selection_independent export_normal_windows_download "
+    "export_download_survives_browser_close export_download_survives_product_restart "
+    "export_download_opened_in_edge"
 ).split()
 
 
@@ -120,6 +141,8 @@ def _phase(offset: int) -> dict:
         "clock_alert_direction": "forward" if offset > 0 else "backward",
         "recorder_utc_verified": True,
         "history_utc_query_verified": True,
+        "analytics_event_utc_preserved": True,
+        "analytics_event_recording_covered": True,
         "live_http_status": 200,
         "live_decoded_frames_before": 4,
         "live_decoded_frames_after": 12,
@@ -137,6 +160,8 @@ def _receipt() -> dict:
         "platform": "Windows",
         **dict.fromkeys(_TRUE, True),
         **dict.fromkeys(_NVR_FLAGS, True),
+        **dict.fromkeys(_ANALYTICS_TRUE, True),
+        **dict.fromkeys(_ANALYTICS_FALSE, False),
         **dict.fromkeys(_FALSE, False),
         "browser_channel": "msedge",
         "playwright_version": "1.58.0",
@@ -161,6 +186,20 @@ def _receipt() -> dict:
         "timeline_playback_decoded_frames": 4,
         "export_decoded_frames": 4,
         "export_bytes": 4096,
+        "historical_recorded_seconds": 10800,
+        "historical_recording_file_count": 18,
+        "historical_recording_gap_seconds": 600,
+        "historical_fixture_fps": 1,
+        "playback_chunk_seconds": 120,
+        "playback_continuation_decoded_frames": 4,
+        "export_download_restart_decoded_frames": 4,
+        "analytics_model_revision": "6697dead54ed1cdd664b0313189c2cb52ee6335e",
+        "analytics_event_playback_decoded_frames": 4,
+        "analytics_positive_person_count": 1,
+        "analytics_processed_frames": 1,
+        "analytics_background_event_count_before": 1,
+        "analytics_background_event_count_after": 2,
+        "analytics_denied_http_statuses": [404, 404, 403, 404, 404, 403, 401, 401],
         "authenticated_camera_restart_frames": 4,
         "direct_rtsp_live_decoded_frames": 12,
         "direct_rtsp_history_decoded_frames": 4,
@@ -178,6 +217,7 @@ def _receipt() -> dict:
         "admin_denied_http_statuses": [403, 404, 403, 401, 401, 404],
         "vm_clock": {
             "schema_version": "1",
+            "analytics_events_utc_preserved": True,
             "head_sha": _HEAD,
             "installer_sha256": _INSTALLER,
             "method": "windows_SetSystemTime",
@@ -408,5 +448,106 @@ def test_native_receipt_requires_bounded_live_and_authorization_observations(
 ):
     receipt = _receipt()
     receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("field", [*_PLAYBACK_EXPORT_TRUE, *_ANALYTICS_TRUE])
+@pytest.mark.parametrize("invalid", [False, 1, None, _MISSING])
+def test_vm_receipt_requires_executed_sprint_product_features(tmp_path, field, invalid):
+    receipt = _receipt()
+    if invalid is _MISSING:
+        del receipt[field]
+    else:
+        receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("field", _ANALYTICS_FALSE)
+@pytest.mark.parametrize("invalid", [True, 0, None, _MISSING])
+def test_vm_receipt_requires_real_inference_without_accuracy_claims(tmp_path, field, invalid):
+    receipt = _receipt()
+    if invalid is _MISSING:
+        del receipt[field]
+    else:
+        receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("historical_recorded_seconds", 7200),
+        ("historical_recording_file_count", 17),
+        ("historical_recording_file_count", 18.0),
+        ("historical_recording_gap_seconds", 0),
+        ("historical_fixture_fps", True),
+        ("playback_chunk_seconds", 59.9),
+        ("playback_chunk_seconds", 301),
+        ("playback_chunk_seconds", float("nan")),
+        ("playback_chunk_seconds", True),
+        ("playback_continuation_decoded_frames", 3),
+        ("export_download_restart_decoded_frames", True),
+        ("export_download_restart_decoded_frames", 3),
+        ("analytics_model_revision", "0" * 40),
+        ("analytics_model_revision", _MISSING),
+        ("analytics_event_playback_decoded_frames", 3),
+        ("analytics_event_playback_decoded_frames", True),
+        ("analytics_positive_person_count", 0),
+        ("analytics_positive_person_count", 33),
+        ("analytics_positive_person_count", 1.0),
+        ("analytics_processed_frames", 0),
+        ("analytics_processed_frames", _MISSING),
+        ("analytics_processed_frames", 100001),
+        ("analytics_background_event_count_before", 0),
+        ("analytics_background_event_count_before", 2),
+        ("analytics_background_event_count_after", 1),
+        ("analytics_background_event_count_after", _MISSING),
+        ("analytics_background_event_count_after", 100001),
+        ("analytics_denied_http_statuses", [404.0, 404, 403, 404, 404, 403, 401, 401]),
+        ("analytics_denied_http_statuses", [True, 404, 403, 404, 404, 403, 401, 401]),
+        ("analytics_denied_http_statuses", ["404", 404, 403, 404, 404, 403, 401, 401]),
+        ("analytics_denied_http_statuses", [404, 404, 403, 404, 404, 403, 401, 200]),
+        ("analytics_denied_http_statuses", [404] * 8),
+        ("analytics_denied_http_statuses", _MISSING),
+    ],
+)
+def test_vm_receipt_rejects_unmeasured_or_tampered_sprint_evidence(tmp_path, field, invalid):
+    receipt = _receipt()
+    if invalid is _MISSING:
+        del receipt[field]
+    else:
+        receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("invalid", [False, 1, None, _MISSING])
+def test_vm_receipt_requires_analytics_event_utc_preservation(tmp_path, invalid):
+    receipt = _receipt()
+    if invalid is _MISSING:
+        del receipt["vm_clock"]["analytics_events_utc_preserved"]
+    else:
+        receipt["vm_clock"]["analytics_events_utc_preserved"] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("phase", [0, 1])
+@pytest.mark.parametrize(
+    "field", ["analytics_event_utc_preserved", "analytics_event_recording_covered"]
+)
+@pytest.mark.parametrize("invalid", [False, 1, None, _MISSING])
+def test_vm_phase_requires_person_event_utc_and_retained_footage_coverage(
+    tmp_path, phase, field, invalid
+):
+    receipt = _receipt()
+    value = receipt["vm_clock"]["phases"][phase]
+    if invalid is _MISSING:
+        del value[field]
+    else:
+        value[field] = invalid
     with pytest.raises(ValueError):
         _verify(_report(tmp_path, receipt))

@@ -24,6 +24,8 @@ _ASSETS = (
     "timeline.js",
     "admin.css",
     "admin.js",
+    "analytics.css",
+    "analytics.js",
 )
 _AUTH_ROUTE = "/api/v1/operator/media-auth"
 _UNTRUSTED_HEADERS = ["Forwarded", "X-Forwarded-*", "X-K5-*"]
@@ -177,6 +179,14 @@ def generate_operator_gateway_configuration(
         },
         {
             "match": [{"path": ["/api/*"]}],
+            "handle": [_proxy(control_port)],
+            "terminal": True,
+        },
+        {
+            "match": [{"method": ["GET"], "path": ["/media/exports/*"]}],
+            # The application checks the existing /media session cookie,
+            # current camera grants, job ownership and completed file identity.
+            # These are private output files, never a public directory route.
             "handle": [_proxy(control_port)],
             "terminal": True,
         },

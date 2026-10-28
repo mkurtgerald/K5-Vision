@@ -230,6 +230,12 @@ class OperatorProductService:
             }
         return self._storage.recording_progress(binding.path_name)
 
+    def recording_files(self, binding) -> dict[str, tuple[int, ...]] | None:
+        """Private cached inventory for the recorder-owned analytics sampler."""
+        if self._storage is None:
+            return None
+        return self._storage.recording_files(binding.path_name)
+
     def _check_gateway(self) -> None:
         """Probe the owned loopback HTTP listener without redirects or a proxy."""
         request = Request(f"http://127.0.0.1:{self.public_port}/operator/")
