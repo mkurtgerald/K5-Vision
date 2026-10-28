@@ -1,0 +1,47 @@
+name: Publish qualified Windows product beta 2b4af7e
+
+"on":
+  push:
+    branches:
+      - codex/publish-qualified-product-2b4af7e
+    paths:
+      - .github/workflows/publish-qualified-product-2b4af7e.yml
+      - scripts/publish_qualified_product_2b4af7e.py
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-qualified-product-2b4af7e
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out delivery helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: delivery-source
+          persist-credentials: false
+      - name: Check out exact qualified source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 2b4af7eaa66fc66e7ff9bf4855e5b182d93d0a69
+          path: qualified-source
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Admit, publish, and verify qualified Windows assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python delivery-source/scripts/publish_qualified_product_2b4af7e.py
+          --source qualified-source
+          --output admitted
+          --publish
+          --verify-public
