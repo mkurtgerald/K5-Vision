@@ -204,10 +204,7 @@ def test_real_udp_discovery_refuses_hostname_foreign_sender_host_and_credential_
 
 
 def test_real_udp_discovery_filters_printers_and_requires_exact_onvif_video_type():
-    endpoints = [
-        f"http://{_INTERFACE}:{_CAMERA_PORT + offset}/wsd/endpoint"
-        for offset in range(4)
-    ]
+    endpoints = [f"http://{_INTERFACE}:{_CAMERA_PORT + offset}/wsd/endpoint" for offset in range(4)]
     with _multicast_camera(
         endpoints,
         device_types=[
