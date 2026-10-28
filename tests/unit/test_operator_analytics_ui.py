@@ -13,13 +13,13 @@ _OTHER = "df5bb85e-363f-4b8c-bc40-00f278b8bd24"
 
 
 def test_analytics_assets_keep_session_authority_and_utc_outside_browser_storage():
-    script = (_ASSETS / "analytics.js").read_text()
+    script = (_ASSETS / "analytics.js").read_text(encoding="utf-8")
     assert "localStorage" not in script and "sessionStorage" not in script
     assert "innerHTML" not in script
     assert "Date.now" not in script
     assert "window.K5Analytics" in script
     assert (_ASSETS / "analytics.css").is_file()
-    html = (_ASSETS / "index.html").read_text()
+    html = (_ASSETS / "index.html").read_text(encoding="utf-8")
     assert "/operator/analytics.js" in html and "/operator/analytics.css" in html
     assert 'id="analytics-panel"' in html
 

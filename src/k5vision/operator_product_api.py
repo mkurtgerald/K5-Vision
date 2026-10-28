@@ -9,6 +9,7 @@ import math
 import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -288,6 +289,7 @@ def install_operator_product_api(
     public_port: int,
     analytics=None,
     analytics_status: str = "disabled",
+    state_root: Path | None = None,
 ) -> None:
     """Install the local product contract without exposing execution credentials."""
     if type(public_port) is not int or not 1 <= public_port <= 65535:
@@ -593,7 +595,7 @@ def install_operator_product_api(
     install_operator_exports_api(
         app,
         service=service,
-        state_root=cameras._root,
+        state_root=cameras._root if state_root is None else state_root,
         require_session=require_session,
         authenticate=authenticate,
         authorized_selection=authorized_selection,

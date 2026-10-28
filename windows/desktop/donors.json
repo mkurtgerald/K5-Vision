@@ -236,9 +236,11 @@
         "filename": "libaom-v3.14.1.tar.gz",
         "component": "aomedia/aom",
         "source_commit": "03087864cf4bea6abb0d28f95cf7843511413d8f",
-        "url": "https://aomedia.googlesource.com/aom/+archive/03087864cf4bea6abb0d28f95cf7843511413d8f.tar.gz",
-        "bytes": 6437605,
-        "sha256": "5e0bbef3dbf20004ae80e68bb84ae149b7e2c532f2674169ea8d6d42b6b16945"
+        "url": "https://codeload.github.com/libsdl-org/aom/tar.gz/03087864cf4bea6abb0d28f95cf7843511413d8f",
+        "bytes": 6385757,
+        "sha256": "b17564e4ff3a36992d17b6ea934a0151f9e38674e630bd91312170859d2be6a2",
+        "source_repository": "https://aomedia.googlesource.com/aom",
+        "archive_mirror": "https://github.com/libsdl-org/aom"
       }
     ]
   },

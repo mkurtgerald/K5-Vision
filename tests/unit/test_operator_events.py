@@ -164,9 +164,25 @@ def test_bounded_event_retention_uses_append_identity_not_wall_age(store, monkey
 def test_site_mismatch_and_replaced_private_database_fail_closed(identity, store):
     with pytest.raises(OperatorEventsError):
         OperatorEventStore(identity.directory, "foreign-site")
+    camera = uuid4()
+    store.configure(camera, enabled=True, confidence_threshold=0.7)
+    assert _record(store, camera, 1)
     original = identity.directory / "operator-events.sqlite3"
     replaced = identity.directory / "old-events.sqlite3"
-    original.rename(replaced)
+    before = original.stat()
+    try:
+        original.rename(replaced)
+    except PermissionError as error:
+        # Windows denies replacing an open SQLite file before K5's inode
+        # revalidation is reached. Prove that actual OS boundary, retaining
+        # the replacement-detection path on platforms which allow the rename.
+        assert os.name == "nt" and error.winerror == 32
+        assert original.exists() and not replaced.exists()
+        after = original.stat()
+        assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+        assert store.settings(camera) == {"enabled": True, "confidence_threshold": 0.7}
+        assert len(store.events(camera)["events"]) == 1
+        return
     original.write_bytes(replaced.read_bytes())
     original.chmod(0o600)
     with pytest.raises(OperatorEventsError, match="state unavailable"):

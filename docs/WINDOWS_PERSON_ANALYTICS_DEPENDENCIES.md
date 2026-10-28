@@ -115,7 +115,17 @@ identities remain in the dependency inventory:
 
 | `libvpx-v1.16.0.tar.gz` | `1024874c5919305883187e2953de8fcb4c3d7fa6` | `274c00c0b21f03a9152e324b1989f73b74268aa8545b39ef5faccc50fdb56393` |
 | `OpenH264-v2.5.0.tar.gz` | `8c7008aeb6335e7d36ab0d9a023a63f82a8eaac0` | `0a12daa5a7fefc3acf5f6485fe21159399351cd4b83af80dde525fa520f17820` |
-| `libaom-v3.14.1.tar.gz` | `03087864cf4bea6abb0d28f95cf7843511413d8f` | `5e0bbef3dbf20004ae80e68bb84ae149b7e2c532f2674169ea8d6d42b6b16945` |
+| `libaom-v3.14.1.tar.gz` | `03087864cf4bea6abb0d28f95cf7843511413d8f` | `b17564e4ff3a36992d17b6ea934a0151f9e38674e630bd91312170859d2be6a2` |
+
+The libaom source remains the official `aomedia.googlesource.com/aom`
+commit shown above. Its archive is fetched from the `libsdl-org/aom` GitHub
+mirror at that exact Git commit/tree. Two independent mirror downloads were
+byte-identical; every one of the 1,445 source files matched the upstream
+archive by length and SHA-256 after removing the mirror archive root prefix.
+The official Gitiles archive inserts request-time tar metadata and cannot be
+used as an exact byte-pinned download. This mirror changes the archive transport,
+not the source revision or source file contents. Both official and mirror
+provenance are recorded in the dependency inventory.
 
 The build repository includes the original complete MinGW/Docker build scripts,
 source-download revisions, OpenH264 wrapper, toolchains and license. The FFmpeg

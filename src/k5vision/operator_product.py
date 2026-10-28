@@ -92,6 +92,7 @@ def create_operator_product_app(
         public_port=service.public_port,
         analytics=analytics,
         analytics_status=analytics_status,
+        state_root=identity.directory,
     )
     previous_lifespan = application.router.lifespan_context
     profile_lock = OperatorProfileLock(identity.directory)

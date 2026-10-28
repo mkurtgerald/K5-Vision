@@ -31,6 +31,52 @@ ONVIF_NOTICE_PATH = "licenses/go2rtc-MIT.txt"
 PERSON_MANIFEST = ROOT / "src/k5vision/data/operator-person-model-manifest.json"
 PERSON_MANIFEST_SHA256 = "b15ac68ec04b1fa9b1c95b320e2694469b8e764049fac544d6986a940f1fd794"
 PERSON_MODEL_ROOT = "runtime/Lib/site-packages/k5vision/data/person-models"
+_BUILD_PHASE = "initialization"
+_BUILD_PHASES = frozenset(
+    {
+        "initialization",
+        "embedded_runtime",
+        "dependency_download",
+        "dependency_admission",
+        "dependency_install",
+        "product_wheel_build",
+        "product_wheel_install",
+        "cpp_runtime",
+        "person_model_manifest",
+        "person_model_xml",
+        "person_model_weights",
+        "native_workers",
+        "required_notices",
+        "decoder_binary",
+        "decoder_source_ffmpeg",
+        "decoder_source_build",
+        "decoder_source_wrapper",
+        "decoder_source_libvpx",
+        "decoder_source_openh264",
+        "decoder_source_libaom",
+        "onvif_notice",
+        "dependency_inventory",
+        "embedded_runtime_execution",
+        "payload_manifest",
+    }
+)
+_SOURCE_PHASES = {
+    "FFmpeg/FFmpeg": "decoder_source_ffmpeg",
+    "opencv/opencv_3rdparty": "decoder_source_build",
+    "opencv/opencv": "decoder_source_wrapper",
+    "webmproject/libvpx": "decoder_source_libvpx",
+    "cisco/openh264": "decoder_source_openh264",
+    "aomedia/aom": "decoder_source_libaom",
+}
+
+
+def phase(value: str) -> None:
+    """Emit only a fixed, source-free build phase; never supplied paths/URLs."""
+    global _BUILD_PHASE
+    if value not in _BUILD_PHASES:
+        raise ValueError("Unknown payload phase")
+    _BUILD_PHASE = value
+    print(json.dumps({"desktop_payload_stage": value}), flush=True)
 
 
 def onvif_source_adaptation(payload: Path) -> dict[str, object]:
@@ -155,7 +201,9 @@ def inventory_wheels(wheels: Path, pins: list[dict[str, object]]) -> list[dict[s
 
 
 def worker_download(source: Path, name: str) -> dict[str, object]:
-    manifest = json.loads((ROOT / "src/k5vision/data" / f"{name}-donor-manifest.json").read_text())
+    manifest = json.loads(
+        (ROOT / "src/k5vision/data" / f"{name}-donor-manifest.json").read_text(encoding="utf-8")
+    )
     artifacts = [item for item in manifest["artifacts"] if item["platform"] == "windows_amd64"]
     if len(artifacts) != 1:
         raise ValueError("Worker platform identity invalid")
@@ -176,6 +224,7 @@ def worker_download(source: Path, name: str) -> dict[str, object]:
 
 def provision_person_model(payload: Path) -> dict[str, object]:
     """Ship only the reviewed model, with no first-use package/model download."""
+    phase("person_model_manifest")
     raw = PERSON_MANIFEST.read_bytes()
     canonical = raw.replace(b"\r\n", b"\n")
     if hashlib.sha256(canonical).hexdigest() != PERSON_MANIFEST_SHA256 or raw not in (
@@ -200,6 +249,7 @@ def provision_person_model(payload: Path) -> dict[str, object]:
             )
         ):
             raise ValueError("Person model artifact path refused")
+        phase("person_model_xml" if relative.suffix == ".xml" else "person_model_weights")
         destination = root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         expected = artifact["bytes"]
@@ -247,6 +297,7 @@ def provision_cpp_runtime(payload: Path, pin: dict) -> dict:
     the original Microsoft name, which need not be installed on a clean PC.
     Preserve the exact admitted bytes under that original app-local name.
     """
+    phase("cpp_runtime")
     source, destination = payload / pin["source_path"], payload / pin["path"]
     admit(source, pin)
     if destination.exists() or destination.is_symlink():
@@ -314,6 +365,7 @@ def provision_decoder_sources(payload: Path, decoder: dict) -> dict:
     Complete source archives accompany the binary in the installation; users
     need no network access or written source offer to obtain these sources.
     """
+    phase("decoder_binary")
     binary, notice = decoder["binary"], decoder["retained_notice"]
     for item in (binary, notice):
         admit(payload / item["path"], item)
@@ -321,6 +373,7 @@ def provision_decoder_sources(payload: Path, decoder: dict) -> dict:
     source_root.mkdir(parents=True)
     sources = []
     for source in decoder["sources"]:
+        phase(_SOURCE_PHASES.get(source.get("component"), ""))
         name = str(source["filename"])
         if (
             PurePosixPath(name).name != name
@@ -381,6 +434,7 @@ def write_manifest(payload: Path, head_sha: str, generated: Path) -> str:
 
 
 def build(args: argparse.Namespace) -> None:
+    phase("initialization")
     if sys.platform != "win32" or sys.version_info[:2] != (3, 12):
         raise ValueError("Payload compilation requires a native Windows Python 3.12 builder")
     if not re.fullmatch(r"[0-9a-f]{40}", args.head_sha):
@@ -394,6 +448,7 @@ def build(args: argparse.Namespace) -> None:
     runtime.mkdir(parents=True)
     wheels.mkdir()
     donors = json.loads(DONORS.read_text(encoding="utf-8"))
+    phase("embedded_runtime")
     archive = args.python_archive
     if archive is None:
         archive = output / "python-3.12.10-embed-amd64.zip"
@@ -402,6 +457,7 @@ def build(args: argparse.Namespace) -> None:
         admit(archive, donors["python"])
     extract_python(archive, runtime)
     requirements = ROOT / "windows/desktop/runtime-requirements.txt"
+    phase("dependency_download")
     run(
         [
             sys.executable,
@@ -417,8 +473,10 @@ def build(args: argparse.Namespace) -> None:
             str(requirements),
         ]
     )
+    phase("dependency_admission")
     wheel_inventory = inventory_wheels(wheels, donors["wheels"])
     site_packages = runtime / "Lib/site-packages"
+    phase("dependency_install")
     run(
         [
             sys.executable,
@@ -438,12 +496,14 @@ def build(args: argparse.Namespace) -> None:
         ]
     )
     product_wheels = output / "product-wheel"
+    phase("product_wheel_build")
     run(
         [sys.executable, "-m", "pip", "wheel", ".", "--no-deps", "--wheel-dir", str(product_wheels)]
     )
     project = list(product_wheels.glob("*.whl"))
     if len(project) != 1:
         raise ValueError("Expected exactly one project wheel")
+    phase("product_wheel_install")
     run(
         [
             sys.executable,
@@ -465,6 +525,7 @@ def build(args: argparse.Namespace) -> None:
             shutil.rmtree(scripts)
     cpp_runtime = provision_cpp_runtime(payload, donors["cpp_runtime"])
     person_model = provision_person_model(payload)
+    phase("native_workers")
     workers = [
         worker_download(args.media_exe, "mediamtx"),
         worker_download(args.gateway_exe, "caddy"),
@@ -477,6 +538,7 @@ def build(args: argparse.Namespace) -> None:
     )
     licenses = payload / "licenses"
     licenses.mkdir()
+    phase("required_notices")
     for source in (
         "LICENSE",
         "THIRD_PARTY_NOTICES.md",
@@ -494,6 +556,7 @@ def build(args: argparse.Namespace) -> None:
         licenses / "OpenModelZoo-person-Apache-2.0.txt",
     )
     decoder = provision_decoder_sources(payload, donors["decoder"])
+    phase("onvif_notice")
     onvif_adaptation = onvif_source_adaptation(payload)
     # The official Windows interpreter explicitly requires external end users
     # to agree to terms protecting its Microsoft Distributable Code. Present
@@ -511,6 +574,7 @@ def build(args: argparse.Namespace) -> None:
         + b"\r\n\r\nComplete included Python and Windows binary-component terms:\r\n\r\n"
         + (runtime / "LICENSE.txt").read_bytes()
     )
+    phase("dependency_inventory")
     (payload / "dependency-inventory.json").write_text(
         json.dumps(
             {
@@ -542,6 +606,7 @@ def build(args: argparse.Namespace) -> None:
     )
     # Exercise the isolated embedded import path before it is admitted. Actual
     # GUI account creation/serving/recording is a separate mandatory native gate.
+    phase("embedded_runtime_execution")
     run(
         [
             str(runtime / "python.exe"),
@@ -568,6 +633,7 @@ def build(args: argparse.Namespace) -> None:
         ]
     )
     generated = output / "PayloadIdentity.generated.cs"
+    phase("payload_manifest")
     manifest_sha = write_manifest(payload, args.head_sha, generated)
     print(
         json.dumps(
@@ -576,7 +642,9 @@ def build(args: argparse.Namespace) -> None:
                 "manifest_sha256": manifest_sha,
                 "dependency_wheels": len(wheel_inventory),
                 "payload_files": len(
-                    json.loads((payload / "payload-manifest.json").read_text())["files"]
+                    json.loads((payload / "payload-manifest.json").read_text(encoding="utf-8"))[
+                        "files"
+                    ]
                 ),
             }
         )
@@ -593,10 +661,16 @@ def main() -> int:
     args = parser.parse_args()
     try:
         build(args)
-    except Exception:
+    except Exception as error:
         # Do not expose remote redirect query strings or local private values.
         print(
-            "Desktop payload build refused; inspect the preceding bounded build stage.",
+            json.dumps(
+                {
+                    "desktop_payload_refused": True,
+                    "stage": _BUILD_PHASE,
+                    "error_type": type(error).__name__,
+                }
+            ),
             file=sys.stderr,
         )
         return 1

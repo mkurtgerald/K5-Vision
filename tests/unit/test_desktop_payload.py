@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import sys
 import tarfile
 from hashlib import sha256
 from pathlib import Path
@@ -35,6 +36,32 @@ def test_exact_donor_identity_detects_size_and_content_tampering(builder, tmp_pa
     donor.write_bytes(b"verified native donor plus")
     with pytest.raises(ValueError, match="identity mismatch"):
         builder.admit(donor, identity)
+
+
+def test_source_download_rejects_archive_metadata_changes_even_when_source_matches(
+    builder, tmp_path, monkeypatch
+):
+    archives = []
+    for timestamp in (1000, 2000):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz") as archive:
+            item = tarfile.TarInfo("upstream/source.c")
+            content = b"unchanged corresponding source\n"
+            item.size, item.mtime = len(content), timestamp
+            archive.addfile(item, io.BytesIO(content))
+        archives.append(output.getvalue())
+    assert archives[0] != archives[1]
+    for raw in archives:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
+            assert archive.extractfile("upstream/source.c").read() == content
+    identity = {
+        "url": "https://public.invalid/source.tar.gz",
+        "bytes": len(archives[0]),
+        "sha256": sha256(archives[0]).hexdigest(),
+    }
+    monkeypatch.setattr(builder, "urlopen", lambda *_args, **_kwargs: io.BytesIO(archives[1]))
+    with pytest.raises(ValueError, match="Donor (content identity mismatch|size exceeded)"):
+        builder.download(identity, tmp_path / "source.tar.gz")
 
 
 def test_embedding_refuses_archive_path_escape(builder, tmp_path):
@@ -186,7 +213,7 @@ def _person_manifest(builder, tmp_path, monkeypatch):
         "artifacts": artifacts,
     }
     path = tmp_path / "person-manifest.json"
-    path.write_text(json.dumps(manifest) + "\n")
+    path.write_text(json.dumps(manifest) + "\n", newline="\n")
     monkeypatch.setattr(builder, "PERSON_MANIFEST", path)
     monkeypatch.setattr(builder, "PERSON_MANIFEST_SHA256", sha256(path.read_bytes()).hexdigest())
 
@@ -210,6 +237,21 @@ def test_installed_person_model_is_complete_and_identity_bound(builder, tmp_path
         assert content == documents[Path(item["path"]).name]
         assert item["bytes"] == len(content)
         assert item["sha256"] == sha256(content).hexdigest()
+
+
+def test_installed_model_accepts_complete_crlf_manifest_with_canonical_pin(
+    builder, tmp_path, monkeypatch
+):
+    _documents, path = _person_manifest(builder, tmp_path, monkeypatch)
+    canonical = path.read_bytes()
+    assert b"\r" not in canonical
+    assert builder.PERSON_MANIFEST_SHA256 == sha256(canonical).hexdigest()
+    windows_text = canonical.replace(b"\n", b"\r\n")
+    assert windows_text != canonical
+    path.write_bytes(windows_text)
+    result = builder.provision_person_model(tmp_path / "payload")
+    assert result["manifest_sha256"] == sha256(windows_text).hexdigest()
+    assert len(result["artifacts"]) == 2
 
 
 @pytest.mark.parametrize("damage", ["changed", "truncated", "oversized"])
@@ -306,3 +348,46 @@ def test_corresponding_sources_refuse_archive_path_escape(builder, tmp_path, uns
     with pytest.raises(ValueError, match="archive layout refused"):
         builder.retain_text_sources(source, destination)
     assert not (tmp_path / "escape.cpp").exists()
+
+
+def test_payload_phase_output_accepts_only_fixed_labels(builder, capsys):
+    builder.phase("decoder_source_libaom")
+    assert json.loads(capsys.readouterr().out) == {"desktop_payload_stage": "decoder_source_libaom"}
+    with pytest.raises(ValueError, match="Unknown payload phase"):
+        builder.phase("https://private.invalid/supplied-secret")
+    assert capsys.readouterr().out == ""
+
+
+def test_payload_failure_reports_phase_and_exception_type_without_private_values(
+    builder, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "build_desktop_payload.py",
+            "--output",
+            "private-output",
+            "--head-sha",
+            "a" * 40,
+            "--media-exe",
+            "private-media.exe",
+            "--gateway-exe",
+            "private-gateway.exe",
+        ],
+    )
+
+    def refused(_arguments):
+        builder.phase("decoder_source_libaom")
+        raise OSError("https://private.invalid/token supplied-secret private-output")
+
+    monkeypatch.setattr(builder, "build", refused)
+    assert builder.main() == 1
+    observed = capsys.readouterr()
+    assert json.loads(observed.err) == {
+        "desktop_payload_refused": True,
+        "stage": "decoder_source_libaom",
+        "error_type": "OSError",
+    }
+    assert "private" not in observed.out + observed.err
+    assert "supplied-secret" not in observed.out + observed.err

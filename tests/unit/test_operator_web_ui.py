@@ -78,8 +78,33 @@ def _operator_asset(route, assets):
         ".js": "application/javascript",
         ".css": "text/css",
     }[Path(name).suffix]
-    route.fulfill(content_type=content_type, body=(assets / name).read_text())
+    route.fulfill(content_type=content_type, body=(assets / name).read_text(encoding="utf-8"))
     return True
+
+
+def test_asset_response_preserves_utf8_under_a_legacy_windows_text_locale(monkeypatch):
+    """An ANSI default must not reject the production timeline's arrow controls."""
+    assets = Path(__file__).resolve().parents[2] / "src/k5vision/operator_web"
+    original = Path.read_text
+
+    def legacy_read(path, encoding=None, errors=None):
+        return original(path, encoding=encoding or "cp1252", errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", legacy_read)
+    with pytest.raises(UnicodeDecodeError):
+        (assets / "timeline.js").read_text()
+
+    class Route:
+        request = type("Request", (), {"url": "http://127.0.0.1:8000/operator/timeline.js"})()
+
+        def fulfill(self, **response):
+            self.response = response
+
+    route = Route()
+    assert _operator_asset(route, assets)
+    assert route.response["content_type"] == "application/javascript"
+    assert "←" in route.response["body"]
+    assert route.response["body"] == original(assets / "timeline.js", encoding="utf-8")
 
 
 def test_focused_camera_switch_observes_its_own_grant_without_wall_response_ambiguity():

@@ -19,12 +19,12 @@ _CODE = "Generated-One-Time-Credential-0123456789"
 
 
 def test_administration_assets_and_first_login_are_in_the_shipped_workspace():
-    html = (_ASSETS / "index.html").read_text()
+    html = (_ASSETS / "index.html").read_text(encoding="utf-8")
     assert "/operator/admin.js" in html and "/operator/admin.css" in html
     assert 'id="admin-tab"' in html and 'id="admin-panel"' in html
     assert 'id="activate-account-form"' in html
     assert 'id="admin-temporary-credential"' in html
-    script = (_ASSETS / "admin.js").read_text()
+    script = (_ASSETS / "admin.js").read_text(encoding="utf-8")
     assert "localStorage" not in script and "sessionStorage" not in script
     assert "innerHTML" not in script
 
@@ -120,7 +120,7 @@ def workspace():
                         ".css": "text/css",
                     }[Path(name).suffix]
                     return route.fulfill(
-                        content_type=content_type, body=(_ASSETS / name).read_text()
+                        content_type=content_type, body=(_ASSETS / name).read_text(encoding="utf-8")
                     )
                 body = route.request.post_data_json if route.request.post_data else None
                 state["requests"].append((method, path, body))

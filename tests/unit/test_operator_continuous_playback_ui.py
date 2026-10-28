@@ -131,7 +131,7 @@ def _history_page(export_response=None, export_handler=None, download_response=N
                         ".css": "text/css",
                         ".js": "application/javascript",
                     }[asset.suffix]
-                    request.fulfill(content_type=mime, body=asset.read_text())
+                    request.fulfill(content_type=mime, body=asset.read_text(encoding="utf-8"))
                 else:
                     request.fulfill(status=404)
                 return
