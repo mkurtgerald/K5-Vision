@@ -99,17 +99,39 @@ def _signature(info: os.stat_result) -> tuple[int, ...]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def _descriptor_signature(
+    descriptor: int,
+    expected_path: tuple[int, ...],
+    error: type[StorageSettingsError] = StorageSettingsError,
+) -> tuple[int, ...]:
+    """Bind the opened object without comparing unlike Windows time fields.
+
+    CPython 3.12 Windows path stat preserves birth time in st_ctime, whereas
+    descriptor stat reports change time. Keep every timestamp in same-API
+    before/after checks; identity, size, regular type and link count bind the
+    descriptor to the admitted path independently of that representation.
+    """
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or (opened.st_dev, opened.st_ino, opened.st_size) != expected_path[:3]
+    ):
+        raise error("Storage file changed")
+    return _signature(opened)
+
+
 def _read(path: Path) -> dict:
     before = _file(path)
     if not 0 < before.st_size <= _LIMIT:
         raise StorageSettingsError("Storage settings were refused")
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(fd, "rb") as stream:
-        if _signature(os.fstat(stream.fileno())) != _signature(before):
-            raise StorageSettingsError("Storage settings changed")
+        opened_before = _descriptor_signature(stream.fileno(), _signature(before))
         payload = stream.read(_LIMIT + 1)
-        if len(payload) != before.st_size or _signature(os.fstat(stream.fileno())) != _signature(
-            before
+        if (
+            len(payload) != before.st_size
+            or _descriptor_signature(stream.fileno(), _signature(before)) != opened_before
         ):
             raise StorageSettingsError("Storage settings changed")
     if _signature(_file(path)) != _signature(before):
@@ -379,13 +401,17 @@ class OperatorStorageSettings:
             raise _MigrationSourceChanged("Recording changed during migration")
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         with os.fdopen(fd, "rb") as stream:
-            if _signature(os.fstat(stream.fileno())) != expected:
-                raise _MigrationSourceChanged("Recording changed during migration")
+            opened_before = _descriptor_signature(
+                stream.fileno(), expected, _MigrationSourceChanged
+            )
             while chunk := stream.read(1024 * 1024):
                 if time.monotonic() >= deadline:
                     raise TimeoutError
                 digest.update(chunk)
-            if _signature(os.fstat(stream.fileno())) != expected:
+            if (
+                _descriptor_signature(stream.fileno(), expected, _MigrationSourceChanged)
+                != opened_before
+            ):
                 raise _MigrationSourceChanged("Recording changed during migration")
         if _signature(_file_info(path)) != expected:
             raise _MigrationSourceChanged("Recording changed during migration")
@@ -482,7 +508,10 @@ class OperatorStorageSettings:
                                     "wb",
                                 ) as output,
                             ):
-                                if _signature(os.fstat(input_file.fileno())) != signature:
+                                opened_before = _descriptor_signature(
+                                    input_file.fileno(), signature, _MigrationSourceChanged
+                                )
+                                if _signature(_file_info(original)) != signature:
                                     error = "source_changed"
                                     raise ValueError
                                 while chunk := input_file.read(1024 * 1024):
@@ -491,7 +520,13 @@ class OperatorStorageSettings:
                                     output.write(chunk)
                                 output.flush()
                                 os.fsync(output.fileno())
-                                if _signature(os.fstat(input_file.fileno())) != signature:
+                                if (
+                                    _descriptor_signature(
+                                        input_file.fileno(), signature, _MigrationSourceChanged
+                                    )
+                                    != opened_before
+                                    or _signature(_file_info(original)) != signature
+                                ):
                                     error = "source_changed"
                                     raise ValueError
                             copied_signature = _signature(_file(temporary))

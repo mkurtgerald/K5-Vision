@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -34,6 +35,85 @@ _ENABLED = (
 pytestmark = pytest.mark.skipif(
     not _ENABLED, reason="Native source configuration requires its disposable Windows gate"
 )
+
+
+def _stage_private_payload(source, parent, *, supervisor_sha, manifest_sha):
+    """Match installed ACL layout without changing a production admission rule."""
+    source, target = Path(source), Path(parent) / "sealed native payload"
+    manifest_path = source / "payload-manifest.json"
+
+    def ordinary(path):
+        info = path.lstat()
+        assert stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+        assert not getattr(info, "st_file_attributes", 0) & 0x400
+        return info
+
+    ordinary(manifest_path)
+    raw = manifest_path.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == manifest_sha
+    manifest = json.loads(raw, object_pairs_hook=identity_state._unique_object)
+    assert type(manifest) is dict and manifest["schema_version"] == 1
+    expected = {
+        "payload-manifest.json": {"bytes": len(raw), "sha256": manifest_sha},
+        "K5Vision.exe": {
+            "bytes": ordinary(source / "K5Vision.exe").st_size,
+            "sha256": supervisor_sha,
+        },
+    }
+    directories = {Path(".")}
+    folded = {value.casefold() for value in expected}
+    for entry in manifest["files"]:
+        relative = entry["path"]
+        parts = relative.split("/")
+        assert all(
+            part and part not in {".", ".."} and "\\" not in part and ":" not in part
+            for part in parts
+        )
+        assert not Path(relative).is_absolute() and relative.casefold() not in folded
+        assert set(entry) == {"path", "bytes", "sha256"}
+        assert type(entry["bytes"]) is int and entry["bytes"] >= 0
+        folded.add(relative.casefold())
+        expected[relative] = entry
+        directories.update(Path(relative).parents)
+    observed = set()
+    pending = [source]
+    while pending:
+        directory = pending.pop()
+        info = directory.lstat()
+        assert stat.S_ISDIR(info.st_mode) and not getattr(info, "st_file_attributes", 0) & 0x400
+        assert directory.relative_to(source) in directories
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                info = path.lstat()
+                assert (
+                    not stat.S_ISLNK(info.st_mode)
+                    and not getattr(info, "st_file_attributes", 0) & 0x400
+                )
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(path)
+                else:
+                    ordinary(path)
+                    relative = path.relative_to(source).as_posix()
+                    assert relative in expected
+                    observed.add(relative)
+    assert observed == set(expected) and not target.exists()
+    target.mkdir(mode=0o700)
+    try:
+        for relative, entry in expected.items():
+            original, destination = source / relative, target / relative
+            ordinary(original)
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copyfile(original, destination, follow_symlinks=False)
+            assert ordinary(destination).st_size == entry["bytes"]
+            assert hashlib.sha256(destination.read_bytes()).hexdigest() == entry["sha256"]
+            ordinary(original)
+        identity_state._checked_path(target)
+        identity_state._windows_admission(target, private=True, directory=True)
+        return target
+    except BaseException:
+        shutil.rmtree(target)
+        raise
 
 
 def _helper(
@@ -138,6 +218,15 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
     parent.mkdir(mode=0o700)
     profile = _private_directory(parent / "profile with spaces")
     guard_path = parent / "time-restoration.json"
+    private_payload = _stage_private_payload(
+        executable.parent,
+        parent,
+        supervisor_sha=supervisor_sha,
+        manifest_sha=hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+    executable = private_payload / "K5Vision.exe"
+    assert hashlib.sha256(executable.read_bytes()).hexdigest() == supervisor_sha
+    assert (private_payload / "payload-manifest.json").read_bytes() == manifest_bytes
     host = WindowsTimeAdministrator(profile, executable=executable)
     proof = {
         "schema_version": 1,
@@ -146,6 +235,7 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
         "payload_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "native_windows_time_administration": True,
         "real_native_supervisor": True,
+        "native_payload_private_staging": True,
         "user_terminal_required": False,
         "native_configuration_readback": False,
         "native_resync_requested": False,

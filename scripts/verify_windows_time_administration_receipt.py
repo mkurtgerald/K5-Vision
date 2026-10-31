@@ -12,6 +12,7 @@ from pathlib import Path
 _TRUE = {
     "native_windows_time_administration",
     "real_native_supervisor",
+    "native_payload_private_staging",
     "native_configuration_readback",
     "native_resync_requested",
     "native_invalid_action_rejected",
