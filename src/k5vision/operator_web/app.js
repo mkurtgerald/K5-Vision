@@ -9,6 +9,12 @@
   const DAY = 86400000;
   const TIME_SAMPLE_MAX_AGE = 30000;
   const RETRY_DELAYS = [1000, 2000, 4000, 8000, 10000];
+  const ROLE_PERMISSIONS = Object.freeze({
+    viewer: ["cameras.view_live", "cameras.playback"],
+    operator: ["cameras.view_live", "cameras.playback", "cameras.export"],
+    administrator: ["cameras.view_live", "cameras.playback", "cameras.export", "cameras.manage", "recording.manage", "analytics.manage", "users.manage", "roles.manage", "storage.manage", "time.manage", "integrations.manage", "audit.read"],
+  });
+  const ADMIN_PERMISSIONS = ["users.manage", "roles.manage", "storage.manage", "time.manage", "integrations.manage", "audit.read"];
   const CAMERA_ERROR_CODES = new Set([
     "discovery_unavailable", "camera_auth_failed", "camera_unreachable",
     "camera_unsupported", "camera_invalid_response", "camera_busy",
@@ -55,7 +61,7 @@
     playbackStart: null, playbackEnd: null, playbackPosition: null, playbackEpoch: 0, selectedStatus: null,
     playbackPrefetch: null, playbackObjectUrl: null, playbackRate: 1,
     exportEpoch: 0, exportController: null, exportJob: null, exportDownloadAllowed: false,
-    securityTransition: false,
+    securityTransition: false, capabilitiesResolved: false,
   };
   let wall = null, timeline = null, administration = null, cameraAnalytics = null, settings = null;
   const PLAYBACK_CHUNK_SECONDS = 120;
@@ -78,7 +84,7 @@
   function cameraWall() {
     if (!wall) wall = window.K5CameraWall.create({
       container: $("wall-panel"), request, ensureHls, safeMediaUrl,
-      getSession: () => state.signingOut ? null : ({ token: state.token, epoch: state.sessionEpoch }),
+      getSession: () => state.signingOut || !allowed("cameras.view_live") ? null : ({ token: state.token, epoch: state.sessionEpoch }),
       onOpenCamera: (deviceId, view = "live") => {
         setView(view, false);
         void selectCamera(deviceId);
@@ -97,7 +103,7 @@
   function analyticsWorkspace() {
     if (!cameraAnalytics && window.K5Analytics?.create) cameraAnalytics = window.K5Analytics.create({
       container: $("analytics-panel"), request,
-      getSession: () => state.signingOut ? null : ({ token: state.token, epoch: state.sessionEpoch, account: state.account }),
+      getSession: () => state.signingOut || !state.capabilitiesResolved ? null : ({ token: state.token, epoch: state.sessionEpoch, account: state.account }),
       onSeek: ({ cameraId, timestamp }) => void seekEventRecording(timestamp, cameraId),
     });
     return cameraAnalytics;
@@ -108,7 +114,7 @@
       if (!window.K5Admin?.create) throw new Error("Account administration did not load");
       administration = window.K5Admin.create({
         request,
-        getSession: () => state.signingOut ? null : ({ token: state.token, epoch: state.sessionEpoch, account: state.account }),
+        getSession: () => state.signingOut || !allowed("users.manage") ? null : ({ token: state.token, epoch: state.sessionEpoch, account: state.account }),
         getCameras: () => state.cameras,
         onSelfChanged: (account, permissionsChanged) => {
           if (!permissionsChanged) {
@@ -149,10 +155,38 @@
   }
 
   function allowed(permission) {
-    if (Array.isArray(state.account?.effective_permissions)) return state.account.effective_permissions.includes(permission);
-    return ["cameras.view_live", "cameras.playback"].includes(permission) ? Boolean(state.account)
-      : permission === "cameras.export" ? ["administrator", "operator"].includes(state.account?.role)
-        : state.account?.role === "administrator";
+    return state.capabilitiesResolved && Array.isArray(state.account?.effective_permissions)
+      && state.account.effective_permissions.includes(permission);
+  }
+
+  function resolveCapabilities(value) {
+    const account = value?.account, current = state.account, permissions = value?.effective_permissions;
+    const ceiling = ROLE_PERMISSIONS[current?.role];
+    if (!current || !ceiling || typeof current.id !== "string" || !account
+      || account.id !== current.id || account.username !== current.username || account.role !== current.role
+      || account.enabled !== true || !Array.isArray(permissions) || permissions.length > ceiling.length
+      || new Set(permissions).size !== permissions.length || !permissions.every((p) => ceiling.includes(p))
+      || !Array.isArray(account.effective_permissions) || account.effective_permissions.length !== permissions.length
+      || JSON.stringify([...account.effective_permissions].sort()) !== JSON.stringify([...permissions].sort())
+      || ![null, undefined].includes(account.role_profile_id) && (typeof account.role_profile_id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(account.role_profile_id))
+      || value.can_export !== permissions.includes("cameras.export")
+      || value.can_manage_users !== permissions.includes("users.manage")
+      || value.can_manage_cameras !== permissions.includes("cameras.manage")
+      || value.can_view_history !== permissions.includes("cameras.playback")) throw new ApiError(503);
+    const exported = canExport();
+    state.account = { ...current, ...account, effective_permissions: [...permissions], authority_resolved: true };
+    state.capabilitiesResolved = true;
+    if (exported && !canExport()) { cancelExport(); disableDownload(); }
+    renderAccountControls();
+    administration?.refreshAuthority(); settings?.refreshAuthority();
+  }
+
+  function suspendCapabilities() {
+    state.capabilitiesResolved = false;
+    if (state.account) state.account = { ...state.account, effective_permissions: [], authority_resolved: false };
+    renderAccountControls(); administration?.refreshAuthority(); settings?.refreshAuthority();
+    wall?.hide(); stopLive(); stopPlayback(); cancelExport(); disableDownload();
+    renderCameraHeading();
   }
   function canExport() {
     return allowed("cameras.export") && !state.signingOut;
@@ -160,10 +194,12 @@
 
   function renderAccountControls() {
     const account = state.account;
-    $("admin-tab").hidden = account?.role !== "administrator";
-    $("security-tab").hidden = !account || !window.K5Settings?.create;
+    $("admin-tab").hidden = account?.role !== "administrator" || !ADMIN_PERMISSIONS.some(allowed);
+    $("security-tab").hidden = !account || !state.capabilitiesResolved || !window.K5Settings?.create;
     $("add-camera-button").hidden = !allowed("cameras.manage");
+    for (const node of $("camera-list").querySelectorAll(".camera-item")) node.disabled = !allowed("cameras.view_live") && !allowed("cameras.playback");
     $("admin-tab").textContent = allowed("users.manage") ? "Administration" : "Recorder settings";
+    $("admin-settings-tab").hidden = !ADMIN_PERMISSIONS.some(allowed);
     $("account-role").title = account?.role === "administrator" ? "Manage users, cameras and recordings"
       : account?.role === "operator" ? "View assigned cameras and export footage" : "Watch assigned live and recorded video";
     $("download-recording").hidden = !canExport();
@@ -393,6 +429,7 @@
     stopPlayback();
     state.token = "";
     state.account = null;
+    state.capabilitiesResolved = false;
     state.cameras = [];
     state.workerStatus = "ready";
     state.diagnostics = null;
@@ -497,6 +534,7 @@
       const button = document.createElement("button");
       button.type = "button";
       button.className = "camera-item";
+      button.disabled = !allowed("cameras.view_live") && !allowed("cameras.playback");
       button.classList.toggle("selected", camera.device_id === state.selected);
       button.setAttribute("aria-pressed", String(camera.device_id === state.selected));
       const heading = document.createElement("span");
@@ -687,12 +725,15 @@
       const data = await request("/api/v1/operator/cameras");
       if (epoch !== state.sessionEpoch || cameraListEpoch !== state.cameraListEpoch) return;
       if (!Array.isArray(data.cameras)) throw new ApiError(503);
+      const restoreWall = !state.capabilitiesResolved;
+      resolveCapabilities(data.capabilities);
       state.workerStatus = ["ready", "unavailable", "disk_full"].includes(data.worker_status) ? data.worker_status : "ready";
       renderWorkerStatus();
       state.cameras = data.cameras.filter((camera) => camera && typeof camera.device_id === "string" && typeof camera.name === "string");
       administration?.refreshCameras();
       settings?.refreshCameras();
       renderCameras();
+      if (restoreWall && state.view === "wall" && allowed("cameras.view_live")) cameraWall().show(state.cameras);
       if (state.selected && !currentCamera() && !["admin", "settings"].includes(state.view)) {
         clearCameraSelection("Camera unavailable", "Select another camera or refresh the camera list.");
       }
@@ -701,6 +742,7 @@
       return true;
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.sessionEpoch || cameraListEpoch !== state.cameraListEpoch) return;
+      suspendCapabilities();
       $("camera-list-message").textContent = apiMessage(error, "Camera list unavailable. Select refresh to try again.");
       return false;
     }
@@ -723,9 +765,9 @@
   }
 
   async function selectCamera(deviceId) {
-    if (!state.token || state.signingOut) return;
+    if (!state.token || state.signingOut || !allowed("cameras.view_live") && !allowed("cameras.playback")) return;
     state.navigationEpoch += 1;
-    if (["wall", "admin"].includes(state.view)) setView("live", false);
+    if (["wall", "admin"].includes(state.view)) setView(allowed("cameras.view_live") ? "live" : "history", false);
     state.selectionController?.abort();
     state.selectionController = new AbortController();
     const epoch = ++state.selectionEpoch;
@@ -987,7 +1029,8 @@
   function setView(view, load = true) {
     if (state.signingOut || state.securityTransition) return;
     if (!["wall", "live", "history", "admin", "settings"].includes(view)) return;
-    if (view === "admin" && state.account?.role !== "administrator") return;
+    if (view === "admin" && !allowed("users.manage")) return;
+    if (view === "live" && !allowed("cameras.view_live") || view === "history" && !allowed("cameras.playback")) return;
     const previous = state.view;
     state.navigationEpoch += 1;
     state.view = view;
@@ -1482,7 +1525,7 @@
 
   async function toggleRecording() {
     const camera = currentCamera();
-    if (!camera || !canManageCameras() || state.recordingBusy || state.signingOut) return;
+    if (!camera || !allowed("recording.manage") || state.recordingBusy || state.signingOut) return;
     const deviceId = camera.device_id, session = state.sessionEpoch;
     const enabled = camera.recording_enabled === false;
     state.recordingBusy = true;
@@ -1775,7 +1818,8 @@
       state.token = result.session_token;
       const account = await request("/api/v1/auth/me");
       if (epoch !== state.sessionEpoch) return;
-      state.account = account;
+      state.account = { ...account, effective_permissions: [], authority_resolved: false };
+      state.capabilitiesResolved = false;
       $("account-name").textContent = account.display_name || account.username;
       $("account-role").textContent = account.role;
       renderAccountControls();
@@ -1938,7 +1982,7 @@
   window.K5Playback = Object.freeze({ getUTC: playbackUtc, seekUTC: seekEventRecording });
 
   function canManageCameras() {
-    return state.account?.role === "administrator" && Boolean(state.token) && !state.signingOut;
+    return allowed("cameras.manage") && Boolean(state.token) && !state.signingOut;
   }
 
   function cameraSetupType() {
@@ -2374,7 +2418,7 @@
 
   $("remove-camera-button").addEventListener("click", () => {
     const camera = currentCamera();
-    if (!camera || state.account?.role !== "administrator") return;
+    if (!camera || !canManageCameras()) return;
     state.removeTarget = { device_id: camera.device_id, name: camera.name, host: camera.host };
     $("remove-camera-name").textContent = `${camera.name} · ${camera.host}`;
     message("remove-camera-message", "");
@@ -2388,7 +2432,7 @@
   $("remove-camera-dialog").addEventListener("close", () => { state.removeTarget = null; });
   $("remove-camera-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (state.removing || !state.removeTarget || state.account?.role !== "administrator") return;
+    if (state.removing || !state.removeTarget || !canManageCameras()) return;
     const target = state.removeTarget;
     const epoch = state.sessionEpoch;
     setRemovalBusy(true);

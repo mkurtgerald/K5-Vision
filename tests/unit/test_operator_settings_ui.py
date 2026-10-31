@@ -19,6 +19,38 @@ _CONNECTION = "e102562c-bfb3-410a-b3c0-0416ec69f6e2"
 _GIB = 1024**3
 
 
+def _ui_core(account):
+    return {
+        "id": account.get("id", "a22c22bc-4089-45b7-a370-f360bb9d33c0"),
+        "username": account["username"],
+        "display_name": account.get("display_name", account["username"]),
+        "role": account["role"],
+        "enabled": account.get("enabled", True),
+    }
+
+
+def _ui_inventory(account, cameras, **extra):
+    from k5vision.operator_role_policy import BASE_PERMISSIONS
+
+    permissions = sorted(account.get("effective_permissions", BASE_PERMISSIONS[account["role"]]))
+    return {
+        **extra,
+        "cameras": cameras,
+        "capabilities": {
+            "account": {
+                **_ui_core(account),
+                "role_profile_id": account.get("role_profile_id"),
+                "effective_permissions": permissions,
+            },
+            "effective_permissions": permissions,
+            "can_export": "cameras.export" in permissions,
+            "can_manage_users": "users.manage" in permissions,
+            "can_manage_cameras": "cameras.manage" in permissions,
+            "can_view_history": "cameras.playback" in permissions,
+        },
+    }
+
+
 @pytest.fixture
 def workspace():
     if os.getenv("K5_OPERATOR_BROWSER_ACCEPTANCE") != "1":
@@ -26,7 +58,9 @@ def workspace():
     browser_api = pytest.importorskip("playwright.sync_api")
 
     @contextmanager
-    def launch(*, role="administrator", permissions=None, mfa_login=False, sso=False):
+    def launch(
+        *, role="administrator", permissions=None, mfa_login=False, sso=False, hold_inventory=False
+    ):
         account = {
             "id": _ADMIN,
             "username": "fixture-admin",
@@ -53,7 +87,7 @@ def workspace():
         ]
         state = {
             "requests": [],
-            "users": [dict(account)],
+            "users": [{**account, **_ui_inventory(account, [])["capabilities"]["account"]}],
             "storage": {
                 "revision": 3,
                 "quota_bytes": 20 * _GIB,
@@ -91,6 +125,9 @@ def workspace():
             "time_sync_requests": 0,
             "reject_session": False,
             "cameras": cameras,
+            "capability_fault": None,
+            "hold_inventory": hold_inventory,
+            "held_inventory": [],
         }
         errors = []
         channel = os.getenv(
@@ -212,7 +249,7 @@ def workspace():
                 }:
                     return respond(route, {"detail": "Unauthorized"}, 401)
                 if path == "/api/v1/auth/me":
-                    return respond(route, account)
+                    return respond(route, _ui_core(account))
                 if path in {"/api/v1/auth/logout", "/api/v1/operator/media-session"}:
                     return respond(route, {}, 204)
                 if path == "/api/v1/operator/status":
@@ -221,7 +258,20 @@ def workspace():
                         {"worker_status": "ready", "server_utc": datetime.now(UTC).isoformat()},
                     )
                 if path == "/api/v1/operator/cameras":
-                    return respond(route, {"cameras": cameras, "worker_status": "ready"})
+                    payload = _ui_inventory(account, cameras, worker_status="ready")
+                    if state["hold_inventory"]:
+                        state["held_inventory"].append((route, payload))
+                        return None
+                    fault = state["capability_fault"]
+                    if fault == "missing":
+                        payload.pop("capabilities")
+                    elif fault == "foreign":
+                        payload["capabilities"]["account"]["id"] = _CAMERA
+                    elif fault == "contradictory":
+                        payload["capabilities"]["can_export"] = False
+                    elif fault == "expanded":
+                        payload["capabilities"]["effective_permissions"].append("unknown.admin")
+                    return respond(route, payload)
                 if path == "/api/v1/operator/admin/users":
                     if method == "GET":
                         return respond(route, {"users": state["users"], "has_more": False})
@@ -903,3 +953,114 @@ def test_exhausted_provider_deliveries_can_be_retried_from_gui(workspace):
         assert (
             page.get_by_role("button", name="Retry exhausted deliveries", exact=True).count() == 0
         )
+
+
+def test_operator_permissions_come_from_inventory_not_core_auth_account(workspace):
+    with workspace(role="operator", permissions=["cameras.view_live", "cameras.playback"]) as (
+        page,
+        state,
+        _,
+    ):
+        assert page.locator("#admin-tab").is_hidden()
+        assert page.locator("#export-panel").is_hidden()
+        assert page.locator("#clip-mark-in").is_hidden()
+        assert page.locator("#download-recording").is_hidden()
+        assert page.locator("#add-camera-button").is_hidden()
+        page.locator(".camera-item").first.click()
+        assert page.locator("#history-tab").is_enabled()
+        assert page.locator("#update-source-button").is_hidden()
+        assert page.locator("#remove-camera-button").is_hidden()
+        assert not any(p.endswith("/capabilities") for _, p, _, _ in state["requests"])
+
+
+@pytest.mark.parametrize("fault", ["missing", "foreign", "contradictory", "expanded"])
+def test_unverified_inventory_pauses_changes_and_preserves_open_settings(workspace, fault):
+    with workspace() as (page, state, _):
+        open_settings(page)
+        page.locator("#storage-quota").fill("37")
+        state["capability_fault"] = fault
+        page.wait_for_function("document.querySelector('#storage-save').disabled")
+        assert page.locator("#settings-storage-panel").is_visible()
+        assert page.locator("#storage-quota").input_value() == "37"
+        assert page.locator("#admin-tab").is_hidden()
+        assert page.locator("#add-camera-button").is_hidden()
+        assert page.locator("#export-panel").is_hidden()
+        assert page.locator("#download-recording").is_hidden()
+        assert page.locator(".camera-item").first.is_disabled()
+        state["capability_fault"] = None
+        page.wait_for_function("!document.querySelector('#storage-save').disabled")
+        assert page.locator("#settings-storage-panel").is_visible()
+        assert page.locator("#storage-quota").input_value() == "37"
+        assert not any(m == "PATCH" and p.endswith("/storage") for m, p, _, _ in state["requests"])
+
+
+def test_capability_refresh_preserves_open_user_editor(workspace):
+    with workspace() as (page, state, _):
+        page.locator("#admin-tab").click()
+        page.locator(f'tr[data-user-id="{_ADMIN}"] [data-user-action="edit"]').click()
+        page.locator("#admin-display-name").fill("Unsaved account name")
+        state["capability_fault"] = "missing"
+        page.wait_for_function("document.querySelector('#admin-save-user').disabled")
+        assert page.locator("#admin-user-dialog").is_visible()
+        assert page.locator("#admin-display-name").input_value() == "Unsaved account name"
+        state["capability_fault"] = None
+        # The modal owns pointer focus; normal background refresh still runs.
+        page.wait_for_function("!document.querySelector('#admin-save-user').disabled")
+        assert page.locator("#admin-display-name").input_value() == "Unsaved account name"
+        page.locator("#admin-cancel-user").click()
+
+
+def test_narrow_user_manager_cannot_change_provider_or_link_stronger_account(workspace):
+    with workspace(permissions=["users.manage"]) as (page, state, _):
+        stronger = _ui_inventory({"username": "full-admin", "role": "administrator"}, [])[
+            "capabilities"
+        ]["account"]
+        stronger.update(
+            id=_ROLE, credential_status="active", camera_access={"mode": "all", "camera_ids": []}
+        )
+        state["users"].append(stronger)
+        state["sso_links"] = [
+            {
+                "id": "strong-link",
+                "issuer": "https://identity.example.test",
+                "subject": "full",
+                "user_id": _ROLE,
+            }
+        ]
+        open_settings(page, "sso")
+        page.wait_for_function(
+            "document.querySelector('#settings-sso-panel').getAttribute('aria-busy') === 'false'"
+        )
+        assert page.locator("#sso-save").is_disabled()
+        assert page.locator("#sso-client-secret").is_disabled()
+        assert page.locator("#sso-authority").is_visible()
+        assert page.locator(f'#sso-link-user option[value="{_ROLE}"]').is_disabled()
+        assert not page.locator(f'#sso-link-user option[value="{_ADMIN}"]').is_disabled()
+        assert page.locator("#sso-unlink-strong-link").is_disabled()
+        page.locator("#sso-provider-form").evaluate(
+            "e=>e.dispatchEvent(new Event('submit',{cancelable:true,bubbles:true}))"
+        )
+        page.locator("#sso-unlink-strong-link").evaluate(
+            "e=>e.dispatchEvent(new MouseEvent('click',{bubbles:true}))"
+        )
+        assert not any(m in {"PUT", "DELETE"} and "/sso/" in p for m, p, _, _ in state["requests"])
+
+
+def test_no_privileged_action_before_canonical_inventory_arrives(workspace):
+    with workspace(hold_inventory=True) as (page, state, _):
+        assert page.locator("#workspace").is_visible()
+        assert page.locator("#admin-tab").is_hidden()
+        assert page.locator("#add-camera-button").is_hidden()
+        assert page.locator("#security-tab").is_hidden()
+        assert page.locator("#export-panel").is_hidden()
+        page.wait_for_function(
+            "document.querySelector('#account-role').textContent === 'administrator'"
+        )
+        page.wait_for_timeout(25)
+        assert state["held_inventory"]
+        state["hold_inventory"] = False
+        route, payload = state["held_inventory"].pop()
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+        page.locator("#admin-tab").wait_for(state="visible")
+        assert page.locator("#add-camera-button").is_visible()
+        assert page.locator("#security-tab").is_visible()

@@ -21,6 +21,13 @@ from k5vision.operator_identity_security import (
     SecondFactorRequired,
 )
 from k5vision.operator_oidc import OIDCError
+from k5vision.operator_role_policy import PERMISSIONS
+from k5vision.operator_role_policy_api import (
+    effective_permissions,
+    require_grant,
+    require_permission,
+)
+from k5vision.services.user_registry import UserRegistryStorageError
 from k5vision.user_admin_api import _UserRateLimiter
 
 _ADMIN = "/api/v1/operator/admin/sso"
@@ -117,10 +124,15 @@ def install_oidc_api(
         if retry is not None:
             raise HTTPException(429, "sso_rate_limit", headers={"Retry-After": str(retry)})
 
+    async def manager(session):
+        current, _ = await authenticate(session[1])
+        require_permission(app, current, "users.manage")
+        return current
+
     @app.get(_ADMIN + "/provider", tags=["single sign-on"])
     async def provider(request: Request, response: Response, session=admin_dependency):
         response.headers["Cache-Control"] = "no-store"
-        await authenticate(session[1])
+        await manager(session)
         try:
             return {**oidc.store.provider(), "redirect_uri": callback_uri(request)}
         except AccountSecurityError:
@@ -130,7 +142,11 @@ def install_oidc_api(
     async def configure(payload: _Provider, response: Response, session=admin_dependency):
         response.headers["Cache-Control"] = "no-store"
         async with mutations:
-            current, _ = await authenticate(session[1])
+            current = await manager(session)
+            # Replacing the issuer/client can authenticate any linked K5
+            # account. Ordinary user-management delegation cannot replace that
+            # site-wide trust boundary on behalf of stronger administrators.
+            require_grant(app, current, PERMISSIONS)
             try:
                 value = oidc.store.configure(**payload.model_dump())
             except (AccountSecurityError, ValueError):
@@ -145,18 +161,19 @@ def install_oidc_api(
     @app.post(_ADMIN + "/provider/test", tags=["single sign-on"])
     async def test_provider(response: Response, session=admin_dependency):
         response.headers["Cache-Control"] = "no-store"
+        await manager(session)
         async with capacity:
             try:
                 value = await asyncio.to_thread(oidc.test)
             except (OIDCError, AccountSecurityError):
                 raise HTTPException(422, "sso_provider_test_failed") from None
-        await authenticate(session[1])
+        await manager(session)
         return value
 
     @app.get(_ADMIN + "/links", tags=["single sign-on"])
     async def links(response: Response, session=admin_dependency):
         response.headers["Cache-Control"] = "no-store"
-        await authenticate(session[1])
+        await manager(session)
         try:
             return {"links": oidc.store.links()}
         except AccountSecurityError:
@@ -166,9 +183,14 @@ def install_oidc_api(
     async def link_user(payload: _Link, response: Response, session=admin_dependency):
         response.headers["Cache-Control"] = "no-store"
         async with mutations:
-            current, _ = await authenticate(session[1])
-            if users.active_session_snapshot(payload.user_id) is None:
+            current = await manager(session)
+            try:
+                target = users.active_session_snapshot(payload.user_id)
+            except UserRegistryStorageError:
+                raise HTTPException(503, "sso_unavailable") from None
+            if target is None:
                 raise HTTPException(422, "sso_user_must_be_active")
+            require_grant(app, current, effective_permissions(app, target[0]))
             try:
                 value = oidc.store.link(**payload.model_dump())
             except (AccountSecurityError, ValueError):
@@ -179,15 +201,21 @@ def install_oidc_api(
     @app.delete(_ADMIN + "/links/{identifier}", status_code=204, tags=["single sign-on"])
     async def unlink_user(identifier: UUID, session=admin_dependency):
         async with mutations:
-            current, _ = await authenticate(session[1])
+            current = await manager(session)
             try:
                 found = next(
                     (row for row in oidc.store.links() if row["id"] == str(identifier)), None
                 )
+                if found is not None:
+                    target = users.get(UUID(found["user_id"]))
+                    # An orphan can only be cleaned up by full authority;
+                    # absence of a target never lowers a delegation ceiling.
+                    ceiling = PERMISSIONS if target is None else effective_permissions(app, target)
+                    require_grant(app, current, ceiling)
                 oidc.store.unlink(identifier)
                 if found is not None:
                     await sessions.revoke_user(UUID(found["user_id"]))
-            except AccountSecurityError:
+            except (AccountSecurityError, UserRegistryStorageError):
                 raise HTTPException(503, "sso_unavailable") from None
             audit(
                 "security.sso_unlinked",

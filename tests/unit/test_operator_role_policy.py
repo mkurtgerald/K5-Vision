@@ -10,7 +10,7 @@ import test_operator_admin_api as admin_helpers
 import test_operator_product_api as helpers
 
 from k5vision.operator_component_state import ComponentStateAnchor, ComponentStateError
-from k5vision.operator_role_policy import OperatorRolePolicy, RolePolicyError
+from k5vision.operator_role_policy import PERMISSIONS, OperatorRolePolicy, RolePolicyError
 
 product = helpers.product
 pytestmark = pytest.mark.parametrize("product", [{"roles": True}], indirect=True)
@@ -85,8 +85,12 @@ def test_delegated_camera_manager_cannot_manage_people_roles_or_recording(produc
     )
 
 
-def test_cannot_replace_last_full_administrator_with_restricted_admin(product):
-    role = _role(product)["role"]
+@pytest.mark.parametrize(
+    "permissions",
+    [["cameras.view_live", "cameras.manage"], ["users.manage", "roles.manage"]],
+)
+def test_cannot_replace_last_full_administrator_with_restricted_admin(product, permissions):
+    role = _role(product, permissions=permissions)["role"]
     assert _assign(product, product.admin.id, role["id"]).status_code == 409
     assert product.app.state.operator_roles.account_fields(product.admin)["role_profile_id"] is None
     delegated = _account(product, role="administrator")
@@ -104,6 +108,27 @@ def test_cannot_replace_last_full_administrator_with_restricted_admin(product):
     )
     assert response.status_code == 409
     assert product.users.credential_status(product.admin.id) == "active"
+
+
+def test_last_full_administrator_profile_cannot_lose_storage_authority(product):
+    profile = _role(product, permissions=sorted(PERMISSIONS))["role"]
+    assert _assign(product, product.admin.id, profile["id"]).status_code == 200
+    headers = _headers(product, product.admin.id)
+    before = product.client.get(_ROLES, headers=headers).json()
+    response = product.client.patch(
+        _ROLES + "/" + profile["id"],
+        headers=headers,
+        json={
+            **{k: v for k, v in profile.items() if k != "id"},
+            "permissions": sorted(PERMISSIONS - {"storage.manage"}),
+            "expected_revision": before["revision"],
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "roles_last_administrator"
+    assert product.client.get(_ROLES, headers=headers).json() == before
+    capabilities = product.client.get("/api/v1/operator/capabilities", headers=headers).json()
+    assert "storage.manage" in capabilities["account"]["effective_permissions"]
 
 
 def test_revision_conflict_profile_in_use_and_base_role_immutability(product):

@@ -18,6 +18,38 @@ _CAMERA = "e4fd401d-ae8e-4ac2-9f92-e8287f241532"
 _CODE = "Generated-One-Time-Credential-0123456789"
 
 
+def _ui_core(account):
+    return {
+        "id": account.get("id", "a22c22bc-4089-45b7-a370-f360bb9d33c0"),
+        "username": account["username"],
+        "display_name": account.get("display_name", account["username"]),
+        "role": account["role"],
+        "enabled": account.get("enabled", True),
+    }
+
+
+def _ui_inventory(account, cameras, **extra):
+    from k5vision.operator_role_policy import BASE_PERMISSIONS
+
+    permissions = sorted(account.get("effective_permissions", BASE_PERMISSIONS[account["role"]]))
+    return {
+        **extra,
+        "cameras": cameras,
+        "capabilities": {
+            "account": {
+                **_ui_core(account),
+                "role_profile_id": account.get("role_profile_id"),
+                "effective_permissions": permissions,
+            },
+            "effective_permissions": permissions,
+            "can_export": "cameras.export" in permissions,
+            "can_manage_users": "users.manage" in permissions,
+            "can_manage_cameras": "cameras.manage" in permissions,
+            "can_view_history": "cameras.playback" in permissions,
+        },
+    }
+
+
 def test_administration_assets_and_first_login_are_in_the_shipped_workspace():
     html = (_ASSETS / "index.html").read_text(encoding="utf-8")
     assert "/operator/admin.js" in html and "/operator/admin.css" in html
@@ -36,7 +68,7 @@ def workspace():
     browser_api = pytest.importorskip("playwright.sync_api")
 
     @contextmanager
-    def launch(role="administrator", *, hold_initial_cameras=False):
+    def launch(role="administrator", *, hold_camera_refresh=False):
         account = {
             "id": _ADMIN_ID,
             "username": "fixture-admin",
@@ -66,8 +98,9 @@ def workspace():
             "hold_create": False,
             "held": None,
             "expire": False,
-            "hold_initial_cameras": hold_initial_cameras,
+            "hold_camera_refresh": hold_camera_refresh,
             "held_inventory": None,
+            "inventory_count": 0,
         }
         channel = os.getenv(
             "K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium"
@@ -139,7 +172,7 @@ def workspace():
                         },
                     )
                 if path == "/api/v1/auth/me":
-                    return respond(route, account)
+                    return respond(route, _ui_core(account))
                 if path in {"/api/v1/auth/logout", "/api/v1/operator/media-session"}:
                     return respond(route, {}, 204)
                 if path == "/api/v1/operator/status":
@@ -148,17 +181,20 @@ def workspace():
                         {"worker_status": "ready", "server_utc": datetime.now(UTC).isoformat()},
                     )
                 if path == "/api/v1/operator/cameras":
-                    if state["hold_initial_cameras"]:
-                        state["hold_initial_cameras"] = False
+                    state["inventory_count"] += 1
+                    if state["hold_camera_refresh"] and state["inventory_count"] == 1:
+                        return respond(route, _ui_inventory(account, [], worker_status="ready"))
+                    if state["hold_camera_refresh"]:
+                        state["hold_camera_refresh"] = False
                         state["held_inventory"] = (
                             route,
-                            {"cameras": cameras, "worker_status": "ready"},
+                            _ui_inventory(account, cameras, worker_status="ready"),
                         )
                         return None
                     return (
                         respond(route, {"detail": "Unauthorized"}, 401)
                         if state["expire"]
-                        else respond(route, {"cameras": cameras, "worker_status": "ready"})
+                        else respond(route, _ui_inventory(account, cameras, worker_status="ready"))
                     )
                 if path == "/api/v1/operator/admin/users" and method == "GET":
                     return respond(route, {"users": state["users"], "has_more": False})
@@ -347,11 +383,11 @@ def test_viewer_controls_are_read_only_and_admin_request_cannot_reveal_after_exp
         assert not errors
 
 
-def test_late_initial_camera_inventory_preserves_administration_and_open_permissions_editor(
+def test_late_camera_refresh_preserves_administration_and_open_permissions_editor(
     workspace,
 ):
-    """A slow first inventory must not undo the administrator's later navigation."""
-    with workspace(hold_initial_cameras=True) as (page, state, _account, errors):
+    """After authority resolves, a late inventory must preserve an open user editor."""
+    with workspace(hold_camera_refresh=True) as (page, state, _account, errors):
         viewer_id = "4a45619d-74db-4e60-a003-c4929c98cf49"
         state["users"].append(
             {
@@ -371,6 +407,11 @@ def test_late_initial_camera_inventory_preserves_administration_and_open_permiss
         selection = page.locator(f'#admin-camera-choices input[value="{_CAMERA}"]')
         assert selection.is_checked()
         assert "Unavailable camera" in page.locator("#admin-camera-choices").inner_text()
+        for _ in range(100):
+            if state["held_inventory"] is not None:
+                break
+            page.wait_for_timeout(50)
+        assert state["held_inventory"] is not None
         route, inventory = state["held_inventory"]
         route.fulfill(content_type="application/json", body=json.dumps(inventory))
         page.locator("#admin-camera-choices").filter(

@@ -5,16 +5,27 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
 import test_operator_admin_api as admin_helpers
+import test_operator_oidc as oidc_helpers
 import test_operator_product_api as helpers
+from fastapi.testclient import TestClient
 
-from k5vision.operator_role_policy import BASE_PERMISSIONS, OperatorRolePolicy, RolePolicyError
+from k5vision.domain.users import UserCreate, UserRole
+from k5vision.operator_product import create_operator_product_app
+from k5vision.operator_role_policy import (
+    BASE_PERMISSIONS,
+    PERMISSIONS,
+    OperatorRolePolicy,
+    RolePolicyError,
+)
 from k5vision.services.user_registry import UserRegistryStorageError
 
 product = helpers.product
+review_identity = oidc_helpers.identity
 _ADMIN = "/api/v1/operator/admin"
 _ROLES = _ADMIN + "/roles"
 
@@ -333,3 +344,165 @@ def test_invalid_durable_anchor_cannot_be_treated_as_first_installation(product,
     with pytest.raises(RolePolicyError, match="roles_unavailable"):
         OperatorRolePolicy(root, product.service.site_id)
     assert path.read_bytes() == before
+
+
+@pytest.fixture
+def composed_review(review_identity):
+    """Keep real identity, product policy, auth routes, audit and middleware."""
+    service = helpers._Service(review_identity.site_id)
+    service.public_port = 8080
+
+    async def start(_sources):
+        pass
+
+    async def stop():
+        pass
+
+    service.start = start
+    service.stop = stop
+    app = create_operator_product_app(identity_directory=review_identity.directory, service=service)
+    with TestClient(app, base_url="http://127.0.0.1:8080") as client:
+        owner = app.state.user_registry.list()[0]
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": owner.username, "password": "federation-test-password"},
+        )
+        assert login.status_code == 200
+        yield SimpleNamespace(
+            app=app,
+            client=client,
+            owner=owner,
+            headers={"Authorization": "Bearer " + login.json()["session_token"]},
+            users=app.state.user_registry,
+            policy=app.state.operator_roles,
+        )
+
+
+def _composed_manager(value, permissions):
+    account, temporary, _ = value.users.create_with_bootstrap(
+        UserCreate(
+            username="composed-people-manager",
+            display_name="Composed people manager",
+            role=UserRole.ADMINISTRATOR,
+        ),
+        actor=value.owner.username,
+    )
+    value.users.activate_bootstrap_password(
+        username=account.username,
+        temporary_credential=temporary,
+        new_password="composed-manager-test-password",
+        actor=value.owner.username,
+    )
+    profile = value.policy.upsert(
+        value.users,
+        {
+            "name": "Composed restricted administration",
+            "description": "Independent composed security review",
+            "base_role": "administrator",
+            "permissions": sorted(permissions),
+        },
+    )
+    value.policy.assign(value.users, account.id, UUID(profile["id"]))
+    response = value.client.post(
+        "/api/v1/auth/login",
+        json={"username": account.username, "password": "composed-manager-test-password"},
+    )
+    assert response.status_code == 200
+    return account, {"Authorization": "Bearer " + response.json()["session_token"]}
+
+
+def test_composed_sso_ceiling_preserves_stronger_session_and_durable_denials(composed_review):
+    value = composed_review
+    manager, headers = _composed_manager(value, {"users.manage"})
+    oidc = value.app.state.operator_oidc
+    oidc.store.configure(
+        enabled=True,
+        display_name="Independent identity fixture",
+        issuer="https://identity.example",
+        client_id="composed-reviewed-client",
+    )
+    link = oidc.store.link(subject="full-owner-subject", user_id=value.owner.id)
+    provider_before, links_before = oidc.store.provider(), oidc.store.links()
+    attempts = (
+        value.client.put(
+            _ADMIN + "/sso/provider",
+            headers=headers,
+            json={
+                "enabled": False,
+                "display_name": "Unprivileged replacement",
+                "issuer": "https://replacement.example",
+                "client_id": "replacement-client",
+            },
+        ),
+        value.client.post(
+            _ADMIN + "/sso/links",
+            headers=headers,
+            json={"subject": "manager-controlled-subject", "user_id": str(value.owner.id)},
+        ),
+        value.client.delete(_ADMIN + "/sso/links/" + link["id"], headers=headers),
+    )
+    assert [response.status_code for response in attempts] == [403, 403, 403]
+    assert oidc.store.provider() == provider_before
+    assert oidc.store.links() == links_before
+    assert value.client.get(_ADMIN + "/users", headers=value.headers).status_code == 200
+    receipt = value.client.get(
+        _ADMIN + "/activity",
+        headers=value.headers,
+        params={"action": "security.sso.configure", "outcome": "denied"},
+    )
+    assert receipt.status_code == 200
+    events = receipt.json()["events"]
+    assert len(events) == 3
+    assert {event["actor_id"] for event in events} == {str(manager.id)}
+    assert {event["status_code"] for event in events} == {403}
+
+
+def test_composed_product_has_no_legacy_account_or_device_takeover_route(composed_review):
+    value = composed_review
+    _, headers = _composed_manager(value, {"users.manage", "roles.manage"})
+    users_before = [account.model_dump() for account in value.users.list()]
+    attempts = (
+        ("POST", "/api/v1/users", {"username": "legacy-takeover", "role": "administrator"}),
+        ("PATCH", f"/api/v1/users/{value.owner.id}", {"enabled": False}),
+        ("POST", "/api/v1/%75sers", {"username": "encoded-takeover", "role": "administrator"}),
+        ("GET", "/api/v1/users/audit", None),
+        ("GET", "/api/v1/users/", None),
+        ("POST", "/api/v1/devices", {"name": "Bypass camera", "host": "192.0.2.10"}),
+        ("GET", "/api/v1/devices/", None),
+    )
+    for method, path, payload in attempts:
+        response = value.client.request(method, path, headers=headers, json=payload)
+        assert response.status_code == 404, (method, path, response.text)
+    assert [account.model_dump() for account in value.users.list()] == users_before
+    assert value.app.state.device_registry.list() == []
+    assert value.client.get("/api/v1/auth/me", headers=headers).status_code == 200
+    assert value.client.get(_ADMIN + "/users", headers=value.headers).status_code == 200
+
+
+@pytest.mark.parametrize("product", [{"roles": True}], indirect=True)
+def test_last_full_profile_keeps_time_authority_when_only_backup_is_a_people_manager(product):
+    _limited_admin(product, ["users.manage", "roles.manage"])
+    profile = _role(product, sorted(PERMISSIONS), base="administrator", name="Full site owner")
+    assert _assign(product, product.admin.id, profile["id"]).status_code == 200
+    _, headers = _session(product, str(product.admin.id))
+    policy = product.app.state.operator_roles
+    before = policy._path.read_bytes()
+    revision = policy.snapshot()["revision"]
+    response = product.client.patch(
+        _ROLES + "/" + profile["id"],
+        headers=headers,
+        json={
+            **{key: value for key, value in profile.items() if key != "id"},
+            "permissions": sorted(PERMISSIONS - {"time.manage"}),
+            "expected_revision": revision,
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "roles_last_administrator"
+    assert policy._path.read_bytes() == before
+    reopened = OperatorRolePolicy(policy._root, product.service.site_id)
+    try:
+        assert reopened.permissions(product.admin) == PERMISSIONS
+    finally:
+        reopened.close()
+    assert product.client.get(_ROLES, headers=headers).status_code == 200

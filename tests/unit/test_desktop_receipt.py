@@ -72,7 +72,8 @@ _ANALYTICS_FALSE = ("analytics_mock_inference", "analytics_accuracy_acceptance")
 _SETTINGS_TRUE = (
     "settings_admin_gui settings_storage_policy_live settings_storage_policy_restored "
     "settings_custom_role_assignment settings_profile_bound_edit "
-    "settings_custom_role_permission_denied settings_role_revoked_sessions "
+    "settings_custom_role_permission_denied settings_role_ui_permissions "
+    "settings_role_revoked_sessions "
     "settings_time_status_visible settings_time_no_clock_changes settings_audit_download "
     "settings_integrations_gui settings_analytics_machine_event settings_neural_v2_roundtrip "
     "settings_provider_event_playback settings_mfa_enrollment settings_mfa_challenge "

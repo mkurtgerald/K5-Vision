@@ -67,6 +67,10 @@ In an existing account's editor, choose a profile and select **Apply role
 profile**. The proposed base role is shown explicitly, and the target's previous
 sessions are revoked. Removing a custom profile keeps its existing base role;
 then edit the built-in role normally. Camera grants remain independent.
+Delegated administrators cannot grant permissions they do not hold or take over
+stronger accounts. K5 preserves at least one enabled administrator with an active
+password and every product permission; account-management permissions alone do
+not make a recovery administrator.
 
 **Organization sign-in** saves an OpenID Connect provider, shows the exact local
 redirect URI to register, and tests issuer, PKCE and signing compatibility.
@@ -74,6 +78,10 @@ Explicitly link each provider subject to an existing K5 account, with an optiona
 required group. A saved configuration or successful metadata test is not proof
 of a particular organization's completed sign-in. Local password sign-in remains
 available. See [account security](WINDOWS_ACCOUNT_SECURITY.md).
+Changing the site-wide provider requires every product permission because that
+provider can authenticate all linked accounts. Linking or unlinking an identity
+requires authority over the target account's current permissions. Restricted
+administrators see these limits in the graphical controls.
 
 ## Authenticator and recovery codes
 

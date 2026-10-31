@@ -36,6 +36,7 @@
     mfa_enrollment_expired: "This enrollment expired. Start a new enrollment.", mfa_already_enabled: "An authenticator is already enabled. Refresh account security.",
     mfa_not_enabled: "An authenticator has not been enabled for this account.",
   });
+  const ALL_PERMISSIONS = ["cameras.view_live", "cameras.playback", "cameras.export", "cameras.manage", "recording.manage", "analytics.manage", "users.manage", "roles.manage", "storage.manage", "time.manage", "integrations.manage", "audit.read"];
   const $ = (id) => document.getElementById(id);
   function element(tag, text = "", attributes = {}) {
     const node = document.createElement(tag); if (text) node.textContent = text;
@@ -61,13 +62,14 @@
     let visible = false, epoch = 0, controller = null, currentSection = "storage", sequence = 0;
     let storage = null, host = null, camera = null, connections = [], editingConnection = null, cameraSelectionLost = false;
     let auditBefore = null, auditStack = [], auditNext = null, roleData = null, editingRole = null;
-    let enrollmentToken = "", mustReauthenticate = false, objectUrl = null, objectTimer = null;
+    let enrollmentToken = "", mustReauthenticate = false, objectUrl = null, objectTimer = null, authoritySuspended = false;
     const tabs = new Map(), panels = new Map(), messages = new Map(), busy = new Map();
     const permitted = (permission) => {
       const account = getSession()?.account;
-      return !permission || (Array.isArray(account?.effective_permissions) ? account.effective_permissions.includes(permission) : account?.role === "administrator");
+      return account?.authority_resolved === true && (!permission
+        || Array.isArray(account.effective_permissions) && account.effective_permissions.includes(permission));
     };
-    const activeSession = () => { const s = getSession(); return s?.token && s.account?.enabled !== false ? s : null; };
+    const activeSession = () => { const s = getSession(); return s?.token && s.account?.enabled !== false && s.account?.authority_resolved === true ? s : null; };
     function errorText(error) {
       if (ERRORS[error.code]) return ERRORS[error.code];
       if (error.status === 401) return "Your session ended. Sign in again.";
@@ -118,6 +120,14 @@
       if (name === "activity") { $("activity-older").disabled = auditNext === null; $("activity-newer").disabled = !auditStack.length; }
       if (name === "roles") { $("roles-delete").disabled = !editingRole; $("roles-base").disabled = Boolean(editingRole); }
       if (name === "integrations") $("integration-kind").disabled = Boolean(editingConnection);
+      if (name === "sso") {
+        const full = canConfigureSso();
+        for (const node of ssoForm.querySelectorAll("input,button[type=submit]")) node.disabled = !full;
+        $("sso-authority").hidden = full;
+        for (const option of linkUser.options) if (option.value) option.disabled = !canLinkSsoUser(ssoUsers.find((u) => u.id === option.value));
+        if (linkUser.selectedOptions[0]?.disabled) linkUser.value = "";
+        for (const node of $("sso-links").querySelectorAll("button")) node.disabled = !canLinkSsoUser(ssoUsers.find((u) => u.id === ssoLinks.find((link) => `sso-unlink-${link.id}` === node.id)?.user_id));
+      }
       if (name === "security" && mustReauthenticate) for (const node of securityPanel.querySelectorAll("button,input")) node.disabled = node.id !== "security-recovery-done";
     }
 
@@ -280,6 +290,7 @@
 
     const ssoPanel = section("sso", "Organization sign-in", "Use an OpenID Connect identity provider with PKCE and signed ID tokens. Each provider subject must be explicitly linked to an existing K5 account; local sign-in remains available.");
     health(ssoPanel, "sso-health");
+    ssoPanel.append(element("p", "Changing the identity provider requires an administrator with every recorder permission. You can link only accounts whose permissions are within your own.", { id: "sso-authority", className: "field-help", hidden: "" }));
     field(ssoPanel, "sso-callback-uri", "Redirect URI to register with your identity provider", { readonly: "", help: "Register this exact local callback URI in the identity-provider application." });
     const ssoForm = element("form", "", { id: "sso-provider-form", autocomplete: "off" }), ssoGrid = element("div", "", { className: "settings-grid" });
     field(ssoGrid, "sso-display-name", "Organization sign-in name", { required: "", maxlength: "80", placeholder: "Your organization" });
@@ -297,7 +308,12 @@
     field(linkGrid, "sso-link-group", "Required group · optional", { maxlength: "128", help: "When set, the verified identity must also contain this group." });
     ssoLinkForm.append(linkGrid); actions(ssoLinkForm, element("button", "Link account", { id: "sso-link-save", type: "submit", className: "button primary" }), button("sso-more-users", "Load more accounts", () => moreSsoUsers()));
     ssoPanel.append(ssoLinkForm, element("div", "", { id: "sso-links", className: "settings-cards" }));
-    let ssoProvider = null, ssoUsers = [], ssoUsersOffset = 0, ssoMoreUsers = false;
+    let ssoProvider = null, ssoUsers = [], ssoLinks = [], ssoUsersOffset = 0, ssoMoreUsers = false;
+    function canConfigureSso() { return ALL_PERMISSIONS.every(permitted); }
+    function canLinkSsoUser(user) {
+      return Array.isArray(user?.effective_permissions) && user.effective_permissions.length <= ALL_PERMISSIONS.length
+        && user.effective_permissions.every((p) => ALL_PERMISSIONS.includes(p) && permitted(p));
+    }
     function renderSsoProvider(d) {
       if (typeof d?.configured !== "boolean" || typeof d.enabled !== "boolean") throw new Error("Invalid SSO provider response");
       const redirect = d.redirect_uri || ssoProvider?.redirect_uri || ""; ssoProvider = { ...d, redirect_uri: redirect }; $("sso-callback-uri").value = redirect; $("sso-display-name").value = d.display_name || ""; $("sso-issuer").value = d.issuer || ""; $("sso-client-id").value = d.client_id || ""; $("sso-groups-claim").value = d.groups_claim || "groups"; $("sso-enabled").checked = d.enabled; $("sso-client-secret").value = ""; $("sso-clear-secret").checked = false;
@@ -311,15 +327,15 @@
       if (ssoUsers.some((u) => u.id === previous)) linkUser.value = previous; $("sso-more-users").hidden = !ssoMoreUsers;
     }
     function renderSsoLinks(d) {
-      const links = Array.isArray(d) ? d : d?.links; if (!Array.isArray(links) || links.length > 10000) throw new Error("Invalid SSO links");
+      const links = Array.isArray(d) ? d : d?.links; if (!Array.isArray(links) || links.length > 10000) throw new Error("Invalid SSO links"); ssoLinks = links;
       $("sso-links").replaceChildren(...(links.length ? links.map((link) => { const card = element("article", "", { className: "settings-card" }); const known = ssoUsers.find((u) => u.id === link.user_id); card.append(element("h3", known?.username || link.user_id), element("p", `Issuer: ${link.issuer}\nSubject: ${link.subject}\nRequired group: ${link.required_group || "none"}`, { className: "settings-status" })); actions(card, button(`sso-unlink-${link.id}`, "Remove identity link", () => unlinkSso(link.id))); return card; }) : [element("p", "No organization identities linked. Identity-provider users cannot sign in until an administrator links their subject to a K5 account.", { className: "settings-empty" })]));
     }
     function loadSso() { return run("sso", async (signal) => { const provider = await request(`${PREFIX}/sso/provider`, { signal }); const users = await request(`${PREFIX}/users?offset=0&limit=100`, { signal }); const links = await request(`${PREFIX}/sso/links`, { signal }); return { provider, users, links }; }, (d) => { renderSsoProvider(d.provider); renderSsoUsers(d.users); renderSsoLinks(d.links); message("sso"); }); }
     function moreSsoUsers() { if (!ssoMoreUsers) return; void run("sso", (signal) => request(`${PREFIX}/users?offset=${ssoUsersOffset}&limit=100`, { signal }), (d) => { renderSsoUsers(d, true); message("sso"); }); }
-    ssoForm.addEventListener("submit", (event) => { event.preventDefault(); const body = { enabled: $("sso-enabled").checked, display_name: $("sso-display-name").value.trim(), issuer: $("sso-issuer").value.trim(), client_id: $("sso-client-id").value.trim(), groups_claim: $("sso-groups-claim").value.trim() }; if ($("sso-clear-secret").checked) body.client_secret = ""; else if ($("sso-client-secret").value) body.client_secret = $("sso-client-secret").value; $("sso-client-secret").value = ""; void run("sso", async (signal) => { try { return await request(`${PREFIX}/sso/provider`, { method: "PUT", body, signal }); } finally { body.client_secret = ""; } }, (d) => { renderSsoProvider(d); message("sso", "Identity-provider configuration saved. Test the provider and link accounts before relying on organization sign-in."); }); });
+    ssoForm.addEventListener("submit", (event) => { event.preventDefault(); if (!canConfigureSso()) { $("sso-client-secret").value = ""; message("sso", "Changing the identity provider requires every recorder permission.", true); return; } const body = { enabled: $("sso-enabled").checked, display_name: $("sso-display-name").value.trim(), issuer: $("sso-issuer").value.trim(), client_id: $("sso-client-id").value.trim(), groups_claim: $("sso-groups-claim").value.trim() }; if ($("sso-clear-secret").checked) body.client_secret = ""; else if ($("sso-client-secret").value) body.client_secret = $("sso-client-secret").value; $("sso-client-secret").value = ""; void run("sso", async (signal) => { try { return await request(`${PREFIX}/sso/provider`, { method: "PUT", body, signal }); } finally { body.client_secret = ""; } }, (d) => { renderSsoProvider(d); message("sso", "Identity-provider configuration saved. Test the provider and link accounts before relying on organization sign-in."); }); });
     function testSso() { void run("sso", (signal) => request(`${PREFIX}/sso/provider/test`, { method: "POST", body: {}, signal, timeout: 30000 }), (d) => { const verified = d?.reachable === true && d.compatible === true && d.issuer_verified === true && d.pkce_s256 === true && d.signing_algorithm === "RS256"; message("sso", verified ? "The identity provider passed issuer, PKCE and signing-capability verification. A linked user's actual sign-in must still complete normally." : "The identity provider did not establish all required OpenID Connect capabilities.", !verified); }); }
-    ssoLinkForm.addEventListener("submit", (event) => { event.preventDefault(); if (!ssoProvider?.issuer) { message("sso", "Configure and save an identity provider first.", true); return; } const body = { subject: $("sso-link-subject").value.trim(), user_id: linkUser.value }; if ($("sso-link-group").value.trim()) body.required_group = $("sso-link-group").value.trim(); void run("sso", async (signal) => { await request(`${PREFIX}/sso/links`, { method: "POST", body, signal }); return request(`${PREFIX}/sso/links`, { signal }); }, (d) => { renderSsoLinks(d); ssoLinkForm.reset(); message("sso", "Organization identity linked to the existing account. Its current role, camera access and MFA still apply."); }); });
-    function unlinkSso(id) { void run("sso", async (signal) => { await request(`${PREFIX}/sso/links/${encodeURIComponent(id)}`, { method: "DELETE", signal }); return request(`${PREFIX}/sso/links`, { signal }); }, (d) => { renderSsoLinks(d); message("sso", "Organization identity link removed."); }); }
+    ssoLinkForm.addEventListener("submit", (event) => { event.preventDefault(); if (!canLinkSsoUser(ssoUsers.find((u) => u.id === linkUser.value))) { message("sso", "Choose an account whose permissions are within your own.", true); return; } if (!ssoProvider?.issuer) { message("sso", "Configure and save an identity provider first.", true); return; } const body = { subject: $("sso-link-subject").value.trim(), user_id: linkUser.value }; if ($("sso-link-group").value.trim()) body.required_group = $("sso-link-group").value.trim(); void run("sso", async (signal) => { await request(`${PREFIX}/sso/links`, { method: "POST", body, signal }); return request(`${PREFIX}/sso/links`, { signal }); }, (d) => { renderSsoLinks(d); ssoLinkForm.reset(); message("sso", "Organization identity linked to the existing account. Its current role, camera access and MFA still apply."); }); });
+    function unlinkSso(id) { if (!canLinkSsoUser(ssoUsers.find((u) => u.id === ssoLinks.find((link) => link.id === id)?.user_id))) { message("sso", "This account's permissions exceed your current authority.", true); return; } void run("sso", async (signal) => { await request(`${PREFIX}/sso/links/${encodeURIComponent(id)}`, { method: "DELETE", signal }); return request(`${PREFIX}/sso/links`, { signal }); }, (d) => { renderSsoLinks(d); message("sso", "Organization identity link removed."); }); }
 
     const securityPanel = section("security", "Account security", "Protect your own account with an authenticator. Recovery codes are shown only when generated; keep them privately outside this recorder.");
     health(securityPanel, "security-health");
@@ -351,10 +367,29 @@
       $("settings-title").textContent = name === "security" ? "Account security" : "Recorder settings";
       void loaders[name]();
     }
-    function hide() { mustReauthenticate = false; visible = false; epoch += 1; controller?.abort(); controller = null; busy.clear(); clearEnrollment(); clearRecovery(); clearConnection(); clearCameraCredentials(); $("integration-setup-token-value").textContent = ""; providerSecret.hidden = true; $("sso-client-secret").value = ""; password.value = ""; code.value = ""; clearDownload(); for (const n of panels.values()) { n.hidden = true; n.setAttribute("aria-busy", "false"); } for (const name of messages.keys()) message(name); }
+    function hide() { mustReauthenticate = false; authoritySuspended = false; visible = false; epoch += 1; controller?.abort(); controller = null; busy.clear(); clearEnrollment(); clearRecovery(); clearConnection(); clearCameraCredentials(); $("integration-setup-token-value").textContent = ""; providerSecret.hidden = true; $("sso-client-secret").value = ""; password.value = ""; code.value = ""; clearDownload(); for (const n of panels.values()) { n.hidden = true; n.setAttribute("aria-busy", "false"); } for (const name of messages.keys()) message(name); }
     return {
       show(preferred = null) { hide(); if (!activeSession()) return; visible = true; for (const [name, , permission] of SECTIONS) tabs.get(name).hidden = !permitted(permission); const chosen = SECTIONS.find((s) => s[0] === preferred && permitted(s[2])) || SECTIONS.find((s) => permitted(s[2])); select(chosen[0]); },
       hide, refreshCameras() { if (visible && currentSection === "time") renderCameraOptions(); },
+      refreshAuthority() {
+        if (!visible) return;
+        if (!activeSession()) {
+          if (!authoritySuspended) { authoritySuspended = true; epoch += 1; controller?.abort(); controller = null; busy.clear(); }
+          for (const tab of tabs.values()) tab.disabled = true;
+          for (const panel of panels.values()) for (const node of panel.querySelectorAll("button,input,select,textarea")) node.disabled = true;
+          message(currentSection, "Current account permissions could not be verified. Changes are paused until a successful refresh.", true);
+          return;
+        }
+        for (const [name, , permission] of SECTIONS) { tabs.get(name).hidden = !permitted(permission); tabs.get(name).disabled = false; }
+        if (authoritySuspended) {
+          authoritySuspended = false; controller = new AbortController();
+          for (const node of panels.get(currentSection).querySelectorAll("button,input,select,textarea")) node.disabled = false;
+          message(currentSection); updateDisabled(currentSection);
+        }
+        if (!busy.has(currentSection)) updateDisabled(currentSection);
+        const active = SECTIONS.find((s) => s[0] === currentSection);
+        if (!permitted(active[2])) select(SECTIONS.find((s) => permitted(s[2]))[0]);
+      },
     };
   }
   window.K5Settings = Object.freeze({ create, errorCodes: Object.freeze(Object.keys(ERRORS)) });

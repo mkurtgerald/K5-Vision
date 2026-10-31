@@ -20,6 +20,30 @@ from k5vision.operator_product_state import OperatorCameraStore
 from k5vision.operator_profile_lock import OperatorProfileLock
 
 
+def _retain_product_authentication_routes(application):
+    """Reuse account sessions without inheriting generic administration APIs.
+
+    Product policy, delegation, camera custody and audit live in the product
+    facades installed below. Admit only the explicitly shared authentication
+    and health routes before installing those facades; new control-plane
+    endpoints must not silently become another product administration path.
+    """
+    shared = {
+        "/api/v1/health": {"GET"},
+        "/api/v1/auth/bootstrap-password": {"POST"},
+        "/api/v1/auth/login": {"POST"},
+        "/api/v1/auth/me": {"GET"},
+        "/api/v1/auth/logout": {"POST"},
+    }
+    application.router.routes[:] = [
+        route
+        for route in application.router.routes
+        if getattr(route, "path", None) in shared
+        and getattr(route, "methods", set()) == shared[route.path]
+    ]
+    application.openapi_schema = None
+
+
 def create_operator_product_app(
     *,
     identity_directory: Path,
@@ -38,6 +62,7 @@ def create_operator_product_app(
         device_db_path=identity.directory / "devices.sqlite3",
         user_db_path=identity.database_path,
     )
+    _retain_product_authentication_routes(application)
     if application.state.device_registry is None or application.state.user_registry is None:
         raise OperatorProductError("Durable operator account or device state was refused")
     cameras = OperatorCameraStore(

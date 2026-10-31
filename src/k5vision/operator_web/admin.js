@@ -21,7 +21,7 @@
   };
 
   function create({ request, getSession, getCameras, onSelfChanged }) {
-    let visible = false, epoch = 0, controller = null, busy = false;
+    let visible = false, epoch = 0, controller = null, busy = false, authoritySuspended = false;
     let users = [], usersOffset = 0, auditOffset = 0;
     let usersRequest = 0, auditRequest = 0;
     let editTarget = null, resetTarget = null, previousRole = "operator", profileData = null;
@@ -43,7 +43,10 @@
 
     function session() {
       const value = getSession();
-      return value?.token && value.account?.role === "administrator" ? value : null;
+      return value?.token && value.account?.role === "administrator"
+        && value.account.authority_resolved === true
+        && Array.isArray(value.account.effective_permissions)
+        && value.account.effective_permissions.includes("users.manage") ? value : null;
     }
 
     function current(start, version) {
@@ -371,6 +374,7 @@
 
     function hide() {
       visible = false; epoch += 1; controller?.abort(); controller = null;
+      authoritySuspended = false;
       setBusy(false); closeEditor(true); closeReset(true); closeCredential();
       users = []; usersOffset = 0; auditOffset = 0;
       $("admin-users-list").replaceChildren(); $("admin-audit-list").replaceChildren();
@@ -385,6 +389,23 @@
         setSection("users");
       },
       hide,
+      refreshAuthority() {
+        if (!visible) return;
+        if (!session()) {
+          if (!authoritySuspended) { epoch += 1; controller?.abort(); controller = null; busy = false; authoritySuspended = true; }
+          for (const node of $("admin-panel").querySelectorAll("input,select,button")) {
+            if (node.id !== "admin-return-button") node.disabled = true;
+          }
+          for (const id of ["admin-user-form", "admin-reset-form"]) for (const node of $(id).querySelectorAll("input,select,button")) {
+            if (!["admin-cancel-user", "admin-close-user", "admin-close-reset", "admin-cancel-reset"].includes(node.id)) node.disabled = true;
+          }
+          message("admin-message", "Current account permissions could not be verified. Account changes are paused until a successful refresh.", true);
+        } else if (authoritySuspended) {
+          authoritySuspended = false; controller = new AbortController();
+          for (const node of $("admin-panel").querySelectorAll("button")) node.disabled = false;
+          setBusy(false); message("admin-message");
+        }
+      },
       refreshCameras() {
         if ($("admin-user-dialog").open && !busy) {
           const ids = Array.from($("admin-camera-choices").querySelectorAll("input:checked"), (input) => input.value);

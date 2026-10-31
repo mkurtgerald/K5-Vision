@@ -275,6 +275,7 @@ jobs:
             'settings_profile_bound_edit',
             'settings_custom_role_permission_denied',
             'settings_role_revoked_sessions',
+            'settings_role_ui_permissions',
             'settings_time_status_visible',
             'settings_time_no_clock_changes',
             'settings_audit_download',

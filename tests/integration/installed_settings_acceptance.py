@@ -65,6 +65,25 @@ def _open(page, name):
     )
 
 
+def _canonical_login(page, helpers, origin, account):
+    """Wait for the product's own inventory authority, with real core auth/me."""
+    with page.expect_response(lambda r: _route(r, "GET", "/api/v1/operator/cameras")) as inventory:
+        token = helpers._login(page, origin, account["username"], account["password"])
+    _require(inventory.value.status == 200, "Canonical camera authority was unavailable")
+    capabilities = inventory.value.json().get("capabilities", {})
+    status, core = helpers._api(page, token, "GET", "/api/v1/auth/me")
+    _require(
+        status == 200
+        and core.get("id") == account["id"]
+        and "effective_permissions" not in core
+        and "role_profile_id" not in core
+        and capabilities.get("account", {}).get("id") == core["id"],
+        "Installed GUI permission proof did not use the real core account contract",
+    )
+    page.locator("#security-tab").wait_for(state="visible")
+    return token, capabilities
+
+
 def _cameras(page):
     if page.locator("#settings-panel").is_visible():
         page.locator("#settings-return-button").click()
@@ -360,11 +379,41 @@ def run_installed_settings_journey(
         ):
             time_mutations.append(True)
 
+    def read(phase, path):
+        """The same bounded browser observer used by the preceding admin journey."""
+        diagnostic["settings_read_phase"] = phase
+        began = time.monotonic()
+        try:
+            status, data = admin_helpers._api(page, client.token, "GET", path)
+            diagnostic["settings_read_http_status"] = status
+            _require(
+                status == 200 and isinstance(data, dict),
+                "Installed settings read did not return its required object",
+            )
+            return data
+        except BaseException as error:
+            diagnostic["settings_read_failure_type"] = (
+                type(error).__name__
+                if type(error).__name__
+                in {
+                    "TimeoutError",
+                    "Error",
+                    "Failed",
+                    "AssertionError",
+                    "RuntimeError",
+                    "ValueError",
+                }
+                else "other"
+            )
+            raise
+        finally:
+            diagnostic["settings_read_seconds"] = round(time.monotonic() - began, 3)
+
     page.on("request", observed)
     try:
         diagnostic["settings_stage"] = "storage"
         _open(page, "storage")
-        before = client.json(_PREFIX + "/storage")
+        before = read("storage_snapshot", _PREFIX + "/storage")
         page.locator("#storage-quota").fill(str(before["quota_bytes"] // _GIB + 1))
         saved = _result(
             page, "PATCH", _PREFIX + "/storage", lambda: page.locator("#storage-save").click()
@@ -427,12 +476,13 @@ def run_installed_settings_journey(
         status, _ = admin_helpers._api(user_page, old_token, "GET", "/api/v1/operator/capabilities")
         _require(status == 401, "Custom-role assignment did not revoke the previous session")
         denials.append(status)
-        token = admin_helpers._login(user_page, origin, operator["username"], operator["password"])
-        status, capabilities = admin_helpers._api(
-            user_page, token, "GET", "/api/v1/operator/capabilities"
-        )
+        token, capabilities = _canonical_login(user_page, admin_helpers, origin, operator)
         _require(
-            status == 200 and capabilities["can_export"] is False,
+            capabilities["can_export"] is False
+            and user_page.locator("#export-panel").is_hidden()
+            and user_page.locator("#download-recording").is_hidden()
+            and user_page.locator("#clip-mark-in").is_hidden()
+            and user_page.locator("#admin-tab").is_hidden(),
             "Custom-role export restriction did not apply",
         )
         status, _ = admin_helpers._api(
@@ -472,6 +522,50 @@ def run_installed_settings_journey(
             lambda: page.locator("#admin-save-user").click(),
         )
         row.locator('[data-user-action="edit"]').click()
+        page.locator("#admin-cancel-user").click()
+        _open(page, "roles")
+        page.locator("#roles-name").fill("Generated time administration only")
+        page.locator("#roles-base").select_option("administrator")
+        for permission in page.locator("#roles-permissions input[type=checkbox]").all():
+            permission.set_checked(permission.get_attribute("value") == "time.manage")
+        time_role = _result(
+            page,
+            "POST",
+            _PREFIX + "/roles",
+            lambda: page.locator("#roles-save").click(),
+            expected=201,
+        )["role"]["id"]
+        _cameras(page)
+        admin_helpers._open_admin(page)
+        row.locator('[data-user-action="edit"]').click()
+        page.locator("#admin-role-profile").select_option(time_role)
+        _result(
+            page,
+            "PUT",
+            _PREFIX + f"/users/{operator['id']}/role-profile",
+            lambda: page.locator("#admin-apply-role-profile").click(),
+        )
+        _, time_capabilities = _canonical_login(user_page, admin_helpers, origin, operator)
+        _require(
+            time_capabilities["effective_permissions"] == ["time.manage"]
+            and user_page.locator("#admin-tab").inner_text() == "Recorder settings",
+            "Time-only administrator did not receive its narrowed GUI authority",
+        )
+        user_page.locator("#admin-tab").click()
+        user_page.locator("#settings-time-panel").wait_for(state="visible")
+        user_page.wait_for_function(
+            "document.querySelector('#settings-time-panel').getAttribute('aria-busy') === 'false'"
+        )
+        _require(
+            user_page.locator("#admin-users-tab").is_hidden()
+            and user_page.locator("#settings-storage-tab").is_hidden()
+            and user_page.locator("#settings-roles-tab").is_hidden()
+            and user_page.locator("#add-camera-button").is_hidden()
+            and user_page.locator("#export-panel").is_hidden()
+            and "Windows Time service:" in user_page.locator("#time-host-health").inner_text(),
+            "Time-only administrator could not open its first allowed settings panel",
+        )
+        row.locator('[data-user-action="edit"]').click()
         page.locator("#admin-role-profile").select_option("")
         _result(
             page,
@@ -479,7 +573,36 @@ def run_installed_settings_journey(
             _PREFIX + f"/users/{operator['id']}/role-profile",
             lambda: page.locator("#admin-apply-role-profile").click(),
         )
+        row.locator('[data-user-action="edit"]').click()
+        diagnostic["settings_role_phase"] = "restore_operator_grants"
+        page.locator("#admin-role").select_option("operator")
+        if operator["camera_access"]["mode"] == "selected":
+            admin_helpers._set_access(page, operator["camera_access"]["camera_ids"])
+        else:
+            page.locator("#admin-access-mode").select_option("all")
+        diagnostic["settings_role_phase"] = "save_restored_operator"
+        restored_role = _result(
+            page,
+            "PATCH",
+            _PREFIX + f"/users/{operator['id']}",
+            lambda: page.locator("#admin-save-user").click(),
+        )
+        _require(
+            restored_role["role"] == "operator" and restored_role["role_profile_id"] is None,
+            "Time-only GUI acceptance did not restore the original operator",
+        )
+        diagnostic["settings_role_phase"] = "restored_operator"
+        evidence["settings_role_ui_permissions"] = True
         evidence["settings_profile_bound_edit"] = True
+        _open(page, "roles")
+        page.locator(f"#roles-edit-{time_role}").click()
+        _result(
+            page,
+            "DELETE",
+            _PREFIX + f"/roles/{time_role}",
+            lambda: page.locator("#roles-delete").click(),
+            expected=204,
+        )
         _open(page, "roles")
         page.locator(f"#roles-edit-{role_id}").click()
         _result(
@@ -738,8 +861,8 @@ def run_installed_settings_journey(
         provider_frames = page.locator("#playback-video").evaluate(
             "v=>v.getVideoPlaybackQuality().totalVideoFrames"
         )
-        provider_events = client.json(
-            f"/api/v1/operator/cameras/{camera_ids[0]}/integration-events"
+        provider_events = read(
+            "provider_events", f"/api/v1/operator/cameras/{camera_ids[0]}/integration-events"
         )["events"]
         _require(
             any(
@@ -814,10 +937,10 @@ def run_installed_settings_journey(
         )
         evidence["settings_denied_http_statuses"] = denials
         _require(
-            client.json(_PREFIX + "/storage")["quota_bytes"] == before["quota_bytes"]
-            and client.json(_PREFIX + "/roles")["roles"] == []
-            and client.json(_PREFIX + "/integrations")["connections"] == []
-            and client.json(_PREFIX + "/sso/provider")["enabled"] is False,
+            read("baseline_storage", _PREFIX + "/storage")["quota_bytes"] == before["quota_bytes"]
+            and read("baseline_roles", _PREFIX + "/roles")["roles"] == []
+            and read("baseline_integrations", _PREFIX + "/integrations")["connections"] == []
+            and read("baseline_sso", _PREFIX + "/sso/provider")["enabled"] is False,
             "Installed settings baseline was not restored before restart",
         )
         status, accounts = admin_helpers._api(page, client.token, "GET", _PREFIX + "/users")
@@ -825,8 +948,11 @@ def run_installed_settings_journey(
         _require(
             status == 200
             and restored_operator["role"] == "operator"
-            and restored_operator["role_profile_id"] is None,
-            "Installed role profile was not removed from the baseline account",
+            and restored_operator["role_profile_id"] is None
+            and restored_operator["camera_access"]["mode"] == operator["camera_access"]["mode"]
+            and set(restored_operator["camera_access"]["camera_ids"])
+            == set(operator["camera_access"]["camera_ids"]),
+            "Installed role profile and camera grants were not restored to baseline",
         )
         evidence["settings_restored_before_restart"] = True
         evidence["settings_journey_seconds"] = round(time.monotonic() - started, 3)
@@ -836,10 +962,19 @@ def run_installed_settings_journey(
         )
         diagnostic["settings_stage"] = "complete"
         return evidence
+    except BaseException as error:
+        diagnostic["settings_failure_type"] = (
+            type(error).__name__
+            if type(error).__name__
+            in {"TimeoutError", "Error", "Failed", "AssertionError", "RuntimeError", "ValueError"}
+            else "other"
+        )
+        raise
     finally:
         page.remove_listener("request", observed)
         for context in reversed(contexts_to_close):
             context.close()
         if idp is not None:
             idp.close()
-        _cameras(page)
+        if diagnostic.get("settings_stage") == "complete":
+            _cameras(page)

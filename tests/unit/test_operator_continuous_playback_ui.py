@@ -27,6 +27,38 @@ _BEGIN = _NOW - timedelta(hours=4)
 _ASSETS = Path(__file__).resolve().parents[2] / "src/k5vision/operator_web"
 
 
+def _ui_core(account):
+    return {
+        "id": account.get("id", "a22c22bc-4089-45b7-a370-f360bb9d33c0"),
+        "username": account["username"],
+        "display_name": account.get("display_name", account["username"]),
+        "role": account["role"],
+        "enabled": account.get("enabled", True),
+    }
+
+
+def _ui_inventory(account, cameras, **extra):
+    from k5vision.operator_role_policy import BASE_PERMISSIONS
+
+    permissions = sorted(account.get("effective_permissions", BASE_PERMISSIONS[account["role"]]))
+    return {
+        **extra,
+        "cameras": cameras,
+        "capabilities": {
+            "account": {
+                **_ui_core(account),
+                "role_profile_id": account.get("role_profile_id"),
+                "effective_permissions": permissions,
+            },
+            "effective_permissions": permissions,
+            "can_export": "cameras.export" in permissions,
+            "can_manage_users": "users.manage" in permissions,
+            "can_manage_cameras": "cameras.manage" in permissions,
+            "can_view_history": "cameras.playback" in permissions,
+        },
+    }
+
+
 @contextmanager
 def _history_page(export_response=None, export_handler=None, download_response=None):
     browser_api = pytest.importorskip("playwright.sync_api")
@@ -144,14 +176,14 @@ def _history_page(export_response=None, export_handler=None, download_response=N
                     "expires_in_seconds": 300,
                 }
             elif path == "/api/v1/auth/me":
-                data = account
+                data = _ui_core(account)
             elif path == "/api/v1/operator/status":
                 data = {
                     "worker_status": "ready",
                     "server_utc": _NOW.isoformat().replace("+00:00", "Z"),
                 }
             elif path == "/api/v1/operator/cameras":
-                data = {"worker_status": "ready", "cameras": [camera]}
+                data = _ui_inventory(account, [camera], worker_status="ready")
             elif path.endswith("/media-session"):
                 data = {
                     "live_url": f"/media/live/{_CAMERA}/index.m3u8",

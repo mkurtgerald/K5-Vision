@@ -250,7 +250,7 @@ class OperatorRolePolicy:
         return (
             account.enabled
             and account.role is UserRole.ADMINISTRATOR
-            and {"users.manage", "roles.manage"} <= OperatorRolePolicy._permissions(account, state)
+            and PERMISSIONS <= OperatorRolePolicy._permissions(account, state)
         )
 
     def _guard(self, users, state, *, replacement=None, excluded=None):
