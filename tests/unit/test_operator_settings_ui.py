@@ -1064,3 +1064,155 @@ def test_no_privileged_action_before_canonical_inventory_arrives(workspace):
         page.locator("#admin-tab").wait_for(state="visible")
         assert page.locator("#add-camera-button").is_visible()
         assert page.locator("#security-tab").is_visible()
+
+
+@pytest.mark.parametrize("refresh_status", [200, 503])
+def test_profile_unbind_blocks_stale_editor_until_fresh_list_succeeds(workspace, refresh_status):
+    with workspace() as (page, state, _):
+        target = "e782ebc7-82b3-4bf1-a27b-280c71c22a73"
+        state["users"].append(
+            {
+                "id": target,
+                "username": "fixture-profiled",
+                "display_name": "Fixture profiled",
+                "role": "administrator",
+                "enabled": True,
+                "credential_status": "active",
+                "camera_access": {"mode": "all", "camera_ids": []},
+                "role_profile_id": _ROLE,
+                "effective_permissions": ["time.manage"],
+            }
+        )
+        state["roles"] = [
+            {
+                "id": _ROLE,
+                "name": "Time only",
+                "description": "",
+                "base_role": "administrator",
+                "permissions": ["time.manage"],
+            }
+        ]
+        page.locator("#admin-tab").click()
+        row = page.locator(f'tr[data-user-id="{target}"]')
+        row.locator('[data-user-action="edit"]').click()
+        page.locator("#admin-role-profile").select_option("")
+        pending = []
+        page.route(
+            "**/api/v1/operator/admin/users?**", lambda route: pending.append(route), times=1
+        )
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "PUT"
+                and response.url.endswith(f"/users/{target}/role-profile")
+            )
+        ) as changed:
+            page.locator("#admin-apply-role-profile").click()
+        assert changed.value.status == 200
+        page.locator("#admin-user-dialog").wait_for(state="hidden")
+        edit = row.locator('[data-user-action="edit"]')
+        assert edit.is_disabled()
+        assert row.locator('[data-user-action="reset"]').is_disabled()
+        assert page.locator("#admin-create-user").is_disabled()
+        edit.evaluate("e=>e.dispatchEvent(new MouseEvent('click',{bubbles:true}))")
+        assert page.locator("#admin-user-dialog").is_hidden()
+        assert pending
+        pending.pop().fulfill(
+            status=refresh_status,
+            content_type="application/json",
+            body=json.dumps(
+                {"users": state["users"], "has_more": False}
+                if refresh_status == 200
+                else {"detail": "unavailable"}
+            ),
+        )
+        if refresh_status != 200:
+            page.wait_for_function("!document.querySelector('#admin-refresh-users').disabled")
+            assert edit.is_disabled()
+            assert (
+                "Account actions are paused. Select Refresh"
+                in page.locator("#admin-message").inner_text()
+            )
+            edit.evaluate("e=>e.dispatchEvent(new MouseEvent('click',{bubbles:true}))")
+            assert page.locator("#admin-user-dialog").is_hidden()
+            page.locator("#admin-refresh-users").click()
+        page.wait_for_function(
+            "id=>!document.querySelector('tr[data-user-id=\"'+id+'\"] "
+            "[data-user-action=edit]').disabled",
+            arg=target,
+        )
+        assert page.locator(f'tr[data-user-id="{_ADMIN}"] [data-user-action="reset"]').is_disabled()
+        edit.click()
+        assert page.locator("#admin-role").is_enabled()
+        assert page.locator("#admin-role-profile").input_value() == ""
+
+
+@pytest.mark.parametrize("profiles_status", [200, 503])
+def test_profile_choice_waits_for_current_metadata_before_selection(workspace, profiles_status):
+    with workspace() as (page, state, _):
+        target = "e782ebc7-82b3-4bf1-a27b-280c71c22a73"
+        state["users"].append(
+            {
+                "id": target,
+                "username": "fixture-profiled",
+                "display_name": "Fixture profiled",
+                "role": "administrator",
+                "enabled": True,
+                "credential_status": "active",
+                "camera_access": {"mode": "all", "camera_ids": []},
+                "role_profile_id": _ROLE,
+                "effective_permissions": ["time.manage"],
+            }
+        )
+        state["roles"] = [
+            {
+                "id": _ROLE,
+                "name": "Time only",
+                "description": "",
+                "base_role": "administrator",
+                "permissions": ["time.manage"],
+            }
+        ]
+        page.locator("#admin-tab").click()
+        row = page.locator(f'tr[data-user-id="{target}"]')
+        row.locator('[data-user-action="edit"]').click()
+        page.wait_for_function("!document.querySelector('#admin-apply-role-profile').disabled")
+        page.locator("#admin-cancel-user").click()
+        pending = []
+        page.route("**/api/v1/operator/admin/roles", lambda r: pending.append(r), times=1)
+        row.locator('[data-user-action="edit"]').click()
+        assert page.locator("#admin-role-profile").is_disabled()
+        assert page.locator("#admin-apply-role-profile").is_disabled()
+        page.locator("#admin-apply-role-profile").evaluate(
+            "e=>e.dispatchEvent(new MouseEvent('click',{bubbles:true}))"
+        )
+        assert not any(
+            m == "PUT" and p.endswith("/role-profile") for m, p, _, _ in state["requests"]
+        )
+        assert pending
+        pending.pop().fulfill(
+            status=profiles_status,
+            content_type="application/json",
+            body=json.dumps(
+                {"revision": state["role_revision"], "roles": state["roles"]}
+                if profiles_status == 200
+                else {"detail": "roles_unavailable"}
+            ),
+        )
+        if profiles_status != 200:
+            page.get_by_text(
+                "Custom roles are unavailable. Built-in account fields remain available.",
+                exact=True,
+            ).wait_for()
+            assert page.locator("#admin-role-profile").is_disabled()
+            assert page.locator("#admin-apply-role-profile").is_disabled()
+            page.locator("#admin-cancel-user").click()
+            row.locator('[data-user-action="edit"]').click()
+        page.locator("#admin-role-profile").select_option("")
+        page.locator("#admin-apply-role-profile").click()
+        page.get_by_text(
+            "Role profile applied. The account's previous sessions were revoked.", exact=True
+        ).wait_for()
+        requests = [
+            b for m, p, b, _ in state["requests"] if m == "PUT" and p.endswith("/role-profile")
+        ]
+        assert len(requests) == 1 and requests[0]["role_profile_id"] is None

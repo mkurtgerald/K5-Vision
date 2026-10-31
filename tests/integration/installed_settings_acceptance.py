@@ -567,15 +567,45 @@ def run_installed_settings_journey(
         )
         row.locator('[data-user-action="edit"]').click()
         page.locator("#admin-role-profile").select_option("")
-        _result(
-            page,
-            "PUT",
-            _PREFIX + f"/users/{operator['id']}/role-profile",
-            lambda: page.locator("#admin-apply-role-profile").click(),
+        diagnostic["settings_role_phase"] = "unbind_time_profile"
+        with page.expect_response(
+            lambda response: _route(response, "GET", _PREFIX + "/users")
+        ) as refreshed:
+            unbound = _result(
+                page,
+                "PUT",
+                _PREFIX + f"/users/{operator['id']}/role-profile",
+                lambda: page.locator("#admin-apply-role-profile").click(),
+            )
+        _require(
+            unbound.get("account", {}).get("role_profile_id") is None
+            and unbound["account"].get("role") == "administrator"
+            and refreshed.value.status == 200,
+            "Installed time profile did not unbind before account restoration",
+        )
+        fresh_account = next(
+            (u for u in refreshed.value.json().get("users", []) if u.get("id") == operator["id"]),
+            None,
+        )
+        _require(
+            fresh_account is not None
+            and fresh_account.get("role_profile_id") is None
+            and fresh_account.get("role") == "administrator",
+            "Installed account list did not read back the unbound administrator",
+        )
+        diagnostic["settings_role_phase"] = "await_unbound_account_refresh"
+        page.locator("#admin-user-dialog").wait_for(state="hidden")
+        page.wait_for_function(
+            """id => { const row = document.querySelector('tr[data-user-id="'+id+'"]');
+              return row
+                && document.querySelector('#admin-users-list').getAttribute('aria-busy') === 'false'
+                && !row.querySelector('[data-user-action="edit"]').disabled; }""",
+            arg=operator["id"],
         )
         row.locator('[data-user-action="edit"]').click()
-        diagnostic["settings_role_phase"] = "restore_operator_grants"
+        diagnostic["settings_role_phase"] = "restore_operator_role"
         page.locator("#admin-role").select_option("operator")
+        diagnostic["settings_role_phase"] = "restore_operator_grants"
         if operator["camera_access"]["mode"] == "selected":
             admin_helpers._set_access(page, operator["camera_access"]["camera_ids"])
         else:
@@ -971,6 +1001,7 @@ def run_installed_settings_journey(
         )
         raise
     finally:
+        diagnostic["settings_elapsed_seconds"] = round(time.monotonic() - started, 3)
         page.remove_listener("request", observed)
         for context in reversed(contexts_to_close):
             context.close()

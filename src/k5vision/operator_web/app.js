@@ -48,7 +48,8 @@
     hls: null, nativeLive: false, hlsScript: null, retryTimer: null, retryCount: 0,
     mediaAuthRefreshUsed: false,
     pollTimer: null, expiryTimer: null, selectionController: null,
-    spans: [], selectedSpan: null, historyEpoch: 0, historyRolling: true, signingOut: false,
+    spans: [], selectedSpan: null, historyEpoch: 0, historyLoad: null, historyRolling: true, signingOut: false,
+    eventSeekEpoch: 0,
     dialogMode: "add", cameraSetupEpoch: 0, diagnostics: null, statusUnavailable: false,
     cameraSetupBusy: false, cameraSetupController: null, cameraProbe: null, cameraProbeTimer: null,
     cameraSetupTarget: null,
@@ -1181,12 +1182,26 @@
     link.textContent = "Prepare MP4 clip";
   }
 
-  async function loadHistory() {
-    if (!state.selected || !state.token) { message("history-message", "Select a camera to view its history."); return; }
+  function loadHistory() {
+    if (!state.selected || !state.token) {
+      message("history-message", "Select a camera to view its history.");
+      return Promise.resolve(false);
+    }
+    // Reserve this intent before recorder-time I/O so an older refresh cannot reset a newer one.
+    const load = { deviceId: state.selected, session: state.sessionEpoch, epoch: ++state.historyEpoch, task: null };
+    state.historyLoad = load;
+    load.task = performHistoryLoad(load).finally(() => {
+      if (state.historyLoad === load) state.historyLoad = null;
+    });
+    return load.task;
+  }
+
+  async function performHistoryLoad({ deviceId, session, epoch }) {
+    const active = () => epoch === state.historyEpoch && session === state.sessionEpoch
+      && deviceId === state.selected && state.token && state.view === "history";
     if (state.historyRolling) {
-      const before = state.selected, session = state.sessionEpoch;
       await refreshDiagnostics();
-      if (before !== state.selected || session !== state.sessionEpoch || !state.token) return;
+      if (!active()) return false;
       if (!state.historyRolling) return;
       if (!setLastDay()) {
         message("history-message", "Recorder time is unavailable. Refresh service status or choose an explicit UTC interval.", true);
@@ -1198,15 +1213,14 @@
     if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end <= start || end - start > DAY) {
       message("history-message", "Choose a valid interval of 24 hours or less.", true); return;
     }
-    const deviceId = state.selected;
-    const epoch = ++state.historyEpoch;
+    if (!active()) return false;
     stopPlayback(); resetHistory();
     $("load-history").disabled = true;
     message("history-message", "Loading recording history…");
     try {
       const query = new URLSearchParams({ start: start.toISOString(), end: end.toISOString() });
       const data = await request(`/api/v1/operator/cameras/${encodeURIComponent(deviceId)}/history?${query}`, { signal: state.selectionController?.signal });
-      if (epoch !== state.historyEpoch || deviceId !== state.selected) return;
+      if (!active()) return false;
       if (!Array.isArray(data.spans)) throw new ApiError(503);
       state.spans = data.spans.map((span) => {
         const originalStart = spanStartMilliseconds(span.started_at);
@@ -1435,6 +1449,7 @@
   }
 
   function selectSpan(span, button, start = span.start, autoPlay = true) {
+    state.eventSeekEpoch += 1;
     stopPlayback();
     markSelectedSpan(span);
     $("playback-start").value = utcInput(new Date(start), true);
@@ -1456,6 +1471,7 @@
 
   function seekRecording(milliseconds) {
     if (!Number.isFinite(milliseconds) || state.view !== "history" || !state.token) return;
+    state.eventSeekEpoch += 1;
     const index = state.spans.findIndex((span) => span.start <= milliseconds && milliseconds < span.end);
     if (index < 0) {
       stopPlayback();
@@ -1479,19 +1495,28 @@
     const at = typeof timestamp === "number" ? timestamp
       : typeof timestamp === "string" && timestamp.length <= 40 && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(timestamp) ? Date.parse(timestamp) : NaN;
     if (!Number.isFinite(at) || !state.token || !state.cameras.some((camera) => camera.device_id === cameraId)) return;
-    const session = state.sessionEpoch;
+    const session = state.sessionEpoch, seek = ++state.eventSeekEpoch;
     setView("history", false);
-    if (cameraId !== state.selected || !state.media || state.selectionController?.signal.aborted) await selectCamera(cameraId);
-    if (session !== state.sessionEpoch || state.selected !== cameraId || state.view !== "history") return;
+    const selection = cameraId !== state.selected || !state.media || state.selectionController?.signal.aborted
+      ? selectCamera(cameraId) : null;
+    const navigation = state.navigationEpoch;
+    const active = () => seek === state.eventSeekEpoch && navigation === state.navigationEpoch
+      && session === state.sessionEpoch && state.selected === cameraId && state.view === "history" && state.token;
+    if (selection) await selection;
+    if (!active()) return;
+    const pending = state.historyLoad;
+    if (pending && pending.deviceId === cameraId && pending.session === session && pending.epoch === state.historyEpoch) {
+      if (!await pending.task || !active()) return;
+    }
     const first = parseUtc($("history-start").value).getTime(), last = parseUtc($("history-end").value).getTime();
     if (!Number.isFinite(first) || at < first || at >= last) {
       const dayStart = new Date(at); dayStart.setUTCHours(0, 0, 0, 0);
       $("history-start").value = utcInput(dayStart, true);
       $("history-end").value = utcInput(new Date(dayStart.getTime() + DAY), true);
       state.historyRolling = false;
-      await loadHistory();
+      if (!await loadHistory()) return;
     }
-    if (session === state.sessionEpoch && state.selected === cameraId && state.view === "history") seekRecording(at);
+    if (active()) seekRecording(at);
   }
 
   function moveFootage(direction) {
