@@ -2049,6 +2049,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     runtime = _helpers("test_operator_product_runtime")
     browser_helpers = _helpers("test_operator_beta_browser")
     admin_helpers = _helpers("test_operator_admin_browser")
+    settings_helpers = _helpers("installed_settings_acceptance")
     helpers = runtime._helpers()
     browser_api = pytest.importorskip("playwright.sync_api")
     _require(version("playwright") == "1.58.0", "Expected reviewed Playwright version is absent")
@@ -2508,6 +2509,22 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt.update(
             _analytics_permission_journey(
                 runtime, port=port, camera_ids=camera_ids, private_state=admin_private_state
+            )
+        )
+        stage = "installed_admin_settings_security_integrations"
+        receipt.update(
+            settings_helpers.run_installed_settings_journey(
+                page,
+                client=client,
+                admin_helpers=admin_helpers,
+                browser_helpers=browser_helpers,
+                admin_username=username,
+                admin_password=password,
+                camera_ids=camera_ids,
+                private_state=admin_private_state,
+                analytics_event=analytics_event,
+                parent=parent,
+                diagnostic=nvr_diagnostic,
             )
         )
         stage = "wall_logout_resource_cleanup"

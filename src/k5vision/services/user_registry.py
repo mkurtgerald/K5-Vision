@@ -933,6 +933,46 @@ class UserRegistry:
             except (sqlite3.Error, ValueError, TypeError):
                 raise UserRegistryStorageError("user session authority is unavailable") from None
 
+    def active_session_snapshot(self, user_id: UUID) -> tuple[UserAccount, bytes] | None:
+        """Bind independently authenticated federation to an existing active user.
+
+        This does not authenticate an external identity. The OIDC boundary must
+        verify its signed token and explicit issuer/subject mapping first. The
+        fingerprint lets normal session resolution revoke federation sessions
+        after password reset, account disablement, or authority changes.
+        """
+        with self._lock:
+            try:
+                row = (
+                    self._require_connection()
+                    .execute(
+                        """SELECT users.id,users.username,users.display_name,users.role,
+                              users.enabled,
+                              user_credentials.scheme,user_credentials.credential_kind,
+                              user_credentials.salt,user_credentials.verifier,
+                              user_credentials.expires_at
+                       FROM users JOIN user_credentials ON user_credentials.site_id=users.site_id
+                         AND user_credentials.user_id=users.id
+                       WHERE users.site_id=? AND users.id=?""",
+                        (self._site_id, str(user_id)),
+                    )
+                    .fetchone()
+                )
+                if (
+                    row is None
+                    or not row["enabled"]
+                    or row["scheme"] != _CREDENTIAL_SCHEME
+                    or row["credential_kind"] != "password"
+                    or row["expires_at"] is not None
+                ):
+                    return None
+                salt, verifier = bytes(row["salt"]), bytes(row["verifier"])
+                if len(salt) != _SALT_BYTES or len(verifier) != _SCRYPT_DKLEN:
+                    raise ValueError
+                return self._decode_user(row), hashlib.sha256(salt + verifier).digest()
+            except (sqlite3.Error, ValueError, TypeError):
+                raise UserRegistryStorageError("user session authority is unavailable") from None
+
     def update(
         self, user_id: UUID, patch: UserPatch, *, actor: str, camera_access: dict | None = None
     ) -> UserAccount | None:

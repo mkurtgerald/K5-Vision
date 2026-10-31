@@ -36,6 +36,20 @@ runtime package is described below; all upstream rights remain effective.
 
 Dependencies declared in `pyproject.toml` must be reviewed under `docs/COMMERCIAL_DEPENDENCY_POLICY.md` before commercial distribution. Their inclusion as package dependencies does not transfer their copyrights to K5 Vision and does not change their governing licenses.
 
+### Native Windows authentication libraries
+
+The installed identity integration uses PyJWT 2.15.1 (MIT), cryptography 50.0.2
+(Apache-2.0 OR BSD-3-Clause), cffi 2.1.1 (MIT-0, with separately noticed libffi
+material), and pycparser 3.12 (BSD-3-Clause). Their full upstream wheel notices
+remain unchanged in the installed runtime. Cryptography's Windows binary
+statically incorporates OpenSSL 4.0.3 and Rust library material; their original
+copyrights and governing licenses remain effective. The installed
+`licenses/Identity-native-NOTICES.txt`, its per-file provenance inventory and
+retained source archives preserve the reviewed native notice closure. K5's
+license does not replace these permissions or attribution requirements.
+Exact distribution identities and the scope of retained other-target notice
+material are recorded in `docs/WINDOWS_IDENTITY_DEPENDENCIES.md`.
+
 ### GStreamer
 
 K5 Vision uses a reviewed external GStreamer runtime surface for RTSP/RTP media transport. The Stage 04 approved surface is pinned to GStreamer 1.28.7 and the `rtspsrc`, `queue`, and `fakesink` elements. GStreamer and its own plugin code are tracked under LGPL-2.1-or-later for engineering dependency purposes. Preserve all applicable upstream copyright/license notices and satisfy the governing LGPL source/relinking obligations for the exact binaries distributed with a K5 release. Approval of this narrow surface is not blanket approval to redistribute every plugin present in a general-purpose GStreamer installation. The review records are maintained in `docs/STAGE_03_GSTREAMER_REVIEW.md` and `docs/STAGE_04_DEPENDENCY_REVIEW.md`.

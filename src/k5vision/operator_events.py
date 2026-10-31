@@ -75,6 +75,14 @@ class OperatorEventStore:
             self._root = state.directory
             self._root_identity = self._root.lstat()
             self._path = self._root / _DATABASE
+            from k5vision.operator_component_state import ComponentStateAnchor
+
+            anchor = ComponentStateAnchor(
+                self._root,
+                site_id,
+                "person_events",
+                present=self._path.exists() or self._path.is_symlink(),
+            )
             created = False
             try:
                 fd = os.open(
@@ -124,6 +132,7 @@ class OperatorEventStore:
                 if row["enabled"] not in (0, 1):
                     raise ValueError
             self._admit()
+            anchor.seal()
         except Exception:
             self.close()
             raise OperatorEventsError("Analytics state admission failed") from None

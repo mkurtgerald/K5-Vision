@@ -70,6 +70,8 @@ def _operator_asset(route, assets):
         "admin.css",
         "analytics.js",
         "analytics.css",
+        "settings.js",
+        "settings.css",
     }:
         route.fulfill(status=404)
         return True

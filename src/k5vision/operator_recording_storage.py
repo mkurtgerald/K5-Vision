@@ -416,6 +416,25 @@ class RecordingStorage:
         with self._lock:
             return self._status(self._scan(deadline, [MAX_STORAGE_ENTRIES]))
 
+    def configure_policy(
+        self, *, max_bytes: int, min_free_bytes: int, retention_seconds: int
+    ) -> None:
+        """Update limits without resetting monotonic segment-age observations."""
+        if (
+            type(max_bytes) is not int
+            or not 1 <= max_bytes <= 2**63 - 1
+            or type(min_free_bytes) is not int
+            or not 0 <= min_free_bytes <= 2**63 - 1
+            or type(retention_seconds) is not int
+            or not 0 <= retention_seconds <= 30 * 86400
+        ):
+            raise ValueError("Recording storage bounds are invalid")
+        with self._lock:
+            self._admit_root()
+            self._max_bytes = max_bytes
+            self._min_free_bytes = min_free_bytes
+            self._retention_seconds = retention_seconds
+
     def prune(self) -> StorageStatus:
         """Free closed segments, protecting newest and latest observed changes.
 

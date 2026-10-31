@@ -34,3 +34,5 @@
   .analytics-event-time { flex-basis: 100%; }
   .analytics-event-action { margin-left: auto; }
 }
+
+.analytics-provider-events { border-top: 1px solid var(--border); margin-top: 24px; padding-top: 20px; }

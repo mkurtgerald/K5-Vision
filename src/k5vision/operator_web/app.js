@@ -55,8 +55,9 @@
     playbackStart: null, playbackEnd: null, playbackPosition: null, playbackEpoch: 0, selectedStatus: null,
     playbackPrefetch: null, playbackObjectUrl: null, playbackRate: 1,
     exportEpoch: 0, exportController: null, exportJob: null, exportDownloadAllowed: false,
+    securityTransition: false,
   };
-  let wall = null, timeline = null, administration = null, cameraAnalytics = null;
+  let wall = null, timeline = null, administration = null, cameraAnalytics = null, settings = null;
   const PLAYBACK_CHUNK_SECONDS = 120;
   const MAX_PREFETCH_BYTES = 32 * 1024 * 1024;
   let wallLayoutPending = false;
@@ -125,14 +126,44 @@
     return administration;
   }
 
+  function settingsWorkspace() {
+    if (!settings && window.K5Settings?.create) settings = window.K5Settings.create({
+      request,
+      getSession: () => state.signingOut ? null : ({ token: state.token, epoch: state.sessionEpoch, account: state.account }),
+      getCameras: () => state.cameras,
+      onSecurityTransition: (active) => {
+        state.securityTransition = active;
+        if (active) {
+          clearTimeout(state.pollTimer); clearTimeout(state.expiryTimer);
+          state.pollTimer = null; state.expiryTimer = null;
+          for (const controller of state.requests) controller.abort();
+        } else if (state.token) { scheduleSessionExpiry(); scheduleCameraPoll(); }
+      },
+      onReauthenticate: () => {
+        const token = state.token;
+        clearWorkspace("Account security changed. Sign in again.");
+        void clearMediaCookie(token);
+      },
+    });
+    return settings;
+  }
+
+  function allowed(permission) {
+    if (Array.isArray(state.account?.effective_permissions)) return state.account.effective_permissions.includes(permission);
+    return ["cameras.view_live", "cameras.playback"].includes(permission) ? Boolean(state.account)
+      : permission === "cameras.export" ? ["administrator", "operator"].includes(state.account?.role)
+        : state.account?.role === "administrator";
+  }
   function canExport() {
-    return ["administrator", "operator"].includes(state.account?.role) && !state.signingOut;
+    return allowed("cameras.export") && !state.signingOut;
   }
 
   function renderAccountControls() {
     const account = state.account;
     $("admin-tab").hidden = account?.role !== "administrator";
-    $("add-camera-button").hidden = account?.role !== "administrator";
+    $("security-tab").hidden = !account || !window.K5Settings?.create;
+    $("add-camera-button").hidden = !allowed("cameras.manage");
+    $("admin-tab").textContent = allowed("users.manage") ? "Administration" : "Recorder settings";
     $("account-role").title = account?.role === "administrator" ? "Manage users, cameras and recordings"
       : account?.role === "operator" ? "View assigned cameras and export footage" : "Watch assigned live and recorded video";
     $("download-recording").hidden = !canExport();
@@ -198,7 +229,8 @@
   async function request(path, options = {}) {
     if (state.signingOut) throw new DOMException("Sign out in progress", "AbortError");
     const controller = new AbortController();
-    const signals = [controller.signal, AbortSignal.timeout(15000)];
+    const timeout = Number.isInteger(options.timeout) && options.timeout >= 1000 && options.timeout <= 120000 ? options.timeout : 15000;
+    const signals = [controller.signal, AbortSignal.timeout(timeout)];
     if (options.signal) signals.push(options.signal);
     const signal = AbortSignal.any(signals);
     const token = state.token;
@@ -215,11 +247,11 @@
         ...(options.rawBody !== undefined ? { body: options.rawBody } : {}),
       });
       if (!response.ok) {
-        if (response.status === 401 && token && token === state.token && path !== "/api/v1/auth/login" && !state.signingOut) {
+        if (response.status === 401 && token && token === state.token && path !== "/api/v1/auth/login" && !state.signingOut && !state.securityTransition) {
           expireSession();
         }
         let code = "", clock = null;
-        if (path.startsWith("/api/v1/operator/camera") || path.startsWith("/api/v1/operator/admin/")) {
+        if (path.startsWith("/api/v1/operator/camera") || path.startsWith("/api/v1/operator/admin/") || path.startsWith("/api/v1/operator/security")) {
           try {
             const detail = (await response.json()).detail;
             const candidate = typeof detail === "string" ? detail : detail?.code;
@@ -229,11 +261,13 @@
             }
             if (path.startsWith("/api/v1/operator/admin/") && ADMIN_ERROR_CODES.has(candidate)) code = candidate;
             if (path.includes("/exports") && Object.hasOwn(EXPORT_ERRORS, candidate)) code = candidate;
+            if (window.K5Settings?.errorCodes?.includes(candidate)) code = candidate;
           } catch (_) { /* Unknown response text never becomes a user-facing error. */ }
         }
         throw new ApiError(response.status, code, clock);
       }
       if (response.status === 204) return null;
+      if (options.responseType === "blob") return await response.blob();
       return await response.json();
     } finally {
       state.requests.delete(controller);
@@ -338,6 +372,8 @@
 
   function clearWorkspace(reason = "") {
     administration?.hide();
+    settings?.hide();
+    state.securityTransition = false;
     cameraAnalytics?.clear();
     cancelExport();
     resetActivation();
@@ -374,6 +410,9 @@
     state.selectedStatus = null;
     state.view = "wall";
     $("admin-panel").hidden = true;
+    $("settings-panel").hidden = true;
+    $("security-tab").hidden = true;
+    $("security-tab").setAttribute("aria-pressed", "false");
     $("camera-workspace").hidden = false;
     $("admin-tab").hidden = true;
     $("admin-tab").setAttribute("aria-pressed", "false");
@@ -410,6 +449,7 @@
   }
 
   function expireSession() {
+    if (state.securityTransition) return;
     const token = state.token;
     if (!token) return;
     clearWorkspace("Your session has ended. Sign in again.");
@@ -498,17 +538,17 @@
       : camera ? String(camera.host || "Enrolled camera") : "Select a camera from the wall or camera list.";
     $("connection-badge").hidden = !focused;
     $("recording-badge").hidden = !focused;
-    $("update-source-button").hidden = !focused || state.account?.role !== "administrator";
-    $("remove-camera-button").hidden = !focused || state.account?.role !== "administrator";
-    $("toggle-recording").hidden = !focused || state.account?.role !== "administrator";
+    $("update-source-button").hidden = !focused || !allowed("cameras.manage");
+    $("remove-camera-button").hidden = !focused || !allowed("cameras.manage");
+    $("toggle-recording").hidden = !focused || !allowed("recording.manage");
     $("toggle-recording").disabled = state.recordingBusy || state.workerStatus === "unavailable";
     const enabled = camera?.recording_enabled !== false;
     $("toggle-recording").textContent = state.recordingBusy ? "Applying…" : enabled ? "Pause recording" : "Resume recording";
     $("toggle-recording").setAttribute("aria-pressed", String(enabled));
     $("toggle-recording").dataset.enabled = String(enabled);
     $("recent-recordings").hidden = !focused;
-    $("live-tab").disabled = !camera;
-    $("history-tab").disabled = !camera;
+    $("live-tab").disabled = !camera || !allowed("cameras.view_live");
+    $("history-tab").disabled = !camera || !allowed("cameras.playback");
     $("recording-state-detail").hidden = !focused;
     $("recording-state-detail").textContent = recording.detail;
     $("person-view-panel").hidden = !focused || camera.analytics_status !== "configured";
@@ -604,7 +644,7 @@
   }
 
   async function refreshDiagnostics() {
-    if (!state.token) return;
+    if (!state.token || state.securityTransition) return;
     const epoch = state.sessionEpoch;
     try {
       const diagnostics = await request("/api/v1/operator/status");
@@ -639,7 +679,7 @@
   }
 
   async function refreshCameras(selectFirst = false) {
-    if (!state.token) return;
+    if (!state.token || state.securityTransition) return;
     const epoch = state.sessionEpoch;
     const navigationEpoch = state.navigationEpoch;
     const cameraListEpoch = ++state.cameraListEpoch;
@@ -651,8 +691,9 @@
       renderWorkerStatus();
       state.cameras = data.cameras.filter((camera) => camera && typeof camera.device_id === "string" && typeof camera.name === "string");
       administration?.refreshCameras();
+      settings?.refreshCameras();
       renderCameras();
-      if (state.selected && !currentCamera() && state.view !== "admin") {
+      if (state.selected && !currentCamera() && !["admin", "settings"].includes(state.view)) {
         clearCameraSelection("Camera unavailable", "Select another camera or refresh the camera list.");
       }
       if (selectFirst && !state.selected && state.cameras.length &&
@@ -667,7 +708,7 @@
 
   function scheduleCameraPoll() {
     clearTimeout(state.pollTimer);
-    if (!state.token) return;
+    if (!state.token || state.securityTransition) return;
     state.pollTimer = setTimeout(async () => {
       await Promise.all([refreshCameras(), refreshDiagnostics()]);
       scheduleCameraPoll();
@@ -944,16 +985,19 @@
   }
 
   function setView(view, load = true) {
-    if (state.signingOut) return;
-    if (!["wall", "live", "history", "admin"].includes(view)) return;
+    if (state.signingOut || state.securityTransition) return;
+    if (!["wall", "live", "history", "admin", "settings"].includes(view)) return;
     if (view === "admin" && state.account?.role !== "administrator") return;
     const previous = state.view;
     state.navigationEpoch += 1;
     state.view = view;
-    $("camera-workspace").hidden = view === "admin";
+    $("camera-workspace").hidden = ["admin", "settings"].includes(view);
     $("admin-panel").hidden = view !== "admin";
+    $("settings-panel").hidden = view !== "settings";
+    $("security-tab").setAttribute("aria-pressed", String(view === "settings"));
     $("admin-tab").setAttribute("aria-pressed", String(view === "admin"));
     if (previous === "admin" && view !== "admin") administration?.hide();
+    if (previous === "settings" && view !== "settings") settings?.hide();
     $("recorder-overview").open = view !== "wall";
     $("wall-panel").hidden = view !== "wall";
     $("live-panel").hidden = view !== "live";
@@ -972,6 +1016,13 @@
       wall?.hide(); stopLive(); stopPlayback();
       try { adminWorkspace().show(); }
       catch (_) { message("admin-message", "Administration could not load. Refresh the workspace to try again.", true); }
+    } else if (view === "settings") {
+      state.selectionEpoch += 1;
+      state.historyEpoch += 1;
+      state.selectionController?.abort();
+      wall?.hide(); stopLive(); stopPlayback();
+      settingsWorkspace()?.show(state.settingsSection || null);
+      state.settingsSection = null;
     } else if (view === "wall") {
       if (state.cameraConnectionNotice) notice("");
       state.selectionEpoch += 1;
@@ -1046,6 +1097,7 @@
   }
 
   function scheduleSessionExpiry() {
+    if (state.securityTransition) return;
     clearTimeout(state.expiryTimer);
     state.expiryTimer = null;
     const current = recorderNow();
@@ -1604,8 +1656,17 @@
   }
 
   let activationEpoch = 0, activationController = null;
+  let mfaChallenge = "", mfaChallengeExpires = 0;
+
+  function resetMfaSignIn() {
+    mfaChallenge = ""; mfaChallengeExpires = 0;
+    $("mfa-sign-in-form").hidden = true; $("mfa-sign-in-code").value = "";
+    $("mfa-sign-in-submit").disabled = false;
+    message("mfa-sign-in-message");
+  }
 
   function resetActivation() {
+    resetMfaSignIn();
     activationEpoch += 1;
     activationController?.abort(); activationController = null;
     $("activate-account-form").reset();
@@ -1682,6 +1743,34 @@
       const result = await request("/api/v1/auth/login", { method: "POST", body: credentials });
       credentials.password = "";
       if (epoch !== state.sessionEpoch) return;
+      await acceptSignInResult(result, epoch);
+    } catch (error) {
+      if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
+      state.token = "";
+      message("sign-in-message", error.status === 401
+        ? "Username or password is incorrect."
+        : apiMessage(error, "Sign-in is unavailable. Confirm K5 is running on this PC and check its startup message."), true);
+    } finally {
+      credentials.password = "";
+      if (epoch === state.sessionEpoch) {
+        $("sign-in-button").disabled = false;
+        $("sign-in-button").textContent = "Sign in →";
+      }
+    }
+  });
+
+  async function acceptSignInResult(result, epoch) {
+      if (result?.mfa_required === true) {
+        if (typeof result.challenge_token !== "string" || result.challenge_token.length > 512 || !Number.isInteger(result.expires_in_seconds) || result.expires_in_seconds < 1 || result.expires_in_seconds > 300) throw new ApiError(503);
+        mfaChallenge = result.challenge_token; mfaChallengeExpires = performance.now() + result.expires_in_seconds * 1000;
+        $("sign-in-form").hidden = true; $("activate-account-button").hidden = true;
+        $("mfa-sign-in-form").hidden = false; $("mfa-sign-in-code").focus();
+        return;
+      }
+      await acceptIssuedSession(result, epoch);
+  }
+
+  async function acceptIssuedSession(result, epoch) {
       if (typeof result.session_token !== "string" || !result.account) throw new ApiError(503);
       state.token = result.session_token;
       const account = await request("/api/v1/auth/me");
@@ -1704,24 +1793,39 @@
       if (epoch !== state.sessionEpoch) return;
       if (navigationEpoch === state.navigationEpoch) setLastDay();
       scheduleCameraPoll();
+  }
+
+  $("mfa-sign-in-cancel").addEventListener("click", () => {
+    state.sessionEpoch += 1; resetActivation(); $("password").focus();
+  });
+  $("mfa-sign-in-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!mfaChallenge || $("mfa-sign-in-submit").disabled) return;
+    if (performance.now() >= mfaChallengeExpires) { resetActivation(); message("sign-in-message", "The verification request expired. Sign in again.", true); return; }
+    const epoch = state.sessionEpoch;
+    const body = { challenge_token: mfaChallenge, code: $("mfa-sign-in-code").value.trim() };
+    $("mfa-sign-in-code").value = ""; $("mfa-sign-in-submit").disabled = true;
+    message("mfa-sign-in-message", "Verifying…");
+    try {
+      const result = await request("/api/v1/auth/mfa", { method: "POST", body });
+      if (epoch !== state.sessionEpoch) return;
+      resetMfaSignIn(); await acceptIssuedSession(result, epoch);
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
       state.token = "";
-      message("sign-in-message", error.status === 401
-        ? "Username or password is incorrect."
-        : apiMessage(error, "Sign-in is unavailable. Confirm K5 is running on this PC and check its startup message."), true);
+      message("mfa-sign-in-message", error.status === 401 ? "The code was not accepted. Enter a current authenticator code or unused recovery code." : apiMessage(error, "Verification is unavailable. Try again or return to sign in."), true);
     } finally {
-      credentials.password = "";
-      if (epoch === state.sessionEpoch) {
-        $("sign-in-button").disabled = false;
-        $("sign-in-button").textContent = "Sign in →";
-      }
+      body.code = ""; body.challenge_token = "";
+      if (epoch === state.sessionEpoch) $("mfa-sign-in-submit").disabled = false;
     }
   });
 
   $("sign-out-button").addEventListener("click", () => void signOut());
-  $("admin-tab").addEventListener("click", () => setView("admin"));
+  $("admin-tab").addEventListener("click", () => setView(allowed("users.manage") ? "admin" : "settings"));
   $("admin-return-button").addEventListener("click", () => setView("wall"));
+  $("admin-settings-tab").addEventListener("click", () => { state.settingsSection = "storage"; setView("settings"); });
+  $("security-tab").addEventListener("click", () => { state.settingsSection = "security"; setView("settings"); });
+  $("settings-return-button").addEventListener("click", () => setView("wall"));
   $("refresh-cameras").addEventListener("click", () => void Promise.all([refreshCameras(true), refreshDiagnostics()]));
   $("camera-search").addEventListener("input", renderCameras);
   $("wall-tab").addEventListener("click", () => setView("wall"));
@@ -2324,7 +2428,40 @@
     $(id).addEventListener("click", () => $("connection-help-dialog").close());
   }
 
-  window.addEventListener("pagehide", () => { administration?.hide(); cameraAnalytics?.clear(); cancelExport(); resetActivation(); wall?.hide(); stopLive(); stopPlayback(); });
+  $("sso-sign-in-button").addEventListener("click", async () => {
+    if (state.token) return;
+    const epoch = ++state.sessionEpoch; resetActivation(); $("sso-sign-in-button").disabled = true;
+    message("sso-sign-in-message", "Opening organization sign-in…");
+    try {
+      const result = await request("/api/v1/auth/oidc/start", { method: "POST", body: {} });
+      if (epoch !== state.sessionEpoch) return;
+      if (typeof result?.authorization_url !== "string" || result.authorization_url.length > 8192) throw new ApiError(503);
+      const destination = new URL(result.authorization_url);
+      const local = destination.hostname === "127.0.0.1" || destination.hostname === "[::1]";
+      if (destination.username || destination.password || !(destination.protocol === "https:" || (destination.protocol === "http:" && local))) throw new ApiError(503);
+      window.location.assign(destination.href);
+    } catch (error) {
+      if (error.name !== "AbortError" && epoch === state.sessionEpoch) message("sso-sign-in-message", "Organization sign-in could not start. Use your local account or ask an administrator to check the identity provider.", true);
+    } finally { if (epoch === state.sessionEpoch) $("sso-sign-in-button").disabled = false; }
+  });
+  async function initializeOrganizationSignIn() {
+    const landing = new URL(window.location.href), code = landing.searchParams.get("sso_code");
+    if (code !== null) {
+      landing.searchParams.delete("sso_code"); window.history.replaceState(null, "", landing.pathname + landing.search + landing.hash);
+      if (!/^[A-Za-z0-9_-]{16,512}$/.test(code)) { message("sign-in-message", "Organization sign-in could not be completed. Try signing in again.", true); return; }
+      const epoch = ++state.sessionEpoch, body = { code };
+      $("sign-in-button").disabled = true; message("sign-in-message", "Completing organization sign-in…");
+      try { const result = await request("/api/v1/auth/oidc/complete", { method: "POST", body }); if (epoch === state.sessionEpoch) await acceptSignInResult(result, epoch); }
+      catch (error) { if (error.name !== "AbortError" && epoch === state.sessionEpoch) { state.token = ""; message("sign-in-message", "Organization sign-in was not accepted. Your identity must be linked to an enabled K5 account. Try again or use local sign-in.", true); } }
+      finally { body.code = ""; if (epoch === state.sessionEpoch) $("sign-in-button").disabled = false; }
+      return;
+    }
+    try { const d = await request("/api/v1/auth/oidc"); if (!state.token && d?.available === true) { $("sso-sign-in").hidden = false; $("sso-sign-in-button").textContent = typeof d.display_name === "string" && d.display_name.length <= 128 ? `Sign in with ${d.display_name}` : "Sign in with your organization"; } }
+    catch (_) { /* Local sign-in stays available when organization sign-in is unconfigured. */ }
+  }
+  void initializeOrganizationSignIn();
+
+  window.addEventListener("pagehide", () => { administration?.hide(); settings?.hide(); cameraAnalytics?.clear(); cancelExport(); resetActivation(); wall?.hide(); stopLive(); stopPlayback(); });
   window.addEventListener("resize", fitCameraWall);
   $("recorder-overview").addEventListener("toggle", fitCameraWall);
   setLastDay();

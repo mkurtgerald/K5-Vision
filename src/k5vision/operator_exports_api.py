@@ -40,6 +40,9 @@ def install_operator_exports_api(
     session_dependency = Depends(require_session)
 
     def permit(principal, camera_id):
+        from k5vision.operator_role_policy_api import require_permission
+
+        require_permission(app, principal, "cameras.export")
         source = authorized_selection(principal, camera_id)
         if principal.role is UserRole.VIEWER:
             raise HTTPException(403, "MP4 export requires an operator or administrator")
@@ -170,10 +173,19 @@ def install_operator_exports_api(
 
         class OwnedFileResponse(StreamingResponse):
             async def __call__(self, scope, receive, send):
+                outcome = "success"
                 try:
                     await super().__call__(scope, receive, send)
+                except BaseException:
+                    outcome = "interrupted"
+                    raise
                 finally:
-                    exports.release_file(job, source)
+                    try:
+                        audit_download = getattr(exports, "audit_download", None)
+                        if audit_download is not None:
+                            audit_download(job, outcome=outcome)
+                    finally:
+                        exports.release_file(job, source)
 
         return OwnedFileResponse(
             content(),

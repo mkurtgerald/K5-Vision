@@ -25,6 +25,7 @@ from k5vision.operator_product_service import (
     admit_native_executable,
 )
 from k5vision.operator_profile_lock import OperatorProfileLock, OperatorProfileLockError
+from k5vision.operator_role_policy import PERMISSIONS
 from k5vision.operator_time import HostClockObserver
 
 
@@ -60,8 +61,15 @@ class _Provider:
 class _Storage:
     allowed = True
 
-    def __init__(self, _root, *, max_bytes):
+    def __init__(self, _root, *, max_bytes, min_free_bytes=1024**3, retention_seconds=86400):
         self.max_bytes = max_bytes
+        self.min_free_bytes = min_free_bytes
+        self.retention_seconds = retention_seconds
+
+    def configure_policy(self, *, max_bytes, min_free_bytes, retention_seconds):
+        self.max_bytes = max_bytes
+        self.min_free_bytes = min_free_bytes
+        self.retention_seconds = retention_seconds
 
     def inspect(self):
         return SimpleNamespace(
@@ -92,6 +100,18 @@ def native(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "MediaMTXProvider", lambda **_kwargs: _Provider())
     monkeypatch.setattr(module, "generate_operator_gateway_configuration", lambda **_kwargs: "{}")
     monkeypatch.setattr(storage_module, "RecordingStorage", _Storage)
+    # This native-process harness uses a synthetic site and no user database.
+    # Real storage-policy tests exercise the durable component anchor separately.
+    import k5vision.operator_storage_settings as settings_module
+
+    class SyntheticIdentityAnchor:
+        def __init__(self, *_args, **_options):
+            pass
+
+        def seal(self):
+            pass
+
+    monkeypatch.setattr(settings_module, "ComponentStateAnchor", SyntheticIdentityAnchor)
     monkeypatch.setattr(_Storage, "allowed", True)
     processes = []
 
@@ -228,6 +248,84 @@ def test_stop_closes_each_active_writer_before_workers_without_rewriting_saved_c
         assert media.stopped == gateway.stopped == 1
 
     asyncio.run(scenario())
+
+
+def test_live_storage_policy_updates_existing_manager_and_recorder_paths(native, monkeypatch):
+    _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        await service.start((_source(1), _source(2)))
+        manager = service._storage
+        try:
+            monkeypatch.setattr(_Storage, "allowed", False)
+            changed = await service.configure_storage(
+                expected_revision=0,
+                quota_bytes=30 * 1024**3,
+                minimum_free_bytes=2 * 1024**3,
+                retention_seconds=3 * 86400,
+            )
+            assert service._storage is manager
+            assert manager.max_bytes == 30 * 1024**3
+            assert manager.min_free_bytes == 2 * 1024**3
+            assert manager.retention_seconds == 3 * 86400
+            assert changed["inspection_available"] and not changed["recording_allowed"]
+            assert all(not path["record"] for path in service._media.paths.values())
+            assert service.status() == "disk_full"
+            monkeypatch.setattr(_Storage, "allowed", True)
+            changed = await service.configure_storage(expected_revision=1, retention_seconds=0)
+            assert service._storage is manager
+            assert changed["recording_allowed"]
+            assert all(path["record"] for path in service._media.paths.values())
+            assert service.status() == "ready"
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_storage_change_and_stop_join_inflight_deletion(native, monkeypatch):
+    _fake_mutations(native, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+
+    async def scenario():
+        service = native.service
+        await service.start((_source(1),))
+        service._task.cancel()
+        try:
+            await service._task
+        except asyncio.CancelledError:
+            pass
+        service._task = None
+        manager = service._storage
+        original_prune = manager.prune
+
+        def held_prune():
+            entered.set()
+            assert release.wait(timeout=5)
+            return original_prune()
+
+        monkeypatch.setattr(manager, "prune", held_prune)
+        update = asyncio.create_task(
+            service.configure_storage(expected_revision=0, retention_seconds=0)
+        )
+        assert await asyncio.to_thread(entered.wait, 3)
+        update.cancel()
+        cleanup = asyncio.create_task(service.stop())
+        await asyncio.sleep(0.05)
+        assert not update.done() and not cleanup.done()
+        assert service._media.poll() is None
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await update
+        await cleanup
+        assert not service._storage_operations
+        assert service._media is None
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
 
 
 def test_stop_skips_flush_when_media_has_already_exited(native, monkeypatch):
@@ -971,7 +1069,12 @@ def test_product_lifespan_uses_existing_human_identity_and_closes_its_camera_sto
             "cameras": [],
             "worker_status": "ready",
             "capabilities": {
-                "account": login.json()["account"],
+                "account": {
+                    **login.json()["account"],
+                    "role_profile_id": None,
+                    "effective_permissions": sorted(PERMISSIONS),
+                },
+                "effective_permissions": sorted(PERMISSIONS),
                 "can_view_history": True,
                 "can_export": True,
                 "can_manage_cameras": True,
@@ -1083,7 +1186,12 @@ def test_second_product_application_cannot_start_workers_for_an_active_identity(
             "cameras": [],
             "worker_status": "ready",
             "capabilities": {
-                "account": login.json()["account"],
+                "account": {
+                    **login.json()["account"],
+                    "role_profile_id": None,
+                    "effective_permissions": sorted(PERMISSIONS),
+                },
+                "effective_permissions": sorted(PERMISSIONS),
                 "can_view_history": True,
                 "can_export": True,
                 "can_manage_cameras": True,

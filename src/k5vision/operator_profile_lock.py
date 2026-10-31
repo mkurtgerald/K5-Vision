@@ -131,6 +131,19 @@ class OperatorProfileLock:
                 # survives in the exported exception's context or cause.
                 raise OperatorProfileLockError(_FAILURE)
 
+    def assert_held(self, site_id: str) -> None:
+        """Re-admit an existing owner before handing its lease to the server."""
+        with self._guard:
+            try:
+                if self._descriptor is None:
+                    raise ValueError
+                state = identity_state.load_identity_state(self._root)
+                if state.site_id != site_id:
+                    raise ValueError
+                _same_file(self._descriptor, state.directory / _LOCK_NAME)
+            except Exception:
+                raise OperatorProfileLockError(_FAILURE) from None
+
     def close(self) -> None:
         with self._guard:
             descriptor, self._descriptor = self._descriptor, None

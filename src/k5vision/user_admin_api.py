@@ -90,7 +90,8 @@ class _BoundedUserRequestBody:
         return (
             (method == "POST" and path == "/api/v1/users")
             or (method == "POST" and path == "/api/v1/auth/bootstrap-password")
-            or (method == "POST" and path == "/api/v1/auth/login")
+            or (method == "POST" and path in {"/api/v1/auth/login", "/api/v1/auth/mfa"})
+            or (method == "POST" and path.startswith("/api/v1/operator/security/"))
             or (method == "PATCH" and path.startswith("/api/v1/users/"))
         )
 
@@ -535,6 +536,8 @@ def install_user_admin_api(
     )
     async def login(payload: UserLogin, response: Response) -> UserSessionIssue:
         response.headers["Cache-Control"] = "no-store"
+        security = getattr(application.state, "operator_identity_security", None)
+        started_epoch = None if security is None else security.primary_started()
         try:
             verified = require_registry().verify_password_snapshot(
                 username=payload.username,
@@ -551,10 +554,48 @@ def install_user_admin_api(
                 detail="Invalid username or password",
             )
         account, credential_version = verified
+        from k5vision.operator_audit import set_audit_actor
+
+        set_audit_actor(account)
+        if security is not None:
+            from k5vision.operator_identity_security import (
+                AccountSecurityError,
+                AccountSecurityUnavailable,
+                SecondFactorRequired,
+            )
+
+            try:
+                primary_epoch = security.password_authenticated(
+                    account, credential_version, started_epoch=started_epoch
+                )
+            except SecondFactorRequired as challenge:
+                return JSONResponse(
+                    challenge.challenge,
+                    status_code=202,
+                    headers={"Cache-Control": "no-store"},
+                )
+            except AccountSecurityUnavailable:
+                raise HTTPException(503, "Account security unavailable") from None
+            except AccountSecurityError:
+                raise HTTPException(401, "Account authentication changed") from None
         session_token, expires_at = await session_manager.issue(
             account, credential_version=credential_version
         )
         current = await session_manager.resolve(session_token)
+        if security is not None:
+            try:
+                security.validate_primary_proof(account, credential_version, primary_epoch)
+                factor_enabled = security.store.status(account.id)["mfa_enabled"]
+            except AccountSecurityUnavailable:
+                await session_manager.revoke(session_token)
+                raise HTTPException(503, "Account security unavailable") from None
+            except AccountSecurityError:
+                await session_manager.revoke(session_token)
+                raise HTTPException(401, "Account authentication changed") from None
+            if factor_enabled:
+                # Enrollment may finish while issue() awaits its session lock.
+                await session_manager.revoke(session_token)
+                raise HTTPException(401, "Second factor required")
         if current is None:
             raise HTTPException(401, "Invalid username or password")
         return UserSessionIssue(

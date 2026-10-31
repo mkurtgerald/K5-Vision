@@ -112,6 +112,8 @@ def workspace():
                         "admin.css",
                         "analytics.js",
                         "analytics.css",
+                        "settings.js",
+                        "settings.css",
                     }:
                         return respond(route, {}, 404)
                     content_type = {

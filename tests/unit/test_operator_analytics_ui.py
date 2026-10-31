@@ -49,11 +49,15 @@ def analytics_page():
               window.eventRows = [{id:12,camera_id:cameraId,occurred_at:'2026-10-27T12:30:00Z',
                 playback_at:'2026-10-27T12:29:58Z',confidence:0.87,person_count:2}];
               window.requests = []; window.seeks = []; window.waiters = [];
+              window.providerRows = []; window.providerMore = false;
               window.hold = false; window.failEvents = false; window.more = false;
               window.request = async (path,options={}) => {
                 window.requests.push({path,method:options.method||'GET',body:options.body});
                 if (window.hold) return await new Promise(resolve =>
                   window.waiters.push({path,resolve}));
+                if (path.includes('/integration-events')) return {
+                  events:structuredClone(window.providerRows),has_more:window.providerMore,
+                  next_before:window.providerMore?34:null};
                 if (path.endsWith('/analytics')) {
                   if (options.method === 'PATCH') {
                     Object.assign(window.settings,options.body,
@@ -133,7 +137,7 @@ def test_viewer_sees_events_without_settings_and_older_events_remain_camera_scop
 def test_camera_switch_and_logout_discard_delayed_detection_responses(analytics_page):
     page, errors = analytics_page
     page.evaluate("() => {window.hold=true;void window.analytics.refresh();}")
-    page.wait_for_function("window.waiters.length===2")
+    page.wait_for_function("window.waiters.length===3")
     page.evaluate(
         """other => {
           window.analytics.selectCamera({device_id:other,name:'Different camera'});
@@ -205,4 +209,49 @@ def test_event_navigation_discards_an_account_change_before_the_click_callback(a
     )
     page.wait_for_timeout(50)
     assert page.evaluate("window.seeks") == []
+    assert not errors
+
+
+def test_provider_events_preserve_status_utc_and_assigned_camera_navigation(analytics_page):
+    page, errors = analytics_page
+    page.evaluate(
+        """camera => {
+          window.providerRows=[{sequence:34,source_id:camera,event_id:'external-event-34',
+            event_type:'analytics.person',status:'candidate',confidence:0.76,
+            observed_at:'2026-10-26T23:59:12Z',playback_at:'2026-10-26T23:59:12Z'}];
+          return window.analytics.refresh();
+        }""",
+        _CAMERA,
+    )
+    row = page.locator('#analytics-provider-events li[data-provider-event-id="external-event-34"]')
+    row.wait_for()
+    assert "candidate" in row.inner_text()
+    assert "76% confidence" in row.inner_text()
+    assert "2026-10-26 23:59:12 UTC" in row.inner_text()
+    row.get_by_role("button").click()
+    assert page.evaluate("window.seeks") == [
+        {"cameraId": _CAMERA, "timestamp": "2026-10-26T23:59:12Z"}
+    ]
+    assert not errors
+
+
+def test_unassigned_provider_event_is_rejected_and_custom_role_cannot_change_detection(
+    analytics_page,
+):
+    page, errors = analytics_page
+    page.evaluate(
+        """other => {
+          window.providerRows=[{sequence:34,source_id:other,event_id:'wrong-camera',
+            event_type:'analytics.person',status:'confirmed',confidence:0.9,
+            observed_at:'2026-10-27T12:30:00Z',playback_at:'2026-10-27T12:30:00Z'}];
+          window.session.account.effective_permissions=['cameras.playback'];
+          return window.analytics.refresh();
+        }""",
+        _OTHER,
+    )
+    assert page.locator("#analytics-provider-events li").count() == 0
+    assert "could not be loaded" in page.locator("#analytics-provider-message").inner_text()
+    assert page.locator("#analytics-settings-form").is_hidden()
+    page.locator("#analytics-settings-form").dispatch_event("submit")
+    assert page.evaluate("window.requests.filter(x=>x.method==='PATCH').length") == 0
     assert not errors

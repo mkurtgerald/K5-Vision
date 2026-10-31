@@ -196,6 +196,31 @@ def _serve(
     except Exception:
         return _response("refused", "unsafe_state")
     stop = threading.Event()
+    last_storage_progress = -1
+
+    def storage_progress(value):
+        nonlocal last_storage_progress
+        if destination is None or type(value) is not dict:
+            raise ValueError
+        copied, total = value.get("copied_bytes"), value.get("total_bytes")
+        if (
+            value.get("phase") not in {"preparing", "copying"}
+            or type(copied) is not int
+            or type(total) is not int
+            or not 0 <= copied <= total < 2**63
+        ):
+            raise ValueError
+        percent = 0 if total == 0 else min(100, copied * 100 // total)
+        if percent > last_storage_progress:
+            destination.write(
+                json.dumps(
+                    {"schema_version": 1, "status": "preparing_recordings", "progress": percent},
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            destination.flush()
+            last_storage_progress = percent
 
     def ready():
         if destination is None:
@@ -227,6 +252,7 @@ def _serve(
                 open_browser=False,
                 shutdown_requested=stop.is_set,
                 ready_callback=ready,
+                storage_progress=storage_progress,
             )
         return _response("stopped", "operator_stopped")
     except Exception:

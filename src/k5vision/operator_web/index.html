@@ -10,10 +10,12 @@
     <link rel="stylesheet" href="/operator/timeline.css">
     <link rel="stylesheet" href="/operator/admin.css">
     <link rel="stylesheet" href="/operator/analytics.css">
+    <link rel="stylesheet" href="/operator/settings.css">
     <script defer src="/operator/wall.js"></script>
     <script defer src="/operator/timeline.js"></script>
     <script defer src="/operator/admin.js"></script>
     <script defer src="/operator/analytics.js"></script>
+    <script defer src="/operator/settings.js"></script>
     <script defer src="/operator/app.js"></script>
   </head>
   <body>
@@ -31,6 +33,13 @@
           <p id="sign-in-message" class="form-message" role="status" aria-live="polite"></p>
           <button id="sign-in-button" class="button primary wide" type="submit">Sign in <span aria-hidden="true">→</span></button>
         </form>
+        <form id="mfa-sign-in-form" autocomplete="off" hidden>
+          <h2>Verify your sign-in</h2><p class="field-help">Enter the current code from your authenticator or an unused recovery code.</p>
+          <label for="mfa-sign-in-code">Authenticator or recovery code</label><input id="mfa-sign-in-code" autocomplete="one-time-code" maxlength="128" required>
+          <p id="mfa-sign-in-message" class="form-message" role="status" aria-live="polite"></p>
+          <button id="mfa-sign-in-submit" class="button primary wide" type="submit">Verify and sign in</button><button id="mfa-sign-in-cancel" class="button quiet wide" type="button">Back to sign in</button>
+        </form>
+        <div id="sso-sign-in" hidden><button id="sso-sign-in-button" class="button secondary wide" type="button">Sign in with your organization</button><p id="sso-sign-in-message" class="form-message" role="status" aria-live="polite"></p></div>
         <button id="activate-account-button" class="button quiet wide" type="button">Set password with a temporary code</button>
         <form id="activate-account-form" autocomplete="off" hidden>
           <h2>Set your password</h2>
@@ -50,7 +59,7 @@
     <div id="workspace" class="workspace" hidden>
       <header class="topbar">
         <div class="brand"><span class="brand-mark" aria-hidden="true">K5</span><span>Vision</span><span class="brand-divider"></span><span class="workspace-label">Surveillance workspace</span></div>
-        <div class="user-menu"><button id="admin-tab" class="button secondary" type="button" aria-pressed="false" hidden>Administration</button><span id="account-name"></span><span id="account-role" class="role-tag"></span><button id="sign-out-button" class="button quiet" type="button">Sign out</button></div>
+        <div class="user-menu"><button id="admin-tab" class="button secondary" type="button" aria-pressed="false" hidden>Administration</button><button id="security-tab" class="button quiet" type="button" aria-pressed="false" hidden>Account security</button><span id="account-name"></span><span id="account-role" class="role-tag"></span><button id="sign-out-button" class="button quiet" type="button">Sign out</button></div>
       </header>
 
       <div id="camera-workspace" class="workspace-body">
@@ -151,9 +160,9 @@
         </main>
       </div>
       <section id="admin-panel" class="admin-workspace" aria-labelledby="admin-title" hidden>
-        <div class="admin-heading"><div><p class="eyebrow">ADMINISTRATION</p><h1 id="admin-title">People and access</h1><p class="muted">Manage accounts, camera permissions and account activity.</p></div><button id="admin-return-button" class="button secondary" type="button">Back to cameras</button></div>
+        <div class="admin-heading"><div><p class="eyebrow">ADMINISTRATION</p><h1 id="admin-title">Administration</h1><p class="muted">Manage accounts, permissions and recorder settings.</p></div><button id="admin-return-button" class="button secondary" type="button">Back to cameras</button></div>
         <p id="admin-message" class="form-message" role="status" aria-live="polite"></p>
-        <nav class="view-tabs" aria-label="Administration"><button id="admin-users-tab" class="tab active" type="button" aria-current="page">Users and permissions</button><button id="admin-audit-tab" class="tab" type="button">Account activity</button></nav>
+        <nav class="view-tabs" aria-label="Administration"><button id="admin-users-tab" class="tab active" type="button" aria-current="page">Users and permissions</button><button id="admin-audit-tab" class="tab" type="button">Account activity</button><button id="admin-settings-tab" class="tab" type="button">Recorder settings</button></nav>
         <section id="admin-users-panel" aria-label="User administration">
           <div class="admin-toolbar"><div><h2>Users</h2><p class="field-help">Administrators manage the site. Operators can view and export footage. Viewers can watch live and recorded video.</p></div><div class="admin-actions"><button id="admin-refresh-users" class="button secondary" type="button">Refresh</button><button id="admin-create-user" class="button primary" type="button">Create user</button></div></div>
           <div class="admin-table-wrap"><table class="admin-table"><thead><tr><th scope="col">Account</th><th scope="col">Role</th><th scope="col">Status</th><th scope="col">Camera access</th><th scope="col">Actions</th></tr></thead><tbody id="admin-users-list"></tbody></table></div>
@@ -167,6 +176,10 @@
           <div class="admin-pagination"><button id="admin-audit-previous" class="button secondary" type="button" disabled>Previous activity</button><span id="admin-audit-page" class="muted"></span><button id="admin-audit-next" class="button secondary" type="button" disabled>Next activity</button></div>
         </section>
       </section>
+      <section id="settings-panel" class="admin-workspace settings-workspace" aria-labelledby="settings-title" hidden>
+        <div class="admin-heading"><div><p class="eyebrow">K5 SETTINGS</p><h1 id="settings-title">Recorder settings</h1><p class="muted">Changes require your current account permissions.</p></div><button id="settings-return-button" class="button secondary" type="button">Back to cameras</button></div>
+        <nav id="settings-tabs" class="view-tabs settings-tabs" aria-label="Recorder settings"></nav><div id="settings-content"></div>
+      </section>
     </div>
 
     <dialog id="admin-user-dialog" class="admin-dialog" aria-labelledby="admin-user-title">
@@ -174,6 +187,10 @@
         <div class="dialog-heading"><h2 id="admin-user-title">Create user</h2><button id="admin-close-user" class="icon-button" type="button" aria-label="Close user editor">×</button></div>
         <div class="admin-form-columns"><div><label for="admin-username">Username</label><input id="admin-username" required minlength="3" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,63}" autocomplete="off"><p class="field-help">3–64 letters, numbers, dots, underscores or hyphens.</p></div><div><label for="admin-display-name">Display name</label><input id="admin-display-name" required maxlength="128"></div></div>
         <label for="admin-role">Role</label><select id="admin-role"><option value="viewer">Viewer · Live and recorded video</option><option value="operator" selected>Operator · View and export footage</option><option value="administrator">Administrator · Manage site and users</option></select>
+        <div id="admin-role-profile-section" class="settings-card" hidden>
+          <label for="admin-role-profile">Custom role profile</label><select id="admin-role-profile"><option value="">Built-in role · no profile</option></select>
+          <p id="admin-role-profile-help" class="field-help"></p><button id="admin-apply-role-profile" class="button secondary" type="button" disabled>Apply role profile</button>
+        </div>
         <label class="admin-checkbox" for="admin-enabled"><input id="admin-enabled" type="checkbox" checked>Account enabled</label>
         <fieldset id="admin-access-fieldset" class="admin-access-fieldset"><legend>Camera access</legend><label for="admin-access-mode">Allow this account to access</label><select id="admin-access-mode"><option value="selected">Selected cameras</option><option value="all">All cameras, including cameras added later</option></select><div id="admin-camera-choices" class="admin-camera-choices"></div><p id="admin-access-help" class="field-help">Choose the cameras this user may view. Selecting none gives this account no camera access.</p></fieldset>
         <p id="admin-own-change" class="notice warning" hidden>Changing your own role or disabling your account signs you out. Another activated administrator must remain available.</p>
