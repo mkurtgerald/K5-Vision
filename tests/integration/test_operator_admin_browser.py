@@ -32,6 +32,7 @@ _PLAYWRIGHT_VERSION = "1.58.0"
 _BROWSER_HELPERS = None
 _ADMIN_FAILURE_CODE = None
 _ADMIN_RESTART_DIAGNOSTIC = {}
+_ADMIN_DENIAL_DIAGNOSTIC = {}
 _FAILURE_MESSAGES = {
     "Restart changed a durable user identity": "restart_user_identity",
     "Restart changed the user's durable role, enabled state or access mode": "restart_role_state",
@@ -40,6 +41,7 @@ _FAILURE_MESSAGES = {
     "Restart granted the viewer an unassigned camera": "restart_viewer_boundary",
     "Generated user could not sign in through the UI": "user_ui_login",
     "Delayed initial inventory navigated away from administration": "late_login_navigation",
+    "A limited account received an unauthorized operation": "admin_denial_status",
 }
 pytestmark = pytest.mark.skipif(
     os.getenv("K5_OPERATOR_BROWSER_ACCEPTANCE") != "1"
@@ -280,6 +282,7 @@ def run_admin_journey(
     """
     __tracebackhide__ = True
     del admin_username, admin_password, client  # The existing admin session is authoritative.
+    _ADMIN_DENIAL_DIAGNOSTIC.clear()
     _require(len(camera_ids) >= 2, "Admin acceptance needs two generated camera identities")
     origin = _origin(page)
     helpers = _browser_helpers()
@@ -298,6 +301,27 @@ def run_admin_journey(
 
     def denial(user_page, token, method, route, expected, data=None):
         status, _ = _api(user_page, token, method, route, data)
+        if status != expected:
+            path = urlsplit(route).path
+            route_class = (
+                "retired_users"
+                if path == "/api/v1/users"
+                else "retired_devices"
+                if path.startswith("/api/v1/devices")
+                else "product_users"
+                if path == "/api/v1/operator/admin/users"
+                else "camera"
+                if path.startswith("/api/v1/operator/cameras/")
+                else "media"
+                if path.startswith("/media/")
+                else "other"
+            )
+            _ADMIN_DENIAL_DIAGNOSTIC.update(
+                method=method if method in {"GET", "POST", "PUT", "PATCH", "DELETE"} else "other",
+                route_class=route_class,
+                expected_status=expected,
+                actual_status=status,
+            )
         _require(status == expected, "A limited account received an unauthorized operation")
         denied.append(status)
 
@@ -350,7 +374,7 @@ def run_admin_journey(
         )
         for method, route, expected, data in (
             ("GET", "/api/v1/operator/admin/users", 403, None),
-            ("GET", "/api/v1/users", 403, None),
+            ("GET", "/api/v1/users", 404, None),
             ("GET", "/api/v1/devices", 404, None),
             ("GET", f"/api/v1/devices/{camera_ids[1]}", 404, None),
             ("GET", f"/api/v1/operator/cameras/{camera_ids[1]}/history", 404, None),
@@ -872,6 +896,7 @@ def test_real_browser_admin_users_roles_camera_access_and_restart(
             "failure_code": failure,
             "assertion_code": _ADMIN_FAILURE_CODE,
             "restart": dict(_ADMIN_RESTART_DIAGNOSTIC),
+            "denial": dict(_ADMIN_DENIAL_DIAGNOSTIC),
             "script_error_codes": script_errors[:16],
             "cleanup_failure_codes": cleanup_failures,
         }
