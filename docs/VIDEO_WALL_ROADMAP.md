@@ -11,11 +11,16 @@ individual tile editing and tile-size-driven stream switching remain planned.
 
 ## Delivery order
 
+The [camera-setup workstream](CAMERA_SETUP_ROADMAP.md) has priority over advanced
+tile customization. Automatic layouts can proceed independently; adaptive wall
+streams should reuse the camera-setup profile/capability model rather than create
+a second source-selection model.
+
 | Order | Item | Target and prerequisites |
 | --- | --- | --- |
 | 1 | [Automatic layout selection — #347](https://github.com/mkurtgerald/K5-Vision/issues/347) | Next wall-usability increment; reuse the current authorized inventory, presets, paging and player lifecycle. |
-| 2 | [Reorder, resize and saved layouts — #348](https://github.com/mkurtgerald/K5-Vision/issues/348) | Following customization increment, once the Auto/manual layout contract and stable camera-to-slot mapping are established. |
-| 3 | [Adaptive main/preview display streams — #349](https://github.com/mkurtgerald/K5-Vision/issues/349) | Investigate ONVIF capabilities alongside item 1; release switching after paired-source persistence, transport, authorization and capacity qualification. |
+| 2 | [Reorder, resize and saved layouts — #348](https://github.com/mkurtgerald/K5-Vision/issues/348) | Following customization increment after the core camera-setup priorities, once the Auto/manual layout contract and stable camera-to-slot mapping are established. |
+| 3 | [Adaptive main/preview display streams — #349](https://github.com/mkurtgerald/K5-Vision/issues/349) | Investigate ONVIF capabilities alongside camera setup; release switching after paired-source persistence, transport, authorization and capacity qualification. |
 
 These are sequencing targets, not calendar commitments. Profile discovery and
 its transport work can proceed independently of browser layout editing. Stream
