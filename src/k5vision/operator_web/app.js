@@ -1516,6 +1516,12 @@
       state.historyRolling = false;
       if (!await loadHistory()) return;
     }
+    // A detector event can arrive after the latest recorder history snapshot.
+    // Re-query once before concluding the event is in a recording gap.
+    // Never let a superseded navigation or changed session apply its result.
+    if (active() && !state.spans.some((span) => span.start <= at && at < span.end)) {
+      if (!await loadHistory() || !active()) return;
+    }
     if (active()) seekRecording(at);
   }
 

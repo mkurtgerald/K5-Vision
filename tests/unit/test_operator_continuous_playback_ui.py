@@ -323,6 +323,48 @@ def test_event_click_waits_for_initial_history_and_latest_click_wins(held_phase,
         assert page.locator(".history-gap").count() == 3
 
 
+def test_event_seek_refreshes_stale_recording_inventory_once():
+    """An event recorded after the inventory fetch must open its real footage."""
+    requests = []
+    event_at = _BEGIN + timedelta(hours=2, minutes=5)
+
+    def updated_inventory(route):
+        if not urlsplit(route.request.url).path.endswith("/history"):
+            return False
+        requests.append(1)
+        if len(requests) != 2:
+            return False
+        spans = [
+            {
+                "recording_id": f"generated-{index}",
+                "started_at": (
+                    _BEGIN + timedelta(minutes=index * 10 + (10 if index >= 12 else 0))
+                ).isoformat(),
+                "duration_seconds": 600,
+            }
+            for index in range(18)
+        ]
+        spans.append(
+            {
+                "recording_id": "newly-arrived-recording",
+                "started_at": (_BEGIN + timedelta(hours=2)).isoformat(),
+                "duration_seconds": 600,
+            }
+        )
+        route.fulfill(
+            content_type="application/json",
+            body=json.dumps({"spans": spans}),
+        )
+        return True
+
+    with _history_page(export_handler=updated_inventory) as (page, expect):
+        page.evaluate("at => window.K5Playback.seekUTC(at)", event_at.isoformat())
+        expected = event_at.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        expect(page.locator("#playback-video")).to_have_attribute("data-utc-start", expected)
+        expect(page.locator("#history-count")).to_have_text("19")
+        assert len(requests) == 2
+
+
 def test_old_recorder_time_response_cannot_reset_a_newer_history_and_event_seek():
     pending, history_requests = [], []
     status_count = 0
