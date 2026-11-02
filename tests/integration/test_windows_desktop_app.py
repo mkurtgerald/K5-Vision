@@ -2128,6 +2128,15 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     form = None
     app = None
     stage, failure, cleanup_failed = "installer", None, False
+    stage_started = started
+    stage_durations = []
+
+    def _enter_stage(name):
+        nonlocal stage, stage_started
+        now = time.monotonic()
+        stage_durations.append((stage, round(now - stage_started, 2)))
+        stage, stage_started = name, now
+
     failure_detail = None
     readiness_diagnostic = {"health_http_status": 0}
     recording_diagnostic = {}
@@ -2158,7 +2167,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         port, upstream_ports = ports[0], ports[1:]
         for listener in reservations:
             listener.close()
-        stage = "first_account_screen"
+        _enter_stage("first_account_screen")
         app = _start_app(installed, profile, port, cohort)
         form = _wait(lambda: api.form(app.pid), "First account window", process=app)
         _wait(
@@ -2174,7 +2183,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         api.set_text(form, _CONFIRM, password)
         api.click(api.control(form, _CREATE))
         client = runtime._Client(port)
-        stage = "embedded_product_startup"
+        _enter_stage("embedded_product_startup")
         _wait(
             lambda: _healthy(client, readiness_diagnostic),
             "Desktop embedded product startup",
@@ -2192,7 +2201,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         )
         receipt["actual_gui_account_setup"] = True
         receipt["administrator_login"] = True
-        stage = "native_default_browser_handoff"
+        _enter_stage("native_default_browser_handoff")
         _wait(
             lambda: api.api.IsWindowEnabled(api.control(form, _OPEN)),
             "Native Open cameras button",
@@ -2215,7 +2224,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "Desktop used an external Python installation",
         )
         receipt["embedded_python_independent_of_path"] = True
-        stage = "generated_camera_fixture"
+        _enter_stage("generated_camera_fixture")
         for index, ((_, host, color), upstream_port) in enumerate(
             zip(_DESKTOP_CAMERAS, upstream_ports, strict=True)
         ):
@@ -2244,7 +2253,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             publishers.append(generated[-1])
             sources.append(source)
         source_uri, onvif_camera = sources[0], onvif_cameras[0]
-        stage = "actual_camera_rtsp_authentication"
+        _enter_stage("actual_camera_rtsp_authentication")
         browser_helpers._assert_rtsp_read_auth(
             ffprobe, source_uri, onvif_camera.username, onvif_camera.password
         )
@@ -2252,7 +2261,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["authenticated_camera_read"] = True
         receipt["rtsp_anonymous_read_rejected"] = True
         receipt["rtsp_wrong_password_rejected"] = True
-        stage = "actual_browser_enrollment"
+        _enter_stage("actual_browser_enrollment")
         playwright = browser_api.sync_playwright().start()
         browser = playwright.chromium.launch(channel="msedge", headless=True)
         receipt["browser_version"] = browser.version
@@ -2308,7 +2317,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["bounded_discovery_executed"] = discovery_completed
         receipt["generated_camera_discovered"] = False
         receipt.update(browser_helpers._onvif_clock_proof(onvif_camera))
-        stage = "actual_direct_rtsp_enrollment"
+        _enter_stage("actual_direct_rtsp_enrollment")
         direct_stream = browser_helpers._rtsp_enroll(
             page,
             name=_DESKTOP_CAMERAS[0][0],
@@ -2326,7 +2335,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["direct_rtsp_enrollment"] = True
         receipt["direct_rtsp_wrong_password_rejected"] = True
         direct_rtsp_started_utc = int(datetime.now(UTC).timestamp() * 1000)
-        stage = "actual_fresh_rtsp_add"
+        _enter_stage("actual_fresh_rtsp_add")
         fresh_uri = urlsplit(source_uri)._replace(path="/direct-channel").geturl()
         fresh_publisher = _publish_fixture(
             parent,
@@ -2397,11 +2406,11 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         browser_helpers._assert_no_browser_storage(page)
         route = "/api/v1/operator/cameras/" + camera_id
         page.locator("#add-camera-dialog").wait_for(state="hidden")
-        stage = "actual_wall_initial_four"
+        _enter_stage("actual_wall_initial_four")
         receipt["wall_decoded_frames"] = browser_helpers._wall_frames(
             page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS], diagnostic=nvr_diagnostic
         )
-        stage = "actual_wall_layout_one"
+        _enter_stage("actual_wall_layout_one")
         page.locator("#wall-layout").select_option("1")
         _wait(
             lambda: page.locator("#wall-panel video").count() == 1,
@@ -2416,7 +2425,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             _DESKTOP_CAMERAS[camera_ids.index(first_id)][2],
             diagnostic=nvr_diagnostic,
         )
-        stage = "actual_wall_layout_nine"
+        _enter_stage("actual_wall_layout_nine")
         page.locator("#wall-layout").select_option("9")
         _wait(
             lambda: page.locator("#wall-panel video").count() == 4,
@@ -2431,7 +2440,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 color,
                 diagnostic=nvr_diagnostic,
             )
-        stage = "actual_wall_restore_four"
+        _enter_stage("actual_wall_restore_four")
         receipt["wall_decoded_frames"] = browser_helpers._wall_frames(
             page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS], diagnostic=nvr_diagnostic
         )
@@ -2441,12 +2450,12 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["camera_count"] = 4
         receipt["four_camera_wall"] = True
         browser_helpers._open_camera_watch(page, camera_id)
-        stage = "actual_browser_live_decode"
+        _enter_stage("actual_browser_live_decode")
         receipt["live_decoded_frames"] = browser_helpers._decoded_color(page, "live-video", "red")
         receipt["direct_rtsp_live_decoded_frames"] = receipt["live_decoded_frames"]
         receipt["actual_edge_login_enrollment_live"] = True
         _wait(lambda: _recording_bytes(profile) > 0, "Desktop recording bytes", process=app)
-        stage = "installed_nvr_workspace"
+        _enter_stage("installed_nvr_workspace")
         receipt.update(
             _desktop_nvr_journey(
                 page=page,
@@ -2471,7 +2480,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["direct_rtsp_recording_bytes_before"] = receipt["camera_recording_bytes_before"][0]
         receipt["direct_rtsp_recording_bytes_after"] = receipt["camera_recording_bytes_after"][0]
         receipt["direct_rtsp_history_decoded_frames"] = receipt["timeline_playback_decoded_frames"]
-        stage = "installed_continuous_person_analytics"
+        _enter_stage("installed_continuous_person_analytics")
         analytics_evidence, analytics_event = _installed_analytics_journey(
             page=page,
             client=client,
@@ -2512,7 +2521,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 analytics_event=analytics_event,
             )
             receipt["host_clock_step_acceptance"] = True
-        stage = "installed_user_administration"
+        _enter_stage("installed_user_administration")
 
         def admin_progress(phase):
             if phase in {
@@ -2553,7 +2562,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         ):
             _require(field in admin_evidence, "Installed user administration proof is incomplete")
             receipt[field] = admin_evidence[field]
-        stage = "installed_analytics_permissions"
+        _enter_stage("installed_analytics_permissions")
         receipt.update(
             _analytics_permission_journey(
                 page,
@@ -2563,7 +2572,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 diagnostic=nvr_diagnostic,
             )
         )
-        stage = "installed_admin_settings_security_integrations"
+        _enter_stage("installed_admin_settings_security_integrations")
         receipt.update(
             settings_helpers.run_installed_settings_journey(
                 page,
@@ -2579,7 +2588,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 diagnostic=nvr_diagnostic,
             )
         )
-        stage = "wall_logout_resource_cleanup"
+        _enter_stage("wall_logout_resource_cleanup")
         browser_helpers._wall_frames(page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS])
         wall_videos = page.locator("#wall-panel video").element_handles()
         _require(len(wall_videos) == 4, "Installed logout proof did not own four live players")
@@ -2599,7 +2608,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         # The browser has signed out. A fresh observer login now authorizes
         # subsequent tray checks without replacing an active browser session.
         runtime._login(client, username, password)
-        stage = "browser_closing"
+        _enter_stage("browser_closing")
         context.close()
         context = None
         browser.close()
@@ -2611,7 +2620,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "Closing the browser removed or changed its normal Windows download",
         )
         receipt["export_download_survives_browser_close"] = True
-        stage = "window_closing_to_tray"
+        _enter_stage("window_closing_to_tray")
         api.close(form)
         _wait(
             lambda: api.api.IsWindow(form) and not api.api.IsWindowVisible(form),
@@ -2619,7 +2628,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             process=app,
         )
         receipt["close_hides_to_tray"] = True
-        stage = "tray_recording_growth"
+        _enter_stage("tray_recording_growth")
         tray_before = [_recording_bytes(profile, root) for root in camera_directories[:3]]
         before = tray_before[0]
         _wait(
@@ -2650,7 +2659,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["tray_camera_status"] = recording_diagnostic["camera_status"]
         receipt["tray_camera_recording"] = recording_diagnostic["camera_recording"]
         receipt["recording_continues_after_browser_and_window_close"] = True
-        stage = "analytics_with_browser_closed"
+        _enter_stage("analytics_with_browser_closed")
         analytics_before = client.json(route + "/analytics")["event_count"]
         browser_closed_at = datetime.now(UTC)
         helpers._stop_owned(publishers[0])
@@ -2689,7 +2698,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             parent, ffmpeg, source_uri, helpers, credentials=primary_publisher_credentials
         )
         processes.append(publishers[0])
-        stage = "double_click_reopens_existing_instance"
+        _enter_stage("double_click_reopens_existing_instance")
         previous_python_pids = {
             process.pid
             for process in cohort.snapshot()
@@ -2706,7 +2715,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         }
         _require(current_python_pids == previous_python_pids, "Second click duplicated backend")
         receipt["second_click_reopens_single_instance"] = True
-        stage = "graceful_stop_and_quit"
+        _enter_stage("graceful_stop_and_quit")
         _stop_app(app, reopened, api, cohort, diagnostic=nvr_diagnostic)
         receipt["graceful_owned_process_cleanup"] = True
         saved_files = sorted((profile / "recordings").rglob("*.mp4"))
@@ -2715,7 +2724,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         _require(decoded > 0, "Desktop recordings did not contain decodable media")
         receipt["recorded_decoded_frames"] = decoded
         _require(not cohort.console_seen and not cohort.failed, "Desktop opened a console window")
-        stage = "durable_profile_restart"
+        _enter_stage("durable_profile_restart")
         app = _start_app(installed, profile, port, cohort)
         form = _wait(lambda: api.form(app.pid), "Returning desktop window", process=app)
         _wait(
@@ -2780,10 +2789,10 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             ffprobe, export_proof["path"]
         )
         receipt["export_download_survives_product_restart"] = True
-        stage = "relaunch_recording_preference_ui"
+        _enter_stage("relaunch_recording_preference_ui")
         browser = playwright.chromium.launch(channel="msedge", headless=True)
         context = browser.new_context(viewport={"width": 1440, "height": 900})
-        stage = "open_saved_windows_download_after_restart"
+        _enter_stage("open_saved_windows_download_after_restart")
         downloaded_page = context.new_page()
         downloaded_page.goto(export_proof["path"].as_uri(), wait_until="domcontentloaded")
         downloaded_video = downloaded_page.locator("video")
@@ -2799,7 +2808,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         )
         downloaded_page.close()
         receipt["export_download_opened_in_edge"] = True
-        stage = "relaunch_recording_preference_ui"
+        _enter_stage("relaunch_recording_preference_ui")
         page = context.new_page()
         page.set_default_timeout(15_000)
         page.goto(client.origin + "/operator/")
@@ -2833,7 +2842,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             page.locator("#wall-panel [data-camera-id]").count() == 4,
             "Relaunched installed workspace lost its camera wall",
         )
-        stage = "durable_user_administration_restart"
+        _enter_stage("durable_user_administration_restart")
         admin_restarted = admin_helpers.assert_admin_restart(
             page,
             private_state=admin_private_state,
@@ -2843,7 +2852,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         for field in ("admin_state_persisted", "admin_restart_viewer_live_decoded_frames"):
             _require(field in admin_restarted, "Restarted user administration proof is incomplete")
             receipt[field] = admin_restarted[field]
-        stage = "relaunch_recording_preference_ui"
+        _enter_stage("relaunch_recording_preference_ui")
         browser_helpers._open_camera_watch(page, camera_ids[3])
         _wait(
             lambda: page.locator("#toggle-recording").get_attribute("data-enabled") == "false",
@@ -2861,7 +2870,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         browser.close()
         browser = None
         _stop_app(app, form, api, cohort, diagnostic=nvr_diagnostic)
-        stage = "uninstall_preserves_profile"
+        _enter_stage("uninstall_preserves_profile")
         uninstaller = installed / "unins000.exe"
         _require(uninstaller.is_file(), "Native GUI uninstaller was not installed")
         result = subprocess.run(
@@ -2907,6 +2916,8 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "Error": "browser_error",
         }.get(type(error).__name__, "qualification_error")
     finally:
+        stage_durations.append((stage, round(time.monotonic() - stage_started, 2)))
+        cleanup_started = time.monotonic()
         if failure is not None and page is not None:
             try:
                 nvr_diagnostic["wall_state_at_failure"] = browser_helpers._wall_state(page)
@@ -2977,8 +2988,10 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 shutil.rmtree(parent)
             except Exception:
                 cleanup_failed = True
+        stage_durations.append(("cleanup", round(time.monotonic() - cleanup_started, 2)))
         diagnostic = {
             "stage": stage,
+            "stage_durations": stage_durations,
             "failure_code": failure,
             "failure_detail": failure_detail,
             "cleanup_failed": cleanup_failed,
@@ -3002,6 +3015,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     _require(not cleanup_failed, "Owned desktop qualification cleanup failed")
     _require(not cohort.console_seen and not cohort.failed, "Desktop opened a console window")
     elapsed = time.monotonic() - started
+    print("Desktop qualification stage seconds: " + json.dumps(stage_durations))
     _require(
         elapsed < 360,
         "Desktop qualification exceeded its bounded VM duration"
