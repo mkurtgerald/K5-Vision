@@ -445,15 +445,20 @@ def run_installed_settings_journey(
         evidence["settings_storage_policy_restored"] = True
 
         diagnostic["settings_stage"] = "roles"
+        diagnostic["settings_role_phase"] = "create_operator_browser"
         user_context, user_page = admin_helpers._new_user_page(page)
         contexts_to_close.append(user_context)
+        diagnostic["settings_role_phase"] = "authenticate_operator"
         old_token = admin_helpers._login(
             user_page, origin, operator["username"], operator["password"]
         )
+        diagnostic["settings_role_phase"] = "open_roles_panel"
         _open(page, "roles")
+        diagnostic["settings_role_phase"] = "configure_restricted_role"
         page.locator("#roles-name").fill("Generated export restriction")
         page.locator("#roles-base").select_option("operator")
         page.locator('#roles-permissions input[value="cameras.export"]').uncheck()
+        diagnostic["settings_role_phase"] = "create_restricted_role"
         created = _result(
             page,
             "POST",
@@ -462,6 +467,7 @@ def run_installed_settings_journey(
             expected=201,
         )
         role_id = created["role"]["id"]
+        diagnostic["settings_role_phase"] = "restricted_role_created"
         _cameras(page)
         admin_helpers._open_admin(page)
         row = page.locator(f'#admin-users-list [data-user-id="{operator["id"]}"]')
@@ -993,6 +999,14 @@ def run_installed_settings_journey(
         diagnostic["settings_stage"] = "complete"
         return evidence
     except BaseException as error:
+        site = None
+        tb = error.__traceback__
+        while tb is not None:
+            if tb.tb_frame.f_code.co_name == "run_installed_settings_journey":
+                site = tb.tb_lineno
+            tb = tb.tb_next
+        if site is not None:
+            diagnostic["settings_failure_line"] = site
         diagnostic["settings_failure_type"] = (
             type(error).__name__
             if type(error).__name__
