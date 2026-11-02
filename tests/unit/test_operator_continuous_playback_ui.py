@@ -319,7 +319,9 @@ def test_event_click_waits_for_initial_history_and_latest_click_wins(held_phase,
             expect(page.locator("#playback-message")).to_contain_text("No playable recording")
             assert page.locator("#playback-video").get_attribute("src") is None
         expect(page.locator("#history-count")).to_have_text("18")
-        assert len(history_requests) == 1
+        # An uncovered event permits exactly one bounded re-read for newly arrived footage.
+        # Recorded and canceled navigations must not perform an extra history fetch.
+        assert len(history_requests) == (2 if final_action == "gap" else 1)
         assert page.locator(".history-gap").count() == 3
 
 
