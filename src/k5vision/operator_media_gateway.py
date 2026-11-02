@@ -26,6 +26,8 @@ _ASSETS = (
     "admin.js",
     "analytics.css",
     "analytics.js",
+    "settings.css",
+    "settings.js",
 )
 _AUTH_ROUTE = "/api/v1/operator/media-auth"
 _UNTRUSTED_HEADERS = ["Forwarded", "X-Forwarded-*", "X-K5-*"]
@@ -153,6 +155,11 @@ def generate_operator_gateway_configuration(
     javascript = _proxy(hls_port, uri="/_k5_assets/hls.min.js")
     javascript["headers"] = {"request": {"delete": ["Cookie", "Authorization"]}}
     host_expression = f"{{http.request.hostport}} == '127.0.0.1:{public_port}'"
+    administration = _proxy(control_port)
+    # Native elevation waits for the user's Windows consent and owns its work
+    # through cancellation. Do not cut that operation off at the media timeout.
+    administration["transport"]["response_header_timeout"] = "80s"
+    administration["transport"]["read_timeout"] = "80s"
     if public_port == 80:
         # Browsers omit the default HTTP port from Host even when the URL
         # explicitly contains it. Both forms still address this one listener.
@@ -176,6 +183,20 @@ def generate_operator_gateway_configuration(
                     },
                 },
             ]
+        },
+        {
+            "match": [
+                {
+                    "path": [
+                        "/api/v1/operator/admin/*",
+                        "/api/v1/operator/cameras/*/time",
+                        "/api/v1/operator/cameras/*/time/*",
+                        "/api/v1/auth/oidc/*",
+                    ]
+                }
+            ],
+            "handle": [administration],
+            "terminal": True,
         },
         {
             "match": [{"path": ["/api/*"]}],

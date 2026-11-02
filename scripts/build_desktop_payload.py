@@ -55,6 +55,7 @@ _BUILD_PHASES = frozenset(
         "decoder_source_openh264",
         "decoder_source_libaom",
         "onvif_notice",
+        "identity_crypto_material",
         "dependency_inventory",
         "embedded_runtime_execution",
         "payload_manifest",
@@ -68,6 +69,24 @@ _SOURCE_PHASES = {
     "cisco/openh264": "decoder_source_openh264",
     "aomedia/aom": "decoder_source_libaom",
 }
+
+
+IDENTITY_CRYPTO_SMOKE = (
+    "import jwt,cffi,cryptography,base64; "
+    "from cryptography.hazmat.primitives.asymmetric import rsa; "
+    "from cryptography.hazmat.backends.openssl.backend import backend; "
+    "assert jwt.__version__=='2.15.1' and cryptography.__version__=='50.0.2'; "
+    "assert cffi.__version__=='2.1.1'; "
+    "assert backend.openssl_version_text().startswith('OpenSSL 4.0.3 '); "
+    "key=rsa.generate_private_key(public_exponent=65537,key_size=2048); "
+    "signed=jwt.encode({'sub':'embedded-smoke','aud':'k5-native'},key,algorithm='RS256'); "
+    "jwk=jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key()); "
+    "public=jwt.algorithms.RSAAlgorithm.from_jwk(jwk); "
+    "assert jwt.decode(signed,public,algorithms=['RS256'],audience='k5-native')"
+    "['sub']=='embedded-smoke'; "
+    "from k5vision.operator_identity_security import totp; "
+    "assert totp(base64.b32decode('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'),1)=='287082'; "
+)
 
 
 def phase(value: str) -> None:
@@ -156,6 +175,63 @@ def extract_python(archive: Path, runtime: Path) -> None:
 
 def run(arguments: list[str]) -> None:
     subprocess.run(arguments, cwd=ROOT, check=True)
+
+
+def provision_identity_crypto_material(payload: Path, pin: dict) -> dict:
+    """Retain complete reviewed native notices and upstream source material."""
+    phase("identity_crypto_material")
+    binaries = []
+    for binary in pin["native_modules"]:
+        admit(payload / binary["path"], binary)
+        binaries.append(dict(binary))
+    notices = []
+    for notice in pin["notices"]:
+        source = ROOT / notice["source_path"]
+        raw = source.read_bytes()
+        canonical = raw.replace(b"\r\n", b"\n")
+        if (
+            len(canonical) != notice["bytes"]
+            or hashlib.sha256(canonical).hexdigest() != notice["sha256"]
+            or raw not in (canonical, canonical.replace(b"\n", b"\r\n"))
+        ):
+            raise ValueError("Identity native notice identity mismatch")
+        destination = payload / notice["path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(raw)
+        notices.append({**notice, "bytes": len(raw), "sha256": digest(destination)})
+    sources = []
+    for source in pin["sources"]:
+        filename = source["filename"]
+        if (
+            PurePosixPath(filename).name != filename
+            or "\\" in filename
+            or ":" in filename
+            or not filename.endswith(".tar.gz")
+        ):
+            raise ValueError("Identity source filename refused")
+        source_root = payload / "licenses" / "sources"
+        source_root.mkdir(parents=True, exist_ok=True)
+        if source.get("retain_text_sources"):
+            downloaded = payload.parent / ("identity-upstream-" + filename)
+            download(source, downloaded)
+            destination = source_root / filename.replace(".tar.gz", "-sources.tar.gz")
+            retained = retain_text_sources(downloaded, destination)
+            inventory = retained["file_inventory"]
+            inventory["path"] = (source_root / inventory["path"]).relative_to(payload).as_posix()
+            sources.append(
+                {
+                    **source,
+                    "upstream_archive_bytes": source["bytes"],
+                    "upstream_archive_sha256": source["sha256"],
+                    **retained,
+                    "path": destination.relative_to(payload).as_posix(),
+                }
+            )
+        else:
+            destination = source_root / filename
+            download(source, destination)
+            sources.append({**source, "path": destination.relative_to(payload).as_posix()})
+    return {**pin, "native_modules": binaries, "notices": notices, "sources": sources}
 
 
 def inventory_wheels(wheels: Path, pins: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -547,6 +623,7 @@ def build(args: argparse.Namespace) -> None:
         "third_party/licenses/Caddy-Apache-2.0.txt",
         "third_party/licenses/InnoSetup-6.4.3.txt",
         "docs/WINDOWS_PERSON_ANALYTICS_DEPENDENCIES.md",
+        "docs/WINDOWS_IDENTITY_DEPENDENCIES.md",
         ONVIF_NOTICE,
     ):
         shutil.copyfile(ROOT / source, licenses / Path(source).name)
@@ -556,6 +633,7 @@ def build(args: argparse.Namespace) -> None:
         licenses / "OpenModelZoo-person-Apache-2.0.txt",
     )
     decoder = provision_decoder_sources(payload, donors["decoder"])
+    identity_crypto = provision_identity_crypto_material(payload, donors["identity_crypto"])
     phase("onvif_notice")
     onvif_adaptation = onvif_source_adaptation(payload)
     # The official Windows interpreter explicitly requires external end users
@@ -588,6 +666,16 @@ def build(args: argparse.Namespace) -> None:
                 "camera_access_controls": True,
                 "person_analytics_bundled": True,
                 "background_person_events": True,
+                "storage_settings": True,
+                "windows_time_administration": True,
+                "camera_time_administration": True,
+                "operational_audit": True,
+                "custom_roles": True,
+                "mfa": True,
+                "oidc_sso": True,
+                "neural_adapter_v2": True,
+                "analytics_event_adapter": True,
+                "shared_neural_host": False,
                 "manual_stream_uri_required": False,
                 "python": donors["python"],
                 "worker_downloads": workers,
@@ -597,6 +685,8 @@ def build(args: argparse.Namespace) -> None:
                 "person_model": person_model,
                 "native_decoder": decoder,
                 "cpp_runtime": cpp_runtime,
+                "identity_crypto": identity_crypto,
+                "identity_crypto_bundled": True,
                 "project_wheel_sha256": digest(project[0]),
             },
             indent=2,
@@ -618,7 +708,8 @@ def build(args: argparse.Namespace) -> None:
             "import k5vision.operator_onvif; import k5vision.operator_time; "
             "import k5vision.operator_rtsp; import k5vision.operator_rtsp_api; "
             "import k5vision.operator_admin_api; "
-            "import cv2,numpy,openvino,re; "
+            + IDENTITY_CRYPTO_SMOKE
+            + "import cv2,numpy,openvino,re; "
             "from k5vision.operator_analytics_person import "
             "load_installed_person_configuration,_PersonDetector; "
             "person=load_installed_person_configuration({}); assert person is not None; "

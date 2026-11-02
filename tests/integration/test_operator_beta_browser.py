@@ -925,7 +925,18 @@ def _recording_navigation_journey(page, *, device_id, seeded, color="red", diagn
     diagnostic = {} if diagnostic is None else diagnostic
     diagnostic["navigation_stage"] = "default_24_hour_inventory"
     _open_camera_recordings(page, device_id)
-    page.locator("#last-24-hours").click()
+    # Rolling history refreshes recorder time before clearing the previous render.
+    # Bind this click to its own camera response so old spans cannot satisfy the wait.
+    inventory_deadline = time.monotonic() + 15
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "GET"
+            and urlsplit(response.url).path == f"/api/v1/operator/cameras/{device_id}/history"
+        ),
+        timeout=15_000,
+    ) as full_day_history:
+        page.locator("#last-24-hours").click()
+    _require(full_day_history.value.status == 200, "Default UTC history could not be loaded")
     page.locator("#recording-timeline select.k5-timeline-scale").select_option("86400000")
     first_ms = seeded["first"].timestamp() * 1000
     gap_ms = seeded["gap_start"].timestamp() * 1000
@@ -937,7 +948,10 @@ def _recording_navigation_journey(page, *, device_id, seeded, color="red", diagn
           const spans=Array.from(root?.querySelectorAll('.k5-timeline-recording') || [])
             .map(span => ({start:Number(span.dataset.start),end:Number(span.dataset.end)}))
             .filter(span => span.start>=first-1000 && span.end<=last+1000);
-          return Number(slider?.getAttribute('aria-valuemax'))-
+          return !document.getElementById('load-history').disabled &&
+            Array.from(document.querySelectorAll('.history-gap'))
+              .some(gap => gap.getClientRects().length>0) &&
+            Number(slider?.getAttribute('aria-valuemax'))-
               Number(slider?.getAttribute('aria-valuemin'))===86400000 &&
             spans.some(span => Math.abs(span.start-first)<1000) &&
             spans.reduce((total,span) => total+span.end-span.start,0)>=seconds*1000-1000;
@@ -947,7 +961,7 @@ def _recording_navigation_journey(page, *, device_id, seeded, color="red", diagn
             "last": seeded["last"].timestamp() * 1000,
             "seconds": seeded["recorded_seconds"],
         },
-        timeout=15_000,
+        timeout=max(1, math.ceil((inventory_deadline - time.monotonic()) * 1000)),
     )
     timeline_bounds = page.locator("#recording-timeline").bounding_box()
     diagnostic["navigation_timeline_height"] = (
@@ -1593,11 +1607,29 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
     the independent real four-camera fixture; it is not native media acceptance.
     """
     __tracebackhide__ = True
+    from k5vision.operator_role_policy import BASE_PERMISSIONS
+
     browser_api = pytest.importorskip("playwright.sync_api")
     channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
     assets = Path(__file__).parents[2] / "src" / "k5vision" / "operator_web"
     cameras, submitted, pending, probes = [], [], [], {}
-    account = {"username": "fixture-admin", "display_name": "Fixture", "role": "administrator"}
+    account = {
+        "id": "e301fc9e-dd1c-49fc-a1c4-7f9aaf80d005",
+        "username": "fixture-admin",
+        "display_name": "Fixture",
+        "role": "administrator",
+        "enabled": True,
+    }
+    permissions = sorted(BASE_PERMISSIONS[account["role"]])
+    capabilities = {
+        "account": {**account, "role_profile_id": None, "effective_permissions": permissions},
+        "effective_permissions": permissions,
+        "can_export": "cameras.export" in permissions,
+        "can_manage_users": "users.manage" in permissions,
+        "can_manage_cameras": "cameras.manage" in permissions,
+        "can_view_history": "cameras.playback" in permissions,
+        "camera_access": {"mode": "all", "camera_ids": []},
+    }
     hosts = ("127.0.0.1", "127.0.0.2")
     identifiers = ("8643f7a8-4a09-4ec0-bf35-15fd728cf001", "8643f7a8-4a09-4ec0-bf35-15fd728cf002")
     playwright = browser = context = None
@@ -1627,6 +1659,8 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
                     "admin.css": "text/css",
                     "analytics.js": "application/javascript",
                     "analytics.css": "text/css",
+                    "settings.js": "application/javascript",
+                    "settings.css": "text/css",
                 }[name]
                 route.fulfill(
                     status=200,
@@ -1700,7 +1734,11 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
                 cameras.append(data)
                 status = 201
             elif path == "/api/v1/operator/cameras":
-                data = {"cameras": cameras, "worker_status": "ready"}
+                data = {
+                    "cameras": cameras,
+                    "worker_status": "ready",
+                    "capabilities": capabilities,
+                }
             elif path.endswith("/media-session"):
                 if identifiers[0] in path and not pending:
                     pending.append(route)

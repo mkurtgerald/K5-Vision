@@ -44,12 +44,28 @@
       "license": "MIT"
     },
     {
+      "name": "cffi",
+      "version": "2.1.1",
+      "filename": "cffi-2.1.1-cp312-cp312-win_amd64.whl",
+      "sha256": "f53e442b08449d42821fa4a4fba000095af9f62742a500f978a9f557ec44339a",
+      "bytes": 185919,
+      "license": "MIT-0"
+    },
+    {
       "name": "click",
       "version": "8.5.0",
       "filename": "click-8.5.0-py3-none-any.whl",
       "sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
       "bytes": 125251,
       "license": "BSD-3-Clause"
+    },
+    {
+      "name": "cryptography",
+      "version": "50.0.2",
+      "filename": "cryptography-50.0.2-cp311-abi3-win_amd64.whl",
+      "sha256": "7afa5a6602a9f29af1f3a2965f831bae7c9d5d597b7cbb716d41ab3b7d89879c",
+      "bytes": 3824692,
+      "license": "Apache-2.0 OR BSD-3-Clause"
     },
     {
       "name": "fastapi",
@@ -124,6 +140,14 @@
       "license": "BSD-3-Clause"
     },
     {
+      "name": "pycparser",
+      "version": "3.12",
+      "filename": "pycparser-3.12-py3-none-any.whl",
+      "sha256": "a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e",
+      "bytes": 62600,
+      "license": "BSD-3-Clause"
+    },
+    {
       "name": "pydantic",
       "version": "2.14.1",
       "filename": "pydantic-2.14.1-py3-none-any.whl",
@@ -137,6 +161,14 @@
       "filename": "pydantic_core-2.50.1-cp312-cp312-win_amd64.whl",
       "sha256": "132529c83901437ff642f585216831bf5fd7a91df66829907e155192ead62498",
       "bytes": 2172522,
+      "license": "MIT"
+    },
+    {
+      "name": "PyJWT",
+      "version": "2.15.1",
+      "filename": "pyjwt-2.15.1-py3-none-any.whl",
+      "sha256": "42d59d631f7768a1028a64c7ff581a9bf7519804daf91fc5b6c56e30eec5e193",
+      "bytes": 33860,
       "license": "MIT"
     },
     {
@@ -252,5 +284,68 @@
     "source_distribution": "numpy",
     "source_version": "2.2.6",
     "license": "Microsoft Distributable Code; retained installation terms"
+  },
+  "identity_crypto": {
+    "cryptography_version": "50.0.2",
+    "openssl_version": "4.0.3",
+    "rust_version": "1.98.1",
+    "rust_commit": "48a229ceaefd4985c50990b14116b6d856af0985",
+    "native_modules": [
+      {
+        "path": "runtime/Lib/site-packages/cryptography/hazmat/bindings/_rust.pyd",
+        "bytes": 9897472,
+        "sha256": "1d4332a447cab13dec8e3a533ad579e0e562b79e40822c931f33769758fc7156"
+      },
+      {
+        "path": "runtime/Lib/site-packages/_cffi_backend.cp312-win_amd64.pyd",
+        "bytes": 181248,
+        "sha256": "9af5e4f68a41f26b726f2e9424f9d58a4f5666189f6a48be95f406b257102aec"
+      }
+    ],
+    "notices": [
+      {
+        "source_path": "third_party/licenses/Identity-native-NOTICES.txt",
+        "path": "licenses/Identity-native-NOTICES.txt",
+        "bytes": 908943,
+        "sha256": "86bbcfd38ccb210069723ab7dbbfd4cbb10718dcecaea1af3dcd23aaa40d0d2f"
+      },
+      {
+        "source_path": "third_party/licenses/Identity-native-notice-inventory.json",
+        "path": "licenses/Identity-native-notice-inventory.json",
+        "bytes": 132046,
+        "sha256": "77c323ba19cc0555a8eebca6e6cf03f4f3a35f1ed886dfe8fb1aba3aebd242ef"
+      }
+    ],
+    "sources": [
+      {
+        "filename": "cryptography-50.0.2.tar.gz",
+        "url": "https://files.pythonhosted.org/packages/9d/af/182eb91b0df3fe75c4d9f26fe70684569566745f6ba7e5c9c73a862c5252/cryptography-50.0.2.tar.gz",
+        "bytes": 880623,
+        "sha256": "7b46165bb56eb4704e2eaaf86f3c940d19154535d9b0ca7d6d590b04060e00d5",
+        "component": "pyca/cryptography",
+        "version": "50.0.2",
+        "license": "Apache-2.0 OR BSD-3-Clause"
+      },
+      {
+        "component": "cffi",
+        "version": "2.1.1",
+        "filename": "cffi-2.1.1.tar.gz",
+        "url": "https://files.pythonhosted.org/packages/9e/ef/008a1939e372c06329a3fce4279c02f328488f3526744906eeec3da7ad5f/cffi-2.1.1.tar.gz",
+        "bytes": 530807,
+        "sha256": "dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be",
+        "license": "MIT-0; bundled libffi notices retained in complete source",
+        "retain_text_sources": true
+      },
+      {
+        "component": "openssl/openssl",
+        "version": "4.0.3",
+        "source_commit": "af1775b60dfa141a4ad762585052cabeb9f37e9e",
+        "url": "https://codeload.github.com/openssl/openssl/tar.gz/af1775b60dfa141a4ad762585052cabeb9f37e9e",
+        "filename": "OpenSSL-4.0.3.tar.gz",
+        "bytes": 55429548,
+        "sha256": "219c0a389f3c76e58f2d9e2b216101887f94747e669bb79c43225d7b6ac1253a",
+        "license": "Apache-2.0"
+      }
+    ]
   }
 }

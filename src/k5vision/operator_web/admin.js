@@ -13,13 +13,18 @@
     admin_invalid_request: "Check the account fields and camera selection, then try again.",
     admin_user_not_found: "This account is no longer available. Refresh the user list.",
     admin_unavailable: "Account administration is unavailable. Try refreshing shortly.",
+    roles_revision_conflict: "Role settings changed. Reopen the editor before applying a profile.",
+    roles_in_use: "This role is still assigned to an account.", roles_not_found: "This role no longer exists. Refresh the role list.",
+    roles_last_administrator: "Keep another activated administrator with full permissions before making this change.",
+    roles_profile_bound: "Apply the built-in role profile first before changing this account's base role.",
+    roles_unavailable: "Custom role administration is unavailable.",
   };
 
   function create({ request, getSession, getCameras, onSelfChanged }) {
-    let visible = false, epoch = 0, controller = null, busy = false;
+    let visible = false, epoch = 0, controller = null, busy = false, authoritySuspended = false;
     let users = [], usersOffset = 0, auditOffset = 0;
-    let usersRequest = 0, auditRequest = 0;
-    let editTarget = null, resetTarget = null, previousRole = "operator";
+    let usersRequest = 0, auditRequest = 0, profileRequest = 0, usersRefreshing = false;
+    let editTarget = null, resetTarget = null, previousRole = "operator", profileData = null;
 
     function message(id, text = "", error = false) {
       $(id).textContent = text;
@@ -38,7 +43,10 @@
 
     function session() {
       const value = getSession();
-      return value?.token && value.account?.role === "administrator" ? value : null;
+      return value?.token && value.account?.role === "administrator"
+        && value.account.authority_resolved === true
+        && Array.isArray(value.account.effective_permissions)
+        && value.account.effective_permissions.includes("users.manage") ? value : null;
     }
 
     function current(start, version) {
@@ -68,6 +76,16 @@
       return `${row.enabled ? "Enabled" : "Disabled"} · ${credential}`;
     }
 
+    function renderUserActions() {
+      const blocked = usersRefreshing || !session();
+      $("admin-create-user").disabled = blocked;
+      $("admin-users-list").setAttribute("aria-busy", String(usersRefreshing));
+      for (const row of $("admin-users-list").querySelectorAll("[data-user-id]")) {
+        for (const node of row.querySelectorAll("[data-user-action]")) node.disabled = blocked
+          || node.dataset.userAction === "reset" && row.dataset.userId === session()?.account.id;
+      }
+    }
+
     function renderUsers() {
       const fragment = document.createDocumentFragment();
       for (const row of users) {
@@ -90,29 +108,32 @@
           button.addEventListener("click", () => action === "edit" ? openEditor(row) : openReset(row));
           actions.append(button);
         }
-        tr.append(account, cell(row.role), cell(accountStatus(row)), cell(scope), actions);
+        tr.append(account, cell(row.role + (row.role_profile_id ? " · custom profile" : "")), cell(accountStatus(row)), cell(scope), actions);
         fragment.append(tr);
       }
       $("admin-users-list").replaceChildren(fragment);
+      renderUserActions();
       $("admin-users-empty").hidden = users.length !== 0;
     }
 
     async function loadUsers(offset = usersOffset) {
       const start = session(), version = epoch, sequence = ++usersRequest;
       if (!start || !visible) return;
+      usersRefreshing = true; renderUserActions();
       $("admin-refresh-users").disabled = true;
       message("admin-message", "Loading accounts…");
       try {
         const data = await request(`${PREFIX}/users?offset=${offset}&limit=${PAGE_SIZE}`, { signal: controller.signal });
         if (!current(start, version) || sequence !== usersRequest) return;
         if (!Array.isArray(data.users) || data.users.length > PAGE_SIZE || !data.users.every(validRow) || typeof data.has_more !== "boolean") throw new Error("Invalid account response");
-        users = data.users; usersOffset = offset; renderUsers();
+        users = data.users; usersOffset = offset; usersRefreshing = false; renderUsers();
         $("admin-users-previous").disabled = offset === 0;
         $("admin-users-next").disabled = !data.has_more;
         $("admin-users-page").textContent = users.length ? `Accounts ${offset + 1}–${offset + users.length}` : "No accounts on this page";
         message("admin-message");
+        return true;
       } catch (error) {
-        if (error.name !== "AbortError" && current(start, version) && sequence === usersRequest) message("admin-message", errorText(error), true);
+        if (error.name !== "AbortError" && current(start, version) && sequence === usersRequest) message("admin-message", `${errorText(error)} Account actions are paused. Select Refresh to reload the account list.`, true);
       } finally {
         if (current(start, version) && sequence === usersRequest) $("admin-refresh-users").disabled = false;
       }
@@ -175,10 +196,53 @@
       renderAccess();
     }
 
+    function profileAllowed() { const account = session()?.account; return !Array.isArray(account?.effective_permissions) || account.effective_permissions.includes("roles.manage"); }
+    function renderProfileHelp() {
+      const chosen = profileData?.roles.find((row) => row.id === $("admin-role-profile").value);
+      $("admin-role-profile-help").textContent = chosen
+        ? `Applying ${chosen.name} explicitly changes this account to the ${chosen.base_role} base role with ${chosen.permissions.length} allowed permissions. The user is signed out; camera assignments still apply.`
+        : "Applying the built-in profile removes a custom profile and keeps the current base role. The user is signed out. You can then edit the built-in role normally.";
+      const unavailable = busy || !profileData || !editTarget || !profileAllowed();
+      $("admin-role-profile").disabled = unavailable;
+      $("admin-apply-role-profile").disabled = unavailable;
+    }
+    async function loadProfiles(target) {
+      const sequence = ++profileRequest;
+      profileData = null; $("admin-role-profile-section").hidden = !target || !profileAllowed(); renderProfileHelp();
+      if (!target || !profileAllowed()) return;
+      const start = session(), version = epoch;
+      try {
+        const data = await request(`${PREFIX}/roles`, { signal: controller.signal });
+        if (!current(start, version) || sequence !== profileRequest || editTarget?.id !== target.id || !$("admin-user-dialog").open) return;
+        if (!Array.isArray(data?.roles) || !Number.isInteger(data.revision)) throw new Error("Invalid role response");
+        profileData = data;
+        const option = document.createElement("option"); option.value = ""; option.textContent = "Built-in role · no profile";
+        const choices = data.roles.map((role) => { const node = document.createElement("option"); node.value = role.id; node.textContent = `${role.name} · ${role.base_role}`; return node; });
+        $("admin-role-profile").replaceChildren(option, ...choices); $("admin-role-profile").value = target.role_profile_id || ""; renderProfileHelp();
+      } catch (error) { if (error.name !== "AbortError" && current(start, version) && sequence === profileRequest && editTarget?.id === target.id) { $("admin-role-profile-help").textContent = "Custom roles are unavailable. Built-in account fields remain available."; $("admin-apply-role-profile").disabled = true; } }
+    }
+    $("admin-role-profile").addEventListener("change", renderProfileHelp);
+    $("admin-apply-role-profile").addEventListener("click", async () => {
+      const start = session(), version = epoch, target = editTarget;
+      if (!start || busy || !target || !profileData || !profileAllowed()) return;
+      const body = { role_profile_id: $("admin-role-profile").value || null, expected_revision: profileData.revision };
+      setBusy(true); message("admin-user-message", "Applying role profile…");
+      try {
+        const data = await request(`${PREFIX}/users/${encodeURIComponent(target.id)}/role-profile`, { method: "PUT", body, signal: controller.signal });
+        if (!current(start, version)) return;
+        if (!data?.account || data.account.id !== target.id) throw new Error("Invalid role assignment");
+        setBusy(false); closeEditor();
+        if (target.id === start.account.id) { onSelfChanged(data.account, true); return; }
+        if (await loadUsers()) message("admin-message", "Role profile applied. The account's previous sessions were revoked.");
+      } catch (error) { if (error.name !== "AbortError" && current(start, version)) message("admin-user-message", errorText(error), true); }
+      finally { if (current(start, version)) setBusy(false); }
+    });
+
     function renderAccess() {
       const administrator = $("admin-role").value === "administrator";
       if (administrator) $("admin-access-mode").value = "all";
       $("admin-access-mode").disabled = busy || administrator;
+      $("admin-role").disabled = busy || Boolean(editTarget?.role_profile_id);
       $("admin-camera-choices").hidden = administrator || $("admin-access-mode").value !== "selected";
       $("admin-access-help").textContent = administrator ? "Administrators can access and manage every camera."
         : $("admin-access-mode").value === "all" ? "This account can access current cameras and cameras added later."
@@ -192,18 +256,19 @@
         $(id).setAttribute("aria-busy", String(value));
         for (const input of $(id).querySelectorAll("input,select,button")) input.disabled = value;
       }
-      renderAccess();
+      renderAccess(); renderProfileHelp();
     }
 
     function closeEditor(force = false) {
       if (busy && !force) return;
+      profileRequest += 1;
       if ($("admin-user-dialog").open) $("admin-user-dialog").close();
       $("admin-user-form").reset(); editTarget = null;
-      $("admin-camera-choices").replaceChildren(); message("admin-user-message");
+      $("admin-camera-choices").replaceChildren(); profileData = null; $("admin-role-profile-section").hidden = true; message("admin-user-message");
     }
 
     function openEditor(row = null) {
-      if (!session() || !visible || busy) return;
+      if (!session() || !visible || busy || usersRefreshing) return;
       closeEditor(); editTarget = row;
       $("admin-user-title").textContent = row ? "Edit account" : "Create user";
       $("admin-username").value = row?.username || ""; $("admin-username").readOnly = Boolean(row);
@@ -215,6 +280,7 @@
       $("admin-save-user").textContent = row ? "Save account" : "Create user";
       setBusy(false); renderCameraChoices(row?.camera_access.camera_ids || []);
       $("admin-user-dialog").showModal();
+      void loadProfiles(row);
       $(row ? "admin-display-name" : "admin-username").focus();
     }
 
@@ -242,7 +308,7 @@
     }
 
     function openReset(row) {
-      if (!session() || !visible || busy || row.id === session().account.id) return;
+      if (!session() || !visible || busy || usersRefreshing || row.id === session().account.id) return;
       resetTarget = row; $("admin-reset-username").textContent = row.username;
       message("admin-reset-message"); $("admin-reset-dialog").showModal();
     }
@@ -257,6 +323,7 @@
         camera_access: { mode: $("admin-role").value === "administrator" ? "all" : $("admin-access-mode").value, camera_ids: [] },
       };
       if (body.camera_access.mode === "selected") body.camera_access.camera_ids = Array.from($("admin-camera-choices").querySelectorAll("input:checked"), (input) => input.value);
+      if (target?.role_profile_id) delete body.role;
       if (!target) body.username = $("admin-username").value.trim();
       setBusy(true); message("admin-user-message", "Saving account…");
       try {
@@ -324,8 +391,9 @@
 
     function hide() {
       visible = false; epoch += 1; controller?.abort(); controller = null;
+      authoritySuspended = false;
       setBusy(false); closeEditor(true); closeReset(true); closeCredential();
-      users = []; usersOffset = 0; auditOffset = 0;
+      users = []; usersOffset = 0; auditOffset = 0; usersRefreshing = false;
       $("admin-users-list").replaceChildren(); $("admin-audit-list").replaceChildren();
       message("admin-message");
     }
@@ -338,6 +406,23 @@
         setSection("users");
       },
       hide,
+      refreshAuthority() {
+        if (!visible) return;
+        if (!session()) {
+          if (!authoritySuspended) { epoch += 1; controller?.abort(); controller = null; busy = false; authoritySuspended = true; }
+          for (const node of $("admin-panel").querySelectorAll("input,select,button")) {
+            if (node.id !== "admin-return-button") node.disabled = true;
+          }
+          for (const id of ["admin-user-form", "admin-reset-form"]) for (const node of $(id).querySelectorAll("input,select,button")) {
+            if (!["admin-cancel-user", "admin-close-user", "admin-close-reset", "admin-cancel-reset"].includes(node.id)) node.disabled = true;
+          }
+          message("admin-message", "Current account permissions could not be verified. Account changes are paused until a successful refresh.", true);
+        } else if (authoritySuspended) {
+          authoritySuspended = false; controller = new AbortController();
+          for (const node of $("admin-panel").querySelectorAll("button")) node.disabled = false;
+          setBusy(false); renderUserActions(); message("admin-message");
+        }
+      },
       refreshCameras() {
         if ($("admin-user-dialog").open && !busy) {
           const ids = Array.from($("admin-camera-choices").querySelectorAll("input:checked"), (input) => input.value);

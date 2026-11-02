@@ -11,6 +11,17 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 _TEST = "test_native_windows_click_install_account_browser_tray_restart_uninstall"
+_SETTINGS_TRUE = (
+    "settings_admin_gui settings_storage_policy_live settings_storage_policy_restored "
+    "settings_custom_role_assignment settings_profile_bound_edit "
+    "settings_custom_role_permission_denied settings_role_ui_permissions "
+    "settings_role_revoked_sessions "
+    "settings_time_status_visible settings_time_no_clock_changes settings_audit_download "
+    "settings_integrations_gui settings_analytics_machine_event settings_neural_v2_roundtrip "
+    "settings_provider_event_playback settings_mfa_enrollment settings_mfa_challenge "
+    "settings_mfa_recovery_single_use settings_mfa_disabled settings_oidc_signed_pkce "
+    "settings_oidc_existing_role settings_restored_before_restart"
+).split()
 _TRUE = (
     "native_windows_execution generated_media_only actual_gui_installer actual_gui_account_setup "
     "administrator_login embedded_python_independent_of_path actual_edge_login_enrollment_live "
@@ -42,6 +53,7 @@ _TRUE = (
     "analytics_browser_closed_detection analytics_role_camera_permissions "
     "analytics_settings_events_persisted"
 ).split()
+_TRUE += _SETTINGS_TRUE
 _FALSE = (
     "physical_camera_acceptance capacity_acceptance endurance_acceptance windows_service "
     "mocked_gui user_terminal_required host_clock_step_acceptance analytics_mock_inference "
@@ -77,8 +89,31 @@ def _admin_journey(receipt):
     _require(all(type(value) is int and value in {401, 403, 404} for value in denials))
 
 
+def _settings_journey(receipt):
+    _require(all(receipt.get(field) is True for field in _SETTINGS_TRUE))
+    for field, minimum, maximum in (
+        ("settings_audit_rows", 5, 5000),
+        ("settings_provider_event_count", 1, 100),
+        ("settings_provider_playback_frames", 4, 1_000_000),
+        ("settings_neural_observations", 1, 20),
+        ("settings_mfa_recovery_codes", 10, 10),
+        ("settings_oidc_token_requests", 1, 1),
+    ):
+        value = receipt.get(field)
+        _require(type(value) is int and minimum <= value <= maximum)
+    denied = receipt.get("settings_denied_http_statuses")
+    _require(type(denied) is list and all(type(code) is int for code in denied))
+    _require(denied == [401, 403, 401, 422, 401])
+    seconds, total = receipt.get("settings_journey_seconds"), receipt.get("duration_seconds")
+    _require(type(seconds) in (int, float) and 0 < seconds <= 180 and math.isfinite(seconds))
+    _require(type(total) in (int, float) and 0 < total < 360 and math.isfinite(total))
+    # Both measurements round to hundredths in the native witness.
+    _require(seconds <= total + 0.01)
+
+
 def _nvr_journey(receipt):
     _admin_journey(receipt)
+    _settings_journey(receipt)
     _require(type(receipt.get("camera_count")) is int and receipt["camera_count"] == 4)
     layouts = receipt.get("wall_layouts")
     _require(type(layouts) is list and len(layouts) == 3)
@@ -182,7 +217,7 @@ def verify(report: Path) -> dict:
     reads = receipt.get("onvif_time_read_count")
     _require(type(reads) is int and 1 <= reads <= 128)
     _require(type(receipt.get("duration_seconds")) in (int, float))
-    _require(0 < receipt["duration_seconds"] < 360)
+    _require(math.isfinite(receipt["duration_seconds"]) and 0 < receipt["duration_seconds"] < 360)
     return receipt
 
 

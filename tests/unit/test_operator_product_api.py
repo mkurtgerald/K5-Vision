@@ -231,6 +231,12 @@ def product(tmp_path, monkeypatch, request):
     options = getattr(request, "param", 8080)
     public_port = options if isinstance(options, int) else options.get("public_port", 8080)
     analytics = _Analytics() if isinstance(options, dict) and options.get("analytics") else None
+    role_policy = None
+    if isinstance(options, dict) and options.get("roles"):
+        from k5vision.operator_role_policy import OperatorRolePolicy
+
+        role_policy = OperatorRolePolicy(state.directory, state.site_id)
+        app.state.operator_roles = role_policy
     install_operator_product_api(
         app,
         cameras=cameras,
@@ -245,6 +251,8 @@ def product(tmp_path, monkeypatch, request):
         yield _Harness(
             client, app, cameras, service, registry, users, sessions, admin, token, analytics
         )
+    if role_policy is not None:
+        role_policy.close()
     cameras.close()
     registry.close()
     users.close()

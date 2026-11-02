@@ -59,6 +59,17 @@ _ANALYTICS_TRUE = (
     "analytics_settings_events_persisted"
 ).split()
 _ANALYTICS_FALSE = ("analytics_mock_inference", "analytics_accuracy_acceptance")
+_SETTINGS_TRUE = (
+    "settings_admin_gui settings_storage_policy_live settings_storage_policy_restored "
+    "settings_custom_role_assignment settings_profile_bound_edit "
+    "settings_custom_role_permission_denied settings_role_ui_permissions "
+    "settings_role_revoked_sessions "
+    "settings_time_status_visible settings_time_no_clock_changes settings_audit_download "
+    "settings_integrations_gui settings_analytics_machine_event settings_neural_v2_roundtrip "
+    "settings_provider_event_playback settings_mfa_enrollment settings_mfa_challenge "
+    "settings_mfa_recovery_single_use settings_mfa_disabled settings_oidc_signed_pkce "
+    "settings_oidc_existing_role settings_restored_before_restart"
+).split()
 _PLAYBACK_EXPORT_TRUE = (
     "historical_navigation_default_24h historical_navigation_real_media "
     "playback_rapid_seek_latest_wins playback_controls_and_zoom "
@@ -162,6 +173,7 @@ def _receipt() -> dict:
         **dict.fromkeys(_NVR_FLAGS, True),
         **dict.fromkeys(_ANALYTICS_TRUE, True),
         **dict.fromkeys(_ANALYTICS_FALSE, False),
+        **dict.fromkeys(_SETTINGS_TRUE, True),
         **dict.fromkeys(_FALSE, False),
         "browser_channel": "msedge",
         "playwright_version": "1.58.0",
@@ -215,6 +227,14 @@ def _receipt() -> dict:
         "admin_user_count_created": 2,
         "admin_audit_event_count": 6,
         "admin_denied_http_statuses": [403, 404, 403, 401, 401, 404],
+        "settings_audit_rows": 10,
+        "settings_provider_event_count": 1,
+        "settings_provider_playback_frames": 4,
+        "settings_neural_observations": 1,
+        "settings_mfa_recovery_codes": 10,
+        "settings_oidc_token_requests": 1,
+        "settings_denied_http_statuses": [401, 403, 401, 422, 401],
+        "settings_journey_seconds": 45.0,
         "vm_clock": {
             "schema_version": "1",
             "analytics_events_utc_preserved": True,
@@ -549,5 +569,133 @@ def test_vm_phase_requires_person_event_utc_and_retained_footage_coverage(
         del value[field]
     else:
         value[field] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+_SETTINGS_INTEGER_BOUNDS = (
+    ("settings_audit_rows", 5, 5000),
+    ("settings_provider_event_count", 1, 100),
+    ("settings_provider_playback_frames", 4, 1_000_000),
+    ("settings_neural_observations", 1, 20),
+    ("settings_mfa_recovery_codes", 10, 10),
+    ("settings_oidc_token_requests", 1, 1),
+)
+
+
+@pytest.mark.parametrize("field", _SETTINGS_TRUE)
+@pytest.mark.parametrize("invalid", [False, 1, 0, None, "true", _MISSING])
+def test_vm_receipt_requires_every_installed_settings_flow(tmp_path, field, invalid):
+    receipt = _receipt()
+    if invalid is _MISSING:
+        del receipt[field]
+    else:
+        receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("field,minimum,maximum", _SETTINGS_INTEGER_BOUNDS)
+@pytest.mark.parametrize(
+    "invalid", [None, True, 1.0, "1", float("nan"), float("inf"), 2**4096, _MISSING]
+)
+def test_vm_settings_observations_require_measured_integer_types(
+    tmp_path, field, minimum, maximum, invalid
+):
+    receipt = _receipt()
+    if invalid is _MISSING:
+        del receipt[field]
+    else:
+        receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("field,minimum,maximum", _SETTINGS_INTEGER_BOUNDS)
+@pytest.mark.parametrize("end", ["minimum", "maximum"])
+def test_vm_settings_observation_boundaries(tmp_path, field, minimum, maximum, end):
+    receipt = _receipt()
+    bound = minimum if end == "minimum" else maximum
+    receipt[field] = bound
+    assert _verify(_report(tmp_path, receipt)) == receipt
+    receipt[field] = bound - 1 if end == "minimum" else bound + 1
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        [],
+        [401, 403, 401, 422],
+        [401, 403, 401, 422, 401, 401],
+        [200, 403, 401, 422, 401],
+        [401, 403, 401, 403, 401],
+        [401, 403, 401, 422, 401.0],
+        [401, 403, "401", 422, 401],
+        {"status": 401},
+        _MISSING,
+    ],
+)
+def test_vm_settings_requires_exact_ordered_denial_journey(tmp_path, invalid):
+    receipt = _receipt()
+    if invalid is _MISSING:
+        del receipt["settings_denied_http_statuses"]
+    else:
+        receipt["settings_denied_http_statuses"] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        True,
+        0,
+        -1,
+        "45",
+        180.001,
+        2**4096,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        _MISSING,
+    ],
+)
+def test_vm_settings_requires_executed_finite_bounded_elapsed_journey(tmp_path, invalid):
+    receipt = _receipt()
+    if invalid is _MISSING:
+        del receipt["settings_journey_seconds"]
+    else:
+        receipt["settings_journey_seconds"] = invalid
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+def test_vm_settings_journey_cannot_exceed_the_enclosing_native_test(tmp_path):
+    receipt = _receipt()
+    receipt["settings_journey_seconds"] = 180
+    receipt["duration_seconds"] = 300
+    assert _verify(_report(tmp_path, receipt)) == receipt
+    receipt["duration_seconds"] = 179
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("seconds", [239.9, 240, 300, 359.999])
+def test_vm_settings_scope_preserves_the_existing_full_product_budget(tmp_path, seconds):
+    receipt = _receipt()
+    receipt["duration_seconds"] = seconds
+    assert _verify(_report(tmp_path, receipt)) == receipt
+
+
+@pytest.mark.parametrize(
+    "seconds", [0, -1, 360, 361, 480, True, "300", float("nan"), float("inf"), float("-inf")]
+)
+def test_vm_full_journey_rejects_nonfinite_or_over_budget_elapsed_values(tmp_path, seconds):
+    receipt = _receipt()
+    receipt["duration_seconds"] = seconds
     with pytest.raises(ValueError):
         _verify(_report(tmp_path, receipt))

@@ -23,6 +23,7 @@ from k5vision.media.mediamtx_provider import (
     _NoRedirect,
 )
 from k5vision.operator_media_gateway import generate_operator_gateway_configuration
+from k5vision.operator_storage_settings import OperatorStorageSettings
 from k5vision.operator_time import HostClockObserver
 
 _RECORDING_FLUSH_SECONDS = 3.0
@@ -137,6 +138,14 @@ class OperatorProductService:
         self.max_recording_bytes = max_recording_bytes
         if type(max_recording_bytes) is not int or not 1 <= max_recording_bytes <= 4096 * 1024**3:
             raise OperatorProductError("Recording capacity was refused")
+        self.storage_settings = OperatorStorageSettings(
+            self.state_root, self.site_id, self.recording_root, quota_bytes=max_recording_bytes
+        )
+        policy = self.storage_settings.snapshot()
+        self.recording_root = _private_directory(Path(policy["recording_directory"]))
+        self.max_recording_bytes = policy["quota_bytes"]
+        self._minimum_free_bytes = policy["minimum_free_bytes"]
+        self._retention_seconds = policy["retention_seconds"]
         self._media = None
         self._gateway = None
         self._sources: tuple[MediaMTXSource, ...] = ()
@@ -148,6 +157,7 @@ class OperatorProductService:
         self._ready = False
         self._needs_reconcile = False
         self._spawns: set[asyncio.Task] = set()
+        self._storage_operations: set[asyncio.Task] = set()
         self._storage = None
         self._storage_status = None
         self._health_failures = {"media": 0, "gateway": 0}
@@ -195,7 +205,7 @@ class OperatorProductService:
         if storage is not None:
             reason = "ready"
             if not storage.recording_allowed:
-                if storage.free_bytes < 1024**3:
+                if storage.free_bytes < self._minimum_free_bytes:
                     reason = "free_space"
                 elif storage.total_bytes > self.max_recording_bytes:
                     reason = "capacity"
@@ -213,6 +223,84 @@ class OperatorProductService:
             "storage": snapshot,
             **self._clock.snapshot(),
         }
+
+    def storage_administration(self) -> dict:
+        """Private directories are returned exclusively by administrator routes."""
+        snapshot = self.storage_settings.snapshot()
+        status = self._storage_status
+        snapshot.update(
+            recording_bytes=None if status is None else status.total_bytes,
+            free_bytes=None if status is None else status.free_bytes,
+            recording_allowed=None if status is None else status.recording_allowed,
+            inspection_available=status is not None,
+        )
+        return snapshot
+
+    async def configure_storage(self, *, expected_revision: int, **changes) -> dict:
+        """Persist policy and apply limits without resetting observed file ages."""
+        async with self._lock:
+            if self._closing:
+                raise OperatorProductError("Recording storage is stopping")
+            policy = self.storage_settings.configure(expected_revision=expected_revision, **changes)
+            self.max_recording_bytes = policy["quota_bytes"]
+            self._minimum_free_bytes = policy["minimum_free_bytes"]
+            self._retention_seconds = policy["retention_seconds"]
+            if self._storage is not None:
+                await self._storage_operation(
+                    self._storage.configure_policy,
+                    max_bytes=self.max_recording_bytes,
+                    min_free_bytes=self._minimum_free_bytes,
+                    retention_seconds=self._retention_seconds,
+                )
+                result = await self._storage_operation(self._storage.prune)
+                await self._apply_storage_status(result)
+            return self.storage_administration()
+
+    async def _storage_operation(self, operation, **options):
+        """Join a canceled scan/deletion before releasing recorder ownership."""
+        if self._closing:
+            raise OperatorProductError("Recording storage is stopping")
+        task = asyncio.create_task(asyncio.to_thread(operation, **options))
+        self._storage_operations.add(task)
+        cancelled = False
+        try:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break
+            result = task.result()
+            if cancelled:
+                raise asyncio.CancelledError
+            return result
+        finally:
+            self._storage_operations.discard(task)
+
+    async def _apply_storage_status(self, result) -> None:
+        if self._closing:
+            raise OperatorProductError("Recording storage is stopping")
+        self._storage_status = result
+        paused = not result.recording_allowed
+        if paused != self._disk_full:
+            was_ready = self._ready
+            self._ready = False
+            self._disk_full = paused
+            self._needs_reconcile = True
+            preferences = {
+                source.binding.path_name: source.recording_enabled for source in self._sources
+            }
+            for path in self._paths:
+                await self._storage_operation(
+                    self._mutation,
+                    method="PATCH",
+                    route=f"/v3/config/paths/patch/{path}",
+                    payload={"record": preferences.get(path, False) and not paused},
+                )
+            await self._storage_operation(self._write_media)
+            self._needs_reconcile = False
+            self._ready = was_ready and not self._closing
 
     @property
     def media_generation(self) -> int:
@@ -326,9 +414,12 @@ class OperatorProductService:
             from k5vision.operator_recording_storage import RecordingStorage
 
             self._storage = RecordingStorage(
-                self.recording_root, max_bytes=self.max_recording_bytes
+                self.recording_root,
+                max_bytes=self.max_recording_bytes,
+                min_free_bytes=self._minimum_free_bytes,
+                retention_seconds=self._retention_seconds,
             )
-            storage = await asyncio.to_thread(self._storage.prune)
+            storage = await self._storage_operation(self._storage.prune)
             self._storage_status = storage
             self._disk_full = not storage.recording_allowed
             self._sources = tuple(sources)
@@ -518,29 +609,8 @@ class OperatorProductService:
                                 self._health_failures[component] += 1
                         last_health = time.monotonic()
                     if time.monotonic() - last_storage >= 15:
-                        result = await asyncio.to_thread(self._storage.prune)
-                        self._storage_status = result
-                        paused = not result.recording_allowed
-                        if paused != self._disk_full:
-                            # Publishing disk_full/ready acknowledges the whole
-                            # writer policy, not just the sampled desired flag.
-                            # Native PATCHes yield between camera paths.
-                            self._ready = False
-                            self._disk_full = paused
-                            self._needs_reconcile = True
-                            preferences = {
-                                source.binding.path_name: source.recording_enabled
-                                for source in self._sources
-                            }
-                            for path in self._paths:
-                                await asyncio.to_thread(
-                                    self._mutation,
-                                    "PATCH",
-                                    f"/v3/config/paths/patch/{path}",
-                                    {"record": preferences.get(path, False) and not paused},
-                                )
-                            await asyncio.to_thread(self._write_media)
-                            self._needs_reconcile = False
+                        result = await self._storage_operation(self._storage.prune)
+                        await self._apply_storage_status(result)
                         last_storage = time.monotonic()
                     self._ready = not any(self._health_failures.values())
             except asyncio.CancelledError:
@@ -588,6 +658,14 @@ class OperatorProductService:
             except Exception:
                 pass
         cancelled = False
+        for operation in tuple(self._storage_operations):
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break
         cleanup_failed = False
         close_provider = asyncio.create_task(self.provider.aclose())
         # A canceled camera-list reader may leave its shared snapshot owner

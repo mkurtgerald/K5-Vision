@@ -80,6 +80,26 @@ def test_inspect_is_aggregate_immutable_and_does_not_delete(root, monkeypatch) -
         status.total_bytes = 0
 
 
+def test_live_retention_change_keeps_monotonic_closed_file_observations(root, monkeypatch, clock):
+    _free(monkeypatch, 500)
+    old, newest = _segment(root, 1), _segment(root, 2)
+    storage = _settled_storage(root, clock, max_bytes=1000, min_free_bytes=100)
+    storage.configure_policy(max_bytes=1000, min_free_bytes=100, retention_seconds=5)
+    result = storage.prune()
+    assert result.deleted_segments == 1
+    assert not old.exists() and newest.exists()
+
+
+def test_live_quota_change_prunes_only_existing_safe_candidates(root, monkeypatch, clock):
+    _free(monkeypatch, 500)
+    old, newest = _segment(root, 1), _segment(root, 2)
+    storage = _settled_storage(root, clock, max_bytes=1000, min_free_bytes=100)
+    storage.configure_policy(max_bytes=15, min_free_bytes=100, retention_seconds=0)
+    result = storage.prune()
+    assert result.total_bytes == 10 and result.recording_allowed
+    assert not old.exists() and newest.exists()
+
+
 def test_prune_oldest_closed_segments_to_hysteresis_and_preserves_newest(
     root, monkeypatch, clock
 ) -> None:

@@ -274,6 +274,7 @@ class ExportManager:
         downloader: Callable = _download,
         validator: Callable = _verify_mp4,
         clock: Callable[[], float] = time.monotonic,
+        audit=None,
     ) -> None:
         self.root = _private_directory(root)
         self.service = service
@@ -287,7 +288,55 @@ class ExportManager:
         self._cache_unsafe = False
         self._stopped = threading.Event()
         self._closed = False
+        self._audit = None
+        self._audit_unavailable = False
+        if audit is not None:
+            self.set_audit(audit)
         self._load()
+
+    def set_audit(self, audit) -> None:
+        """Attach the product's durable audit before accepting export work."""
+        if (
+            not callable(getattr(audit, "record", None))
+            or (self._audit is not None and self._audit is not audit)
+            or getattr(audit, "site_id", self.service.site_id) != self.service.site_id
+        ):
+            raise ValueError("Export audit was refused")
+        self._audit = audit
+
+    def _audit_job(self, job: ExportJob, action: str, outcome: str) -> bool:
+        if self._audit is None:
+            return True
+        if self._audit_unavailable:
+            return False
+        details = {
+            "export_id": job.id,
+            "clip_start": job.start,
+            "clip_duration_seconds": job.duration,
+        }
+        if type(job.bytes) is int and 0 <= job.bytes <= MAX_EXPORT_BYTES:
+            details["bytes"] = job.bytes
+        try:
+            self._audit.record(
+                action,
+                outcome=outcome,
+                actor=job.owner,
+                target_kind="camera",
+                target_id=job.camera,
+                details=details,
+            )
+            return True
+        except Exception:
+            # Never forward a failed sink's SQL, private path or exception text.
+            self._audit_unavailable = True
+            return False
+
+    def audit_download(self, job: ExportJob, *, outcome: str) -> None:
+        """Record a transfer's selected evidence; the API owns current authority."""
+        if outcome not in {"success", "denied", "failure", "interrupted"}:
+            raise ValueError("Export audit outcome was refused")
+        if not self._audit_job(job, "export.download", outcome):
+            raise ExportError("export_unavailable")
 
     def _path(self, job: ExportJob, suffix: str = ".mp4") -> Path:
         return self.root / (str(job.id) + suffix)
@@ -458,7 +507,7 @@ class ExportManager:
             raise ValueError("Invalid export selection")
         start = start.astimezone(UTC)
         end = start + timedelta(seconds=duration)
-        if self._closed:
+        if self._closed or self._audit_unavailable:
             raise ExportError("export_unavailable")
         spans = await self.service.provider.playback_spans(binding, start=start, end=end)
         if authorize is not None:
@@ -471,7 +520,7 @@ class ExportManager:
             cursor = max(cursor, span_end)
         if cursor < end - timedelta(milliseconds=1):
             raise ExportError("export_recording_gap")
-        if self._closed:
+        if self._closed or self._audit_unavailable:
             raise ExportError("export_unavailable")
         if len(self._tasks) >= 2:
             raise ExportError("export_busy")
@@ -542,6 +591,8 @@ class ExportManager:
         except asyncio.CancelledError:
             raise
         except Exception:
+            if job.status != "failed":
+                self._audit_job(job, "export.failed", "failure")
             job.status = "failed"
             job.error = "export_file_unavailable"
         finally:
@@ -629,7 +680,11 @@ class ExportManager:
                 failure_code = "export_too_large"
         except Exception:
             failed = True
+        if not failed and not cancelled and not self._audit_job(job, "export.completed", "success"):
+            failed = True
+            failure_code = "export_unavailable"
         if failed or cancelled:
+            self._audit_job(job, "export.failed", "interrupted" if cancelled else "failure")
             job.status = "failed"
             job.error = failure_code
             job.bytes = 0

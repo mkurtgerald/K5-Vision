@@ -9,6 +9,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 from k5vision.domain.users import UserAccount, UserCreate, UserPatch, UserRole
+from k5vision.operator_role_policy import RolePolicyError
+from k5vision.operator_role_policy_api import BASE_PERMISSIONS, effective_permissions, require_grant
 from k5vision.services.device_registry import DeviceRegistryStorageError
 from k5vision.services.user_registry import (
     UserRegistryCapacityError,
@@ -86,8 +88,11 @@ def install_operator_admin_api(
         access = users.get_camera_access(account.id)
         if access is None:
             raise HTTPException(404, "admin_user_not_found")
+        role_policy = getattr(app.state, "operator_roles", None)
+        role_fields = {} if role_policy is None else role_policy.account_fields(account)
         return {
             **account.model_dump(mode="json"),
+            **role_fields,
             "credential_status": users.credential_status(account.id),
             "camera_access": {
                 "mode": access["mode"],
@@ -110,6 +115,10 @@ def install_operator_admin_api(
         return {"mode": access.mode, "camera_ids": list(access.camera_ids)}
 
     def registry_error(error):
+        if isinstance(error, RolePolicyError):
+            if str(error) in {"roles_last_administrator", "roles_profile_bound"}:
+                return HTTPException(409, str(error))
+            return HTTPException(503, "roles_unavailable")
         if isinstance(error, UserRegistryLastAdministratorError):
             return HTTPException(409, "admin_last_administrator")
         if isinstance(error, UserRegistryCapacityError):
@@ -189,6 +198,7 @@ def install_operator_admin_api(
         response.headers["Cache-Control"] = "no-store"
         async with mutations:
             actor, _ = await mutation_admin(session)
+            require_grant(app, actor, BASE_PERMISSIONS[payload.role])
             access = policy(payload.camera_access, payload.role)
             try:
                 request = UserCreate.model_validate(payload.model_dump(exclude={"camera_access"}))
@@ -219,6 +229,9 @@ def install_operator_admin_api(
         async with mutations:
             actor, _ = await mutation_admin(session)
             account = target(user_id)
+            require_grant(app, actor, effective_permissions(app, account))
+            if payload.role is not None:
+                require_grant(app, actor, BASE_PERMISSIONS[payload.role])
             previous_account = account
             access = (
                 policy(payload.camera_access, payload.role or account.role)
@@ -228,6 +241,9 @@ def install_operator_admin_api(
             try:
                 previous_access = users.get_camera_access(user_id)
                 fields = payload.model_dump(exclude={"camera_access"}, exclude_none=True)
+                role_policy = getattr(app.state, "operator_roles", None)
+                if role_policy is not None:
+                    role_policy.guard_account_change(users, account, fields)
                 if fields:
                     account = users.update(
                         user_id,
@@ -254,6 +270,7 @@ def install_operator_admin_api(
                 UserRegistryStorageError,
                 UserRegistryLastAdministratorError,
                 UserRegistryConflictError,
+                RolePolicyError,
                 ValueError,
             ) as error:
                 raise registry_error(error) from None
@@ -269,6 +286,7 @@ def install_operator_admin_api(
         async with mutations:
             actor, _ = await mutation_admin(session)
             account = target(user_id)
+            require_grant(app, actor, effective_permissions(app, account))
             access = policy(payload, account.role)
             try:
                 previous_access = users.get_camera_access(user_id)
@@ -291,7 +309,12 @@ def install_operator_admin_api(
         response.headers["Cache-Control"] = "no-store"
         async with mutations:
             actor, _ = await mutation_admin(session)
+            account = target(user_id)
+            require_grant(app, actor, effective_permissions(app, account))
             try:
+                role_policy = getattr(app.state, "operator_roles", None)
+                if role_policy is not None:
+                    role_policy.guard_credential_reset(users, target(user_id))
                 result = users.reset_bootstrap(user_id, actor=actor.username)
                 if result is None:
                     raise HTTPException(404, "admin_user_not_found")
@@ -307,6 +330,7 @@ def install_operator_admin_api(
             except (
                 UserRegistryStorageError,
                 UserRegistryLastAdministratorError,
+                RolePolicyError,
                 ValueError,
             ) as error:
                 raise registry_error(error) from None

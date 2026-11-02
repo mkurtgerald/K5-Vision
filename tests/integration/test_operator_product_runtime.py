@@ -59,9 +59,11 @@ class _Client:
         self.cookies = http.cookiejar.CookieJar()
         self.opener = build_opener(ProxyHandler({}), HTTPCookieProcessor(self.cookies))
         self.token = ""
+        self.transport_failure = None
 
     def get(self, route, *, method="GET", data=None, media=False, max_bytes=1_048_576):
         __tracebackhide__ = True
+        self.transport_failure = None
         headers = {"Origin": self.origin}
         if self.token and not media:
             headers["Authorization"] = "Bearer " + self.token
@@ -70,12 +72,34 @@ class _Client:
             payload = json.dumps(data).encode()
             headers["Content-Type"] = "application/json"
         request = Request(self.origin + route, data=payload, headers=headers, method=method)
+        began = time.monotonic()
         try:
             response = self.opener.open(request, timeout=3)
         except HTTPError as error:
             response = error
-        except OSError:
-            raise RuntimeError("Local operator request did not complete") from None
+        except OSError as error:
+            safe_types = {
+                "TimeoutError",
+                "ConnectionRefusedError",
+                "ConnectionResetError",
+                "ConnectionAbortedError",
+                "BrokenPipeError",
+                "RemoteDisconnected",
+                "URLError",
+                "OSError",
+            }
+            error_type = type(error).__name__
+            reason_type = type(getattr(error, "reason", None)).__name__
+            self.transport_failure = {
+                "operation": "login" if route == "/api/v1/auth/login" else "other",
+                "exception_type": error_type if error_type in safe_types else "OSError",
+                "reason_type": reason_type if reason_type in safe_types else "none",
+                "elapsed_seconds": round(time.monotonic() - began, 3),
+            }
+            raise RuntimeError(
+                "Local operator request did not complete: "
+                + json.dumps(self.transport_failure, sort_keys=True)
+            ) from None
         with response:
             status = response.code
             deadline = time.monotonic() + 15
@@ -156,8 +180,14 @@ def _wait(condition, *, label, product=None, timeout=15):
 
 def _login(client, username, password):
     __tracebackhide__ = True
+    began = time.monotonic()
+    print("Product phase: authenticated login request", flush=True)
     result = client.json(
         "/api/v1/auth/login", method="POST", data={"username": username, "password": password}
+    )
+    print(
+        f"Product authentication completed in {time.monotonic() - began:.3f}s",
+        flush=True,
     )
     token = result.get("session_token")
     if not isinstance(token, str) or not 32 <= len(token) <= 128:
@@ -316,6 +346,7 @@ def test_assembled_operator_product_login_live_recording_logout_and_restart(
         "analytics_acceptance": False,
         "real_camera_acceptance": False,
     }
+    client = None
     try:
         for listener in reservations:
             listener.close()
@@ -474,6 +505,11 @@ def test_assembled_operator_product_login_live_recording_logout_and_restart(
             "operator_product_runtime_receipt", json.dumps(receipt, sort_keys=True)
         )
     finally:
+        if client is not None and client.transport_failure is not None:
+            record_testsuite_property(
+                "operator_product_transport_failure",
+                json.dumps(client.transport_failure, sort_keys=True),
+            )
         print("Product phase: stop and reap owned application and fixtures", flush=True)
         cleanup_failures = 0
         for product in reversed(products):

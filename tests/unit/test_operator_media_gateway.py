@@ -26,6 +26,8 @@ def assets(tmp_path):
         "admin.css",
         "analytics.js",
         "analytics.css",
+        "settings.js",
+        "settings.css",
     ):
         (root / name).write_text("fixture", encoding="utf-8")
     return root
@@ -59,14 +61,17 @@ def test_fixed_gateway_authorizes_each_media_request_before_private_proxy(assets
                 yield from proxies(child)
 
     worker_proxies = list(proxies(document))
-    assert len(worker_proxies) == 7
+    assert len(worker_proxies) == 8
     for proxy in worker_proxies:
         # Every route must retire pooled connections before Uvicorn's 5s
         # idle limit; a failed mutation is never replayed as a workaround.
         transport = proxy["transport"]
         assert transport["keep_alive"] == {"idle_timeout": "2s"}
         assert transport["max_conns_per_host"] == 32
-        assert transport["read_timeout"] == "15s" and transport["write_timeout"] == "10s"
+        assert transport["read_timeout"] in {"15s", "80s"}
+        assert transport["write_timeout"] == "10s"
+        if transport["read_timeout"] == "80s":
+            assert transport["response_header_timeout"] == "80s"
         assert not any(key.startswith("lb_try") for key in proxy)
     assert document["admin"] == {"disabled": True}
     server = document["apps"]["http"]["servers"]["operator"]
@@ -119,6 +124,10 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
     routes = document["apps"]["http"]["servers"]["operator"]["routes"]
     paths = [path for route in routes for m in route.get("match", []) for path in m.get("path", [])]
     assert paths == [
+        "/api/v1/operator/admin/*",
+        "/api/v1/operator/cameras/*/time",
+        "/api/v1/operator/cameras/*/time/*",
+        "/api/v1/auth/oidc/*",
         "/api/*",
         "/media/exports/*",
         "/media/hls.js",
@@ -138,6 +147,8 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
         "/operator/admin.js",
         "/operator/analytics.css",
         "/operator/analytics.js",
+        "/operator/settings.css",
+        "/operator/settings.js",
     ]
     javascript = next(
         route["handle"][0]

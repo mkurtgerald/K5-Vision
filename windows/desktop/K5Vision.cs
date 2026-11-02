@@ -16,6 +16,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using Microsoft.Win32.SafeHandles;
 
 namespace K5VisionDesktop
 {
@@ -30,6 +31,8 @@ namespace K5VisionDesktop
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            if (arguments.Length == 3 && arguments[0] == "--time-admin")
+                return TimeAdministration.Execute(arguments[1], arguments[2]);
             if (arguments.Length == 1 && arguments[0] == "--installation-check")
                 return InstallationCheck();
             if (arguments.Length == 2 && arguments[0] == "--installation-identity")
@@ -284,6 +287,442 @@ namespace K5VisionDesktop
         }
     }
 
+    internal static class TimeAdministration
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileIdentity
+        {
+            internal uint Attributes;
+            internal System.Runtime.InteropServices.ComTypes.FILETIME Created, Accessed, Written;
+            internal uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(string path, uint access, uint share,
+            IntPtr security, uint creation, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle file, out FileIdentity info);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(IntPtr process,
+            out System.Runtime.InteropServices.ComTypes.FILETIME created,
+            out System.Runtime.InteropServices.ComTypes.FILETIME exited,
+            out System.Runtime.InteropServices.ComTypes.FILETIME system,
+            out System.Runtime.InteropServices.ComTypes.FILETIME user);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool GetTokenInformation(IntPtr token, int kind, IntPtr buffer,
+            uint length, out uint needed);
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct StartupInfo
+        {
+            internal uint Size;
+            internal string Reserved, Desktop, Title;
+            internal uint X, Y, XSize, YSize, XChars, YChars, Fill, Flags;
+            internal ushort Show, ReservedBytes;
+            internal IntPtr ReservedPointer, StandardInput, StandardOutput, StandardError;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessInformation
+        {
+            internal IntPtr Process, Thread;
+            internal uint ProcessId, ThreadId;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CreateProcess(string executable, StringBuilder command,
+            IntPtr processSecurity, IntPtr threadSecurity, bool inheritHandles, uint flags,
+            IntPtr environment, string directory, ref StartupInfo startup, out ProcessInformation info);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint ResumeThread(IntPtr thread);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForMultipleObjects(uint count, IntPtr[] handles,
+            bool waitAll, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetExitCodeProcess(IntPtr process, out uint code);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr process, uint code);
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private static FileIdentity Identify(FileStream stream)
+        {
+            FileIdentity identity;
+            if (!GetFileInformationByHandle(stream.SafeFileHandle, out identity) ||
+                identity.Links != 1 || (identity.Attributes & (0x10u | 0x400u)) != 0)
+                throw new InvalidOperationException();
+            return identity;
+        }
+
+        private static long Integer(object value)
+        {
+            if (value is int) return (int)value;
+            if (value is long) return (long)value;
+            throw new InvalidOperationException();
+        }
+
+        private sealed class LiveIssuer : IDisposable
+        {
+            internal IntPtr Handle;
+            private ulong created100ns;
+            internal void Bind(uint pid, ulong created)
+            {
+                if (Handle != IntPtr.Zero || pid == 0 || created == 0) throw new InvalidOperationException();
+                // Keep the exact kernel process object, not a PID lookup that
+                // could later select a replacement process after PID reuse.
+                Handle = OpenProcess(0x00100000u | 0x00001000u, false, pid);
+                if (Handle == IntPtr.Zero) throw new InvalidOperationException();
+                created100ns = created;
+                Check();
+            }
+            internal void Check()
+            {
+                if (Handle == IntPtr.Zero || WaitForSingleObject(Handle, 0) != 258)
+                    throw new InvalidOperationException();
+                System.Runtime.InteropServices.ComTypes.FILETIME created, exited, system, user;
+                if (!GetProcessTimes(Handle, out created, out exited, out system, out user) ||
+                    (((ulong)(uint)created.dwHighDateTime << 32) | (uint)created.dwLowDateTime) != created100ns)
+                    throw new InvalidOperationException();
+                IntPtr token = IntPtr.Zero, buffer = IntPtr.Zero;
+                try
+                {
+                    if (!OpenProcessToken(Handle, 8, out token)) throw new UnauthorizedAccessException();
+                    uint needed;
+                    GetTokenInformation(token, 1, IntPtr.Zero, 0, out needed);
+                    if (needed < IntPtr.Size || needed > 4096) throw new InvalidOperationException();
+                    buffer = Marshal.AllocHGlobal((int)needed);
+                    if (!GetTokenInformation(token, 1, buffer, needed, out needed))
+                        throw new InvalidOperationException();
+                    IntPtr sid = Marshal.ReadIntPtr(buffer);
+                    if (sid == IntPtr.Zero || new SecurityIdentifier(sid).Value != Program.Sid)
+                        throw new UnauthorizedAccessException();
+                    if (WaitForSingleObject(Handle, 0) != 258) throw new InvalidOperationException();
+                }
+                finally
+                {
+                    if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+                    if (token != IntPtr.Zero) CloseHandle(token);
+                }
+            }
+            public void Dispose()
+            {
+                if (Handle != IntPtr.Zero) { CloseHandle(Handle); Handle = IntPtr.Zero; }
+            }
+        }
+
+        private sealed class DirectoryPins : IDisposable
+        {
+            private readonly List<SafeFileHandle> handles = new List<SafeFileHandle>();
+            internal void Acquire(string directory, string root)
+            {
+                List<string> ancestors = new List<string>();
+                for (string current = directory; !String.IsNullOrEmpty(current);
+                    current = Path.GetDirectoryName(current)) ancestors.Add(current);
+                ancestors.Reverse();
+                foreach (string ancestor in ancestors)
+                {
+                    Custody.Admit(ancestor, root);
+                    // Pin every directory from the fixed volume downwards.
+                    // No FILE_SHARE_DELETE: a later reparse/rename cannot redirect
+                    // elevated response creation to a different directory.
+                    SafeFileHandle handle = CreateFile(ancestor, 0, 3, IntPtr.Zero,
+                        3, 0x02000000u | 0x00200000u, IntPtr.Zero);
+                    FileIdentity identity;
+                    if (handle.IsInvalid || !GetFileInformationByHandle(handle, out identity) ||
+                        (identity.Attributes & 0x400u) != 0 || (identity.Attributes & 0x10u) == 0)
+                    {
+                        handle.Dispose();
+                        throw new InvalidOperationException();
+                    }
+                    handles.Add(handle);
+                }
+                Custody.Admit(directory, root);
+            }
+            public void Dispose()
+            {
+                for (int index = handles.Count - 1; index >= 0; index--) handles[index].Dispose();
+                handles.Clear();
+            }
+        }
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr OpenSCManager(string machine, string database, uint access);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr OpenService(IntPtr manager, string name, uint access);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool ChangeServiceConfig(IntPtr service, uint type, uint start,
+            uint error, string binary, string group, IntPtr tag, string dependencies,
+            string account, string password, string display);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool StartService(IntPtr service, uint count, IntPtr arguments);
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ServiceStatus
+        {
+            internal uint Kind, State, Accepted, Win32Exit, ServiceExit, Checkpoint, WaitHint;
+        }
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool QueryServiceStatus(IntPtr service, out ServiceStatus status);
+        [DllImport("advapi32.dll")]
+        private static extern bool CloseServiceHandle(IntPtr handle);
+
+        private static void StartTimeService(Action admit, Stopwatch elapsed)
+        {
+            IntPtr manager = OpenSCManager(null, null, 1);
+            if (manager == IntPtr.Zero) throw new UnauthorizedAccessException();
+            IntPtr service = IntPtr.Zero;
+            try
+            {
+                service = OpenService(manager, "W32Time", 0x0002 | 0x0004 | 0x0010);
+                if (service == IntPtr.Zero) throw new UnauthorizedAccessException();
+                admit();
+                if (!ChangeServiceConfig(service, UInt32.MaxValue, 2, UInt32.MaxValue,
+                    null, null, IntPtr.Zero, null, null, null, null))
+                    throw new InvalidOperationException();
+                admit();
+                if (!StartService(service, 0, IntPtr.Zero) && Marshal.GetLastWin32Error() != 1056)
+                    throw new InvalidOperationException();
+                long deadline = Math.Min(45000, elapsed.ElapsedMilliseconds + 5000);
+                ServiceStatus status;
+                while (elapsed.ElapsedMilliseconds < deadline)
+                {
+                    admit();
+                    if (!QueryServiceStatus(service, out status)) throw new InvalidOperationException();
+                    if (status.State == 4) return;
+                    if (status.State != 2) throw new InvalidOperationException();
+                    Thread.Sleep(50);
+                }
+                throw new TimeoutException();
+            }
+            finally
+            {
+                if (service != IntPtr.Zero) CloseServiceHandle(service);
+                CloseServiceHandle(manager);
+            }
+        }
+
+        private static bool HexNonce(string nonce)
+        {
+            return nonce != null && nonce.Length == 32 &&
+                nonce.All(c => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+        }
+
+        private static void CheckCapability(string path, string root, byte[] admitted,
+            FileIdentity expected, LiveIssuer owner)
+        {
+            owner.Check();
+            Custody.Admit(path, root);
+            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                FileShare.Read | FileShare.Delete))
+            {
+                FileIdentity identity = Identify(stream);
+                if (identity.Volume != expected.Volume || identity.IndexHigh != expected.IndexHigh ||
+                    identity.IndexLow != expected.IndexLow) throw new InvalidOperationException();
+                if (stream.Length != admitted.Length) throw new InvalidOperationException();
+                byte[] current = new byte[admitted.Length];
+                int read = 0;
+                while (read < current.Length)
+                {
+                    int count = stream.Read(current, read, current.Length - read);
+                    if (count <= 0) throw new InvalidOperationException();
+                    read += count;
+                }
+                if (!current.SequenceEqual(admitted)) throw new InvalidOperationException();
+            }
+            owner.Check();
+        }
+
+        private static void RunTimeCommand(string arguments, Stopwatch elapsed,
+            LiveIssuer owner, Action admit)
+        {
+            int remaining = Math.Min(25000, 45000 - (int)elapsed.ElapsedMilliseconds);
+            if (remaining <= 0) throw new TimeoutException();
+            string system = Environment.GetFolderPath(Environment.SpecialFolder.System);
+            string executable = Path.Combine(system, "w32tm.exe");
+            Custody.Admit(executable, Path.GetDirectoryName(Application.ExecutablePath));
+            string windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            string environment = "PATH=" + system + ";" + windows + "\0SystemDrive=" +
+                Path.GetPathRoot(windows).TrimEnd('\\') + "\0SystemRoot=" + windows +
+                "\0WINDIR=" + windows + "\0\0";
+            ProcessInformation information = new ProcessInformation();
+            using (ProcessJob job = new ProcessJob())
+            {
+                IntPtr environmentBlock = Marshal.StringToHGlobalUni(environment);
+                try
+                {
+                    StartupInfo startup = new StartupInfo();
+                    startup.Size = (uint)Marshal.SizeOf(startup);
+                    // Fixed system command starts suspended. No privileged
+                    // action runs before its exact process belongs to our Job.
+                    admit();
+                    if (!CreateProcess(executable, new StringBuilder("\"" + executable + "\" " + arguments),
+                        IntPtr.Zero, IntPtr.Zero, false, 0x08000000u | 0x00000004u | 0x00000400u,
+                        environmentBlock, system, ref startup, out information))
+                        throw new InvalidOperationException();
+                    using (Process process = Process.GetProcessById((int)information.ProcessId)) job.Assign(process);
+                    admit();
+                    if (ResumeThread(information.Thread) == UInt32.MaxValue) throw new InvalidOperationException();
+                    uint waited = WaitForMultipleObjects(2,
+                        new[] { information.Process, owner.Handle }, false, (uint)remaining);
+                    if (waited == 258) throw new TimeoutException();
+                    if (waited != 0) throw new InvalidOperationException();
+                    uint exitCode;
+                    if (!GetExitCodeProcess(information.Process, out exitCode)) throw new InvalidOperationException();
+                    if (exitCode == 0x800705B4u) throw new TimeSourceUnavailable();
+                    if (exitCode != 0) throw new InvalidOperationException();
+                }
+                finally
+                {
+                    if (information.Process != IntPtr.Zero)
+                    {
+                        if (WaitForSingleObject(information.Process, 0) != 0)
+                        {
+                            TerminateProcess(information.Process, 1);
+                            if (WaitForSingleObject(information.Process, 2000) != 0)
+                            {
+                                job.Dispose();
+                                WaitForSingleObject(information.Process, 2000);
+                            }
+                        }
+                        CloseHandle(information.Process);
+                    }
+                    if (information.Thread != IntPtr.Zero) CloseHandle(information.Thread);
+                    Marshal.FreeHGlobal(environmentBlock);
+                }
+            }
+        }
+
+        private sealed class TimeSourceUnavailable : Exception { }
+
+        internal static int Execute(string requestArgument, string responseArgument)
+        {
+            using (System.Threading.Timer watchdog = new System.Threading.Timer(
+                delegate { Environment.Exit(1); }, null, 45000, Timeout.Infinite))
+            using (DirectoryPins directoryPins = new DirectoryPins())
+            using (LiveIssuer owner = new LiveIssuer())
+            {
+            string response = null, root = null, nonce = null;
+            string code = "invalid_request";
+            bool succeeded = false;
+            Stopwatch elapsed = Stopwatch.StartNew();
+            try
+            {
+                string application = Path.GetDirectoryName(Application.ExecutablePath);
+                Custody.VerifyPayload(application);
+                string requestPath = Custody.OrdinaryAbsolute(requestArgument);
+                response = Custody.OrdinaryAbsolute(responseArgument);
+                string directory = Path.GetDirectoryName(requestPath);
+                if (!String.Equals(Path.GetDirectoryName(response), directory,
+                    StringComparison.OrdinalIgnoreCase) || Path.GetFileName(directory) != "time-admin")
+                    throw new InvalidOperationException();
+                root = Path.GetDirectoryName(directory);
+                directoryPins.Acquire(directory, root);
+                Custody.Admit(directory, root);
+                if (File.Exists(response) || Directory.Exists(response)) throw new InvalidOperationException();
+                Custody.Admit(requestPath, root);
+                byte[] bytes;
+                FileIdentity requestIdentity;
+                using (FileStream input = new FileStream(requestPath, FileMode.Open, FileAccess.Read,
+                    FileShare.Read | FileShare.Delete))
+                {
+                    requestIdentity = Identify(input);
+                    if (input.Length <= 0 || input.Length > 4096) throw new InvalidOperationException();
+                    bytes = new byte[(int)input.Length];
+                    int position = 0;
+                    while (position < bytes.Length)
+                    {
+                        int count = input.Read(bytes, position, bytes.Length - position);
+                        if (count <= 0) throw new InvalidOperationException();
+                        position += count;
+                    }
+                }
+                Dictionary<string, object> request = Json.Parse(new UTF8Encoding(false, true).GetString(bytes));
+                HashSet<string> keys = new HashSet<string>(new[] {
+                    "schema_version", "operation", "ntp_servers", "mode", "nonce",
+                    "owner_pid", "owner_created_100ns" });
+                if (!keys.SetEquals(request.Keys) || !(request["schema_version"] is int) ||
+                    (int)request["schema_version"] != 1) throw new InvalidOperationException();
+                nonce = request["nonce"] as string;
+                if (!HexNonce(nonce) || Path.GetFileName(requestPath) != ".time-admin-" + nonce + ".json" ||
+                    Path.GetFileName(response) != ".time-admin-" + nonce + ".result.json")
+                    throw new InvalidOperationException();
+                string operation = request["operation"] as string;
+                string mode = request["mode"] as string;
+                if ((operation != "configure" && operation != "resync") ||
+                    (mode != "manual" && mode != "domain")) throw new InvalidOperationException();
+                IEnumerable values = request["ntp_servers"] as IEnumerable;
+                if (values == null || values is string) throw new InvalidOperationException();
+                List<string> servers = new List<string>();
+                foreach (object value in values)
+                {
+                    string host = value as string;
+                    if (host == null || host.Length < 1 || host.Length > 253 ||
+                        !host.All(c => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') || c == '.' || c == '-' || c == ':') ||
+                        Uri.CheckHostName(host) == UriHostNameType.Unknown ||
+                        servers.Contains(host) || servers.Count >= 4) throw new InvalidOperationException();
+                    servers.Add(host);
+                }
+                if (mode == "manual" && operation == "configure" && servers.Count == 0)
+                    throw new InvalidOperationException();
+                long ownerPid = Integer(request["owner_pid"]);
+                long ownerCreated = Integer(request["owner_created_100ns"]);
+                if (ownerPid < 1 || ownerPid > UInt32.MaxValue || ownerCreated < 1)
+                    throw new InvalidOperationException();
+                owner.Bind((uint)ownerPid, (ulong)ownerCreated);
+                WindowsPrincipal principal = new WindowsPrincipal(WindowsIdentity.GetCurrent());
+                if (!principal.IsInRole(WindowsBuiltInRole.Administrator))
+                    throw new UnauthorizedAccessException();
+                Action admit = delegate { CheckCapability(requestPath, root, bytes, requestIdentity, owner); };
+                admit();
+                StartTimeService(admit, elapsed);
+                admit();
+                if (operation == "configure")
+                {
+                    using (Microsoft.Win32.RegistryKey parameters = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                        @"SYSTEM\CurrentControlSet\Services\W32Time\Parameters", true))
+                    {
+                        if (parameters == null) throw new InvalidOperationException();
+                        admit();
+                        parameters.SetValue("Type", mode == "domain" ? "NT5DS" : "NTP", Microsoft.Win32.RegistryValueKind.String);
+                        admit();
+                        if (mode == "manual") parameters.SetValue("NtpServer",
+                            String.Join(" ", servers.Select(s => s + ",0x9")), Microsoft.Win32.RegistryValueKind.String);
+                    }
+                    admit();
+                    RunTimeCommand("/config /update", elapsed, owner, admit);
+                }
+                else RunTimeCommand("/resync /rediscover", elapsed, owner, admit);
+                admit();
+                succeeded = true; code = "completed";
+            }
+            catch (UnauthorizedAccessException) { code = "access_denied"; }
+            catch (TimeoutException) { code = "timeout"; }
+            catch (TimeSourceUnavailable) { code = "ntp_unreachable"; }
+            catch { code = "operation_failed"; }
+            try
+            {
+                if (response == null || root == null || !HexNonce(nonce)) return 1;
+                // No delayed response/profile write after its issuing backend
+                // has exited, including a hard-killed owner with a live file.
+                owner.Check();
+                Custody.Admit(Path.GetDirectoryName(response), root);
+                using (FileStream output = new FileStream(response, FileMode.CreateNew,
+                    FileAccess.Write, FileShare.None))
+                {
+                    byte[] result = Encoding.UTF8.GetBytes(Json.Serializer.Serialize(new Dictionary<string, object> {
+                        { "schema_version", 1 }, { "nonce", nonce }, { "succeeded", succeeded }, { "code", code } }));
+                    output.Write(result, 0, result.Length); output.Flush(true);
+                }
+                Custody.Admit(response, root);
+            }
+            catch { return 1; }
+            return succeeded ? 0 : 1;
+            }
+        }
+    }
+
     internal static class Workers
     {
         private static void PrivateDirectory(string path, string root)
@@ -510,9 +949,14 @@ namespace K5VisionDesktop
         private Dictionary<string, object> outcome;
         internal volatile bool InvalidOutput;
         private int lines;
+        private int progressLines;
+        private readonly bool persistent;
+        internal volatile bool PreparingRecordings;
+        internal volatile int RecordingsProgress;
 
         internal Bridge(string root, Dictionary<string, object> request, ProcessJob job, bool persistent)
         {
+            this.persistent = persistent;
             ProcessStartInfo start = new ProcessStartInfo(Path.Combine(root, "runtime", "python.exe"),
                 "-I -B -m k5vision.desktop_setup");
             start.WorkingDirectory = root;
@@ -556,8 +1000,21 @@ namespace K5VisionDesktop
             {
                 try
                 {
-                    if (++lines > 2 || args.Data.Length > 1024) throw new InvalidOperationException();
+                    if (args.Data.Length > 1024) throw new InvalidOperationException();
                     Dictionary<string, object> response = Json.Parse(args.Data);
+                    if (response.ContainsKey("status") && (string)response["status"] == "preparing_recordings")
+                    {
+                        if (!persistent || Running.WaitOne(0) || ++progressLines > 101 ||
+                            response.Count != 3 || !(response["schema_version"] is int) ||
+                            (int)response["schema_version"] != 1 || !(response["progress"] is int))
+                            throw new InvalidOperationException();
+                        int percent = (int)response["progress"];
+                        if (percent < 0 || percent > 100 || percent < RecordingsProgress)
+                            throw new InvalidOperationException();
+                        RecordingsProgress = percent; PreparingRecordings = true;
+                        return;
+                    }
+                    if (++lines > 2) throw new InvalidOperationException();
                     if (Convert.ToInt32(response["schema_version"]) != 1 ||
                         !new[] { "ready", "new", "refused", "running", "stopped" }.Contains((string)response["status"]))
                         throw new InvalidOperationException();
@@ -829,11 +1286,26 @@ namespace K5VisionDesktop
                     request["port"] = options.Port; request["recording_limit_gb"] = 20;
                     backend = new Bridge(root, request, job, true);
                     Stopwatch deadline = Stopwatch.StartNew();
+                    int lastMigrationProgress = -1;
                     while (!backend.Running.WaitOne(50))
-                        if (exiting || backend.InvalidOutput || backend.Process.HasExited || deadline.ElapsedMilliseconds > 45000)
+                    {
+                        int startupLimit = backend.PreparingRecordings ? 330000 : 45000;
+                        if (backend.PreparingRecordings && !exiting &&
+                            backend.RecordingsProgress != lastMigrationProgress)
+                        {
+                            int prepared = backend.RecordingsProgress;
+                            lastMigrationProgress = prepared;
+                            BeginInvoke((Action)delegate {
+                                if (!exiting && !IsDisposed)
+                                    status.Text = "Preparing recordings (" + prepared +
+                                        "%). Original footage is preserved.";
+                            });
+                        }
+                        if (exiting || backend.InvalidOutput || backend.Process.HasExited || deadline.ElapsedMilliseconds > startupLimit)
                             throw new InvalidOperationException();
+                    }
                     bool healthy = false;
-                    while (!healthy && deadline.ElapsedMilliseconds < 45000 && !exiting && !backend.Process.HasExited)
+                    while (!healthy && deadline.ElapsedMilliseconds < (backend.PreparingRecordings ? 330000 : 45000) && !exiting && !backend.Process.HasExited)
                     {
                         try
                         {

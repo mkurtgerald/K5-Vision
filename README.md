@@ -1,30 +1,42 @@
 # K5 Vision
 
-Early-stage systems project.
+Native Windows surveillance with ONVIF and direct RTSP cameras, recording,
+continuous UTC playback, verified MP4 exports and local person detection.
 
-## Native Windows operator pilot
+## Windows beta
 
-The donor-based pilot adds persistent camera enrollment, live video, continuous
-recording, history and bounded MP4 playback through a local browser dashboard.
-All services run natively on Windows. Follow
-[the pilot startup instructions](docs/WINDOWS_OPERATOR_PILOT.md) for the wheel
-bundle or source checkout. Person detection is not configured in this build.
+Download **K5VisionSetup.exe** from the matching
+[public release](https://github.com/mkurtgerald/K5-Vision/releases) and double-click
+it. End users do not need PowerShell, Command Prompt, external Python, Docker,
+WSL or a separate model installation. Choose **Stop and quit** from the K5 tray
+menu before upgrading. Recording runs while the Windows user is signed in;
+first launch needs Internet to obtain the verified native media workers.
 
-## Windows Alpha — Start Here
+The workspace provides camera discovery/enrollment, a camera wall, recording
+controls, a zoomable UTC timeline, direct seeking, playback controls, normal MP4
+downloads, and background person events that open their recorded footage.
+Administration manages local users, roles, camera access, activation/reset and
+account activity. See the [desktop guide](docs/WINDOWS_DESKTOP_BETA.md).
 
-For the current Windows alpha test path, download and run `Install-K5VisionAlpha.ps1` from the repository root.
+Expanded administration in this source branch includes storage quota/reserve/
+retention settings and verified copy-first directory migration, Windows Time and
+ONVIF time controls, comprehensive activity downloads, constrained custom roles,
+TOTP MFA, and OIDC sign-in linked to existing accounts. The
+[settings guide](docs/ADMIN_SETTINGS_WORKSPACE.md) explains the graphical controls.
+Feature availability in an installer is established by its matching release
+notes and exact-source Windows receipts; a source change alone is not a
+qualified download.
 
-The bootstrap:
-- downloads the exact reviewed K5 alpha revision;
-- installs K5 into a user-local isolated environment;
-- provisions the reviewed GStreamer runtime;
-- creates the **K5 Vision Alpha** desktop shortcut;
-- verifies the installed revision;
-- removes its temporary bootstrap files.
+Analytics Lab 0.1 ingestion and K5-Lab v2 observation/response adapters use scoped
+machine credentials and durable delivery. The Neural adapter is non-authorizing:
+a connected provider is required, and K5-Lab currently supplies no production
+shared Neural host. Saving a connection does not establish model execution.
 
-Launching the desktop shortcut now defaults to a **non-recording local synthetic RTSP operator test** generated entirely on the Windows host. K5 uses the normal authentication, device-enrollment, and live-operator APIs; the generated test media and temporary session state are not retained. A credential-free public RTSP URL can still be supplied explicitly as an override.
-
-This is still an alpha bootstrap, not the final signed MSI/EXE installer.
+Native release gates exercise the installed GUI, bundled inference, saved MP4s,
+restart persistence and actual +/-48-hour host clock corrections. Time
+administration has a separate native configuration/restoration witness. Source
+configuration, observed offset and successful synchronization are reported
+separately; clock-step resilience alone does not certify absolute UTC accuracy.
 
 ## Development
 
@@ -40,7 +52,11 @@ ruff format --check src tests
 pytest
 ```
 
-## Installed startup
+## Engineering startup
+
+The older [Alpha bootstrap](scripts/windows-alpha/README.md) and source commands
+below are engineering paths. The normal Windows product uses the EXE above.
+
 
 `k5-vision serve` starts the local control plane on loopback by default.
 `k5-vision serve --operator` selects the existing Stage-One operator application

@@ -71,6 +71,9 @@ def _product_path(path: str) -> bool:
         path == _PREFIX + "/cameras"
         or path.startswith(_PREFIX + "/cameras/")
         or path.startswith(_PREFIX + "/admin/")
+        or path.startswith(_PREFIX + "/security/")
+        or path.startswith(_PREFIX + "/integrations/")
+        or path.startswith("/api/v1/auth/oidc/")
         or path
         in {
             _PREFIX + "/media-auth",
@@ -78,6 +81,8 @@ def _product_path(path: str) -> bool:
             _PREFIX + "/camera-discovery",
             _PREFIX + "/camera-profiles",
             _PREFIX + "/camera-stream-probe",
+            _PREFIX + "/security",
+            "/api/v1/auth/mfa",
         }
     )
 
@@ -100,6 +105,11 @@ class _BoundedProductBody:
         ):
             await self.app(scope, receive, send)
             return
+        body_limit = (
+            64 * 1024
+            if scope.get("path", "").startswith(_PREFIX + "/integrations/")
+            else _BODY_LIMIT
+        )
         lengths = [value for name, value in scope.get("headers", ()) if name == b"content-length"]
         if len(lengths) > 1:
             await JSONResponse({"detail": "Invalid request length"}, status_code=400)(
@@ -116,7 +126,7 @@ class _BoundedProductBody:
                     scope, receive, send
                 )
                 return
-            if length > _BODY_LIMIT:
+            if length > body_limit:
                 await JSONResponse({"detail": "Request body too large"}, status_code=413)(
                     scope, receive, send
                 )
@@ -130,7 +140,7 @@ class _BoundedProductBody:
                 )
                 return
             piece = message.get("body", b"")
-            if len(body) + len(piece) > _BODY_LIMIT:
+            if len(body) + len(piece) > body_limit:
                 await JSONResponse({"detail": "Request body too large"}, status_code=413)(
                     scope, receive, send
                 )
@@ -313,6 +323,14 @@ def install_operator_product_api(
     media_generation = getattr(service, "media_generation", 0)
     app.add_middleware(_BoundedProductBody)
     app.add_middleware(_ProductRoutesOnly)
+    from k5vision.operator_role_policy_api import (
+        OperatorPermissionContext,
+        effective_permissions,
+        install_operator_role_api,
+        require_current_permission,
+    )
+
+    app.add_middleware(OperatorPermissionContext)
     previous_validation_handler = app.exception_handlers.get(
         RequestValidationError, request_validation_exception_handler
     )
@@ -347,6 +365,10 @@ def install_operator_product_api(
             or not credential_active
         ):
             raise _unauthorized()
+        from k5vision.operator_audit import set_audit_actor
+
+        set_audit_actor(current)
+        require_current_permission(app, current)
         return current, token
 
     async def require_session(request: Request) -> tuple[UserAccount, str]:
@@ -435,12 +457,16 @@ def install_operator_product_api(
 
     def capabilities(account: UserAccount) -> dict:
         access = access_policy(account)
+        permissions = effective_permissions(app, account)
+        role_policy = getattr(app.state, "operator_roles", None)
+        role_fields = {} if role_policy is None else role_policy.account_fields(account)
         return {
-            "account": account.model_dump(mode="json"),
-            "can_manage_users": account.role is UserRole.ADMINISTRATOR,
-            "can_manage_cameras": account.role is UserRole.ADMINISTRATOR,
-            "can_export": account.role is not UserRole.VIEWER,
-            "can_view_history": True,
+            "account": {**account.model_dump(mode="json"), **role_fields},
+            "effective_permissions": sorted(permissions),
+            "can_manage_users": "users.manage" in permissions,
+            "can_manage_cameras": "cameras.manage" in permissions,
+            "can_export": "cameras.export" in permissions,
+            "can_view_history": "cameras.playback" in permissions,
             "camera_access": {
                 "mode": access["mode"],
                 "camera_ids": [str(value) for value in access["camera_ids"]],
@@ -579,6 +605,89 @@ def install_operator_product_api(
         mutations=mutations,
     )
 
+    role_policy = getattr(app.state, "operator_roles", None)
+    if role_policy is not None:
+        install_operator_role_api(
+            app,
+            policy=role_policy,
+            users=users,
+            sessions=sessions,
+            require_admin=require_admin,
+            authenticate=authenticate,
+            mutations=mutations,
+        )
+
+    from k5vision.operator_audit_api import install_operator_audit_api
+    from k5vision.operator_audit_middleware import OperatorAuditMiddleware
+    from k5vision.operator_identity_security_api import install_account_security_api
+    from k5vision.operator_integrations_api import install_operator_integrations_api
+    from k5vision.operator_oidc_api import install_oidc_api
+    from k5vision.operator_storage_settings_api import install_operator_storage_settings_api
+    from k5vision.operator_time_admin_api import install_operator_time_admin_api
+
+    audit = getattr(app.state, "operator_audit", None)
+    if audit is not None:
+        app.add_middleware(OperatorAuditMiddleware, store=audit)
+        install_operator_audit_api(
+            app,
+            store=audit,
+            require_admin=require_admin,
+            authenticate=authenticate,
+        )
+    security = getattr(app.state, "operator_identity_security", None)
+    if security is not None:
+        install_account_security_api(
+            app,
+            security=security,
+            sessions=sessions,
+            require_session=require_session,
+            authenticate=authenticate,
+            admit_origin=admit_origin,
+            mutations=mutations,
+        )
+        install_oidc_api(
+            app,
+            oidc=app.state.operator_oidc,
+            security=security,
+            users=users,
+            sessions=sessions,
+            require_admin=require_admin,
+            authenticate=authenticate,
+            admit_origin=admit_origin,
+            public_port=public_port,
+            mutations=mutations,
+        )
+    if callable(getattr(service, "storage_administration", None)):
+        install_operator_storage_settings_api(
+            app,
+            service=service,
+            require_admin=require_admin,
+            authenticate=authenticate,
+            mutations=mutations,
+        )
+    time_admin = getattr(app.state, "operator_time_admin", None)
+    if time_admin is not None:
+        install_operator_time_admin_api(
+            app,
+            time_admin=time_admin,
+            require_admin=require_admin,
+            authenticate=authenticate,
+            authorized_selection=authorized_selection,
+            mutations=mutations,
+        )
+    integrations = getattr(app.state, "operator_integrations", None)
+    if integrations is not None:
+        install_operator_integrations_api(
+            app,
+            integrations=integrations,
+            registry=registry,
+            require_admin=require_admin,
+            require_session=require_session,
+            authenticate=authenticate,
+            authorized_selection=authorized_selection,
+            mutations=mutations,
+        )
+
     from k5vision.operator_events_api import install_operator_events_api
     from k5vision.operator_exports_api import install_operator_exports_api
 
@@ -601,6 +710,8 @@ def install_operator_product_api(
         authorized_selection=authorized_selection,
         admit_origin=admit_origin,
     )
+    if audit is not None:
+        app.state.operator_exports.set_audit(audit)
 
     @app.get(_PREFIX + "/capabilities", tags=["operator"])
     async def current_capabilities(
@@ -1056,10 +1167,12 @@ def install_operator_product_api(
             for source in selections()
         ):
             raise _unauthorized()
-        if current.role is UserRole.VIEWER and urlsplit(uris[0]).path == "/media/playback":
+        if urlsplit(uris[0]).path == "/media/playback":
             values = dict(parse_qsl(urlsplit(uris[0]).query))
             if values.get("format", "fmp4") == "mp4":
-                raise HTTPException(403, "MP4 export requires an operator or administrator")
+                from k5vision.operator_role_policy_api import require_permission
+
+                require_permission(app, current, "cameras.export")
         if service.status() not in {"ready", "disk_full"}:
             raise HTTPException(503, "Media unavailable")
         return Response(status_code=200)

@@ -1647,33 +1647,80 @@ def _installed_analytics_journey(
     }, detected
 
 
-def _analytics_permission_journey(runtime, *, port, camera_ids, private_state):
+def _analytics_permission_journey(page, *, admin_helpers, camera_ids, private_state, diagnostic):
+    """Use the same bounded browser observer as the installed admin journey."""
+    __tracebackhide__ = True
     denied = []
-    for account in private_state["users"]:
-        observer = runtime._Client(port)
-        runtime._login(observer, account["username"], account["password"])
-        allowed = f"/api/v1/operator/cameras/{camera_ids[0]}"
-        restricted = f"/api/v1/operator/cameras/{camera_ids[3]}"
-        for suffix in ("/analytics", "/events"):
-            _require(
-                observer.get(allowed + suffix)[0] == 200, "Assigned camera analytics were denied"
+    context, observer = admin_helpers._new_user_page(page)
+    origin = admin_helpers._origin(page)
+    started = time.monotonic()
+
+    def request(phase, token, method, route, data=None):
+        diagnostic["analytics_permissions_phase"] = phase
+        result = admin_helpers._api(observer, token, method, route, data)
+        diagnostic["analytics_permissions_http_status"] = result[0]
+        return result
+
+    try:
+        diagnostic["analytics_permissions_phase"] = "observer_navigation"
+        observer.goto(origin + "/operator/")
+        for account in private_state["users"]:
+            status, issued = request(
+                "password_login",
+                None,
+                "POST",
+                "/api/v1/auth/login",
+                {"username": account["username"], "password": account["password"]},
             )
-            status = observer.get(restricted + suffix)[0]
-            _require(status == 404, "Unassigned camera analytics were exposed")
+            _require(status == 200, "Limited analytics observer could not authenticate")
+            token = issued.get("session_token") if isinstance(issued, dict) else None
+            _require(
+                isinstance(token, str) and 32 <= len(token) <= 128,
+                "Limited analytics observer did not receive an opaque session",
+            )
+            allowed = f"/api/v1/operator/cameras/{camera_ids[0]}"
+            restricted = f"/api/v1/operator/cameras/{camera_ids[3]}"
+            for suffix in ("/analytics", "/events"):
+                _require(
+                    request("assigned_camera_read", token, "GET", allowed + suffix)[0] == 200,
+                    "Assigned camera analytics were denied",
+                )
+                status = request("unassigned_camera_read", token, "GET", restricted + suffix)[0]
+                _require(status == 404, "Unassigned camera analytics were exposed")
+                denied.append(status)
+            status = request(
+                "limited_analytics_write",
+                token,
+                "PATCH",
+                allowed + "/analytics",
+                {"enabled": False, "confidence_threshold": 0.5},
+            )[0]
+            _require(status == 403, "A limited account changed camera analytics settings")
             denied.append(status)
-        status = observer.get(
-            allowed + "/analytics",
-            method="PATCH",
-            data={"enabled": False, "confidence_threshold": 0.5},
-        )[0]
-        _require(status == 403, "A limited account changed camera analytics settings")
-        denied.append(status)
-    anonymous = runtime._Client(port)
-    for suffix in ("/analytics", "/events"):
-        status = anonymous.get(f"/api/v1/operator/cameras/{camera_ids[0]}" + suffix)[0]
-        _require(status == 401, "Anonymous analytics access was admitted")
-        denied.append(status)
-    return {"analytics_role_camera_permissions": True, "analytics_denied_http_statuses": denied}
+            request("session_cleanup", token, "POST", "/api/v1/auth/logout")
+        context.clear_cookies()
+        for suffix in ("/analytics", "/events"):
+            status = request(
+                "anonymous_camera_read",
+                None,
+                "GET",
+                f"/api/v1/operator/cameras/{camera_ids[0]}" + suffix,
+            )[0]
+            _require(status == 401, "Anonymous analytics access was admitted")
+            denied.append(status)
+        diagnostic["analytics_permissions_phase"] = "complete"
+        return {"analytics_role_camera_permissions": True, "analytics_denied_http_statuses": denied}
+    except BaseException as error:
+        diagnostic["analytics_permissions_failure_type"] = (
+            type(error).__name__
+            if type(error).__name__
+            in {"TimeoutError", "Error", "Failed", "AssertionError", "RuntimeError", "ValueError"}
+            else "other"
+        )
+        raise
+    finally:
+        diagnostic["analytics_permissions_seconds"] = round(time.monotonic() - started, 3)
+        context.close()
 
 
 def _vm_clock_phase(
@@ -2049,6 +2096,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     runtime = _helpers("test_operator_product_runtime")
     browser_helpers = _helpers("test_operator_beta_browser")
     admin_helpers = _helpers("test_operator_admin_browser")
+    settings_helpers = _helpers("installed_settings_acceptance")
     helpers = runtime._helpers()
     browser_api = pytest.importorskip("playwright.sync_api")
     _require(version("playwright") == "1.58.0", "Expected reviewed Playwright version is absent")
@@ -2505,9 +2553,30 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         ):
             _require(field in admin_evidence, "Installed user administration proof is incomplete")
             receipt[field] = admin_evidence[field]
+        stage = "installed_analytics_permissions"
         receipt.update(
             _analytics_permission_journey(
-                runtime, port=port, camera_ids=camera_ids, private_state=admin_private_state
+                page,
+                admin_helpers=admin_helpers,
+                camera_ids=camera_ids,
+                private_state=admin_private_state,
+                diagnostic=nvr_diagnostic,
+            )
+        )
+        stage = "installed_admin_settings_security_integrations"
+        receipt.update(
+            settings_helpers.run_installed_settings_journey(
+                page,
+                client=client,
+                admin_helpers=admin_helpers,
+                browser_helpers=browser_helpers,
+                admin_username=username,
+                admin_password=password,
+                camera_ids=camera_ids,
+                private_state=admin_private_state,
+                analytics_event=analytics_event,
+                parent=parent,
+                diagnostic=nvr_diagnostic,
             )
         )
         stage = "wall_logout_resource_cleanup"
@@ -2813,6 +2882,22 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["uninstall_preserves_profile_and_media"] = True
         receipt["no_console_windows"] = not cohort.console_seen and not cohort.failed
     except BaseException as error:
+        nvr_diagnostic["failure_type"] = (
+            type(error).__name__
+            if type(error).__name__
+            in {
+                "TimeoutExpired",
+                "TimeoutError",
+                "Failed",
+                "AssertionError",
+                "Error",
+                "RuntimeError",
+                "ValueError",
+                "OSError",
+                "HTTPError",
+            }
+            else "other"
+        )
         failure_detail = _failure_detail(error)
         failure = {
             "TimeoutExpired": "process_timeout",

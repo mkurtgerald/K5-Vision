@@ -81,6 +81,27 @@ class UserSessionManager:
         self._sessions: dict[bytes, _SessionRecord] = {}
         self._user_tokens: dict[UUID, bytes] = {}
         self._lock = asyncio.Lock()
+        self._revocation_listeners: set[Callable[[UUID], None]] = set()
+
+    def add_revocation_listener(self, callback: Callable[[UUID], None]) -> Callable[[], None]:
+        """Register a bounded synchronous pending-auth invalidation callback.
+
+        Listeners run after the session lock is released. They must perform
+        only bounded in-memory work and must not recursively acquire a session
+        lock or perform I/O. Ordinary session issue/replacement does not notify.
+        """
+        if not callable(callback):
+            raise ValueError("Session revocation listener must be callable")
+        self._revocation_listeners.add(callback)
+
+        def remove():
+            self._revocation_listeners.discard(callback)
+
+        return remove
+
+    def _notify_revocation(self, user_id: UUID) -> None:
+        for listener in tuple(self._revocation_listeners):
+            listener(user_id)
 
     @property
     def ttl_seconds(self) -> int:
@@ -160,7 +181,8 @@ class UserSessionManager:
                 return False
             if self._user_tokens.get(record.account.id) == digest:
                 self._user_tokens.pop(record.account.id, None)
-            return True
+        self._notify_revocation(record.account.id)
+        return True
 
     async def revoke_user(self, user_id: UUID) -> None:
         """Revoke the active session for a user after an authority-bearing change."""
@@ -168,3 +190,6 @@ class UserSessionManager:
             digest = self._user_tokens.pop(user_id, None)
             if digest is not None:
                 self._sessions.pop(digest, None)
+        # Authority changes must also invalidate pending authentication when
+        # no full session exists yet (for example SSO followed by local MFA).
+        self._notify_revocation(user_id)

@@ -27,8 +27,42 @@ _BEGIN = _NOW - timedelta(hours=4)
 _ASSETS = Path(__file__).resolve().parents[2] / "src/k5vision/operator_web"
 
 
+def _ui_core(account):
+    return {
+        "id": account.get("id", "a22c22bc-4089-45b7-a370-f360bb9d33c0"),
+        "username": account["username"],
+        "display_name": account.get("display_name", account["username"]),
+        "role": account["role"],
+        "enabled": account.get("enabled", True),
+    }
+
+
+def _ui_inventory(account, cameras, **extra):
+    from k5vision.operator_role_policy import BASE_PERMISSIONS
+
+    permissions = sorted(account.get("effective_permissions", BASE_PERMISSIONS[account["role"]]))
+    return {
+        **extra,
+        "cameras": cameras,
+        "capabilities": {
+            "account": {
+                **_ui_core(account),
+                "role_profile_id": account.get("role_profile_id"),
+                "effective_permissions": permissions,
+            },
+            "effective_permissions": permissions,
+            "can_export": "cameras.export" in permissions,
+            "can_manage_users": "users.manage" in permissions,
+            "can_manage_cameras": "cameras.manage" in permissions,
+            "can_view_history": "cameras.playback" in permissions,
+        },
+    }
+
+
 @contextmanager
-def _history_page(export_response=None, export_handler=None, download_response=None):
+def _history_page(
+    export_response=None, export_handler=None, download_response=None, *, wait_for_history=True
+):
     browser_api = pytest.importorskip("playwright.sync_api")
     channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
     with browser_api.sync_playwright() as api:
@@ -144,14 +178,14 @@ def _history_page(export_response=None, export_handler=None, download_response=N
                     "expires_in_seconds": 300,
                 }
             elif path == "/api/v1/auth/me":
-                data = account
+                data = _ui_core(account)
             elif path == "/api/v1/operator/status":
                 data = {
                     "worker_status": "ready",
                     "server_utc": _NOW.isoformat().replace("+00:00", "Z"),
                 }
             elif path == "/api/v1/operator/cameras":
-                data = {"worker_status": "ready", "cameras": [camera]}
+                data = _ui_inventory(account, [camera], worker_status="ready")
             elif path.endswith("/media-session"):
                 data = {
                     "live_url": f"/media/live/{_CAMERA}/index.m3u8",
@@ -172,7 +206,9 @@ def _history_page(export_response=None, export_handler=None, download_response=N
             page.locator("#password").fill("generated-human-password")
             page.locator("#sign-in-button").click()
             page.locator(f'[data-camera-id="{_CAMERA}"] [data-wall-action="recordings"]').click()
-            browser_api.expect(page.locator("#history-count")).to_have_text("18")
+            page.locator("#history-panel").wait_for(state="visible")
+            if wait_for_history:
+                browser_api.expect(page.locator("#history-count")).to_have_text("18")
             yield page, browser_api.expect
             assert not errors
         finally:
@@ -190,6 +226,147 @@ def _jump(page, at):
         at.isoformat(timespec="seconds").replace("+00:00", "").removesuffix(":00")
     )
     page.locator("#playback-form").evaluate("form => form.requestSubmit()")
+
+
+@pytest.mark.parametrize("held_phase", ["status", "history"])
+@pytest.mark.parametrize("final_action", ["recorded", "gap", "leave"])
+def test_event_click_waits_for_initial_history_and_latest_click_wins(held_phase, final_action):
+    """Provider events are actionable before the selected camera's inventory arrives."""
+    pending, history_requests = [], []
+    status_count = 0
+    moments = [_BEGIN + timedelta(minutes=5), _BEGIN + timedelta(minutes=65)]
+    if final_action == "gap":
+        moments[-1] = _BEGIN + timedelta(minutes=125)
+
+    def delayed_inventory(route):
+        nonlocal status_count
+        path = urlsplit(route.request.url).path
+        if path == "/api/v1/operator/status":
+            status_count += 1
+            if held_phase == "status" and status_count == 2:
+                pending.append(route)
+                return True
+        if path.endswith("/history"):
+            history_requests.append(route.request.url)
+            if held_phase == "history" and len(history_requests) == 1:
+                pending.append(route)
+                return True
+        if path.endswith("/integration-events"):
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "events": [
+                            {
+                                "sequence": index + 1,
+                                "source_id": _CAMERA,
+                                "event_id": f"early-provider-{index}",
+                                "event_type": "analytics.person",
+                                "status": "confirmed",
+                                "confidence": 0.9,
+                                "observed_at": at.isoformat(),
+                                "playback_at": at.isoformat(),
+                            }
+                            for index, at in enumerate(moments)
+                        ],
+                        "has_more": False,
+                        "next_before": None,
+                    }
+                ),
+            )
+            return True
+        return False
+
+    with _history_page(export_handler=delayed_inventory, wait_for_history=False) as (page, expect):
+        buttons = page.locator("#analytics-provider-events button")
+        expect(buttons).to_have_count(2)
+        assert len(pending) == 1
+        buttons.nth(0).click()
+        buttons.nth(1).click()
+        assert page.locator("#playback-video").get_attribute("src") is None
+        assert "No playable recording" not in page.locator("#playback-message").inner_text()
+        if final_action == "leave":
+            page.locator("#wall-tab").click()
+        body = {"worker_status": "ready", "server_utc": _NOW.isoformat().replace("+00:00", "Z")}
+        if held_phase == "history":
+            body = {
+                "spans": [
+                    {
+                        "recording_id": f"generated-{index}",
+                        "started_at": (
+                            _BEGIN + timedelta(minutes=index * 10 + (10 if index >= 12 else 0))
+                        ).isoformat(),
+                        "duration_seconds": 600,
+                    }
+                    for index in range(18)
+                ]
+            }
+        pending[0].fulfill(content_type="application/json", body=json.dumps(body))
+        if final_action == "leave":
+            # Drain the fulfilled response's microtasks before checking navigation cancellation.
+            page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame(() => "
+                "requestAnimationFrame(resolve)))"
+            )
+            assert page.locator("#wall-panel").is_visible()
+            assert page.locator("#playback-video").get_attribute("src") is None
+            assert page.locator("#playback-video").get_attribute("data-utc-start") is None
+            return
+        if final_action == "recorded":
+            expected = moments[-1].isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            expect(page.locator("#playback-video")).to_have_attribute("data-utc-start", expected)
+        else:
+            expect(page.locator("#playback-message")).to_contain_text("No playable recording")
+            assert page.locator("#playback-video").get_attribute("src") is None
+        expect(page.locator("#history-count")).to_have_text("18")
+        assert len(history_requests) == 1
+        assert page.locator(".history-gap").count() == 3
+
+
+def test_old_recorder_time_response_cannot_reset_a_newer_history_and_event_seek():
+    pending, history_requests = [], []
+    status_count = 0
+
+    def delayed_status(route):
+        nonlocal status_count
+        path = urlsplit(route.request.url).path
+        if path == "/api/v1/operator/status":
+            status_count += 1
+            if status_count == 2:
+                route.request.frame.evaluate("window.initialHistoryStatusHeld=true")
+                pending.append(route)
+                return True
+        if path.endswith("/history"):
+            history_requests.append(route.request.url)
+        return False
+
+    with _history_page(export_handler=delayed_status, wait_for_history=False) as (page, expect):
+        page.wait_for_function("window.initialHistoryStatusHeld===true")
+        page.locator("#last-24-hours").click()
+        expect(page.locator("#history-count")).to_have_text("18")
+        first = page.locator("#history-start").input_value()
+        last = page.locator("#history-end").input_value()
+        event_at = _BEGIN + timedelta(minutes=65)
+        page.evaluate("at => window.K5Playback.seekUTC(at)", event_at.isoformat())
+        expected = event_at.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        expect(page.locator("#playback-video")).to_have_attribute("data-utc-start", expected)
+        pending[0].fulfill(
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "worker_status": "ready",
+                    "server_utc": _NOW.isoformat().replace("+00:00", "Z"),
+                }
+            ),
+        )
+        page.evaluate(
+            "() => new Promise(resolve => requestAnimationFrame(() => "
+            "requestAnimationFrame(resolve)))"
+        )
+        assert len(history_requests) == 1
+        assert page.locator("#history-start").input_value() == first
+        assert page.locator("#history-end").input_value() == last
+        expect(page.locator("#playback-video")).to_have_attribute("data-utc-start", expected)
 
 
 def test_full_day_zoom_and_rapid_seeks_keep_export_selection_independent():

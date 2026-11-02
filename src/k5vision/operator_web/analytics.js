@@ -68,7 +68,8 @@
     let camera = null, range = null, settings = null, events = [], before = null;
     let visible = false, destroyed = false, epoch = 0, controller = null, timer = null;
     let loading = false, saving = false, dirty = false, loadedOlder = false;
-    let requestNumber = 0, eventRequestNumber = 0;
+    let requestNumber = 0, eventRequestNumber = 0, providerRequestNumber = 0;
+    let providerEvents = [], providerBefore = null, providerLoadedOlder = false;
 
     container.classList.add("analytics-panel");
     container.setAttribute("aria-labelledby", "analytics-title");
@@ -109,7 +110,15 @@
     const eventMessage = element("p", "form-message"); eventMessage.id = "analytics-events-message"; eventMessage.setAttribute("role", "status"); eventMessage.setAttribute("aria-live", "polite");
     const eventList = element("ol", "analytics-events"); eventList.id = "analytics-events"; eventList.setAttribute("aria-label", "Recorded person events");
     const olderButton = element("button", "button secondary", "Load older events"); olderButton.type = "button"; olderButton.id = "analytics-older"; olderButton.hidden = true;
-    container.replaceChildren(heading, health, statusMessage, form, limits, eventHeading, eventRange, eventMessage, eventList, olderButton);
+    const providerSection = element("section", "analytics-provider-events"); providerSection.setAttribute("aria-label", "Provider events");
+    const providerHeading = element("div", "analytics-events-heading"); providerHeading.append(element("h4", "", "Recent provider events"));
+    const providerRefresh = element("button", "button secondary", "Refresh provider events"); providerRefresh.type = "button"; providerRefresh.id = "analytics-provider-refresh"; providerHeading.append(providerRefresh);
+    const providerHelp = element("p", "field-help", "Recent accepted analytics-provider observations across recording history. Candidate, confirmed and cleared results remain distinct. Select an event to find footage at its reported UTC.");
+    const providerMessage = element("p", "form-message"); providerMessage.id = "analytics-provider-message"; providerMessage.setAttribute("role", "status"); providerMessage.setAttribute("aria-live", "polite");
+    const providerList = element("ol", "analytics-events"); providerList.id = "analytics-provider-events";
+    const providerOlder = element("button", "button secondary", "Load older provider events"); providerOlder.type = "button"; providerOlder.id = "analytics-provider-older"; providerOlder.hidden = true;
+    providerSection.append(providerHeading, providerHelp, providerMessage, providerList, providerOlder);
+    container.replaceChildren(heading, health, statusMessage, form, limits, eventHeading, eventRange, eventMessage, eventList, olderButton, providerSection);
 
     function message(node, text = "", error = false) {
       node.textContent = text;
@@ -119,7 +128,7 @@
     function session() {
       const value = getSession();
       return value?.token && ["administrator", "operator", "viewer"].includes(value.account?.role)
-        ? { token: value.token, epoch: value.epoch, account: { role: value.account.role } } : null;
+        ? { token: value.token, epoch: value.epoch, account: { role: value.account.role, ...(Array.isArray(value.account.effective_permissions) ? { effective_permissions: [...value.account.effective_permissions] } : {}) } } : null;
     }
 
     function current(start, version, cameraId) {
@@ -136,7 +145,8 @@
 
     function controls() {
       const active = !destroyed && visible && Boolean(camera) && Boolean(session());
-      const administrator = session()?.account.role === "administrator";
+      const account = session()?.account;
+      const administrator = account?.role === "administrator" && (!Array.isArray(account.effective_permissions) || account.effective_permissions.includes("analytics.manage"));
       form.hidden = !administrator;
       form.setAttribute("aria-busy", String(saving));
       enabled.disabled = !active || !settings || saving;
@@ -144,6 +154,7 @@
       saveButton.disabled = !active || !settings || saving || !dirty;
       refreshButton.disabled = !active || loading || saving;
       olderButton.disabled = !active || loading || saving || !before;
+      providerRefresh.disabled = !active || loading || saving; providerOlder.disabled = !active || loading || saving || !providerBefore;
       saveButton.textContent = saving ? "Saving…" : "Save detection settings";
     }
 
@@ -233,6 +244,52 @@
       }
     }
 
+    function validProviderEvent(value, cameraId) {
+      return value && Number.isSafeInteger(value.sequence) && value.sequence > 0 && value.source_id === cameraId
+        && typeof value.event_id === "string" && value.event_id.length <= 128
+        && typeof value.event_type === "string" && value.event_type.length <= 128
+        && ["candidate", "confirmed", "cleared", "abstain"].includes(value.status)
+        && timestamp(value.observed_at) && timestamp(value.playback_at)
+        && (value.confidence === null || Number.isFinite(value.confidence) && value.confidence >= 0 && value.confidence <= 1);
+    }
+    function renderProviderEvents() {
+      const start = session(), version = epoch, cameraId = camera?.device_id;
+      providerList.replaceChildren(...providerEvents.map((event) => {
+        const row = element("li", "analytics-event"); row.dataset.providerEventId = event.event_id;
+        const open = element("button", "analytics-event-button"); open.type = "button";
+        open.append(element("strong", "", event.event_type.replaceAll(".", " · ")), element("span", "", utcLabel(event.observed_at)), element("span", "muted", `${event.status} · ${event.confidence === null ? "Confidence unavailable" : `${Math.round(event.confidence * 100)}% confidence`}`));
+        open.addEventListener("click", () => { if (start && current(start, version, cameraId)) Promise.resolve().then(() => onSeek({ cameraId, timestamp: event.playback_at })).catch(() => { if (current(start, version, cameraId)) message(providerMessage, "This provider event could not open recorded footage. Refresh history and try again.", true); }); }); row.append(open); return row;
+      }));
+      providerOlder.hidden = !providerBefore || providerEvents.length >= MAX_EVENTS; controls();
+    }
+    async function loadProviderEvents(start, version, cameraId, append = false) {
+      const number = ++providerRequestNumber, query = new URLSearchParams({ limit: String(PAGE_SIZE) });
+      if (append && providerBefore) query.set("before", String(providerBefore));
+      try {
+        const data = await request(`${PREFIX}/${cameraId}/integration-events?${query}`, { signal: controller.signal });
+        if (!current(start, version, cameraId) || number !== providerRequestNumber) return;
+        if (!Array.isArray(data?.events) || data.events.length > PAGE_SIZE || !data.events.every((e) => validProviderEvent(e, cameraId)) || typeof data.has_more !== "boolean" || !(data.next_before === null || Number.isSafeInteger(data.next_before) && data.next_before > 0) || data.has_more && data.next_before === null) throw new Error("Invalid provider events");
+        const merged = append ? [...providerEvents, ...data.events] : data.events;
+        providerEvents = [...new Map(merged.map((e) => [e.sequence, e])).values()].slice(0, MAX_EVENTS);
+        providerBefore = data.has_more ? data.next_before : null; providerLoadedOlder = append; renderProviderEvents();
+        message(providerMessage, providerEvents.length ? providerEvents.length >= MAX_EVENTS && data.has_more ? "Showing 250 recent provider events. Refresh to return to the latest events." : "Select a provider event to find its recorded footage. Its status is the provider's observation, not authorization to act." : "No accepted provider events for this camera. Built-in person events are listed above.");
+      } catch (error) {
+        if (error.name !== "AbortError" && current(start, version, cameraId) && number === providerRequestNumber) {
+          if (!append) { providerEvents = []; providerBefore = null; renderProviderEvents(); }
+          message(providerMessage, error.status === 403 ? "Your account cannot view provider events for this camera." : error.status === 404 ? "Provider event history is unavailable in this running build." : "Provider events could not be loaded. Select Refresh provider events to try again.", true);
+        }
+      }
+    }
+    async function refreshProviderEvents(append = false) {
+      const start = session(), cameraId = camera?.device_id;
+      if (!start || !cameraId || !visible || loading || saving || append && !providerBefore) return;
+      const version = epoch; loading = true; controller ??= new AbortController(); controls();
+      try { await loadProviderEvents(start, version, cameraId, append); }
+      finally { if (current(start, version, cameraId)) { loading = false; controls(); schedule(); } }
+    }
+    providerRefresh.addEventListener("click", () => { providerLoadedOlder = false; void refreshProviderEvents(); });
+    providerOlder.addEventListener("click", () => void refreshProviderEvents(true));
+
     function schedule() {
       if (timer !== null) clearTimeout(timer);
       timer = null;
@@ -244,10 +301,10 @@
       if (destroyed || !visible || !start || !cameraId || saving || loading) return;
       const version = epoch, number = ++requestNumber;
       controller ??= new AbortController(); loading = true;
-      if (manual) { loadedOlder = false; before = null; }
+      if (manual) { loadedOlder = false; before = null; providerLoadedOlder = false; providerBefore = null; }
       controls();
       try {
-        await Promise.allSettled([loadSettings(start, version, cameraId, number), ...(!loadedOlder || manual ? [loadEvents(start, version, cameraId)] : [])]);
+        await Promise.allSettled([loadSettings(start, version, cameraId, number), ...(!providerLoadedOlder || manual ? [loadProviderEvents(start, version, cameraId)] : []), ...(!loadedOlder || manual ? [loadEvents(start, version, cameraId)] : [])]);
       } finally {
         if (current(start, version, cameraId) && number === requestNumber) { loading = false; controls(); schedule(); }
       }
@@ -256,7 +313,7 @@
     async function save(event) {
       event.preventDefault();
       const start = session(), cameraId = camera?.device_id;
-      if (destroyed || !visible || !cameraId || !start || start.account.role !== "administrator" || saving || !settings) return;
+      if (destroyed || !visible || !cameraId || !start || (start.account.role !== "administrator" || (Array.isArray(start.account.effective_permissions) && !start.account.effective_permissions.includes("analytics.manage"))) || saving || !settings) return;
       const percent = Number(confidence.value);
       if (!Number.isInteger(percent) || percent < 50 || percent > 99) { message(statusMessage, "Choose a confidence between 50% and 99%.", true); return; }
       stopRequests(); controller = new AbortController(); const version = epoch;
@@ -277,6 +334,7 @@
 
     function resetDisplay() {
       settings = null; events = []; before = null; dirty = false; loadedOlder = false;
+      providerEvents = []; providerBefore = null; providerLoadedOlder = false; renderProviderEvents(); message(providerMessage);
       enabled.checked = false; confidence.value = "60"; renderSettings(); renderEvents();
       message(statusMessage); message(eventMessage);
     }

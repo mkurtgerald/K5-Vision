@@ -150,6 +150,8 @@ def trusted_payload_variants(source: Path):
         "k5vision/operator_web/admin.js",
         "k5vision/operator_web/analytics.css",
         "k5vision/operator_web/analytics.js",
+        "k5vision/operator_web/settings.css",
+        "k5vision/operator_web/settings.js",
     }
     result = {}
     for name, exact in alpha.source_payload(source).items():
@@ -593,6 +595,8 @@ def test_trusted_checkout_variants_reject_mixed_endings_and_tamper(tmp_path):
         "operator_web/admin.js": b'"use strict";\nconst administration = 1;\n',
         "operator_web/analytics.css": b".analytics-panel {\n  display: block;\n}\n",
         "operator_web/analytics.js": b'"use strict";\nconst analytics = 1;\n',
+        "operator_web/settings.css": b".settings-panel {\n  display: block;\n}\n",
+        "operator_web/settings.js": b'"use strict";\nconst settings = 1;\n',
         "data/other.txt": b"unclassified\ntext\n",
         "data/unknown-manifest.json": b'{\n"unclassified": true\n}\n',
         "operator_web/other.html": b"unclassified\nasset\n",
@@ -622,6 +626,8 @@ def test_trusted_checkout_variants_reject_mixed_endings_and_tamper(tmp_path):
         "operator_web/admin.js",
         "operator_web/analytics.css",
         "operator_web/analytics.js",
+        "operator_web/settings.css",
+        "operator_web/settings.js",
     )
     for name in trusted_text:
         data = files[name]

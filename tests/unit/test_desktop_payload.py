@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import io
 import json
@@ -36,6 +37,124 @@ def test_exact_donor_identity_detects_size_and_content_tampering(builder, tmp_pa
     donor.write_bytes(b"verified native donor plus")
     with pytest.raises(ValueError, match="identity mismatch"):
         builder.admit(donor, identity)
+
+
+def test_identity_native_smoke_executes_rs256_jwk_and_totp_primitives(builder):
+    # This executes genuine crypto primitives; the Windows payload builder runs
+    # the same code in its isolated embedded interpreter before packaging.
+    exec(builder.IDENTITY_CRYPTO_SMOKE, {})
+
+
+def test_actual_combined_embedded_smoke_script_is_valid_python(builder):
+    source = (builder.ROOT / "scripts/build_desktop_payload.py").read_text(encoding="utf-8")
+    expressions = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Add)
+        and any(
+            isinstance(child, ast.Name) and child.id == "IDENTITY_CRYPTO_SMOKE"
+            for child in ast.walk(node)
+        )
+    ]
+    # The largest containing expression is the real combined -c argument.
+    expression = max(expressions, key=lambda node: len(ast.get_source_segment(source, node)))
+    assembled = eval(compile(ast.Expression(expression), "<smoke argument>", "eval"), vars(builder))
+    compile(assembled, "<actual embedded -c smoke>", "exec")
+
+
+def _identity_crypto_material(builder, tmp_path, monkeypatch):
+    root, payload = tmp_path / "source", tmp_path / "payload"
+    root.mkdir()
+    payload.mkdir()
+    monkeypatch.setattr(builder, "ROOT", root)
+    native = payload / "runtime/native.pyd"
+    native.parent.mkdir()
+    native.write_bytes(b"reviewed native identity binary")
+    notice = root / "native-NOTICES.txt"
+    notice.write_bytes(b"Complete upstream permission notice\nSecond original line\n")
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as target:
+        for name, raw in (
+            ("upstream/native.c", b"/* Original complete license */\nsource\n"),
+            ("upstream/prebuilt.lib", b"\x00unneededbinary"),
+        ):
+            member = tarfile.TarInfo(name)
+            member.size = len(raw)
+            target.addfile(member, io.BytesIO(raw))
+    source_bytes = archive.getvalue()
+    pin = {
+        "native_modules": [
+            {
+                "path": "runtime/native.pyd",
+                "bytes": native.stat().st_size,
+                "sha256": builder.digest(native),
+            }
+        ],
+        "notices": [
+            {
+                "source_path": notice.name,
+                "path": "licenses/native-NOTICES.txt",
+                "bytes": notice.stat().st_size,
+                "sha256": builder.digest(notice),
+            }
+        ],
+        "sources": [
+            {
+                "filename": "upstream.tar.gz",
+                "url": "https://public.invalid/source",
+                "bytes": len(source_bytes),
+                "sha256": sha256(source_bytes).hexdigest(),
+                "retain_text_sources": True,
+            }
+        ],
+    }
+    monkeypatch.setattr(builder, "urlopen", lambda *_args, **_kwargs: io.BytesIO(source_bytes))
+    return payload, pin, native, notice
+
+
+def test_identity_crypto_material_seals_notices_native_bytes_and_source_derivative(
+    builder, tmp_path, monkeypatch
+):
+    payload, pin, _native, notice = _identity_crypto_material(builder, tmp_path, monkeypatch)
+    raw = notice.read_bytes().replace(b"\n", b"\r\n")
+    notice.write_bytes(raw)
+    result = builder.provision_identity_crypto_material(payload, pin)
+    retained_notice = result["notices"][0]
+    assert (payload / retained_notice["path"]).read_bytes() == raw
+    assert retained_notice["sha256"] == sha256(raw).hexdigest()
+    source = result["sources"][0]
+    assert source["upstream_archive_sha256"] == pin["sources"][0]["sha256"]
+    assert source["retained_files"] == 1
+    with tarfile.open(payload / source["path"], "r:gz") as retained:
+        assert retained.getnames() == ["upstream/native.c"]
+        assert (
+            retained.extractfile("upstream/native.c").read()
+            == b"/* Original complete license */\nsource\n"
+        )
+    inventory = source["file_inventory"]
+    assert builder.digest(payload / inventory["path"]) == inventory["sha256"]
+
+
+@pytest.mark.parametrize("changed", ["native", "notice"])
+def test_identity_crypto_refuses_modified_native_or_incomplete_notice(
+    builder, tmp_path, monkeypatch, changed
+):
+    payload, pin, native, notice = _identity_crypto_material(builder, tmp_path, monkeypatch)
+    target = native if changed == "native" else notice
+    target.write_bytes(target.read_bytes()[:-1] + b"X")
+    with pytest.raises(ValueError, match="identity mismatch"):
+        builder.provision_identity_crypto_material(payload, pin)
+
+
+@pytest.mark.parametrize("name", ["../outside.tar.gz", "..\\outside.tar.gz", "C:outside.tar.gz"])
+def test_identity_source_paths_cannot_escape_installed_sources(
+    builder, tmp_path, monkeypatch, name
+):
+    payload, pin, _, _ = _identity_crypto_material(builder, tmp_path, monkeypatch)
+    pin["sources"][0]["filename"] = name
+    with pytest.raises(ValueError, match="source filename refused"):
+        builder.provision_identity_crypto_material(payload, pin)
 
 
 def test_source_download_rejects_archive_metadata_changes_even_when_source_matches(

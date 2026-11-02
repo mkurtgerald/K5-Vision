@@ -23,6 +23,38 @@ _CAMERA = "e4fd401d-ae8e-4ac2-9f92-e8287f241532"
 _OTHER = "2cad3cbb-c56a-4368-b3e6-e5032576b77a"
 
 
+def _ui_core(account):
+    return {
+        "id": account.get("id", "a22c22bc-4089-45b7-a370-f360bb9d33c0"),
+        "username": account["username"],
+        "display_name": account.get("display_name", account["username"]),
+        "role": account["role"],
+        "enabled": account.get("enabled", True),
+    }
+
+
+def _ui_inventory(account, cameras, **extra):
+    from k5vision.operator_role_policy import BASE_PERMISSIONS
+
+    permissions = sorted(account.get("effective_permissions", BASE_PERMISSIONS[account["role"]]))
+    return {
+        **extra,
+        "cameras": cameras,
+        "capabilities": {
+            "account": {
+                **_ui_core(account),
+                "role_profile_id": account.get("role_profile_id"),
+                "effective_permissions": permissions,
+            },
+            "effective_permissions": permissions,
+            "can_export": "cameras.export" in permissions,
+            "can_manage_users": "users.manage" in permissions,
+            "can_manage_cameras": "cameras.manage" in permissions,
+            "can_view_history": "cameras.playback" in permissions,
+        },
+    }
+
+
 def test_datetime_local_minute_boundary_accepts_shared_formatter_and_floors_microseconds():
     """Chromium canonicalizes zero seconds, which strict fill() must preserve."""
     browser_api = pytest.importorskip("playwright.sync_api")
@@ -70,6 +102,8 @@ def _operator_asset(route, assets):
         "admin.css",
         "analytics.js",
         "analytics.css",
+        "settings.js",
+        "settings.css",
     }:
         route.fulfill(status=404)
         return True
@@ -170,11 +204,11 @@ def test_focused_camera_switch_observes_its_own_grant_without_wall_response_ambi
                     "expires_in_seconds": 300,
                 }
             elif path == "/api/v1/auth/me":
-                data = account
+                data = _ui_core(account)
             elif path == "/api/v1/operator/status":
                 data = {"worker_status": "ready", "server_utc": datetime.now(UTC).isoformat()}
             elif path == "/api/v1/operator/cameras":
-                data = {"cameras": cameras, "worker_status": "ready"}
+                data = _ui_inventory(account, cameras, worker_status="ready")
             elif path.endswith("/media-session") and route.request.method == "POST":
                 identifier = path.split("/")[-2]
                 current = [grant for grant in grants if grant[0] == phase["mode"]]
@@ -322,11 +356,11 @@ def test_late_camera_connection_completion_preserves_explicit_wall_choice():
                     "expires_in_seconds": 300,
                 }
             elif path == "/api/v1/auth/me":
-                data = account
+                data = _ui_core(account)
             elif path == "/api/v1/operator/status":
                 data = {"worker_status": "ready", "server_utc": now.isoformat()}
             elif path == "/api/v1/operator/cameras":
-                data = {"cameras": cameras, "worker_status": "ready"}
+                data = _ui_inventory(account, cameras, worker_status="ready")
                 if hold["lists"]:
                     pending.append(route)
                     return
@@ -397,7 +431,7 @@ def test_late_camera_connection_completion_preserves_explicit_wall_choice():
             while pending:
                 pending.pop().fulfill(
                     content_type="application/json",
-                    body=json.dumps({"cameras": cameras, "worker_status": "ready"}),
+                    body=json.dumps(_ui_inventory(account, cameras, worker_status="ready")),
                 )
         # Two real animation frames run all response promise continuations and
         # deferred wall layout work, without a fixed delay to hide the race.
@@ -498,7 +532,7 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
                     "expires_in_seconds": 300,
                 }
             elif path == "/api/v1/auth/me":
-                data = account
+                data = _ui_core(account)
             elif path == "/api/v1/operator/status":
                 data = {
                     **service,
@@ -511,11 +545,11 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
                 elif clock_response["missing"]:
                     data.pop("server_utc")
             elif path == "/api/v1/operator/cameras":
-                data = {**service, "cameras": cameras}
+                data = _ui_inventory(account, cameras, **service)
                 if hold_camera_list["next"]:
                     hold_camera_list["next"] = False
                     held_camera_lists.append(
-                        (route, {**service, "cameras": [dict(item) for item in cameras]})
+                        (route, _ui_inventory(account, [dict(item) for item in cameras], **service))
                     )
                     return
             elif path.endswith("/recording") and method == "PUT":
@@ -851,9 +885,9 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
                     "expires_in_seconds": 300,
                 }
             elif path == "/api/v1/auth/me":
-                data = account
+                data = _ui_core(account)
             elif path == "/api/v1/operator/cameras":
-                data = {"worker_status": "ready", "cameras": cameras}
+                data = _ui_inventory(account, cameras, worker_status="ready")
             elif path == "/api/v1/operator/status":
                 data = {
                     "worker_status": "ready",
@@ -1035,7 +1069,7 @@ def test_timeline_gap_clears_previous_clip_and_download_without_losing_history(l
                     "expires_in_seconds": 300,
                 }
             elif path == "/api/v1/auth/me":
-                data = account
+                data = _ui_core(account)
             elif path == "/api/v1/operator/status":
                 data = {
                     "worker_status": "ready",
@@ -1043,7 +1077,7 @@ def test_timeline_gap_clears_previous_clip_and_download_without_losing_history(l
                     "clock": {"status": "observing", "sync_verified": False},
                 }
             elif path == "/api/v1/operator/cameras":
-                data = {"worker_status": "ready", "cameras": [camera]}
+                data = _ui_inventory(account, [camera], worker_status="ready")
             elif path.endswith("/media-session"):
                 data = {
                     "live_url": f"/media/live/{_CAMERA}/index.m3u8",
@@ -1175,7 +1209,7 @@ def test_direct_rtsp_enrollment_tests_privately_and_connects_only_an_opaque_prob
                         "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
                     }
                 elif path == "/api/v1/auth/me":
-                    data = account
+                    data = _ui_core(account)
                 elif path == "/api/v1/operator/status":
                     data = {
                         "worker_status": "ready",
@@ -1189,7 +1223,7 @@ def test_direct_rtsp_enrollment_tests_privately_and_connects_only_an_opaque_prob
                         },
                     }
                 elif path == "/api/v1/operator/cameras":
-                    data = {"cameras": cameras, "worker_status": "ready"}
+                    data = _ui_inventory(account, cameras, worker_status="ready")
                 elif path == "/api/v1/operator/camera-stream-probe":
                     probes.append(route.request.post_data_json)
                     data = {
