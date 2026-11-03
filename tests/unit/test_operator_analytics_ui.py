@@ -135,9 +135,7 @@ def test_unchanged_polled_event_keeps_its_click_target_until_event_data_changes(
     page.wait_for_function("window.seeks.length === 1")
     assert page.evaluate("window.seeks[0].timestamp") == "2026-10-27T12:29:58Z"
 
-    page.evaluate(
-        "() => {window.eventRows[0].confidence=0.91; return window.analytics.refresh();}"
-    )
+    page.evaluate("() => {window.eventRows[0].confidence=0.91; return window.analytics.refresh();}")
     assert "91% confidence" in page.locator("#analytics-events").inner_text()
     assert not page.evaluate(
         """() => document.querySelector(
