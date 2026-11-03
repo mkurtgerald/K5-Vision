@@ -73,9 +73,11 @@ class _Helpers:
         self.old_token = "old-" + "a" * 40
         self.new_token = "new-" + "b" * 40
 
-    def _login(self, page, origin, username, password):
+    def _login(self, page, origin, username, password, *, progress=None):
         assert origin == "http://127.0.0.1:5555"
         assert username == "generated-user" and password == "generated-secret"
+        assert callable(progress)
+        progress("workspace_visible")
         page.emit(_Inventory(self.old_token, self.stale_status))
         page.emit(_Inventory(self.new_token, self.current_status))
         return self.new_token
