@@ -21,6 +21,10 @@ For each donor component or copied source block, record:
 
 ## Current donor imports
 
+The operator's ONVIF camera onboarding adapts the reviewed go2rtc source slice
+recorded below. The retained upstream MIT terms continue to cover that donor
+material; the surrounding K5 license does not replace them.
+
 No Analytics business logic is vendored in K5. The following entry records the
 separate, exact-source engineering wheel and its supplemental license notice.
 
@@ -51,6 +55,67 @@ Package dependencies declared in `pyproject.toml` are dependencies, not automati
 4. Copyleft, source-available, non-commercial, research-only, evaluation-only, no-license, or ambiguous material requires explicit review before incorporation.
 5. Public availability is not evidence of permission to copy or commercialize code.
 6. If provenance cannot be demonstrated, do not merge the material.
+
+## go2rtc ONVIF discovery and stream resolution source slice
+
+- **Source:** https://github.com/AlexxIT/go2rtc
+- **Version/commit:** `v1.9.14`,
+  `b5948cfb25404cc5cb37b166ecaa2dca20b11d4b`
+- **License:** MIT, exact upstream root `LICENSE`; no different license was
+  identified for the three selected ONVIF source files
+- **Copyright:** Copyright (c) 2022 Alexey Khit
+- **K5 files affected:** `src/k5vision/operator_onvif.py`, its operator API/UI
+  integration and acceptance tests, `third_party/licenses/go2rtc-MIT.txt`, and
+  the donor/distribution/desktop dependency records
+- **Integration method:** selected Go source behavior and SOAP message structure
+  adapted into a bounded Python standard-library connector. No go2rtc executable,
+  Go runtime, module dependency tree, WSDL bundle, or ONVIF Device Manager source
+  is incorporated.
+- **Adapted source scope:**
+  - `pkg/onvif/client.go`: device `GetCapabilities`, media `GetProfiles` and
+    `GetStreamUri` flow, and inheriting supplied camera credentials when the
+    returned stream URI has no user information
+  - `pkg/onvif/envelope.go`: SOAP envelope/WS-Security UsernameToken structure,
+    nonce, creation time and SHA-1 password digest
+  - `pkg/onvif/helpers.go`: multicast WS-Discovery Probe and camera scope/name
+    extraction. The unrelated `GetPosixTZ` function, which credits a separate
+    upstream project, is outside the adopted slice.
+- **Modifications:** Python standard-library transport/XML implementation;
+  numeric camera-address pinning, strict XML handling, bounded response bytes,
+  deadlines and concurrency; HTTP Digest support and Media2 fallback. The GUI
+  offers discovery, camera credentials, an H.264 profile and **Connect**; K5
+  resolves the underlying RTSP URI. ONVIF server behavior, PTZ, imaging,
+  configuration writes and the donor's regular-expression XML parser are not
+  adopted.
+- **Purpose/runtime scope:** native Windows camera onboarding for the recording
+  operator. The existing MediaMTX recording and Caddy delivery boundaries remain
+  in use. No shell, separate Python install, go2rtc process, or additional Python
+  distribution is needed by the desktop user.
+- **Required notices:** the complete unchanged MIT license/copyright is retained
+  in `third_party/licenses/go2rtc-MIT.txt`, the adapted module's inline donor
+  notice, the distribution notice register and the desktop installer's licenses.
+  Preserve these with copies/substantial portions of the adapted source.
+- **Commercial use:** approved for this exact selected-source adaptation under
+  MIT with its notices preserved. This does not clear unrelated go2rtc packages,
+  assets, dependencies or executables, change K5-owned source terms, or claim
+  physical-camera qualification.
+- **Reviewed by:** automated exact Git object, selected-file source and notice
+  identity inspection under `docs/COMMERCIAL_DEPENDENCY_POLICY.md`; no legal
+  sign-off is claimed
+- **Reviewed on:** 2026-10-18
+- **Replacement boundary:** `operator_onvif.py` discovery, profile selection and
+  stream-resolution contract; the recording worker and saved camera model remain
+  separate. An upstream/source-scope change needs a new donor review and native
+  onboarding acceptance.
+- **Integrity references:** the local upstream checkout resolves the tag and
+  commit above. Exact source identities are:
+
+| Upstream file | Git blob | SHA-256 |
+| --- | --- | --- |
+| `LICENSE` (1,068 bytes) | `beb8fca089b8d99cb85586015cdaf68959114cf8` | `b0dcf4855af5a72b4dfbd9117c207b330f4cc35658576a0b5351d6e2becac546` |
+| `pkg/onvif/client.go` | `bad103c71f3b88ccb61cc098d0423f9df03e7f43` | `fc523c62bac62cb6a12ff9fde8eb752d41be3721457c25bd3b6463ba6cdd7b0c` |
+| `pkg/onvif/envelope.go` | `76a41260a36d22661938e3e8c78ccd9b2ff3129c` | `6de78d351fd43c112dbe180b56690dda8a06cb94ac326e5b6a7f0559921a3bed` |
+| `pkg/onvif/helpers.go` | `8fac9ac4cbb8cfd3e359a4a2e4ad59a34e26b27d` | `1fe6e4935027bfaf84ab5f5382808fc63c8feaa1a0809b50f47750ec643b2807` |
 
 ## Analytics Lab engineering package wrapper
 
@@ -224,3 +289,49 @@ Package dependencies declared in `pyproject.toml` are dependencies, not automati
   Full source/artifact references are in the test-tool manifest.
 - **Replacement:** supply separately admitted fixture tools; this does not
   change the K5/MediaMTX runtime or the normalized provider contract.
+
+## OpenVINO / Open Model Zoo optional operator person view
+
+- **Source:** https://github.com/openvinotoolkit/open_model_zoo
+- **Version/revision:** model `person-detection-retail-0013` FP16 at
+  `6697dead54ed1cdd664b0313189c2cb52ee6335e`; OpenVINO API/runtime `2026.3.1`,
+  NumPy `2.2.6`, OpenVINO telemetry `2025.2.0`.
+- **License/copyright:** model's official `model.yml` expressly links Apache-2.0;
+  copyright (c) 2023-2024 Intel Corporation. OpenVINO source is Apache-2.0;
+  NumPy source is BSD-3-Clause; exact platform/native/transitive wheel notice
+  closure remains separate from the API/model source review.
+- **K5 files affected:** `operator_analytics.py`, `operator_analytics_person.py`,
+  `data/operator-person-model-manifest.json`, unit/native witness tests, and
+  `docs/OPERATOR_PERSON_DETECTION_REVIEW.md`.
+- **Integration/modifications:** independently written K5 adapter uses documented
+  OpenVINO public APIs and exact local model bytes; no model or native binary is
+  committed, bundled or downloaded during product startup. No restricted
+  Analytics Lab detector, tracker or pose implementation is copied/imported.
+  Existing K5 worker lifecycle is reused without invoking its Analytics Lab
+  backend. No donor implementation source is modified.
+- **Purpose/runtime:** optional native CPU view-only person boxes; missing config
+  leaves inference disabled. MediaMTX recording remains independent. The
+  transient view cannot produce source-attested events or unattended analytics.
+- **Required notices:** full unchanged OMZ Apache-2.0 license at
+  `src/k5vision/data/analytics-runtime-Apache-2.0.txt`, Git blob
+  `261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64`; preserve Intel attribution and
+  all separately supplied runtime-wheel notices in any later redistribution.
+- **Development image:** official Apache OMZ model example at the same revision,
+  553,577 bytes, Git blob `de3f62ab7774b00d88d8658a142ea20993780323`, SHA-256
+  `2be4dfa4d874e5f7929bebd1baf401e2ee630c4bf36cead7a2f8d5421d583959`.
+  Ephemeral functional test only; no private cameras/data or image distribution.
+- **Review/commercial conclusion:** Apache permits commercial use of its licensed
+  material with required terms/notices. This closes the independent API/model
+  artifact identity for an optional engineering candidate, not legal sign-off,
+  model training-data provenance/suitability, native/transitive redistribution,
+  commercial release or physical-camera/accuracy acceptance.
+- **Reviewed by/on:** automated exact upstream model definition, documented
+  interface, artifact hashes, source license and example Git identity inspection,
+  2026-10-13. Real native execution is separately tested and reported per platform.
+- **Integrity:** model definition Git blob `7faf63ff85b3d8692cfe8dc20a98d2e765e0da96`;
+  README Git blob `3219ebf6ec2fe7ae954200b5f72a78b78c4cd663`; artifact size/SHA-384
+  and immutable source references in the pinned manifest. Only its two exact
+  LF/CRLF byte representations are admitted. Native model reads verify bounded
+  immutable XML/BIN bytes and do not reopen paths after admission.
+- **Replacement:** new model/revision/runtime requires new immutable manifest,
+  interface/provenance review and native execution; no unreviewed fallback.

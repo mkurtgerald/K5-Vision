@@ -13,13 +13,15 @@ import pytest
 
 from k5vision import identity_state
 from k5vision.domain.devices import Device, DeviceCreate, DeviceProtocol
+from k5vision.domain.users import UserCreate, UserPatch, UserRole
 from k5vision.operator_product_state import (
     MAX_OPERATOR_CAMERAS,
     OperatorCameraCapacityError,
     OperatorCameraStore,
     OperatorCameraStoreError,
 )
-from k5vision.services.device_registry import DeviceRegistry
+from k5vision.services.device_registry import DeviceRegistry, DeviceRegistryConflictError
+from k5vision.services.user_registry import UserRegistry
 
 _SECRET = "source-fixture-private-secret"
 
@@ -97,6 +99,75 @@ def test_atomic_upsert_reload_remove_and_independent_device_objects(identity) ->
     last.close()
 
 
+def test_recording_choice_survives_source_update_restart_and_onvif_reconnect(identity) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    history = identity.directory / "recordings" / previous.binding.path_name / "retained.mp4"
+    history.parent.mkdir(parents=True)
+    history.write_bytes(b"retained video")
+    try:
+        assert previous.recording_enabled is True
+        paused = store.set_recording_enabled(device.id, False)
+        assert paused.recording_enabled is False
+        assert paused.binding == previous.binding and paused.source_uri == previous.source_uri
+        updated = store.upsert(device, _uri(device, "new-profile"))
+        assert updated.recording_enabled is False
+        store.close()
+        store = OperatorCameraStore(identity.directory, identity.site_id, registry=registry)
+        assert store.get(device.id).recording_enabled is False
+        reconnected = store.reconnect_onvif(device.id, _uri(device, "onvif"), 8443, True)
+        assert reconnected.recording_enabled is False
+        assert reconnected.binding == previous.binding
+        assert history.read_bytes() == b"retained video"
+        store.remove(device.id)
+        assert not store._connection.execute("SELECT * FROM camera_recording").fetchall()
+        # Removing a camera clears only its saved preference, never its footage.
+        assert history.read_bytes() == b"retained video"
+        assert store.reconnect_onvif(device.id, _uri(device), 8443, True).recording_enabled is True
+    finally:
+        store.close()
+        registry.close()
+
+
+def test_existing_source_database_migrates_with_recording_enabled(identity) -> None:
+    device = _device()
+    store = OperatorCameraStore(identity.directory, identity.site_id)
+    source = store.upsert(device, _uri(device))
+    store.close()
+    # Prior releases have only the original three-column camera source schema.
+    _change(identity, "DROP TABLE camera_recording")
+    store = OperatorCameraStore(identity.directory, identity.site_id)
+    try:
+        restored = store.get(device.id)
+        assert restored == source and restored.recording_enabled is True
+        assert store.set_recording_enabled(device.id, False).recording_enabled is False
+    finally:
+        store.close()
+
+
+def test_recording_preference_write_failure_preserves_prior_choice_and_source(identity) -> None:
+    device = _device()
+    store = OperatorCameraStore(identity.directory, identity.site_id)
+    source = store.upsert(device, _uri(device))
+    _change(
+        identity,
+        "CREATE TRIGGER refuse_preference BEFORE INSERT ON camera_recording "
+        "BEGIN SELECT RAISE(ABORT, 'source-fixture-private-secret'); END",
+    )
+    try:
+        with pytest.raises(OperatorCameraStoreError) as error:
+            store.set_recording_enabled(device.id, False)
+        assert _SECRET not in str(error.value)
+        assert not store._connection.in_transaction
+        assert store.get(device.id) == source
+        for invalid in (1, "false", None):
+            with pytest.raises(OperatorCameraStoreError):
+                store.set_recording_enabled(device.id, invalid)
+        with pytest.raises(OperatorCameraStoreError):
+            store.set_recording_enabled(UUID(int=99), False)
+    finally:
+        store.close()
+
+
 def test_store_checks_the_existing_site_scoped_device_registry(identity, tmp_path) -> None:
     registry = DeviceRegistry(database_path=tmp_path / "devices.sqlite3", site_id=identity.site_id)
     device = registry.enroll(
@@ -116,6 +187,161 @@ def test_store_checks_the_existing_site_scoped_device_registry(identity, tmp_pat
     with pytest.raises(OperatorCameraStoreError):
         OperatorCameraStore(identity.directory, identity.site_id, registry=foreign)
     foreign.close()
+
+
+def _registered_store(identity, *, database=None):
+    registry = DeviceRegistry(
+        database_path=database or identity.directory / "devices.sqlite3", site_id=identity.site_id
+    )
+    device = registry.register(
+        DeviceCreate(
+            name="Retained camera",
+            host="192.0.2.10",
+            protocols={DeviceProtocol.RTSP},
+            tags={"retained-label"},
+        )
+    )
+    store = OperatorCameraStore(identity.directory, identity.site_id, registry=registry)
+    previous = store.upsert(device, _uri(device, "old"))
+    return registry, store, device, previous
+
+
+def test_onvif_port_migration_preserves_identity_history_and_survives_restart(identity) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    history = identity.directory / "recordings" / previous.binding.path_name / "retained.mp4"
+    history.parent.mkdir(parents=True)
+    history.write_bytes(b"existing recording fixture")
+    try:
+        source = store.reconnect_onvif(device.id, _uri(device, "resolved"), 8443, True)
+        assert source.device.id == device.id
+        assert source.binding == previous.binding
+        assert source.device.management_port == 8443
+        assert source.device.tags == {"retained-label", "k5-onvif-https"}
+        assert source.device.protocols == {DeviceProtocol.RTSP, DeviceProtocol.ONVIF}
+        for field in ("name", "host", "kind"):
+            assert getattr(source.device, field) == getattr(device, field)
+        assert registry.get(device.id) == source.device
+        assert store.get(device.id) == source
+        assert history.read_bytes() == b"existing recording fixture"
+        assert [row[1] for row in store._connection.execute("PRAGMA database_list")] == ["main"]
+        store.close()
+        registry.close()
+        registry = DeviceRegistry(
+            database_path=identity.directory / "devices.sqlite3", site_id=identity.site_id
+        )
+        store = OperatorCameraStore(identity.directory, identity.site_id, registry=registry)
+        assert registry.get(device.id) == source.device
+        assert store.get(device.id) == source
+        assert history.read_bytes() == b"existing recording fixture"
+    finally:
+        store.close()
+        registry.close()
+
+
+def test_onvif_private_write_failure_rolls_back_both_databases_without_credentials(
+    identity,
+) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    _change(
+        identity,
+        "CREATE TRIGGER refuse_reconnect BEFORE UPDATE ON camera_sources "
+        "BEGIN SELECT RAISE(ABORT, 'source-fixture-private-secret'); END",
+    )
+    try:
+        with pytest.raises(OperatorCameraStoreError) as raised:
+            store.reconnect_onvif(device.id, _uri(device, "resolved"), 8443, True)
+        assert raised.value.__context__ is None
+        assert _SECRET not in str(raised.value)
+        assert registry.get(device.id) == device
+        assert store.get(device.id) == previous
+        assert not store._connection.in_transaction
+        assert [row[1] for row in store._connection.execute("PRAGMA database_list")] == ["main"]
+        store.close()
+        store = OperatorCameraStore(identity.directory, identity.site_id, registry=registry)
+        assert store.get(device.id) == previous
+    finally:
+        store.close()
+        registry.close()
+
+
+def test_onvif_endpoint_conflict_preserves_canonical_and_private_state(identity) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    occupied = registry.register(
+        DeviceCreate(name="Separate endpoint", host=device.host, management_port=8080)
+    )
+    try:
+        with pytest.raises(DeviceRegistryConflictError) as raised:
+            store.reconnect_onvif(device.id, _uri(device, "resolved"), 8080, False)
+        assert raised.value.__context__ is None
+        assert registry.get(device.id) == device
+        assert registry.get(occupied.id) == occupied
+        assert store.get(device.id) == previous
+    finally:
+        store.close()
+        registry.close()
+
+
+def test_onvif_restores_removed_source_and_tracks_https_changes_without_new_identity(
+    identity,
+) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    try:
+        store.remove(device.id)
+        restored = store.reconnect_onvif(device.id, _uri(device, "restored"), 443, True)
+        assert restored.binding == previous.binding
+        assert len(registry.list()) == len(store.list_sources()) == 1
+        changed = store.reconnect_onvif(device.id, _uri(device, "http-settings"), 8080, False)
+        assert changed.binding == previous.binding
+        assert changed.device.tags == {"retained-label"}
+        assert registry.get(device.id) == changed.device
+    finally:
+        store.close()
+        registry.close()
+
+
+@pytest.mark.parametrize("target", ["main", "registry"])
+def test_onvif_cross_database_migration_refuses_wal_without_mutation(identity, target) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    handle = store._connection if target == "main" else registry._connection
+    handle.execute("PRAGMA journal_mode=WAL")
+    try:
+        with pytest.raises(OperatorCameraStoreError):
+            store.reconnect_onvif(device.id, _uri(device, "resolved"), 8443, True)
+        assert registry.get(device.id) == device
+        assert store.get(device.id) == previous
+    finally:
+        store.close()
+        registry.close()
+
+
+@pytest.mark.parametrize("foreign", ["memory", "outside"])
+def test_onvif_migration_refuses_noncanonical_registry(identity, tmp_path, foreign) -> None:
+    database = ":memory:" if foreign == "memory" else tmp_path / "devices.sqlite3"
+    registry, store, device, previous = _registered_store(identity, database=database)
+    try:
+        with pytest.raises(OperatorCameraStoreError):
+            store.reconnect_onvif(device.id, _uri(device, "resolved"), 8443, True)
+        assert registry.get(device.id) == device
+        assert store.get(device.id) == previous
+    finally:
+        store.close()
+        registry.close()
+
+
+def test_onvif_invalid_source_is_refused_before_a_transaction(identity) -> None:
+    registry, store, device, previous = _registered_store(identity)
+    commands = []
+    store._connection.set_trace_callback(commands.append)
+    try:
+        with pytest.raises(OperatorCameraStoreError):
+            store.reconnect_onvif(device.id, _uri(_device(2), "foreign"), 8443, True)
+        assert not any(command.startswith(("ATTACH", "BEGIN", "UPDATE")) for command in commands)
+        assert registry.get(device.id) == device
+        assert store.get(device.id) == previous
+    finally:
+        store._connection.set_trace_callback(None)
+        store.close()
+        registry.close()
 
 
 def test_capacity_limits_creates_but_allows_replacement(identity) -> None:
@@ -430,3 +656,191 @@ def test_closed_store_has_no_reusable_handle_and_preserves_state(identity) -> No
         with pytest.raises(OperatorCameraStoreError):
             operation()
     assert _database(identity).exists()
+
+
+@pytest.mark.parametrize(
+    "lifecycle",
+    [
+        "expired-pending",
+        "reset-original-pending",
+        "reset-original-expired",
+        "demote-original",
+        "disable-original",
+    ],
+)
+def test_user_credential_lifecycle_preserves_identity_camera_store_and_restart(
+    identity, monkeypatch, lifecycle
+):
+    import k5vision.services.user_registry as users_module
+
+    elapsed = [1000.0]
+    monkeypatch.setattr(users_module, "monotonic", lambda: elapsed[0])
+    devices, store, device, source = _registered_store(identity)
+    paused = store.set_recording_enabled(device.id, False)
+    history = identity.directory / "recordings" / source.binding.path_name / "retained.mp4"
+    history.parent.mkdir(parents=True)
+    retained = b"existing recording retained during account lifecycle"
+    history.write_bytes(retained)
+    users = UserRegistry(database_path=identity.database_path, site_id=identity.site_id)
+    original = users.list()[0]
+    backup, code, _ = users.create_with_bootstrap(
+        UserCreate(
+            username="backup.admin", display_name="Backup admin", role=UserRole.ADMINISTRATOR
+        ),
+        actor=original.username,
+    )
+    users.activate_bootstrap_password(
+        username=backup.username,
+        temporary_credential=code,
+        new_password="backup administrator fixture password",
+        actor="bootstrap-user",
+    )
+    temporary = None
+    target = original
+    try:
+        if lifecycle == "expired-pending":
+            target, temporary, _ = users.create_with_bootstrap(
+                UserCreate(
+                    username="pending.viewer", display_name="Pending viewer", role=UserRole.VIEWER
+                ),
+                actor=backup.username,
+                ttl_seconds=60,
+            )
+        elif lifecycle.startswith("reset-original"):
+            _, temporary, _ = users.reset_bootstrap(
+                original.id, actor=backup.username, ttl_seconds=60
+            )
+            assert users.credential_status(original.id) == "pending"
+            assert identity_state.load_identity_state(identity.directory) == identity
+        elif lifecycle == "demote-original":
+            users.update(original.id, UserPatch(role=UserRole.OPERATOR), actor=backup.username)
+        else:
+            users.update(original.id, UserPatch(enabled=False), actor=backup.username)
+        if "expired" in lifecycle:
+            elapsed[0] += 60
+            assert users.credential_status(target.id) == "expired"
+            assert (
+                users.activate_bootstrap_password(
+                    username=target.username,
+                    temporary_credential=temporary,
+                    new_password="replacement user fixture password",
+                    actor="bootstrap-user",
+                )
+                is None
+            )
+        assert identity_state.load_identity_state(identity.directory) == identity
+        assert store.list_sources() == (paused,)
+        assert history.read_bytes() == retained
+    finally:
+        users.close()
+        store.close()
+        devices.close()
+    assert identity_state.load_identity_state(identity.directory) == identity
+    reopened_devices = DeviceRegistry(
+        database_path=identity.directory / "devices.sqlite3", site_id=identity.site_id
+    )
+    reopened = OperatorCameraStore(identity.directory, identity.site_id, registry=reopened_devices)
+    try:
+        assert reopened.list_sources() == (paused,)
+        assert history.read_bytes() == retained
+    finally:
+        reopened.close()
+        reopened_devices.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "expiry", "valid"),
+    [
+        ("expired-bootstrap", "2035-01-01T00:00:00+00:00", True),
+        ("unknown-bootstrap", "2035-01-01T00:00:00+00:00", False),
+        ("expired-bootstrap", "2035-01-01T00:00:00", False),
+        ("expired-bootstrap", "invalid-expiry", False),
+        ("expired-bootstrap", None, False),
+    ],
+)
+def test_expired_credential_identity_admission_preserves_kind_and_expiry_checks(
+    identity, kind, expiry, valid
+):
+    users = UserRegistry(database_path=identity.database_path, site_id=identity.site_id)
+    pending, _, _ = users.create_with_bootstrap(
+        UserCreate(username="pending.viewer", display_name="Pending viewer", role=UserRole.VIEWER),
+        actor="fixture-admin",
+    )
+    users.close()
+    with sqlite3.connect(identity.database_path) as connection:
+        connection.execute(
+            "UPDATE user_credentials SET credential_kind = ?, expires_at = ? WHERE user_id = ?",
+            (kind, expiry, str(pending.id)),
+        )
+    if valid:
+        assert identity_state.load_identity_state(identity.directory) == identity
+    else:
+        with pytest.raises(identity_state.IdentityStateError):
+            identity_state.load_identity_state(identity.directory)
+
+
+def test_identity_requires_a_current_initialized_admin_beyond_historical_setup(identity):
+    with sqlite3.connect(identity.database_path) as connection:
+        connection.execute("UPDATE users SET role = 'viewer'")
+    with pytest.raises(identity_state.IdentityStateError):
+        identity_state.load_identity_state(identity.directory)
+
+
+@pytest.mark.parametrize("grants", ["absent", "selected"])
+def test_identity_admits_legacy_or_valid_camera_grants_without_rewriting(identity, grants):
+    users = UserRegistry(database_path=identity.database_path, site_id=identity.site_id)
+    viewer, _, _ = users.create_with_bootstrap(
+        UserCreate(username="restricted.viewer", display_name="Viewer", role=UserRole.VIEWER),
+        actor="fixture-admin",
+        camera_access={"mode": "selected", "camera_ids": [UUID(int=3)]},
+    )
+    users.close()
+    if grants == "absent":
+        with sqlite3.connect(identity.database_path) as connection:
+            connection.execute("DROP TABLE user_camera_access")
+    before = identity.database_path.read_bytes()
+    assert identity_state.load_identity_state(identity.directory) == identity
+    assert identity.database_path.read_bytes() == before
+    reopened = UserRegistry(database_path=identity.database_path, site_id=identity.site_id)
+    try:
+        assert reopened.get_camera_access(viewer.id) == (
+            {"mode": "all", "camera_ids": []}
+            if grants == "absent"
+            else {"mode": "selected", "camera_ids": [UUID(int=3)]}
+        )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("site_id", "foreign-site"),
+        ("user_id", str(UUID(int=99))),
+        ("mode", "unknown"),
+        ("camera_ids_json", "not-json"),
+        ("camera_ids_json", '["invalid-camera"]'),
+        ("camera_ids_json", '{"mode":"all"}'),
+        ("camera_ids_json", " " * 8193),
+        ("camera_ids_json", json.dumps([str(UUID(int=index)) for index in range(65)])),
+        ("camera_ids_json", json.dumps([str(UUID(int=3)), str(UUID(int=3))])),
+    ],
+)
+def test_identity_refuses_foreign_or_invalid_camera_grants(identity, column, value):
+    users = UserRegistry(database_path=identity.database_path, site_id=identity.site_id)
+    viewer, _, _ = users.create_with_bootstrap(
+        UserCreate(username="restricted.viewer", display_name="Viewer", role=UserRole.VIEWER),
+        actor="fixture-admin",
+        camera_access={"mode": "selected", "camera_ids": []},
+    )
+    users.close()
+    assert column in {"site_id", "user_id", "mode", "camera_ids_json"}
+    with sqlite3.connect(identity.database_path) as connection:
+        connection.execute(
+            f"UPDATE user_camera_access SET {column} = ? WHERE user_id = ?",
+            (value, str(viewer.id)),
+        )
+    before = identity.database_path.read_bytes()
+    with pytest.raises(identity_state.IdentityStateError):
+        identity_state.load_identity_state(identity.directory)
+    assert identity.database_path.read_bytes() == before

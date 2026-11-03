@@ -1,7 +1,8 @@
 """Own native service processes without launching outside their cleanup boundary.
 
 Windows starts an isolated Python relay, assigns it to a kill-on-close Job Object,
-then opens its stdin gate. Native children inherit that job and process group.
+then opens its stdin gate. Relay and native children never create console windows;
+native children inherit the owned job and process group.
 Linux uses a new session, retaining the leader until its process group is stopped.
 Arguments contain executable/configuration paths, never private source URLs.
 """
@@ -22,6 +23,7 @@ _START_GATE = b"K5_NATIVE_START_V1\n"
 _GRACE_SECONDS = 5.0
 _REAP_SECONDS = 2.0
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NO_WINDOW = 0x08000000
 
 
 class NativeProcessError(RuntimeError):
@@ -138,7 +140,7 @@ class OwnedNativeProcess:
                     stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    creationflags=_CREATE_NEW_PROCESS_GROUP,
+                    creationflags=_CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW,
                     close_fds=True,
                 )
                 self._job.assign(self._process)
@@ -209,7 +211,9 @@ class OwnedNativeProcess:
                 try:
                     process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", 1))
                 except OSError:
-                    pass  # A service without a console still has Job termination.
+                    # Consoleless workers cannot receive console control events.
+                    # Keep the bounded wait, then terminate only the owned job.
+                    pass
                 try:
                     process.wait(timeout=_GRACE_SECONDS)
                 except subprocess.TimeoutExpired:
@@ -264,8 +268,8 @@ def _relay(arguments: list[str]) -> int:
     gate = sys.stdin.buffer.read(len(_START_GATE))
     if gate != _START_GATE or sys.stdin.buffer.read(1):
         return 1
-    # The native child shares this group and handles CTRL_BREAK itself. Keep the
-    # relay waiting so native exit status and graceful shutdown remain observable.
+    # Keep the relay waiting so native exit status remains observable. Consoleless
+    # workers are still contained by the parent's kill-on-close Job Object.
     signal.signal(signal.SIGBREAK, lambda _signal, _frame: None)
     try:
         process = subprocess.Popen(
@@ -273,6 +277,7 @@ def _relay(arguments: list[str]) -> int:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=_CREATE_NO_WINDOW,
             close_fds=True,
         )
         return process.wait()

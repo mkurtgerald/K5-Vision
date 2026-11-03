@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "provider": "openvino-omz-person-view-v1",
+  "model": "person-detection-retail-0013",
+  "source_repository": "https://github.com/openvinotoolkit/open_model_zoo",
+  "source_revision": "6697dead54ed1cdd664b0313189c2cb52ee6335e",
+  "model_spec_git_blob_sha1": "7faf63ff85b3d8692cfe8dc20a98d2e765e0da96",
+  "model_readme_git_blob_sha1": "3219ebf6ec2fe7ae954200b5f72a78b78c4cd663",
+  "license_id": "Apache-2.0",
+  "license_git_blob_sha1": "261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64",
+  "license_file": "analytics-runtime-Apache-2.0.txt",
+  "copyright": "Copyright (c) 2023-2024 Intel Corporation",
+  "input": {
+    "name": "data",
+    "shape": [
+      1,
+      3,
+      320,
+      544
+    ],
+    "color": "BGR"
+  },
+  "output": {
+    "shape": [
+      1,
+      1,
+      200,
+      7
+    ],
+    "person_class_id": 1
+  },
+  "runtime_versions": {
+    "openvino": "2026.3.1",
+    "numpy": "2.2.6",
+    "openvino-telemetry": "2025.2.0"
+  },
+  "artifacts": [
+    {
+      "relative_path": "person-detection-retail-0013/FP16/person-detection-retail-0013.xml",
+      "bytes": 571233,
+      "sha384": "99ad3d4580a0123bef05ff77b6f46ccec16de974d1f5699fb94cd842e3242c6aa641f4977f9a5bb2f0fab42fe51cbb63",
+      "source_url": "https://storage.openvinotoolkit.org/repositories/open_model_zoo/2023.0/models_bin/1/person-detection-retail-0013/FP16/person-detection-retail-0013.xml"
+    },
+    {
+      "relative_path": "person-detection-retail-0013/FP16/person-detection-retail-0013.bin",
+      "bytes": 1445734,
+      "sha384": "a67422e3b5ec76057651d2a0237eab862de00e968c7eef1e5f333849ae64f91900bcd30a23e1b7dbaa07313e358759b9",
+      "source_url": "https://storage.openvinotoolkit.org/repositories/open_model_zoo/2023.0/models_bin/1/person-detection-retail-0013/FP16/person-detection-retail-0013.bin"
+    }
+  ],
+  "qualification": "Optional view-only engineering candidate; default disabled. Native execution, model suitability and product native/transitive redistribution qualification remain separate release gates."
+}

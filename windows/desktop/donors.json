@@ -1,0 +1,351 @@
+{
+  "schema_version": 1,
+  "python": {
+    "version": "3.12.10",
+    "source": "https://github.com/python/cpython/tree/0cc81280367df838c4b199f8f0378837165071c2",
+    "source_commit": "0cc81280367df838c4b199f8f0378837165071c2",
+    "url": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip",
+    "sha256": "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3",
+    "bytes": 11133606,
+    "license": "Python-2.0 / included upstream binary-component terms"
+  },
+  "inno_setup": {
+    "version": "6.4.3",
+    "source_commit": "9254dce05d45fd804f64bc802d6353cd9d44755c",
+    "url": "https://github.com/jrsoftware/issrc/releases/download/is-6_4_3/innosetup-6.4.3.exe",
+    "sha256": "f3c42116542c4cc57263c5ba6c4feabfc49fe771f2f98a79d2f7628b8762723b",
+    "bytes": 6454616,
+    "source": "https://github.com/jrsoftware/issrc/tree/is-6_4_3",
+    "license": "Inno Setup License"
+  },
+  "wheels": [
+    {
+      "name": "annotated-doc",
+      "version": "0.0.5",
+      "filename": "annotated_doc-0.0.5-py3-none-any.whl",
+      "sha256": "117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101",
+      "bytes": 5302,
+      "license": "MIT"
+    },
+    {
+      "name": "annotated-types",
+      "version": "0.8.0",
+      "filename": "annotated_types-0.8.0-py3-none-any.whl",
+      "sha256": "f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0",
+      "bytes": 13427,
+      "license": "MIT"
+    },
+    {
+      "name": "anyio",
+      "version": "4.15.1",
+      "filename": "anyio-4.15.1-py3-none-any.whl",
+      "sha256": "6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101",
+      "bytes": 132079,
+      "license": "MIT"
+    },
+    {
+      "name": "cffi",
+      "version": "2.1.1",
+      "filename": "cffi-2.1.1-cp312-cp312-win_amd64.whl",
+      "sha256": "f53e442b08449d42821fa4a4fba000095af9f62742a500f978a9f557ec44339a",
+      "bytes": 185919,
+      "license": "MIT-0"
+    },
+    {
+      "name": "click",
+      "version": "8.5.0",
+      "filename": "click-8.5.0-py3-none-any.whl",
+      "sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
+      "bytes": 125251,
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "cryptography",
+      "version": "50.0.2",
+      "filename": "cryptography-50.0.2-cp311-abi3-win_amd64.whl",
+      "sha256": "7afa5a6602a9f29af1f3a2965f831bae7c9d5d597b7cbb716d41ab3b7d89879c",
+      "bytes": 3824692,
+      "license": "Apache-2.0 OR BSD-3-Clause"
+    },
+    {
+      "name": "fastapi",
+      "version": "0.143.0",
+      "filename": "fastapi-0.143.0-py3-none-any.whl",
+      "sha256": "3e9395fd35276425b61b516a31fdd7c77fe2af83e41b4da22e30696fb1304c5d",
+      "bytes": 144665,
+      "license": "MIT"
+    },
+    {
+      "name": "h11",
+      "version": "0.16.0",
+      "filename": "h11-0.16.0-py3-none-any.whl",
+      "sha256": "63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86",
+      "bytes": 37515,
+      "license": "MIT"
+    },
+    {
+      "name": "idna",
+      "version": "3.20",
+      "filename": "idna-3.20-py3-none-any.whl",
+      "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c",
+      "bytes": 69583,
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "numpy",
+      "version": "2.2.6",
+      "filename": "numpy-2.2.6-cp312-cp312-win_amd64.whl",
+      "sha256": "c1f9540be57940698ed329904db803cf7a402f3fc200bfe599334c9bd84a40b2",
+      "bytes": 12614190,
+      "license": "BSD-3-Clause and retained OpenBLAS/GCC runtime notices"
+    },
+    {
+      "name": "opencv-python-headless",
+      "version": "5.0.0.93",
+      "filename": "opencv_python_headless-5.0.0.93-cp37-abi3-win_amd64.whl",
+      "sha256": "829717b6a95554f273e49e357cee3b3a2a26b6f4842fbc1bed2b45bdd8f87e0e",
+      "bytes": 43825962,
+      "license": "MIT/Apache-2.0; FFmpeg LGPL-2.1-or-later and retained native notices"
+    },
+    {
+      "name": "opentelemetry-api",
+      "version": "1.45.1",
+      "filename": "opentelemetry_api-1.45.1-py3-none-any.whl",
+      "sha256": "b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb",
+      "bytes": 60256,
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "openvino",
+      "version": "2026.3.1",
+      "filename": "openvino-2026.3.1-22476-cp312-cp312-win_amd64.whl",
+      "sha256": "b686302a47abf7c87b48cb265b3a894f787a1b6380f4ab9f5a511de838ba3c64",
+      "bytes": 75818370,
+      "license": "Apache-2.0 and retained native third-party notices"
+    },
+    {
+      "name": "openvino-telemetry",
+      "version": "2025.2.0",
+      "filename": "openvino_telemetry-2025.2.0-py3-none-any.whl",
+      "sha256": "bcb667e83a44f202ecf4cfa49281715c6d7e21499daec04ff853b7f964833599",
+      "bytes": 25227,
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "psutil",
+      "version": "7.2.2",
+      "filename": "psutil-7.2.2-cp37-abi3-win_amd64.whl",
+      "sha256": "eb7e81434c8d223ec4a219b5fc1c47d0417b12be7ea866e24fb5ad6e84b3d988",
+      "bytes": 137737,
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "pycparser",
+      "version": "3.12",
+      "filename": "pycparser-3.12-py3-none-any.whl",
+      "sha256": "a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e",
+      "bytes": 62600,
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "pydantic",
+      "version": "2.14.1",
+      "filename": "pydantic-2.14.1-py3-none-any.whl",
+      "sha256": "9195d967ec791692a04438115466764fb8b9a27b31f14a760437694f40d6b454",
+      "bytes": 488106,
+      "license": "MIT"
+    },
+    {
+      "name": "pydantic_core",
+      "version": "2.50.1",
+      "filename": "pydantic_core-2.50.1-cp312-cp312-win_amd64.whl",
+      "sha256": "132529c83901437ff642f585216831bf5fd7a91df66829907e155192ead62498",
+      "bytes": 2172522,
+      "license": "MIT"
+    },
+    {
+      "name": "PyJWT",
+      "version": "2.15.1",
+      "filename": "pyjwt-2.15.1-py3-none-any.whl",
+      "sha256": "42d59d631f7768a1028a64c7ff581a9bf7519804daf91fc5b6c56e30eec5e193",
+      "bytes": 33860,
+      "license": "MIT"
+    },
+    {
+      "name": "starlette",
+      "version": "1.7.0",
+      "filename": "starlette-1.7.0-py3-none-any.whl",
+      "sha256": "67f8e99895493dd2911a03f11314af6ceebeae4e704bb9f43dfc6a9db151c93e",
+      "bytes": 78980,
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "typing-inspection",
+      "version": "0.4.4",
+      "filename": "typing_inspection-0.4.4-py3-none-any.whl",
+      "sha256": "65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147",
+      "bytes": 14750,
+      "license": "MIT"
+    },
+    {
+      "name": "typing_extensions",
+      "version": "4.16.0",
+      "filename": "typing_extensions-4.16.0-py3-none-any.whl",
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+      "bytes": 45571,
+      "license": "PSF-2.0"
+    },
+    {
+      "name": "uvicorn",
+      "version": "0.54.0",
+      "filename": "uvicorn-0.54.0-py3-none-any.whl",
+      "sha256": "505bdb0f318731d45f1f712071fc781a8981f6847a31c902c9f5e652d4f67faf",
+      "bytes": 87427,
+      "license": "BSD-3-Clause"
+    }
+  ],
+  "decoder": {
+    "distribution": "opencv-python-headless",
+    "version": "5.0.0.93",
+    "upstream_binary_source_commit": "06dc20cad65dc7fcf784f70c95d46750520889a7",
+    "binary": {
+      "path": "runtime/Lib/site-packages/cv2/opencv_videoio_ffmpeg500_64.dll",
+      "bytes": 30876160,
+      "sha256": "7aabff029d1fa47cf56ede4dbbe05dc62da3208f07cd16471d4c966a33f9aa31"
+    },
+    "retained_notice": {
+      "path": "runtime/Lib/site-packages/cv2/LICENSE-3RD-PARTY.txt",
+      "bytes": 183251,
+      "sha256": "c1d60169b55cee56452b227c2fd2a7b9ddda3dd3741065f1c6201072be73fadb"
+    },
+    "license": "LGPL-2.1-or-later",
+    "replacement_permitted": true,
+    "sources": [
+      {
+        "filename": "FFmpeg-n7.1.tar.gz",
+        "component": "FFmpeg/FFmpeg",
+        "source_commit": "b08d7969c550a804a59511c7b83f2dd8cc0499b8",
+        "url": "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/b08d7969c550a804a59511c7b83f2dd8cc0499b8",
+        "bytes": 15900622,
+        "sha256": "02fa6d9827da3b6786e4df821218cc036db2b4481e7f48267c2dcda695633afc"
+      },
+      {
+        "filename": "OpenCV-FFmpeg-build.tar.gz",
+        "component": "opencv/opencv_3rdparty",
+        "source_commit": "06dc20cad65dc7fcf784f70c95d46750520889a7",
+        "url": "https://codeload.github.com/opencv/opencv_3rdparty/tar.gz/06dc20cad65dc7fcf784f70c95d46750520889a7",
+        "bytes": 25729765,
+        "sha256": "6ed03e7468a3d91b62e24aa5ad2183924f231dd81a3442da221d7ddf315220b8",
+        "retain_text_sources": true
+      },
+      {
+        "filename": "OpenCV-FFmpeg-wrapper.tar.gz",
+        "component": "opencv/opencv",
+        "source_commit": "a0a660fcb1e58a295e6caa6aee64ed4d369b0181",
+        "url": "https://codeload.github.com/opencv/opencv/tar.gz/a0a660fcb1e58a295e6caa6aee64ed4d369b0181",
+        "bytes": 81508684,
+        "sha256": "5d97bddd4c5d2895dddafe6aff211b9fc1add564887263b7c062f2699660bf1d",
+        "retain_text_sources": true
+      },
+      {
+        "filename": "libvpx-v1.16.0.tar.gz",
+        "component": "webmproject/libvpx",
+        "source_commit": "1024874c5919305883187e2953de8fcb4c3d7fa6",
+        "url": "https://codeload.github.com/webmproject/libvpx/tar.gz/1024874c5919305883187e2953de8fcb4c3d7fa6",
+        "bytes": 5637178,
+        "sha256": "274c00c0b21f03a9152e324b1989f73b74268aa8545b39ef5faccc50fdb56393"
+      },
+      {
+        "filename": "OpenH264-v2.5.0.tar.gz",
+        "component": "cisco/openh264",
+        "source_commit": "8c7008aeb6335e7d36ab0d9a023a63f82a8eaac0",
+        "url": "https://codeload.github.com/cisco/openh264/tar.gz/8c7008aeb6335e7d36ab0d9a023a63f82a8eaac0",
+        "bytes": 60304002,
+        "sha256": "0a12daa5a7fefc3acf5f6485fe21159399351cd4b83af80dde525fa520f17820",
+        "retain_text_sources": true
+      },
+      {
+        "filename": "libaom-v3.14.1.tar.gz",
+        "component": "aomedia/aom",
+        "source_commit": "03087864cf4bea6abb0d28f95cf7843511413d8f",
+        "url": "https://codeload.github.com/libsdl-org/aom/tar.gz/03087864cf4bea6abb0d28f95cf7843511413d8f",
+        "bytes": 6385757,
+        "sha256": "b17564e4ff3a36992d17b6ea934a0151f9e38674e630bd91312170859d2be6a2",
+        "source_repository": "https://aomedia.googlesource.com/aom",
+        "archive_mirror": "https://github.com/libsdl-org/aom"
+      }
+    ]
+  },
+  "cpp_runtime": {
+    "source_path": "runtime/Lib/site-packages/numpy.libs/msvcp140-263139962577ecda4cd9469ca360a746.dll",
+    "path": "runtime/msvcp140.dll",
+    "bytes": 575056,
+    "sha256": "a4c2229bdc2a2a630acdc095b4d86008e5c3e3bc7773174354f3da4f5beb9cde",
+    "source_distribution": "numpy",
+    "source_version": "2.2.6",
+    "license": "Microsoft Distributable Code; retained installation terms"
+  },
+  "identity_crypto": {
+    "cryptography_version": "50.0.2",
+    "openssl_version": "4.0.3",
+    "rust_version": "1.98.1",
+    "rust_commit": "48a229ceaefd4985c50990b14116b6d856af0985",
+    "native_modules": [
+      {
+        "path": "runtime/Lib/site-packages/cryptography/hazmat/bindings/_rust.pyd",
+        "bytes": 9897472,
+        "sha256": "1d4332a447cab13dec8e3a533ad579e0e562b79e40822c931f33769758fc7156"
+      },
+      {
+        "path": "runtime/Lib/site-packages/_cffi_backend.cp312-win_amd64.pyd",
+        "bytes": 181248,
+        "sha256": "9af5e4f68a41f26b726f2e9424f9d58a4f5666189f6a48be95f406b257102aec"
+      }
+    ],
+    "notices": [
+      {
+        "source_path": "third_party/licenses/Identity-native-NOTICES.txt",
+        "path": "licenses/Identity-native-NOTICES.txt",
+        "bytes": 908943,
+        "sha256": "86bbcfd38ccb210069723ab7dbbfd4cbb10718dcecaea1af3dcd23aaa40d0d2f"
+      },
+      {
+        "source_path": "third_party/licenses/Identity-native-notice-inventory.json",
+        "path": "licenses/Identity-native-notice-inventory.json",
+        "bytes": 132046,
+        "sha256": "77c323ba19cc0555a8eebca6e6cf03f4f3a35f1ed886dfe8fb1aba3aebd242ef"
+      }
+    ],
+    "sources": [
+      {
+        "filename": "cryptography-50.0.2.tar.gz",
+        "url": "https://files.pythonhosted.org/packages/9d/af/182eb91b0df3fe75c4d9f26fe70684569566745f6ba7e5c9c73a862c5252/cryptography-50.0.2.tar.gz",
+        "bytes": 880623,
+        "sha256": "7b46165bb56eb4704e2eaaf86f3c940d19154535d9b0ca7d6d590b04060e00d5",
+        "component": "pyca/cryptography",
+        "version": "50.0.2",
+        "license": "Apache-2.0 OR BSD-3-Clause"
+      },
+      {
+        "component": "cffi",
+        "version": "2.1.1",
+        "filename": "cffi-2.1.1.tar.gz",
+        "url": "https://files.pythonhosted.org/packages/9e/ef/008a1939e372c06329a3fce4279c02f328488f3526744906eeec3da7ad5f/cffi-2.1.1.tar.gz",
+        "bytes": 530807,
+        "sha256": "dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be",
+        "license": "MIT-0; bundled libffi notices retained in complete source",
+        "retain_text_sources": true
+      },
+      {
+        "component": "openssl/openssl",
+        "version": "4.0.3",
+        "source_commit": "af1775b60dfa141a4ad762585052cabeb9f37e9e",
+        "url": "https://codeload.github.com/openssl/openssl/tar.gz/af1775b60dfa141a4ad762585052cabeb9f37e9e",
+        "filename": "OpenSSL-4.0.3.tar.gz",
+        "bytes": 55429548,
+        "sha256": "219c0a389f3c76e58f2d9e2b216101887f94747e669bb79c43225d7b6ac1253a",
+        "license": "Apache-2.0"
+      }
+    ]
+  }
+}

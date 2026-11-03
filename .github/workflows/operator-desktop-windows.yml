@@ -1,0 +1,426 @@
+name: Native Windows Desktop Installer
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta, codex/windows-onvif-onboarding, codex/windows-surveillance-workspace]
+    paths:
+      - .github/workflows/operator-desktop-windows.yml
+      - .github/actions/provision-operator-tools/**
+      - windows/desktop/**
+      - scripts/build_desktop_payload.py
+      - scripts/verify_desktop_receipt.py
+      - src/k5vision/**
+      - tests/integration/test_windows_desktop_app.py
+      - tests/integration/windows_vm_clock.py
+      - tests/integration/windows_time_configuration.py
+      - tests/integration/test_windows_time_administration.py
+      - tests/unit/test_operator_time*.py
+      - tests/unit/test_windows_time*.py
+      - scripts/verify_windows_time_administration_receipt.py
+      - tests/unit/test_windows_vm_clock*.py
+      - scripts/verify_windows_vm_clock_receipt.py
+      - tests/integration/test_operator_beta_browser.py
+      - tests/integration/recorded_history_fixture.py
+      - scripts/provision_operator_person_acceptance.py
+      - tests/integration/test_operator_admin_browser.py
+      - tests/unit/test_operator_admin*.py
+      - tests/unit/test_operator_events*.py
+      - tests/unit/test_operator_exports.py
+      - tests/unit/test_operator_analytics_ui.py
+      - tests/unit/test_operator_continuous_playback_ui.py
+      - tests/test_user_admin_api.py
+      - tests/test_user_registry.py
+      - tests/integration/onvif_camera_fixture.py
+      - tests/unit/test_desktop*.py
+      - tests/unit/test_operator_onvif*.py
+      - tests/integration/test_operator_onvif*.py
+      - docs/WINDOWS_DESKTOP*.md
+      - third_party/licenses/**
+      - THIRD_PARTY_NOTICES.md
+      - pyproject.toml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: operator-desktop-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused-windows:
+    name: Windows focused checks (${{ matrix.lane }})
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [setup, onvif, cameras]
+    env:
+      K5_BETA_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+    steps:
+      - name: Checkout exact desktop revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up native development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install acceptance dependencies only in development Python
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Desktop development install failed" }
+      - name: Verify desktop setup and process ownership on Windows
+        if: matrix.lane == 'setup'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_desktop_setup.py tests/unit/test_desktop_payload.py tests/unit/test_desktop_receipt.py tests/unit/test_operator_native_process.py tests/unit/test_operator_product_service.py tests/unit/test_operator_time.py tests/unit/test_operator_time_admin.py tests/unit/test_operator_time_admin_api.py tests/unit/test_operator_identity_security.py tests/unit/test_operator_oidc.py tests/unit/test_operator_identity_adversarial.py tests/unit/test_windows_time_configuration.py tests/unit/test_windows_time_administration_receipt.py tests/unit/test_windows_time_staging.py tests/unit/test_operator_recording_storage.py tests/unit/test_operator_storage_directory.py tests/unit/test_operator_storage_windows_stat.py tests/test_auth_session_clock.py tests/unit/test_mediamtx_provider.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify ONVIF and RTSP authentication, discovery and honest video status
+        if: matrix.lane == 'onvif'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_rtsp.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_admin_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py tests/unit/test_operator_analytics_ui.py tests/unit/test_operator_continuous_playback_ui.py tests/unit/test_operator_settings_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify camera administration and atomic reconnect on Windows
+        if: matrix.lane == 'cameras'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_admin_api.py tests/unit/test_operator_product_state.py tests/unit/test_operator_events.py tests/unit/test_operator_events_api.py tests/unit/test_operator_exports.py tests/unit/test_operator_export_audit.py tests/unit/test_operator_audit.py tests/unit/test_operator_audit_api.py tests/unit/test_operator_role_policy.py tests/unit/test_operator_role_policy_review.py tests/unit/test_operator_integrations.py tests/unit/test_operator_storage_settings.py tests/unit/test_operator_storage_settings_api.py tests/test_device_registry.py tests/test_user_registry.py tests/test_user_admin_api.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  native-desktop:
+    name: Build and exercise actual graphical Windows installation
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      K5_BETA_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+    steps:
+      - name: Checkout exact desktop revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up native development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install acceptance dependencies only in development Python
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Desktop development install failed" }
+      - name: Provision immutable native acceptance tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Provision the admitted public person fixture for installed analytics
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Installed analytics fixture admission failed" }
+      - name: Build exact offline operator runtime and file manifest
+        shell: pwsh
+        run: |
+          python scripts/build_desktop_payload.py --output desktop-build --head-sha $env:K5_BETA_HEAD_SHA --media-exe $env:K5_MEDIAMTX_DONOR_EXE --gateway-exe $env:K5_CADDY_DONOR_EXE
+          if ($LASTEXITCODE -ne 0) { throw "Offline desktop payload build failed" }
+      - name: Compile native graphical supervisor with payload identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $compiler = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw "Native .NET Framework compiler unavailable" }
+          $source = (Resolve-Path -LiteralPath windows/desktop/K5Vision.cs).Path
+          $identity = (Resolve-Path -LiteralPath desktop-build/PayloadIdentity.generated.cs).Path
+          $output = Join-Path $env:GITHUB_WORKSPACE "desktop-build\payload\K5Vision.exe"
+          & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll ('/out:' + $output) $source $identity
+          if ($LASTEXITCODE -ne 0) { throw "Native graphical supervisor compilation failed" }
+      - name: Exercise native Windows Time configuration and restoration
+        timeout-minutes: 6
+        shell: pwsh
+        env:
+          K5_NATIVE_TIME_ACCEPTANCE: "1"
+          K5_VM_CLOCK_ACCEPTANCE: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or $env:RUNNER_OS -ne "Windows") {
+            throw "Native time configuration requires a disposable hosted Windows VM"
+          }
+          $env:K5_DESKTOP_PAYLOAD = (Resolve-Path -LiteralPath desktop-build/payload).Path
+          $supervisor = Join-Path $env:K5_DESKTOP_PAYLOAD "K5Vision.exe"
+          $manifest = Join-Path $env:K5_DESKTOP_PAYLOAD "payload-manifest.json"
+          $supervisorSha = (Get-FileHash -LiteralPath $supervisor -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifestSha = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash.ToLowerInvariant()
+          python -m pytest tests/integration/test_windows_time_administration.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=90 --junitxml=desktop-build/time-administration-windows.xml
+          if ($LASTEXITCODE -ne 0) { throw "Actual native time configuration qualification failed" }
+          python scripts/verify_windows_time_administration_receipt.py desktop-build/time-administration-windows.xml desktop-build/time-administration-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --supervisor-sha256 $supervisorSha --payload-manifest-sha256 $manifestSha
+          if ($LASTEXITCODE -ne 0) { throw "Native time configuration receipt admission failed" }
+      - name: Preserve finite native time-administration evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: time-administration-windows-witness-${{ github.run_id }}
+          path: |
+            desktop-build/time-administration-windows.xml
+            desktop-build/time-administration-windows-receipt.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Provision exact reviewed Inno Setup compiler
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $identity = (Get-Content -LiteralPath windows/desktop/donors.json -Raw | ConvertFrom-Json).inno_setup
+          $compilerRoot = Join-Path $env:RUNNER_TEMP ("K5 desktop compiler " + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $compilerRoot | Out-Null
+          $archive = Join-Path $compilerRoot "innosetup-6.4.3.exe"
+          Invoke-WebRequest -Uri $identity.url -OutFile $archive -TimeoutSec 180
+          $actual = Get-Item -LiteralPath $archive
+          if ($actual.Length -ne $identity.bytes -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $identity.sha256) {
+            throw "Inno Setup compiler archive identity mismatch"
+          }
+          $install = Join-Path $compilerRoot "compiler"
+          $process = Start-Process -FilePath $archive -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', ('/DIR="' + $install + '"')) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Reviewed compiler installation failed" }
+          $iscc = Join-Path $install "ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) { throw "Reviewed compiler frontend unavailable" }
+          # ISCC's upstream frontend resource uses 0.0.0.0. The exact admitted
+          # installer pins its bytes; check the actual engine banner at compile.
+          "K5_DESKTOP_ISCC=$iscc" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          Write-Host "Native Inno Setup compiler 6.4.3 admitted by exact official archive SHA256"
+      - name: Build click-through native Windows installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $payload = (Resolve-Path -LiteralPath desktop-build/payload).Path
+          $output = Join-Path $env:GITHUB_WORKSPACE "desktop-build/installer"
+          New-Item -ItemType Directory -Path $output | Out-Null
+          $launcherHash = (Get-FileHash -LiteralPath (Join-Path $payload "K5Vision.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
+          $configuration = (Resolve-Path -LiteralPath windows/desktop/K5Vision.iss).Path
+          $compilerOutput = @(& $env:K5_DESKTOP_ISCC ('/DPayloadRoot=' + $payload) ('/DOutputRoot=' + $output) ('/DLauncherSha=' + $launcherHash) $configuration 2>&1 | ForEach-Object { $_.ToString() })
+          $compilerExit = $LASTEXITCODE
+          $compilerOutput | Where-Object { $_ -match '^Compiler engine version:|^Error on line|^Error:|^Warning:' } | ForEach-Object { Write-Host $_ }
+          if ($compilerExit -ne 0) {
+            $compilerOutput | Select-Object -Last 6 | ForEach-Object { Write-Host $_ }
+            throw "Native GUI installer build failed"
+          }
+          if (@($compilerOutput | Where-Object { $_ -match '^Compiler engine version: Inno Setup 6\.4\.3(?:\s|$)' }).Count -ne 1) {
+            throw "Unexpected Inno Setup compiler engine version"
+          }
+          "K5_DESKTOP_SETUP=$(Join-Path $output 'K5VisionSetup.exe')" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_PAYLOAD=$payload" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Exercise actual installer, first-run account, tray, media and uninstall
+        timeout-minutes: 12
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_desktop_app.py -o addopts= --no-cov -s -o faulthandler_timeout=180 --junitxml=desktop-build/desktop-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_desktop_receipt.py desktop-build/desktop-windows.xml desktop-build/desktop-windows-receipt.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Admit only the actually exercised installer and finite evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $witness = Get-Content -LiteralPath desktop-build/desktop-windows-receipt.json -Raw | ConvertFrom-Json
+          if ($witness.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $witness.receipt.onvif_credential_profile_enrollment -isnot [bool] -or
+              $witness.receipt.onvif_credential_profile_enrollment -ne $true -or
+              $witness.receipt.no_manual_stream_uri -isnot [bool] -or
+              $witness.receipt.no_manual_stream_uri -ne $true -or
+              $witness.receipt.installed_worker_bundle_verified -isnot [bool] -or
+              $witness.receipt.installed_worker_bundle_verified -ne $true -or
+              $witness.receipt.onvif_clock_skew_compensated -isnot [bool] -or
+              $witness.receipt.onvif_clock_skew_compensated -ne $true -or
+              $witness.receipt.onvif_time_health_displayed -isnot [bool] -or
+              $witness.receipt.onvif_time_health_displayed -ne $true -or
+              $witness.receipt.recorder_time_health_displayed -isnot [bool] -or
+              $witness.receipt.recorder_time_health_displayed -ne $true -or
+              $witness.receipt.camera_count -ne 4 -or
+              $witness.receipt.four_camera_wall -ne $true -or
+              $witness.receipt.native_default_browser_handoff -ne $true -or
+              $witness.receipt.timeline_seek_playback -ne $true -or
+              $witness.receipt.direct_rtsp_enrollment -isnot [bool] -or
+              $witness.receipt.direct_rtsp_enrollment -ne $true -or
+              $witness.receipt.direct_rtsp_fresh_enrollment -ne $true -or
+              $witness.receipt.direct_rtsp_multi_channel_same_endpoint -ne $true -or
+              $witness.receipt.admin_user_management -ne $true -or
+              $witness.receipt.role_permissions -ne $true -or
+              $witness.receipt.camera_access_controls -ne $true -or
+              $witness.receipt.admin_state_persisted -ne $true -or
+              $witness.receipt.actual_recording_export -ne $true) {
+            throw "Four-camera surveillance workspace qualification is incomplete"
+          }
+          foreach ($feature in @(
+            'historical_navigation_default_24h', 'historical_navigation_real_media',
+            'playback_rapid_seek_latest_wins', 'playback_controls_and_zoom',
+            'playback_contiguous_chunk_handoff', 'playback_gap_requires_explicit_navigation',
+            'playback_export_selection_independent', 'export_normal_windows_download',
+            'export_download_survives_browser_close', 'export_download_survives_product_restart',
+            'export_download_opened_in_edge',
+            'product_analytics_enablement', 'analytics_bundled_native_inference',
+            'analytics_gui_configuration', 'analytics_person_event_recorded',
+            'analytics_event_utc_playback', 'analytics_public_fixture_only',
+            'analytics_browser_closed_detection', 'analytics_role_camera_permissions',
+            'analytics_settings_events_persisted',
+            'settings_admin_gui',
+            'settings_storage_policy_live',
+            'settings_storage_policy_restored',
+            'settings_custom_role_assignment',
+            'settings_profile_bound_edit',
+            'settings_custom_role_permission_denied',
+            'settings_role_revoked_sessions',
+            'settings_role_ui_permissions',
+            'settings_time_status_visible',
+            'settings_time_no_clock_changes',
+            'settings_audit_download',
+            'settings_integrations_gui',
+            'settings_analytics_machine_event',
+            'settings_neural_v2_roundtrip',
+            'settings_provider_event_playback',
+            'settings_mfa_enrollment',
+            'settings_mfa_challenge',
+            'settings_mfa_recovery_single_use',
+            'settings_mfa_disabled',
+            'settings_oidc_signed_pkce',
+            'settings_oidc_existing_role',
+            'settings_restored_before_restart'
+          )) {
+            if ($witness.receipt.$feature -isnot [bool] -or $witness.receipt.$feature -ne $true) {
+              throw "Executed playback, export and analytics qualification is incomplete: $feature"
+            }
+          }
+          $release = Join-Path $env:GITHUB_WORKSPACE "desktop-build/release"
+          New-Item -ItemType Directory -Path $release | Out-Null
+          Copy-Item -LiteralPath $env:K5_DESKTOP_SETUP -Destination (Join-Path $release "K5VisionSetup.exe")
+          Copy-Item -LiteralPath desktop-build/desktop-windows-receipt.json -Destination $release
+          Copy-Item -LiteralPath desktop-build/payload/payload-manifest.json -Destination $release
+          Copy-Item -LiteralPath desktop-build/payload/dependency-inventory.json -Destination $release
+          $setup = Get-Item -LiteralPath $env:K5_DESKTOP_SETUP
+          $metadata = @{
+            schema_version=1; head_sha=$env:K5_BETA_HEAD_SHA; unsigned=$true;
+            setup_sha256=(Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant();
+            setup_bytes=$setup.Length;
+            launcher_sha256=(Get-FileHash -LiteralPath desktop-build/payload/K5Vision.exe -Algorithm SHA256).Hash.ToLowerInvariant();
+            payload_manifest_sha256=(Get-FileHash -LiteralPath desktop-build/payload/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant();
+            runtime='CPython 3.12.10 embedded amd64'; installer='Inno Setup 6.4.3';
+            scope='Native Windows ONVIF surveillance workspace'; no_terminal_required=$true;
+            no_external_python_required=$true; no_runtime_package_downloads=$true
+            workers_bundled=$true; first_launch_internet_required=$false; disconnected_network_qualified=$false
+            onvif_camera_onboarding=$true; manual_stream_uri_required=$false
+            direct_rtsp_enrollment=$true
+            admin_user_management=$true; role_permissions=$true; camera_access_controls=$true
+            person_analytics_bundled=$true; background_person_events=$true
+            storage_settings=$true; windows_time_administration=$true; camera_time_administration=$true
+            operational_audit=$true; custom_roles=$true; mfa=$true; oidc_sso=$true
+            neural_adapter_v2=$true; analytics_event_adapter=$true; shared_neural_host=$false
+            surveillance_workspace=$true; four_camera_wall=$true; actual_recording_export=$true
+          }
+          $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $release "desktop-package.json") -Encoding utf8
+      - name: Upload qualified graphical Windows installer
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: k5-vision-windows-setup-${{ github.event.pull_request.head.sha || github.sha }}
+          path: desktop-build/release/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve finite graphical acceptance evidence on failure
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: desktop-windows-witness-${{ github.run_id }}
+          path: |
+            desktop-build/desktop-windows.xml
+            desktop-build/desktop-windows-receipt.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  vm-clock:
+    name: Exercise real clock corrections on a second disposable Windows VM
+    needs: [native-desktop, focused-windows]
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_VM_CLOCK_ACCEPTANCE: "1"
+    steps:
+      - name: Checkout the tested installer revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up development Python on the isolated VM
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install test automation before changing guest time
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "VM test dependency install failed" }
+      - name: Provision all pinned recording tools before changing guest time
+        uses: ./.github/actions/provision-operator-tools
+      - name: Provision the admitted public person fixture before changing guest time
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Installed analytics fixture admission failed" }
+      - name: Download the installer exercised by the first VM
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: k5-vision-windows-setup-${{ github.event.pull_request.head.sha || github.sha }}
+          path: vm-clock-input
+      - name: Bind downloaded Setup and manifest to the exact tested revision
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or $env:RUNNER_OS -ne "Windows") {
+            throw "Real clock tests require a disposable GitHub-hosted Windows VM"
+          }
+          $package = Get-Content -LiteralPath vm-clock-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath vm-clock-input/payload-manifest.json -Raw | ConvertFrom-Json
+          $setup = Get-Item -LiteralPath vm-clock-input/K5VisionSetup.exe
+          $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
+              $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath vm-clock-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant()) {
+            throw "VM test installer source or content identity mismatch"
+          }
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_SETUP_SHA256=$sha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Test restoration guard and strict VM evidence admission
+        shell: pwsh
+        env:
+          K5_VM_CLOCK_ACCEPTANCE: "0"
+        run: |
+          python -m pytest tests/unit/test_windows_vm_clock.py tests/unit/test_windows_vm_clock_receipt.py -o addopts= --no-cov --tb=short
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exercise installed GUI, real UTC steps and restoration
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_desktop_app.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=180 --junitxml=vm-clock-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_windows_vm_clock_receipt.py vm-clock-windows.xml vm-clock-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve finite VM clock evidence after UTC restoration
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: vm-clock-windows-witness-${{ github.run_id }}
+          path: |
+            vm-clock-windows.xml
+            vm-clock-windows-receipt.json
+            vm-clock-input/desktop-package.json
+          if-no-files-found: warn
+          retention-days: 14

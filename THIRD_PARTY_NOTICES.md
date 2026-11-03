@@ -6,12 +6,49 @@ This file is the distribution-facing notice registry. Detailed source provenance
 
 ## Incorporated donor source
 
+### go2rtc ONVIF camera onboarding
+
+The operator's `src/k5vision/operator_onvif.py` adapts selected ONVIF discovery,
+SOAP/WS-Security envelope and camera stream-resolution source from
+[AlexxIT/go2rtc](https://github.com/AlexxIT/go2rtc), `v1.9.14`, commit
+`b5948cfb25404cc5cb37b166ecaa2dca20b11d4b`, specifically
+`pkg/onvif/client.go`, `pkg/onvif/envelope.go` and `pkg/onvif/helpers.go`.
+
+Copyright (c) 2022 Alexey Khit. This donor material remains under the **MIT
+License**. The complete unchanged upstream license is retained in
+`third_party/licenses/go2rtc-MIT.txt` and the installed desktop licenses
+directory. Preserve the full copyright and permission notice with copies or
+substantial portions of the adapted software. K5's surrounding source license
+does not replace the upstream MIT permissions.
+
+K5 adapts this source to a bounded Python standard-library connector with XML,
+address, response-size and timeout handling. The recording product discovers
+ONVIF cameras and resolves their stream addresses after the user supplies camera
+credentials and selects an H.264 profile. No go2rtc executable, Go runtime,
+ONVIF Device Manager source, `onvif-python`, lxml, or WSDL bundle is incorporated
+by this source adaptation. The selected functions and exact source/license hashes
+are recorded in `docs/DONOR_LEDGER.md`.
+
 K5 does not vendor Analytics Lab business logic. Its separately built engineering
 runtime package is described below; all upstream rights remain effective.
 
 ## Runtime and development dependencies
 
 Dependencies declared in `pyproject.toml` must be reviewed under `docs/COMMERCIAL_DEPENDENCY_POLICY.md` before commercial distribution. Their inclusion as package dependencies does not transfer their copyrights to K5 Vision and does not change their governing licenses.
+
+### Native Windows authentication libraries
+
+The installed identity integration uses PyJWT 2.15.1 (MIT), cryptography 50.0.2
+(Apache-2.0 OR BSD-3-Clause), cffi 2.1.1 (MIT-0, with separately noticed libffi
+material), and pycparser 3.12 (BSD-3-Clause). Their full upstream wheel notices
+remain unchanged in the installed runtime. Cryptography's Windows binary
+statically incorporates OpenSSL 4.0.3 and Rust library material; their original
+copyrights and governing licenses remain effective. The installed
+`licenses/Identity-native-NOTICES.txt`, its per-file provenance inventory and
+retained source archives preserve the reviewed native notice closure. K5's
+license does not replace these permissions or attribution requirements.
+Exact distribution identities and the scope of retained other-target notice
+material are recorded in `docs/WINDOWS_IDENTITY_DEPENDENCIES.md`.
 
 ### GStreamer
 
@@ -93,3 +130,83 @@ OpenCV or other native runtime binary is bundled. Exact native/transitive wheel
 notices and redistribution review, separate model/data rights, and commercial
 project authority remain release gates. See `docs/ANALYTICS_RUNTIME_PACKAGING.md`
 and `docs/DONOR_LEDGER.md`; the upstream register's pending reviews remain pending.
+
+## Independent OpenVINO / Open Model Zoo person view
+
+The optional K5 operator person-view adapter uses the documented public API of
+OpenVINO `2026.3.1` and the separately licensed Open Model Zoo
+`person-detection-retail-0013` FP16 model at revision
+`6697dead54ed1cdd664b0313189c2cb52ee6335e`. The official model definition is
+copyright (c) 2023-2024 Intel Corporation and expressly links the Apache-2.0
+license. The unchanged exact source-root license remains in
+`src/k5vision/data/analytics-runtime-Apache-2.0.txt`. NumPy `2.2.6` is separately
+BSD-3-Clause licensed; OpenVINO telemetry `2025.2.0` and supplied platform/native
+dependencies retain their own package notices.
+
+K5 wrote this adapter independently; no Analytics Lab detector/tracker source is
+copied or imported. That project's separate engineering-wrapper restrictions
+remain unchanged. The separate native Windows surveillance installer now
+bundles this model and its independently reviewed native runtime; datasets and
+demonstration images remain outside that product payload.
+The official Apache OMZ person example used by the ephemeral native witness
+retains Intel/Open Model Zoo attribution and the same license. Do not remove
+applicable native/transitive package notices when provisioning separate wheels.
+The installed Windows payload retains exact native/transitive notices and
+corresponding FFmpeg source/build material. See
+`docs/WINDOWS_PERSON_ANALYTICS_DEPENDENCIES.md` for its exact input identities,
+source/relinking rights and installed scope. The earlier engineering view
+limits and donor provenance remain in `docs/OPERATOR_PERSON_DETECTION_REVIEW.md`
+and the donor ledger.
+
+## Native graphical Windows operator candidate
+
+The separate graphical operator installer bundles the unchanged official
+CPython 3.12.10 Windows amd64 embeddable distribution and nineteen pinned binary
+Python distributions for the recording operator, account administration and
+independent person detector. The exact model and complete native decoder
+notices/corresponding source material accompany the installation.
+Its first graphical
+launch downloads MediaMTX v1.21.2 and Caddy v2.11.7 directly from their official
+releases, verifies their archive, executable and license hashes, and preserves
+their supplied licenses in the private profile. These worker executables are
+not bundled in the K5 installer. This packaging scope
+supersedes the earlier no-binary-bundling statements only for that explicit
+desktop installer. The reviewed go2rtc ONVIF source adaptation above uses the
+bundled Python standard library; it adds no external ONVIF runtime or WSDL
+package. The installer includes the independent OpenVINO person model/runtime
+and the separately loaded LGPL FFmpeg decoder with corresponding sources. It
+does not include the Analytics Lab wrapper, standalone FFmpeg executable,
+sample images or development/browser tools.
+
+The installed `licenses` directory retains the complete CPython binary-component
+terms, MediaMTX MIT, Caddy Apache-2.0 and go2rtc MIT licenses, K5's license,
+this notice, and
+the dedicated `WINDOWS_DESKTOP_DEPENDENCIES.md` review. Every dependency's
+`.dist-info` directory and upstream license/notice files remain installed.
+`dependency-inventory.json` records exact wheel and retained-notice hashes.
+The source `windows/desktop/donors.json` and `runtime-requirements.txt` pin each
+artifact. The pinned `workers/donor-downloads.json` controls official first-run
+worker provisioning; preserving these identities does not replace outstanding
+transitive native-binary redistribution review.
+
+The GUI installer is produced with Inno Setup 6.4.3, copyright (C) 1997-2025
+Jordan Russell, portions copyright (C) 2000-2025 Martijn Laan. Its unchanged
+custom license is retained as `third_party/licenses/InnoSetup-6.4.3.txt` and in
+the installed `licenses` directory. Inno Setup's license expressly permits
+commercial use and redistribution subject to its retained notices and website
+addresses. Sources: https://jrsoftware.org/ and
+https://github.com/jrsoftware/issrc/tree/is-6_4_3. The compiler installer itself
+is an ephemeral development tool and is not included in the product installer.
+
+## Installed Windows OpenCV/FFmpeg decoder
+
+The independent background person detector and completed-export verification
+use OpenCV headless 5.0.0.93. Its unchanged Windows FFmpeg decoder is separately
+loaded and LGPL-2.1-or-later licensed. Complete supplied OpenCV/FFmpeg/native
+notices remain in the bundled `cv2` and distribution-license directories.
+Exact corresponding FFmpeg source, OpenCV wrapper and upstream build material
+are installed in `licenses/sources/`; their hashes and provenance are recorded
+in the dependency inventory. Recipients retain applicable LGPL modification,
+relinking and reverse-engineering-for-debugging rights for their own copies.
+The independent K5 adapter and upstream licenses remain separate. The complete
+input/source record is `docs/WINDOWS_PERSON_ANALYTICS_DEPENDENCIES.md`.

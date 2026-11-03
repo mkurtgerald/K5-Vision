@@ -1,0 +1,41 @@
+.camera-wall { min-width: 0; margin-top: 24px; }
+.camera-wall-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin-bottom: 18px; }
+.camera-wall-heading h2 { font-size: 21px; }
+.camera-wall-summary { max-width: 580px; color: var(--muted); font-size: 12px; line-height: 1.6; margin-top: 7px; }
+.camera-wall-controls { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.camera-wall-layout-label { display: flex; align-items: center; gap: 8px; margin: 0 8px 0 0; }
+.camera-wall-layout { width: auto; min-height: 35px; font-size: 12px; padding: 6px 25px 6px 10px; }
+.camera-wall-controls .button { min-height: 35px; padding: 7px 10px; }
+.camera-wall-pages { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.camera-wall-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.camera-wall-grid[data-layout="1"] { grid-template-columns: minmax(0, 1fr); }
+.camera-wall-grid[data-layout="9"] { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px; }
+.camera-wall-tile { min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); }
+.camera-wall-tile-heading { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 13px; }
+.camera-wall-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.camera-wall-status { flex-shrink: 0; font-size: 10px; color: var(--amber); }
+.camera-wall-status[data-state="live"] { color: var(--green); }
+.camera-wall-status[data-state="unavailable"] { color: var(--red); }
+.camera-wall-surface { position: relative; aspect-ratio: 16 / 9; background: #05090f; }
+.camera-wall-video { display: block; width: 100%; height: 100%; object-fit: contain; background: #05090f; }
+.camera-wall-overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 15px; padding: 24px 20px 45px; background: #080d16; }
+.camera-wall-description { max-width: 360px; font-size: 12px; color: var(--muted); line-height: 1.6; text-align: center; }
+.camera-wall-recording { position: absolute; left: 10px; bottom: 10px; background: #081019e8; border: 1px solid #ffffff13; border-radius: 4px; padding: 5px 7px; color: var(--muted); font-size: 10px; pointer-events: none; }
+.camera-wall-recording[data-state="recording"] { color: var(--green); }
+.camera-wall-recording[data-state="enabled"] { color: #b7c9df; }
+.camera-wall-recording[data-state="paused"] { color: var(--amber); }
+.camera-wall-tile-actions { display: flex; align-items: center; gap: 5px; padding: 9px; }
+.camera-wall-tile-actions .button { min-height: 32px; font-size: 11px; padding: 6px 9px; }
+.camera-wall-tile-actions .button:last-child { margin-left: auto; }
+.camera-wall-tile:fullscreen { width: 100vw; height: 100vh; display: flex; flex-direction: column; border: 0; border-radius: 0; }
+.camera-wall-tile:fullscreen .camera-wall-surface { flex: 1; min-height: 0; aspect-ratio: auto; }
+.camera-wall-empty { padding: 50px 25px; border: 1px dashed var(--border); border-radius: 9px; color: var(--muted); text-align: center; line-height: 1.7; }
+@media (max-width: 1200px) {
+  .camera-wall-toolbar { flex-wrap: wrap; gap: 13px; }
+  .camera-wall-grid[data-layout="9"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 700px) {
+  .camera-wall-grid, .camera-wall-grid[data-layout="9"] { grid-template-columns: minmax(0, 1fr); }
+  .camera-wall-controls { flex-wrap: wrap; }
+  .camera-wall-grid { gap: 14px; }
+}

@@ -5,7 +5,9 @@ opens in Microsoft Edge or Chrome on the same computer. It supports password
 sign-in, manually adding an RTSP camera, live HLS video, continuous recording,
 recording history with gaps, and MP4 playback or download of up to five minutes.
 Saved cameras and recordings survive an application restart. Person detection
-is not configured in this build.
+is unconfigured by default. The sprint adds per-user installation, camera removal
+and source-free recording/service status. Optional person detection is a separately
+admitted sampled-view candidate, described in `OPERATOR_PERSON_DETECTION_REVIEW.md`.
 
 ## Start
 
@@ -17,7 +19,18 @@ Neither Docker nor WSL is required.
 
 Download the `k5-operator-windows-pilot` artifact from a successful **Native
 Windows Operator Product** Actions run and extract the entire folder. Open
-PowerShell in that folder and run:
+PowerShell in that folder and install the reusable Start menu application:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-K5Operator.ps1 -DesktopShortcut
+```
+
+Open **K5 Vision Operator** from Start or the Desktop shortcut. Installation,
+safe upgrades, optional user logon startup and profile-preserving uninstall are
+described in `docs/WINDOWS_OPERATOR_INSTALL.md` in the package. Installed 64-bit
+Python 3.12 remains required. The supervisor console must remain open.
+
+To run directly from the extracted package instead:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Start-K5Operator.ps1 -PackagePath .\dist\k5_vision-0.1.0-py3-none-any.whl
@@ -61,6 +74,16 @@ download an MP4 clip. History becomes available as recording segments are closed
 Signing out revokes media access. Press **Ctrl+C** in the PowerShell window to
 stop the application and its native workers.
 
+The sidebar shows the last sampled recording bytes, configured allowance and free
+space. It distinguishes low space, capacity pressure and unsafe storage inspection.
+Unresponsive native workers are detected and recovered independently of camera
+connection state. A disconnected camera does not restart all other cameras.
+
+An administrator can select **Remove camera**, review the confirmation and stop
+that camera's live/recording path. Existing files are retained subject to rolling
+retention; that camera's history closes. Re-adding the same original name and IP
+with a valid source preserves its camera identity and restores retained history.
+
 ## Local state and limits
 
 The default runtime is `%LOCALAPPDATA%\K5VisionOperatorRuntime`; identity, camera
@@ -75,13 +98,17 @@ recent writes are protected. Recording pauses if storage remains above its
 allowance, less than 1 GiB is free, or storage cannot be safely inspected. Live
 video and existing history remain available when the disk pause is active.
 The dashboard shows the pause; free space and the supervisor will retry.
+Use `-RecordingLimitGb 50` on the starter or installer to select a 50 GiB allowance.
+The installer saves that setting for subsequent starts.
 
 This is a foreground, local operator pilot. It does not start automatically on
 Windows boot or continue after Windows signs the user out. Automated acceptance
 uses a generated H.264 stream and checks recording, playback, source reconnect,
 logout and whole-product restart. Real-camera compatibility, multi-camera
-capacity, long-duration operation, browser behavior on the target Windows machine
-and a signed installer still require field qualification.
+capacity and long-duration operation still require field qualification. The sprint
+separately exercises two generated camera streams in actual native Windows Edge;
+that result does not qualify arbitrary camera firmware, resolution or capacity.
+A signed installer and boot service remain outside this per-user candidate.
 
 MediaMTX remains under its MIT license and Caddy under Apache-2.0. The package
 includes their notices; native binaries are obtained from their pinned official

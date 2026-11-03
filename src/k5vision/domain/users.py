@@ -73,7 +73,7 @@ class UserBootstrapIssue(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     account: UserAccount
-    temporary_credential: BootstrapCredential
+    temporary_credential: BootstrapCredential = Field(repr=False)
     expires_at: datetime
 
 
@@ -83,8 +83,8 @@ class UserBootstrapPasswordChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     username: Username
-    temporary_credential: BootstrapCredential
-    new_password: str = Field(min_length=12, max_length=256)
+    temporary_credential: BootstrapCredential = Field(repr=False)
+    new_password: str = Field(min_length=12, max_length=256, repr=False)
 
 
 class UserAuditEvent(BaseModel):

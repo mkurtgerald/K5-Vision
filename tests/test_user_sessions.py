@@ -1,8 +1,11 @@
 import json
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 
+from k5vision.auth_sessions import DEFAULT_SESSION_TTL_SECONDS
+from k5vision.domain.users import UserPatch
 from k5vision.main import (
     CONTROL_PLANE_READ_TOKEN_ENV,
     CONTROL_PLANE_SITE_ENV,
@@ -74,10 +77,49 @@ def _login(client: TestClient, username: str, password: str = PASSWORD) -> dict[
     return response.json()
 
 
+def test_durable_demotion_denies_stale_admin_session_without_revoke_callback():
+    application = create_app()
+    with TestClient(application) as client:
+        account = _create_initialized_user(client, username="admin.one", role="administrator")
+        _create_initialized_user(client, username="admin.two", role="administrator")
+        token = str(_login(client, "admin.one")["session_token"])
+        application.state.user_registry.update(
+            UUID(str(account["id"])), UserPatch(role="viewer"), actor="admin.two"
+        )
+        assert client.get("/api/v1/users", headers=_headers(token)).status_code == 401
+        assert client.get("/api/v1/auth/me", headers=_headers(token)).status_code == 401
+
+
+def test_password_reset_denies_existing_session_before_any_revoke_callback():
+    application = create_app()
+    with TestClient(application) as client:
+        account = _create_initialized_user(client, username="operator.one", role="operator")
+        token = str(_login(client, "operator.one")["session_token"])
+        _, temporary, _ = application.state.user_registry.reset_bootstrap(
+            UUID(str(account["id"])), actor="admin"
+        )
+        assert client.get("/api/v1/auth/me", headers=_headers(token)).status_code == 401
+        assert (
+            client.post(
+                "/api/v1/auth/bootstrap-password",
+                json={
+                    "username": "operator.one",
+                    "temporary_credential": temporary,
+                    "new_password": "replacement operator password",
+                },
+            ).status_code
+            == 204
+        )
+        assert client.get("/api/v1/auth/me", headers=_headers(token)).status_code == 401
+
+
 def test_initialized_admin_can_login_and_use_same_bounded_admin_surface() -> None:
     with TestClient(create_app()) as client:
         _create_initialized_user(client, username="admin.one", role="administrator")
         session = _login(client, "admin.one")
+        assert type(session["expires_in_seconds"]) is int
+        assert session["expires_in_seconds"] == DEFAULT_SESSION_TTL_SECONDS
+        assert session["expires_at"]
         token = str(session["session_token"])
 
         me = client.get("/api/v1/auth/me", headers=_headers(token))
@@ -128,6 +170,7 @@ def test_non_admin_session_is_authenticated_but_cannot_administer_users() -> Non
 def test_authority_change_revokes_existing_human_session() -> None:
     with TestClient(create_app()) as client:
         account = _create_initialized_user(client, username="admin.one", role="administrator")
+        _create_initialized_user(client, username="admin.two", role="administrator")
         session = _login(client, "admin.one")
         token = str(session["session_token"])
 
@@ -141,6 +184,29 @@ def test_authority_change_revokes_existing_human_session() -> None:
     assert changed.status_code == 200
     assert changed.json()["role"] == "operator"
     assert after_change.status_code == 401
+
+
+@pytest.mark.parametrize("patch", [{"enabled": False}, {"role": "operator"}])
+def test_last_admin_removal_returns_conflict_without_revoking_session(patch) -> None:
+    with TestClient(create_app()) as client:
+        account = _create_initialized_user(client, username="admin.one", role="administrator")
+        token = str(_login(client, "admin.one")["session_token"])
+        audit_before = client.get("/api/v1/users/audit", headers=_headers(token)).json()
+        rejected = client.patch(
+            f"/api/v1/users/{account['id']}", json=patch, headers=_headers(token)
+        )
+        still_authenticated = client.get("/api/v1/auth/me", headers=_headers(token))
+        accounts_after = client.get("/api/v1/users", headers=_headers(token))
+        audit_after = client.get("/api/v1/users/audit", headers=_headers(token))
+
+    assert rejected.status_code == 409
+    assert rejected.json() == {
+        "detail": "Activate another enabled administrator before removing this administrator"
+    }
+    assert still_authenticated.status_code == 200
+    assert still_authenticated.json() == account
+    assert accounts_after.json() == [account]
+    assert audit_after.json() == audit_before
 
 
 def test_password_identity_survives_restart_but_sessions_do_not() -> None:

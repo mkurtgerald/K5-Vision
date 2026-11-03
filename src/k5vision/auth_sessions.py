@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Annotated
 from uuid import UUID
 
@@ -34,7 +36,7 @@ class UserLogin(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     username: Username
-    password: str = Field(min_length=1, max_length=256)
+    password: str = Field(min_length=1, max_length=256, repr=False)
 
 
 class UserSessionIssue(BaseModel):
@@ -43,29 +45,68 @@ class UserSessionIssue(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     account: UserAccount
-    session_token: SessionToken
+    session_token: SessionToken = Field(repr=False)
     expires_at: datetime
+    expires_in_seconds: int = Field(
+        ge=MIN_SESSION_TTL_SECONDS, le=MAX_SESSION_TTL_SECONDS, strict=True
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class _SessionRecord:
     account: UserAccount
     expires_at: datetime
+    deadline: float
+    credential_version: bytes | None = None
 
 
 class UserSessionManager:
     """Maintain one bounded opaque in-process session per durable user."""
 
-    def __init__(self, *, ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS) -> None:
-        if not MIN_SESSION_TTL_SECONDS <= ttl_seconds <= MAX_SESSION_TTL_SECONDS:
+    def __init__(
+        self,
+        *,
+        ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS,
+        resolve_account: Callable[[UserAccount, bytes | None], UserAccount | None] | None = None,
+    ) -> None:
+        if type(ttl_seconds) is not int or not (
+            MIN_SESSION_TTL_SECONDS <= ttl_seconds <= MAX_SESSION_TTL_SECONDS
+        ):
             raise ValueError(
                 f"ttl_seconds must be between {MIN_SESSION_TTL_SECONDS} "
                 f"and {MAX_SESSION_TTL_SECONDS}"
             )
         self._ttl_seconds = ttl_seconds
+        self._resolve_account = resolve_account
         self._sessions: dict[bytes, _SessionRecord] = {}
         self._user_tokens: dict[UUID, bytes] = {}
         self._lock = asyncio.Lock()
+        self._revocation_listeners: set[Callable[[UUID], None]] = set()
+
+    def add_revocation_listener(self, callback: Callable[[UUID], None]) -> Callable[[], None]:
+        """Register a bounded synchronous pending-auth invalidation callback.
+
+        Listeners run after the session lock is released. They must perform
+        only bounded in-memory work and must not recursively acquire a session
+        lock or perform I/O. Ordinary session issue/replacement does not notify.
+        """
+        if not callable(callback):
+            raise ValueError("Session revocation listener must be callable")
+        self._revocation_listeners.add(callback)
+
+        def remove():
+            self._revocation_listeners.discard(callback)
+
+        return remove
+
+    def _notify_revocation(self, user_id: UUID) -> None:
+        for listener in tuple(self._revocation_listeners):
+            listener(user_id)
+
+    @property
+    def ttl_seconds(self) -> int:
+        """Return the bounded elapsed lifetime advertised to a new login."""
+        return self._ttl_seconds
 
     @staticmethod
     def _digest(token: str) -> bytes:
@@ -79,13 +120,24 @@ class UserSessionManager:
             and all(character.isalnum() or character in "_-" for character in token)
         )
 
-    async def issue(self, account: UserAccount) -> tuple[str, datetime]:
+    async def issue(
+        self, account: UserAccount, *, credential_version: bytes | None = None
+    ) -> tuple[str, datetime]:
         """Issue a new session and revoke any prior session for the same user."""
+        if credential_version is not None and (
+            type(credential_version) is not bytes or len(credential_version) != 32
+        ):
+            raise ValueError("credential version must be an opaque SHA-256 identity")
         token = secrets.token_urlsafe(32)
         digest = self._digest(token)
-        expires_at = datetime.now(UTC) + timedelta(seconds=self._ttl_seconds)
-        record = _SessionRecord(account=account, expires_at=expires_at)
         async with self._lock:
+            expires_at = datetime.now(UTC) + timedelta(seconds=self._ttl_seconds)
+            record = _SessionRecord(
+                account=account,
+                expires_at=expires_at,
+                deadline=monotonic() + self._ttl_seconds,
+                credential_version=credential_version,
+            )
             previous = self._user_tokens.get(account.id)
             if previous is not None:
                 self._sessions.pop(previous, None)
@@ -98,17 +150,25 @@ class UserSessionManager:
         if not self._token_is_valid(token):
             return None
         digest = self._digest(token)
-        now = datetime.now(UTC)
         async with self._lock:
             record = self._sessions.get(digest)
             if record is None:
                 return None
-            if record.expires_at <= now:
+            if record.deadline <= monotonic():
                 self._sessions.pop(digest, None)
                 if self._user_tokens.get(record.account.id) == digest:
                     self._user_tokens.pop(record.account.id, None)
                 return None
-            return record.account
+            current = (
+                record.account
+                if self._resolve_account is None
+                else self._resolve_account(record.account, record.credential_version)
+            )
+            if current is None:
+                self._sessions.pop(digest, None)
+                if self._user_tokens.get(record.account.id) == digest:
+                    self._user_tokens.pop(record.account.id, None)
+            return current
 
     async def revoke(self, token: str) -> bool:
         """Revoke one session token without exposing session state."""
@@ -121,7 +181,8 @@ class UserSessionManager:
                 return False
             if self._user_tokens.get(record.account.id) == digest:
                 self._user_tokens.pop(record.account.id, None)
-            return True
+        self._notify_revocation(record.account.id)
+        return True
 
     async def revoke_user(self, user_id: UUID) -> None:
         """Revoke the active session for a user after an authority-bearing change."""
@@ -129,3 +190,6 @@ class UserSessionManager:
             digest = self._user_tokens.pop(user_id, None)
             if digest is not None:
                 self._sessions.pop(digest, None)
+        # Authority changes must also invalidate pending authentication when
+        # no full session exists yet (for example SSO followed by local MFA).
+        self._notify_revocation(user_id)

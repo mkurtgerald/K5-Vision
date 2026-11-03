@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import math
 import re
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlsplit
 from uuid import UUID
@@ -14,7 +18,7 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress
+from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress, StrictBool
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -25,6 +29,13 @@ from k5vision.media.mediamtx_provider import (
     MediaMTXBinding,
     MediaWorkerError,
     MediaWorkerErrorCode,
+)
+from k5vision.media.presentation_frame import PixelFormat, PresentationVideoFrame
+from k5vision.operator_analytics import (
+    MAX_VIEW_FRAME_BYTES,
+    MAX_VIEW_HEIGHT,
+    MAX_VIEW_PIXELS,
+    MAX_VIEW_WIDTH,
 )
 from k5vision.operator_product_state import OperatorCameraCapacityError
 from k5vision.services.device_registry import (
@@ -44,16 +55,34 @@ _BODY_LIMIT = 16 * 1024
 _READ_ROLES = frozenset(UserRole)
 _HLS_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:m3u8|mp4|m4s|ts)")
 _RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})")
+_PERSON_PATH = re.compile(
+    re.escape(_PREFIX) + r"/cameras/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/person-view"
+)
+_SESSION_TOKEN = re.compile(r"[A-Za-z0-9_-]{32,128}")
+
+
+def _analytics_owner(token: str) -> UUID:
+    return UUID(bytes=hashlib.sha256(token.encode("ascii")).digest()[:16])
 
 
 def _product_path(path: str) -> bool:
     return (
         path == _PREFIX + "/cameras"
         or path.startswith(_PREFIX + "/cameras/")
+        or path.startswith(_PREFIX + "/admin/")
+        or path.startswith(_PREFIX + "/security/")
+        or path.startswith(_PREFIX + "/integrations/")
+        or path.startswith("/api/v1/auth/oidc/")
         or path
         in {
             _PREFIX + "/media-auth",
             _PREFIX + "/media-session",
+            _PREFIX + "/camera-discovery",
+            _PREFIX + "/camera-profiles",
+            _PREFIX + "/camera-stream-probe",
+            _PREFIX + "/security",
+            "/api/v1/auth/mfa",
         }
     )
 
@@ -69,9 +98,18 @@ class _BoundedProductBody:
             scope["type"] != "http"
             or scope.get("method") not in {"POST", "DELETE", "PATCH", "PUT"}
             or not _product_path(scope.get("path", ""))
+            or (
+                scope.get("method") == "POST"
+                and _PERSON_PATH.fullmatch(scope.get("path", "")) is not None
+            )
         ):
             await self.app(scope, receive, send)
             return
+        body_limit = (
+            64 * 1024
+            if scope.get("path", "").startswith(_PREFIX + "/integrations/")
+            else _BODY_LIMIT
+        )
         lengths = [value for name, value in scope.get("headers", ()) if name == b"content-length"]
         if len(lengths) > 1:
             await JSONResponse({"detail": "Invalid request length"}, status_code=400)(
@@ -88,7 +126,7 @@ class _BoundedProductBody:
                     scope, receive, send
                 )
                 return
-            if length > _BODY_LIMIT:
+            if length > body_limit:
                 await JSONResponse({"detail": "Request body too large"}, status_code=413)(
                     scope, receive, send
                 )
@@ -102,7 +140,7 @@ class _BoundedProductBody:
                 )
                 return
             piece = message.get("body", b"")
-            if len(body) + len(piece) > _BODY_LIMIT:
+            if len(body) + len(piece) > body_limit:
                 await JSONResponse({"detail": "Request body too large"}, status_code=413)(
                     scope, receive, send
                 )
@@ -122,12 +160,49 @@ class _BoundedProductBody:
         await self.app(scope, replay, send)
 
 
+class _ProductRoutesOnly:
+    """The installed workspace exposes its scoped camera API, not legacy adapters.
+
+    Legacy control-plane device/recording APIs have different selection semantics.
+    They remain available in the standalone control plane, but cannot bypass
+    workspace grants when both compositions share an application instance.
+    """
+
+    _LEGACY = (
+        "/api/v1/devices",
+        "/api/v1/operator/live",
+        "/api/v1/operator/recordings",
+        "/api/v1/operator/recording-sessions",
+        "/api/v1/operator/playback-controls",
+    )
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = scope.get("path", "")
+        if scope["type"] == "http" and any(
+            path == prefix or path.startswith(prefix + "/") for prefix in self._LEGACY
+        ):
+            await JSONResponse(
+                {"detail": "Not found"}, status_code=404, headers={"Cache-Control": "no-store"}
+            )(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 class _CameraEnrollment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=128)
     host: IPvAnyAddress
     source_uri: str = Field(min_length=1, max_length=4096, repr=False)
+
+
+class _RecordingPreference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: StrictBool
 
 
 def _unauthorized() -> HTTPException:
@@ -223,10 +298,15 @@ def install_operator_product_api(
     service: OperatorProductService,
     public_port: int,
     analytics=None,
+    analytics_status: str = "disabled",
+    state_root: Path | None = None,
 ) -> None:
     """Install the local product contract without exposing execution credentials."""
     if type(public_port) is not int or not 1 <= public_port <= 65535:
         raise ValueError("operator public port is invalid")
+    if analytics_status not in {"disabled", "configured", "unavailable"}:
+        raise ValueError("operator person view status is invalid")
+    person_status = "configured" if analytics is not None else analytics_status
     registry = app.state.device_registry
     users = app.state.user_registry
     sessions = app.state.user_session_manager
@@ -235,8 +315,22 @@ def install_operator_product_api(
     if users.site_id != service.site_id:
         raise ValueError("operator accounts belong to another site")
     mutations = asyncio.Lock()
+    person_slots = asyncio.Semaphore(4)
     seen_live: set[UUID] = set()
+    connection_started: dict[UUID, float] = {}
+    recording_started: dict[UUID, float] = {}
+    recording_changed: dict[UUID, float] = {}
+    media_generation = getattr(service, "media_generation", 0)
     app.add_middleware(_BoundedProductBody)
+    app.add_middleware(_ProductRoutesOnly)
+    from k5vision.operator_role_policy_api import (
+        OperatorPermissionContext,
+        effective_permissions,
+        install_operator_role_api,
+        require_current_permission,
+    )
+
+    app.add_middleware(OperatorPermissionContext)
     previous_validation_handler = app.exception_handlers.get(
         RequestValidationError, request_validation_exception_handler
     )
@@ -244,7 +338,12 @@ def install_operator_product_api(
     @app.exception_handler(RequestValidationError)
     async def product_validation_error(request: Request, exc: RequestValidationError):
         if _product_path(request.url.path):
-            return JSONResponse({"detail": "Invalid operator request"}, status_code=422)
+            detail = (
+                "admin_invalid_request"
+                if request.url.path.startswith(_PREFIX + "/admin/")
+                else "Invalid operator request"
+            )
+            return JSONResponse({"detail": detail}, status_code=422)
         return await previous_validation_handler(request, exc)
 
     async def authenticate(token: str) -> tuple[UserAccount, str]:
@@ -253,10 +352,23 @@ def install_operator_product_api(
             raise _unauthorized()
         try:
             current = users.get(principal.id)
+            credential_active = (
+                current is not None and users.credential_status(current.id) == "active"
+            )
         except UserRegistryStorageError:
             raise HTTPException(503, "Operator identity unavailable") from None
-        if current is None or not current.enabled or current.role not in _READ_ROLES:
+        if (
+            current is None
+            or not current.enabled
+            or current.role not in _READ_ROLES
+            or current.role is not principal.role
+            or not credential_active
+        ):
             raise _unauthorized()
+        from k5vision.operator_audit import set_audit_actor
+
+        set_audit_actor(current)
+        require_current_permission(app, current)
         return current, token
 
     async def require_session(request: Request) -> tuple[UserAccount, str]:
@@ -323,75 +435,424 @@ def install_operator_product_api(
                 return source
         raise HTTPException(404, "Camera not found")
 
-    async def camera_view(source: MediaMTXSource) -> dict:
+    def access_policy(account: UserAccount) -> dict:
+        try:
+            value = users.get_camera_access(account.id)
+            if value is None:
+                raise _unauthorized()
+            return value
+        except UserRegistryStorageError:
+            raise HTTPException(503, "Operator identity unavailable") from None
+
+    def permitted(account: UserAccount, device_id: UUID) -> bool:
+        if account.role is UserRole.ADMINISTRATOR:
+            return True
+        access = access_policy(account)
+        return access["mode"] == "all" or device_id in access["camera_ids"]
+
+    def authorized_selection(account: UserAccount, device_id: UUID) -> MediaMTXSource:
+        if not permitted(account, device_id):
+            raise HTTPException(404, "Camera not found")
+        return selection(device_id)
+
+    def capabilities(account: UserAccount) -> dict:
+        access = access_policy(account)
+        permissions = effective_permissions(app, account)
+        role_policy = getattr(app.state, "operator_roles", None)
+        role_fields = {} if role_policy is None else role_policy.account_fields(account)
+        return {
+            "account": {**account.model_dump(mode="json"), **role_fields},
+            "effective_permissions": sorted(permissions),
+            "can_manage_users": "users.manage" in permissions,
+            "can_manage_cameras": "cameras.manage" in permissions,
+            "can_export": "cameras.export" in permissions,
+            "can_view_history": "cameras.playback" in permissions,
+            "camera_access": {
+                "mode": access["mode"],
+                "camera_ids": [str(value) for value in access["camera_ids"]],
+            },
+        }
+
+    async def camera_view(source: MediaMTXSource, *, worker_snapshot=None) -> dict:
+        nonlocal media_generation
+        now = monotonic()
+        generation = getattr(service, "media_generation", 0)
+        if generation != media_generation:
+            seen_live.clear()
+            connection_started.clear()
+            recording_started.clear()
+            recording_changed.clear()
+            recording_changed.update((item.binding.device_id, now) for item in selections())
+            media_generation = generation
+        identifier = source.binding.device_id
+        connection_started.setdefault(identifier, now)
         result = {
             "device_id": str(source.binding.device_id),
             "name": source.device.name,
             "host": str(source.device.host),
+            "management_port": source.device.management_port,
+            "management_secure": "k5-onvif-https" in source.device.tags,
+            "connection_type": "onvif"
+            if DeviceProtocol.ONVIF in source.device.protocols
+            else "rtsp",
             "status": "unavailable",
             "recording": False,
-            "analytics_status": "disabled",
+            "recording_enabled": source.recording_enabled,
+            "recording_state": "error",
+            "recording_status": {
+                "reason": "worker_unavailable",
+                "observed_bytes": 0,
+                "last_progress_age_seconds": None,
+            },
+            "connection_error": None,
+            "analytics_status": person_status,
         }
         if service.status() not in {"ready", "disk_full"}:
+            if not source.recording_enabled:
+                result["recording_state"] = "paused"
+                result["recording_status"]["reason"] = "operator_paused"
             return result
         try:
-            state = await service.provider.path_state(source.binding)
-            configuration = await service.provider.path_configuration(source.binding)
+            if isinstance(worker_snapshot, MediaWorkerErrorCode):
+                raise MediaWorkerError(worker_snapshot)
+            if worker_snapshot is None:
+                state = await service.provider.path_state(source.binding)
+                configuration = await service.provider.path_configuration(source.binding)
+            else:
+                state, configuration = worker_snapshot
+            now = monotonic()
             if state.online and state.available:
                 seen_live.add(source.binding.device_id)
                 result["status"] = "live"
                 result["recording"] = configuration.recording_enabled
-            elif source.binding.device_id in seen_live or state.available:
+            elif (
+                identifier in seen_live
+                or state.available
+                or now - connection_started[identifier] >= 30
+            ):
                 result["status"] = "disconnected"
             else:
                 result["status"] = "connecting"
         except MediaWorkerError as exc:
+            now = monotonic()
             if exc.code is MediaWorkerErrorCode.NOT_FOUND:
-                result["status"] = "connecting"
+                result["status"] = (
+                    "disconnected"
+                    if identifier in seen_live or now - connection_started[identifier] >= 30
+                    else "connecting"
+                )
+        if result["status"] == "disconnected":
+            result["connection_error"] = "stream_unavailable"
+        if not source.recording_enabled:
+            recording_started.pop(identifier, None)
+            result["recording_state"], reason = "paused", "operator_paused"
+        elif service.status() == "disk_full":
+            result["recording_state"], reason = "paused", "storage_paused"
+        elif result["status"] == "unavailable":
+            result["recording_state"], reason = "error", "worker_unavailable"
+        elif result["status"] != "live":
+            recording_started.pop(identifier, None)
+            result["recording_state"], reason = "waiting", "camera_unavailable"
+        elif result["recording"] is not True:
+            result["recording_state"], reason = "error", "configuration_mismatch"
+        else:
+            began = recording_started.setdefault(identifier, now)
+            try:
+                progress = service.recording_progress(source.binding)
+                size, age = progress["observed_bytes"], progress["last_progress_age_seconds"]
+                if type(size) is not int or not 0 <= size <= 2**63 - 1:
+                    raise ValueError
+                if age is not None and (
+                    type(age) not in (int, float) or not math.isfinite(age) or age < 0
+                ):
+                    raise ValueError
+                result["recording_status"].update(
+                    observed_bytes=size,
+                    last_progress_age_seconds=None if age is None else min(86400, age),
+                )
+                if progress.get("inspection_complete") is not True:
+                    result["recording_state"], reason = "error", "storage_inspection"
+                elif (
+                    age is not None
+                    and age <= 45
+                    and (
+                        identifier not in recording_changed
+                        or now - age >= recording_changed[identifier]
+                    )
+                ):
+                    result["recording_state"], reason = "recording", "disk_progress"
+                elif now - began >= 45:
+                    result["recording_state"], reason = "stalled", "no_disk_progress"
+                else:
+                    result["recording_state"], reason = "waiting", "awaiting_disk_progress"
+            except Exception:
+                result["recording_state"], reason = "error", "storage_inspection"
+        result["recording_status"]["reason"] = reason
         return result
 
     read_session = Depends(require_session)
     admin_session = Depends(require_admin)
 
-    @app.get(_PREFIX + "/cameras", tags=["operator"])
-    async def list_cameras(_session: tuple[UserAccount, str] = read_session):
-        selected = selections()
-        semaphore = asyncio.Semaphore(4)
+    from k5vision.operator_admin_api import install_operator_admin_api
 
-        async def view(source):
-            async with semaphore:
-                return await camera_view(source)
+    install_operator_admin_api(
+        app,
+        users=users,
+        sessions=sessions,
+        registry=registry,
+        require_admin=require_admin,
+        authenticate=authenticate,
+        mutations=mutations,
+    )
+
+    role_policy = getattr(app.state, "operator_roles", None)
+    if role_policy is not None:
+        install_operator_role_api(
+            app,
+            policy=role_policy,
+            users=users,
+            sessions=sessions,
+            require_admin=require_admin,
+            authenticate=authenticate,
+            mutations=mutations,
+        )
+
+    from k5vision.operator_audit_api import install_operator_audit_api
+    from k5vision.operator_audit_middleware import OperatorAuditMiddleware
+    from k5vision.operator_identity_security_api import install_account_security_api
+    from k5vision.operator_integrations_api import install_operator_integrations_api
+    from k5vision.operator_oidc_api import install_oidc_api
+    from k5vision.operator_storage_settings_api import install_operator_storage_settings_api
+    from k5vision.operator_time_admin_api import install_operator_time_admin_api
+
+    audit = getattr(app.state, "operator_audit", None)
+    if audit is not None:
+        app.add_middleware(OperatorAuditMiddleware, store=audit)
+        install_operator_audit_api(
+            app,
+            store=audit,
+            require_admin=require_admin,
+            authenticate=authenticate,
+        )
+    security = getattr(app.state, "operator_identity_security", None)
+    if security is not None:
+        install_account_security_api(
+            app,
+            security=security,
+            sessions=sessions,
+            require_session=require_session,
+            authenticate=authenticate,
+            admit_origin=admit_origin,
+            mutations=mutations,
+        )
+        install_oidc_api(
+            app,
+            oidc=app.state.operator_oidc,
+            security=security,
+            users=users,
+            sessions=sessions,
+            require_admin=require_admin,
+            authenticate=authenticate,
+            admit_origin=admit_origin,
+            public_port=public_port,
+            mutations=mutations,
+        )
+    if callable(getattr(service, "storage_administration", None)):
+        install_operator_storage_settings_api(
+            app,
+            service=service,
+            require_admin=require_admin,
+            authenticate=authenticate,
+            mutations=mutations,
+        )
+    time_admin = getattr(app.state, "operator_time_admin", None)
+    if time_admin is not None:
+        install_operator_time_admin_api(
+            app,
+            time_admin=time_admin,
+            require_admin=require_admin,
+            authenticate=authenticate,
+            authorized_selection=authorized_selection,
+            mutations=mutations,
+        )
+    integrations = getattr(app.state, "operator_integrations", None)
+    if integrations is not None:
+        install_operator_integrations_api(
+            app,
+            integrations=integrations,
+            registry=registry,
+            require_admin=require_admin,
+            require_session=require_session,
+            authenticate=authenticate,
+            authorized_selection=authorized_selection,
+            mutations=mutations,
+        )
+
+    from k5vision.operator_events_api import install_operator_events_api
+    from k5vision.operator_exports_api import install_operator_exports_api
+
+    install_operator_events_api(
+        app,
+        events=getattr(app.state, "operator_events", None),
+        require_session=require_session,
+        require_admin=require_admin,
+        authenticate=authenticate,
+        authorized_selection=authorized_selection,
+        selections=selections,
+        mutations=mutations,
+    )
+    install_operator_exports_api(
+        app,
+        service=service,
+        state_root=cameras._root if state_root is None else state_root,
+        require_session=require_session,
+        authenticate=authenticate,
+        authorized_selection=authorized_selection,
+        admit_origin=admit_origin,
+    )
+    if audit is not None:
+        app.state.operator_exports.set_audit(audit)
+
+    @app.get(_PREFIX + "/capabilities", tags=["operator"])
+    async def current_capabilities(
+        response: Response, session: tuple[UserAccount, str] = read_session
+    ):
+        response.headers["Cache-Control"] = "no-store"
+        return capabilities(session[0])
+
+    @app.get(_PREFIX + "/status", tags=["operator"])
+    async def operator_status(response: Response, _session: tuple[UserAccount, str] = read_session):
+        response.headers["Cache-Control"] = "no-store"
+        return {**service.diagnostics(), "analytics_status": person_status}
+
+    @app.get(_PREFIX + "/cameras", tags=["operator"])
+    async def list_cameras(response: Response, session: tuple[UserAccount, str] = read_session):
+        response.headers["Cache-Control"] = "no-store"
+        selected = tuple(
+            source for source in selections() if permitted(session[0], source.binding.device_id)
+        )
+        snapshot = {}
+        if selected and service.status() in {"ready", "disk_full"}:
+            try:
+                snapshot = await service.provider.path_snapshot(
+                    tuple(source.binding for source in selected)
+                )
+            except MediaWorkerError as error:
+                snapshot = {source.binding: error.code for source in selected}
+
+        current, _ = await authenticate(session[1])
+        selected = tuple(
+            source for source in selections() if permitted(current, source.binding.device_id)
+        )
 
         return {
-            "cameras": await asyncio.gather(*(view(source) for source in selected)),
+            "cameras": [
+                await camera_view(
+                    source,
+                    worker_snapshot=snapshot.get(source.binding, MediaWorkerErrorCode.UNAVAILABLE),
+                )
+                for source in selected
+            ],
             "worker_status": service.status(),
+            "capabilities": capabilities(current),
         }
 
-    @app.post(_PREFIX + "/cameras", status_code=201, tags=["operator"])
-    async def enroll_camera(
-        payload: _CameraEnrollment, _session: tuple[UserAccount, str] = admin_session
+    async def enroll_camera_source(
+        *,
+        name: str,
+        host: str,
+        source_uri: str,
+        session: tuple[UserAccount, str],
+        management_port: int = 80,
+        management_secure: bool = False,
+        onvif: bool = False,
+        stream_key: str | None = None,
+        reconnect_id: UUID | None = None,
+        before_store=None,
     ):
         try:
             request = DeviceCreate(
-                name=payload.name, host=payload.host, protocols={DeviceProtocol.RTSP}
+                name=name,
+                host=host,
+                management_port=management_port,
+                protocols={DeviceProtocol.ONVIF, DeviceProtocol.RTSP}
+                if onvif
+                else {DeviceProtocol.RTSP},
+                tags={"k5-onvif-https"} if onvif and management_secure else set(),
             )
             provisional = Device(**request.model_dump())
             MediaMTXSource(
-                MediaMTXBinding(service.site_id, provisional.id), provisional, payload.source_uri
+                MediaMTXBinding(service.site_id, provisional.id), provisional, source_uri
             )
         except ValueError:
             raise HTTPException(422, "Invalid camera selection") from None
         async with mutations:
+            current, _token = await authenticate(session[1])
+            if current.id != session[0].id or current.role is not UserRole.ADMINISTRATOR:
+                raise HTTPException(403, "Insufficient camera administration permission")
+            if before_store is not None:
+                before_store()
             try:
                 existing = selections()
-                if len(existing) >= 64 and not any(
-                    source.device.host == request.host
-                    and source.device.management_port == request.management_port
-                    for source in existing
+                known_stream = (
+                    registry.find_stream(str(request.host), management_port, stream_key)
+                    if stream_key is not None
+                    else None
+                )
+                if (
+                    stream_key is not None
+                    and reconnect_id is None
+                    and len(existing) >= 64
+                    and not any(
+                        known_stream is not None and source.device.id == known_stream.id
+                        for source in existing
+                    )
                 ):
                     raise HTTPException(409, "Camera capacity reached")
-                device = registry.enroll(request).device
-                source = cameras.upsert(device, payload.source_uri)
+                if reconnect_id is not None:
+                    previous = selection(reconnect_id)
+                    if previous.device.name != request.name or previous.device.host != request.host:
+                        raise HTTPException(
+                            422, "Stream must match the selected camera name and host"
+                        )
+                reconnect = (
+                    registry.find_name_host(request.name, str(request.host)) if onvif else []
+                )
+                if len(reconnect) > 1:
+                    raise HTTPException(409, "Camera endpoint already enrolled")
+                if (
+                    len(existing) >= 64
+                    and not reconnect
+                    and reconnect_id is None
+                    and not any(
+                        source.device.host == request.host
+                        and source.device.management_port == request.management_port
+                        for source in existing
+                    )
+                ):
+                    raise HTTPException(409, "Camera capacity reached")
+                if reconnect_id is not None:
+                    source = cameras.reconnect_stream(
+                        reconnect_id, source_uri, management_port, stream_key
+                    )
+                elif reconnect:
+                    source = cameras.reconnect_onvif(
+                        reconnect[0].id,
+                        source_uri,
+                        management_port=management_port,
+                        secure=management_secure,
+                    )
+                else:
+                    device = (
+                        registry.enroll_stream(request, stream_key).device
+                        if stream_key is not None
+                        else registry.enroll(request).device
+                    )
+                    source = cameras.upsert(device, source_uri)
+                seen_live.discard(source.binding.device_id)
+                connection_started[source.binding.device_id] = monotonic()
+                recording_started.pop(source.binding.device_id, None)
+                recording_changed[source.binding.device_id] = monotonic()
                 await service.apply_sources(selections())
             except DeviceRegistryConflictError:
                 raise HTTPException(409, "Camera endpoint already enrolled") from None
@@ -403,6 +864,78 @@ def install_operator_product_api(
                 raise HTTPException(503, "Camera configuration unavailable") from None
         return await camera_view(source)
 
+    @app.post(_PREFIX + "/cameras", status_code=201, tags=["operator"])
+    async def enroll_camera(
+        payload: _CameraEnrollment, session: tuple[UserAccount, str] = admin_session
+    ):
+        return await enroll_camera_source(
+            name=payload.name,
+            host=str(payload.host),
+            source_uri=payload.source_uri,
+            session=session,
+        )
+
+    from k5vision.operator_onvif_api import install_operator_onvif_api
+
+    onvif_probes = install_operator_onvif_api(
+        app, require_admin=require_admin, authenticate=authenticate, enroll=enroll_camera_source
+    )
+    from k5vision.operator_rtsp_api import install_operator_rtsp_api
+
+    rtsp_probes = install_operator_rtsp_api(
+        app, require_admin=require_admin, authenticate=authenticate, enroll=enroll_camera_source
+    )
+
+    @app.put(_PREFIX + "/cameras/{device_id}/recording", tags=["operator"])
+    async def recording_preference(
+        device_id: UUID,
+        payload: _RecordingPreference,
+        response: Response,
+        session: tuple[UserAccount, str] = admin_session,
+    ):
+        response.headers["Cache-Control"] = "no-store"
+        async with mutations:
+            current, _ = await authenticate(session[1])
+            if current.id != session[0].id or current.role is not UserRole.ADMINISTRATOR:
+                raise HTTPException(403, "Insufficient camera administration permission")
+            source = selection(device_id)
+            if source.recording_enabled == payload.enabled:
+                return await camera_view(source)
+            previous = selections()
+            updated = tuple(
+                replace(item, recording_enabled=payload.enabled)
+                if item.binding.device_id == device_id
+                else item
+                for item in previous
+            )
+            try:
+                await service.apply_recording_preferences(updated)
+                current, _ = await authenticate(session[1])
+                if current.id != session[0].id or current.role is not UserRole.ADMINISTRATOR:
+                    raise HTTPException(403, "Insufficient camera administration permission")
+                source = cameras.set_recording_enabled(device_id, payload.enabled)
+            except BaseException as error:
+                rollback = asyncio.create_task(service.apply_recording_preferences(previous))
+                try:
+                    await asyncio.shield(rollback)
+                except asyncio.CancelledError:
+                    try:
+                        await asyncio.shield(rollback)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                if isinstance(error, (HTTPException, asyncio.CancelledError)):
+                    raise
+                raise HTTPException(
+                    503,
+                    "Recording preference could not be applied",
+                    headers={"Cache-Control": "no-store"},
+                ) from None
+            recording_started.pop(device_id, None)
+            recording_changed[device_id] = monotonic()
+            return await camera_view(source)
+
     @app.delete(_PREFIX + "/cameras/{device_id}", status_code=204, tags=["operator"])
     async def remove_camera(device_id: UUID, _session: tuple[UserAccount, str] = admin_session):
         async with mutations:
@@ -410,6 +943,9 @@ def install_operator_product_api(
             try:
                 cameras.remove(device_id)
                 seen_live.discard(device_id)
+                connection_started.pop(device_id, None)
+                recording_started.pop(device_id, None)
+                recording_changed.pop(device_id, None)
                 await service.apply_sources(selections())
             except (RuntimeError, OSError, ValueError):
                 raise HTTPException(503, "Camera configuration unavailable") from None
@@ -418,11 +954,13 @@ def install_operator_product_api(
     @app.get(_PREFIX + "/cameras/{device_id}/history", tags=["operator"])
     async def camera_history(
         device_id: UUID,
+        response: Response,
         start: str | None = None,
         end: str | None = None,
-        _session: tuple[UserAccount, str] = read_session,
+        session: tuple[UserAccount, str] = read_session,
     ):
-        source = selection(device_id)
+        response.headers["Cache-Control"] = "no-store"
+        source = authorized_selection(session[0], device_id)
         try:
             first, last = _interval(start, end)
         except (ValueError, OverflowError):
@@ -435,6 +973,8 @@ def install_operator_product_api(
             spans = await service.provider.playback_spans(source.binding, start=first, end=last)
         except MediaWorkerError:
             raise HTTPException(503, "Playback inventory unavailable") from None
+        current, _ = await authenticate(session[1])
+        authorized_selection(current, device_id)
         return {
             "spans": [
                 {
@@ -446,6 +986,105 @@ def install_operator_product_api(
             ]
         }
 
+    @app.post(_PREFIX + "/cameras/{device_id}/person-view", tags=["operator"])
+    async def person_view(
+        device_id: UUID,
+        request: Request,
+        response: Response,
+        session: tuple[UserAccount, str] = read_session,
+    ):
+        # Frame pixels are transient caller-supplied view data, never trusted
+        # camera evidence. Admission precedes body buffering and is repeated
+        # after inference, including durable account and source membership.
+        if len(request.headers.getlist("origin")) != 1:
+            raise HTTPException(403, "Invalid operator origin")
+        admit_origin(request)
+        origin = urlsplit(request.headers["origin"])
+        if origin.scheme != request.url.scheme or origin.hostname != request.url.hostname:
+            raise HTTPException(403, "Invalid operator origin")
+        authorized_selection(session[0], device_id)
+        if analytics is None:
+            raise HTTPException(503, "Person view is not configured")
+        try:
+            query = _query(
+                request.url.query,
+                allowed={"width", "height", "frame_id"},
+                required={"width", "height", "frame_id"},
+            )
+            if any(
+                not value.isascii() or not value.isdecimal() or len(value) > 10
+                for value in query.values()
+            ):
+                raise ValueError
+            width, height, frame_id = (int(query[key]) for key in ("width", "height", "frame_id"))
+            if not (
+                1 <= width <= MAX_VIEW_WIDTH
+                and 1 <= height <= MAX_VIEW_HEIGHT
+                and width * height <= MAX_VIEW_PIXELS
+                and 0 <= frame_id <= 2_147_483_647
+            ):
+                raise ValueError
+        except (ValueError, OverflowError):
+            raise HTTPException(422, "Invalid person view geometry") from None
+        if request.headers.getlist("content-type") != ["application/octet-stream"] or (
+            request.headers.getlist("content-encoding") not in ([], ["identity"])
+        ):
+            raise HTTPException(415, "Person view requires raw BGRX bytes")
+        expected = width * height * 4
+        lengths = request.headers.getlist("content-length")
+        if len(lengths) > 1:
+            raise HTTPException(400, "Invalid person view length")
+        if lengths:
+            value = lengths[0]
+            if not value.isascii() or not value.isdecimal() or len(value) > 10:
+                raise HTTPException(400, "Invalid person view length")
+            declared = int(value)
+            if declared > MAX_VIEW_FRAME_BYTES:
+                raise HTTPException(413, "Person view frame too large")
+            if declared != expected:
+                raise HTTPException(400, "Person view length does not match geometry")
+        if person_slots.locked():
+            raise HTTPException(429, "Person view capacity is busy")
+        await person_slots.acquire()
+        body = bytearray()
+        try:
+            try:
+                async with asyncio.timeout(3):
+                    async for piece in request.stream():
+                        if len(body) + len(piece) > expected:
+                            raise HTTPException(413, "Person view frame too large")
+                        body.extend(piece)
+            except TimeoutError:
+                raise HTTPException(408, "Person view upload timed out") from None
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(400, "Person view upload unavailable") from None
+            if len(body) != expected:
+                raise HTTPException(400, "Person view length does not match geometry")
+            try:
+                result = await analytics.infer(
+                    owner_id=_analytics_owner(session[1]),
+                    camera_id=device_id,
+                    frame_id=frame_id,
+                    frame=PresentationVideoFrame(
+                        memoryview(body), width, height, width * 4, PixelFormat.BGRX, 0
+                    ),
+                )
+                if result.frame_id != frame_id:
+                    raise ValueError
+                value = result.as_dict()
+            except Exception:
+                raise HTTPException(503, "Person view unavailable") from None
+            current, _ = await authenticate(session[1])
+            authorized_selection(current, device_id)
+            response.headers["Cache-Control"] = "no-store"
+            return value
+        finally:
+            if body:
+                body[:] = b"\0" * len(body)
+            person_slots.release()
+
     @app.post(_PREFIX + "/cameras/{device_id}/media-session", tags=["operator"])
     async def media_session(
         device_id: UUID,
@@ -454,11 +1093,12 @@ def install_operator_product_api(
         session: tuple[UserAccount, str] = read_session,
     ):
         admit_origin(request)
-        source = selection(device_id)
+        source = authorized_selection(session[0], device_id)
         response.set_cookie(
             _COOKIE,
             session[1],
-            max_age=8 * 60 * 60,
+            # A browser wall-clock correction must not expire media access
+            # ahead of its authoritative, monotonic human-session deadline.
             path="/media",
             httponly=True,
             secure=request.url.scheme == "https",
@@ -473,6 +1113,24 @@ def install_operator_product_api(
     @app.delete(_PREFIX + "/media-session", status_code=204, tags=["operator"])
     async def clear_media_session(request: Request):
         admit_origin(request)
+        values = request.headers.getlist("authorization")
+        scheme, separator, token = (values[0] if len(values) == 1 else "").partition(" ")
+        if separator and scheme.lower() == "bearer" and _SESSION_TOKEN.fullmatch(token) is not None:
+            onvif_probes.clear_token(token)
+            rtsp_probes.clear_token(token)
+        if (
+            analytics is not None
+            and separator
+            and scheme.lower() == "bearer"
+            and _SESSION_TOKEN.fullmatch(token) is not None
+        ):
+            # Logout revokes the bearer before this cookie-clear request.
+            # Closure uses only the opaque session-derived owner; it admits
+            # neither media nor inference for a revoked token.
+            try:
+                await analytics.close_owner(_analytics_owner(token))
+            except Exception:
+                pass
         response = Response(status_code=204)
         response.delete_cookie(
             _COOKIE,
@@ -495,7 +1153,7 @@ def install_operator_product_api(
                 tokens.append(value)
         if len(tokens) != 1:
             raise _unauthorized()
-        await authenticate(tokens[0])
+        current, _ = await authenticate(tokens[0])
         methods = request.headers.getlist("x-forwarded-method")
         uris = request.headers.getlist("x-forwarded-uri")
         if methods != ["GET"] or len(uris) != 1:
@@ -504,8 +1162,17 @@ def install_operator_product_api(
             path = _media_selection(uris[0])
         except (ValueError, OverflowError):
             raise _unauthorized() from None
-        if not any(source.binding.path_name == path for source in selections()):
+        if not any(
+            source.binding.path_name == path and permitted(current, source.binding.device_id)
+            for source in selections()
+        ):
             raise _unauthorized()
+        if urlsplit(uris[0]).path == "/media/playback":
+            values = dict(parse_qsl(urlsplit(uris[0]).query))
+            if values.get("format", "fmp4") == "mp4":
+                from k5vision.operator_role_policy_api import require_permission
+
+                require_permission(app, current, "cameras.export")
         if service.status() not in {"ready", "disk_full"}:
             raise HTTPException(503, "Media unavailable")
         return Response(status_code=200)

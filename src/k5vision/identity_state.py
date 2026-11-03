@@ -193,13 +193,40 @@ def _validate_registry(connection: sqlite3.Connection, site_id: str) -> None:
         if row["credential_kind"] == "password":
             if row["expires_at"] is not None:
                 raise IdentityStateError("identity password state is invalid")
-        elif row["credential_kind"] == "bootstrap":
+        elif row["credential_kind"] in {"bootstrap", "expired-bootstrap"}:
             expiry = datetime.fromisoformat(row["expires_at"])
             if expiry.tzinfo is None or expiry.utcoffset() is None:
                 raise IdentityStateError("identity bootstrap state is invalid")
         else:
             raise IdentityStateError("identity credential kind is invalid")
         credentials[row["user_id"]] = row["credential_kind"]
+    access_table = connection.execute(
+        "SELECT type FROM sqlite_master WHERE name = 'user_camera_access'"
+    ).fetchone()
+    if access_table is not None:
+        if access_table["type"] != "table":
+            raise IdentityStateError("identity camera access state is invalid")
+        access_users = set()
+        for row in connection.execute(
+            "SELECT * FROM user_camera_access LIMIT ?", (MAX_USER_CAPACITY + 1,)
+        ):
+            if (
+                row["site_id"] != site_id
+                or row["user_id"] not in users
+                or row["user_id"] in access_users
+                or type(row["camera_ids_json"]) is not str
+                or len(row["camera_ids_json"]) > 8192
+            ):
+                raise IdentityStateError("identity camera access state is invalid")
+            identifiers = json.loads(row["camera_ids_json"])
+            admitted = UserRegistry._camera_access_value(
+                users[row["user_id"]], {"mode": row["mode"], "camera_ids": identifiers}
+            )
+            if identifiers != [str(item) for item in admitted["camera_ids"]]:
+                raise IdentityStateError("identity camera access identifiers are invalid")
+            access_users.add(row["user_id"])
+        if len(access_users) > MAX_USER_CAPACITY:
+            raise IdentityStateError("identity camera access capacity exceeded")
     setup_complete = False
     if connection.execute(
         "SELECT 1 FROM user_audit WHERE site_id IS NOT ? LIMIT 1", (site_id,)
@@ -225,7 +252,7 @@ def _validate_registry(connection: sqlite3.Connection, site_id: str) -> None:
             event.action == "password-initialized"
             and event.actor == "local-admin-setup"
             and event.changed_fields == ("credential_state",)
-            and credentials.get(str(event.user_id)) == "password"
+            and str(event.user_id) in credentials
         ):
             setup_complete = True
     if (
@@ -233,6 +260,12 @@ def _validate_registry(connection: sqlite3.Connection, site_id: str) -> None:
         or len(users) > MAX_USER_CAPACITY
         or users.keys() != credentials.keys()
         or not setup_complete
+        or not any(
+            user.enabled
+            and user.role is UserRole.ADMINISTRATOR
+            and credentials.get(identifier) == "password"
+            for identifier, user in users.items()
+        )
     ):
         raise IdentityStateError("identity setup is incomplete")
 
