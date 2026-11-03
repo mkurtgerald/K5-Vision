@@ -427,3 +427,44 @@ def test_late_camera_refresh_preserves_administration_and_open_permissions_edito
             for method, path, _body in state["requests"]
         )
         assert not errors
+
+
+
+def test_unchanged_camera_refresh_does_not_replace_active_permissions_controls(workspace):
+    """Polling an unchanged inventory must not erase an in-progress camera grant."""
+    with workspace() as (page, _state, _account, errors):
+        _login(page)
+        page.locator("#admin-tab").click()
+        page.locator("#admin-users-list tr").wait_for()
+        page.locator("#admin-create-user").click()
+        choice = page.locator(f'#admin-camera-choices input[value="{_CAMERA}"]')
+        choice.check()
+        original = choice.element_handle()
+        assert original is not None
+
+        for checked in (True, False, True):
+            with page.expect_response(
+                lambda response: response.request.method == "GET"
+                and urlsplit(response.url).path == "/api/v1/operator/cameras"
+            ) as refreshed:
+                page.evaluate("document.getElementById('refresh-cameras').click()")
+            assert refreshed.value.status == 200
+            page.wait_for_timeout(100)
+            assert original.evaluate("(input) => input.isConnected")
+            assert choice.is_checked() is checked
+            if checked:
+                choice.uncheck()
+            else:
+                choice.check()
+
+        page.locator("#admin-username").fill("stable-viewer")
+        page.locator("#admin-display-name").fill("Stable viewer")
+        page.locator("#admin-role").select_option("viewer")
+        with page.expect_response(
+            lambda response: response.request.method == "POST"
+            and urlsplit(response.url).path == "/api/v1/operator/admin/users"
+        ) as created:
+            page.locator("#admin-save-user").click()
+        assert created.value.status == 201
+        page.locator("#admin-credential-dialog").wait_for(state="visible")
+        assert not errors
