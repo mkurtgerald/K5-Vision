@@ -13,7 +13,7 @@ requires its own passing receipt; an earlier installer does not qualify it.
 ## Install and connect cameras
 
 Use Windows 10/11 x64 and a current Edge or Chrome browser. The installer includes
-its own runtime; first launch needs Internet access to download and verify the
+its own runtime; internal candidates bundle and verify the
 native recording workers. The engine and workers run on this Windows PC.
 Normal setup needs no terminal, separate Python
 installation, manual packages, Docker or WSL. The testing installer is unsigned.

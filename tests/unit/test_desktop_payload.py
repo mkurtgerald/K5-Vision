@@ -510,3 +510,60 @@ def test_payload_failure_reports_phase_and_exception_type_without_private_values
     }
     assert "private" not in observed.out + observed.err
     assert "supplied-secret" not in observed.out + observed.err
+
+
+def test_native_worker_bundle_admits_official_archive_executable_and_license(
+    builder, tmp_path, monkeypatch
+):
+    """CI must seal both exact worker binaries and upstream licenses, not URLs."""
+    source = tmp_path / "worker.exe"
+    source.write_bytes(b"MZ\\x00reviewed worker")
+    license_bytes = b"Exact upstream permission notice\\n"
+    archive = io.BytesIO()
+    with ZipFile(archive, "w") as zipped:
+        zipped.writestr("mediamtx.exe", source.read_bytes())
+        zipped.writestr("LICENSE", license_bytes)
+    zipped_bytes = archive.getvalue()
+    pin = {
+        "component": "MediaMTX", "version": "v1.21.2",
+        "executable": "mediamtx.exe", "executable_bytes": source.stat().st_size,
+        "executable_sha256": sha256(source.read_bytes()).hexdigest(),
+        "license_sha256": sha256(license_bytes).hexdigest(),
+        "url": "https://example.invalid/reviewed-worker.zip",
+        "bytes": len(zipped_bytes), "sha256": sha256(zipped_bytes).hexdigest(),
+    }
+    monkeypatch.setattr(builder, "worker_download", lambda supplied, name: pin)
+    monkeypatch.setattr(builder, "urlopen", lambda url, timeout: io.BytesIO(zipped_bytes))
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    result = builder.bundle_worker(payload, source, "mediamtx")
+    assert (payload / result["payload_executable"]).read_bytes() == source.read_bytes()
+    assert (payload / result["payload_license"]).read_bytes() == license_bytes
+    assert result["payload_license_bytes"] == len(license_bytes)
+
+
+def test_native_worker_bundle_refuses_changed_upstream_license(
+    builder, tmp_path, monkeypatch
+):
+    source = tmp_path / "worker.exe"
+    source.write_bytes(b"MZ\\x00reviewed worker")
+    official_license = b"Reviewed permission notice"
+    archive = io.BytesIO()
+    with ZipFile(archive, "w") as zipped:
+        zipped.writestr("mediamtx.exe", source.read_bytes())
+        zipped.writestr("LICENSE", b"Altered permission notice")
+    zipped_bytes = archive.getvalue()
+    pin = {
+        "component": "MediaMTX", "version": "v1.21.2",
+        "executable": "mediamtx.exe", "executable_bytes": source.stat().st_size,
+        "executable_sha256": sha256(source.read_bytes()).hexdigest(),
+        "license_sha256": sha256(official_license).hexdigest(),
+        "url": "https://example.invalid/reviewed-worker.zip",
+        "bytes": len(zipped_bytes), "sha256": sha256(zipped_bytes).hexdigest(),
+    }
+    monkeypatch.setattr(builder, "worker_download", lambda supplied, name: pin)
+    monkeypatch.setattr(builder, "urlopen", lambda url, timeout: io.BytesIO(zipped_bytes))
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    with pytest.raises(ValueError, match="Worker archive member identity mismatch"):
+        builder.bundle_worker(payload, source, "mediamtx")

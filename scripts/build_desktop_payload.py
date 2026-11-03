@@ -298,6 +298,73 @@ def worker_download(source: Path, name: str) -> dict[str, object]:
     }
 
 
+
+def bundle_worker(payload: Path, source: Path, name: str) -> dict[str, object]:
+    """Seal exact official worker bytes and their original license at build time.
+
+    Network access belongs solely to CI; installed users never fetch workers.
+    Both the supplied CI executable and the independent official archive must
+    match the existing fixed executable identity before packaging.
+    """
+    identity = worker_download(source, name)
+    executable = name + ".exe"
+    if identity["executable"] != executable or identity["component"] not in {"MediaMTX", "Caddy"}:
+        raise ValueError("Worker platform identity invalid")
+    pin = {"bytes": identity["executable_bytes"], "sha256": identity["executable_sha256"]}
+    admit(source, pin)
+    archive = payload.parent / ("worker-" + name + "-official.zip")
+    download(identity, archive)
+    root = payload / "workers"
+    root.mkdir(exist_ok=True)
+
+    with ZipFile(archive) as zipped:
+        def copy_member(member: str, destination: Path, maximum: int, sha: str) -> dict:
+            matches = [entry for entry in zipped.infolist() if entry.filename == member]
+            if len(matches) != 1:
+                raise ValueError("Worker archive member is missing or ambiguous")
+            info = matches[0]
+            if (
+                info.is_dir()
+                or info.file_size <= 0
+                or info.file_size > maximum
+                or info.external_attr >> 16 & 0o170000 == 0o120000
+            ):
+                raise ValueError("Worker archive member layout refused")
+            copied = 0
+            identity_hash = hashlib.sha256()
+            with zipped.open(info) as stream, destination.open("xb") as output:
+                while chunk := stream.read(min(1024 * 1024, maximum + 1 - copied)):
+                    copied += len(chunk)
+                    if copied > maximum or copied > info.file_size:
+                        raise ValueError("Worker archive member size exceeded")
+                    output.write(chunk)
+                    identity_hash.update(chunk)
+            if copied != info.file_size or identity_hash.hexdigest() != sha:
+                raise ValueError("Worker archive member identity mismatch")
+            return {"bytes": copied, "sha256": sha}
+
+        binary = root / executable
+        details = copy_member(
+            executable, binary, int(identity["executable_bytes"]), identity["executable_sha256"]
+        )
+        if details["bytes"] != identity["executable_bytes"]:
+            raise ValueError("Worker executable size mismatch")
+        license_path = root / (name + "-LICENSE")
+        license_entries = [entry for entry in zipped.infolist() if entry.filename == "LICENSE"]
+        if len(license_entries) != 1:
+            raise ValueError("Worker upstream license missing")
+        license_info = copy_member(
+            "LICENSE", license_path, 65536, identity["license_sha256"]
+        )
+    admit(binary, pin)
+    return {
+        **identity,
+        "payload_executable": binary.relative_to(payload).as_posix(),
+        "payload_license": license_path.relative_to(payload).as_posix(),
+        "payload_license_bytes": license_info["bytes"],
+    }
+
+
 def provision_person_model(payload: Path) -> dict[str, object]:
     """Ship only the reviewed model, with no first-use package/model download."""
     phase("person_model_manifest")
@@ -603,10 +670,9 @@ def build(args: argparse.Namespace) -> None:
     person_model = provision_person_model(payload)
     phase("native_workers")
     workers = [
-        worker_download(args.media_exe, "mediamtx"),
-        worker_download(args.gateway_exe, "caddy"),
+        bundle_worker(payload, args.media_exe, "mediamtx"),
+        bundle_worker(payload, args.gateway_exe, "caddy"),
     ]
-    (payload / "workers").mkdir()
     (payload / "workers/donor-downloads.json").write_text(
         json.dumps({"schema_version": 1, "artifacts": workers}, indent=2) + "\n",
         encoding="utf-8",
@@ -679,7 +745,9 @@ def build(args: argparse.Namespace) -> None:
                 "manual_stream_uri_required": False,
                 "python": donors["python"],
                 "worker_downloads": workers,
-                "workers_bundled": False,
+                "workers_bundled": True,
+                "worker_runtime_downloads": False,
+                "worker_redistribution_review": "internal-testing-only",
                 "wheels": wheel_inventory,
                 "source_adaptations": [onvif_adaptation],
                 "person_model": person_model,

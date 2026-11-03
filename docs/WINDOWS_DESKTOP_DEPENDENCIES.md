@@ -4,9 +4,9 @@ Reviewed on 2026-10-13; ONVIF source slice reviewed on 2026-10-18; installed
 person-analytics inputs reviewed on 2026-10-28. This record covers the desktop package:
 an embedded CPython runtime, an exact minimal Python operator environment,
 official first-run native-worker provisioning, and an Inno Setup installer. The user installs
-and starts the application through Windows graphical controls. First launch
-requires Internet access to the pinned official worker downloads; subsequent
-launches reuse the admitted private copies. The independent OpenVINO person
+and starts the application through Windows graphical controls. The development
+installer carries its pinned native workers and requires no first-launch network
+downloads. The independent OpenVINO person
 detector, OpenCV decoder, exact model and native notices/sources are bundled;
 development tools and the separate Analytics Lab engineering wrapper remain
 outside this package. See `WINDOWS_PERSON_ANALYTICS_DEPENDENCIES.md` for the exact
@@ -174,10 +174,13 @@ installed product qualification requires the actual shipped runtime.
 
 ## Native Go media workers
 
-The desktop installer does not bundle these worker executables. Its graphical
-first launch downloads the same unmodified official Windows amd64 workers
-already pinned for the native operator pilot, with finite progress and no shell
-commands. Their surrounding K5 interfaces remain the replacement boundary.
+The internal desktop installer now carries these unchanged official Windows
+amd64 worker executables and their exact upstream licenses. CI independently
+admits the official archive digest, executable identity and license digest;
+installed runtime verification enforces both the sealed payload manifest and
+the same worker hashes before launch. Owner startup does not access a network,
+execute installer scripts, or fetch executables. Their surrounding K5 interfaces
+remain the replacement boundary.
 
 | Component | Immutable source | Archive SHA-256 | Executable SHA-256 |
 | --- | --- | --- | --- |
@@ -188,17 +191,19 @@ Official source, download URLs, executable sizes and archive identities are in
 `src/k5vision/data/caddy-donor-manifest.json` and
 `src/k5vision/data/mediamtx-donor-manifest.json`. The installed, hash-bound
 `workers/donor-downloads.json` selects exactly these two Windows artifacts.
-Provisioning verifies each archive SHA-256, executable length/SHA-256 and
-unchanged license SHA-256 before using it. The private worker directory retains
-the official archive's complete license alongside its executable. Existing
-verified copies are reused; modified bytes are refused rather than executed.
+CI admission verifies each archive SHA-256, executable length/SHA-256 and
+unchanged license SHA-256 before sealing both executables and licenses in the
+installer. The installed program refuses missing or modified worker bytes
+rather than attempting a first-launch download.
 
 Caddy's official release supplies target-specific SBOMs. The separately captured
 exact compiled-module inventory and supplied notices help assess future worker
 redistribution, but package-level declarations alone do not establish all native
-component rights. Earlier pilot records admitted official downloads and left
-broader binary redistribution review open. Keeping the same download boundary
-does not silently close that review or make K5 the owner of Go dependencies.
+component rights. Earlier pilot records admitted official downloads and left broader binary
+redistribution review open. Including the pinned copies in an **unsigned
+internal-testing candidate** does not close that review or authorize a
+commercial release. Component rights and source/notice obligations remain
+explicit release gates; K5 does not acquire ownership of Go dependencies.
 
 This record establishes the package inputs and the bounded desktop scope. It
 does not grant rights over restricted analytics material, settle missing terms

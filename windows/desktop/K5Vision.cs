@@ -247,7 +247,9 @@ namespace K5VisionDesktop
                 }
             }
             if (!admitted.Contains("runtime/python.exe") || !admitted.Contains("runtime/python312._pth") ||
-                !admitted.Contains("workers/donor-downloads.json"))
+                !admitted.Contains("workers/donor-downloads.json") ||
+                !admitted.Contains("workers/mediamtx.exe") || !admitted.Contains("workers/caddy.exe") ||
+                !admitted.Contains("workers/mediamtx-LICENSE") || !admitted.Contains("workers/caddy-LICENSE"))
                 throw new InvalidOperationException();
             foreach (string bootstrap in new[] { "K5Vision.exe", "payload-manifest.json", "unins000.exe", "unins000.dat", "unins000.msg" })
                 admitted.Add(bootstrap);
@@ -725,17 +727,6 @@ namespace K5VisionDesktop
 
     internal static class Workers
     {
-        private static void PrivateDirectory(string path, string root)
-        {
-            if (!Directory.Exists(path))
-            {
-                string parent = Path.GetDirectoryName(path);
-                Custody.Admit(parent, root);
-                Directory.CreateDirectory(path);
-            }
-            Custody.Admit(path, root);
-        }
-
         private static void VerifyFile(string path, string root, long bytes, string expected)
         {
             Custody.Admit(path, root);
@@ -746,81 +737,11 @@ namespace K5VisionDesktop
                     throw new InvalidOperationException();
         }
 
-        private static void Download(string url, string target, long expectedBytes, CancellationToken cancellation)
-        {
-            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-            Stopwatch elapsed = Stopwatch.StartNew();
-            Uri uri = new Uri(url);
-            for (int redirect = 0; redirect < 6; redirect++)
-            {
-                cancellation.ThrowIfCancellationRequested();
-                int remaining = 120000 - (int)elapsed.ElapsedMilliseconds;
-                if (remaining <= 0) throw new InvalidOperationException();
-                if (uri.Scheme != "https" || !new[] { "github.com", "release-assets.githubusercontent.com",
-                    "objects.githubusercontent.com", "github-releases.githubusercontent.com" }.Contains(uri.Host))
-                    throw new InvalidOperationException();
-                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(uri);
-                request.AllowAutoRedirect = false; request.Timeout = request.ReadWriteTimeout = remaining;
-                request.UserAgent = "K5-Vision-Desktop";
-                Action abort = delegate { try { request.Abort(); } catch { } };
-                using (CancellationTokenRegistration registration = cancellation.Register(abort))
-                using (System.Threading.Timer deadline = new System.Threading.Timer(delegate { abort(); }, null, remaining, Timeout.Infinite))
-                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
-                {
-                    if ((int)response.StatusCode >= 300 && (int)response.StatusCode <= 399)
-                    {
-                        uri = new Uri(uri, response.Headers["Location"]);
-                        continue;
-                    }
-                    if (response.StatusCode != HttpStatusCode.OK ||
-                        (response.ContentLength >= 0 && response.ContentLength != expectedBytes))
-                        throw new InvalidOperationException();
-                    using (Stream source = response.GetResponseStream())
-                    using (FileStream file = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                    {
-                        byte[] buffer = new byte[65536];
-                        long total = 0;
-                        int count;
-                        while ((count = source.Read(buffer, 0, buffer.Length)) != 0)
-                        {
-                            cancellation.ThrowIfCancellationRequested();
-                            total += count;
-                            if (total > expectedBytes || total > 128 * 1024 * 1024) throw new InvalidOperationException();
-                            file.Write(buffer, 0, count);
-                        }
-                        if (total != expectedBytes) throw new InvalidOperationException();
-                        file.Flush(true);
-                    }
-                    return;
-                }
-            }
-            throw new InvalidOperationException();
-        }
-
-        private static void Extract(ZipArchive archive, string name, string target, long maximum)
-        {
-            ZipArchiveEntry[] entries = archive.Entries.Where(entry => entry.FullName == name).ToArray();
-            if (entries.Length != 1 || entries[0].Length > maximum) throw new InvalidOperationException();
-            using (Stream source = entries[0].Open())
-            using (FileStream file = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            {
-                byte[] buffer = new byte[65536];
-                long total = 0; int count;
-                while ((count = source.Read(buffer, 0, buffer.Length)) != 0)
-                {
-                    total += count;
-                    if (total > maximum || total > entries[0].Length) throw new InvalidOperationException();
-                    file.Write(buffer, 0, count);
-                }
-                if (total != entries[0].Length) throw new InvalidOperationException();
-                file.Flush(true);
-            }
-        }
-
         internal static Dictionary<string, string> Provision(string application, string profile, CancellationToken cancellation)
         {
-            string cache = Path.Combine(profile, "desktop-workers");
-            PrivateDirectory(cache, profile);
+            // The owner workstation must not download executable dependencies.
+            // Verify the installation and exact source identities on every start.
+            Custody.Admit(profile, profile);
             string path = Path.Combine(application, "workers", "donor-downloads.json");
             Custody.Admit(path, application);
             Dictionary<string, object> manifest = Json.Parse(File.ReadAllText(path, Encoding.UTF8));
@@ -834,49 +755,15 @@ namespace K5VisionDesktop
                 if (component != "MediaMTX" && component != "Caddy") throw new InvalidOperationException();
                 if (result.ContainsKey(component)) throw new InvalidOperationException();
                 string executable = component == "MediaMTX" ? "mediamtx.exe" : "caddy.exe";
+                string name = component == "MediaMTX" ? "mediamtx" : "caddy";
                 string version = (string)artifact["version"];
                 if (version.Length > 32 || !System.Text.RegularExpressions.Regex.IsMatch(version, "^v[0-9]+[.][0-9]+[.][0-9]+$") ||
                     (string)artifact["executable"] != executable) throw new InvalidOperationException();
-                string componentRoot = Path.Combine(cache, component);
-                PrivateDirectory(componentRoot, profile);
-                string directory = Path.Combine(componentRoot, version);
-                PrivateDirectory(directory, profile);
-                string binary = Path.Combine(directory, executable), license = Path.Combine(directory, "LICENSE");
-                long binaryBytes = Convert.ToInt64(artifact["executable_bytes"]);
-                if (File.Exists(binary))
-                {
-                    VerifyFile(binary, profile, binaryBytes, (string)artifact["executable_sha256"]);
-                    VerifyFile(license, profile, -1, (string)artifact["license_sha256"]);
-                }
-                else
-                {
-                    string nonce = Guid.NewGuid().ToString("N");
-                    string zip = Path.Combine(directory, "download-" + nonce + ".zip");
-                    string candidate = Path.Combine(directory, "candidate-" + nonce + ".exe");
-                    string candidateLicense = Path.Combine(directory, "license-" + nonce + ".txt");
-                    try
-                    {
-                        Download((string)artifact["url"], zip, Convert.ToInt64(artifact["bytes"]), cancellation);
-                        cancellation.ThrowIfCancellationRequested();
-                        VerifyFile(zip, profile, Convert.ToInt64(artifact["bytes"]), (string)artifact["sha256"]);
-                        using (FileStream input = new FileStream(zip, FileMode.Open, FileAccess.Read, FileShare.Read))
-                        using (ZipArchive archive = new ZipArchive(input, ZipArchiveMode.Read))
-                        {
-                            Extract(archive, executable, candidate, binaryBytes);
-                            Extract(archive, "LICENSE", candidateLicense, 65536);
-                        }
-                        VerifyFile(candidate, profile, binaryBytes, (string)artifact["executable_sha256"]);
-                        VerifyFile(candidateLicense, profile, -1, (string)artifact["license_sha256"]);
-                        if (File.Exists(license)) VerifyFile(license, profile, -1, (string)artifact["license_sha256"]);
-                        else File.Move(candidateLicense, license);
-                        File.Move(candidate, binary);
-                    }
-                    finally
-                    {
-                        foreach (string temporary in new[] { zip, candidate, candidateLicense })
-                            if (File.Exists(temporary)) { Custody.Admit(temporary, profile); File.Delete(temporary); }
-                    }
-                }
+                string binary = Path.Combine(application, "workers", executable);
+                string license = Path.Combine(application, "workers", name + "-LICENSE");
+                VerifyFile(binary, application, Convert.ToInt64(artifact["executable_bytes"]),
+                    (string)artifact["executable_sha256"]);
+                VerifyFile(license, application, -1, (string)artifact["license_sha256"]);
                 result[component] = binary;
             }
             if (result.Count != 2) throw new InvalidOperationException();
@@ -1270,7 +1157,7 @@ namespace K5VisionDesktop
         private async void StartRecording()
         {
             if (exiting) return;
-            phase = "starting"; busy = true; setup.Visible = false; status.Text = "Preparing your camera services. First launch may take a few minutes…";
+            phase = "starting"; busy = true; setup.Visible = false; status.Text = "Starting your locally bundled camera services…";
             bool failed = false;
             try
             {
