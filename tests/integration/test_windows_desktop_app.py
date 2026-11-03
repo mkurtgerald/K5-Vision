@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
@@ -1169,9 +1170,13 @@ def _generate_fixture(
         helpers._stop_owned(upstream)
         raise
     source_uri = f"rtsp://{host}:{upstream_port}/generated"
-    publisher = _publish_fixture(
-        parent, ffmpeg, source_uri, helpers, color=color, credentials=publisher_credentials
-    )
+    try:
+        publisher = _publish_fixture(
+            parent, ffmpeg, source_uri, helpers, color=color, credentials=publisher_credentials
+        )
+    except BaseException:
+        helpers._stop_owned(upstream)
+        raise
     return [upstream, publisher], source_uri
 
 
@@ -2396,33 +2401,57 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         )
         receipt["embedded_python_independent_of_path"] = True
         _enter_stage("generated_camera_fixture")
-        for index, ((_, host, color), upstream_port) in enumerate(
-            zip(_DESKTOP_CAMERAS, upstream_ports, strict=True)
-        ):
-            camera_fixture = _helpers("onvif_camera_fixture").OnvifCameraFixture(
-                host=host,
-                stream_uri=f"rtsp://{host}:{upstream_port}/generated",
-                clock_skew_seconds=1200 if index % 2 == 0 else -1200,
-                clock_mode="NTP",
-            )
-            onvif_cameras.append(camera_fixture)
-            generated, source = _generate_fixture(
-                parent,
-                media,
-                ffmpeg,
-                upstream_port,
-                helpers,
-                host=host,
-                color=color,
-                camera_credentials=(camera_fixture.username, camera_fixture.password)
-                if index == 0
-                else None,
-                publisher_credentials=primary_publisher_credentials if index == 0 else None,
-                extra_stream_paths=("direct-channel",) if index == 0 else (),
-            )
-            processes.extend(generated)
-            publishers.append(generated[-1])
-            sources.append(source)
+        # The four independently addressed, generated fixtures require the same
+        # source bytes and listener admission, but need not be provisioned
+        # serially. Bound startup concurrency to avoid overwhelming the VM.
+        with ThreadPoolExecutor(max_workers=2) as fixture_pool:
+            fixture_futures = []
+            for index, ((_, host, color), upstream_port) in enumerate(
+                zip(_DESKTOP_CAMERAS, upstream_ports, strict=True)
+            ):
+                camera_fixture = _helpers("onvif_camera_fixture").OnvifCameraFixture(
+                    host=host,
+                    stream_uri=f"rtsp://{host}:{upstream_port}/generated",
+                    clock_skew_seconds=1200 if index % 2 == 0 else -1200,
+                    clock_mode="NTP",
+                )
+                onvif_cameras.append(camera_fixture)
+                fixture_futures.append(
+                    fixture_pool.submit(
+                        _generate_fixture,
+                        parent,
+                        media,
+                        ffmpeg,
+                        upstream_port,
+                        helpers,
+                        host=host,
+                        color=color,
+                        camera_credentials=(camera_fixture.username, camera_fixture.password)
+                        if index == 0
+                        else None,
+                        publisher_credentials=primary_publisher_credentials
+                        if index == 0
+                        else None,
+                        extra_stream_paths=("direct-channel",) if index == 0 else (),
+                    )
+                )
+            fixture_failure = None
+            # Collect in original camera order so source identities and all
+            # subsequent camera/media assertions are exactly unchanged. Even
+            # after a failed worker, collect and own all successful processes
+            # before the outer cleanup runs.
+            for future in fixture_futures:
+                try:
+                    generated, source = future.result()
+                except BaseException as error:
+                    if fixture_failure is None:
+                        fixture_failure = error
+                    continue
+                processes.extend(generated)
+                publishers.append(generated[-1])
+                sources.append(source)
+        if fixture_failure is not None:
+            raise fixture_failure
         source_uri, onvif_camera = sources[0], onvif_cameras[0]
         _enter_stage("actual_camera_rtsp_authentication")
         browser_helpers._assert_rtsp_read_auth(
