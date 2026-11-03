@@ -70,7 +70,7 @@
     let loading = false, saving = false, dirty = false, loadedOlder = false;
     let requestNumber = 0, eventRequestNumber = 0, providerRequestNumber = 0;
     let providerEvents = [], providerBefore = null, providerLoadedOlder = false;
-    let renderedEventSignature = null;
+    let renderedEventSignature = null, renderedProviderSignature = null;
 
     container.classList.add("analytics-panel");
     container.setAttribute("aria-labelledby", "analytics-title");
@@ -268,6 +268,19 @@
     }
     function renderProviderEvents() {
       const start = session(), version = epoch, cameraId = camera?.device_id;
+      // The five-second poll must not detach a focused provider-event button
+      // when the event list has not actually changed. Include the camera and
+      // playback target so an updated event always gets a fresh callback.
+      const signature = JSON.stringify([cameraId, version, providerEvents.map((event) => [
+        event.sequence, event.source_id, event.event_id, event.event_type,
+        event.observed_at, event.playback_at, event.status, event.confidence,
+      ])]);
+      if (signature === renderedProviderSignature) {
+        providerOlder.hidden = !providerBefore || providerEvents.length >= MAX_EVENTS;
+        controls();
+        return;
+      }
+      renderedProviderSignature = signature;
       providerList.replaceChildren(...providerEvents.map((event) => {
         const row = element("li", "analytics-event"); row.dataset.providerEventId = event.event_id;
         const open = element("button", "analytics-event-button"); open.type = "button";
