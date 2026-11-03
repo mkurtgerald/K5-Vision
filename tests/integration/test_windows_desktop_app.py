@@ -1744,12 +1744,12 @@ def _installed_analytics_journey(
     diagnostic["analytics_navigation_step"] = "playback_frames"
     try:
         page.wait_for_function(
-        """chosen => {
-          const video=document.getElementById('playback-video');
-          return Math.abs(Date.parse(video.dataset.utcStart || '')-chosen)<1000 &&
-            video.readyState>=2 && !video.paused &&
-            video.getVideoPlaybackQuality().totalVideoFrames>=4;
-        }""",
+            """chosen => {
+              const video=document.getElementById('playback-video');
+              return Math.abs(Date.parse(video.dataset.utcStart || '')-chosen)<1000 &&
+                video.readyState>=2 && !video.paused &&
+                video.getVideoPlaybackQuality().totalVideoFrames>=4;
+            }""",
             arg=expected_ms,
             timeout=20_000,
         )
