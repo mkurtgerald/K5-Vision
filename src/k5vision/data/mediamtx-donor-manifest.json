@@ -13,14 +13,20 @@
       "use": "native-target-evaluation",
       "filename": "mediamtx_v1.21.2_windows_amd64.zip",
       "sha256": "a84224f5a490855684e62ba6fb71e80ea2a5e16aed61883bb58380290e93e467",
-      "url": "https://github.com/bluenviron/mediamtx/releases/download/v1.21.2/mediamtx_v1.21.2_windows_amd64.zip"
+      "url": "https://github.com/bluenviron/mediamtx/releases/download/v1.21.2/mediamtx_v1.21.2_windows_amd64.zip",
+      "executable": "mediamtx.exe",
+      "executable_sha256": "31bc3cc425a0278c7a5696c7ba309257235060157eb338eed20bb88dbe0faf87",
+      "executable_bytes": 57024512
     },
     {
       "platform": "linux_amd64",
       "use": "portable-regression-only",
       "filename": "mediamtx_v1.21.2_linux_amd64.tar.gz",
       "sha256": "121be6e00397e473a95d83c75f4fcd3819a6af3b0e1a50889cba43ab4fab6a27",
-      "url": "https://github.com/bluenviron/mediamtx/releases/download/v1.21.2/mediamtx_v1.21.2_linux_amd64.tar.gz"
+      "url": "https://github.com/bluenviron/mediamtx/releases/download/v1.21.2/mediamtx_v1.21.2_linux_amd64.tar.gz",
+      "executable": "mediamtx",
+      "executable_sha256": "0ffb7f18210d08ee38cb16668c4f3a2c96622e69d401119c0026d078a2b89523",
+      "executable_bytes": 56324825
     }
   ]
 }

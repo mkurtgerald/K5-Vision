@@ -7,6 +7,7 @@ import json
 import os
 from collections.abc import Sequence
 from contextlib import nullcontext
+from pathlib import Path
 
 import uvicorn
 
@@ -52,6 +53,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     setup.add_argument("--identity-dir", required=True, help="new private absolute directory")
     setup.add_argument("--username", default=DEFAULT_RECOVERY_USERNAME)
+    operator = subparsers.add_parser("operator", help="run the persistent local operator dashboard")
+    operator.add_argument("--identity-dir", required=True)
+    operator.add_argument("--recording-root")
+    operator.add_argument("--media-exe", required=True)
+    operator.add_argument("--gateway-exe", required=True)
+    operator.add_argument("--port", type=int, default=DEFAULT_PORT)
+    operator.add_argument("--recording-limit-gb", type=int, default=20)
+    operator.add_argument("--open-browser", action="store_true")
     subparsers.add_parser(
         "analytics-preflight", help="check selected analytics without starting the application"
     )
@@ -89,6 +98,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "analytics-preflight":
         return _analytics_preflight()
+    if args.command == "operator":
+        try:
+            from k5vision.operator_product import run_operator_product
+
+            run_operator_product(
+                identity_directory=Path(args.identity_dir),
+                recording_root=None if args.recording_root is None else Path(args.recording_root),
+                media_executable=Path(args.media_exe),
+                gateway_executable=Path(args.gateway_exe),
+                port=args.port,
+                open_browser=args.open_browser,
+                recording_limit_gb=args.recording_limit_gb,
+            )
+        except KeyboardInterrupt:
+            return 130
+        except Exception:
+            print("Operator startup refused; check private state and the verified native tools.")
+            return 1
+        return 0
     if args.command == "setup-admin":
         try:
             setup_administrator(args.identity_dir, username=args.username)

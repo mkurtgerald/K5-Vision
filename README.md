@@ -2,6 +2,14 @@
 
 Early-stage systems project.
 
+## Native Windows operator pilot
+
+The donor-based pilot adds persistent camera enrollment, live video, continuous
+recording, history and bounded MP4 playback through a local browser dashboard.
+All services run natively on Windows. Follow
+[the pilot startup instructions](docs/WINDOWS_OPERATOR_PILOT.md) for the wheel
+bundle or source checkout. Person detection is not configured in this build.
+
 ## Windows Alpha — Start Here
 
 For the current Windows alpha test path, download and run `Install-K5VisionAlpha.ps1` from the repository root.

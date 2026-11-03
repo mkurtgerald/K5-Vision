@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>K5 Vision · Operator</title>
+    <link rel="stylesheet" href="/operator/app.css">
+    <script defer src="/operator/app.js"></script>
+  </head>
+  <body>
+    <section id="sign-in" class="sign-in-screen" aria-labelledby="sign-in-title">
+      <div class="sign-in-card">
+        <div class="brand"><span class="brand-mark" aria-hidden="true">K5</span><span>Vision</span></div>
+        <p class="eyebrow">OPERATOR WORKSPACE</p>
+        <h1 id="sign-in-title">Your cameras.<br>Your view.</h1>
+        <p class="muted">Sign in to view live cameras and recorded video.</p>
+        <form id="sign-in-form">
+          <label for="username">Username</label>
+          <input id="username" name="username" autocomplete="username" required minlength="3" maxlength="64" autofocus>
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="256">
+          <p id="sign-in-message" class="form-message" role="status" aria-live="polite"></p>
+          <button id="sign-in-button" class="button primary wide" type="submit">Sign in <span aria-hidden="true">→</span></button>
+        </form>
+        <p class="sign-in-footnote">K5 Vision · Local operator access</p>
+      </div>
+    </section>
+
+    <div id="workspace" class="workspace" hidden>
+      <header class="topbar">
+        <div class="brand"><span class="brand-mark" aria-hidden="true">K5</span><span>Vision</span><span class="brand-divider"></span><span class="workspace-label">Operator</span></div>
+        <div class="user-menu"><span id="account-name"></span><span id="account-role" class="role-tag"></span><button id="sign-out-button" class="button quiet" type="button">Sign out</button></div>
+      </header>
+
+      <div class="workspace-body">
+        <aside class="camera-sidebar" aria-label="Cameras">
+          <div class="sidebar-heading"><h2>Cameras <span id="camera-count" class="count">0</span></h2><button id="refresh-cameras" class="icon-button" type="button" title="Refresh cameras" aria-label="Refresh cameras">↻</button></div>
+          <button id="add-camera-button" class="button secondary wide" type="button" hidden><span aria-hidden="true">＋</span> Add camera</button>
+          <label class="visually-hidden" for="camera-search">Find a camera</label>
+          <input id="camera-search" class="camera-search" type="search" placeholder="Find a camera" autocomplete="off">
+          <div id="camera-list" class="camera-list"></div>
+          <p id="camera-list-message" class="sidebar-message" role="status" aria-live="polite">Loading cameras…</p>
+          <div class="sidebar-footer"><span class="small-dot" aria-hidden="true"></span> LOCAL WORKSPACE</div>
+        </aside>
+
+        <main class="main-content">
+          <div class="view-heading">
+            <div><p class="eyebrow">CAMERA WORKSPACE</p><h1 id="camera-title">Select a camera</h1><p id="camera-subtitle" class="muted">Live view and recording history in one place.</p></div>
+            <div class="camera-indicators"><span id="connection-badge" class="status-badge" hidden></span><span id="recording-badge" class="recording-badge" hidden>Recording</span><button id="update-source-button" class="button secondary" type="button" hidden>Update source</button></div>
+          </div>
+          <div id="worker-message" class="notice warning" role="status" aria-live="polite" hidden></div>
+          <div id="workspace-message" class="notice" role="status" aria-live="polite" hidden></div>
+
+          <nav class="view-tabs" aria-label="Camera view">
+            <button id="live-tab" class="tab active" type="button" aria-current="page">Live view</button>
+            <button id="history-tab" class="tab" type="button">History</button>
+          </nav>
+
+          <section id="live-panel" aria-label="Live view">
+            <div class="video-surface">
+              <video id="live-video" autoplay muted playsinline controls preload="none" aria-label="Live camera video"></video>
+              <div id="live-placeholder" class="video-placeholder"><div class="camera-glyph" aria-hidden="true">▣</div><h2 id="live-placeholder-title">Choose a camera to begin</h2><p id="live-placeholder-description">Your live feed will appear here.</p><button id="retry-live" class="button secondary" type="button" hidden>Reconnect</button></div>
+              <div id="live-video-label" class="video-label" hidden><span class="live-dot" aria-hidden="true"></span> LIVE</div>
+            </div>
+            <div class="video-footer"><span id="live-state" role="status" aria-live="polite">No camera selected</span><button id="play-live" class="button quiet" type="button" hidden>Play live video</button><span id="analytics-state" class="muted"></span></div>
+          </section>
+
+          <section id="history-panel" aria-label="Recording history" hidden>
+            <div class="history-toolbar">
+              <div class="history-toolbar-title"><h2>Recording history</h2><p class="muted">Available video and gaps · All times UTC</p></div>
+              <div class="day-picker"><label for="history-day">Jump to day</label><input id="history-day" type="date"><button id="last-24-hours" class="button secondary" type="button">Last 24 hours</button></div>
+            </div>
+            <form id="history-form" class="interval-form">
+              <div><label for="history-start">From · UTC</label><input id="history-start" type="datetime-local" step="1" required></div>
+              <div><label for="history-end">To · UTC</label><input id="history-end" type="datetime-local" step="1" required></div>
+              <button id="load-history" class="button primary" type="submit">Show history</button>
+            </form>
+            <p id="history-message" class="form-message" role="status" aria-live="polite"></p>
+            <div class="history-content">
+              <div class="history-list-panel"><div class="section-heading"><h3>Available intervals</h3><span id="history-count" class="count">0</span></div><div id="history-list" class="history-list"></div></div>
+              <div class="playback-panel">
+                <div class="video-surface playback-surface"><video id="playback-video" controls playsinline preload="metadata" aria-label="Recorded camera video"></video><div id="playback-placeholder" class="video-placeholder"><div class="camera-glyph" aria-hidden="true">◷</div><h2>Select a recording</h2><p>Choose an available interval to play video.</p></div></div>
+                <p id="selected-recording" class="selected-recording muted">No interval selected</p>
+                <form id="playback-form" class="playback-form">
+                  <div><label for="playback-start">Start · UTC</label><input id="playback-start" type="datetime-local" step="0.001" required disabled></div>
+                  <div class="duration-field"><label for="playback-duration">Seconds</label><input id="playback-duration" type="number" min="1" max="300" step="1" value="60" required disabled></div>
+                  <button id="play-recording" class="button primary" type="submit" disabled>Play</button>
+                  <a id="download-recording" class="button secondary disabled" aria-disabled="true" tabindex="-1">Download</a>
+                </form>
+                <p id="playback-message" class="form-message" role="status" aria-live="polite">Preview up to 5 minutes. Select a new start time to seek.</p>
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <dialog id="add-camera-dialog" aria-labelledby="add-camera-title">
+      <form id="add-camera-form" autocomplete="off">
+        <div class="dialog-heading"><div><p class="eyebrow">CAMERA SETUP</p><h2 id="add-camera-title">Add a camera</h2></div><button id="close-add-camera" class="icon-button" type="button" aria-label="Close camera setup">×</button></div>
+        <p id="camera-setup-description" class="muted">Connect an RTSP camera to live view and continuous recording.</p>
+        <label for="new-camera-name">Camera name</label><input id="new-camera-name" name="name" placeholder="Front entrance" required maxlength="128">
+        <label for="new-camera-host">Camera IP address</label><input id="new-camera-host" name="host" placeholder="192.168.1.20" required maxlength="45" spellcheck="false">
+        <label for="new-camera-source">RTSP stream address</label><input id="new-camera-source" name="source_uri" type="password" placeholder="rtsp://user:password@192.168.1.20/stream" required maxlength="4096" autocomplete="off" spellcheck="false">
+        <p class="field-help">Use the camera’s H.264 stream. The address is cleared after submission.</p>
+        <p id="add-camera-message" class="form-message" role="status" aria-live="polite"></p>
+        <div class="dialog-actions"><button id="cancel-add-camera" class="button secondary" type="button">Cancel</button><button id="save-camera" class="button primary" type="submit">Connect camera</button></div>
+      </form>
+    </dialog>
+  </body>
+</html>

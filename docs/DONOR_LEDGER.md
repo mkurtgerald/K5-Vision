@@ -93,6 +93,52 @@ Package dependencies declared in `pyproject.toml` are dependencies, not automati
   manifest/version update and applicable installed-runtime qualification, rather
   than copying business logic into K5 or admitting arbitrary `PYTHONPATH` source
 
+## Caddy native operator media gateway pilot
+
+- **Source:** https://github.com/caddyserver/caddy
+- **Version/commit:** `v2.11.7`,
+  `72dd0fb067f6d7826c7f79907670ba4a713bfe37`
+- **License:** Apache-2.0
+- **Copyright:** copyright 2015 Matthew Holt and The Caddy Authors
+- **K5 files affected:** `src/k5vision/data/caddy-donor-manifest.json`,
+  `src/k5vision/operator_media_gateway.py`,
+  `src/k5vision/operator_product_service.py`, `scripts/Start-K5Operator.ps1`,
+  `third_party/licenses/Caddy-Apache-2.0.txt`,
+  and this notice register
+- **Integration method:** separately downloaded official native executable,
+  invoked as the local HTTP data gateway. K5 generates private gateway
+  configuration and retains operator authorization. Caddy streams media;
+  Python remains the control plane. No Caddy implementation source or binary
+  is incorporated into this repository.
+- **Modifications:** none to donor source or release binaries
+- **Runtime/development use:** official Windows amd64 binary is the per-user
+  pilot target; Linux amd64 is portable protocol regression only. No Linux,
+  WSL, Docker, hosted service, or custom Caddy plugin is required by the target.
+- **Required notices:** preserve the unchanged Apache-2.0 license and copyright
+  attribution. No root `NOTICE` file exists at this source revision. Preserve
+  applicable module notices when redistributing the binary; official per-target
+  SBOMs are published alongside the release.
+- **Commercial use:** Apache-2.0 permits commercial source use and redistribution
+  with its notices preserved. This review admits the official-download pilot
+  scope, not a claim of completed transitive binary redistribution review or
+  installed Windows product acceptance. No executable is shipped in the PR.
+- **Reviewed by:** automated immutable-source, archive, release-digest and
+  upstream-checksum verification; no legal sign-off is claimed
+- **Reviewed on:** 2026-10-11
+- **Integrity references:** exact source license SHA-256
+  `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30`;
+  Windows archive SHA-256
+  `0a1edc0b799512051c57071ce0e798d3f2cf67dc98171366f1d2b326072e3b06`;
+  Linux archive SHA-256
+  `727b91701a392de6ebc5027509f548bf39979e5216340d0faed8fa5e69c84f8b`.
+  Both downloaded archives match GitHub's release-asset SHA-256 digests and
+  the official release checksum file's SHA-512 values. The manifest records
+  both algorithms and executable SHA-256 hashes derived from these archives.
+- **Replacement boundary:** fixed local HTTP proxy configuration and K5-owned
+  authorization checks. A different gateway or upstream upgrade requires new
+  immutable artifact review and target acceptance. Accepted Alpha installer
+  pins are not changed by the pilot launcher.
+
 ## MediaMTX native continuous-media worker evaluation
 
 - **Source:** https://github.com/bluenviron/mediamtx
@@ -102,21 +148,25 @@ Package dependencies declared in `pyproject.toml` are dependencies, not automati
 - **Copyright:** copyright (c) 2019 aler9
 - **K5 files affected:** `src/k5vision/media/mediamtx_provider.py`,
   `src/k5vision/media/mediamtx_config.py`,
+  `src/k5vision/operator_product_service.py`,
+  `src/k5vision/operator_web/app.js`,
   `src/k5vision/data/mediamtx-donor-manifest.json`,
   `tests/unit/test_mediamtx_provider.py`,
   `tests/integration/test_mediamtx_donor_runtime.py`,
   `docs/WINDOWS_DONOR_MEDIA_BOUNDARY.md`, `THIRD_PARTY_NOTICES.md`, and
   `third_party/licenses/MediaMTX-MIT.txt`
 - **Integration method:** separate native executable with fixed HTTP read APIs
-  and private generated configuration. No upstream implementation source or
-  binary is vendored. K5-owned adapter code follows the pinned upstream schema;
-  the exact upstream license is copied unchanged for attribution.
+  and private generated configuration. No donor binary is vendored. The local
+  dashboard's HLS event wiring adapts the pinned MIT HLS page; its attribution
+  is retained in `operator_web/app.js`. K5-owned adapter code follows the pinned
+  upstream schema; the exact upstream license is copied unchanged for attribution.
 - **Modifications:** none to donor source or release binaries. Opt-in K5
   normalization and configuration do not replace the current installed runtime
   or change accepted installer identities.
 - **Purpose:** evaluate continuous enrolled-camera RTSP pull, reconnect,
   stream fan-out, fMP4 recording, age-based retention and playback inventory
-  behind the canonical Windows media-worker boundary.
+  behind the canonical Windows media-worker boundary, and compose the separate
+  foreground Windows operator pilot.
 - **Runtime/development use:** official Windows amd64 executable is the target;
   the official Linux amd64 executable is used only for portable protocol and
   generated-media regression. No new detector/model or paid service is adopted.

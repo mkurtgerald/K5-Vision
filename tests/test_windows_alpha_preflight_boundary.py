@@ -129,12 +129,18 @@ def trusted_payload_variants(source: Path):
     """Generate exact checkout forms from trusted Git bytes, never normalize input.
 
     The older hosted probe was installed from a Windows checkout. Only tracked
-    Python sources and the two enumerated UTF-8 package data files permit its
+    Python sources and the enumerated UTF-8 package data and web assets permit its
     deterministic LF-to-CRLF checkout representation. Production hashes stay exact.
     """
     text_data = {
         "k5vision/data/analytics-runtime-manifest.json",
         "k5vision/data/analytics-runtime-Apache-2.0.txt",
+        "k5vision/data/caddy-donor-manifest.json",
+        "k5vision/data/mediamtx-donor-manifest.json",
+        "k5vision/data/mediamtx-donor-test-tools.json",
+        "k5vision/operator_web/index.html",
+        "k5vision/operator_web/app.css",
+        "k5vision/operator_web/app.js",
     }
     result = {}
     for name, exact in alpha.source_payload(source).items():
@@ -558,28 +564,58 @@ def test_temp_access_denial_aborts_only_owned_execution(monkeypatch):
 def test_trusted_checkout_variants_reject_mixed_endings_and_tamper(tmp_path):
     package = tmp_path / "src/k5vision"
     (package / "data").mkdir(parents=True)
+    (package / "operator_web").mkdir()
     files = {
         "analytics_config.py": b"first = 1\nsecond = 2\n",
         "data/analytics-runtime-manifest.json": b'{\n"schema": 1\n}\n',
         "data/analytics-runtime-Apache-2.0.txt": b"reviewed\nnotice\n",
+        "data/caddy-donor-manifest.json": b'{\n"component": "Caddy"\n}\n',
+        "data/mediamtx-donor-manifest.json": b'{\n"component": "MediaMTX"\n}\n',
+        "data/mediamtx-donor-test-tools.json": b'{\n"schema_version": "1"\n}\n',
+        "operator_web/index.html": b"<!doctype html>\n<html></html>\n",
+        "operator_web/app.css": b"body {\n  color: white;\n}\n",
+        "operator_web/app.js": b'"use strict";\nconst version = 1;\n',
         "data/other.txt": b"unclassified\ntext\n",
+        "data/unknown-manifest.json": b'{\n"unclassified": true\n}\n',
+        "operator_web/other.html": b"unclassified\nasset\n",
+        "data/payload.bin": b"\x00\xff\n\x01\n",
     }
     for name, data in files.items():
         (package / name).write_bytes(data)
     allowed = trusted_payload_variants(tmp_path)
-    for name in (
+    trusted_text = (
         "analytics_config.py",
         "data/analytics-runtime-manifest.json",
         "data/analytics-runtime-Apache-2.0.txt",
-    ):
+        "data/caddy-donor-manifest.json",
+        "data/mediamtx-donor-manifest.json",
+        "data/mediamtx-donor-test-tools.json",
+        "operator_web/index.html",
+        "operator_web/app.css",
+        "operator_web/app.js",
+    )
+    for name in trusted_text:
         data = files[name]
         expected = allowed["k5vision/" + name]
+        assert len(expected) == 2
         assert common.hashlib.sha256(data).hexdigest() in expected
         assert common.hashlib.sha256(data.replace(b"\n", b"\r\n")).hexdigest() in expected
         assert common.hashlib.sha256(data.replace(b"\n", b"\r\n", 1)).hexdigest() not in expected
         assert common.hashlib.sha256(data + b"tamper").hexdigest() not in expected
-    assert len(allowed["k5vision/data/other.txt"]) == 1
-    (package / "analytics_config.py").write_bytes(b"not canonical\r\n")
+    for name in files.keys() - set(trusted_text):
+        data = files[name]
+        assert allowed["k5vision/" + name] == [common.hashlib.sha256(data).hexdigest()]
+        assert (
+            common.hashlib.sha256(data.replace(b"\n", b"\r\n")).hexdigest()
+            not in allowed["k5vision/" + name]
+        )
+    for name in trusted_text:
+        data = files[name]
+        (package / name).write_bytes(data.replace(b"\n", b"\r\n", 1))
+        with pytest.raises(ObservationFailure):
+            trusted_payload_variants(tmp_path)
+        (package / name).write_bytes(data)
+    (package / "operator_web/app.js").write_bytes(b"\xff\n")
     with pytest.raises(ObservationFailure):
         trusted_payload_variants(tmp_path)
 
