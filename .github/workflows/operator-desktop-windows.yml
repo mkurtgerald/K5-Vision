@@ -235,6 +235,8 @@ jobs:
               $witness.receipt.onvif_credential_profile_enrollment -ne $true -or
               $witness.receipt.no_manual_stream_uri -isnot [bool] -or
               $witness.receipt.no_manual_stream_uri -ne $true -or
+              $witness.receipt.installed_worker_bundle_verified -isnot [bool] -or
+              $witness.receipt.installed_worker_bundle_verified -ne $true -or
               $witness.receipt.onvif_clock_skew_compensated -isnot [bool] -or
               $witness.receipt.onvif_clock_skew_compensated -ne $true -or
               $witness.receipt.onvif_time_health_displayed -isnot [bool] -or
@@ -311,7 +313,7 @@ jobs:
             runtime='CPython 3.12.10 embedded amd64'; installer='Inno Setup 6.4.3';
             scope='Native Windows ONVIF surveillance workspace'; no_terminal_required=$true;
             no_external_python_required=$true; no_runtime_package_downloads=$true
-            workers_bundled=$false; first_launch_internet_required=$true
+            workers_bundled=$true; first_launch_internet_required=$false; disconnected_network_qualified=$false
             onvif_camera_onboarding=$true; manual_stream_uri_required=$false
             direct_rtsp_enrollment=$true
             admin_user_management=$true; role_permissions=$true; camera_access_controls=$true
