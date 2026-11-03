@@ -9,26 +9,206 @@
   const DAY = 86400000;
   const TIME_SAMPLE_MAX_AGE = 30000;
   const RETRY_DELAYS = [1000, 2000, 4000, 8000, 10000];
+  const ROLE_PERMISSIONS = Object.freeze({
+    viewer: ["cameras.view_live", "cameras.playback"],
+    operator: ["cameras.view_live", "cameras.playback", "cameras.export"],
+    administrator: ["cameras.view_live", "cameras.playback", "cameras.export", "cameras.manage", "recording.manage", "analytics.manage", "users.manage", "roles.manage", "storage.manage", "time.manage", "integrations.manage", "audit.read"],
+  });
+  const ADMIN_PERMISSIONS = ["users.manage", "roles.manage", "storage.manage", "time.manage", "integrations.manage", "audit.read"];
   const CAMERA_ERROR_CODES = new Set([
     "discovery_unavailable", "camera_auth_failed", "camera_unreachable",
     "camera_unsupported", "camera_invalid_response", "camera_busy",
     "camera_probe_expired", "camera_profile_unsupported",
+    "stream_invalid", "stream_auth_failed", "stream_unsupported", "stream_unreachable", "stream_invalid_response",
   ]);
+  const ADMIN_ERROR_CODES = new Set([
+    "admin_last_administrator", "admin_username_exists", "admin_capacity",
+    "admin_invalid_request", "admin_user_not_found", "admin_unavailable",
+  ]);
+  const EXPORT_ERRORS = Object.freeze({
+    export_too_large: "This clip exceeds 256 MB. Select a shorter clip.",
+    export_recording_gap: "The clip crosses a recording gap or unavailable footage. Adjust its start or duration.",
+    export_busy: "Other clips are being prepared. Wait a moment, then prepare this clip again.",
+    export_capacity: "The saved clip cache is full. Wait for older clips to expire, then try again.",
+    export_invalid_selection: "Choose a valid recorded UTC start and a clip length from 1 to 3600 seconds.",
+    export_file_unavailable: "The prepared MP4 is no longer available. Prepare the clip again.",
+    export_cache_unavailable: "The MP4 export storage is unavailable. Check storage and restart K5 before trying again.",
+    export_unavailable: "The recording service is unavailable. Check recorder status, then try again.",
+    export_preparation_failed: "K5 could not verify a complete, playable MP4. Check available footage or try a shorter clip.",
+  });
+  const EXPORT_PHASES = Object.freeze({
+    queued: "Waiting to prepare the clip…",
+    downloading: "Preparing the MP4…",
+    validating: "Checking MP4 playback…",
+    persisting: "Saving the prepared MP4…",
+  });
   const state = {
     token: "", account: null, cameras: [], workerStatus: "ready", selected: null, media: null,
-    view: "live", sessionEpoch: 0, selectionEpoch: 0, requests: new Set(),
+    view: "wall", sessionEpoch: 0, selectionEpoch: 0, requests: new Set(),
     hls: null, nativeLive: false, hlsScript: null, retryTimer: null, retryCount: 0,
     mediaAuthRefreshUsed: false,
     pollTimer: null, expiryTimer: null, selectionController: null,
-    spans: [], selectedSpan: null, historyEpoch: 0, historyRolling: true, signingOut: false,
+    spans: [], selectedSpan: null, historyEpoch: 0, historyLoad: null, historyRolling: true, signingOut: false,
+    eventSeekEpoch: 0,
     dialogMode: "add", cameraSetupEpoch: 0, diagnostics: null, statusUnavailable: false,
     cameraSetupBusy: false, cameraSetupController: null, cameraProbe: null, cameraProbeTimer: null,
+    cameraSetupTarget: null,
     cameraConnectionNotice: null,
     recorderTime: null, sessionExpiresAt: null, sessionExpirySteady: null,
     removeTarget: null, removing: false,
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
     personFrameId: 0,
+    recordingBusy: false, cameraListEpoch: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
+    playbackStart: null, playbackEnd: null, playbackPosition: null, playbackEpoch: 0, selectedStatus: null,
+    playbackPrefetch: null, playbackObjectUrl: null, playbackRate: 1,
+    exportEpoch: 0, exportController: null, exportJob: null, exportDownloadAllowed: false,
+    securityTransition: false, capabilitiesResolved: false,
   };
+  let wall = null, timeline = null, administration = null, cameraAnalytics = null, settings = null;
+  const PLAYBACK_CHUNK_SECONDS = 120;
+  const MAX_PREFETCH_BYTES = 32 * 1024 * 1024;
+  let wallLayoutPending = false;
+
+  function fitCameraWall() {
+    if (wallLayoutPending) return;
+    wallLayoutPending = true;
+    requestAnimationFrame(() => {
+      wallLayoutPending = false;
+      const grid = $("wall-panel").querySelector(".camera-wall-grid");
+      if (grid && state.view === "wall" && !$("workspace").hidden) {
+        const top = grid.getBoundingClientRect().top + window.scrollY;
+        grid.style.setProperty("--wall-height", `${Math.max(280, window.innerHeight - top - 24)}px`);
+      }
+    });
+  }
+
+  function cameraWall() {
+    if (!wall) wall = window.K5CameraWall.create({
+      container: $("wall-panel"), request, ensureHls, safeMediaUrl,
+      getSession: () => state.signingOut || !allowed("cameras.view_live") ? null : ({ token: state.token, epoch: state.sessionEpoch }),
+      onOpenCamera: (deviceId, view = "live") => {
+        setView(view, false);
+        void selectCamera(deviceId);
+      },
+    });
+    return wall;
+  }
+
+  function recordingTimeline() {
+    if (!timeline) timeline = window.K5RecordingTimeline.create({
+      container: $("recording-timeline"), onSeek: seekRecording,
+    });
+    return timeline;
+  }
+
+  function analyticsWorkspace() {
+    if (!cameraAnalytics && window.K5Analytics?.create) cameraAnalytics = window.K5Analytics.create({
+      container: $("analytics-panel"), request,
+      getSession: () => state.signingOut || !state.capabilitiesResolved ? null : ({ token: state.token, epoch: state.sessionEpoch, account: state.account }),
+      onSeek: ({ cameraId, timestamp }) => void seekEventRecording(timestamp, cameraId),
+    });
+    return cameraAnalytics;
+  }
+
+  function adminWorkspace() {
+    if (!administration) {
+      if (!window.K5Admin?.create) throw new Error("Account administration did not load");
+      administration = window.K5Admin.create({
+        request,
+        getSession: () => state.signingOut || !allowed("users.manage") ? null : ({ token: state.token, epoch: state.sessionEpoch, account: state.account }),
+        getCameras: () => state.cameras,
+        onSelfChanged: (account, permissionsChanged) => {
+          if (!permissionsChanged) {
+            state.account = { ...state.account, ...account };
+            $("account-name").textContent = account.display_name || account.username;
+            renderAccountControls();
+            return;
+          }
+          const token = state.token;
+          clearWorkspace("Your account permissions changed. Sign in again.");
+          void clearMediaCookie(token);
+        },
+      });
+    }
+    return administration;
+  }
+
+  function settingsWorkspace() {
+    if (!settings && window.K5Settings?.create) settings = window.K5Settings.create({
+      request,
+      getSession: () => state.signingOut ? null : ({ token: state.token, epoch: state.sessionEpoch, account: state.account }),
+      getCameras: () => state.cameras,
+      onSecurityTransition: (active) => {
+        state.securityTransition = active;
+        if (active) {
+          clearTimeout(state.pollTimer); clearTimeout(state.expiryTimer);
+          state.pollTimer = null; state.expiryTimer = null;
+          for (const controller of state.requests) controller.abort();
+        } else if (state.token) { scheduleSessionExpiry(); scheduleCameraPoll(); }
+      },
+      onReauthenticate: () => {
+        const token = state.token;
+        clearWorkspace("Account security changed. Sign in again.");
+        void clearMediaCookie(token);
+      },
+    });
+    return settings;
+  }
+
+  function allowed(permission) {
+    return state.capabilitiesResolved && Array.isArray(state.account?.effective_permissions)
+      && state.account.effective_permissions.includes(permission);
+  }
+
+  function resolveCapabilities(value) {
+    const account = value?.account, current = state.account, permissions = value?.effective_permissions;
+    const ceiling = ROLE_PERMISSIONS[current?.role];
+    if (!current || !ceiling || typeof current.id !== "string" || !account
+      || account.id !== current.id || account.username !== current.username || account.role !== current.role
+      || account.enabled !== true || !Array.isArray(permissions) || permissions.length > ceiling.length
+      || new Set(permissions).size !== permissions.length || !permissions.every((p) => ceiling.includes(p))
+      || !Array.isArray(account.effective_permissions) || account.effective_permissions.length !== permissions.length
+      || JSON.stringify([...account.effective_permissions].sort()) !== JSON.stringify([...permissions].sort())
+      || ![null, undefined].includes(account.role_profile_id) && (typeof account.role_profile_id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(account.role_profile_id))
+      || value.can_export !== permissions.includes("cameras.export")
+      || value.can_manage_users !== permissions.includes("users.manage")
+      || value.can_manage_cameras !== permissions.includes("cameras.manage")
+      || value.can_view_history !== permissions.includes("cameras.playback")) throw new ApiError(503);
+    const exported = canExport();
+    state.account = { ...current, ...account, effective_permissions: [...permissions], authority_resolved: true };
+    state.capabilitiesResolved = true;
+    if (exported && !canExport()) { cancelExport(); disableDownload(); }
+    renderAccountControls();
+    administration?.refreshAuthority(); settings?.refreshAuthority();
+  }
+
+  function suspendCapabilities() {
+    state.capabilitiesResolved = false;
+    if (state.account) state.account = { ...state.account, effective_permissions: [], authority_resolved: false };
+    renderAccountControls(); administration?.refreshAuthority(); settings?.refreshAuthority();
+    wall?.hide(); stopLive(); stopPlayback(); cancelExport(); disableDownload();
+    renderCameraHeading();
+  }
+  function canExport() {
+    return allowed("cameras.export") && !state.signingOut;
+  }
+
+  function renderAccountControls() {
+    const account = state.account;
+    $("admin-tab").hidden = account?.role !== "administrator" || !ADMIN_PERMISSIONS.some(allowed);
+    $("security-tab").hidden = !account || !state.capabilitiesResolved || !window.K5Settings?.create;
+    $("add-camera-button").hidden = !allowed("cameras.manage");
+    for (const node of $("camera-list").querySelectorAll(".camera-item")) node.disabled = !allowed("cameras.view_live") && !allowed("cameras.playback");
+    $("admin-tab").textContent = allowed("users.manage") ? "Administration" : "Recorder settings";
+    $("admin-settings-tab").hidden = !ADMIN_PERMISSIONS.some(allowed);
+    $("account-role").title = account?.role === "administrator" ? "Manage users, cameras and recordings"
+      : account?.role === "operator" ? "View assigned cameras and export footage" : "Watch assigned live and recorded video";
+    $("download-recording").hidden = !canExport();
+    $("clip-mark-in").hidden = !canExport();
+    $("clip-mark-out").hidden = !canExport();
+    $("clip-selection-label").hidden = !canExport();
+    $("export-panel").hidden = !canExport();
+  }
 
   class ApiError extends Error {
     constructor(status, code = "", clock = null) { super("Request unavailable"); this.status = status; this.code = code; this.clock = clock; }
@@ -57,9 +237,7 @@
         text: "Camera stream is reaching K5. Recording is paused because storage needs attention.",
         error: true,
       };
-      return camera.recording === true
-        ? { text: "Camera stream is reaching K5. Recording is enabled.", error: false }
-        : { text: "Camera stream is reaching K5. Recording is not active.", error: true };
+      return { text: `Camera video is connected. ${recordingDetails(camera).detail}`, error: camera.recording_state === "stalled" || camera.recording_state === "error" };
     }
     if (camera?.status === "disconnected") return {
       text: "Camera saved, but its video stream is disconnected. Check its power, network and video permissions, then use Reconnect camera.",
@@ -86,8 +264,10 @@
   }
 
   async function request(path, options = {}) {
+    if (state.signingOut) throw new DOMException("Sign out in progress", "AbortError");
     const controller = new AbortController();
-    const signals = [controller.signal, AbortSignal.timeout(15000)];
+    const timeout = Number.isInteger(options.timeout) && options.timeout >= 1000 && options.timeout <= 120000 ? options.timeout : 15000;
+    const signals = [controller.signal, AbortSignal.timeout(timeout)];
     if (options.signal) signals.push(options.signal);
     const signal = AbortSignal.any(signals);
     const token = state.token;
@@ -104,11 +284,11 @@
         ...(options.rawBody !== undefined ? { body: options.rawBody } : {}),
       });
       if (!response.ok) {
-        if (response.status === 401 && token && token === state.token && path !== "/api/v1/auth/login" && !state.signingOut) {
+        if (response.status === 401 && token && token === state.token && path !== "/api/v1/auth/login" && !state.signingOut && !state.securityTransition) {
           expireSession();
         }
         let code = "", clock = null;
-        if (path.startsWith("/api/v1/operator/camera")) {
+        if (path.startsWith("/api/v1/operator/camera") || path.startsWith("/api/v1/operator/admin/") || path.startsWith("/api/v1/operator/security")) {
           try {
             const detail = (await response.json()).detail;
             const candidate = typeof detail === "string" ? detail : detail?.code;
@@ -116,11 +296,15 @@
               code = candidate;
               clock = cameraClockReport(detail?.clock);
             }
+            if (path.startsWith("/api/v1/operator/admin/") && ADMIN_ERROR_CODES.has(candidate)) code = candidate;
+            if (path.includes("/exports") && Object.hasOwn(EXPORT_ERRORS, candidate)) code = candidate;
+            if (window.K5Settings?.errorCodes?.includes(candidate)) code = candidate;
           } catch (_) { /* Unknown response text never becomes a user-facing error. */ }
         }
         throw new ApiError(response.status, code, clock);
       }
       if (response.status === 204) return null;
+      if (options.responseType === "blob") return await response.blob();
       return await response.json();
     } finally {
       state.requests.delete(controller);
@@ -137,6 +321,45 @@
     if (["connecting", "starting", "pending"].includes(status)) return { text: "Connecting", style: "connecting" };
     if (["offline", "disconnected"].includes(status)) return { text: "Disconnected", style: "offline" };
     return { text: "Unavailable", style: "offline" };
+  }
+
+  function recordingDetails(camera) {
+    if (!camera) return { text: "No camera selected", detail: "Select a camera to view its recording state.", paused: false };
+    const reason = camera.recording_status?.reason;
+    if (camera.recording_enabled === false || reason === "operator_paused") return {
+      text: "Recording paused", detail: "Recording is paused for this camera. Live video and retained recordings remain available.", paused: true,
+    };
+    if (state.workerStatus === "disk_full" || reason === "storage_paused") return {
+      text: "Storage paused", detail: "Recording is paused because storage needs attention. Check the storage status above.", paused: true,
+    };
+    if (camera.recording_state === "recording") return {
+      text: "Recording", detail: "New recording data has been observed on disk.", paused: false,
+    };
+    if (camera.recording_state === "stalled" || camera.recording_state === "error") return {
+      text: "Recording needs attention", detail: reason === "camera_unavailable"
+        ? "No new footage is confirmed while the camera is disconnected. Check the camera connection."
+        : "New recording data is not being confirmed. Check the camera and storage status, then reconnect the camera if needed.", paused: true,
+    };
+    if (camera.status !== "live") return {
+      text: "Waiting for video", detail: "Recording will be checked after the camera starts sending video.", paused: false,
+    };
+    return { text: "Checking recording", detail: "Video is connected. Waiting to confirm new recording data on disk.", paused: false };
+  }
+
+  function renderOverview() {
+    const cameras = state.cameras;
+    $("summary-online").textContent = String(cameras.filter((camera) => camera.status === "live").length);
+    $("summary-camera-total").textContent = `${cameras.length} ${cameras.length === 1 ? "camera" : "cameras"} configured`;
+    $("summary-recording").textContent = String(cameras.filter((camera) => camera.recording_state === "recording").length);
+    const paused = cameras.filter((camera) => camera.recording_enabled === false || camera.recording_state === "paused").length;
+    const attention = cameras.filter((camera) => ["stalled", "error"].includes(camera.recording_state)).length;
+    $("summary-recording-detail").textContent = attention ? `${attention} need attention${paused ? ` · ${paused} paused` : ""}`
+      : paused ? `${paused} paused · Confirmed from disk activity` : "Confirmed from observed disk activity";
+    $("summary-storage").textContent = state.statusUnavailable ? "Unavailable" : byteLabel(state.diagnostics?.storage?.recording_bytes) || "—";
+    $("summary-storage-detail").textContent = byteLabel(state.diagnostics?.max_recording_bytes)
+      ? `${byteLabel(state.diagnostics.max_recording_bytes)} recording limit` : "Checking recording storage";
+    $("summary-free").textContent = state.statusUnavailable ? "Unavailable" : byteLabel(state.diagnostics?.storage?.free_bytes) || "—";
+    fitCameraWall();
   }
 
   function resetVideo(video) {
@@ -159,7 +382,20 @@
   }
 
   function stopPlayback() {
+    state.playbackEpoch += 1;
+    clearPlaybackPrefetch();
+    if (state.playbackObjectUrl) URL.revokeObjectURL(state.playbackObjectUrl);
+    state.playbackObjectUrl = null;
+    $("playback-video").onloadedmetadata = null;
     resetVideo($("playback-video"));
+    state.playbackStart = null;
+    state.playbackEnd = null;
+    state.playbackPosition = null;
+    delete $("playback-video").dataset.utcStart;
+    delete $("playback-video").dataset.utcEnd;
+    $("playback-clock").textContent = "Choose recorded footage";
+    $("playback-clock").removeAttribute("datetime");
+    $("playback-toggle").textContent = "Play";
     $("playback-placeholder").hidden = false;
   }
 
@@ -172,6 +408,12 @@
   }
 
   function clearWorkspace(reason = "") {
+    administration?.hide();
+    settings?.hide();
+    state.securityTransition = false;
+    cameraAnalytics?.clear();
+    cancelExport();
+    resetActivation();
     state.sessionEpoch += 1;
     state.selectionEpoch += 1;
     state.historyEpoch += 1;
@@ -180,12 +422,15 @@
     state.pollTimer = null;
     state.expiryTimer = null;
     state.selectionController?.abort();
+    wall?.hide();
+    timeline?.clear();
     for (const controller of state.requests) controller.abort();
     state.requests.clear();
     stopLive();
     stopPlayback();
     state.token = "";
     state.account = null;
+    state.capabilitiesResolved = false;
     state.cameras = [];
     state.workerStatus = "ready";
     state.diagnostics = null;
@@ -199,6 +444,17 @@
     state.selected = null;
     state.media = null;
     state.mediaAuthRefreshUsed = false;
+    state.recordingBusy = false;
+    state.selectedStatus = null;
+    state.view = "wall";
+    $("admin-panel").hidden = true;
+    $("settings-panel").hidden = true;
+    $("security-tab").hidden = true;
+    $("security-tab").setAttribute("aria-pressed", "false");
+    $("camera-workspace").hidden = false;
+    $("admin-tab").hidden = true;
+    $("admin-tab").setAttribute("aria-pressed", "false");
+    state.historyRangeMs = DAY;
     state.spans = [];
     state.selectedSpan = null;
     $("workspace").hidden = true;
@@ -231,6 +487,7 @@
   }
 
   function expireSession() {
+    if (state.securityTransition) return;
     const token = state.token;
     if (!token) return;
     clearWorkspace("Your session has ended. Sign in again.");
@@ -240,6 +497,7 @@
   async function signOut() {
     if (state.signingOut) return;
     state.signingOut = true;
+    administration?.hide();
     closeAddCamera();
     const token = state.token;
     state.sessionEpoch += 1;
@@ -248,6 +506,7 @@
     clearTimeout(state.pollTimer);
     clearTimeout(state.expiryTimer);
     state.selectionController?.abort();
+    wall?.hide();
     for (const controller of state.requests) controller.abort();
     state.requests.clear();
     stopLive();
@@ -276,6 +535,7 @@
       const button = document.createElement("button");
       button.type = "button";
       button.className = "camera-item";
+      button.disabled = !allowed("cameras.view_live") && !allowed("cameras.playback");
       button.classList.toggle("selected", camera.device_id === state.selected);
       button.setAttribute("aria-pressed", String(camera.device_id === state.selected));
       const heading = document.createElement("span");
@@ -289,7 +549,7 @@
       heading.append(dot, name);
       const details = document.createElement("span");
       details.className = "camera-item-details";
-      details.textContent = `${status.text}${camera.recording ? " · Recording enabled" : ""}`;
+      details.textContent = `${status.text} · ${recordingDetails(camera).text}`;
       button.append(heading, details);
       button.addEventListener("click", () => void selectCamera(camera.device_id));
       fragment.append(button);
@@ -303,19 +563,37 @@
       $("camera-list-message").textContent = visible.length ? "" : "No cameras match your search.";
     }
     renderCameraHeading();
+    renderOverview();
+    if (state.token && state.view === "wall") cameraWall().update(state.cameras);
   }
 
   function renderCameraHeading() {
     const camera = currentCamera();
-    $("camera-title").textContent = camera?.name || "Select a camera";
-    $("camera-subtitle").textContent = camera ? String(camera.host || "Enrolled camera") : "Live view and recording history in one place.";
-    $("connection-badge").hidden = !camera;
-    $("recording-badge").hidden = !camera || (!camera.recording && state.workerStatus !== "disk_full");
-    $("update-source-button").hidden = !camera || state.account?.role !== "administrator";
-    $("remove-camera-button").hidden = !camera || state.account?.role !== "administrator";
-    $("person-view-panel").hidden = !camera || camera.analytics_status !== "configured";
-    $("recording-badge").textContent = state.workerStatus === "disk_full" ? "Recording paused" : "Recording enabled";
-    $("recording-badge").classList.toggle("paused", state.workerStatus === "disk_full");
+    analyticsWorkspace()?.selectCamera(camera || null);
+    const focused = Boolean(camera && state.view !== "wall");
+    const recording = recordingDetails(camera);
+    $("camera-title").textContent = state.view === "wall" ? "All cameras" : camera?.name || "Select a camera";
+    $("camera-subtitle").textContent = state.view === "wall" ? "Live cameras, recording activity and one-click access to recordings."
+      : camera ? String(camera.host || "Enrolled camera") : "Select a camera from the wall or camera list.";
+    $("connection-badge").hidden = !focused;
+    $("recording-badge").hidden = !focused;
+    $("update-source-button").hidden = !focused || !allowed("cameras.manage");
+    $("remove-camera-button").hidden = !focused || !allowed("cameras.manage");
+    $("toggle-recording").hidden = !focused || !allowed("recording.manage");
+    $("toggle-recording").disabled = state.recordingBusy || state.workerStatus === "unavailable";
+    const enabled = camera?.recording_enabled !== false;
+    $("toggle-recording").textContent = state.recordingBusy ? "Applying…" : enabled ? "Pause recording" : "Resume recording";
+    $("toggle-recording").setAttribute("aria-pressed", String(enabled));
+    $("toggle-recording").dataset.enabled = String(enabled);
+    $("recent-recordings").hidden = !focused;
+    $("live-tab").disabled = !camera || !allowed("cameras.view_live");
+    $("history-tab").disabled = !camera || !allowed("cameras.playback");
+    $("recording-state-detail").hidden = !focused;
+    $("recording-state-detail").textContent = recording.detail;
+    $("person-view-panel").hidden = !focused || camera.analytics_status !== "configured";
+    $("recording-badge").textContent = recording.text;
+    $("recording-badge").classList.toggle("paused", recording.paused);
+    $("recording-badge").classList.toggle("waiting", !recording.paused && camera?.recording_state !== "recording");
     if (camera) {
       const status = statusDetails(camera);
       $("connection-badge").textContent = status.text;
@@ -330,6 +608,11 @@
         livePlaceholder("Camera disconnected", "Check the camera’s power and network, or use Reconnect camera to test its account and video stream. Recording history is still available.", true);
         message("live-state", "Camera disconnected");
       }
+      if (["disconnected", "connecting", "unavailable"].includes(state.selectedStatus) && camera.status === "live" && state.view === "live" && state.media) {
+        state.retryCount = 0;
+        void startLive();
+      }
+      state.selectedStatus = camera.status;
       renderCameraConnectionNotice(camera);
     } else $("analytics-state").textContent = "";
     renderPersonControls();
@@ -396,10 +679,11 @@
       : state.workerStatus === "unavailable" || state.statusUnavailable
         ? "K5 is checking or restarting its media service. If this persists, confirm K5 is running and check its startup message."
         : "The media service is ready. If a camera stays disconnected or connecting, check the camera settings below.";
+    renderOverview();
   }
 
   async function refreshDiagnostics() {
-    if (!state.token) return;
+    if (!state.token || state.securityTransition) return;
     const epoch = state.sessionEpoch;
     try {
       const diagnostics = await request("/api/v1/operator/status");
@@ -430,26 +714,36 @@
     resetHistory(); renderCameras();
     livePlaceholder(title, description);
     message("live-state", "No camera selected");
+    if (state.token) setView("wall", false);
   }
 
   async function refreshCameras(selectFirst = false) {
-    if (!state.token) return;
+    if (!state.token || state.securityTransition) return;
     const epoch = state.sessionEpoch;
+    const navigationEpoch = state.navigationEpoch;
+    const cameraListEpoch = ++state.cameraListEpoch;
     try {
       const data = await request("/api/v1/operator/cameras");
-      if (epoch !== state.sessionEpoch) return;
+      if (epoch !== state.sessionEpoch || cameraListEpoch !== state.cameraListEpoch) return;
       if (!Array.isArray(data.cameras)) throw new ApiError(503);
+      const restoreWall = !state.capabilitiesResolved;
+      resolveCapabilities(data.capabilities);
       state.workerStatus = ["ready", "unavailable", "disk_full"].includes(data.worker_status) ? data.worker_status : "ready";
       renderWorkerStatus();
       state.cameras = data.cameras.filter((camera) => camera && typeof camera.device_id === "string" && typeof camera.name === "string");
+      administration?.refreshCameras();
+      settings?.refreshCameras();
       renderCameras();
-      if (state.selected && !currentCamera()) {
+      if (restoreWall && state.view === "wall" && allowed("cameras.view_live")) cameraWall().show(state.cameras);
+      if (state.selected && !currentCamera() && !["admin", "settings"].includes(state.view)) {
         clearCameraSelection("Camera unavailable", "Select another camera or refresh the camera list.");
       }
-      if (selectFirst && !state.selected && state.cameras.length) await selectCamera(state.cameras[0].device_id);
+      if (selectFirst && !state.selected && state.cameras.length &&
+        navigationEpoch === state.navigationEpoch && ["live", "history"].includes(state.view)) await selectCamera(state.cameras[0].device_id);
       return true;
     } catch (error) {
-      if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
+      if (error.name === "AbortError" || epoch !== state.sessionEpoch || cameraListEpoch !== state.cameraListEpoch) return;
+      suspendCapabilities();
       $("camera-list-message").textContent = apiMessage(error, "Camera list unavailable. Select refresh to try again.");
       return false;
     }
@@ -457,11 +751,11 @@
 
   function scheduleCameraPoll() {
     clearTimeout(state.pollTimer);
-    if (!state.token) return;
+    if (!state.token || state.securityTransition) return;
     state.pollTimer = setTimeout(async () => {
       await Promise.all([refreshCameras(), refreshDiagnostics()]);
       scheduleCameraPoll();
-    }, 10000);
+    }, 3000);
   }
 
   function safeMediaUrl(value, expectedPrefix) {
@@ -472,7 +766,9 @@
   }
 
   async function selectCamera(deviceId) {
-    if (!state.token || state.signingOut) return;
+    if (!state.token || state.signingOut || !allowed("cameras.view_live") && !allowed("cameras.playback")) return;
+    state.navigationEpoch += 1;
+    if (["wall", "admin"].includes(state.view)) setView(allowed("cameras.view_live") ? "live" : "history", false);
     state.selectionController?.abort();
     state.selectionController = new AbortController();
     const epoch = ++state.selectionEpoch;
@@ -480,6 +776,7 @@
     state.selected = deviceId;
     state.media = null;
     state.mediaAuthRefreshUsed = false;
+    state.selectedStatus = null;
     stopLive(); stopPlayback(); resetHistory();
     if (state.cameraConnectionNotice !== deviceId) {
       state.cameraConnectionNotice = null;
@@ -498,7 +795,7 @@
         playback_url: safeMediaUrl(media.playback_url, "/media/playback"),
       };
       if (state.view === "live") await startLive(epoch);
-      else await loadHistory();
+      else if (state.view === "history") await loadHistory();
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.selectionEpoch || !state.token) return;
       const value = apiMessage(error, "Camera media is unavailable. Try reconnecting.");
@@ -730,22 +1027,77 @@
     }
   }
 
-  function setView(view) {
-    if (state.view === view) return;
+  function setView(view, load = true) {
+    if (state.signingOut || state.securityTransition) return;
+    if (!["wall", "live", "history", "admin", "settings"].includes(view)) return;
+    if (view === "admin" && !allowed("users.manage")) return;
+    if (view === "live" && !allowed("cameras.view_live") || view === "history" && !allowed("cameras.playback")) return;
+    const previous = state.view;
+    state.navigationEpoch += 1;
     state.view = view;
+    $("camera-workspace").hidden = ["admin", "settings"].includes(view);
+    $("admin-panel").hidden = view !== "admin";
+    $("settings-panel").hidden = view !== "settings";
+    $("security-tab").setAttribute("aria-pressed", String(view === "settings"));
+    $("admin-tab").setAttribute("aria-pressed", String(view === "admin"));
+    if (previous === "admin" && view !== "admin") administration?.hide();
+    if (previous === "settings" && view !== "settings") settings?.hide();
+    $("recorder-overview").open = view !== "wall";
+    $("wall-panel").hidden = view !== "wall";
     $("live-panel").hidden = view !== "live";
     $("history-panel").hidden = view !== "history";
-    for (const value of ["live", "history"]) {
+    analyticsWorkspace()?.setVisible(view === "history");
+    if (view !== "history") { cancelExport(); disableDownload(); }
+    for (const value of ["wall", "live", "history"]) {
       $(`${value}-tab`).classList.toggle("active", view === value);
       if (view === value) $(`${value}-tab`).setAttribute("aria-current", "page");
       else $(`${value}-tab`).removeAttribute("aria-current");
     }
-    if (view === "history") { stopLive(); if (state.selected) void loadHistory(); }
-    else { stopPlayback(); if (state.media) void startLive(); }
+    if (view === "admin") {
+      state.selectionEpoch += 1;
+      state.historyEpoch += 1;
+      state.selectionController?.abort();
+      wall?.hide(); stopLive(); stopPlayback();
+      try { adminWorkspace().show(); }
+      catch (_) { message("admin-message", "Administration could not load. Refresh the workspace to try again.", true); }
+    } else if (view === "settings") {
+      state.selectionEpoch += 1;
+      state.historyEpoch += 1;
+      state.selectionController?.abort();
+      wall?.hide(); stopLive(); stopPlayback();
+      settingsWorkspace()?.show(state.settingsSection || null);
+      state.settingsSection = null;
+    } else if (view === "wall") {
+      if (state.cameraConnectionNotice) notice("");
+      state.selectionEpoch += 1;
+      state.selectionController?.abort();
+      stopLive(); stopPlayback();
+      if (state.token) cameraWall().show(state.cameras);
+      fitCameraWall();
+    } else {
+      wall?.hide();
+      if (view === "history") {
+        stopLive();
+        if (load && state.selected) {
+          if (state.media && !state.selectionController?.signal.aborted) void loadHistory();
+          else void selectCamera(state.selected);
+        }
+      } else {
+        stopPlayback();
+        if (load && state.selected) {
+          if (state.media && !state.selectionController?.signal.aborted) void startLive();
+          else void selectCamera(state.selected);
+        }
+      }
+    }
+    renderCameraHeading();
   }
 
   function utcInput(date, seconds = false) { return date.toISOString().slice(0, seconds ? 23 : 16); }
-  function parseUtc(value) { return new Date(`${value.length === 16 ? value + ":00" : value}Z`); }
+  function parseUtc(value) {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?$/.test(value)) return new Date(NaN);
+    return new Date(`${value.length === 16 ? value + ":00" : value}Z`);
+  }
   function utcMilliseconds(value) {
     return typeof value === "string" && value.length <= 32 &&
       /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/.test(value) ? Date.parse(value) : NaN;
@@ -773,7 +1125,7 @@
     const current = recorderNow();
     if (current === null) return false;
     const end = new Date(current); end.setUTCMilliseconds(0);
-    $("history-start").value = utcInput(new Date(end.getTime() - DAY), true);
+    $("history-start").value = utcInput(new Date(end.getTime() - state.historyRangeMs), true);
     $("history-end").value = utcInput(end, true);
     $("history-day").value = "";
     $("history-day").max = end.toISOString().slice(0, 10);
@@ -789,6 +1141,7 @@
   }
 
   function scheduleSessionExpiry() {
+    if (state.securityTransition) return;
     clearTimeout(state.expiryTimer);
     state.expiryTimer = null;
     const current = recorderNow();
@@ -801,31 +1154,54 @@
   }
 
   function resetHistory() {
+    cancelExport();
     state.spans = []; state.selectedSpan = null;
+    cameraAnalytics?.setRange(null);
+    timeline?.clear();
     $("history-list").replaceChildren();
     $("history-count").textContent = "0";
     $("load-history").disabled = false;
     $("selected-recording").textContent = "No interval selected";
     $("playback-start").value = "";
+    $("clip-start").value = "";
     $("playback-duration").value = "60";
-    for (const id of ["playback-start", "playback-duration", "play-recording"]) $(id).disabled = true;
+    for (const id of ["playback-start", "clip-start", "playback-duration", "play-recording"]) $(id).disabled = true;
+    $("clip-mark-in").disabled = true;
+    $("clip-mark-out").disabled = true;
+    $("clip-selection-label").textContent = "Select contiguous recorded footage · Up to 1 hour / 256 MB per clip.";
+    playbackControls();
     disableDownload();
     message("history-message", state.selected ? "Select a date or interval to see recorded video." : "Select a camera to view its history.");
-    message("playback-message", "Preview up to 5 minutes. Select a new start time to seek.");
+    message("playback-message", "Choose recorded footage. Playback continues through adjacent recordings and stops at gaps.");
   }
 
   function disableDownload() {
     const link = $("download-recording");
     link.removeAttribute("href"); link.removeAttribute("download");
     link.classList.add("disabled"); link.setAttribute("aria-disabled", "true"); link.tabIndex = -1;
+    link.textContent = "Prepare MP4 clip";
   }
 
-  async function loadHistory() {
-    if (!state.selected || !state.token) { message("history-message", "Select a camera to view its history."); return; }
+  function loadHistory() {
+    if (!state.selected || !state.token) {
+      message("history-message", "Select a camera to view its history.");
+      return Promise.resolve(false);
+    }
+    // Reserve this intent before recorder-time I/O so an older refresh cannot reset a newer one.
+    const load = { deviceId: state.selected, session: state.sessionEpoch, epoch: ++state.historyEpoch, task: null };
+    state.historyLoad = load;
+    load.task = performHistoryLoad(load).finally(() => {
+      if (state.historyLoad === load) state.historyLoad = null;
+    });
+    return load.task;
+  }
+
+  async function performHistoryLoad({ deviceId, session, epoch }) {
+    const active = () => epoch === state.historyEpoch && session === state.sessionEpoch
+      && deviceId === state.selected && state.token && state.view === "history";
     if (state.historyRolling) {
-      const before = state.selected, session = state.sessionEpoch;
       await refreshDiagnostics();
-      if (before !== state.selected || session !== state.sessionEpoch || !state.token) return;
+      if (!active()) return false;
       if (!state.historyRolling) return;
       if (!setLastDay()) {
         message("history-message", "Recorder time is unavailable. Refresh service status or choose an explicit UTC interval.", true);
@@ -837,15 +1213,14 @@
     if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end <= start || end - start > DAY) {
       message("history-message", "Choose a valid interval of 24 hours or less.", true); return;
     }
-    const deviceId = state.selected;
-    const epoch = ++state.historyEpoch;
+    if (!active()) return false;
     stopPlayback(); resetHistory();
     $("load-history").disabled = true;
     message("history-message", "Loading recording history…");
     try {
       const query = new URLSearchParams({ start: start.toISOString(), end: end.toISOString() });
       const data = await request(`/api/v1/operator/cameras/${encodeURIComponent(deviceId)}/history?${query}`, { signal: state.selectionController?.signal });
-      if (epoch !== state.historyEpoch || deviceId !== state.selected) return;
+      if (!active()) return false;
       if (!Array.isArray(data.spans)) throw new ApiError(503);
       state.spans = data.spans.map((span) => {
         const originalStart = spanStartMilliseconds(span.started_at);
@@ -853,9 +1228,17 @@
         return { ...span, start: Math.max(originalStart, start.getTime()), end: Math.min(originalEnd, end.getTime()) };
       }).filter((span) => Number.isFinite(span.start) && Number.isFinite(span.end) && span.end > span.start).sort((a, b) => a.start - b.start);
       renderHistory(start.getTime(), end.getTime());
+      recordingTimeline().setData({ start: start.getTime(), end: end.getTime(), spans: state.spans });
+      const latest = state.spans[state.spans.length - 1];
+      if (latest) recordingTimeline().setPlayhead(Math.max(latest.start, latest.end - 1000));
+      analyticsWorkspace()?.setRange({ start: start.toISOString(), end: end.toISOString() });
+      for (const id of ["playback-start", "play-recording"]) $(id).disabled = !state.spans.length;
+      playbackControls();
+      state.historyFetchedSteady = performance.now();
       message("history-message", state.spans.length
         ? `${state.spans.length} available ${state.spans.length === 1 ? "interval" : "intervals"}. Gaps contain no recorded video.`
         : "No recorded video is available in this interval.");
+      return true;
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.historyEpoch || !state.token) return;
       message("history-message", apiMessage(error, "Recording history is unavailable. Try again."), true);
@@ -874,9 +1257,10 @@
       const time = document.createElement("span"); time.textContent = `${utcLabel(from)} → ${utcLabel(to)}`;
       gap.append(title, time); fragment.append(gap);
     }
-    for (const span of state.spans) {
+    for (const [index, span] of state.spans.entries()) {
       addGap(cursor, span.start);
       const button = document.createElement("button"); button.type = "button"; button.className = "history-item";
+      button.dataset.recordingIndex = String(index);
       button.setAttribute("aria-pressed", "false");
       const time = document.createElement("span"); time.className = "history-item-time";
       time.textContent = `${utcLabel(span.start)} → ${utcLabel(span.end, false)}`;
@@ -892,68 +1276,534 @@
     $("history-count").textContent = String(state.spans.length);
   }
 
-  function selectSpan(span, button) {
-    stopPlayback();
-    state.selectedSpan = span;
-    for (const item of $("history-list").querySelectorAll("button")) {
-      item.classList.toggle("selected", item === button);
-      item.setAttribute("aria-pressed", String(item === button));
+  function coverageEnd(start) {
+    const first = state.spans.find((span) => span.start <= start && start < span.end);
+    if (!first) return null;
+    let end = first.end;
+    for (const span of state.spans) {
+      // A one-millisecond tolerance accounts only for JS timestamp rounding.
+      if (span.start > end + 1) break;
+      if (span.end > end) end = span.end;
     }
-    const start = span.start;
+    return end;
+  }
+
+  function chunkAt(start) {
+    if (!state.media || !Number.isFinite(start)) throw new SelectionError("Choose an available recording first.");
+    const requestedStart = start;
+    const span = state.spans.find((item) => item.start <= start && start < item.end);
+    if (!span) throw new SelectionError("No playable recording at this time.");
+    // The recorder already joins files that share compatible stream metadata.
+    // Adjacent list entries can require a fresh decoder (for example after a
+    // camera reconnect); never ask the donor to mux across that boundary.
+    const availableEnd = span.end;
+    if (availableEnd - start < 1000) {
+      start = Math.max(span.start, availableEnd - 1000);
+      if (availableEnd - start < 1000) throw new SelectionError("This recording is shorter than one second and cannot be played.");
+    }
+    const end = Math.min(availableEnd, start + PLAYBACK_CHUNK_SECONDS * 1000);
+    const url = new URL(state.media.playback_url, location.origin);
+    url.searchParams.set("start", new Date(start).toISOString());
+    url.searchParams.set("duration", String((end - start) / 1000));
+    // Fragmented MP4 is authorized for every viewing role. Exports have their own API.
+    url.searchParams.set("format", "fmp4");
+    return { start, end, seekOffset: (requestedStart - start) / 1000, url: url.pathname + url.search };
+  }
+
+  function nextChunkStart(end) {
+    if (!Number.isFinite(end)) return null;
+    if (coverageEnd(end) !== null) return end;
+    const next = state.spans.find((span) => span.start >= end && span.end - span.start >= 1000);
+    return next && next.start - end <= 1 ? next.start : null;
+  }
+
+  function clearPlaybackPrefetch() {
+    const pending = state.playbackPrefetch;
+    state.playbackPrefetch = null;
+    pending?.controller.abort();
+    if (pending?.objectUrl) URL.revokeObjectURL(pending.objectUrl);
+  }
+
+  function prefetchPlayback(epoch) {
+    if (state.playbackPrefetch || epoch !== state.playbackEpoch || !state.token) return;
+    const next = nextChunkStart(state.playbackEnd);
+    if (next === null) return;
+    let chunk;
+    try { chunk = chunkAt(next); } catch (_) { return; }
+    const controller = new AbortController();
+    const pending = { chunk, controller, objectUrl: null, task: null };
+    state.playbackPrefetch = pending;
+    pending.task = (async () => {
+      let reader = null;
+      try {
+        const response = await fetch(chunk.url, {
+          credentials: "same-origin", cache: "no-store",
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]),
+        });
+        if (!response.ok || !response.body) return null;
+        const length = Number(response.headers.get("Content-Length"));
+        if (Number.isFinite(length) && length > MAX_PREFETCH_BYTES) return null;
+        reader = response.body.getReader();
+        const buffers = []; let bytes = 0;
+        while (true) {
+          const item = await reader.read();
+          if (item.done) break;
+          bytes += item.value.byteLength;
+          if (bytes > MAX_PREFETCH_BYTES) return null;
+          buffers.push(item.value);
+        }
+        if (!bytes || epoch !== state.playbackEpoch || controller.signal.aborted || state.playbackPrefetch !== pending) return null;
+        pending.objectUrl = URL.createObjectURL(new Blob(buffers, { type: "video/mp4" }));
+        return pending.objectUrl;
+      } catch (_) { return null; }
+      finally {
+        if (reader) void reader.cancel().catch(() => {});
+        if (!pending.objectUrl) controller.abort();
+      }
+    })();
+  }
+
+  function playbackControls() {
+    const enabled = Boolean(state.token && state.spans.length && state.media && state.view === "history");
+    for (const id of ["playback-previous", "playback-next", "playback-back", "playback-forward"]) $(id).disabled = !enabled;
+    $("playback-toggle").disabled = !enabled || !state.selectedSpan;
+    const at = playbackUtc();
+    if (Number.isFinite(at)) {
+      $("playback-clock").dateTime = new Date(at).toISOString();
+      $("playback-clock").textContent = `${utcLabel(at)} UTC`;
+    }
+    $("playback-toggle").textContent = $("playback-video").paused ? "Play" : "Pause";
+  }
+
+  function markSelectedSpan(span) {
+    state.selectedSpan = span;
+    for (const [index, item] of [...$("history-list").querySelectorAll("button")].entries()) {
+      const selected = state.spans[index] === span;
+      item.classList.toggle("selected", selected);
+      item.setAttribute("aria-pressed", String(selected));
+    }
+    $("selected-recording").textContent = span
+      ? `${utcLabel(span.start)} — ${utcLabel(coverageEnd(span.start))} UTC` : "No interval selected";
+  }
+
+  async function loadPlaybackChunk(chunk, { prepared = null, autoplay = true } = {}) {
+    const epoch = ++state.playbackEpoch;
+    clearPlaybackPrefetch();
+    const video = $("playback-video");
+    video.pause();
+    if (state.playbackObjectUrl) URL.revokeObjectURL(state.playbackObjectUrl);
+    state.playbackObjectUrl = prepared;
+    state.playbackStart = chunk.start;
+    state.playbackEnd = chunk.end;
+    state.playbackPosition = chunk.start;
+    video.dataset.utcStart = new Date(chunk.start).toISOString();
+    video.dataset.utcEnd = new Date(chunk.end).toISOString();
+    video.onloadedmetadata = chunk.seekOffset > 0 ? () => {
+      if (epoch !== state.playbackEpoch || !state.token || state.view !== "history") return;
+      video.onloadedmetadata = null;
+      video.currentTime = chunk.seekOffset;
+      timeline?.setPlayhead(playbackUtc());
+      playbackControls();
+    } : null;
+    video.src = prepared || chunk.url;
+    video.load();
+    video.playbackRate = state.playbackRate;
+    $("playback-placeholder").hidden = true;
+    markSelectedSpan(state.spans.find((span) => span.start <= chunk.start && chunk.start < span.end) || state.selectedSpan);
+    recordingTimeline().setPlayhead(chunk.start + chunk.seekOffset * 1000);
+    playbackControls();
+    message("playback-message", "Loading recorded video…");
+    if (!autoplay) return;
+    try { await video.play(); }
+    catch (error) {
+      if (epoch !== state.playbackEpoch || error.name === "AbortError") return;
+      message("playback-message", error.name === "NotAllowedError"
+        ? "Select Play to begin recorded video."
+        : "Playback is unavailable. Refresh history or select another interval.", true);
+    }
+  }
+
+  async function advancePlayback() {
+    if (!state.token || state.view !== "history" || state.playbackEnd === null) return;
+    const epoch = state.playbackEpoch;
+    const next = nextChunkStart(state.playbackEnd);
+    if (next === null) {
+      const later = state.spans.find((span) => span.start > state.playbackEnd && span.end - span.start >= 1000);
+      message("playback-message", later
+        ? `Recording gap. Next footage starts at ${utcLabel(later.start)} UTC. Select Next footage to continue.`
+        : "End of available footage. Refresh history to see newer recordings.");
+      playbackControls();
+      return;
+    }
+    const pending = state.playbackPrefetch;
+    let prepared = null;
+    if (pending?.chunk.start === next) {
+      message("playback-message", "Continuing recorded video…");
+      prepared = await pending.task;
+      if (epoch !== state.playbackEpoch || state.view !== "history" || !state.token) return;
+      pending.objectUrl = null; // Transfer this bounded buffer to the active player.
+      state.playbackPrefetch = null;
+    }
+    try { await loadPlaybackChunk(chunkAt(next), { prepared }); }
+    catch (_) { message("playback-message", "Next recorded footage is unavailable. Refresh history and try again.", true); }
+  }
+
+  function selectSpan(span, button, start = span.start, autoPlay = true) {
+    state.eventSeekEpoch += 1;
+    stopPlayback();
+    markSelectedSpan(span);
     $("playback-start").value = utcInput(new Date(start), true);
-    $("playback-start").min = utcInput(new Date(start), true);
-    $("playback-start").max = utcInput(new Date(span.end), true);
-    $("playback-duration").value = String(Math.max(1, Math.min(60, Math.floor((span.end - start) / 1000))));
-    for (const id of ["playback-start", "playback-duration", "play-recording"]) $(id).disabled = false;
-    $("selected-recording").textContent = `${utcLabel(span.start)} — ${utcLabel(span.end)} UTC`;
-    message("playback-message", "Preview up to 5 minutes. Select a new start time to seek.");
+    $("playback-start").removeAttribute("min");
+    $("playback-start").removeAttribute("max");
+    for (const id of ["playback-start", "clip-start", "playback-duration", "play-recording", "clip-mark-in", "clip-mark-out"]) $(id).disabled = false;
+    if (!$("clip-start").value) {
+      $("clip-start").value = utcInput(new Date(start), true);
+      $("playback-duration").value = String(Math.max(1, Math.min(60, Math.floor((coverageEnd(start) - start) / 1000))));
+    }
     updateDownload();
+    recordingTimeline().setPlayhead(start);
+    playbackControls();
+    if (autoPlay) {
+      try { void loadPlaybackChunk(chunkAt(start)); }
+      catch (error) { message("playback-message", error instanceof SelectionError ? error.message : "Playback is unavailable.", true); }
+    }
+  }
+
+  function seekRecording(milliseconds) {
+    if (!Number.isFinite(milliseconds) || state.view !== "history" || !state.token) return;
+    state.eventSeekEpoch += 1;
+    const index = state.spans.findIndex((span) => span.start <= milliseconds && milliseconds < span.end);
+    if (index < 0) {
+      stopPlayback();
+      state.playbackPosition = milliseconds;
+      markSelectedSpan(null);
+      $("playback-start").value = "";
+      for (const id of ["playback-start", "play-recording"]) $(id).disabled = !state.spans.length;
+      for (const id of ["clip-start", "playback-duration", "clip-mark-in", "clip-mark-out"]) $(id).disabled = true;
+      cancelExport(); disableDownload();
+      recordingTimeline().setPlayhead(milliseconds);
+      $("playback-clock").dateTime = new Date(milliseconds).toISOString();
+      $("playback-clock").textContent = `${utcLabel(milliseconds)} UTC · No recording`;
+      message("playback-message", `No playable recording at ${utcLabel(milliseconds)} UTC. Choose a recorded interval or select Next footage.`, true);
+      playbackControls();
+      return;
+    }
+    selectSpan(state.spans[index], $("history-list").querySelector(`[data-recording-index="${index}"]`), milliseconds);
+  }
+
+  async function seekEventRecording(timestamp, cameraId = state.selected) {
+    const at = typeof timestamp === "number" ? timestamp
+      : typeof timestamp === "string" && timestamp.length <= 40 && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(timestamp) ? Date.parse(timestamp) : NaN;
+    if (!Number.isFinite(at) || !state.token || !state.cameras.some((camera) => camera.device_id === cameraId)) return;
+    const session = state.sessionEpoch, seek = ++state.eventSeekEpoch;
+    setView("history", false);
+    const selection = cameraId !== state.selected || !state.media || state.selectionController?.signal.aborted
+      ? selectCamera(cameraId) : null;
+    const navigation = state.navigationEpoch;
+    const active = () => seek === state.eventSeekEpoch && navigation === state.navigationEpoch
+      && session === state.sessionEpoch && state.selected === cameraId && state.view === "history" && state.token;
+    if (selection) await selection;
+    if (!active()) return;
+    const pending = state.historyLoad;
+    if (pending && pending.deviceId === cameraId && pending.session === session && pending.epoch === state.historyEpoch) {
+      if (!await pending.task || !active()) return;
+    }
+    const first = parseUtc($("history-start").value).getTime(), last = parseUtc($("history-end").value).getTime();
+    if (!Number.isFinite(first) || at < first || at >= last) {
+      const dayStart = new Date(at); dayStart.setUTCHours(0, 0, 0, 0);
+      $("history-start").value = utcInput(dayStart, true);
+      $("history-end").value = utcInput(new Date(dayStart.getTime() + DAY), true);
+      state.historyRolling = false;
+      if (!await loadHistory()) return;
+    }
+    // A detector event can arrive after the latest recorder history snapshot.
+    // Re-query once before concluding the event is in a recording gap.
+    // Never let a superseded navigation or changed session apply its result.
+    if (active() && !state.spans.some((span) => span.start <= at && at < span.end)) {
+      if (!await loadHistory() || !active()) return;
+    }
+    if (active()) seekRecording(at);
+  }
+
+  function moveFootage(direction) {
+    const at = playbackUtc();
+    const fallback = Number.isFinite(at) ? at : parseUtc($("history-start").value).getTime();
+    const list = direction > 0 ? state.spans : [...state.spans].reverse();
+    const target = list.find((span) => span.end - span.start >= 1000 && (direction > 0 ? span.start > fallback : span.start < fallback - 1));
+    if (target) seekRecording(target.start);
+    else message("playback-message", direction > 0 ? "No later footage is available in this history window." : "No earlier footage is available in this history window.");
+  }
+
+  function playLatestSpan() {
+    const span = [...state.spans].reverse().find((item) => item.end - item.start >= 1000);
+    if (!span) {
+      message("playback-message", "No playable recording is available yet. Check the recording state and refresh history after video has been recorded.", true);
+      return;
+    }
+    const index = state.spans.indexOf(span);
+    const start = Math.max(span.start, span.end - 60000);
+    selectSpan(span, $("history-list").querySelector(`[data-recording-index="${index}"]`), start);
+  }
+
+  async function showLatestRecording() {
+    if (!state.selected || !state.token) return;
+    const deviceId = state.selected, session = state.sessionEpoch;
+    setView("history", false);
+    if (state.media && !state.selectionController?.signal.aborted) await loadHistory();
+    else await selectCamera(deviceId);
+    if (deviceId === state.selected && session === state.sessionEpoch && state.view === "history") playLatestSpan();
+  }
+
+  async function toggleRecording() {
+    const camera = currentCamera();
+    if (!camera || !allowed("recording.manage") || state.recordingBusy || state.signingOut) return;
+    const deviceId = camera.device_id, session = state.sessionEpoch;
+    const enabled = camera.recording_enabled === false;
+    state.recordingBusy = true;
+    state.cameraListEpoch += 1;
+    renderCameraHeading();
+    try {
+      await request(`/api/v1/operator/cameras/${encodeURIComponent(deviceId)}/recording`, { method: "PUT", body: { enabled } });
+      if (session !== state.sessionEpoch) return;
+      await refreshCameras();
+      if (deviceId === state.selected) notice(enabled
+        ? "Recording resumed. K5 will confirm new recording data on disk."
+        : "Recording paused for this camera. Live video and retained recordings remain available.");
+    } catch (error) {
+      if (error.name !== "AbortError" && session === state.sessionEpoch && deviceId === state.selected) {
+        notice(apiMessage(error, "The recording change could not be confirmed. Refresh and check its state before trying again."), true);
+      }
+    } finally {
+      if (session === state.sessionEpoch) { state.recordingBusy = false; renderCameraHeading(); }
+    }
+  }
+
+  function rollingHistory(milliseconds) {
+    state.historyRangeMs = milliseconds;
+    state.historyRolling = true;
+    void loadHistory();
+  }
+
+  function playbackUtc() {
+    const elapsed = $("playback-video").currentTime;
+    return Number.isFinite(state.playbackStart) && Number.isFinite(elapsed)
+      ? Math.min(state.playbackEnd, state.playbackStart + elapsed * 1000)
+      : Number.isFinite(state.playbackPosition) ? state.playbackPosition : parseUtc($("playback-start").value).getTime();
   }
 
   function playbackSelection() {
-    if (!state.selectedSpan || !state.media) throw new SelectionError("Choose an available recording interval first.");
-    const start = parseUtc($("playback-start").value).getTime();
-    const seconds = Number($("playback-duration").value);
-    const span = state.selectedSpan;
-    if (!Number.isFinite(start) || start < span.start || start >= span.end) throw new SelectionError("Choose a start time inside the selected interval.");
-    if (!Number.isFinite(seconds) || seconds < 1 || seconds > 300 || !Number.isInteger(seconds)) throw new SelectionError("Choose a preview length from 1 to 300 seconds.");
-    const duration = Math.min(seconds, (span.end - start) / 1000);
-    if (duration < 1) throw new SelectionError("Choose a start time at least one second before the interval ends.");
-    const url = new URL(state.media.playback_url, location.origin);
-    url.searchParams.set("start", new Date(start).toISOString());
-    url.searchParams.set("duration", String(duration));
-    url.searchParams.set("format", "mp4");
-    return { url: url.pathname + url.search, start, duration };
+    if (!state.media || !state.selected) throw new SelectionError("Choose an available recording first.");
+    const start = parseUtc($("clip-start").value).getTime();
+    const duration = Number($("playback-duration").value);
+    if (!Number.isFinite(start) || coverageEnd(start) === null) throw new SelectionError("Choose a clip start inside recorded footage.");
+    if (!Number.isInteger(duration) || duration < 1 || duration > 3600) throw new SelectionError("Choose a clip length from 1 to 3600 seconds.");
+    if (start + duration * 1000 > coverageEnd(start)) throw new SelectionError("The selected clip crosses a recording gap or ends after available footage.");
+    return { start, duration, signature: `${state.selected}:${start}:${duration}` };
+  }
+
+  function cancelExport() {
+    state.exportEpoch += 1;
+    state.exportController?.abort();
+    state.exportController = null;
+    state.exportJob = null;
+    state.exportDownloadAllowed = false;
+  }
+
+  function validateReadyExport(job, selection, cameraId) {
+    if (!job || job.status !== "ready" || !Number.isSafeInteger(job.bytes) || job.bytes <= 0
+      || typeof job.filename !== "string" || !/^[A-Za-z0-9._-]+\.mp4$/.test(job.filename)
+      || Date.parse(job.start) !== selection.start || job.duration !== selection.duration
+      || job.download_url !== `/media/exports/${cameraId}/${job.id}.mp4`) throw new ApiError(409, "export_file_unavailable");
+    safeMediaUrl(job.download_url, "/media/exports/");
+  }
+
+  async function downloadReadyExport() {
+    if (state.exportController || !state.exportJob || state.exportJob.status !== "ready") return;
+    const job = state.exportJob, cameraId = state.selected, session = state.sessionEpoch, epoch = state.exportEpoch;
+    const controller = new AbortController();
+    state.exportController = controller;
+    const active = () => epoch === state.exportEpoch && session === state.sessionEpoch && cameraId === state.selected && state.token && !controller.signal.aborted;
+    try {
+      const selection = playbackSelection();
+      const current = await request(`/api/v1/operator/cameras/${encodeURIComponent(cameraId)}/exports/${encodeURIComponent(job.id)}`, { signal: controller.signal });
+      if (!active()) return;
+      if (current?.id !== job.id) throw new ApiError(409, "export_file_unavailable");
+      validateReadyExport(current, selection, cameraId);
+      state.exportJob = { ...current, signature: selection.signature };
+      state.exportController = null;
+      updateDownload();
+      state.exportDownloadAllowed = true;
+      $("download-recording").click();
+    } catch (error) {
+      if (!active() || error.name === "AbortError") return;
+      cancelExport(); updateDownload();
+      message("export-message", EXPORT_ERRORS[error.code] || apiMessage(error, "The prepared MP4 is no longer available. Prepare the clip again."), true);
+    }
   }
 
   function updateDownload() {
+    if (!canExport()) { disableDownload(); return; }
     try {
       const selection = playbackSelection();
       const link = $("download-recording");
-      link.href = selection.url;
-      link.download = `K5-recording-${new Date(selection.start).toISOString().replace(/[:.]/g, "-")}.mp4`;
-      link.classList.remove("disabled"); link.setAttribute("aria-disabled", "false"); link.tabIndex = 0;
-    } catch (_) { disableDownload(); }
+      if (state.exportJob?.signature !== selection.signature) cancelExport();
+      const ready = state.exportJob?.status === "ready";
+      link.href = ready ? safeMediaUrl(state.exportJob.download_url, "/media/exports/") : "#";
+      if (ready) link.download = state.exportJob.filename;
+      else link.removeAttribute("download");
+      link.textContent = ready ? "Save MP4 clip" : state.exportJob ? "Preparing MP4…" : "Prepare MP4 clip";
+      link.classList.toggle("disabled", Boolean(state.exportJob && !ready));
+      link.setAttribute("aria-disabled", String(Boolean(state.exportJob && !ready)));
+      link.tabIndex = state.exportJob && !ready ? -1 : 0;
+      $("clip-selection-label").textContent = `${utcLabel(selection.start)} → ${utcLabel(selection.start + selection.duration * 1000, false)} UTC · ${durationLabel(selection.duration * 1000)} · Up to 1 hour / 256 MB per clip`;
+      if (!state.exportJob) message("export-message", "Choose Prepare MP4 clip. K5 checks and prepares the selected footage before downloading.");
+    } catch (error) {
+      cancelExport(); disableDownload();
+      message("export-message", error instanceof SelectionError ? error.message : "The selected clip is unavailable.", true);
+    }
+  }
+
+  async function prepareExport(event) {
+    if (!canExport()) { event.preventDefault(); return; }
+    if (state.exportJob?.status === "ready" && state.exportDownloadAllowed) {
+      state.exportDownloadAllowed = false;
+      message("export-message", "MP4 ready. Your browser handles the download; open Downloads to check the saved file.");
+      return;
+    }
+    event.preventDefault();
+    if (state.exportJob?.status === "ready") { void downloadReadyExport(); return; }
+    if (state.exportController) return;
+    let selection;
+    try { selection = playbackSelection(); }
+    catch (error) { message("export-message", error.message, true); return; }
+    cancelExport();
+    const epoch = state.exportEpoch, session = state.sessionEpoch, cameraId = state.selected;
+    const controller = new AbortController();
+    state.exportController = controller;
+    state.exportJob = { signature: selection.signature, status: "queued" };
+    updateDownload();
+    message("export-message", "Preparing MP4… Recording and playback continue.");
+    const active = () => epoch === state.exportEpoch && session === state.sessionEpoch && cameraId === state.selected && state.token && !controller.signal.aborted;
+    const base = `/api/v1/operator/cameras/${encodeURIComponent(cameraId)}/exports`;
+    try {
+      let job = await request(base, { method: "POST", body: { start: new Date(selection.start).toISOString(), duration: selection.duration }, signal: controller.signal });
+      const deadline = performance.now() + 120000;
+      while (active()) {
+        if (!job || typeof job.id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(job.id) || !["queued", "preparing", "ready", "failed"].includes(job.status)) throw new Error("Invalid export status");
+        if (job.status === "failed") throw new ApiError(409, Object.hasOwn(EXPORT_ERRORS, job.error) ? job.error : "export_preparation_failed");
+        state.exportJob = { ...job, signature: selection.signature };
+        if (job.status === "ready") {
+          validateReadyExport(job, selection, cameraId);
+          state.exportController = null;
+          updateDownload();
+          message("export-message", "MP4 ready. Your browser handles the download; open Downloads to check the saved file.");
+          state.exportDownloadAllowed = true;
+          $("download-recording").click();
+          return;
+        }
+        const phase = EXPORT_PHASES[job.phase] || "Preparing the MP4…";
+        const progress = Number.isSafeInteger(job.bytes) && job.bytes > 0 && job.bytes <= 256 * 1024 * 1024
+          ? ` ${(job.bytes / (1024 * 1024)).toFixed(1)} MB processed.` : "";
+        message("export-message", `${phase}${progress} Recording and playback continue.`);
+        if (performance.now() >= deadline) throw new Error("Export preparation timed out");
+        await new Promise((resolve) => {
+          const timer = setTimeout(done, 500);
+          function done() { clearTimeout(timer); controller.signal.removeEventListener("abort", done); resolve(); }
+          controller.signal.addEventListener("abort", done, { once: true });
+        });
+        if (!active()) return;
+        job = await request(`${base}/${encodeURIComponent(job.id)}`, { signal: controller.signal });
+      }
+    } catch (error) {
+      if (!active() || error.name === "AbortError") return;
+      cancelExport();
+      updateDownload();
+      message("export-message", EXPORT_ERRORS[error.code] || apiMessage(error, "The MP4 could not be prepared. Check that the selected footage is available, then try again."), true);
+    }
   }
 
   async function playRecording(event) {
     event.preventDefault();
-    try {
-      const selection = playbackSelection();
-      const video = $("playback-video");
-      video.src = selection.url;
-      video.load();
-      $("playback-placeholder").hidden = true;
-      message("playback-message", `Loading ${durationLabel(selection.duration * 1000)} of recorded video…`);
-      updateDownload();
-      await video.play();
-    } catch (error) {
-      message("playback-message", error.name === "NotAllowedError"
-        ? "Select play in the video controls to begin."
-        : error instanceof SelectionError ? error.message
-          : "Playback is unavailable. Refresh history or select another interval.", true);
-    }
+    const at = parseUtc($("playback-start").value).getTime();
+    if (!Number.isFinite(at)) { message("playback-message", "Choose a valid recorded UTC time.", true); return; }
+    seekRecording(at);
   }
+
+  let activationEpoch = 0, activationController = null;
+  let mfaChallenge = "", mfaChallengeExpires = 0;
+
+  function resetMfaSignIn() {
+    mfaChallenge = ""; mfaChallengeExpires = 0;
+    $("mfa-sign-in-form").hidden = true; $("mfa-sign-in-code").value = "";
+    $("mfa-sign-in-submit").disabled = false;
+    message("mfa-sign-in-message");
+  }
+
+  function resetActivation() {
+    resetMfaSignIn();
+    activationEpoch += 1;
+    activationController?.abort(); activationController = null;
+    $("activate-account-form").reset();
+    $("activate-account-form").hidden = true;
+    $("sign-in-form").hidden = false;
+    $("activate-account-button").hidden = false;
+    $("activate-account-submit").disabled = false;
+    $("activate-account-submit").textContent = "Set password";
+    message("activation-message", "");
+  }
+
+  $("activate-account-button").addEventListener("click", () => {
+    if (state.token) return;
+    resetActivation();
+    $("activation-username").value = $("username").value.trim();
+    $("sign-in-form").hidden = true;
+    $("activate-account-button").hidden = true;
+    $("activate-account-form").hidden = false;
+    message("sign-in-message", "");
+    $("activation-username").focus();
+  });
+  $("activation-cancel").addEventListener("click", resetActivation);
+  $("activate-account-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (state.token || $("activate-account-submit").disabled) return;
+    if ($("activation-password").value !== $("activation-confirm").value) {
+      message("activation-message", "The new passwords do not match.", true); return;
+    }
+    const body = {
+      username: $("activation-username").value.trim(),
+      temporary_credential: $("activation-credential").value,
+      new_password: $("activation-password").value,
+    };
+    $("activation-credential").value = "";
+    $("activation-password").value = "";
+    $("activation-confirm").value = "";
+    const version = ++activationEpoch;
+    activationController?.abort(); activationController = new AbortController();
+    $("activate-account-submit").disabled = true;
+    $("activate-account-submit").textContent = "Setting password…";
+    message("activation-message", "");
+    try {
+      await request("/api/v1/auth/bootstrap-password", { method: "POST", body, signal: activationController.signal });
+      if (version !== activationEpoch) return;
+      const username = body.username;
+      resetActivation();
+      $("username").value = username;
+      message("sign-in-message", "Password set. Sign in with your new password.");
+      $("password").focus();
+    } catch (error) {
+      if (error.name === "AbortError" || version !== activationEpoch) return;
+      message("activation-message", error.status === 401
+        ? "The temporary code is invalid or expired. Ask your administrator for a new code."
+        : error.status === 422 ? "Use a new password of 12–256 characters, different from your temporary code. Enter the code and password again."
+          : apiMessage(error, "Password setup is unavailable. Enter your code again and retry."), true);
+    } finally {
+      body.temporary_credential = ""; body.new_password = "";
+      if (version === activationEpoch) {
+        $("activate-account-submit").disabled = false;
+        $("activate-account-submit").textContent = "Set password";
+      }
+    }
+  });
 
   $("sign-in-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -967,24 +1817,7 @@
       const result = await request("/api/v1/auth/login", { method: "POST", body: credentials });
       credentials.password = "";
       if (epoch !== state.sessionEpoch) return;
-      if (typeof result.session_token !== "string" || !result.account) throw new ApiError(503);
-      state.token = result.session_token;
-      const account = await request("/api/v1/auth/me");
-      if (epoch !== state.sessionEpoch) return;
-      state.account = account;
-      $("account-name").textContent = account.display_name || account.username;
-      $("account-role").textContent = account.role;
-      $("add-camera-button").hidden = account.role !== "administrator";
-      $("sign-in").hidden = true;
-      $("workspace").hidden = false;
-      state.sessionExpiresAt = Date.parse(result.expires_at);
-      state.sessionExpirySteady = Number.isInteger(result.expires_in_seconds) && result.expires_in_seconds > 0 && result.expires_in_seconds <= 86400
-        ? performance.now() + result.expires_in_seconds * 1000 : null;
-      scheduleSessionExpiry();
-      await Promise.all([refreshCameras(true), refreshDiagnostics()]);
-      if (epoch !== state.sessionEpoch) return;
-      setLastDay(); resetHistory();
-      scheduleCameraPoll();
+      await acceptSignInResult(result, epoch);
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
       state.token = "";
@@ -1000,11 +1833,85 @@
     }
   });
 
+  async function acceptSignInResult(result, epoch) {
+      if (result?.mfa_required === true) {
+        if (typeof result.challenge_token !== "string" || result.challenge_token.length > 512 || !Number.isInteger(result.expires_in_seconds) || result.expires_in_seconds < 1 || result.expires_in_seconds > 300) throw new ApiError(503);
+        mfaChallenge = result.challenge_token; mfaChallengeExpires = performance.now() + result.expires_in_seconds * 1000;
+        $("sign-in-form").hidden = true; $("activate-account-button").hidden = true;
+        $("mfa-sign-in-form").hidden = false; $("mfa-sign-in-code").focus();
+        return;
+      }
+      await acceptIssuedSession(result, epoch);
+  }
+
+  async function acceptIssuedSession(result, epoch) {
+      if (typeof result.session_token !== "string" || !result.account) throw new ApiError(503);
+      state.token = result.session_token;
+      const account = await request("/api/v1/auth/me");
+      if (epoch !== state.sessionEpoch) return;
+      state.account = { ...account, effective_permissions: [], authority_resolved: false };
+      state.capabilitiesResolved = false;
+      $("account-name").textContent = account.display_name || account.username;
+      $("account-role").textContent = account.role;
+      renderAccountControls();
+      state.historyRolling = true;
+      resetHistory();
+      setView("wall", false);
+      const navigationEpoch = state.navigationEpoch;
+      $("sign-in").hidden = true;
+      $("workspace").hidden = false;
+      state.sessionExpiresAt = Date.parse(result.expires_at);
+      state.sessionExpirySteady = Number.isInteger(result.expires_in_seconds) && result.expires_in_seconds > 0 && result.expires_in_seconds <= 86400
+        ? performance.now() + result.expires_in_seconds * 1000 : null;
+      scheduleSessionExpiry();
+      await Promise.all([refreshCameras(true), refreshDiagnostics()]);
+      if (epoch !== state.sessionEpoch) return;
+      if (navigationEpoch === state.navigationEpoch) setLastDay();
+      scheduleCameraPoll();
+  }
+
+  $("mfa-sign-in-cancel").addEventListener("click", () => {
+    state.sessionEpoch += 1; resetActivation(); $("password").focus();
+  });
+  $("mfa-sign-in-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!mfaChallenge || $("mfa-sign-in-submit").disabled) return;
+    if (performance.now() >= mfaChallengeExpires) { resetActivation(); message("sign-in-message", "The verification request expired. Sign in again.", true); return; }
+    const epoch = state.sessionEpoch;
+    const body = { challenge_token: mfaChallenge, code: $("mfa-sign-in-code").value.trim() };
+    $("mfa-sign-in-code").value = ""; $("mfa-sign-in-submit").disabled = true;
+    message("mfa-sign-in-message", "Verifying…");
+    try {
+      const result = await request("/api/v1/auth/mfa", { method: "POST", body });
+      if (epoch !== state.sessionEpoch) return;
+      resetMfaSignIn(); await acceptIssuedSession(result, epoch);
+    } catch (error) {
+      if (error.name === "AbortError" || epoch !== state.sessionEpoch) return;
+      state.token = "";
+      message("mfa-sign-in-message", error.status === 401 ? "The code was not accepted. Enter a current authenticator code or unused recovery code." : apiMessage(error, "Verification is unavailable. Try again or return to sign in."), true);
+    } finally {
+      body.code = ""; body.challenge_token = "";
+      if (epoch === state.sessionEpoch) $("mfa-sign-in-submit").disabled = false;
+    }
+  });
+
   $("sign-out-button").addEventListener("click", () => void signOut());
+  $("admin-tab").addEventListener("click", () => setView(allowed("users.manage") ? "admin" : "settings"));
+  $("admin-return-button").addEventListener("click", () => setView("wall"));
+  $("admin-settings-tab").addEventListener("click", () => { state.settingsSection = "storage"; setView("settings"); });
+  $("security-tab").addEventListener("click", () => { state.settingsSection = "security"; setView("settings"); });
+  $("settings-return-button").addEventListener("click", () => setView("wall"));
   $("refresh-cameras").addEventListener("click", () => void Promise.all([refreshCameras(true), refreshDiagnostics()]));
   $("camera-search").addEventListener("input", renderCameras);
+  $("wall-tab").addEventListener("click", () => setView("wall"));
   $("live-tab").addEventListener("click", () => setView("live"));
   $("history-tab").addEventListener("click", () => setView("history"));
+  $("toggle-recording").addEventListener("click", () => void toggleRecording());
+  $("recent-recordings").addEventListener("click", () => void showLatestRecording());
+  $("play-latest-recording").addEventListener("click", async () => {
+    const session = state.sessionEpoch, deviceId = state.selected;
+    if (await loadHistory() && session === state.sessionEpoch && deviceId === state.selected && state.view === "history") playLatestSpan();
+  });
   $("retry-live").addEventListener("click", () => { if (state.selected) void selectCamera(state.selected); });
   $("play-live").addEventListener("click", () => void $("live-video").play().catch(() => message("live-state", "Unable to play live video. Try reconnecting.")));
   $("live-video").addEventListener("playing", () => {
@@ -1036,7 +1943,9 @@
   $("history-form").addEventListener("submit", (event) => { event.preventDefault(); void loadHistory(); });
   $("history-start").addEventListener("input", () => { state.historyRolling = false; });
   $("history-end").addEventListener("input", () => { state.historyRolling = false; });
-  $("last-24-hours").addEventListener("click", () => { state.historyRolling = true; void loadHistory(); });
+  $("last-24-hours").addEventListener("click", () => rollingHistory(DAY));
+  $("history-last-hour").addEventListener("click", () => rollingHistory(3600000));
+  $("history-15-minutes").addEventListener("click", () => rollingHistory(900000));
   $("history-day").addEventListener("change", () => {
     const date = new Date(`${$("history-day").value}T00:00:00Z`);
     if (!Number.isFinite(date.getTime())) return;
@@ -1046,13 +1955,87 @@
     void loadHistory();
   });
   $("playback-form").addEventListener("submit", (event) => void playRecording(event));
-  $("playback-start").addEventListener("input", updateDownload);
+  $("clip-start").addEventListener("input", updateDownload);
   $("playback-duration").addEventListener("input", updateDownload);
-  $("playback-video").addEventListener("playing", () => message("playback-message", "Recorded video · Select a new start time to seek to another point."));
-  $("playback-video").addEventListener("error", () => { if (state.token && state.selectedSpan) message("playback-message", "Playback is unavailable. Refresh history or select another interval.", true); });
+  $("download-recording").addEventListener("click", (event) => void prepareExport(event));
+  $("playback-video").addEventListener("timeupdate", () => {
+    if (!Number.isFinite(state.playbackStart)) return;
+    const at = playbackUtc();
+    timeline?.setPlayhead(at);
+    playbackControls();
+    if (state.playbackEnd - at <= 45000) prefetchPlayback(state.playbackEpoch);
+  });
+  $("playback-video").addEventListener("ended", () => void advancePlayback());
+  $("playback-video").addEventListener("pause", playbackControls);
+  $("playback-toggle").addEventListener("click", () => {
+    const video = $("playback-video");
+    if (!video.paused && !video.ended) video.pause();
+    else if (video.ended) void advancePlayback();
+    else if (video.getAttribute("src")) void video.play().catch(() => message("playback-message", "Select play in the video controls to begin.", true));
+    else void playRecording({ preventDefault() {} });
+  });
+  $("playback-back").addEventListener("click", () => seekRecording(playbackUtc() - 10000));
+  $("playback-forward").addEventListener("click", () => seekRecording(playbackUtc() + 10000));
+  $("playback-previous").addEventListener("click", () => moveFootage(-1));
+  $("playback-next").addEventListener("click", () => moveFootage(1));
+  $("playback-speed").addEventListener("change", () => {
+    const rate = Number($("playback-speed").value);
+    if (![0.25, 0.5, 1, 2, 4].includes(rate)) return;
+    state.playbackRate = rate;
+    $("playback-video").playbackRate = rate;
+  });
+  $("clip-mark-in").addEventListener("click", () => {
+    const at = playbackUtc(), end = coverageEnd(at);
+    if (!Number.isFinite(at) || end === null || end - at < 1000) return;
+    $("clip-start").value = utcInput(new Date(at), true);
+    $("playback-duration").value = String(Math.max(1, Math.min(Number($("playback-duration").value) || 60, Math.floor((end - at) / 1000))));
+    updateDownload();
+  });
+  $("clip-mark-out").addEventListener("click", () => {
+    const at = playbackUtc(), start = parseUtc($("clip-start").value).getTime();
+    const duration = Math.floor((at - start) / 1000);
+    if (!Number.isFinite(duration) || duration < 1 || duration > 3600 || coverageEnd(start) === null || at > coverageEnd(start)) {
+      message("export-message", "Choose a clip end after its start, within one hour of contiguous recorded footage.", true);
+      return;
+    }
+    $("playback-duration").value = String(duration);
+    updateDownload();
+  });
+  $("playback-video").addEventListener("playing", () => {
+    playbackControls();
+    if (!state.token || state.view !== "history" || state.playbackStart === null) return;
+    message("playback-message", "Recorded video · Continuous across adjacent recordings. Gaps stop playback.");
+    prefetchPlayback(state.playbackEpoch);
+  });
+  $("playback-video").addEventListener("error", () => {
+    if (state.token && state.selectedSpan && state.playbackStart !== null) message("playback-message", "Playback is unavailable. Refresh history or select another interval.", true);
+  });
+  window.K5Playback = Object.freeze({ getUTC: playbackUtc, seekUTC: seekEventRecording });
 
   function canManageCameras() {
-    return state.account?.role === "administrator" && Boolean(state.token) && !state.signingOut;
+    return allowed("cameras.manage") && Boolean(state.token) && !state.signingOut;
+  }
+
+  function cameraSetupType() {
+    return $("camera-connection-type").value === "rtsp" ? "rtsp" : "onvif";
+  }
+
+  function renderCameraSetupType() {
+    const direct = cameraSetupType() === "rtsp", updating = state.dialogMode === "update";
+    $("camera-onvif-settings").hidden = direct;
+    $("camera-stream-settings").hidden = !direct;
+    $("camera-discovery-section").hidden = direct || updating;
+    $("camera-setup-description").textContent = direct
+      ? updating ? "Enter the replacement RTSP stream address for this camera. Reconnecting keeps its identity and recording history."
+        : "Connect a camera or video source directly using its RTSP stream address, with an optional camera account."
+      : updating ? "Sign in to this camera and test its available video streams. Reconnecting keeps its identity and recording history."
+        : "Find an ONVIF camera on your network, then sign in to the camera. K5 finds its available video streams for you.";
+    $("camera-account-help").textContent = direct
+      ? "Leave the account blank for a stream that does not require authentication. The stream address, username and password are cleared after testing."
+      : "Use the account configured on this camera. Its password is cleared after testing.";
+    $("camera-profile-help").textContent = direct
+      ? "This stream reports H.264 video for live viewing and continuous recording. K5 does not change the source settings."
+      : "Choose an H.264 stream for live video and continuous recording. K5 does not change camera settings.";
   }
 
   function clearCameraProbe() {
@@ -1096,18 +2079,24 @@
     $("camera-clock-status").hidden = false;
   }
 
+  function renderStreamClock() {
+    message("camera-clock-status", "RTSP does not provide a camera clock check. Recording history uses recorder UTC. Verify Windows time synchronization and the camera’s NTP settings.", true);
+    $("camera-clock-status").hidden = false;
+  }
+
   function setCameraSetupBusy(busy, action = "") {
     state.cameraSetupBusy = busy;
+    const direct = cameraSetupType() === "rtsp";
     $("add-camera-form").setAttribute("aria-busy", String(busy));
-    for (const id of [
-      "new-camera-name", "new-camera-host", "new-camera-port", "new-camera-secure",
-      "new-camera-username", "new-camera-password",
-    ]) $(id).disabled = busy;
-    $("find-cameras").disabled = busy || !canManageCameras() || state.dialogMode === "update";
+    for (const id of ["new-camera-name", "new-camera-username", "new-camera-password"]) $(id).disabled = busy;
+    for (const id of ["new-camera-host", "new-camera-port", "new-camera-secure"]) $(id).disabled = busy || direct;
+    $("new-camera-stream-uri").disabled = busy || !direct;
+    $("camera-connection-type").disabled = busy;
+    $("find-cameras").disabled = busy || direct || !canManageCameras() || state.dialogMode === "update";
     $("test-camera-connection").disabled = busy || !canManageCameras();
     $("camera-profile").disabled = busy || !state.cameraProbe;
     const selected = state.cameraProbe?.profiles.find((profile) => profile.id === $("camera-profile").value);
-    $("save-camera").disabled = busy || !canManageCameras() || !selected?.supported;
+    $("save-camera").disabled = busy || !canManageCameras() || !selected?.supported || state.cameraProbe?.kind !== cameraSetupType();
     $("find-cameras").textContent = action === "discovery" ? "Finding cameras…" : "Find cameras on this network";
     $("test-camera-connection").textContent = action === "profiles" ? "Testing camera…" : "Test connection";
     $("save-camera").textContent = action === "connect" ? "Connecting camera…" : state.dialogMode === "update" ? "Reconnect camera" : "Connect camera";
@@ -1120,12 +2109,14 @@
     state.cameraSetupController = null;
     clearCameraProbe();
     $("add-camera-form").reset();
+    state.cameraSetupTarget = null;
     $("new-camera-name").readOnly = false;
     $("new-camera-host").readOnly = false;
     $("discovered-cameras").replaceChildren();
     message("camera-discovery-message", "If Windows Firewall blocks discovery, enter the camera’s IP address below.");
     message("add-camera-message", "");
     state.dialogMode = "add";
+    renderCameraSetupType();
     setCameraSetupBusy(false);
   }
 
@@ -1155,14 +2146,42 @@
       camera_probe_expired: "The connection test expired. Enter the camera password and test again.",
       camera_profile_unsupported: "Choose an H.264 stream. Other video formats are not supported yet.",
     };
+    if (cameraSetupType() === "rtsp") {
+      Object.assign(messages, {
+        camera_auth_failed: "Stream authentication failed. Check the camera username and password, then test again.",
+        camera_unreachable: "The stream could not be reached. Check the camera address, stream port and path, and confirm RTSP is enabled.",
+        camera_unsupported: "The stream does not report supported H.264 video. Choose an H.264 stream and test again.",
+        camera_invalid_response: "The source did not return a usable RTSP stream. Check its address and stream settings.",
+        camera_probe_expired: "The connection test expired. Enter the stream address and account, then test again.",
+      });
+      messages.stream_invalid = "Enter an rtsp:// or rtsps:// stream address with the camera’s numeric IP address and stream path. Use either the URL account or the separate account fields.";
+      for (const name of ["auth_failed", "unsupported", "unreachable", "invalid_response"]) {
+        messages[`stream_${name}`] = messages[`camera_${name}`];
+      }
+    }
     return messages[error.code] || (error.status === 410
       ? messages.camera_probe_expired
       : error.status === 409 ? "This camera is already configured. Select it in the camera list to reconnect."
-        : error.status === 422 ? "Check the camera’s IP address, camera settings port and account, then test again."
+        : error.status === 422 ? cameraSetupType() === "rtsp"
+          ? "Check the RTSP address, numeric camera IP, stream port and account, then test again. Reconnecting uses the same camera IP address."
+          : "Check the camera’s IP address, camera settings port and account, then test again."
           : apiMessage(error, "The camera connection did not complete. Check the camera settings and try again."));
   }
 
   function cameraConnection() {
+    if (cameraSetupType() === "rtsp") {
+      const source_uri = $("new-camera-stream-uri").value.trim();
+      try {
+        const parsed = new URL(source_uri);
+        if (!source_uri || source_uri.length > 4096 || /[\s\\]/.test(source_uri) ||
+          !["rtsp:", "rtsps:"].includes(parsed.protocol) || !parsed.hostname || parsed.hash) throw new SelectionError();
+      } catch {
+        message("add-camera-message", "Enter an rtsp:// or rtsps:// stream address with the camera’s numeric IP address and stream path.", true);
+        $("new-camera-stream-uri").focus();
+        return null;
+      }
+      return { source_uri, username: $("new-camera-username").value, password: $("new-camera-password").value };
+    }
     const host = $("new-camera-host").value.trim();
     if (!host || /[\s/?#@\\]/.test(host) || host.includes("://")) {
       message("add-camera-message", "Enter the camera’s numeric IP address, without a web or video address.", true);
@@ -1185,13 +2204,12 @@
     if (mode === "update") stopPersonView();
     resetCameraSetup();
     state.dialogMode = mode;
+    state.cameraSetupTarget = camera?.device_id || null;
+    $("camera-connection-type").value = camera?.connection_type === "rtsp" ? "rtsp" : "onvif";
     $("new-camera-name").readOnly = mode === "update";
     $("new-camera-host").readOnly = mode === "update";
     $("add-camera-title").textContent = mode === "update" ? "Reconnect camera" : "Add a camera";
-    $("camera-setup-description").textContent = mode === "update"
-      ? "Sign in to this camera and test its available video streams. Reconnecting keeps its identity and recording history."
-      : "Find an ONVIF camera on your network, then sign in to the camera. K5 finds its available video streams for you.";
-    $("camera-discovery-section").hidden = mode === "update";
+    renderCameraSetupType();
     if (camera) {
       $("new-camera-name").value = camera.name;
       $("new-camera-host").value = camera.host;
@@ -1200,7 +2218,7 @@
     }
     setCameraSetupBusy(false);
     $("add-camera-dialog").showModal();
-    $(mode === "update" ? "new-camera-username" : "find-cameras").focus();
+    $(cameraSetupType() === "rtsp" ? "new-camera-stream-uri" : mode === "update" ? "new-camera-username" : "find-cameras").focus();
   }
   $("add-camera-button").addEventListener("click", () => openCameraSetup("add"));
   $("update-source-button").addEventListener("click", () => openCameraSetup("update"));
@@ -1213,10 +2231,20 @@
   $("add-camera-dialog").addEventListener("close", () => {
     if ($("add-camera-dialog").open) return;
     $("new-camera-password").value = "";
+    $("new-camera-username").value = "";
+    $("new-camera-stream-uri").value = "";
   });
   for (const id of [
-    "new-camera-name", "new-camera-host", "new-camera-port", "new-camera-username", "new-camera-password",
+    "new-camera-name", "new-camera-host", "new-camera-port", "new-camera-username", "new-camera-password", "new-camera-stream-uri",
   ]) $(id).addEventListener("input", cameraSetupChanged);
+  $("camera-connection-type").addEventListener("change", () => {
+    cameraSetupChanged();
+    $("new-camera-stream-uri").value = "";
+    $("new-camera-username").value = "";
+    $("new-camera-password").value = "";
+    renderCameraSetupType();
+    setCameraSetupBusy(false);
+  });
   $("new-camera-secure").addEventListener("change", () => {
     if ($("new-camera-secure").checked && $("new-camera-port").value === "80") $("new-camera-port").value = "443";
     else if (!$("new-camera-secure").checked && $("new-camera-port").value === "443") $("new-camera-port").value = "80";
@@ -1279,20 +2307,22 @@
     if (!canManageCameras() || state.cameraSetupBusy) return;
     const credentials = cameraConnection();
     if (!credentials) return;
+    const kind = cameraSetupType(), direct = kind === "rtsp";
     clearCameraProbe();
     const epoch = state.sessionEpoch, setupEpoch = state.cameraSetupEpoch;
     const controller = new AbortController();
     state.cameraSetupController = controller;
     setCameraSetupBusy(true, "profiles");
-    message("add-camera-message", "Signing in to the camera and reading its video streams…");
+    message("add-camera-message", direct ? "Checking the RTSP stream and its video format…" : "Signing in to the camera and reading its video streams…");
     try {
-      const tested = await request("/api/v1/operator/camera-profiles", {
+      const tested = await request(direct ? "/api/v1/operator/camera-stream-probe" : "/api/v1/operator/camera-profiles", {
         method: "POST", body: credentials, signal: controller.signal,
       });
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       if (typeof tested.probe_id !== "string" || !tested.probe_id || tested.probe_id.length > 256 || tested.probe_id.includes("://") ||
         !Array.isArray(tested.profiles) || tested.profiles.length > 64) throw new SelectionError();
-      renderCameraClock(tested.clock);
+      if (direct) renderStreamClock();
+      else renderCameraClock(tested.clock);
       const profiles = tested.profiles.filter((profile) =>
         typeof profile.id === "string" && profile.id && profile.id.length <= 256 && !profile.id.includes("://") &&
         ["H264", "H265", "MJPEG", "UNKNOWN"].includes(profile.codec)
@@ -1315,10 +2345,12 @@
       }
       $("camera-profile-section").hidden = false;
       if (!first) {
-        message("add-camera-message", "The camera account was accepted, but no H.264 stream is available. Enable H.264 in the camera settings, then test again.", true);
+        message("add-camera-message", direct
+          ? "The stream does not report supported H.264 video. Choose an H.264 stream and test again."
+          : "The camera account was accepted, but no H.264 stream is available. Enable H.264 in the camera settings, then test again.", true);
         return;
       }
-      state.cameraProbe = { id: tested.probe_id, profiles };
+      state.cameraProbe = { id: tested.probe_id, profiles, kind };
       $("camera-profile").value = first.id;
       const lifetime = Number.isInteger(tested.expires_in_seconds) && tested.expires_in_seconds > 0
         ? Math.min(tested.expires_in_seconds, 120) : 120;
@@ -1328,18 +2360,31 @@
         state.cameraSetupController?.abort();
         state.cameraSetupController = null;
         clearCameraProbe();
-        message("add-camera-message", "The connection test expired. Enter the camera password and test again.", true);
+        message("add-camera-message", direct
+          ? "The connection test expired. Enter the stream address and account, then test again."
+          : "The connection test expired. Enter the camera password and test again.", true);
         setCameraSetupBusy(false);
       }, lifetime * 1000);
-      message("add-camera-message", "Camera account accepted. Choose an H.264 stream; video is checked after connecting.");
+      message("add-camera-message", direct
+        ? "RTSP stream reports H.264 video. Connect to start live viewing and recording; video is confirmed after connecting."
+        : "Camera account accepted. Choose an H.264 stream; video is checked after connecting.");
     } catch (error) {
       if (controller.signal.aborted || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
-      renderCameraClock(error.clock);
+      if (direct) renderStreamClock();
+      else renderCameraClock(error.clock);
       message("add-camera-message", cameraSetupError(error), true);
     } finally {
       credentials.password = "";
+      if (direct) {
+        credentials.source_uri = "";
+        credentials.username = "";
+      }
       if (epoch === state.sessionEpoch && setupEpoch === state.cameraSetupEpoch) {
         $("new-camera-password").value = "";
+        if (direct) {
+          $("new-camera-stream-uri").value = "";
+          $("new-camera-username").value = "";
+        }
         state.cameraSetupController = null;
         setCameraSetupBusy(false);
         if (state.cameraProbe) $("camera-profile").focus();
@@ -1353,29 +2398,33 @@
     const epoch = state.sessionEpoch;
     const setupEpoch = state.cameraSetupEpoch;
     const updating = state.dialogMode === "update";
+    const direct = state.cameraProbe.kind === "rtsp";
     const profile = state.cameraProbe.profiles.find((item) => item.id === $("camera-profile").value && item.supported);
     if (!profile) return;
     const camera = {
       name: $("new-camera-name").value.trim(), probe_id: state.cameraProbe.id, profile_id: profile.id,
+      ...(direct && updating ? { device_id: state.cameraSetupTarget } : {}),
     };
     const controller = new AbortController();
     state.cameraSetupController = controller;
     setCameraSetupBusy(true, "connect");
     message("add-camera-message", updating ? "Reconnecting live video and recording…" : "Connecting your camera…");
     try {
-      const created = await request("/api/v1/operator/cameras/connect", {
+      const created = await request(direct ? "/api/v1/operator/cameras/stream-connect" : "/api/v1/operator/cameras/connect", {
         method: "POST", body: camera, signal: controller.signal,
       });
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       closeAddCamera();
       const completedEpoch = state.cameraSetupEpoch;
+      const navigationEpoch = state.navigationEpoch;
       const deviceId = created.device_id || created.camera?.device_id;
       const cameraStatus = created.camera || created;
       state.cameraConnectionNotice = deviceId || null;
       const connection = cameraConnectionStatus(cameraStatus, state.workerStatus);
       notice(connection.text, connection.error, "camera_connection");
       await refreshCameras();
-      if (deviceId && completedEpoch === state.cameraSetupEpoch) await selectCamera(deviceId);
+      if (deviceId && epoch === state.sessionEpoch && completedEpoch === state.cameraSetupEpoch &&
+        navigationEpoch === state.navigationEpoch) await selectCamera(deviceId);
     } catch (error) {
       if (controller.signal.aborted || epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       if (error.status === 410 || error.code === "camera_probe_expired") clearCameraProbe();
@@ -1400,7 +2449,7 @@
 
   $("remove-camera-button").addEventListener("click", () => {
     const camera = currentCamera();
-    if (!camera || state.account?.role !== "administrator") return;
+    if (!camera || !canManageCameras()) return;
     state.removeTarget = { device_id: camera.device_id, name: camera.name, host: camera.host };
     $("remove-camera-name").textContent = `${camera.name} · ${camera.host}`;
     message("remove-camera-message", "");
@@ -1414,7 +2463,7 @@
   $("remove-camera-dialog").addEventListener("close", () => { state.removeTarget = null; });
   $("remove-camera-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (state.removing || !state.removeTarget || state.account?.role !== "administrator") return;
+    if (state.removing || !state.removeTarget || !canManageCameras()) return;
     const target = state.removeTarget;
     const epoch = state.sessionEpoch;
     setRemovalBusy(true);
@@ -1454,7 +2503,42 @@
     $(id).addEventListener("click", () => $("connection-help-dialog").close());
   }
 
-  window.addEventListener("pagehide", () => { stopLive(); stopPlayback(); });
+  $("sso-sign-in-button").addEventListener("click", async () => {
+    if (state.token) return;
+    const epoch = ++state.sessionEpoch; resetActivation(); $("sso-sign-in-button").disabled = true;
+    message("sso-sign-in-message", "Opening organization sign-in…");
+    try {
+      const result = await request("/api/v1/auth/oidc/start", { method: "POST", body: {} });
+      if (epoch !== state.sessionEpoch) return;
+      if (typeof result?.authorization_url !== "string" || result.authorization_url.length > 8192) throw new ApiError(503);
+      const destination = new URL(result.authorization_url);
+      const local = destination.hostname === "127.0.0.1" || destination.hostname === "[::1]";
+      if (destination.username || destination.password || !(destination.protocol === "https:" || (destination.protocol === "http:" && local))) throw new ApiError(503);
+      window.location.assign(destination.href);
+    } catch (error) {
+      if (error.name !== "AbortError" && epoch === state.sessionEpoch) message("sso-sign-in-message", "Organization sign-in could not start. Use your local account or ask an administrator to check the identity provider.", true);
+    } finally { if (epoch === state.sessionEpoch) $("sso-sign-in-button").disabled = false; }
+  });
+  async function initializeOrganizationSignIn() {
+    const landing = new URL(window.location.href), code = landing.searchParams.get("sso_code");
+    if (code !== null) {
+      landing.searchParams.delete("sso_code"); window.history.replaceState(null, "", landing.pathname + landing.search + landing.hash);
+      if (!/^[A-Za-z0-9_-]{16,512}$/.test(code)) { message("sign-in-message", "Organization sign-in could not be completed. Try signing in again.", true); return; }
+      const epoch = ++state.sessionEpoch, body = { code };
+      $("sign-in-button").disabled = true; message("sign-in-message", "Completing organization sign-in…");
+      try { const result = await request("/api/v1/auth/oidc/complete", { method: "POST", body }); if (epoch === state.sessionEpoch) await acceptSignInResult(result, epoch); }
+      catch (error) { if (error.name !== "AbortError" && epoch === state.sessionEpoch) { state.token = ""; message("sign-in-message", "Organization sign-in was not accepted. Your identity must be linked to an enabled K5 account. Try again or use local sign-in.", true); } }
+      finally { body.code = ""; if (epoch === state.sessionEpoch) $("sign-in-button").disabled = false; }
+      return;
+    }
+    try { const d = await request("/api/v1/auth/oidc"); if (!state.token && d?.available === true) { $("sso-sign-in").hidden = false; $("sso-sign-in-button").textContent = typeof d.display_name === "string" && d.display_name.length <= 128 ? `Sign in with ${d.display_name}` : "Sign in with your organization"; } }
+    catch (_) { /* Local sign-in stays available when organization sign-in is unconfigured. */ }
+  }
+  void initializeOrganizationSignIn();
+
+  window.addEventListener("pagehide", () => { administration?.hide(); settings?.hide(); cameraAnalytics?.clear(); cancelExport(); resetActivation(); wall?.hide(); stopLive(); stopPlayback(); });
+  window.addEventListener("resize", fitCameraWall);
+  $("recorder-overview").addEventListener("toggle", fitCameraWall);
   setLastDay();
   resetHistory();
 })();

@@ -32,6 +32,7 @@ import asyncio
 import base64
 import hashlib
 import http.client
+import io
 import ipaddress
 import math
 import re
@@ -55,6 +56,7 @@ _MEDIA = "http://www.onvif.org/ver10/media/wsdl"
 _MEDIA2 = "http://www.onvif.org/ver20/media/wsdl"
 _SOAP = "http://www.w3.org/2003/05/soap-envelope"
 _WSD = "http://schemas.xmlsoap.org/ws/2005/04/discovery"
+_NETWORK = "http://www.onvif.org/ver10/network/wsdl"
 _WSA = "http://schemas.xmlsoap.org/ws/2004/08/addressing"
 _MAX_RESPONSE = 1024 * 1024
 _CLOCK_READ_SECONDS = 2.0
@@ -785,11 +787,71 @@ def _probe_profiles(client: _Client, base: str, host: str, username: str, passwo
     return tuple(replace(profile, clock=client.clock) for profile in results)
 
 
+def _xml_with_namespace_contexts(body: bytes) -> tuple[ET.Element, dict[int, dict[str, str]]]:
+    """Parse bounded XML once and retain each element's in-scope namespace bindings."""
+    if len(body) > _MAX_RESPONSE or b"\x00" in body:
+        raise OnvifError("invalid_response")
+    text = body.decode("utf-8-sig")
+    if re.search(r"<!\s*(?:DOCTYPE|ENTITY)", text, flags=re.IGNORECASE):
+        raise OnvifError("invalid_response")
+    contexts: dict[int, dict[str, str]] = {}
+    current: dict[str, str] = {}
+    stack: list[dict[str, str]] = []
+    pending: dict[str, str] = {}
+    root: ET.Element | None = None
+    depth, count = -1, 0
+    for event, value in ET.iterparse(io.BytesIO(body), events=("start-ns", "start", "end")):
+        if event == "start-ns":
+            prefix, uri = value
+            pending[prefix or ""] = uri
+        elif event == "start":
+            depth += 1
+            count += 1
+            if count > 8192 or depth > 48:
+                raise OnvifError("invalid_response")
+            stack.append(current)
+            current = current.copy()
+            current.update(pending)
+            pending.clear()
+            contexts[id(value)] = current.copy()
+            if root is None:
+                root = value
+        else:
+            depth -= 1
+            current = stack.pop()
+    if root is None:
+        raise OnvifError("invalid_response")
+    return root, contexts
+
+
+def _is_onvif_video_transmitter(
+    match: ET.Element, namespace_contexts: dict[int, dict[str, str]]
+) -> bool:
+    # WS-Discovery is shared by printers, scanners and other non-camera devices.
+    # Admit only the ONVIF NetworkVideoTransmitter QName, not a matching label.
+    types = next((child for child in match if _local(child) == "Types"), None)
+    if types is None:
+        return False
+    namespaces = namespace_contexts.get(id(types), {})
+    for qname in (types.text or "").split():
+        if ":" in qname:
+            prefix, local_name = qname.split(":", 1)
+            namespace = namespaces.get(prefix)
+        else:
+            local_name, namespace = qname, namespaces.get("")
+        if local_name == "NetworkVideoTransmitter" and namespace == _NETWORK:
+            return True
+    return False
+
+
 def _discovery_candidates(body: bytes, sender: str) -> list[dict]:
-    root = _xml(body)
+    root, namespace_contexts = _xml_with_namespace_contexts(body)
+    matches = [item for item in root.iter() if _local(item) == "ProbeMatch"]
+    if not matches:
+        return []
     candidates = []
-    for match in root.iter():
-        if _local(match) != "ProbeMatch":
+    for match in matches:
+        if not _is_onvif_video_transmitter(match, namespace_contexts):
             continue
         name = ""
         for scope in _text(match, "Scopes").split():
@@ -828,11 +890,13 @@ def _discover(interface: str | None, budget: float, interface_provider=None) -> 
     if any(":" in address for address in interfaces):
         raise OnvifError("unsupported")
     probe = (
-        f'<s:Envelope xmlns:s="{_SOAP}" xmlns:a="{_WSA}" xmlns:d="{_WSD}">'
+        f'<s:Envelope xmlns:s="{_SOAP}" xmlns:a="{_WSA}" xmlns:d="{_WSD}" '
+        f'xmlns:dn="{_NETWORK}">'
         f"<s:Header><a:Action>{_WSD}/Probe</a:Action>"
         f"<a:MessageID>{uuid4().urn}</a:MessageID>"
         "<a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To></s:Header>"
-        "<s:Body><d:Probe><d:Types/><d:Scopes/></d:Probe></s:Body></s:Envelope>"
+        "<s:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types>"
+        "<d:Scopes/></d:Probe></s:Body></s:Envelope>"
     ).encode()
     deadline = time.monotonic() + budget
     results, seen = [], set()

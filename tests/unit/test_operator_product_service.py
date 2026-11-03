@@ -6,6 +6,7 @@ import json
 import os
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from k5vision.operator_product_service import (
     admit_native_executable,
 )
 from k5vision.operator_profile_lock import OperatorProfileLock, OperatorProfileLockError
+from k5vision.operator_role_policy import PERMISSIONS
 from k5vision.operator_time import HostClockObserver
 
 
@@ -52,12 +54,22 @@ class _Provider:
     async def info(self):
         return None
 
+    async def aclose(self):
+        return None
+
 
 class _Storage:
     allowed = True
 
-    def __init__(self, _root, *, max_bytes):
+    def __init__(self, _root, *, max_bytes, min_free_bytes=1024**3, retention_seconds=86400):
         self.max_bytes = max_bytes
+        self.min_free_bytes = min_free_bytes
+        self.retention_seconds = retention_seconds
+
+    def configure_policy(self, *, max_bytes, min_free_bytes, retention_seconds):
+        self.max_bytes = max_bytes
+        self.min_free_bytes = min_free_bytes
+        self.retention_seconds = retention_seconds
 
     def inspect(self):
         return SimpleNamespace(
@@ -88,6 +100,18 @@ def native(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "MediaMTXProvider", lambda **_kwargs: _Provider())
     monkeypatch.setattr(module, "generate_operator_gateway_configuration", lambda **_kwargs: "{}")
     monkeypatch.setattr(storage_module, "RecordingStorage", _Storage)
+    # This native-process harness uses a synthetic site and no user database.
+    # Real storage-policy tests exercise the durable component anchor separately.
+    import k5vision.operator_storage_settings as settings_module
+
+    class SyntheticIdentityAnchor:
+        def __init__(self, *_args, **_options):
+            pass
+
+        def seal(self):
+            pass
+
+    monkeypatch.setattr(settings_module, "ComponentStateAnchor", SyntheticIdentityAnchor)
     monkeypatch.setattr(_Storage, "allowed", True)
     processes = []
 
@@ -210,7 +234,6 @@ def test_stop_closes_each_active_writer_before_workers_without_rewriting_saved_c
         def stop_gateway():
             assert len(mutations) == 2
             assert all(not path["record"] for path in media.paths.values())
-            assert media.stopped == 0
             original_stop()
 
         monkeypatch.setattr(gateway, "stop", stop_gateway)
@@ -224,6 +247,113 @@ def test_stop_closes_each_active_writer_before_workers_without_rewriting_saved_c
         assert media.stopped == gateway.stopped == 1
 
     asyncio.run(scenario())
+
+
+def test_stop_joins_both_native_workers_in_parallel_after_recording_flush(native, monkeypatch):
+    mutations = _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        await service.start((_source(1), _source(2)))
+        media, gateway = service._media, service._gateway
+        barrier = threading.Barrier(2)
+
+        def checked_stop(process):
+            original = process.stop
+
+            def stop():
+                assert len(mutations) == 2
+                assert all(not path["record"] for path in media.paths.values())
+                # A serial stop would strand the first worker at this barrier.
+                barrier.wait(timeout=6)
+                original()
+
+            return stop
+
+        monkeypatch.setattr(gateway, "stop", checked_stop(gateway))
+        monkeypatch.setattr(media, "stop", checked_stop(media))
+        await service.stop()
+        assert media.stopped == gateway.stopped == 1
+
+    asyncio.run(scenario())
+
+
+def test_live_storage_policy_updates_existing_manager_and_recorder_paths(native, monkeypatch):
+    _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        await service.start((_source(1), _source(2)))
+        manager = service._storage
+        try:
+            monkeypatch.setattr(_Storage, "allowed", False)
+            changed = await service.configure_storage(
+                expected_revision=0,
+                quota_bytes=30 * 1024**3,
+                minimum_free_bytes=2 * 1024**3,
+                retention_seconds=3 * 86400,
+            )
+            assert service._storage is manager
+            assert manager.max_bytes == 30 * 1024**3
+            assert manager.min_free_bytes == 2 * 1024**3
+            assert manager.retention_seconds == 3 * 86400
+            assert changed["inspection_available"] and not changed["recording_allowed"]
+            assert all(not path["record"] for path in service._media.paths.values())
+            assert service.status() == "disk_full"
+            monkeypatch.setattr(_Storage, "allowed", True)
+            changed = await service.configure_storage(expected_revision=1, retention_seconds=0)
+            assert service._storage is manager
+            assert changed["recording_allowed"]
+            assert all(path["record"] for path in service._media.paths.values())
+            assert service.status() == "ready"
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_storage_change_and_stop_join_inflight_deletion(native, monkeypatch):
+    _fake_mutations(native, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+
+    async def scenario():
+        service = native.service
+        await service.start((_source(1),))
+        service._task.cancel()
+        try:
+            await service._task
+        except asyncio.CancelledError:
+            pass
+        service._task = None
+        manager = service._storage
+        original_prune = manager.prune
+
+        def held_prune():
+            entered.set()
+            assert release.wait(timeout=5)
+            return original_prune()
+
+        monkeypatch.setattr(manager, "prune", held_prune)
+        update = asyncio.create_task(
+            service.configure_storage(expected_revision=0, retention_seconds=0)
+        )
+        assert await asyncio.to_thread(entered.wait, 3)
+        update.cancel()
+        cleanup = asyncio.create_task(service.stop())
+        await asyncio.sleep(0.05)
+        assert not update.done() and not cleanup.done()
+        assert service._media.poll() is None
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await update
+        await cleanup
+        assert not service._storage_operations
+        assert service._media is None
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
 
 
 def test_stop_skips_flush_when_media_has_already_exited(native, monkeypatch):
@@ -286,6 +416,33 @@ def test_cancelled_stop_joins_flush_before_cleanup_or_return(native, monkeypatch
             assert media.stopped == gateway.stopped == 0
         finally:
             release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+        assert media.stopped == gateway.stopped == 1
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_stop_joins_provider_before_authenticated_worker_is_released(native, monkeypatch):
+    async def scenario():
+        service = native.service
+        await service.start(())
+        media, gateway = service._media, service._gateway
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def close_provider():
+            entered.set()
+            await release.wait()
+            assert media.stopped == gateway.stopped == 0
+
+        monkeypatch.setattr(service.provider, "aclose", close_provider)
+        cleanup = asyncio.create_task(service.stop())
+        await entered.wait()
+        cleanup.cancel()
+        await asyncio.sleep(0)
+        assert not cleanup.done()
+        assert media.stopped == gateway.stopped == 0
+        release.set()
         with pytest.raises(asyncio.CancelledError):
             await cleanup
         assert media.stopped == gateway.stopped == 1
@@ -555,6 +712,205 @@ def test_partial_disk_pause_retries_until_every_camera_stops_recording(native, m
     asyncio.run(scenario())
 
 
+def test_recording_preference_patches_only_writer_and_survives_worker_restart(native, monkeypatch):
+    mutations = _fake_mutations(native, monkeypatch)
+    _fast_maintenance(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first, second = _source(1), _source(2)
+        try:
+            await service.start((first, second))
+            media, gateway = service._media, service._gateway
+            original = json.loads(service._media_file.read_text())
+            paused = replace(first, recording_enabled=False)
+            await service.apply_recording_preferences((paused, second))
+            assert mutations == [("PATCH", f"/v3/config/paths/patch/{first.binding.path_name}")]
+            assert (service._media, service._gateway) == (media, gateway)
+            assert media.paths[first.binding.path_name] == {
+                **original["paths"][first.binding.path_name],
+                "record": False,
+            }
+            assert (
+                media.paths[second.binding.path_name] == original["paths"][second.binding.path_name]
+            )
+            assert service._sources == (paused, second)
+            generation = service.media_generation
+            media.returncode = 19
+            await _until(
+                lambda: service.media_generation > generation and service.status() == "ready"
+            )
+            assert service._media.paths[first.binding.path_name]["record"] is False
+            assert service._media.paths[second.binding.path_name]["record"] is True
+            await service.apply_recording_preferences((first, second))
+            assert service._media.paths[first.binding.path_name]["record"] is True
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_storage_recovery_never_resumes_an_operator_paused_camera(native, monkeypatch):
+    _fast_maintenance(native, monkeypatch)
+    _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first, second = replace(_source(1), recording_enabled=False), _source(2)
+        try:
+            await service.start((first, second))
+            _Storage.allowed = False
+            await _until(lambda: service.status() == "disk_full")
+            assert all(not value["record"] for value in service._media.paths.values())
+            _Storage.allowed = True
+            await _until(lambda: service.status() == "ready")
+            assert service._media.paths[first.binding.path_name]["record"] is False
+            assert service._media.paths[second.binding.path_name]["record"] is True
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("initially_allowed", [True, False])
+def test_storage_policy_is_not_acknowledged_until_all_writer_patches_finish(
+    native, monkeypatch, initially_allowed
+):
+    _fast_maintenance(native, monkeypatch)
+    _fake_mutations(native, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    _Storage.allowed = initially_allowed
+
+    async def scenario():
+        service = native.service
+        first, second = replace(_source(1), recording_enabled=False), _source(2)
+        try:
+            await service.start((first, second))
+            mutation = service._mutation
+            blocked = False
+
+            def held_patch(*args, **kwargs):
+                nonlocal blocked
+                if not blocked:
+                    blocked = True
+                    entered.set()
+                    assert release.wait(3)
+                mutation(*args, **kwargs)
+
+            monkeypatch.setattr(service, "_mutation", held_patch)
+            _Storage.allowed = not initially_allowed
+            await _until(entered.is_set)
+            # The storage sample has changed, but a native writer still has
+            # the previous policy. Neither ready nor disk_full is an ack yet.
+            assert service.status() == "unavailable"
+            assert service._needs_reconcile is True
+            release.set()
+            expected = "disk_full" if initially_allowed else "ready"
+            await _until(lambda: service.status() == expected)
+            assert service._needs_reconcile is False
+            assert service._media.paths[first.binding.path_name]["record"] is False
+            assert service._media.paths[second.binding.path_name]["record"] is (
+                not initially_allowed
+            )
+            assert json.loads(service._media_file.read_text())["paths"] == service._media.paths
+        finally:
+            release.set()
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["ambiguous_patch", "configuration_write"])
+def test_failed_recording_preference_compensates_old_writer_and_saved_configuration(
+    native, monkeypatch, failure
+):
+    _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first, second = _source(1), _source(2)
+        try:
+            await service.start((first, second))
+            original = service._media_file.read_bytes()
+            original_operation = (
+                service._mutation if failure == "ambiguous_patch" else service._write_media
+            )
+            failed = False
+
+            def operation(*args, **kwargs):
+                nonlocal failed
+                result = original_operation(*args, **kwargs)
+                if not failed:
+                    failed = True
+                    raise RuntimeError("private worker diagnostics")
+                return result
+
+            monkeypatch.setattr(
+                service, "_mutation" if failure == "ambiguous_patch" else "_write_media", operation
+            )
+            with pytest.raises(OperatorProductError) as error:
+                await service.apply_recording_preferences(
+                    (replace(first, recording_enabled=False), second)
+                )
+            assert "private" not in str(error.value)
+            assert service._sources == (first, second)
+            assert all(value["record"] for value in service._media.paths.values())
+            assert service._media_file.read_bytes() == original
+            assert service.status() == "ready"
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_recording_preference_joins_late_patch_and_restores_previous_intent(
+    native, monkeypatch
+):
+    _fake_mutations(native, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+
+    async def scenario():
+        service = native.service
+        first = _source(1)
+        try:
+            await service.start((first,))
+            mutation = service._mutation
+            first_call = True
+
+            def held_patch(*args, **kwargs):
+                nonlocal first_call
+                if first_call:
+                    first_call = False
+                    entered.set()
+                    assert release.wait(3)
+                mutation(*args, **kwargs)
+
+            monkeypatch.setattr(service, "_mutation", held_patch)
+            change = asyncio.create_task(
+                service.apply_recording_preferences((replace(first, recording_enabled=False),))
+            )
+            await _until(entered.is_set)
+            change.cancel()
+            await asyncio.sleep(0.02)
+            assert not change.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await change
+            assert service._sources == (first,)
+            assert service._media.paths[first.binding.path_name]["record"] is True
+            assert (
+                json.loads(service._media_file.read_text())["paths"][first.binding.path_name][
+                    "record"
+                ]
+                is True
+            )
+        finally:
+            release.set()
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
 def test_stop_attempts_media_cleanup_when_gateway_cleanup_fails(native):
     async def scenario():
         service = native.service
@@ -678,8 +1034,8 @@ def _product_application(
     class Cameras:
         closed = False
 
-        def __init__(self, *_args, **_kwargs):
-            pass
+        def __init__(self, root, *_args, **_kwargs):
+            self._root = root
 
         def list_sources(self):
             return ()
@@ -737,7 +1093,23 @@ def test_product_lifespan_uses_existing_human_identity_and_closes_its_camera_sto
             headers={"Authorization": "Bearer " + login.json()["session_token"]},
         )
         assert result.status_code == 200
-        assert result.json() == {"cameras": [], "worker_status": "ready"}
+        assert result.json() == {
+            "cameras": [],
+            "worker_status": "ready",
+            "capabilities": {
+                "account": {
+                    **login.json()["account"],
+                    "role_profile_id": None,
+                    "effective_permissions": sorted(PERMISSIONS),
+                },
+                "effective_permissions": sorted(PERMISSIONS),
+                "can_view_history": True,
+                "can_export": True,
+                "can_manage_cameras": True,
+                "can_manage_users": True,
+                "camera_access": {"mode": "all", "camera_ids": []},
+            },
+        }
     assert calls == [("start", ()), ("stop", ())]
     assert app.state.operator_camera_store.closed
     _assert_profile_lease_available(tmp_path / "identity")
@@ -775,7 +1147,7 @@ def test_rejected_optional_person_configuration_does_not_prevent_recording_start
     def refuse(_environment):
         raise person_module.OperatorPersonConfigurationError("Person configuration was refused.")
 
-    monkeypatch.setattr(person_module, "load_person_configuration", refuse)
+    monkeypatch.setattr(person_module, "load_installed_person_configuration", refuse)
     app, calls = _product_application(native, tmp_path, monkeypatch)
     with TestClient(app) as client:
         assert client.get("/api/v1/health").status_code == 200
@@ -800,7 +1172,10 @@ def test_configured_person_broker_closes_even_when_recording_startup_fails(
         async def aclose(self):
             closed.append(True)
 
-    monkeypatch.setattr(person_module, "load_person_configuration", lambda _environment: object())
+    monkeypatch.setattr(
+        person_module, "load_installed_person_configuration", lambda _environment: object()
+    )
+    monkeypatch.setenv(person_module.PERSON_CONFIG_ENV, "explicit-engineering-test-configuration")
     monkeypatch.setattr(broker_module, "OperatorAnalyticsBroker", Broker)
     app, calls = _product_application(native, tmp_path, monkeypatch, fail_start=True)
     with pytest.raises(OperatorProductError, match="startup"):
@@ -835,7 +1210,23 @@ def test_second_product_application_cannot_start_workers_for_an_active_identity(
         assert not first.state.operator_camera_store.closed
         response = client.get("/api/v1/operator/cameras", headers=headers)
         assert response.status_code == 200
-        assert response.json() == {"cameras": [], "worker_status": "ready"}
+        assert response.json() == {
+            "cameras": [],
+            "worker_status": "ready",
+            "capabilities": {
+                "account": {
+                    **login.json()["account"],
+                    "role_profile_id": None,
+                    "effective_permissions": sorted(PERMISSIONS),
+                },
+                "effective_permissions": sorted(PERMISSIONS),
+                "can_view_history": True,
+                "can_export": True,
+                "can_manage_cameras": True,
+                "can_manage_users": True,
+                "camera_access": {"mode": "all", "camera_ids": []},
+            },
+        }
         probe = OperatorProfileLock(tmp_path / "identity")
         try:
             with pytest.raises(OperatorProfileLockError):

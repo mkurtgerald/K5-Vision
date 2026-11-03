@@ -129,6 +129,24 @@ def load_person_configuration(
     return config
 
 
+def load_installed_person_configuration(
+    environment: Mapping[str, str],
+) -> OperatorPersonConfiguration | None:
+    """Use an explicit engineering override or the immutable installed model.
+
+    Absence remains supported by source-only/legacy installations. A present
+    but damaged installed model is refused rather than silently hidden.
+    """
+    if PERSON_CONFIG_ENV in environment:
+        return load_person_configuration(environment)
+    root = Path(__file__).parent / "data" / "person-models"
+    if not root.exists():
+        return None
+    config = OperatorPersonConfiguration(root.absolute())
+    validate_person_runtime(config)
+    return config
+
+
 @dataclass(frozen=True, slots=True)
 class _PersonBox:
     x_min: float

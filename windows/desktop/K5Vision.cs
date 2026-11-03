@@ -16,6 +16,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using Microsoft.Win32.SafeHandles;
 
 namespace K5VisionDesktop
 {
@@ -30,6 +31,8 @@ namespace K5VisionDesktop
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            if (arguments.Length == 3 && arguments[0] == "--time-admin")
+                return TimeAdministration.Execute(arguments[1], arguments[2]);
             if (arguments.Length == 1 && arguments[0] == "--installation-check")
                 return InstallationCheck();
             if (arguments.Length == 2 && arguments[0] == "--installation-identity")
@@ -244,7 +247,9 @@ namespace K5VisionDesktop
                 }
             }
             if (!admitted.Contains("runtime/python.exe") || !admitted.Contains("runtime/python312._pth") ||
-                !admitted.Contains("workers/donor-downloads.json"))
+                !admitted.Contains("workers/donor-downloads.json") ||
+                !admitted.Contains("workers/mediamtx.exe") || !admitted.Contains("workers/caddy.exe") ||
+                !admitted.Contains("workers/mediamtx-LICENSE") || !admitted.Contains("workers/caddy-LICENSE"))
                 throw new InvalidOperationException();
             foreach (string bootstrap in new[] { "K5Vision.exe", "payload-manifest.json", "unins000.exe", "unins000.dat", "unins000.msg" })
                 admitted.Add(bootstrap);
@@ -284,19 +289,444 @@ namespace K5VisionDesktop
         }
     }
 
-    internal static class Workers
+    internal static class TimeAdministration
     {
-        private static void PrivateDirectory(string path, string root)
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileIdentity
         {
-            if (!Directory.Exists(path))
-            {
-                string parent = Path.GetDirectoryName(path);
-                Custody.Admit(parent, root);
-                Directory.CreateDirectory(path);
-            }
-            Custody.Admit(path, root);
+            internal uint Attributes;
+            internal System.Runtime.InteropServices.ComTypes.FILETIME Created, Accessed, Written;
+            internal uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(string path, uint access, uint share,
+            IntPtr security, uint creation, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle file, out FileIdentity info);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(IntPtr process,
+            out System.Runtime.InteropServices.ComTypes.FILETIME created,
+            out System.Runtime.InteropServices.ComTypes.FILETIME exited,
+            out System.Runtime.InteropServices.ComTypes.FILETIME system,
+            out System.Runtime.InteropServices.ComTypes.FILETIME user);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool GetTokenInformation(IntPtr token, int kind, IntPtr buffer,
+            uint length, out uint needed);
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct StartupInfo
+        {
+            internal uint Size;
+            internal string Reserved, Desktop, Title;
+            internal uint X, Y, XSize, YSize, XChars, YChars, Fill, Flags;
+            internal ushort Show, ReservedBytes;
+            internal IntPtr ReservedPointer, StandardInput, StandardOutput, StandardError;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessInformation
+        {
+            internal IntPtr Process, Thread;
+            internal uint ProcessId, ThreadId;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CreateProcess(string executable, StringBuilder command,
+            IntPtr processSecurity, IntPtr threadSecurity, bool inheritHandles, uint flags,
+            IntPtr environment, string directory, ref StartupInfo startup, out ProcessInformation info);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint ResumeThread(IntPtr thread);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForMultipleObjects(uint count, IntPtr[] handles,
+            bool waitAll, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetExitCodeProcess(IntPtr process, out uint code);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr process, uint code);
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private static FileIdentity Identify(FileStream stream)
+        {
+            FileIdentity identity;
+            if (!GetFileInformationByHandle(stream.SafeFileHandle, out identity) ||
+                identity.Links != 1 || (identity.Attributes & (0x10u | 0x400u)) != 0)
+                throw new InvalidOperationException();
+            return identity;
         }
 
+        private static long Integer(object value)
+        {
+            if (value is int) return (int)value;
+            if (value is long) return (long)value;
+            throw new InvalidOperationException();
+        }
+
+        private sealed class LiveIssuer : IDisposable
+        {
+            internal IntPtr Handle;
+            private ulong created100ns;
+            internal void Bind(uint pid, ulong created)
+            {
+                if (Handle != IntPtr.Zero || pid == 0 || created == 0) throw new InvalidOperationException();
+                // Keep the exact kernel process object, not a PID lookup that
+                // could later select a replacement process after PID reuse.
+                Handle = OpenProcess(0x00100000u | 0x00001000u, false, pid);
+                if (Handle == IntPtr.Zero) throw new InvalidOperationException();
+                created100ns = created;
+                Check();
+            }
+            internal void Check()
+            {
+                if (Handle == IntPtr.Zero || WaitForSingleObject(Handle, 0) != 258)
+                    throw new InvalidOperationException();
+                System.Runtime.InteropServices.ComTypes.FILETIME created, exited, system, user;
+                if (!GetProcessTimes(Handle, out created, out exited, out system, out user) ||
+                    (((ulong)(uint)created.dwHighDateTime << 32) | (uint)created.dwLowDateTime) != created100ns)
+                    throw new InvalidOperationException();
+                IntPtr token = IntPtr.Zero, buffer = IntPtr.Zero;
+                try
+                {
+                    if (!OpenProcessToken(Handle, 8, out token)) throw new UnauthorizedAccessException();
+                    uint needed;
+                    GetTokenInformation(token, 1, IntPtr.Zero, 0, out needed);
+                    if (needed < IntPtr.Size || needed > 4096) throw new InvalidOperationException();
+                    buffer = Marshal.AllocHGlobal((int)needed);
+                    if (!GetTokenInformation(token, 1, buffer, needed, out needed))
+                        throw new InvalidOperationException();
+                    IntPtr sid = Marshal.ReadIntPtr(buffer);
+                    if (sid == IntPtr.Zero || new SecurityIdentifier(sid).Value != Program.Sid)
+                        throw new UnauthorizedAccessException();
+                    if (WaitForSingleObject(Handle, 0) != 258) throw new InvalidOperationException();
+                }
+                finally
+                {
+                    if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+                    if (token != IntPtr.Zero) CloseHandle(token);
+                }
+            }
+            public void Dispose()
+            {
+                if (Handle != IntPtr.Zero) { CloseHandle(Handle); Handle = IntPtr.Zero; }
+            }
+        }
+
+        private sealed class DirectoryPins : IDisposable
+        {
+            private readonly List<SafeFileHandle> handles = new List<SafeFileHandle>();
+            internal void Acquire(string directory, string root)
+            {
+                List<string> ancestors = new List<string>();
+                for (string current = directory; !String.IsNullOrEmpty(current);
+                    current = Path.GetDirectoryName(current)) ancestors.Add(current);
+                ancestors.Reverse();
+                foreach (string ancestor in ancestors)
+                {
+                    Custody.Admit(ancestor, root);
+                    // Pin every directory from the fixed volume downwards.
+                    // No FILE_SHARE_DELETE: a later reparse/rename cannot redirect
+                    // elevated response creation to a different directory.
+                    SafeFileHandle handle = CreateFile(ancestor, 0, 3, IntPtr.Zero,
+                        3, 0x02000000u | 0x00200000u, IntPtr.Zero);
+                    FileIdentity identity;
+                    if (handle.IsInvalid || !GetFileInformationByHandle(handle, out identity) ||
+                        (identity.Attributes & 0x400u) != 0 || (identity.Attributes & 0x10u) == 0)
+                    {
+                        handle.Dispose();
+                        throw new InvalidOperationException();
+                    }
+                    handles.Add(handle);
+                }
+                Custody.Admit(directory, root);
+            }
+            public void Dispose()
+            {
+                for (int index = handles.Count - 1; index >= 0; index--) handles[index].Dispose();
+                handles.Clear();
+            }
+        }
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr OpenSCManager(string machine, string database, uint access);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr OpenService(IntPtr manager, string name, uint access);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool ChangeServiceConfig(IntPtr service, uint type, uint start,
+            uint error, string binary, string group, IntPtr tag, string dependencies,
+            string account, string password, string display);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool StartService(IntPtr service, uint count, IntPtr arguments);
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ServiceStatus
+        {
+            internal uint Kind, State, Accepted, Win32Exit, ServiceExit, Checkpoint, WaitHint;
+        }
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool QueryServiceStatus(IntPtr service, out ServiceStatus status);
+        [DllImport("advapi32.dll")]
+        private static extern bool CloseServiceHandle(IntPtr handle);
+
+        private static void StartTimeService(Action admit, Stopwatch elapsed)
+        {
+            IntPtr manager = OpenSCManager(null, null, 1);
+            if (manager == IntPtr.Zero) throw new UnauthorizedAccessException();
+            IntPtr service = IntPtr.Zero;
+            try
+            {
+                service = OpenService(manager, "W32Time", 0x0002 | 0x0004 | 0x0010);
+                if (service == IntPtr.Zero) throw new UnauthorizedAccessException();
+                admit();
+                if (!ChangeServiceConfig(service, UInt32.MaxValue, 2, UInt32.MaxValue,
+                    null, null, IntPtr.Zero, null, null, null, null))
+                    throw new InvalidOperationException();
+                admit();
+                if (!StartService(service, 0, IntPtr.Zero) && Marshal.GetLastWin32Error() != 1056)
+                    throw new InvalidOperationException();
+                long deadline = Math.Min(45000, elapsed.ElapsedMilliseconds + 5000);
+                ServiceStatus status;
+                while (elapsed.ElapsedMilliseconds < deadline)
+                {
+                    admit();
+                    if (!QueryServiceStatus(service, out status)) throw new InvalidOperationException();
+                    if (status.State == 4) return;
+                    if (status.State != 2) throw new InvalidOperationException();
+                    Thread.Sleep(50);
+                }
+                throw new TimeoutException();
+            }
+            finally
+            {
+                if (service != IntPtr.Zero) CloseServiceHandle(service);
+                CloseServiceHandle(manager);
+            }
+        }
+
+        private static bool HexNonce(string nonce)
+        {
+            return nonce != null && nonce.Length == 32 &&
+                nonce.All(c => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+        }
+
+        private static void CheckCapability(string path, string root, byte[] admitted,
+            FileIdentity expected, LiveIssuer owner)
+        {
+            owner.Check();
+            Custody.Admit(path, root);
+            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                FileShare.Read | FileShare.Delete))
+            {
+                FileIdentity identity = Identify(stream);
+                if (identity.Volume != expected.Volume || identity.IndexHigh != expected.IndexHigh ||
+                    identity.IndexLow != expected.IndexLow) throw new InvalidOperationException();
+                if (stream.Length != admitted.Length) throw new InvalidOperationException();
+                byte[] current = new byte[admitted.Length];
+                int read = 0;
+                while (read < current.Length)
+                {
+                    int count = stream.Read(current, read, current.Length - read);
+                    if (count <= 0) throw new InvalidOperationException();
+                    read += count;
+                }
+                if (!current.SequenceEqual(admitted)) throw new InvalidOperationException();
+            }
+            owner.Check();
+        }
+
+        private static void RunTimeCommand(string arguments, Stopwatch elapsed,
+            LiveIssuer owner, Action admit)
+        {
+            int remaining = Math.Min(25000, 45000 - (int)elapsed.ElapsedMilliseconds);
+            if (remaining <= 0) throw new TimeoutException();
+            string system = Environment.GetFolderPath(Environment.SpecialFolder.System);
+            string executable = Path.Combine(system, "w32tm.exe");
+            Custody.Admit(executable, Path.GetDirectoryName(Application.ExecutablePath));
+            string windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            string environment = "PATH=" + system + ";" + windows + "\0SystemDrive=" +
+                Path.GetPathRoot(windows).TrimEnd('\\') + "\0SystemRoot=" + windows +
+                "\0WINDIR=" + windows + "\0\0";
+            ProcessInformation information = new ProcessInformation();
+            using (ProcessJob job = new ProcessJob())
+            {
+                IntPtr environmentBlock = Marshal.StringToHGlobalUni(environment);
+                try
+                {
+                    StartupInfo startup = new StartupInfo();
+                    startup.Size = (uint)Marshal.SizeOf(startup);
+                    // Fixed system command starts suspended. No privileged
+                    // action runs before its exact process belongs to our Job.
+                    admit();
+                    if (!CreateProcess(executable, new StringBuilder("\"" + executable + "\" " + arguments),
+                        IntPtr.Zero, IntPtr.Zero, false, 0x08000000u | 0x00000004u | 0x00000400u,
+                        environmentBlock, system, ref startup, out information))
+                        throw new InvalidOperationException();
+                    using (Process process = Process.GetProcessById((int)information.ProcessId)) job.Assign(process);
+                    admit();
+                    if (ResumeThread(information.Thread) == UInt32.MaxValue) throw new InvalidOperationException();
+                    uint waited = WaitForMultipleObjects(2,
+                        new[] { information.Process, owner.Handle }, false, (uint)remaining);
+                    if (waited == 258) throw new TimeoutException();
+                    if (waited != 0) throw new InvalidOperationException();
+                    uint exitCode;
+                    if (!GetExitCodeProcess(information.Process, out exitCode)) throw new InvalidOperationException();
+                    if (exitCode == 0x800705B4u) throw new TimeSourceUnavailable();
+                    if (exitCode != 0) throw new InvalidOperationException();
+                }
+                finally
+                {
+                    if (information.Process != IntPtr.Zero)
+                    {
+                        if (WaitForSingleObject(information.Process, 0) != 0)
+                        {
+                            TerminateProcess(information.Process, 1);
+                            if (WaitForSingleObject(information.Process, 2000) != 0)
+                            {
+                                job.Dispose();
+                                WaitForSingleObject(information.Process, 2000);
+                            }
+                        }
+                        CloseHandle(information.Process);
+                    }
+                    if (information.Thread != IntPtr.Zero) CloseHandle(information.Thread);
+                    Marshal.FreeHGlobal(environmentBlock);
+                }
+            }
+        }
+
+        private sealed class TimeSourceUnavailable : Exception { }
+
+        internal static int Execute(string requestArgument, string responseArgument)
+        {
+            using (System.Threading.Timer watchdog = new System.Threading.Timer(
+                delegate { Environment.Exit(1); }, null, 45000, Timeout.Infinite))
+            using (DirectoryPins directoryPins = new DirectoryPins())
+            using (LiveIssuer owner = new LiveIssuer())
+            {
+            string response = null, root = null, nonce = null;
+            string code = "invalid_request";
+            bool succeeded = false;
+            Stopwatch elapsed = Stopwatch.StartNew();
+            try
+            {
+                string application = Path.GetDirectoryName(Application.ExecutablePath);
+                Custody.VerifyPayload(application);
+                string requestPath = Custody.OrdinaryAbsolute(requestArgument);
+                response = Custody.OrdinaryAbsolute(responseArgument);
+                string directory = Path.GetDirectoryName(requestPath);
+                if (!String.Equals(Path.GetDirectoryName(response), directory,
+                    StringComparison.OrdinalIgnoreCase) || Path.GetFileName(directory) != "time-admin")
+                    throw new InvalidOperationException();
+                root = Path.GetDirectoryName(directory);
+                directoryPins.Acquire(directory, root);
+                Custody.Admit(directory, root);
+                if (File.Exists(response) || Directory.Exists(response)) throw new InvalidOperationException();
+                Custody.Admit(requestPath, root);
+                byte[] bytes;
+                FileIdentity requestIdentity;
+                using (FileStream input = new FileStream(requestPath, FileMode.Open, FileAccess.Read,
+                    FileShare.Read | FileShare.Delete))
+                {
+                    requestIdentity = Identify(input);
+                    if (input.Length <= 0 || input.Length > 4096) throw new InvalidOperationException();
+                    bytes = new byte[(int)input.Length];
+                    int position = 0;
+                    while (position < bytes.Length)
+                    {
+                        int count = input.Read(bytes, position, bytes.Length - position);
+                        if (count <= 0) throw new InvalidOperationException();
+                        position += count;
+                    }
+                }
+                Dictionary<string, object> request = Json.Parse(new UTF8Encoding(false, true).GetString(bytes));
+                HashSet<string> keys = new HashSet<string>(new[] {
+                    "schema_version", "operation", "ntp_servers", "mode", "nonce",
+                    "owner_pid", "owner_created_100ns" });
+                if (!keys.SetEquals(request.Keys) || !(request["schema_version"] is int) ||
+                    (int)request["schema_version"] != 1) throw new InvalidOperationException();
+                nonce = request["nonce"] as string;
+                if (!HexNonce(nonce) || Path.GetFileName(requestPath) != ".time-admin-" + nonce + ".json" ||
+                    Path.GetFileName(response) != ".time-admin-" + nonce + ".result.json")
+                    throw new InvalidOperationException();
+                string operation = request["operation"] as string;
+                string mode = request["mode"] as string;
+                if ((operation != "configure" && operation != "resync") ||
+                    (mode != "manual" && mode != "domain")) throw new InvalidOperationException();
+                IEnumerable values = request["ntp_servers"] as IEnumerable;
+                if (values == null || values is string) throw new InvalidOperationException();
+                List<string> servers = new List<string>();
+                foreach (object value in values)
+                {
+                    string host = value as string;
+                    if (host == null || host.Length < 1 || host.Length > 253 ||
+                        !host.All(c => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') || c == '.' || c == '-' || c == ':') ||
+                        Uri.CheckHostName(host) == UriHostNameType.Unknown ||
+                        servers.Contains(host) || servers.Count >= 4) throw new InvalidOperationException();
+                    servers.Add(host);
+                }
+                if (mode == "manual" && operation == "configure" && servers.Count == 0)
+                    throw new InvalidOperationException();
+                long ownerPid = Integer(request["owner_pid"]);
+                long ownerCreated = Integer(request["owner_created_100ns"]);
+                if (ownerPid < 1 || ownerPid > UInt32.MaxValue || ownerCreated < 1)
+                    throw new InvalidOperationException();
+                owner.Bind((uint)ownerPid, (ulong)ownerCreated);
+                WindowsPrincipal principal = new WindowsPrincipal(WindowsIdentity.GetCurrent());
+                if (!principal.IsInRole(WindowsBuiltInRole.Administrator))
+                    throw new UnauthorizedAccessException();
+                Action admit = delegate { CheckCapability(requestPath, root, bytes, requestIdentity, owner); };
+                admit();
+                StartTimeService(admit, elapsed);
+                admit();
+                if (operation == "configure")
+                {
+                    using (Microsoft.Win32.RegistryKey parameters = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                        @"SYSTEM\CurrentControlSet\Services\W32Time\Parameters", true))
+                    {
+                        if (parameters == null) throw new InvalidOperationException();
+                        admit();
+                        parameters.SetValue("Type", mode == "domain" ? "NT5DS" : "NTP", Microsoft.Win32.RegistryValueKind.String);
+                        admit();
+                        if (mode == "manual") parameters.SetValue("NtpServer",
+                            String.Join(" ", servers.Select(s => s + ",0x9")), Microsoft.Win32.RegistryValueKind.String);
+                    }
+                    admit();
+                    RunTimeCommand("/config /update", elapsed, owner, admit);
+                }
+                else RunTimeCommand("/resync /rediscover", elapsed, owner, admit);
+                admit();
+                succeeded = true; code = "completed";
+            }
+            catch (UnauthorizedAccessException) { code = "access_denied"; }
+            catch (TimeoutException) { code = "timeout"; }
+            catch (TimeSourceUnavailable) { code = "ntp_unreachable"; }
+            catch { code = "operation_failed"; }
+            try
+            {
+                if (response == null || root == null || !HexNonce(nonce)) return 1;
+                // No delayed response/profile write after its issuing backend
+                // has exited, including a hard-killed owner with a live file.
+                owner.Check();
+                Custody.Admit(Path.GetDirectoryName(response), root);
+                using (FileStream output = new FileStream(response, FileMode.CreateNew,
+                    FileAccess.Write, FileShare.None))
+                {
+                    byte[] result = Encoding.UTF8.GetBytes(Json.Serializer.Serialize(new Dictionary<string, object> {
+                        { "schema_version", 1 }, { "nonce", nonce }, { "succeeded", succeeded }, { "code", code } }));
+                    output.Write(result, 0, result.Length); output.Flush(true);
+                }
+                Custody.Admit(response, root);
+            }
+            catch { return 1; }
+            return succeeded ? 0 : 1;
+            }
+        }
+    }
+
+    internal static class Workers
+    {
         private static void VerifyFile(string path, string root, long bytes, string expected)
         {
             Custody.Admit(path, root);
@@ -307,81 +737,11 @@ namespace K5VisionDesktop
                     throw new InvalidOperationException();
         }
 
-        private static void Download(string url, string target, long expectedBytes, CancellationToken cancellation)
-        {
-            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-            Stopwatch elapsed = Stopwatch.StartNew();
-            Uri uri = new Uri(url);
-            for (int redirect = 0; redirect < 6; redirect++)
-            {
-                cancellation.ThrowIfCancellationRequested();
-                int remaining = 120000 - (int)elapsed.ElapsedMilliseconds;
-                if (remaining <= 0) throw new InvalidOperationException();
-                if (uri.Scheme != "https" || !new[] { "github.com", "release-assets.githubusercontent.com",
-                    "objects.githubusercontent.com", "github-releases.githubusercontent.com" }.Contains(uri.Host))
-                    throw new InvalidOperationException();
-                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(uri);
-                request.AllowAutoRedirect = false; request.Timeout = request.ReadWriteTimeout = remaining;
-                request.UserAgent = "K5-Vision-Desktop";
-                Action abort = delegate { try { request.Abort(); } catch { } };
-                using (CancellationTokenRegistration registration = cancellation.Register(abort))
-                using (System.Threading.Timer deadline = new System.Threading.Timer(delegate { abort(); }, null, remaining, Timeout.Infinite))
-                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
-                {
-                    if ((int)response.StatusCode >= 300 && (int)response.StatusCode <= 399)
-                    {
-                        uri = new Uri(uri, response.Headers["Location"]);
-                        continue;
-                    }
-                    if (response.StatusCode != HttpStatusCode.OK ||
-                        (response.ContentLength >= 0 && response.ContentLength != expectedBytes))
-                        throw new InvalidOperationException();
-                    using (Stream source = response.GetResponseStream())
-                    using (FileStream file = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                    {
-                        byte[] buffer = new byte[65536];
-                        long total = 0;
-                        int count;
-                        while ((count = source.Read(buffer, 0, buffer.Length)) != 0)
-                        {
-                            cancellation.ThrowIfCancellationRequested();
-                            total += count;
-                            if (total > expectedBytes || total > 128 * 1024 * 1024) throw new InvalidOperationException();
-                            file.Write(buffer, 0, count);
-                        }
-                        if (total != expectedBytes) throw new InvalidOperationException();
-                        file.Flush(true);
-                    }
-                    return;
-                }
-            }
-            throw new InvalidOperationException();
-        }
-
-        private static void Extract(ZipArchive archive, string name, string target, long maximum)
-        {
-            ZipArchiveEntry[] entries = archive.Entries.Where(entry => entry.FullName == name).ToArray();
-            if (entries.Length != 1 || entries[0].Length > maximum) throw new InvalidOperationException();
-            using (Stream source = entries[0].Open())
-            using (FileStream file = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            {
-                byte[] buffer = new byte[65536];
-                long total = 0; int count;
-                while ((count = source.Read(buffer, 0, buffer.Length)) != 0)
-                {
-                    total += count;
-                    if (total > maximum || total > entries[0].Length) throw new InvalidOperationException();
-                    file.Write(buffer, 0, count);
-                }
-                if (total != entries[0].Length) throw new InvalidOperationException();
-                file.Flush(true);
-            }
-        }
-
         internal static Dictionary<string, string> Provision(string application, string profile, CancellationToken cancellation)
         {
-            string cache = Path.Combine(profile, "desktop-workers");
-            PrivateDirectory(cache, profile);
+            // The owner workstation must not download executable dependencies.
+            // Verify the installation and exact source identities on every start.
+            Custody.Admit(profile, profile);
             string path = Path.Combine(application, "workers", "donor-downloads.json");
             Custody.Admit(path, application);
             Dictionary<string, object> manifest = Json.Parse(File.ReadAllText(path, Encoding.UTF8));
@@ -395,49 +755,15 @@ namespace K5VisionDesktop
                 if (component != "MediaMTX" && component != "Caddy") throw new InvalidOperationException();
                 if (result.ContainsKey(component)) throw new InvalidOperationException();
                 string executable = component == "MediaMTX" ? "mediamtx.exe" : "caddy.exe";
+                string name = component == "MediaMTX" ? "mediamtx" : "caddy";
                 string version = (string)artifact["version"];
                 if (version.Length > 32 || !System.Text.RegularExpressions.Regex.IsMatch(version, "^v[0-9]+[.][0-9]+[.][0-9]+$") ||
                     (string)artifact["executable"] != executable) throw new InvalidOperationException();
-                string componentRoot = Path.Combine(cache, component);
-                PrivateDirectory(componentRoot, profile);
-                string directory = Path.Combine(componentRoot, version);
-                PrivateDirectory(directory, profile);
-                string binary = Path.Combine(directory, executable), license = Path.Combine(directory, "LICENSE");
-                long binaryBytes = Convert.ToInt64(artifact["executable_bytes"]);
-                if (File.Exists(binary))
-                {
-                    VerifyFile(binary, profile, binaryBytes, (string)artifact["executable_sha256"]);
-                    VerifyFile(license, profile, -1, (string)artifact["license_sha256"]);
-                }
-                else
-                {
-                    string nonce = Guid.NewGuid().ToString("N");
-                    string zip = Path.Combine(directory, "download-" + nonce + ".zip");
-                    string candidate = Path.Combine(directory, "candidate-" + nonce + ".exe");
-                    string candidateLicense = Path.Combine(directory, "license-" + nonce + ".txt");
-                    try
-                    {
-                        Download((string)artifact["url"], zip, Convert.ToInt64(artifact["bytes"]), cancellation);
-                        cancellation.ThrowIfCancellationRequested();
-                        VerifyFile(zip, profile, Convert.ToInt64(artifact["bytes"]), (string)artifact["sha256"]);
-                        using (FileStream input = new FileStream(zip, FileMode.Open, FileAccess.Read, FileShare.Read))
-                        using (ZipArchive archive = new ZipArchive(input, ZipArchiveMode.Read))
-                        {
-                            Extract(archive, executable, candidate, binaryBytes);
-                            Extract(archive, "LICENSE", candidateLicense, 65536);
-                        }
-                        VerifyFile(candidate, profile, binaryBytes, (string)artifact["executable_sha256"]);
-                        VerifyFile(candidateLicense, profile, -1, (string)artifact["license_sha256"]);
-                        if (File.Exists(license)) VerifyFile(license, profile, -1, (string)artifact["license_sha256"]);
-                        else File.Move(candidateLicense, license);
-                        File.Move(candidate, binary);
-                    }
-                    finally
-                    {
-                        foreach (string temporary in new[] { zip, candidate, candidateLicense })
-                            if (File.Exists(temporary)) { Custody.Admit(temporary, profile); File.Delete(temporary); }
-                    }
-                }
+                string binary = Path.Combine(application, "workers", executable);
+                string license = Path.Combine(application, "workers", name + "-LICENSE");
+                VerifyFile(binary, application, Convert.ToInt64(artifact["executable_bytes"]),
+                    (string)artifact["executable_sha256"]);
+                VerifyFile(license, application, -1, (string)artifact["license_sha256"]);
                 result[component] = binary;
             }
             if (result.Count != 2) throw new InvalidOperationException();
@@ -510,9 +836,14 @@ namespace K5VisionDesktop
         private Dictionary<string, object> outcome;
         internal volatile bool InvalidOutput;
         private int lines;
+        private int progressLines;
+        private readonly bool persistent;
+        internal volatile bool PreparingRecordings;
+        internal volatile int RecordingsProgress;
 
         internal Bridge(string root, Dictionary<string, object> request, ProcessJob job, bool persistent)
         {
+            this.persistent = persistent;
             ProcessStartInfo start = new ProcessStartInfo(Path.Combine(root, "runtime", "python.exe"),
                 "-I -B -m k5vision.desktop_setup");
             start.WorkingDirectory = root;
@@ -556,8 +887,21 @@ namespace K5VisionDesktop
             {
                 try
                 {
-                    if (++lines > 2 || args.Data.Length > 1024) throw new InvalidOperationException();
+                    if (args.Data.Length > 1024) throw new InvalidOperationException();
                     Dictionary<string, object> response = Json.Parse(args.Data);
+                    if (response.ContainsKey("status") && (string)response["status"] == "preparing_recordings")
+                    {
+                        if (!persistent || Running.WaitOne(0) || ++progressLines > 101 ||
+                            response.Count != 3 || !(response["schema_version"] is int) ||
+                            (int)response["schema_version"] != 1 || !(response["progress"] is int))
+                            throw new InvalidOperationException();
+                        int percent = (int)response["progress"];
+                        if (percent < 0 || percent > 100 || percent < RecordingsProgress)
+                            throw new InvalidOperationException();
+                        RecordingsProgress = percent; PreparingRecordings = true;
+                        return;
+                    }
+                    if (++lines > 2) throw new InvalidOperationException();
                     if (Convert.ToInt32(response["schema_version"]) != 1 ||
                         !new[] { "ready", "new", "refused", "running", "stopped" }.Contains((string)response["status"]))
                         throw new InvalidOperationException();
@@ -628,6 +972,7 @@ namespace K5VisionDesktop
         private readonly Options options;
         private readonly string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
         private readonly Label status = new Label();
+        private readonly Label workspaceHelp = new Label();
         private readonly TextBox diagnostic = new TextBox();
         private readonly Panel setup = new Panel();
         private readonly TextBox username = new TextBox();
@@ -666,6 +1011,12 @@ namespace K5VisionDesktop
             status.Location = new Point(30, 78); status.Size = new Size(500, 62);
             status.Text = "Preparing K5 Vision…"; status.Name = "Status"; SetId(status, 1006);
             Controls.Add(status);
+            workspaceHelp.Location = new Point(30, 158); workspaceHelp.Size = new Size(500, 100);
+            workspaceHelp.Text = "This window starts K5 Vision and keeps it running in the notification area. " +
+                "Open the camera wall in your browser for live viewing, recordings and camera controls. " +
+                "Closing either window keeps the camera engine running.";
+            workspaceHelp.ForeColor = Color.FromArgb(75, 89, 108); workspaceHelp.Visible = false;
+            Controls.Add(workspaceHelp);
             diagnostic.Visible = false; diagnostic.ReadOnly = true; diagnostic.Name = "Diagnostic";
             SetId(diagnostic, 1010); Controls.Add(diagnostic);
             GC.KeepAlive(diagnostic.Handle);
@@ -680,14 +1031,19 @@ namespace K5VisionDesktop
             create.Location = new Point(0, 185); create.Size = new Size(166, 36); SetId(create, 1003);
             create.Click += delegate { CreateAccount(); };
             setup.Controls.Add(create); Controls.Add(setup);
-            open.Text = "Open cameras"; open.Name = "OpenOperator";
-            open.Location = new Point(30, 389); open.Size = new Size(166, 36); open.Enabled = false; SetId(open, 1004);
+            open.Text = "Open camera wall"; open.Name = "OpenOperator";
+            open.Location = new Point(30, 383); open.Size = new Size(220, 42); open.Enabled = false; SetId(open, 1004);
+            open.FlatStyle = FlatStyle.Flat; open.FlatAppearance.BorderSize = 0;
+            open.BackColor = Color.FromArgb(27, 109, 159); open.ForeColor = Color.White;
+            open.FlatAppearance.MouseOverBackColor = Color.FromArgb(22, 91, 134);
+            open.FlatAppearance.MouseDownBackColor = Color.FromArgb(17, 74, 110);
+            open.UseVisualStyleBackColor = false; open.Font = new Font("Segoe UI", 10, FontStyle.Bold);
             open.Click += delegate { OpenDashboard(); }; Controls.Add(open);
             quit.Text = "Stop and quit"; quit.Name = "StopRecording";
             quit.Location = new Point(350, 389); quit.Size = new Size(166, 36); SetId(quit, 1005);
             quit.Click += delegate { StopAndQuit(); }; Controls.Add(quit);
             ContextMenuStrip menu = new ContextMenuStrip();
-            menu.Items.Add("Open cameras", null, delegate { ShowOwner(); OpenDashboard(); });
+            menu.Items.Add("Open camera wall", null, delegate { ShowOwner(); OpenDashboard(); });
             menu.Items.Add("Show K5 Vision", null, delegate { ShowOwner(); });
             menu.Items.Add("Stop and quit", null, delegate { StopAndQuit(); });
             tray.Icon = SystemIcons.Application; Icon = SystemIcons.Application;
@@ -698,7 +1054,7 @@ namespace K5VisionDesktop
             {
                 if (openEvent.WaitOne(0)) { ShowOwner(); if (!options.NoBrowser) OpenDashboard(); }
                 if (ready && backend != null && backend.Process.HasExited)
-                { phase = "failed"; ready = false; open.Enabled = false; status.Text = "Recording stopped unexpectedly. Close and reopen K5 Vision to try again. Your recordings have been kept."; ShowOwner(); }
+                { phase = "failed"; ready = false; open.Enabled = false; workspaceHelp.Visible = false; status.Text = "Recording stopped unexpectedly. Close and reopen K5 Vision to try again. Your recordings have been kept."; ShowOwner(); }
                 UpdateDiagnostic();
             };
             timer.Start();
@@ -801,7 +1157,7 @@ namespace K5VisionDesktop
         private async void StartRecording()
         {
             if (exiting) return;
-            phase = "starting"; busy = true; setup.Visible = false; status.Text = "Preparing your camera services. First launch may take a few minutes…";
+            phase = "starting"; busy = true; setup.Visible = false; status.Text = "Starting your locally bundled camera services…";
             bool failed = false;
             try
             {
@@ -817,11 +1173,26 @@ namespace K5VisionDesktop
                     request["port"] = options.Port; request["recording_limit_gb"] = 20;
                     backend = new Bridge(root, request, job, true);
                     Stopwatch deadline = Stopwatch.StartNew();
+                    int lastMigrationProgress = -1;
                     while (!backend.Running.WaitOne(50))
-                        if (exiting || backend.InvalidOutput || backend.Process.HasExited || deadline.ElapsedMilliseconds > 45000)
+                    {
+                        int startupLimit = backend.PreparingRecordings ? 330000 : 45000;
+                        if (backend.PreparingRecordings && !exiting &&
+                            backend.RecordingsProgress != lastMigrationProgress)
+                        {
+                            int prepared = backend.RecordingsProgress;
+                            lastMigrationProgress = prepared;
+                            BeginInvoke((Action)delegate {
+                                if (!exiting && !IsDisposed)
+                                    status.Text = "Preparing recordings (" + prepared +
+                                        "%). Original footage is preserved.";
+                            });
+                        }
+                        if (exiting || backend.InvalidOutput || backend.Process.HasExited || deadline.ElapsedMilliseconds > startupLimit)
                             throw new InvalidOperationException();
+                    }
                     bool healthy = false;
-                    while (!healthy && deadline.ElapsedMilliseconds < 45000 && !exiting && !backend.Process.HasExited)
+                    while (!healthy && deadline.ElapsedMilliseconds < (backend.PreparingRecordings ? 330000 : 45000) && !exiting && !backend.Process.HasExited)
                     {
                         try
                         {
@@ -839,8 +1210,9 @@ namespace K5VisionDesktop
                 await startup;
                 if (exiting) return;
                 phase = "running"; ready = true; busy = false; open.Enabled = true;
-                status.Text = "Recording service is running. You can close this window; K5 Vision stays in the tray.";
-                tray.Text = "K5 Vision — recording service running";
+                workspaceHelp.Visible = true;
+                status.Text = "Recording service is running. Camera engine ready. Select Open camera wall to add cameras and check live video and recording.";
+                tray.Text = "K5 Vision — camera engine ready";
                 if (!options.NoBrowser) OpenDashboard();
             }
             catch { failed = true; }
@@ -866,7 +1238,7 @@ namespace K5VisionDesktop
         private void Fail(string message)
         {
             if (exiting || IsDisposed) return;
-            phase = "failed"; busy = false; ready = false; open.Enabled = false; create.Enabled = false;
+            phase = "failed"; busy = false; ready = false; open.Enabled = false; create.Enabled = false; workspaceHelp.Visible = false;
             status.Text = message; ShowOwner();
         }
 

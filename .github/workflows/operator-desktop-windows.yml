@@ -3,7 +3,7 @@ name: Native Windows Desktop Installer
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta]
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta, codex/windows-onvif-onboarding, codex/windows-surveillance-workspace]
     paths:
       - .github/workflows/operator-desktop-windows.yml
       - .github/actions/provision-operator-tools/**
@@ -13,9 +13,24 @@ on:
       - src/k5vision/**
       - tests/integration/test_windows_desktop_app.py
       - tests/integration/windows_vm_clock.py
+      - tests/integration/windows_time_configuration.py
+      - tests/integration/test_windows_time_administration.py
+      - tests/unit/test_operator_time*.py
+      - tests/unit/test_windows_time*.py
+      - scripts/verify_windows_time_administration_receipt.py
       - tests/unit/test_windows_vm_clock*.py
       - scripts/verify_windows_vm_clock_receipt.py
       - tests/integration/test_operator_beta_browser.py
+      - tests/integration/recorded_history_fixture.py
+      - scripts/provision_operator_person_acceptance.py
+      - tests/integration/test_operator_admin_browser.py
+      - tests/unit/test_operator_admin*.py
+      - tests/unit/test_operator_events*.py
+      - tests/unit/test_operator_exports.py
+      - tests/unit/test_operator_analytics_ui.py
+      - tests/unit/test_operator_continuous_playback_ui.py
+      - tests/test_user_admin_api.py
+      - tests/test_user_registry.py
       - tests/integration/onvif_camera_fixture.py
       - tests/unit/test_desktop*.py
       - tests/unit/test_operator_onvif*.py
@@ -33,6 +48,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  focused-windows:
+    name: Windows focused checks (${{ matrix.lane }})
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [setup, onvif, cameras]
+    env:
+      K5_BETA_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+    steps:
+      - name: Checkout exact desktop revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up native development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install acceptance dependencies only in development Python
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Desktop development install failed" }
+      - name: Verify desktop setup and process ownership on Windows
+        if: matrix.lane == 'setup'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_desktop_setup.py tests/unit/test_desktop_payload.py tests/unit/test_desktop_receipt.py tests/unit/test_operator_native_process.py tests/unit/test_operator_product_service.py tests/unit/test_operator_time.py tests/unit/test_operator_time_admin.py tests/unit/test_operator_time_admin_api.py tests/unit/test_operator_identity_security.py tests/unit/test_operator_oidc.py tests/unit/test_operator_identity_adversarial.py tests/unit/test_windows_time_configuration.py tests/unit/test_windows_time_administration_receipt.py tests/unit/test_windows_time_staging.py tests/unit/test_operator_recording_storage.py tests/unit/test_operator_storage_directory.py tests/unit/test_operator_storage_windows_stat.py tests/test_auth_session_clock.py tests/unit/test_mediamtx_provider.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify ONVIF and RTSP authentication, discovery and honest video status
+        if: matrix.lane == 'onvif'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_rtsp.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_admin_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py tests/unit/test_operator_analytics_ui.py tests/unit/test_operator_continuous_playback_ui.py tests/unit/test_operator_settings_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify camera administration and atomic reconnect on Windows
+        if: matrix.lane == 'cameras'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_admin_api.py tests/unit/test_operator_product_state.py tests/unit/test_operator_events.py tests/unit/test_operator_events_api.py tests/unit/test_operator_exports.py tests/unit/test_operator_export_audit.py tests/unit/test_operator_audit.py tests/unit/test_operator_audit_api.py tests/unit/test_operator_role_policy.py tests/unit/test_operator_role_policy_review.py tests/unit/test_operator_integrations.py tests/unit/test_operator_storage_settings.py tests/unit/test_operator_storage_settings_api.py tests/test_device_registry.py tests/test_user_registry.py tests/test_user_admin_api.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   native-desktop:
     name: Build and exercise actual graphical Windows installation
     runs-on: windows-2025
@@ -58,23 +121,13 @@ jobs:
         run: |
           python -m pip install -e ".[dev]" "playwright==1.58.0"
           if ($LASTEXITCODE -ne 0) { throw "Desktop development install failed" }
-      - name: Verify desktop setup and process ownership on Windows
-        shell: pwsh
-        run: |
-          python -m pytest tests/unit/test_desktop_setup.py tests/unit/test_desktop_payload.py tests/unit/test_desktop_receipt.py tests/unit/test_operator_native_process.py tests/unit/test_operator_product_service.py tests/unit/test_operator_time.py tests/unit/test_operator_recording_storage.py tests/test_auth_session_clock.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify ONVIF authentication, multicast and honest video status
-        shell: pwsh
-        run: |
-          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_web_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify camera administration and atomic reconnect on Windows
-        shell: pwsh
-        run: |
-          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_product_state.py tests/test_device_registry.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Provision immutable native acceptance tools
         uses: ./.github/actions/provision-operator-tools
+      - name: Provision the admitted public person fixture for installed analytics
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Installed analytics fixture admission failed" }
       - name: Build exact offline operator runtime and file manifest
         shell: pwsh
         run: |
@@ -91,6 +144,36 @@ jobs:
           $output = Join-Path $env:GITHUB_WORKSPACE "desktop-build\payload\K5Vision.exe"
           & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll ('/out:' + $output) $source $identity
           if ($LASTEXITCODE -ne 0) { throw "Native graphical supervisor compilation failed" }
+      - name: Exercise native Windows Time configuration and restoration
+        timeout-minutes: 6
+        shell: pwsh
+        env:
+          K5_NATIVE_TIME_ACCEPTANCE: "1"
+          K5_VM_CLOCK_ACCEPTANCE: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or $env:RUNNER_OS -ne "Windows") {
+            throw "Native time configuration requires a disposable hosted Windows VM"
+          }
+          $env:K5_DESKTOP_PAYLOAD = (Resolve-Path -LiteralPath desktop-build/payload).Path
+          $supervisor = Join-Path $env:K5_DESKTOP_PAYLOAD "K5Vision.exe"
+          $manifest = Join-Path $env:K5_DESKTOP_PAYLOAD "payload-manifest.json"
+          $supervisorSha = (Get-FileHash -LiteralPath $supervisor -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifestSha = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash.ToLowerInvariant()
+          python -m pytest tests/integration/test_windows_time_administration.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=90 --junitxml=desktop-build/time-administration-windows.xml
+          if ($LASTEXITCODE -ne 0) { throw "Actual native time configuration qualification failed" }
+          python scripts/verify_windows_time_administration_receipt.py desktop-build/time-administration-windows.xml desktop-build/time-administration-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --supervisor-sha256 $supervisorSha --payload-manifest-sha256 $manifestSha
+          if ($LASTEXITCODE -ne 0) { throw "Native time configuration receipt admission failed" }
+      - name: Preserve finite native time-administration evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: time-administration-windows-witness-${{ github.run_id }}
+          path: |
+            desktop-build/time-administration-windows.xml
+            desktop-build/time-administration-windows-receipt.json
+          if-no-files-found: warn
+          retention-days: 14
       - name: Provision exact reviewed Inno Setup compiler
         shell: pwsh
         run: |
@@ -157,8 +240,60 @@ jobs:
               $witness.receipt.onvif_time_health_displayed -isnot [bool] -or
               $witness.receipt.onvif_time_health_displayed -ne $true -or
               $witness.receipt.recorder_time_health_displayed -isnot [bool] -or
-              $witness.receipt.recorder_time_health_displayed -ne $true) {
-            throw "ONVIF camera-onboarding GUI qualification is incomplete"
+              $witness.receipt.recorder_time_health_displayed -ne $true -or
+              $witness.receipt.camera_count -ne 4 -or
+              $witness.receipt.four_camera_wall -ne $true -or
+              $witness.receipt.native_default_browser_handoff -ne $true -or
+              $witness.receipt.timeline_seek_playback -ne $true -or
+              $witness.receipt.direct_rtsp_enrollment -isnot [bool] -or
+              $witness.receipt.direct_rtsp_enrollment -ne $true -or
+              $witness.receipt.direct_rtsp_fresh_enrollment -ne $true -or
+              $witness.receipt.direct_rtsp_multi_channel_same_endpoint -ne $true -or
+              $witness.receipt.admin_user_management -ne $true -or
+              $witness.receipt.role_permissions -ne $true -or
+              $witness.receipt.camera_access_controls -ne $true -or
+              $witness.receipt.admin_state_persisted -ne $true -or
+              $witness.receipt.actual_recording_export -ne $true) {
+            throw "Four-camera surveillance workspace qualification is incomplete"
+          }
+          foreach ($feature in @(
+            'historical_navigation_default_24h', 'historical_navigation_real_media',
+            'playback_rapid_seek_latest_wins', 'playback_controls_and_zoom',
+            'playback_contiguous_chunk_handoff', 'playback_gap_requires_explicit_navigation',
+            'playback_export_selection_independent', 'export_normal_windows_download',
+            'export_download_survives_browser_close', 'export_download_survives_product_restart',
+            'export_download_opened_in_edge',
+            'product_analytics_enablement', 'analytics_bundled_native_inference',
+            'analytics_gui_configuration', 'analytics_person_event_recorded',
+            'analytics_event_utc_playback', 'analytics_public_fixture_only',
+            'analytics_browser_closed_detection', 'analytics_role_camera_permissions',
+            'analytics_settings_events_persisted',
+            'settings_admin_gui',
+            'settings_storage_policy_live',
+            'settings_storage_policy_restored',
+            'settings_custom_role_assignment',
+            'settings_profile_bound_edit',
+            'settings_custom_role_permission_denied',
+            'settings_role_revoked_sessions',
+            'settings_role_ui_permissions',
+            'settings_time_status_visible',
+            'settings_time_no_clock_changes',
+            'settings_audit_download',
+            'settings_integrations_gui',
+            'settings_analytics_machine_event',
+            'settings_neural_v2_roundtrip',
+            'settings_provider_event_playback',
+            'settings_mfa_enrollment',
+            'settings_mfa_challenge',
+            'settings_mfa_recovery_single_use',
+            'settings_mfa_disabled',
+            'settings_oidc_signed_pkce',
+            'settings_oidc_existing_role',
+            'settings_restored_before_restart'
+          )) {
+            if ($witness.receipt.$feature -isnot [bool] -or $witness.receipt.$feature -ne $true) {
+              throw "Executed playback, export and analytics qualification is incomplete: $feature"
+            }
           }
           $release = Join-Path $env:GITHUB_WORKSPACE "desktop-build/release"
           New-Item -ItemType Directory -Path $release | Out-Null
@@ -174,10 +309,17 @@ jobs:
             launcher_sha256=(Get-FileHash -LiteralPath desktop-build/payload/K5Vision.exe -Algorithm SHA256).Hash.ToLowerInvariant();
             payload_manifest_sha256=(Get-FileHash -LiteralPath desktop-build/payload/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant();
             runtime='CPython 3.12.10 embedded amd64'; installer='Inno Setup 6.4.3';
-            scope='Native Windows ONVIF camera-onboarding recording operator'; no_terminal_required=$true;
+            scope='Native Windows ONVIF surveillance workspace'; no_terminal_required=$true;
             no_external_python_required=$true; no_runtime_package_downloads=$true
             workers_bundled=$false; first_launch_internet_required=$true
             onvif_camera_onboarding=$true; manual_stream_uri_required=$false
+            direct_rtsp_enrollment=$true
+            admin_user_management=$true; role_permissions=$true; camera_access_controls=$true
+            person_analytics_bundled=$true; background_person_events=$true
+            storage_settings=$true; windows_time_administration=$true; camera_time_administration=$true
+            operational_audit=$true; custom_roles=$true; mfa=$true; oidc_sso=$true
+            neural_adapter_v2=$true; analytics_event_adapter=$true; shared_neural_host=$false
+            surveillance_workspace=$true; four_camera_wall=$true; actual_recording_export=$true
           }
           $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $release "desktop-package.json") -Encoding utf8
       - name: Upload qualified graphical Windows installer
@@ -200,7 +342,7 @@ jobs:
 
   vm-clock:
     name: Exercise real clock corrections on a second disposable Windows VM
-    needs: native-desktop
+    needs: [native-desktop, focused-windows]
     runs-on: windows-2025
     timeout-minutes: 15
     env:
@@ -226,6 +368,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "VM test dependency install failed" }
       - name: Provision all pinned recording tools before changing guest time
         uses: ./.github/actions/provision-operator-tools
+      - name: Provision the admitted public person fixture before changing guest time
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Installed analytics fixture admission failed" }
       - name: Download the installer exercised by the first VM
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
@@ -257,7 +404,7 @@ jobs:
           python -m pytest tests/unit/test_windows_vm_clock.py tests/unit/test_windows_vm_clock_receipt.py -o addopts= --no-cov --tb=short
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Exercise installed GUI, real UTC steps and restoration
-        timeout-minutes: 8
+        timeout-minutes: 10
         shell: pwsh
         run: |
           python -m pytest tests/integration/test_windows_desktop_app.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=180 --junitxml=vm-clock-windows.xml

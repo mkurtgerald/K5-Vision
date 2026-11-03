@@ -661,8 +661,10 @@ def test_cancelled_workers_keep_slots_until_real_work_finishes(monkeypatch):
 
 def test_discovery_extracts_only_source_free_same_sender_candidates():
     body = (
-        f'<s:Envelope xmlns:s="{onvif._SOAP}" xmlns:d="{onvif._WSD}">'
+        f'<s:Envelope xmlns:s="{onvif._SOAP}" xmlns:d="{onvif._WSD}" '
+        f'xmlns:dn="{onvif._NETWORK}">'
         "<s:Body><d:ProbeMatches><d:ProbeMatch>"
+        "<d:Types>dn:NetworkVideoTransmitter</d:Types>"
         "<d:Scopes>onvif://www.onvif.org/name/Front%20Door</d:Scopes>"
         "<d:XAddrs>http://127.0.0.1:8899/onvif/device_service "
         "https://127.0.0.1/device http://192.0.2.1/device "
@@ -705,10 +707,11 @@ def test_discovery_transport_is_fixed_local_multicast_and_candidate_count_bounde
         def recvfrom(self, size):
             self.count += 1
             host = f"192.0.2.{self.count}"
-            return f"<ProbeMatch><XAddrs>http://{host}/device</XAddrs></ProbeMatch>".encode(), (
-                host,
-                3702,
-            )
+            return (
+                f'<ProbeMatch xmlns:dn="{onvif._NETWORK}">'
+                f"<Types>dn:NetworkVideoTransmitter</Types>"
+                f"<XAddrs>http://{host}/device</XAddrs></ProbeMatch>"
+            ).encode(), (host, 3702)
 
     wire = Wire()
     monkeypatch.setattr(onvif.socket, "socket", lambda *args: wire)

@@ -1,9 +1,11 @@
 import json
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 
 from k5vision.auth_sessions import DEFAULT_SESSION_TTL_SECONDS
+from k5vision.domain.users import UserPatch
 from k5vision.main import (
     CONTROL_PLANE_READ_TOKEN_ENV,
     CONTROL_PLANE_SITE_ENV,
@@ -73,6 +75,42 @@ def _login(client: TestClient, username: str, password: str = PASSWORD) -> dict[
     )
     assert response.status_code == 200
     return response.json()
+
+
+def test_durable_demotion_denies_stale_admin_session_without_revoke_callback():
+    application = create_app()
+    with TestClient(application) as client:
+        account = _create_initialized_user(client, username="admin.one", role="administrator")
+        _create_initialized_user(client, username="admin.two", role="administrator")
+        token = str(_login(client, "admin.one")["session_token"])
+        application.state.user_registry.update(
+            UUID(str(account["id"])), UserPatch(role="viewer"), actor="admin.two"
+        )
+        assert client.get("/api/v1/users", headers=_headers(token)).status_code == 401
+        assert client.get("/api/v1/auth/me", headers=_headers(token)).status_code == 401
+
+
+def test_password_reset_denies_existing_session_before_any_revoke_callback():
+    application = create_app()
+    with TestClient(application) as client:
+        account = _create_initialized_user(client, username="operator.one", role="operator")
+        token = str(_login(client, "operator.one")["session_token"])
+        _, temporary, _ = application.state.user_registry.reset_bootstrap(
+            UUID(str(account["id"])), actor="admin"
+        )
+        assert client.get("/api/v1/auth/me", headers=_headers(token)).status_code == 401
+        assert (
+            client.post(
+                "/api/v1/auth/bootstrap-password",
+                json={
+                    "username": "operator.one",
+                    "temporary_credential": temporary,
+                    "new_password": "replacement operator password",
+                },
+            ).status_code
+            == 204
+        )
+        assert client.get("/api/v1/auth/me", headers=_headers(token)).status_code == 401
 
 
 def test_initialized_admin_can_login_and_use_same_bounded_admin_surface() -> None:

@@ -40,6 +40,12 @@ _TESTS = {
             "operator_beta_browser_receipt",
         )
     ],
+    "admin": [
+        (
+            "test_real_browser_admin_users_roles_camera_access_and_restart",
+            "operator_admin_browser_receipt",
+        ),
+    ],
     "person": [
         (
             "test_native_person_broker_positive_blank_capacity_and_cleanup",
@@ -52,6 +58,12 @@ _TESTS = {
     ],
 }
 _TRUE = {
+    "admin": (
+        "admin_user_management role_permissions camera_access_controls admin_user_creation "
+        "admin_bootstrap_password_change admin_password_reset admin_disable_reenable "
+        "admin_live_media_revocation admin_audit_visible admin_state_persisted "
+        "generated_media_only owned_cleanup"
+    ).split(),
     "launcher": (
         "preprovisioned_identity wheel_install isolated_wheel_import health "
         "administrator_login worker_ready owned_tree_cleanup"
@@ -81,7 +93,20 @@ _TRUE = {
         "ui_removal_preserved_files_and_denied_media ui_reenrollment_restored_history "
         "onvif_credential_profile_enrollment no_manual_stream_uri onvif_clock_skew_compensated "
         "onvif_time_health_displayed recorder_time_health_displayed "
-        "server_utc_rolling_history browser_clock_skew_session_preserved"
+        "server_utc_rolling_history browser_clock_skew_session_preserved "
+        "generated_media_only ui_four_camera_enrollment four_camera_wall wall_outage_recovery "
+        "recording_pause_live_continues recording_pause_others_continue "
+        "recording_preference_persisted recording_resume_growth ui_recording_controls "
+        "timeline_seek_playback actual_download_saved_and_decoded logout_destroyed_wall_tiles "
+        "logout_background_recording_continues authenticated_camera_read "
+        "rtsp_anonymous_read_rejected rtsp_wrong_password_rejected wall_viewport_fit "
+        "direct_rtsp_enrollment direct_rtsp_fresh_enrollment "
+        "direct_rtsp_multi_channel_same_endpoint direct_rtsp_wrong_password_rejected "
+        "direct_rtsp_reconnect_preserved_identity direct_rtsp_history_and_export "
+        "historical_navigation_default_24h historical_navigation_real_media "
+        "playback_rapid_seek_latest_wins playback_controls_and_zoom "
+        "playback_contiguous_chunk_handoff playback_gap_requires_explicit_navigation "
+        "playback_export_selection_independent"
     ).split(),
     "person": (
         "single_flight_busy independent_view_workers third_view_capacity_denied "
@@ -100,6 +125,89 @@ _TRUE = {
 def _require(value: bool) -> None:
     if not value:
         raise ValueError("Native sprint acceptance receipt is incomplete or did not execute")
+
+
+def _integers(value, count, minimum):
+    _require(type(value) is list and len(value) == count)
+    _require(all(type(item) is int and minimum <= item <= 2**63 - 1 for item in value))
+    return value
+
+
+def _browser_nvr_journey(receipt):
+    for field, expected in (
+        ("historical_recorded_seconds", 10800),
+        ("historical_recording_file_count", 18),
+        ("historical_recording_gap_seconds", 600),
+        ("historical_fixture_fps", 1),
+    ):
+        _require(type(receipt.get(field)) is int and receipt[field] == expected)
+    chunk = receipt.get("playback_chunk_seconds")
+    _require(type(chunk) in (int, float) and math.isfinite(chunk) and 60 <= chunk <= 300)
+    frames = receipt.get("playback_continuation_decoded_frames")
+    _require(type(frames) is int and 4 <= frames <= 100000)
+    _require(type(receipt.get("camera_count")) is int and receipt["camera_count"] == 4)
+    layouts = receipt.get("wall_layouts")
+    _require(type(layouts) is list and len(layouts) == 3)
+    _require(all(type(count) is int for count in layouts) and layouts == [1, 4, 9])
+    viewport = receipt.get("wall_viewport")
+    _require(type(viewport) is list and len(viewport) == 2)
+    _require(all(type(size) is int for size in viewport) and viewport == [1440, 900])
+    for field, minimum in (
+        ("direct_rtsp_live_decoded_frames", 4),
+        ("direct_rtsp_playback_decoded_frames", 4),
+        ("direct_rtsp_export_decoded_frames", 1),
+        ("direct_rtsp_recording_bytes_before", 0),
+        ("direct_rtsp_recording_bytes_after", 1),
+    ):
+        value = receipt.get(field)
+        _require(type(value) is int and minimum <= value <= 2**63 - 1)
+    _require(
+        receipt["direct_rtsp_recording_bytes_after"] > receipt["direct_rtsp_recording_bytes_before"]
+    )
+    for field in (
+        "real_camera_acceptance",
+        "analytics_acceptance",
+        "long_duration_acceptance",
+        "hardware_capacity_acceptance",
+    ):
+        _require(receipt.get(field) is False)
+    for field, count, minimum in (
+        ("wall_decoded_frames", 4, 4),
+        ("wall_reconnected_decoded_frames", 4, 4),
+        ("wall_outage_other_decoded_frames", 3, 4),
+        ("export_decoded_frames", 4, 1),
+        ("logout_wall_decoded_frames", 4, 4),
+    ):
+        _integers(receipt.get(field), count, minimum)
+    before = _integers(receipt.get("per_camera_recording_bytes_before"), 4, 0)
+    after = _integers(receipt.get("per_camera_recording_bytes_after"), 4, 0)
+    _require(all(end > start for start, end in zip(before, after, strict=True)))
+    outage_before = _integers(receipt.get("wall_outage_other_decoded_frames_before"), 3, 4)
+    outage_after = _integers(receipt.get("wall_outage_other_decoded_frames"), 3, 4)
+    _require(all(end >= start + 4 for start, end in zip(outage_before, outage_after, strict=True)))
+    for prefix in ("wall_outage_other_recording_bytes", "pause_other_recording_bytes"):
+        before = _integers(receipt.get(prefix + "_before"), 3, 0)
+        after = _integers(receipt.get(prefix + "_after"), 3, 0)
+        _require(all(end > start for start, end in zip(before, after, strict=True)))
+    for field in (
+        "pause_live_decoded_frames_before",
+        "pause_live_decoded_frames_after",
+        "pause_recording_bytes_before",
+        "pause_recording_bytes_after",
+        "paused_recording_bytes_after_restart",
+        "resumed_recording_bytes",
+    ):
+        value = receipt.get(field)
+        _require(type(value) is int and 0 < value <= 2**63 - 1)
+    _require(
+        receipt["pause_live_decoded_frames_after"] > receipt["pause_live_decoded_frames_before"]
+    )
+    _require(
+        receipt["pause_recording_bytes_before"]
+        == receipt["pause_recording_bytes_after"]
+        == receipt["paused_recording_bytes_after_restart"]
+        < receipt["resumed_recording_bytes"]
+    )
 
 
 def verify(lane: str, path: Path) -> list[dict]:
@@ -153,6 +261,37 @@ def verify(lane: str, path: Path) -> list[dict]:
         elif lane == "install":
             _require(str(receipt.get("powershell_version", "")).startswith("5.1"))
             _require(receipt.get("windows_service") is False)
+        elif lane == "admin":
+            for field in (
+                "physical_camera_acceptance",
+                "capacity_acceptance",
+                "endurance_acceptance",
+                "host_clock_step_acceptance",
+                "user_terminal_required",
+            ):
+                _require(receipt.get(field) is False)
+            _require(receipt.get("browser_channel") == "msedge")
+            _require(receipt.get("playwright_version") == "1.58.0")
+            _require(bool(receipt.get("browser_version")))
+            _require(type(receipt.get("camera_count")) is int and receipt["camera_count"] == 2)
+            for field in (
+                "admin_viewer_live_decoded_frames",
+                "admin_operator_live_decoded_frames",
+                "admin_restart_viewer_live_decoded_frames",
+            ):
+                value = receipt.get(field)
+                _require(type(value) is int and 4 <= value <= 100000)
+            _require(type(receipt.get("admin_user_count_created")) is int)
+            _require(receipt["admin_user_count_created"] == 2)
+            events = receipt.get("admin_audit_event_count")
+            _require(type(events) is int and 3 <= events <= 100000)
+            denied = receipt.get("admin_denied_http_statuses")
+            _require(type(denied) is list and 6 <= len(denied) <= 32)
+            _require(all(type(status) is int and status in {401, 403, 404} for status in denied))
+            _require(receipt.get("browser_script_errors") == 0)
+            duration = receipt.get("duration_seconds")
+            _require(type(duration) in (int, float) and math.isfinite(duration))
+            _require(0 < duration < 180)
         elif lane == "browser":
             _require(receipt.get("host_clock_step_acceptance") is False)
             _require(type(receipt.get("browser_date_skew_seconds")) is int)
@@ -161,10 +300,10 @@ def verify(lane: str, path: Path) -> list[dict]:
             _require(receipt.get("browser_channel") == "msedge")
             _require(receipt.get("playwright_version") == "1.58.0")
             _require(bool(receipt.get("browser_version")))
-            _require(receipt.get("camera_count") == 2)
+            _browser_nvr_journey(receipt)
             offsets = receipt.get("onvif_clock_offsets_seconds")
             reads = receipt.get("onvif_time_read_counts")
-            _require(type(offsets) is list and len(offsets) == 2)
+            _require(type(offsets) is list and len(offsets) == 4)
             _require(
                 all(
                     type(offset) in (int, float)
@@ -174,13 +313,12 @@ def verify(lane: str, path: Path) -> list[dict]:
                 )
             )
             _require(offsets[0] > 0 > offsets[1])
-            _require(type(reads) is list and len(reads) == 2)
+            _require(type(reads) is list and len(reads) == 4)
             _require(all(type(count) is int and 0 < count <= 128 for count in reads))
             _require(receipt.get("browser_script_errors") == 0)
-            for field, count in (("live_decoded_frames", 3), ("playback_decoded_frames", 2)):
-                frames = receipt.get(field, [])
-                _require(len(frames) == count and all(type(n) is int and n >= 4 for n in frames))
-            _require(0 < receipt.get("duration_seconds", 0) < 180)
+            for field, count in (("live_decoded_frames", 3), ("playback_decoded_frames", 4)):
+                _integers(receipt.get(field), count, 4)
+            _require(0 < receipt.get("duration_seconds", 0) < 240)
         elif group == "person-view":
             _require(receipt.get("portable_ancestor_adjustment") is False)
             _require(receipt.get("browser_channel") == "msedge")

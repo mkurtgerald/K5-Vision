@@ -30,8 +30,10 @@ MAX_RESPONSE_BYTES = 262_144
 # A full day of the generated worker's 60-second segments, including its open
 # segment, fits this bound. Playback queries independently cover at most one day.
 MAX_RECORDING_ITEMS = 2_048
+MAX_SNAPSHOT_PATHS = 64
 _SITE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _STREAM = re.compile(r"[A-Za-z0-9._:-]{1,256}")
+_PATH = re.compile(r"k5_[0-9a-f]{64}")
 
 
 class MediaWorkerErrorCode(StrEnum):
@@ -223,6 +225,76 @@ def _recording_id(binding: MediaMTXBinding, started: datetime) -> str:
     return hashlib.sha256((binding.path_name + ":" + started.isoformat()).encode()).hexdigest()
 
 
+def _path_state(binding: MediaMTXBinding, result: object) -> MediaPathState:
+    if not isinstance(result, dict) or result.get("name") != binding.path_name:
+        raise ValueError
+    tracks, readers = result.get("tracks2"), result.get("readers")
+    tracks = [] if tracks is None else tracks
+    readers = [] if readers is None else readers
+    if not isinstance(tracks, list) or not isinstance(readers, list):
+        raise ValueError
+    if len(tracks) > 32 or len(readers) > MAX_RECORDING_ITEMS:
+        raise ValueError
+    codecs = set()
+    for track in tracks:
+        if not isinstance(track, dict) or not isinstance(track.get("codec"), str):
+            raise ValueError
+        codec = track["codec"].lower()
+        if codec in {"h264", "h265", "mjpeg"}:
+            codecs.add(VideoCodec(codec))
+    return MediaPathState(
+        binding.device_id,
+        binding.stream_token,
+        _boolean(result.get("available")),
+        _boolean(result.get("online")),
+        tuple(sorted(codecs)),
+        len(readers),
+        _count(result.get("inboundBytes")),
+        _count(result.get("outboundBytes")),
+    )
+
+
+def _path_configuration(binding: MediaMTXBinding, result: object) -> MediaPathConfiguration:
+    if not isinstance(result, dict) or result.get("recordFormat") != "fmp4":
+        raise ValueError
+    return MediaPathConfiguration(
+        binding.device_id,
+        binding.stream_token,
+        _boolean(result.get("record")),
+        _boolean(result.get("sourceOnDemand")),
+        "fmp4",
+    )
+
+
+def _path_list(result: object) -> dict[str, dict]:
+    if not isinstance(result, dict):
+        raise ValueError
+    items, count, pages = result.get("items"), result.get("itemCount"), result.get("pageCount")
+    if (
+        not isinstance(items, list)
+        or len(items) > MAX_SNAPSHOT_PATHS
+        or type(count) is not int
+        or count != len(items)
+        or type(pages) is not int
+        or pages != (1 if items else 0)
+    ):
+        raise ValueError
+    indexed = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError
+        name = item.get("name")
+        if not isinstance(name, str) or _PATH.fullmatch(name) is None or name in indexed:
+            raise ValueError
+        indexed[name] = item
+    return indexed
+
+
+PathSnapshot = dict[
+    MediaMTXBinding, tuple[MediaPathState, MediaPathConfiguration] | MediaWorkerErrorCode
+]
+
+
 class MediaMTXProvider:
     """Bound asynchronous reads of one site-owned, fixed-version local worker.
 
@@ -268,6 +340,9 @@ class MediaMTXProvider:
         self._requester = requester
         self._requests: set[asyncio.Task] = set()
         self._version_admitted = False
+        self._snapshots: dict[tuple[MediaMTXBinding, ...], asyncio.Task] = {}
+        self._closed = False
+        self._close_task: asyncio.Task | None = None
 
     def _binding(self, binding: MediaMTXBinding) -> str:
         if not isinstance(binding, MediaMTXBinding) or binding.site_id != self._site_id:
@@ -311,6 +386,8 @@ class MediaMTXProvider:
             task.exception()
 
     async def _get(self, origin: str, route: str) -> object:
+        if self._closed:
+            raise MediaWorkerError(MediaWorkerErrorCode.UNAVAILABLE)
         if len(self._requests) >= self._max_active:
             raise MediaWorkerError(MediaWorkerErrorCode.BUSY)
         task = asyncio.create_task(asyncio.to_thread(self._read, origin, route))
@@ -323,6 +400,8 @@ class MediaMTXProvider:
             timed_out = True
         if timed_out:
             raise MediaWorkerError(MediaWorkerErrorCode.TIMEOUT)
+        if self._closed:
+            raise MediaWorkerError(MediaWorkerErrorCode.UNAVAILABLE)
         if isinstance(result, MediaWorkerErrorCode):
             raise MediaWorkerError(result)
         return result
@@ -345,6 +424,8 @@ class MediaMTXProvider:
         return MediaWorkerInfo(MEDIAMTX_VERSION, started)
 
     async def _admit(self) -> None:
+        if self._closed:
+            raise MediaWorkerError(MediaWorkerErrorCode.UNAVAILABLE)
         if not self._version_admitted:
             await self.info()
 
@@ -354,33 +435,7 @@ class MediaMTXProvider:
         result = await self._get(self._api_origin, "/v3/paths/get/" + quote(path, safe=""))
         invalid = False
         try:
-            if not isinstance(result, dict) or result.get("name") != path:
-                raise ValueError
-            tracks = result.get("tracks2")
-            readers = result.get("readers")
-            tracks = [] if tracks is None else tracks
-            readers = [] if readers is None else readers
-            if not isinstance(tracks, list) or not isinstance(readers, list):
-                raise ValueError
-            if len(tracks) > 32 or len(readers) > MAX_RECORDING_ITEMS:
-                raise ValueError
-            codecs = set()
-            for track in tracks:
-                if not isinstance(track, dict) or not isinstance(track.get("codec"), str):
-                    raise ValueError
-                codec = track["codec"].lower()
-                if codec in {"h264", "h265", "mjpeg"}:
-                    codecs.add(VideoCodec(codec))
-            state = MediaPathState(
-                binding.device_id,
-                binding.stream_token,
-                _boolean(result.get("available")),
-                _boolean(result.get("online")),
-                tuple(sorted(codecs)),
-                len(readers),
-                _count(result.get("inboundBytes")),
-                _count(result.get("outboundBytes")),
-            )
+            state = _path_state(binding, result)
         except (ValueError, TypeError, KeyError):
             invalid = True
         if invalid:
@@ -393,20 +448,107 @@ class MediaMTXProvider:
         result = await self._get(self._api_origin, "/v3/config/paths/get/" + quote(path, safe=""))
         invalid = False
         try:
-            if not isinstance(result, dict) or result.get("recordFormat") != "fmp4":
-                raise ValueError
-            configuration = MediaPathConfiguration(
-                binding.device_id,
-                binding.stream_token,
-                _boolean(result.get("record")),
-                _boolean(result.get("sourceOnDemand")),
-                "fmp4",
-            )
+            configuration = _path_configuration(binding, result)
         except (ValueError, TypeError):
             invalid = True
         if invalid:
             raise MediaWorkerError(MediaWorkerErrorCode.INVALID_RESPONSE)
         return configuration
+
+    async def _path_snapshot(self, bindings: tuple[MediaMTXBinding, ...]) -> PathSnapshot:
+        try:
+            await self._admit()
+            states = _path_list(
+                await self._get(self._api_origin, "/v3/paths/list?itemsPerPage=64&page=0")
+            )
+            configurations = _path_list(
+                await self._get(self._api_origin, "/v3/config/paths/list?itemsPerPage=64&page=0")
+            )
+        except MediaWorkerError as error:
+            return dict.fromkeys(bindings, error.code)
+        except (ValueError, TypeError, KeyError):
+            return dict.fromkeys(bindings, MediaWorkerErrorCode.INVALID_RESPONSE)
+        snapshot: PathSnapshot = {}
+        for binding in bindings:
+            path = binding.path_name
+            if path not in states or path not in configurations:
+                snapshot[binding] = MediaWorkerErrorCode.NOT_FOUND
+                continue
+            try:
+                snapshot[binding] = (
+                    _path_state(binding, states[path]),
+                    _path_configuration(binding, configurations[path]),
+                )
+            except (ValueError, TypeError, KeyError):
+                snapshot[binding] = MediaWorkerErrorCode.INVALID_RESPONSE
+        return snapshot
+
+    def _snapshot_completed(
+        self, bindings: tuple[MediaMTXBinding, ...], task: asyncio.Task
+    ) -> None:
+        if self._snapshots.get(bindings) is task:
+            del self._snapshots[bindings]
+        if not task.cancelled():
+            task.exception()
+
+    async def path_snapshot(self, bindings: tuple[MediaMTXBinding, ...]) -> PathSnapshot:
+        """Read up to 64 enrolled paths with two sequential, bounded list requests.
+
+        Concurrent readers of the same selection share only their in-flight
+        snapshot. Cancellation of one reader leaves the native request bound
+        intact; subsequent completed reads obtain a fresh worker observation.
+        """
+        if not isinstance(bindings, tuple) or len(bindings) > MAX_SNAPSHOT_PATHS:
+            raise ValueError("media snapshot requires at most 64 unique site-owned selections")
+        paths = [self._binding(binding) for binding in bindings]
+        if len(set(paths)) != len(paths):
+            raise ValueError("media snapshot requires at most 64 unique site-owned selections")
+        if not bindings:
+            return {}
+        if self._closed:
+            return dict.fromkeys(bindings, MediaWorkerErrorCode.UNAVAILABLE)
+        selected = tuple(binding for _, binding in sorted(zip(paths, bindings, strict=True)))
+        task = self._snapshots.get(selected)
+        if task is None:
+            if len(self._snapshots) >= self._max_active:
+                return dict.fromkeys(bindings, MediaWorkerErrorCode.BUSY)
+            task = asyncio.create_task(self._path_snapshot(selected))
+            self._snapshots[selected] = task
+            task.add_done_callback(lambda finished: self._snapshot_completed(selected, finished))
+        return dict(await asyncio.shield(task))
+
+    async def _close_requests(self) -> None:
+        snapshots = tuple(self._snapshots.values())
+        for task in snapshots:
+            task.cancel()
+        if snapshots:
+            await asyncio.gather(*snapshots, return_exceptions=True)
+        # Cancelling to_thread tasks would free their tracked slots before the
+        # native readers exit. Only coroutine owners are cancelled; actual reads
+        # remain joined until the underlying request returns.
+        requests = tuple(self._requests)
+        if requests:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in requests), return_exceptions=True
+            )
+
+    async def aclose(self) -> None:
+        """Close admission and join every real native read before releasing ownership."""
+        self._closed = True
+        self._version_admitted = False
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_requests())
+        interrupted = False
+        while True:
+            try:
+                await asyncio.shield(self._close_task)
+                break
+            except asyncio.CancelledError:
+                if self._close_task.cancelled():
+                    raise
+                interrupted = True
+        if interrupted:
+            raise asyncio.CancelledError
 
     async def recordings(self, binding: MediaMTXBinding) -> tuple[MediaRecordingSegment, ...]:
         path = self._binding(binding)

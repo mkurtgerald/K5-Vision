@@ -14,7 +14,21 @@ from pathlib import Path
 
 from k5vision.media.mediamtx_provider import MediaMTXCredentials
 
-_ASSETS = ("index.html", "app.css", "app.js")
+_ASSETS = (
+    "index.html",
+    "app.css",
+    "app.js",
+    "wall.css",
+    "wall.js",
+    "timeline.css",
+    "timeline.js",
+    "admin.css",
+    "admin.js",
+    "analytics.css",
+    "analytics.js",
+    "settings.css",
+    "settings.js",
+)
 _AUTH_ROUTE = "/api/v1/operator/media-auth"
 _UNTRUSTED_HEADERS = ["Forwarded", "X-Forwarded-*", "X-K5-*"]
 
@@ -22,6 +36,9 @@ _UNTRUSTED_HEADERS = ["Forwarded", "X-Forwarded-*", "X-K5-*"]
 def _transport() -> dict:
     return {
         "protocol": "http",
+        # Uvicorn closes idle control connections after five seconds. Retire
+        # them first, so a mutation cannot race a stale pooled connection.
+        "keep_alive": {"idle_timeout": "2s"},
         "dial_timeout": "2s",
         "response_header_timeout": "10s",
         "read_timeout": "15s",
@@ -138,6 +155,11 @@ def generate_operator_gateway_configuration(
     javascript = _proxy(hls_port, uri="/_k5_assets/hls.min.js")
     javascript["headers"] = {"request": {"delete": ["Cookie", "Authorization"]}}
     host_expression = f"{{http.request.hostport}} == '127.0.0.1:{public_port}'"
+    administration = _proxy(control_port)
+    # Native elevation waits for the user's Windows consent and owns its work
+    # through cancellation. Do not cut that operation off at the media timeout.
+    administration["transport"]["response_header_timeout"] = "80s"
+    administration["transport"]["read_timeout"] = "80s"
     if public_port == 80:
         # Browsers omit the default HTTP port from Host even when the URL
         # explicitly contains it. Both forms still address this one listener.
@@ -163,7 +185,29 @@ def generate_operator_gateway_configuration(
             ]
         },
         {
+            "match": [
+                {
+                    "path": [
+                        "/api/v1/operator/admin/*",
+                        "/api/v1/operator/cameras/*/time",
+                        "/api/v1/operator/cameras/*/time/*",
+                        "/api/v1/auth/oidc/*",
+                    ]
+                }
+            ],
+            "handle": [administration],
+            "terminal": True,
+        },
+        {
             "match": [{"path": ["/api/*"]}],
+            "handle": [_proxy(control_port)],
+            "terminal": True,
+        },
+        {
+            "match": [{"method": ["GET"], "path": ["/media/exports/*"]}],
+            # The application checks the existing /media session cookie,
+            # current camera grants, job ownership and completed file identity.
+            # These are private output files, never a public directory route.
             "handle": [_proxy(control_port)],
             "terminal": True,
         },
@@ -210,7 +254,10 @@ def generate_operator_gateway_configuration(
         },
         {
             "match": [
-                {"method": ["GET", "HEAD"], "path": ["/operator/app.css", "/operator/app.js"]}
+                {
+                    "method": ["GET", "HEAD"],
+                    "path": ["/operator/" + name for name in _ASSETS if name != "index.html"],
+                }
             ],
             "handle": [
                 {"handler": "rewrite", "strip_path_prefix": "/operator"},
