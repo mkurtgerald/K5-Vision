@@ -1894,6 +1894,15 @@ def _vm_clock_phase(
     original_token = client.token
     captured_live = []
     non_loopback = []
+    phase_times = []
+    phase_checkpoint = time.monotonic()
+    diagnostic["vm_clock_phase_seconds"] = phase_times
+
+    def mark_clock_phase(name):
+        nonlocal phase_checkpoint
+        now = time.monotonic()
+        phase_times.append((name, round(now - phase_checkpoint, 2)))
+        phase_checkpoint = now
 
     def observed_request(request):
         parsed = urlsplit(request.url)
@@ -1957,6 +1966,7 @@ def _vm_clock_phase(
     )
     before_history = client.json(route + "/history" + history_query)["spans"]
     _require(bool(before_history), "VM clock pre-shift recording history is empty")
+    mark_clock_phase("closed_footage_admission")
     page.on("request", observed_request)
     processes.append(
         _publish_fixture(parent, ffmpeg, source_uri, helpers, credentials=publisher_credentials)
@@ -1978,6 +1988,7 @@ def _vm_clock_phase(
         and context.request.get(live_url, timeout=5000).status == 200,
         "VM clock baseline authenticated live media failed",
     )
+    mark_clock_phase("source_reconnect_live")
     phases = []
     guard = _helpers("windows_vm_clock").WindowsVmClockGuard(
         parent / "vm-clock-guard.json", watchdog_seconds=90
@@ -1995,6 +2006,7 @@ def _vm_clock_phase(
                 native = guard.shift(offset)
                 actual_step = native["actual_step_seconds"]
                 diagnostic["vm_clock_native_step_seconds"] = actual_step
+                mark_clock_phase(direction + "_native_shift")
                 _require(
                     type(actual_step) in (int, float) and abs(actual_step - offset) <= 2,
                     "VM clock native UTC did not perform the requested real step",
@@ -2051,6 +2063,7 @@ def _vm_clock_phase(
                     process=app,
                     timeout=10,
                 )
+                mark_clock_phase(direction + "_recorder_warning")
                 # Observe at least two normal five-second storage-maintenance
                 # cycles and allow pre-step live buffers to drain naturally.
                 _wait(
@@ -2059,6 +2072,7 @@ def _vm_clock_phase(
                     process=app,
                     timeout=15,
                 )
+                mark_clock_phase(direction + "_two_maintenance_cycles")
                 diagnostic["vm_clock_stage"] = direction + "_live"
                 live_status = context.request.get(live_url, timeout=5000).status
                 diagnostic["vm_clock_media_http_status"] = live_status
@@ -2151,12 +2165,14 @@ def _vm_clock_phase(
                     abs(held["baseline_residual_seconds"] - offset) <= 2,
                     "VM clock requested UTC step did not remain in effect",
                 )
+                mark_clock_phase(direction + "_live_recording_history")
                 diagnostic["vm_clock_stage"] = direction + "_restore"
                 restoration = guard.restore()
                 _require(
                     restoration["restored"] is True and abs(restoration["residual_seconds"]) <= 2,
                     "VM clock UTC restoration was not verified",
                 )
+                mark_clock_phase(direction + "_native_restore")
                 # Force an observation of the correction before the next phase,
                 # so its signed step is measured from restored recorder UTC.
                 client.json("/api/v1/operator/status")
@@ -2218,6 +2234,7 @@ def _vm_clock_phase(
         and guard_receipt["services_restored"] is True,
         "VM clock guard did not restore UTC and original guest time services",
     )
+    mark_clock_phase("restored_playback")
     diagnostic["vm_clock_stage"] = "complete"
     return {
         "schema_version": "1",
@@ -3184,6 +3201,11 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     _require(not cohort.console_seen and not cohort.failed, "Desktop opened a console window")
     elapsed = time.monotonic() - started
     print("Desktop qualification stage seconds: " + json.dumps(stage_durations))
+    if vm_clock_enabled:
+        print(
+            "Desktop VM clock phase seconds: "
+            + json.dumps(vm_clock_diagnostic.get("vm_clock_phase_seconds", []))
+        )
     _require(
         elapsed < 360,
         "Desktop qualification exceeded its bounded VM duration"
