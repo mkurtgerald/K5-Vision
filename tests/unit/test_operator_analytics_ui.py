@@ -261,7 +261,6 @@ def test_provider_events_preserve_status_utc_and_assigned_camera_navigation(anal
     assert not errors
 
 
-
 def test_unchanged_provider_poll_preserves_focused_playback_button(analytics_page):
     page, errors = analytics_page
     page.evaluate(
@@ -328,6 +327,7 @@ def test_unchanged_provider_poll_preserves_focused_playback_button(analytics_pag
     page.wait_for_function("window.seeks.length === 2")
     assert page.evaluate("window.seeks[1].timestamp") == "2026-10-26T23:59:12Z"
     assert not errors
+
 
 def test_unassigned_provider_event_is_rejected_and_custom_role_cannot_change_detection(
     analytics_page,
