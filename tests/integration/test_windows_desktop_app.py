@@ -1878,6 +1878,7 @@ def _vm_clock_phase(
                         return status
                     return None
 
+                diagnostic["vm_clock_stage"] = direction + "_signed_recorder_alert"
                 changed = _wait(
                     clock_changed, "VM clock signed recorder alert", process=app, timeout=10
                 )
@@ -1891,7 +1892,14 @@ def _vm_clock_phase(
                     and client.json("/api/v1/auth/me").get("role") == "administrator",
                     "VM clock step invalidated the existing human session",
                 )
-                page.locator("#recorder-time-warning").wait_for(state="visible", timeout=10_000)
+                diagnostic["vm_clock_stage"] = direction + "_warning_visible"
+                _wait(
+                    lambda: page.locator("#recorder-time-warning").is_visible(),
+                    "VM clock warning visible after real step",
+                    process=app,
+                    timeout=10,
+                )
+                diagnostic["vm_clock_stage"] = direction + "_warning_direction"
                 _wait(
                     lambda direction=direction: (
                         direction in page.locator("#recorder-time-warning").inner_text()
@@ -1900,6 +1908,7 @@ def _vm_clock_phase(
                     process=app,
                     timeout=10,
                 )
+                diagnostic["vm_clock_stage"] = direction + "_recorder_utc"
                 _wait(
                     displayed_recorder_utc_matches,
                     "VM clock visible recorder UTC",
