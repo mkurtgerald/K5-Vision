@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -365,6 +365,33 @@ def test_event_seek_refreshes_stale_recording_inventory_once():
         expect(page.locator("#playback-video")).to_have_attribute("data-utc-start", expected)
         expect(page.locator("#history-count")).to_have_text("19")
         assert len(requests) == 2
+
+
+
+def test_rolling_history_keeps_events_from_the_current_recorder_second():
+    """A fresh event must not disappear because the history end was truncated to a second."""
+    recorded_at = _NOW + timedelta(milliseconds=100)
+    server_utc = (_NOW + timedelta(milliseconds=875)).isoformat().replace("+00:00", "Z")
+
+    def fractional_clock(route):
+        if urlsplit(route.request.url).path == "/api/v1/operator/status":
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps({"worker_status": "ready", "server_utc": server_utc}),
+            )
+            return True
+        return False
+
+    with _history_page(export_handler=fractional_clock) as (page, _expect):
+        with page.expect_response(
+            lambda response: urlsplit(response.url).path.endswith("/history")
+        ) as loaded:
+            page.locator("#last-24-hours").click()
+        bounds = parse_qs(urlsplit(loaded.value.url).query)
+        start = datetime.fromisoformat(bounds["start"][0].replace("Z", "+00:00"))
+        end = datetime.fromisoformat(bounds["end"][0].replace("Z", "+00:00"))
+        assert start <= recorded_at <= end
+        assert end - start == timedelta(days=1)
 
 
 def test_old_recorder_time_response_cannot_reset_a_newer_history_and_event_seek():
