@@ -446,8 +446,10 @@ def test_unchanged_camera_refresh_does_not_replace_active_permissions_controls(
 
         for checked in (True, False, True):
             with page.expect_response(
-                lambda response: response.request.method == "GET"
-                and urlsplit(response.url).path == "/api/v1/operator/cameras"
+                lambda response: (
+                    response.request.method == "GET"
+                    and urlsplit(response.url).path == "/api/v1/operator/cameras"
+                )
             ) as refreshed:
                 page.evaluate("document.getElementById('refresh-cameras').click()")
             assert refreshed.value.status == 200
@@ -464,8 +466,10 @@ def test_unchanged_camera_refresh_does_not_replace_active_permissions_controls(
         page.locator("#admin-display-name").fill("Stable viewer")
         page.locator("#admin-role").select_option("viewer")
         with page.expect_response(
-            lambda response: response.request.method == "POST"
-            and urlsplit(response.url).path == "/api/v1/operator/admin/users"
+            lambda response: (
+                response.request.method == "POST"
+                and urlsplit(response.url).path == "/api/v1/operator/admin/users"
+            )
         ) as created:
             page.locator("#admin-save-user").click()
         assert created.value.status == 201
