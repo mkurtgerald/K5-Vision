@@ -791,6 +791,15 @@ def run_installed_settings_journey(
             settings_mfa_disabled=True,
             settings_mfa_recovery_codes=len(recovery_codes),
         )
+        # These browser contexts have completed every role/MFA assertion.
+        # Release their Edge processes before starting the separate signed
+        # OIDC callback journey instead of leaving unused sessions polling.
+        diagnostic["settings_browser_context_stage"] = "closing_completed_role_mfa"
+        replay_context.close()
+        contexts_to_close.remove(replay_context)
+        user_context.close()
+        contexts_to_close.remove(user_context)
+        diagnostic["settings_browser_context_stage"] = "role_mfa_closed"
 
         diagnostic["settings_stage"] = "oidc"
         _open(page, "sso")
