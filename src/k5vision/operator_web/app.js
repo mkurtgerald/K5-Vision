@@ -1124,7 +1124,8 @@
   function setLastDay() {
     const current = recorderNow();
     if (current === null) return false;
-    const end = new Date(current); end.setUTCMilliseconds(0);
+    // Keep recorder-anchored subsecond UTC so freshly recorded events remain in range.
+    const end = new Date(current);
     $("history-start").value = utcInput(new Date(end.getTime() - state.historyRangeMs), true);
     $("history-end").value = utcInput(end, true);
     $("history-day").value = "";

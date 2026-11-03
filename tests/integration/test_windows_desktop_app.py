@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
@@ -1169,9 +1170,13 @@ def _generate_fixture(
         helpers._stop_owned(upstream)
         raise
     source_uri = f"rtsp://{host}:{upstream_port}/generated"
-    publisher = _publish_fixture(
-        parent, ffmpeg, source_uri, helpers, color=color, credentials=publisher_credentials
-    )
+    try:
+        publisher = _publish_fixture(
+            parent, ffmpeg, source_uri, helpers, color=color, credentials=publisher_credentials
+        )
+    except BaseException:
+        helpers._stop_owned(upstream)
+        raise
     return [upstream, publisher], source_uri
 
 
@@ -1894,6 +1899,15 @@ def _vm_clock_phase(
     original_token = client.token
     captured_live = []
     non_loopback = []
+    phase_times = []
+    phase_checkpoint = time.monotonic()
+    diagnostic["vm_clock_phase_seconds"] = phase_times
+
+    def mark_clock_phase(name):
+        nonlocal phase_checkpoint
+        now = time.monotonic()
+        phase_times.append((name, round(now - phase_checkpoint, 2)))
+        phase_checkpoint = now
 
     def observed_request(request):
         parsed = urlsplit(request.url)
@@ -1957,6 +1971,7 @@ def _vm_clock_phase(
     )
     before_history = client.json(route + "/history" + history_query)["spans"]
     _require(bool(before_history), "VM clock pre-shift recording history is empty")
+    mark_clock_phase("closed_footage_admission")
     page.on("request", observed_request)
     processes.append(
         _publish_fixture(parent, ffmpeg, source_uri, helpers, credentials=publisher_credentials)
@@ -1978,6 +1993,7 @@ def _vm_clock_phase(
         and context.request.get(live_url, timeout=5000).status == 200,
         "VM clock baseline authenticated live media failed",
     )
+    mark_clock_phase("source_reconnect_live")
     phases = []
     guard = _helpers("windows_vm_clock").WindowsVmClockGuard(
         parent / "vm-clock-guard.json", watchdog_seconds=90
@@ -1995,6 +2011,7 @@ def _vm_clock_phase(
                 native = guard.shift(offset)
                 actual_step = native["actual_step_seconds"]
                 diagnostic["vm_clock_native_step_seconds"] = actual_step
+                mark_clock_phase(direction + "_native_shift")
                 _require(
                     type(actual_step) in (int, float) and abs(actual_step - offset) <= 2,
                     "VM clock native UTC did not perform the requested real step",
@@ -2014,6 +2031,7 @@ def _vm_clock_phase(
                         return status
                     return None
 
+                diagnostic["vm_clock_stage"] = direction + "_signed_recorder_alert"
                 changed = _wait(
                     clock_changed, "VM clock signed recorder alert", process=app, timeout=10
                 )
@@ -2027,7 +2045,14 @@ def _vm_clock_phase(
                     and client.json("/api/v1/auth/me").get("role") == "administrator",
                     "VM clock step invalidated the existing human session",
                 )
-                page.locator("#recorder-time-warning").wait_for(state="visible", timeout=10_000)
+                diagnostic["vm_clock_stage"] = direction + "_warning_visible"
+                _wait(
+                    lambda: page.locator("#recorder-time-warning").is_visible(),
+                    "VM clock warning visible after real step",
+                    process=app,
+                    timeout=10,
+                )
+                diagnostic["vm_clock_stage"] = direction + "_warning_direction"
                 _wait(
                     lambda direction=direction: (
                         direction in page.locator("#recorder-time-warning").inner_text()
@@ -2036,12 +2061,14 @@ def _vm_clock_phase(
                     process=app,
                     timeout=10,
                 )
+                diagnostic["vm_clock_stage"] = direction + "_recorder_utc"
                 _wait(
                     displayed_recorder_utc_matches,
                     "VM clock visible recorder UTC",
                     process=app,
                     timeout=10,
                 )
+                mark_clock_phase(direction + "_recorder_warning")
                 # Observe at least two normal five-second storage-maintenance
                 # cycles and allow pre-step live buffers to drain naturally.
                 _wait(
@@ -2050,6 +2077,7 @@ def _vm_clock_phase(
                     process=app,
                     timeout=15,
                 )
+                mark_clock_phase(direction + "_two_maintenance_cycles")
                 diagnostic["vm_clock_stage"] = direction + "_live"
                 live_status = context.request.get(live_url, timeout=5000).status
                 diagnostic["vm_clock_media_http_status"] = live_status
@@ -2142,12 +2170,14 @@ def _vm_clock_phase(
                     abs(held["baseline_residual_seconds"] - offset) <= 2,
                     "VM clock requested UTC step did not remain in effect",
                 )
+                mark_clock_phase(direction + "_live_recording_history")
                 diagnostic["vm_clock_stage"] = direction + "_restore"
                 restoration = guard.restore()
                 _require(
                     restoration["restored"] is True and abs(restoration["residual_seconds"]) <= 2,
                     "VM clock UTC restoration was not verified",
                 )
+                mark_clock_phase(direction + "_native_restore")
                 # Force an observation of the correction before the next phase,
                 # so its signed step is measured from restored recorder UTC.
                 client.json("/api/v1/operator/status")
@@ -2181,24 +2211,39 @@ def _vm_clock_phase(
             diagnostic["vm_clock_guard"] = guard.receipt()
         except RuntimeError:
             diagnostic["vm_clock_guard"] = {"available": False}
-    diagnostic["vm_clock_stage"] = "restored_playback"
+    # Identify the exact failing post-restoration operation without exposing
+    # recorded media, camera addresses or authenticated request contents.
+    diagnostic["vm_clock_stage"] = "restored_closed_hashes"
     _require(_hashes_preserved(closed), "VM clock restoration changed closed footage hashes")
-    restored_history = client.json(route + "/history" + history_query)["spans"]
+    diagnostic["vm_clock_stage"] = "restored_history_query"
+    try:
+        restored_history = client.json(route + "/history" + history_query)["spans"]
+    finally:
+        # The local client reports transport failures as RuntimeError. Retain
+        # only its bounded, route-free exception class and elapsed time.
+        if client.transport_failure is not None:
+            diagnostic["vm_clock_history_transport"] = dict(client.transport_failure)
+    diagnostic["vm_clock_stage"] = "restored_history_unchanged"
     _require(
         all(span in restored_history for span in before_history),
         "VM clock restoration lost retained recording history",
     )
+    diagnostic["vm_clock_stage"] = "restored_browser_history_submit"
     page.locator("#history-tab").click()
     page.locator("#history-start").fill(browser_helpers._datetime_local_value(historical_start))
     page.locator("#history-end").fill(browser_helpers._datetime_local_value(historical_end))
     page.locator("#history-form").evaluate("form => form.requestSubmit()")
+    diagnostic["vm_clock_stage"] = "restored_browser_history_visible"
     page.locator(".history-item").first.wait_for(state="visible", timeout=15_000)
     page.locator(".history-item").first.click()
     page.locator("#play-recording").click()
+    diagnostic["vm_clock_stage"] = "restored_playback_frames"
     playback_frames = browser_helpers._decoded_color(page, "playback-video", "red")
     page.locator("#live-tab").click()
+    diagnostic["vm_clock_stage"] = "restored_live_frames"
     browser_helpers._decoded_color(page, "live-video", "red")
     _require(not non_loopback, "VM clock proof attempted an external request while shifted")
+    diagnostic["vm_clock_stage"] = "restored_guard_receipt"
     guard_receipt = guard.receipt()
     _require(
         guard_receipt["reason"] == "closed"
@@ -2209,6 +2254,7 @@ def _vm_clock_phase(
         and guard_receipt["services_restored"] is True,
         "VM clock guard did not restore UTC and original guest time services",
     )
+    mark_clock_phase("restored_playback")
     diagnostic["vm_clock_stage"] = "complete"
     return {
         "schema_version": "1",
@@ -2370,33 +2416,55 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         )
         receipt["embedded_python_independent_of_path"] = True
         _enter_stage("generated_camera_fixture")
-        for index, ((_, host, color), upstream_port) in enumerate(
-            zip(_DESKTOP_CAMERAS, upstream_ports, strict=True)
-        ):
-            camera_fixture = _helpers("onvif_camera_fixture").OnvifCameraFixture(
-                host=host,
-                stream_uri=f"rtsp://{host}:{upstream_port}/generated",
-                clock_skew_seconds=1200 if index % 2 == 0 else -1200,
-                clock_mode="NTP",
-            )
-            onvif_cameras.append(camera_fixture)
-            generated, source = _generate_fixture(
-                parent,
-                media,
-                ffmpeg,
-                upstream_port,
-                helpers,
-                host=host,
-                color=color,
-                camera_credentials=(camera_fixture.username, camera_fixture.password)
-                if index == 0
-                else None,
-                publisher_credentials=primary_publisher_credentials if index == 0 else None,
-                extra_stream_paths=("direct-channel",) if index == 0 else (),
-            )
-            processes.extend(generated)
-            publishers.append(generated[-1])
-            sources.append(source)
+        # The four independently addressed, generated fixtures require the same
+        # source bytes and listener admission, but need not be provisioned
+        # serially. Bound startup concurrency to avoid overwhelming the VM.
+        with ThreadPoolExecutor(max_workers=2) as fixture_pool:
+            fixture_futures = []
+            for index, ((_, host, color), upstream_port) in enumerate(
+                zip(_DESKTOP_CAMERAS, upstream_ports, strict=True)
+            ):
+                camera_fixture = _helpers("onvif_camera_fixture").OnvifCameraFixture(
+                    host=host,
+                    stream_uri=f"rtsp://{host}:{upstream_port}/generated",
+                    clock_skew_seconds=1200 if index % 2 == 0 else -1200,
+                    clock_mode="NTP",
+                )
+                onvif_cameras.append(camera_fixture)
+                fixture_futures.append(
+                    fixture_pool.submit(
+                        _generate_fixture,
+                        parent,
+                        media,
+                        ffmpeg,
+                        upstream_port,
+                        helpers,
+                        host=host,
+                        color=color,
+                        camera_credentials=(camera_fixture.username, camera_fixture.password)
+                        if index == 0
+                        else None,
+                        publisher_credentials=primary_publisher_credentials if index == 0 else None,
+                        extra_stream_paths=("direct-channel",) if index == 0 else (),
+                    )
+                )
+            fixture_failure = None
+            # Collect in original camera order so source identities and all
+            # subsequent camera/media assertions are exactly unchanged. Even
+            # after a failed worker, collect and own all successful processes
+            # before the outer cleanup runs.
+            for future in fixture_futures:
+                try:
+                    generated, source = future.result()
+                except BaseException as error:
+                    if fixture_failure is None:
+                        fixture_failure = error
+                    continue
+                processes.extend(generated)
+                publishers.append(generated[-1])
+                sources.append(source)
+        if fixture_failure is not None:
+            raise fixture_failure
         source_uri, onvif_camera = sources[0], onvif_cameras[0]
         _enter_stage("actual_camera_rtsp_authentication")
         browser_helpers._assert_rtsp_read_auth(
@@ -3175,6 +3243,11 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     _require(not cohort.console_seen and not cohort.failed, "Desktop opened a console window")
     elapsed = time.monotonic() - started
     print("Desktop qualification stage seconds: " + json.dumps(stage_durations))
+    if vm_clock_enabled:
+        print(
+            "Desktop VM clock phase seconds: "
+            + json.dumps(vm_clock_diagnostic.get("vm_clock_phase_seconds", []))
+        )
     _require(
         elapsed < 360,
         "Desktop qualification exceeded its bounded VM duration"
