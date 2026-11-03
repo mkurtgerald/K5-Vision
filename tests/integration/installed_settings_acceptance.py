@@ -90,6 +90,7 @@ def _canonical_login(page, helpers, origin, account, *, diagnostic=None):
         diagnostic["settings_role_phase"] = "relogin_wait_auth_and_inventory"
     page.on("response", observed)
     try:
+
         def login_progress(phase):
             if diagnostic is not None:
                 diagnostic["settings_role_phase"] = "relogin_" + phase
