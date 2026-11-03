@@ -289,7 +289,9 @@ def test_unchanged_provider_poll_preserves_focused_playback_button(analytics_pag
             document.activeElement === window.originalProviderButton;
         }"""
     )
-    page.locator('#analytics-provider-events [data-provider-event-id="external-event-34"] button').click()
+    page.locator(
+        '#analytics-provider-events [data-provider-event-id="external-event-34"] button'
+    ).click()
     page.wait_for_function("window.seeks.length === 1")
     assert page.evaluate("window.seeks[0]") == {
         "cameraId": _CAMERA,
@@ -320,7 +322,9 @@ def test_unchanged_provider_poll_preserves_focused_playback_button(analytics_pag
           '#analytics-provider-events [data-provider-event-id="external-event-34"] button')
           !== window.previousProviderButton"""
     )
-    page.locator('#analytics-provider-events [data-provider-event-id="external-event-34"] button').click()
+    page.locator(
+        '#analytics-provider-events [data-provider-event-id="external-event-34"] button'
+    ).click()
     page.wait_for_function("window.seeks.length === 2")
     assert page.evaluate("window.seeks[1].timestamp") == "2026-10-26T23:59:12Z"
     assert not errors
