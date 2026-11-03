@@ -333,7 +333,9 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
     """Drive the actual Inno wizard without suppressing its user interface."""
     __tracebackhide__ = True
     diagnostic = {} if diagnostic is None else diagnostic
-    diagnostic.update(installer_action="starting", installer_install_posted=False)
+    diagnostic.update(
+        installer_action="starting", installer_install_posted=False, installer_next_clicks=0
+    )
     process = subprocess.Popen(
         [
             str(setup),
@@ -391,6 +393,8 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                             diagnostic["installer_action"] = (
                                 "finish" if caption == "finish" else "next"
                             )
+                            if caption.startswith("next"):
+                                diagnostic["installer_next_clicks"] += 1
                             api.click(captions[caption])
                         clicked.add(caption)
                         break
@@ -400,14 +404,16 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
         _require(launch_unchecked, "Installer launch option was not available to the user")
         diagnostic["installer_action"] = "completed"
     finally:
+        diagnostic["installer_exit_code"] = process.poll()
+        diagnostic["installer_steps_seen"] = sorted(clicked)
+        diagnostic["installer_launch_unchecked"] = launch_unchecked
         if process.poll() is None:
-            children = psutil.Process(process.pid).children(recursive=True)
+            children = psutil.Process(process.pid).children(recursive=True
             process.kill()
             process.wait(timeout=10)
             for child in children:
                 if child.is_running():
                     child.kill()
-
 
 
 def _verify_installed_worker_bundle(installed: Path) -> None:
@@ -454,12 +460,16 @@ def _verify_installed_worker_bundle(installed: Path) -> None:
             (license_name, "payload_license_bytes", "license_sha256"),
         ):
             candidate = workers / filename
-            _require(candidate.is_file() and not candidate.is_symlink(), "Native worker file is absent")
+            _require(
+                candidate.is_file() and not candidate.is_symlink(), "Native worker file is absent"
+            )
             size = artifact.get(size_field)
             digest = artifact.get(digest_field)
             _require(
-                type(size) is int and 0 < size <= 128 * 1024 * 1024
-                and type(digest) is str and len(digest) == 64,
+                type(size) is int
+                and 0 < size <= 128 * 1024 * 1024
+                and type(digest) is str
+                and len(digest) == 64,
                 "Installed native worker file identity is invalid",
             )
             _require(candidate.stat().st_size == size, "Installed native worker length mismatch")
