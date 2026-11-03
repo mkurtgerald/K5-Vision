@@ -392,6 +392,13 @@ def test_rolling_history_keeps_events_from_the_current_recorder_second():
         end = datetime.fromisoformat(bounds["end"][0].replace("Z", "+00:00"))
         assert start <= recorded_at <= end
         assert end - start == timedelta(days=1)
+        # The actual datetime-local form must accept the millisecond UTC range,
+        # not merely load it programmatically while blocking later manual submits.
+        assert page.locator("#history-form").evaluate("form => form.checkValidity()")
+        with page.expect_response(
+            lambda response: urlsplit(response.url).path.endswith("/history")
+        ):
+            page.locator("#load-history").click()
 
 
 def test_old_recorder_time_response_cannot_reset_a_newer_history_and_event_seek():
