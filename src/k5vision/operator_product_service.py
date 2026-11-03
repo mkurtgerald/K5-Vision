@@ -24,6 +24,8 @@ from k5vision.media.mediamtx_provider import (
 )
 from k5vision.operator_media_gateway import generate_operator_gateway_configuration
 
+_RECORDING_FLUSH_SECONDS = 3.0
+
 
 class OperatorProductError(RuntimeError):
     """Safe product failure, without private configuration or source values."""
@@ -317,7 +319,11 @@ class OperatorProductService:
             await self.stop()
             raise OperatorProductError("Operator startup was refused or incomplete") from None
 
-    def _mutation(self, method: str, route: str, payload: dict | None = None) -> None:
+    def _mutation(
+        self, method: str, route: str, payload: dict | None = None, *, timeout: float = 3.0
+    ) -> None:
+        if type(timeout) not in (int, float) or not 0 < timeout <= 3:
+            raise OperatorProductError("Camera configuration could not be applied")
         token = base64.b64encode(
             f"{self.credentials.username}:{self.credentials.password}".encode("ascii")
         ).decode("ascii")
@@ -329,7 +335,9 @@ class OperatorProductService:
             headers={"Authorization": "Basic " + token, "Content-Type": "application/json"},
         )
         try:
-            with build_opener(ProxyHandler({}), _NoRedirect()).open(request, timeout=3) as response:
+            with build_opener(ProxyHandler({}), _NoRedirect()).open(
+                request, timeout=timeout
+            ) as response:
                 if response.status != 200:
                     raise ValueError
         except HTTPError as error:
@@ -433,6 +441,29 @@ class OperatorProductService:
                 self._ready = False
                 await asyncio.sleep(3)
 
+    def _flush_recordings(self, paths: tuple[str, ...]) -> None:
+        """Close active fMP4 writers through only the owned worker's private API.
+
+        One thread spends a shared request budget across all paths; no queued
+        work can issue late requests after the worker releases its API port.
+        This changes ephemeral worker state only, leaving saved camera settings
+        and the next-launch configuration intact. Failed flushes still fall back
+        to the existing bounded native process cleanup.
+        """
+        deadline = time.monotonic() + _RECORDING_FLUSH_SECONDS
+        for path in paths:
+            if self._media is None or self._media.poll() is not None:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                self._mutation(
+                    "PATCH", f"/v3/config/paths/patch/{path}", {"record": False}, timeout=remaining
+                )
+            except Exception:
+                pass
+
     async def stop(self) -> None:
         self._closing = True
         self._ready = False
@@ -448,6 +479,24 @@ class OperatorProductService:
                 await asyncio.shield(pending)
             except Exception:
                 pass
+        cancelled = False
+        if self._paths and self._media is not None and self._media.poll() is None:
+            flush = asyncio.create_task(
+                asyncio.to_thread(self._flush_recordings, tuple(self._paths))
+            )
+            # Cancellation cannot abandon a credential-bearing native request.
+            # Join it before process cleanup and before this API port is reusable.
+            while not flush.done():
+                try:
+                    await asyncio.shield(flush)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break
+            try:
+                flush.result()
+            except Exception:
+                pass
         cleanup_failed = False
         for process in (self._gateway, self._media):
             if process is not None:
@@ -458,3 +507,5 @@ class OperatorProductService:
         if cleanup_failed:
             raise OperatorProductError("Native operator cleanup was incomplete") from None
         self._gateway = self._media = None
+        if cancelled:
+            raise asyncio.CancelledError

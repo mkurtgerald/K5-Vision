@@ -1,0 +1,160 @@
+# Native Windows desktop dependency review
+
+Reviewed on 2026-10-13. This record covers the recording-first desktop package:
+an embedded CPython runtime, an exact minimal Python operator environment,
+official first-run native-worker provisioning, and an Inno Setup installer. The user installs
+and starts the application through Windows graphical controls. First launch
+requires Internet access to the pinned official worker downloads; subsequent
+launches reuse the admitted private copies. Development tools and separately
+configured analytics remain outside this package.
+
+## CPython runtime
+
+- **Artifact:** official CPython 3.12.10 Windows amd64 embeddable distribution,
+  [`python-3.12.10-embed-amd64.zip`](https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip).
+- **Source:** [CPython v3.12.10](https://github.com/python/cpython/tree/0cc81280367df838c4b199f8f0378837165071c2),
+  commit `0cc81280367df838c4b199f8f0378837165071c2`.
+- **Integrity:** 11,133,606 bytes; SHA-256
+  `4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3`.
+- **Integration:** unchanged official interpreter, standard-library archive,
+  and native libraries are installed in the application directory. The path
+  configuration is adjusted to load the bundled application and site packages;
+  this does not remove or replace upstream notices.
+- **Rights:** Python's PSF and historical licenses allow commercial use and
+  redistribution with their notices preserved. Embedded native components have
+  their own terms. The official archive's complete `LICENSE.txt` is retained,
+  including the Microsoft Distributable Code provisions and bundled library
+  notices. Its exact bytes are 36,874 bytes with SHA-256
+  `e502c6b880ff58d614901495a9009c136539cd0b1e2a2abb8fc00b934c203419`.
+- **Windows restrictions:** Microsoft Distributable Code remains limited to
+  Microsoft platforms; preserve its copyright, trademark and patent notices,
+  do not imply Microsoft endorsement, and retain the supplied restrictions on
+  malicious, deceptive or unlawful programs. Installer acceptance must cover
+  these supplied terms. These restrictions apply to Microsoft's code, rather
+  than changing the Python software license or ownership of K5 code.
+- **Maintenance:** this exact binary is a reproducible package input. Future
+  interpreter/security updates require a newly reviewed artifact and native
+  desktop acceptance; the package does not automatically upgrade itself.
+
+## Exact Python operator environment
+
+The desktop package installs the K5 wheel with dependency resolution disabled
+and separately provisions the following exact operator runtime. This is a
+deliberately smaller environment than the general-purpose dependency list in
+`pyproject.toml`. It supports the explicit RTSP enrollment and recording product;
+ONVIF discovery is outside this desktop package.
+
+| Distribution | Version | Declared license |
+| --- | --- | --- |
+| annotated-doc | 0.0.5 | MIT |
+| annotated-types | 0.8.0 | MIT |
+| anyio | 4.15.1 | MIT |
+| click | 8.5.0 | BSD-3-Clause |
+| fastapi | 0.143.0 | MIT |
+| h11 | 0.16.0 | MIT |
+| idna | 3.20 | BSD-3-Clause |
+| opentelemetry-api | 1.45.1 | Apache-2.0 |
+| psutil | 7.2.2 | BSD-3-Clause |
+| pydantic | 2.14.1 | MIT |
+| pydantic-core | 2.50.1 | MIT |
+| starlette | 1.7.0 | BSD-3-Clause |
+| typing-extensions | 4.16.0 | PSF-2.0 |
+| typing-inspection | 0.4.4 | MIT |
+| uvicorn | 0.54.0 | BSD-3-Clause |
+
+These declarations were checked against the exact wheel metadata and included
+license files. Click 8.5.0 declares no runtime `Requires-Dist`, so colorama is
+not required by this exact environment. The native Windows build must preserve
+all installed `.dist-info` metadata and license directories, including older
+wheel layouts that put `LICENSE` directly in `.dist-info`, and retain package
+notices elsewhere in the wheel. Apache `NOTICE` files must remain intact when
+provided. K5's license does not supersede any of these third-party terms.
+
+The build inventory should record each distribution name and version, exact
+wheel filename and SHA-256, declared license expression/classifiers, and the
+relative paths and hashes of every supplied license and notice. Record CPython
+and media-worker hashes separately. Review the installed distribution inventory
+against this exact list and reject unplanned additions. Preserve native-package
+and compiled-component notices; package-level metadata alone does not establish
+that every statically linked component has completed a separate release review.
+
+The omitted general dependency subtree needs its own review before it can be
+added to a redistributed desktop product:
+
+- `onvif-python==0.3.1` declares MIT for its Python package, but separately ships
+  `onvif/wsdl/LICENSE.md`. That document contains custom ONVIF contribution and
+  document terms: copying unchanged documents with retained notices is allowed,
+  while modification of that document is not granted. This is not equivalent
+  to applying the package's MIT declaration to every bundled schema.
+- Its requests/zeep dependency subtree brings `certifi`, with MPL-2.0 source
+  availability obligations, and the Windows `lxml` wheel. The inspected lxml
+  6.1.3 `LICENSES.txt` states that its binary wheels bundle LGPL-2.1 iconv and
+  describes some schematron extraction resources as unlicensed. The package's
+  BSD declaration does not resolve those separate obligations or missing terms.
+  These packages and resources are excluded rather than relicensed by K5.
+
+OpenVINO, NumPy, OpenCV, analytics model weights, the Analytics Lab engineering
+wrapper, FFmpeg, GStreamer, Playwright, and browser binaries are not included in
+this desktop recording package. Installing an optional analytics provider later
+requires the separate model/native/transitive review already described in
+`OPERATOR_PERSON_DETECTION_REVIEW.md`.
+
+## Inno Setup installer
+
+- **Artifact:** official [Inno Setup 6.4.3 installer](https://github.com/jrsoftware/issrc/releases/download/is-6_4_3/innosetup-6.4.3.exe),
+  6,454,616 bytes; SHA-256
+  `f3c42116542c4cc57263c5ba6c4feabfc49fe771f2f98a79d2f7628b8762723b`.
+  The downloaded bytes match the official GitHub release digest.
+- **Source:** tag `is-6_4_3`, commit
+  `9254dce05d45fd804f64bc802d6353cd9d44755c` in
+  [jrsoftware/issrc](https://github.com/jrsoftware/issrc/tree/9254dce05d45fd804f64bc802d6353cd9d44755c).
+- **License:** the exact [Inno Setup License](https://github.com/jrsoftware/issrc/blob/9254dce05d45fd804f64bc802d6353cd9d44755c/license.txt)
+  is preserved unchanged in
+  `third_party/licenses/InnoSetup-6.4.3.txt`, SHA-256
+  `a7f97b166be34fc8bf04e79617b9f56b2aa7903a2808f94155e449c80bdfdcc2`.
+  Copyright (C) 1997-2025 Jordan Russell; portions copyright (C) 2000-2025
+  Martijn Laan.
+- **Integration and conclusion:** the compiler is a build tool, and its
+  generated installer/uninstaller engine is distributed with the product.
+  The exact 6.4.3 license expressly permits use for any purpose, including
+  commercial applications, and redistribution. Retain source copyrights and
+  conditions, all binary copyright notices and website addresses, do not
+  misrepresent origin, and clearly mark modifications to upstream software.
+  K5 supplies its own installer configuration without modifying the Inno engine.
+- **Version boundary:** the build uses this exact reviewed compiler. An image's
+  preinstalled compiler or a current/latest release is not interchangeable;
+  later version terms, artifact hashes, and generated behavior require review.
+  A successful compiler signature/hash check does not sign the generated K5
+  installer or confer Windows SmartScreen reputation.
+
+## Native Go media workers
+
+The desktop installer does not bundle these worker executables. Its graphical
+first launch downloads the same unmodified official Windows amd64 workers
+already pinned for the native operator pilot, with finite progress and no shell
+commands. Their surrounding K5 interfaces remain the replacement boundary.
+
+| Component | Immutable source | Archive SHA-256 | Executable SHA-256 |
+| --- | --- | --- | --- |
+| Caddy v2.11.7, Apache-2.0 | `72dd0fb067f6d7826c7f79907670ba4a713bfe37` | `0a1edc0b799512051c57071ce0e798d3f2cf67dc98171366f1d2b326072e3b06` | `5f93a9bd555f3aac9d33af2756ba14b3519d8cca4ffd55256bdaeab444c9db2a` |
+| MediaMTX v1.21.2, MIT | `914e39535ece709919ac325aaeed98d394ed9093` | `a84224f5a490855684e62ba6fb71e80ea2a5e16aed61883bb58380290e93e467` | `31bc3cc425a0278c7a5696c7ba309257235060157eb338eed20bb88dbe0faf87` |
+
+Official source, download URLs, executable sizes and archive identities are in
+`src/k5vision/data/caddy-donor-manifest.json` and
+`src/k5vision/data/mediamtx-donor-manifest.json`. The installed, hash-bound
+`workers/donor-downloads.json` selects exactly these two Windows artifacts.
+Provisioning verifies each archive SHA-256, executable length/SHA-256 and
+unchanged license SHA-256 before using it. The private worker directory retains
+the official archive's complete license alongside its executable. Existing
+verified copies are reused; modified bytes are refused rather than executed.
+
+Caddy's official release supplies target-specific SBOMs. The separately captured
+exact compiled-module inventory and supplied notices help assess future worker
+redistribution, but package-level declarations alone do not establish all native
+component rights. Earlier pilot records admitted official downloads and left
+broader binary redistribution review open. Keeping the same download boundary
+does not silently close that review or make K5 the owner of Go dependencies.
+
+This record establishes the package inputs and the bounded desktop scope. It
+does not grant rights over restricted analytics material, settle missing terms
+in omitted packages, or claim legal sign-off for a general commercial release.

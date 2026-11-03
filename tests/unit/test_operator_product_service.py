@@ -161,7 +161,7 @@ def _fake_mutations(native, monkeypatch, *, fail_once=None):
     attempts = []
     failed = False
 
-    def mutation(method, route, payload=None):
+    def mutation(method, route, payload=None, *, timeout=3.0):
         nonlocal failed
         attempts.append((method, route))
         if fail_once is not None and not failed and fail_once(method, route, len(attempts)):
@@ -190,6 +190,105 @@ def _fake_mutations(native, monkeypatch, *, fail_once=None):
 
     monkeypatch.setattr(native.service, "_mutation", mutation)
     return attempts
+
+
+def test_stop_closes_each_active_writer_before_workers_without_rewriting_saved_config(
+    native, monkeypatch
+):
+    mutations = _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        await service.start((_source(1), _source(2)))
+        media, gateway = service._media, service._gateway
+        saved = service._media_file.read_bytes()
+        original_sources, original_paths = service._sources, service._paths.copy()
+        original_stop = gateway.stop
+
+        def stop_gateway():
+            assert len(mutations) == 2
+            assert all(not path["record"] for path in media.paths.values())
+            assert media.stopped == 0
+            original_stop()
+
+        monkeypatch.setattr(gateway, "stop", stop_gateway)
+        await service.stop()
+        assert set(mutations) == {
+            ("PATCH", f"/v3/config/paths/patch/{path}") for path in original_paths
+        }
+        assert service._media_file.read_bytes() == saved
+        assert all(settings["record"] for settings in json.loads(saved)["paths"].values())
+        assert service._sources == original_sources and service._paths == original_paths
+        assert media.stopped == gateway.stopped == 1
+
+    asyncio.run(scenario())
+
+
+def test_stop_skips_flush_when_media_has_already_exited(native, monkeypatch):
+    async def scenario():
+        service = native.service
+        await service.start((_source(1),))
+        media, gateway = service._media, service._gateway
+        media.returncode = 19
+        monkeypatch.setattr(service, "_mutation", lambda *_args, **_kwargs: pytest.fail("late API"))
+        await service.stop()
+        assert media.stopped == gateway.stopped == 1
+
+    asyncio.run(scenario())
+
+
+def test_stop_uses_one_shared_flush_budget_and_still_cleans_unresponsive_worker(
+    native, monkeypatch
+):
+    async def scenario():
+        service = native.service
+        await service.start(tuple(_source(index) for index in range(1, 65)))
+        media, gateway = service._media, service._gateway
+        clock = SimpleNamespace(value=100.0)
+        monkeypatch.setattr(native.module, "time", SimpleNamespace(monotonic=lambda: clock.value))
+        attempts = []
+
+        def unresponsive(_method, _route, _payload=None, *, timeout=3.0):
+            attempts.append(timeout)
+            clock.value += timeout
+            raise OperatorProductError("Camera configuration could not be applied")
+
+        monkeypatch.setattr(service, "_mutation", unresponsive)
+        await service.stop()
+        assert attempts == [native.module._RECORDING_FLUSH_SECONDS]
+        assert media.stopped == gateway.stopped == 1
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_stop_joins_flush_before_cleanup_or_return(native, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    async def scenario():
+        service = native.service
+        await service.start((_source(1),))
+        media, gateway = service._media, service._gateway
+
+        def held_request(_method, _route, _payload=None, *, timeout=3.0):
+            entered.set()
+            assert release.wait(3)
+            assert media.stopped == gateway.stopped == 0
+
+        monkeypatch.setattr(service, "_mutation", held_request)
+        cleanup = asyncio.create_task(service.stop())
+        await _until(entered.is_set)
+        cleanup.cancel()
+        try:
+            await asyncio.sleep(0.02)
+            assert not cleanup.done()
+            assert media.stopped == gateway.stopped == 0
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+        assert media.stopped == gateway.stopped == 1
+
+    asyncio.run(scenario())
 
 
 def test_empty_start_then_camera_add_keeps_existing_native_workers(native, monkeypatch):
