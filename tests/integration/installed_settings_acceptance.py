@@ -65,13 +65,22 @@ def _open(page, name):
     )
 
 
-def _canonical_login(page, helpers, origin, account):
+def _canonical_login(page, helpers, origin, account, *, diagnostic=None):
     """Wait for the product's own inventory authority, with real core auth/me."""
+    if diagnostic is not None:
+        diagnostic["settings_role_phase"] = "relogin_wait_auth_and_inventory"
     with page.expect_response(lambda r: _route(r, "GET", "/api/v1/operator/cameras")) as inventory:
         token = helpers._login(page, origin, account["username"], account["password"])
+    if diagnostic is not None:
+        diagnostic["settings_role_phase"] = "relogin_inventory_response"
+        diagnostic["settings_relogin_inventory_http_status"] = inventory.value.status
     _require(inventory.value.status == 200, "Canonical camera authority was unavailable")
     capabilities = inventory.value.json().get("capabilities", {})
+    if diagnostic is not None:
+        diagnostic["settings_role_phase"] = "relogin_core_identity_request"
     status, core = helpers._api(page, token, "GET", "/api/v1/auth/me")
+    if diagnostic is not None:
+        diagnostic["settings_relogin_core_http_status"] = status
     _require(
         status == 200
         and core.get("id") == account["id"]
@@ -80,7 +89,11 @@ def _canonical_login(page, helpers, origin, account):
         and capabilities.get("account", {}).get("id") == core["id"],
         "Installed GUI permission proof did not use the real core account contract",
     )
+    if diagnostic is not None:
+        diagnostic["settings_role_phase"] = "relogin_security_tab_visible"
     page.locator("#security-tab").wait_for(state="visible")
+    if diagnostic is not None:
+        diagnostic["settings_role_phase"] = "relogin_complete"
     return token, capabilities
 
 
@@ -482,7 +495,9 @@ def run_installed_settings_journey(
         status, _ = admin_helpers._api(user_page, old_token, "GET", "/api/v1/operator/capabilities")
         _require(status == 401, "Custom-role assignment did not revoke the previous session")
         denials.append(status)
-        token, capabilities = _canonical_login(user_page, admin_helpers, origin, operator)
+        token, capabilities = _canonical_login(
+            user_page, admin_helpers, origin, operator, diagnostic=diagnostic
+        )
         _require(
             capabilities["can_export"] is False
             and user_page.locator("#export-panel").is_hidden()
@@ -551,7 +566,9 @@ def run_installed_settings_journey(
             _PREFIX + f"/users/{operator['id']}/role-profile",
             lambda: page.locator("#admin-apply-role-profile").click(),
         )
-        _, time_capabilities = _canonical_login(user_page, admin_helpers, origin, operator)
+        _, time_capabilities = _canonical_login(
+            user_page, admin_helpers, origin, operator, diagnostic=diagnostic
+        )
         _require(
             time_capabilities["effective_permissions"] == ["time.manage"]
             and user_page.locator("#admin-tab").inner_text() == "Recorder settings",
