@@ -271,7 +271,7 @@
       // The five-second poll must not detach a focused provider-event button
       // when the event list has not actually changed. Include the camera and
       // playback target so an updated event always gets a fresh callback.
-      const signature = JSON.stringify([cameraId, providerEvents.map((event) => [
+      const signature = JSON.stringify([cameraId, version, providerEvents.map((event) => [
         event.sequence, event.source_id, event.event_id, event.event_type,
         event.observed_at, event.playback_at, event.status, event.confidence,
       ])]);
