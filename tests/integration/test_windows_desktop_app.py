@@ -1703,25 +1703,59 @@ def _installed_analytics_journey(
     page.locator("#last-24-hours").click()
     diagnostic["analytics_navigation_step"] = "events_refresh_click"
     page.locator("#analytics-refresh").click()
-    diagnostic["analytics_navigation_step"] = "event_button_visible"
-    event_button = page.locator(f'#analytics-events button[data-event-id="{detected["id"]}"]')
-    event_button.wait_for(state="visible", timeout=15_000)
-    diagnostic["analytics_navigation_step"] = "event_button_click"
-    event_button.click()
-    diagnostic["analytics_navigation_step"] = "playback_frames"
     expected_ms = (
         datetime.fromisoformat(detected["playback_at"].replace("Z", "+00:00")).timestamp() * 1000
     )
-    page.wait_for_function(
+
+    def navigation_snapshot():
+        # Only bounded browser state, never video source URLs or bearer values.
+        return page.evaluate(
+            """expected => {
+              const video=document.getElementById('playback-video');
+              const start=Date.parse(video?.dataset.utcStart || '');
+              const from=Date.parse(document.getElementById('history-start')?.value || '');
+              const to=Date.parse(document.getElementById('history-end')?.value || '');
+              return {
+                history_visible:!document.getElementById('history-panel')?.hidden,
+                history_start_delta_seconds:Number.isFinite(from)?Math.round((from-expected)/1000):null,
+                history_end_delta_seconds:Number.isFinite(to)?Math.round((to-expected)/1000):null,
+                history_intervals:document.querySelectorAll('#history-list button').length,
+                person_event_buttons:document.querySelectorAll('#analytics-events button').length,
+                playback_start_delta_ms:Number.isFinite(start)?Math.round(start-expected):null,
+                playback_ready_state:video?.readyState ?? null,
+                playback_frame_count:video?.getVideoPlaybackQuality?.().totalVideoFrames ?? null,
+                playback_paused:video?.paused ?? null,
+                playback_error_code:video?.error?.code ?? null,
+                playback_source_present:!!video?.currentSrc
+              };
+            }""",
+            expected_ms,
+        )
+
+    diagnostic["analytics_navigation_step"] = "event_button_visible"
+    event_button = page.locator(f'#analytics-events button[data-event-id="{detected["id"]}"]')
+    try:
+        event_button.wait_for(state="visible", timeout=15_000)
+    except Exception:
+        diagnostic["analytics_navigation_snapshot"] = navigation_snapshot()
+        raise
+    diagnostic["analytics_navigation_step"] = "event_button_click"
+    event_button.click()
+    diagnostic["analytics_navigation_step"] = "playback_frames"
+    try:
+        page.wait_for_function(
         """chosen => {
           const video=document.getElementById('playback-video');
           return Math.abs(Date.parse(video.dataset.utcStart || '')-chosen)<1000 &&
             video.readyState>=2 && !video.paused &&
             video.getVideoPlaybackQuality().totalVideoFrames>=4;
         }""",
-        arg=expected_ms,
-        timeout=20_000,
-    )
+            arg=expected_ms,
+            timeout=20_000,
+        )
+    except Exception:
+        diagnostic["analytics_navigation_snapshot"] = navigation_snapshot()
+        raise
     diagnostic["analytics_navigation_step"] = "playback_decoded"
     event_frames = page.locator("#playback-video").evaluate(
         "video => video.getVideoPlaybackQuality().totalVideoFrames"
