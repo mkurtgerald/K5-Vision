@@ -2429,9 +2429,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                         camera_credentials=(camera_fixture.username, camera_fixture.password)
                         if index == 0
                         else None,
-                        publisher_credentials=primary_publisher_credentials
-                        if index == 0
-                        else None,
+                        publisher_credentials=primary_publisher_credentials if index == 0 else None,
                         extra_stream_paths=("direct-channel",) if index == 0 else (),
                     )
                 )
