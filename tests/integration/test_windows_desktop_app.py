@@ -2532,7 +2532,21 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 "admin_disable_and_reenable",
                 "admin_reset_password",
                 "admin_visible_audit",
-            }:
+            } or any(
+                phase == f"admin_{role}_{step}"
+                for role in ("viewer", "operator")
+                for step in (
+                    "open_tab",
+                    "wait_panel",
+                    "open_users",
+                    "wait_users",
+                    "open_editor",
+                    "wait_editor",
+                    "submit_create",
+                    "one_time_credential",
+                    "wait_created_row",
+                )
+            ):
                 nvr_diagnostic["admin_stage"] = phase
 
         admin_evidence, admin_private_state = admin_helpers.run_admin_journey(

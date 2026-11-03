@@ -144,11 +144,19 @@ def _activate(page, origin, username, temporary_credential, password):
     return _login(page, origin, username, password)
 
 
-def _open_admin(page):
+def _open_admin(page, *, progress=None):
     __tracebackhide__ = True
+    if progress is not None:
+        progress("open_tab")
     page.locator("#admin-tab").click()
+    if progress is not None:
+        progress("wait_panel")
     page.locator("#admin-panel").wait_for(state="visible")
+    if progress is not None:
+        progress("open_users")
     page.locator("#admin-users-tab").click()
+    if progress is not None:
+        progress("wait_users")
     page.locator("#admin-users-list").wait_for(state="visible")
 
 
@@ -181,16 +189,24 @@ def _credential(page, username):
     return credential
 
 
-def _create_user(page, username, role, identifiers):
+def _create_user(page, username, role, identifiers, *, progress=None):
     __tracebackhide__ = True
-    _open_admin(page)
+
+    def checkpoint(name):
+        if progress is not None and role in {"viewer", "operator"}:
+            progress(f"admin_{role}_{name}")
+
+    _open_admin(page, progress=checkpoint)
+    checkpoint("open_editor")
     page.locator("#admin-create-user").click()
+    checkpoint("wait_editor")
     page.locator("#admin-user-dialog").wait_for(state="visible")
     page.locator("#admin-username").fill(username)
     page.locator("#admin-display-name").fill("Generated " + role)
     page.locator("#admin-role").select_option(role)
     page.locator("#admin-enabled").set_checked(True)
     _set_access(page, identifiers)
+    checkpoint("submit_create")
     with page.expect_response(
         lambda response: _route_response(response, "POST", "/api/v1/operator/admin/users")
     ) as created:
@@ -212,11 +228,13 @@ def _create_user(page, username, role, identifiers):
         and set(account["camera_access"]["camera_ids"]) == set(identifiers),
         "New account did not atomically receive its selected cameras",
     )
+    checkpoint("one_time_credential")
     credential = _credential(page, username)
     _require(
         credential == result.get("temporary_credential"),
         "Visible one-time credential did not match the actual account issue",
     )
+    checkpoint("wait_created_row")
     page.locator(f'#admin-users-list [data-user-id="{identifier}"]').wait_for(state="visible")
     return identifier, credential
 
@@ -327,9 +345,11 @@ def run_admin_journey(
 
     try:
         phase("admin_create_accounts")
-        viewer_id, viewer_temporary = _create_user(page, viewer_name, "viewer", camera_ids[:1])
+        viewer_id, viewer_temporary = _create_user(
+            page, viewer_name, "viewer", camera_ids[:1], progress=phase
+        )
         operator_id, operator_temporary = _create_user(
-            page, operator_name, "operator", camera_ids[:2]
+            page, operator_name, "operator", camera_ids[:2], progress=phase
         )
         evidence["admin_user_creation"] = True
 
