@@ -525,12 +525,15 @@ def test_native_worker_bundle_admits_official_archive_executable_and_license(
         zipped.writestr("LICENSE", license_bytes)
     zipped_bytes = archive.getvalue()
     pin = {
-        "component": "MediaMTX", "version": "v1.21.2",
-        "executable": "mediamtx.exe", "executable_bytes": source.stat().st_size,
+        "component": "MediaMTX",
+        "version": "v1.21.2",
+        "executable": "mediamtx.exe",
+        "executable_bytes": source.stat().st_size,
         "executable_sha256": sha256(source.read_bytes()).hexdigest(),
         "license_sha256": sha256(license_bytes).hexdigest(),
         "url": "https://example.invalid/reviewed-worker.zip",
-        "bytes": len(zipped_bytes), "sha256": sha256(zipped_bytes).hexdigest(),
+        "bytes": len(zipped_bytes),
+        "sha256": sha256(zipped_bytes).hexdigest(),
     }
     monkeypatch.setattr(builder, "worker_download", lambda supplied, name: pin)
     monkeypatch.setattr(builder, "urlopen", lambda url, timeout: io.BytesIO(zipped_bytes))
@@ -542,9 +545,7 @@ def test_native_worker_bundle_admits_official_archive_executable_and_license(
     assert result["payload_license_bytes"] == len(license_bytes)
 
 
-def test_native_worker_bundle_refuses_changed_upstream_license(
-    builder, tmp_path, monkeypatch
-):
+def test_native_worker_bundle_refuses_changed_upstream_license(builder, tmp_path, monkeypatch):
     source = tmp_path / "worker.exe"
     source.write_bytes(b"MZ\\x00reviewed worker")
     official_license = b"Reviewed permission notice"
@@ -554,12 +555,15 @@ def test_native_worker_bundle_refuses_changed_upstream_license(
         zipped.writestr("LICENSE", b"Altered permission notice")
     zipped_bytes = archive.getvalue()
     pin = {
-        "component": "MediaMTX", "version": "v1.21.2",
-        "executable": "mediamtx.exe", "executable_bytes": source.stat().st_size,
+        "component": "MediaMTX",
+        "version": "v1.21.2",
+        "executable": "mediamtx.exe",
+        "executable_bytes": source.stat().st_size,
         "executable_sha256": sha256(source.read_bytes()).hexdigest(),
         "license_sha256": sha256(official_license).hexdigest(),
         "url": "https://example.invalid/reviewed-worker.zip",
-        "bytes": len(zipped_bytes), "sha256": sha256(zipped_bytes).hexdigest(),
+        "bytes": len(zipped_bytes),
+        "sha256": sha256(zipped_bytes).hexdigest(),
     }
     monkeypatch.setattr(builder, "worker_download", lambda supplied, name: pin)
     monkeypatch.setattr(builder, "urlopen", lambda url, timeout: io.BytesIO(zipped_bytes))
