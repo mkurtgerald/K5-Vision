@@ -637,6 +637,23 @@ def test_browser_origin_is_retained_when_connection_closes_before_window_visibil
     assert len(watcher.origin_ancestries) == 1 and not watcher.failed
 
 
+def _retire_temporary_browser_processes(owned):
+    """Retire only browser descendants observed after native OS handoff.
+
+    Closing the test window is the graceful shutdown signal. A long idle
+    wait before terminating still-live descendants adds no observation.
+    Require their actual exit instead of silently accepting leaks.
+    """
+    _, alive = psutil.wait_procs(list(owned.values()), timeout=0.5)
+    for item in alive:
+        try:
+            item.terminate()
+        except psutil.NoSuchProcess:
+            pass
+    _, remaining = psutil.wait_procs(alive, timeout=5)
+    _require(not remaining, "Native browser handoff left owned processes running")
+
+
 def _default_browser_handoff(api, form, port, *, diagnostic=None):
     """Observe real OS dispatch, origin traffic and the new product browser window."""
     diagnostic = {} if diagnostic is None else diagnostic
@@ -732,16 +749,31 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
         diagnostic["browser_handoff_observer_stopped"] = watcher_finished
         if opened and api.api.IsWindow(opened):
             api.close(opened)
-        _, alive = psutil.wait_procs(list(owned.values()), timeout=5)
-        # Existing browser processes are never terminated; only the new window
-        # and processes introduced beneath its browser root are owned here.
-        for item in alive:
-            try:
-                item.terminate()
-            except psutil.NoSuchProcess:
-                pass
-        psutil.wait_procs(alive, timeout=5)
+        # Existing browsers are not owned. Only new descendants observed
+        # during this handoff may be terminated after its window closes.
+        _retire_temporary_browser_processes(owned)
         _require(watcher_finished, "Native browser launch observer did not finish")
+
+
+def test_native_browser_handoff_retires_only_observed_descendants(monkeypatch):
+    calls = []
+    child = SimpleNamespace(terminate=lambda: calls.append("terminated"))
+
+    def wait_procs(processes, timeout):
+        assert processes == [child]
+        calls.append(timeout)
+        return ([], [child]) if timeout == 0.5 else ([child], [])
+
+    monkeypatch.setattr(psutil, "wait_procs", wait_procs)
+    _retire_temporary_browser_processes({(123, 456): child})
+    assert calls == [0.5, "terminated", 5]
+
+
+def test_native_browser_handoff_rejects_unreaped_descendants(monkeypatch):
+    child = SimpleNamespace(terminate=lambda: None)
+    monkeypatch.setattr(psutil, "wait_procs", lambda _processes, timeout: ([], [child]))
+    with pytest.raises(pytest.fail.Exception, match="left owned processes running"):
+        _retire_temporary_browser_processes({(123, 456): child})
 
 
 def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
