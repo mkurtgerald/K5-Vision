@@ -47,8 +47,9 @@
         <main class="main-content">
           <div class="view-heading">
             <div><p class="eyebrow">CAMERA WORKSPACE</p><h1 id="camera-title">Select a camera</h1><p id="camera-subtitle" class="muted">Live view and recording history in one place.</p></div>
-            <div class="camera-indicators"><span id="connection-badge" class="status-badge" hidden></span><span id="recording-badge" class="recording-badge" hidden>Recording</span><button id="update-source-button" class="button secondary" type="button" hidden>Update source</button></div>
+            <div class="camera-indicators"><span id="connection-badge" class="status-badge" hidden></span><span id="recording-badge" class="recording-badge" hidden>Recording</span><button id="update-source-button" class="button secondary" type="button" hidden>Update source</button><button id="remove-camera-button" class="button quiet danger" type="button" hidden>Remove camera</button></div>
           </div>
+          <div class="system-status" aria-label="Service and recording storage"><div><span id="service-status" role="status" aria-live="polite">Checking media service…</span><span id="storage-status" class="muted">Checking recording storage…</span></div><button id="connection-help-button" class="button quiet" type="button">Connection help</button></div>
           <div id="worker-message" class="notice warning" role="status" aria-live="polite" hidden></div>
           <div id="workspace-message" class="notice" role="status" aria-live="polite" hidden></div>
 
@@ -64,6 +65,11 @@
               <div id="live-video-label" class="video-label" hidden><span class="live-dot" aria-hidden="true"></span> LIVE</div>
             </div>
             <div class="video-footer"><span id="live-state" role="status" aria-live="polite">No camera selected</span><button id="play-live" class="button quiet" type="button" hidden>Play live video</button><span id="analytics-state" class="muted"></span></div>
+            <section id="person-view-panel" class="person-view-panel" aria-label="Person detection sampled view" hidden>
+              <div class="person-view-heading"><div><h2>Person detection · sampled view</h2><p class="field-help">A separate sampled frame with matching boxes. Live video and recording continue independently.</p></div><button id="toggle-person-view" class="button secondary" type="button" aria-pressed="false">Start sampled view</button></div>
+              <canvas id="person-view-canvas" width="0" height="0" aria-label="Sampled camera frame and person boxes" hidden></canvas>
+              <p id="person-view-message" class="form-message" role="status" aria-live="polite">Select Start sampled view while live video is playing. Samples are processed locally and are not saved.</p>
+            </section>
           </section>
 
           <section id="history-panel" aria-label="Recording history" hidden>
@@ -107,6 +113,31 @@
         <p id="add-camera-message" class="form-message" role="status" aria-live="polite"></p>
         <div class="dialog-actions"><button id="cancel-add-camera" class="button secondary" type="button">Cancel</button><button id="save-camera" class="button primary" type="submit">Connect camera</button></div>
       </form>
+    </dialog>
+
+    <dialog id="remove-camera-dialog" aria-labelledby="remove-camera-title" aria-describedby="remove-camera-consequences">
+      <form id="remove-camera-form">
+        <div class="dialog-heading"><div><p class="eyebrow">CAMERA ADMINISTRATION</p><h2 id="remove-camera-title">Remove camera?</h2></div><button id="close-remove-camera" class="icon-button" type="button" aria-label="Close camera removal">×</button></div>
+        <p id="remove-camera-name" class="removal-camera-name"></p>
+        <p id="remove-camera-consequences" class="muted">Live video and new recording will stop. This camera’s history and playback will disappear from the workspace.</p>
+        <p class="field-help">This action does not delete recording files. They remain subject to rolling retention. To restore access to retained recordings, re-add the camera with its original name, IP address and RTSP stream.</p>
+        <p id="remove-camera-message" class="form-message" role="status" aria-live="polite"></p>
+        <div class="dialog-actions"><button id="cancel-remove-camera" class="button secondary" type="button" autofocus>Keep camera</button><button id="confirm-remove-camera" class="button destructive" type="submit">Remove camera</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="connection-help-dialog" aria-labelledby="connection-help-title">
+      <div class="dialog-heading"><div><p class="eyebrow">LOCAL CAMERA CONNECTION</p><h2 id="connection-help-title">Connection help</h2></div><button id="close-connection-help" class="icon-button" type="button" aria-label="Close connection help">×</button></div>
+      <p id="connection-help-status" class="muted"></p>
+      <ol class="help-list">
+        <li>Confirm the camera is powered on and reachable from this PC. Open its management page using the camera’s IP address.</li>
+        <li>Enable RTSP and select an H.264 video stream in the camera settings. Use the exact stream address provided by the camera manufacturer.</li>
+        <li>Use a numeric IP address when adding the camera. The RTSP address must point to that same camera.</li>
+        <li>After changing the camera password or stream path, select <strong>Update source</strong> and enter the complete RTSP address again.</li>
+        <li>Use current Edge or Chrome. If K5 itself is unavailable, confirm K5 is running on this PC and check its startup message.</li>
+      </ol>
+      <p class="field-help">Closing the browser does not stop recording while K5 remains running. Live connection failures create gaps in recording history.</p>
+      <div class="dialog-actions"><button id="done-connection-help" class="button primary" type="button">Done</button></div>
     </dialog>
   </body>
 </html>

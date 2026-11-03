@@ -40,7 +40,11 @@ class UserRegistryCapacityError(RuntimeError):
 
 
 class UserRegistryConflictError(RuntimeError):
-    """Raised when a username is already present in the same site scope."""
+    """Raised when a user mutation conflicts with existing identity or authority."""
+
+
+class UserRegistryLastAdministratorError(UserRegistryConflictError):
+    """Raised when no other enabled password-initialized administrator would remain."""
 
 
 class UserRegistryStorageError(RuntimeError):
@@ -613,6 +617,38 @@ class UserRegistry:
                         values[field_name] = value
                         changed.append(field_name)
                 updated = UserAccount(**values)
+                if (
+                    current.enabled
+                    and current.role is UserRole.ADMINISTRATOR
+                    and (not updated.enabled or updated.role is not UserRole.ADMINISTRATOR)
+                ):
+                    # BEGIN IMMEDIATE serializes this authority check with every
+                    # update, including other registry instances on the same DB.
+                    # A rejected mutation changes neither account nor audit.
+                    administrators = connection.execute(
+                        """
+                        SELECT COUNT(*) FROM users
+                        JOIN user_credentials
+                          ON user_credentials.site_id = users.site_id
+                         AND user_credentials.user_id = users.id
+                        WHERE users.site_id = ? AND users.id != ?
+                          AND users.role = ? AND users.enabled = 1
+                          AND user_credentials.credential_kind = 'password'
+                          AND user_credentials.scheme = ?
+                          AND user_credentials.expires_at IS NULL
+                        """,
+                        (
+                            self._site_id,
+                            str(current.id),
+                            UserRole.ADMINISTRATOR.value,
+                            _CREDENTIAL_SCHEME,
+                        ),
+                    ).fetchone()[0]
+                    if administrators == 0:
+                        raise UserRegistryLastAdministratorError(
+                            "Activate another enabled administrator "
+                            "before removing this administrator"
+                        )
                 if changed:
                     connection.execute(
                         """
@@ -637,6 +673,10 @@ class UserRegistry:
                     )
                 connection.execute("COMMIT")
                 return updated
+            except UserRegistryLastAdministratorError:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
             except sqlite3.Error as exc:
                 if connection.in_transaction:
                     connection.execute("ROLLBACK")

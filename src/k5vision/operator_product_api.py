@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import math
 import re
@@ -26,6 +27,13 @@ from k5vision.media.mediamtx_provider import (
     MediaWorkerError,
     MediaWorkerErrorCode,
 )
+from k5vision.media.presentation_frame import PixelFormat, PresentationVideoFrame
+from k5vision.operator_analytics import (
+    MAX_VIEW_FRAME_BYTES,
+    MAX_VIEW_HEIGHT,
+    MAX_VIEW_PIXELS,
+    MAX_VIEW_WIDTH,
+)
 from k5vision.operator_product_state import OperatorCameraCapacityError
 from k5vision.services.device_registry import (
     DeviceRegistryCapacityError,
@@ -44,6 +52,15 @@ _BODY_LIMIT = 16 * 1024
 _READ_ROLES = frozenset(UserRole)
 _HLS_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:m3u8|mp4|m4s|ts)")
 _RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})")
+_PERSON_PATH = re.compile(
+    re.escape(_PREFIX) + r"/cameras/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/person-view"
+)
+_SESSION_TOKEN = re.compile(r"[A-Za-z0-9_-]{32,128}")
+
+
+def _analytics_owner(token: str) -> UUID:
+    return UUID(bytes=hashlib.sha256(token.encode("ascii")).digest()[:16])
 
 
 def _product_path(path: str) -> bool:
@@ -69,6 +86,10 @@ class _BoundedProductBody:
             scope["type"] != "http"
             or scope.get("method") not in {"POST", "DELETE", "PATCH", "PUT"}
             or not _product_path(scope.get("path", ""))
+            or (
+                scope.get("method") == "POST"
+                and _PERSON_PATH.fullmatch(scope.get("path", "")) is not None
+            )
         ):
             await self.app(scope, receive, send)
             return
@@ -223,10 +244,14 @@ def install_operator_product_api(
     service: OperatorProductService,
     public_port: int,
     analytics=None,
+    analytics_status: str = "disabled",
 ) -> None:
     """Install the local product contract without exposing execution credentials."""
     if type(public_port) is not int or not 1 <= public_port <= 65535:
         raise ValueError("operator public port is invalid")
+    if analytics_status not in {"disabled", "configured", "unavailable"}:
+        raise ValueError("operator person view status is invalid")
+    person_status = "configured" if analytics is not None else analytics_status
     registry = app.state.device_registry
     users = app.state.user_registry
     sessions = app.state.user_session_manager
@@ -235,6 +260,7 @@ def install_operator_product_api(
     if users.site_id != service.site_id:
         raise ValueError("operator accounts belong to another site")
     mutations = asyncio.Lock()
+    person_slots = asyncio.Semaphore(4)
     seen_live: set[UUID] = set()
     app.add_middleware(_BoundedProductBody)
     previous_validation_handler = app.exception_handlers.get(
@@ -330,7 +356,7 @@ def install_operator_product_api(
             "host": str(source.device.host),
             "status": "unavailable",
             "recording": False,
-            "analytics_status": "disabled",
+            "analytics_status": person_status,
         }
         if service.status() not in {"ready", "disk_full"}:
             return result
@@ -352,6 +378,11 @@ def install_operator_product_api(
 
     read_session = Depends(require_session)
     admin_session = Depends(require_admin)
+
+    @app.get(_PREFIX + "/status", tags=["operator"])
+    async def operator_status(response: Response, _session: tuple[UserAccount, str] = read_session):
+        response.headers["Cache-Control"] = "no-store"
+        return {**service.diagnostics(), "analytics_status": person_status}
 
     @app.get(_PREFIX + "/cameras", tags=["operator"])
     async def list_cameras(_session: tuple[UserAccount, str] = read_session):
@@ -446,6 +477,105 @@ def install_operator_product_api(
             ]
         }
 
+    @app.post(_PREFIX + "/cameras/{device_id}/person-view", tags=["operator"])
+    async def person_view(
+        device_id: UUID,
+        request: Request,
+        response: Response,
+        session: tuple[UserAccount, str] = read_session,
+    ):
+        # Frame pixels are transient caller-supplied view data, never trusted
+        # camera evidence. Admission precedes body buffering and is repeated
+        # after inference, including durable account and source membership.
+        if len(request.headers.getlist("origin")) != 1:
+            raise HTTPException(403, "Invalid operator origin")
+        admit_origin(request)
+        origin = urlsplit(request.headers["origin"])
+        if origin.scheme != request.url.scheme or origin.hostname != request.url.hostname:
+            raise HTTPException(403, "Invalid operator origin")
+        selection(device_id)
+        if analytics is None:
+            raise HTTPException(503, "Person view is not configured")
+        try:
+            query = _query(
+                request.url.query,
+                allowed={"width", "height", "frame_id"},
+                required={"width", "height", "frame_id"},
+            )
+            if any(
+                not value.isascii() or not value.isdecimal() or len(value) > 10
+                for value in query.values()
+            ):
+                raise ValueError
+            width, height, frame_id = (int(query[key]) for key in ("width", "height", "frame_id"))
+            if not (
+                1 <= width <= MAX_VIEW_WIDTH
+                and 1 <= height <= MAX_VIEW_HEIGHT
+                and width * height <= MAX_VIEW_PIXELS
+                and 0 <= frame_id <= 2_147_483_647
+            ):
+                raise ValueError
+        except (ValueError, OverflowError):
+            raise HTTPException(422, "Invalid person view geometry") from None
+        if request.headers.getlist("content-type") != ["application/octet-stream"] or (
+            request.headers.getlist("content-encoding") not in ([], ["identity"])
+        ):
+            raise HTTPException(415, "Person view requires raw BGRX bytes")
+        expected = width * height * 4
+        lengths = request.headers.getlist("content-length")
+        if len(lengths) > 1:
+            raise HTTPException(400, "Invalid person view length")
+        if lengths:
+            value = lengths[0]
+            if not value.isascii() or not value.isdecimal() or len(value) > 10:
+                raise HTTPException(400, "Invalid person view length")
+            declared = int(value)
+            if declared > MAX_VIEW_FRAME_BYTES:
+                raise HTTPException(413, "Person view frame too large")
+            if declared != expected:
+                raise HTTPException(400, "Person view length does not match geometry")
+        if person_slots.locked():
+            raise HTTPException(429, "Person view capacity is busy")
+        await person_slots.acquire()
+        body = bytearray()
+        try:
+            try:
+                async with asyncio.timeout(3):
+                    async for piece in request.stream():
+                        if len(body) + len(piece) > expected:
+                            raise HTTPException(413, "Person view frame too large")
+                        body.extend(piece)
+            except TimeoutError:
+                raise HTTPException(408, "Person view upload timed out") from None
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(400, "Person view upload unavailable") from None
+            if len(body) != expected:
+                raise HTTPException(400, "Person view length does not match geometry")
+            try:
+                result = await analytics.infer(
+                    owner_id=_analytics_owner(session[1]),
+                    camera_id=device_id,
+                    frame_id=frame_id,
+                    frame=PresentationVideoFrame(
+                        memoryview(body), width, height, width * 4, PixelFormat.BGRX, 0
+                    ),
+                )
+                if result.frame_id != frame_id:
+                    raise ValueError
+                value = result.as_dict()
+            except Exception:
+                raise HTTPException(503, "Person view unavailable") from None
+            await authenticate(session[1])
+            selection(device_id)
+            response.headers["Cache-Control"] = "no-store"
+            return value
+        finally:
+            if body:
+                body[:] = b"\0" * len(body)
+            person_slots.release()
+
     @app.post(_PREFIX + "/cameras/{device_id}/media-session", tags=["operator"])
     async def media_session(
         device_id: UUID,
@@ -473,6 +603,21 @@ def install_operator_product_api(
     @app.delete(_PREFIX + "/media-session", status_code=204, tags=["operator"])
     async def clear_media_session(request: Request):
         admit_origin(request)
+        values = request.headers.getlist("authorization")
+        scheme, separator, token = (values[0] if len(values) == 1 else "").partition(" ")
+        if (
+            analytics is not None
+            and separator
+            and scheme.lower() == "bearer"
+            and _SESSION_TOKEN.fullmatch(token) is not None
+        ):
+            # Logout revokes the bearer before this cookie-clear request.
+            # Closure uses only the opaque session-derived owner; it admits
+            # neither media nor inference for a revoked token.
+            try:
+                await analytics.close_owner(_analytics_owner(token))
+            except Exception:
+                pass
         response = Response(status_code=204)
         response.delete_cookie(
             _COOKIE,

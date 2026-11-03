@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import webbrowser
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import uvicorn
@@ -36,8 +37,30 @@ def create_operator_product_app(
     cameras = OperatorCameraStore(
         identity.directory, identity.site_id, registry=application.state.device_registry
     )
+    from k5vision.operator_analytics import OperatorAnalyticsBroker
+    from k5vision.operator_analytics_person import (
+        OperatorPersonConfigurationError,
+        load_person_configuration,
+    )
+
+    analytics = None
+    analytics_status = "disabled"
+    try:
+        person_config = load_person_configuration(os.environ)
+        if person_config is not None:
+            analytics = OperatorAnalyticsBroker(person_config)
+            analytics_status = "configured"
+    except OperatorPersonConfigurationError:
+        # An optional rejected detector cannot prevent camera recording. It
+        # remains disabled and the operator sees a fixed, source-free status.
+        analytics_status = "unavailable"
     install_operator_product_api(
-        application, cameras=cameras, service=service, public_port=service.public_port
+        application,
+        cameras=cameras,
+        service=service,
+        public_port=service.public_port,
+        analytics=analytics,
+        analytics_status=analytics_status,
     )
     previous_lifespan = application.router.lifespan_context
     profile_lock = OperatorProfileLock(identity.directory)
@@ -45,9 +68,20 @@ def create_operator_product_app(
     @asynccontextmanager
     async def lifespan(app):
         async with previous_lifespan(app):
+            analytics_task = None
             try:
                 profile_lock.acquire()
                 await service.start(cameras.list_sources())
+                if analytics is not None:
+
+                    async def maintain_analytics():
+                        while True:
+                            await asyncio.sleep(5)
+                            await analytics.expire_idle()
+
+                    analytics_task = asyncio.create_task(
+                        maintain_analytics(), name="operator-transient-person-views"
+                    )
                 if open_browser:
                     asyncio.get_running_loop().call_later(
                         0.5, webbrowser.open, f"http://127.0.0.1:{service.public_port}/operator/"
@@ -55,16 +89,27 @@ def create_operator_product_app(
                 yield
             finally:
                 try:
-                    await service.stop()
+                    if analytics_task is not None:
+                        analytics_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await analytics_task
                 finally:
                     try:
-                        cameras.close()
+                        if analytics is not None:
+                            await analytics.aclose()
                     finally:
-                        profile_lock.close()
+                        try:
+                            await service.stop()
+                        finally:
+                            try:
+                                cameras.close()
+                            finally:
+                                profile_lock.close()
 
     application.router.lifespan_context = lifespan
     application.state.operator_product_service = service
     application.state.operator_camera_store = cameras
+    application.state.operator_person_status = analytics_status
     return application
 
 

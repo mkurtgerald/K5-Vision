@@ -58,7 +58,9 @@ class _Storage:
         self.max_bytes = max_bytes
 
     def inspect(self):
-        return SimpleNamespace(recording_allowed=self.allowed)
+        return SimpleNamespace(
+            recording_allowed=self.allowed, total_bytes=100, free_bytes=2 * 1024**3
+        )
 
     prune = inspect
 
@@ -106,6 +108,7 @@ def native(tmp_path, monkeypatch):
         rtsp_port=18084,
         hls_port=18085,
     )
+    monkeypatch.setattr(service, "_check_gateway", lambda: None)
     return SimpleNamespace(
         service=service,
         processes=processes,
@@ -128,7 +131,7 @@ def _source(index):
     )
 
 
-async def _until(predicate, *, timeout=1):
+async def _until(predicate, *, timeout=3):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -145,7 +148,9 @@ def _fast_maintenance(native, monkeypatch):
     async def sleep(delay):
         if delay >= 0.1:
             clock.value += delay
-            await original_sleep(0)
+            # Preserve logical cadence without a busy loop that starves the
+            # native-thread wakeup on Windows' coarser event-loop clock.
+            await original_sleep(0.001)
         else:
             await original_sleep(delay)
 
@@ -249,6 +254,112 @@ def test_dead_media_worker_restarts_from_saved_sources(native, monkeypatch):
             await service.stop()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("component", ["media", "gateway"])
+def test_alive_unresponsive_worker_is_recovered_after_repeated_probes(
+    native, monkeypatch, component
+):
+    _fast_maintenance(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        try:
+            await service.start((_source(1),))
+            failed = getattr(service, "_" + component)
+            other = service._gateway if component == "media" else service._media
+            attempts = []
+            observed_status = []
+
+            def check():
+                if getattr(service, "_" + component) is failed:
+                    observed_status.append(service.status())
+                    attempts.append(True)
+                    raise OperatorProductError("Worker is unresponsive")
+
+            async def info():
+                check()
+
+            if component == "media":
+                monkeypatch.setattr(service.provider, "info", info)
+            else:
+                monkeypatch.setattr(service, "_check_gateway", check)
+            await _until(
+                lambda: (
+                    getattr(service, "_" + component) is not failed and service.status() == "ready"
+                )
+            )
+            assert len(attempts) == 3
+            assert "unavailable" in observed_status
+            assert failed.stopped == 1
+            assert (service._gateway if component == "media" else service._media) is other
+            assert set(service._media.paths) == {_source(1).binding.path_name}
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_transient_health_failure_marks_unavailable_without_restarting_workers(native, monkeypatch):
+    _fast_maintenance(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        try:
+            await service.start(())
+            original = service._media, service._gateway
+            attempts = []
+            observed_status = []
+
+            def probe():
+                observed_status.append(service.status())
+                attempts.append(True)
+                if len(attempts) == 1:
+                    raise OperatorProductError("Temporary listener delay")
+
+            monkeypatch.setattr(service, "_check_gateway", probe)
+            await _until(lambda: len(attempts) >= 2 and service.status() == "ready")
+            assert observed_status[1] == "unavailable"
+            assert (service._media, service._gateway) == original
+            assert all(process.stopped == 0 for process in original)
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("total", "free", "allowed", "reason"),
+    [
+        (100, 2 * 1024**3, True, "ready"),
+        (100, 100, False, "free_space"),
+        (21 * 1024**3, 2 * 1024**3, False, "capacity"),
+        (100, 2 * 1024**3, False, "inspection"),
+    ],
+)
+def test_diagnostics_projects_only_last_aggregate_storage_sample(
+    native, total, free, allowed, reason
+):
+    service = native.service
+    assert service.diagnostics()["storage"] is None
+    service._storage_status = SimpleNamespace(
+        total_bytes=total, free_bytes=free, recording_allowed=allowed
+    )
+    result = service.diagnostics()
+    assert result == {
+        "worker_status": "unavailable",
+        "max_recording_bytes": 20 * 1024**3,
+        "storage": {
+            "recording_bytes": total,
+            "free_bytes": free,
+            "recording_allowed": allowed,
+            "reason": reason,
+        },
+    }
+    text = json.dumps(result)
+    assert service.credentials.password not in text
+    assert str(service.state_root) not in text
+    assert "rtsp://" not in text
 
 
 def test_partial_camera_update_is_reconciled_without_a_manual_process_crash(native, monkeypatch):
@@ -504,6 +615,51 @@ def test_product_startup_failure_closes_camera_store_and_attempts_native_cleanup
     with pytest.raises(OperatorProductError, match="startup"):
         with TestClient(app):
             pass
+    assert calls == [("start", ()), ("stop", ())]
+    assert app.state.operator_camera_store.closed
+    _assert_profile_lease_available(tmp_path / "identity")
+
+
+def test_rejected_optional_person_configuration_does_not_prevent_recording_start(
+    native, tmp_path, monkeypatch
+):
+    import k5vision.operator_analytics_person as person_module
+
+    def refuse(_environment):
+        raise person_module.OperatorPersonConfigurationError("Person configuration was refused.")
+
+    monkeypatch.setattr(person_module, "load_person_configuration", refuse)
+    app, calls = _product_application(native, tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.get("/api/v1/health").status_code == 200
+        assert app.state.operator_person_status == "unavailable"
+        assert calls == [("start", ())]
+    assert calls == [("start", ()), ("stop", ())]
+    _assert_profile_lease_available(tmp_path / "identity")
+
+
+def test_configured_person_broker_closes_even_when_recording_startup_fails(
+    native, tmp_path, monkeypatch
+):
+    import k5vision.operator_analytics as broker_module
+    import k5vision.operator_analytics_person as person_module
+
+    closed = []
+
+    class Broker:
+        def __init__(self, _config):
+            pass
+
+        async def aclose(self):
+            closed.append(True)
+
+    monkeypatch.setattr(person_module, "load_person_configuration", lambda _environment: object())
+    monkeypatch.setattr(broker_module, "OperatorAnalyticsBroker", Broker)
+    app, calls = _product_application(native, tmp_path, monkeypatch, fail_start=True)
+    with pytest.raises(OperatorProductError, match="startup"):
+        with TestClient(app):
+            pass
+    assert closed == [True]
     assert calls == [("start", ()), ("stop", ())]
     assert app.state.operator_camera_store.closed
     _assert_profile_lease_available(tmp_path / "identity")

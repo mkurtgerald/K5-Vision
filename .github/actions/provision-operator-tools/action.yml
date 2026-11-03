@@ -1,0 +1,103 @@
+name: Prepare pinned native operator acceptance tools
+description: Admit official MediaMTX/Caddy archives and development-only FFmpeg by immutable hashes.
+runs:
+  using: composite
+  steps:
+    - name: Verify and provision pinned native development tools
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        $mediaManifest = Get-Content -LiteralPath src/k5vision/data/mediamtx-donor-manifest.json -Raw | ConvertFrom-Json
+        $mediaArtifacts = @($mediaManifest.artifacts | Where-Object { $_.platform -eq "windows_amd64" })
+        if ($mediaArtifacts.Count -ne 1) { throw "Expected one pinned native Windows MediaMTX archive" }
+        $mediaArtifact = $mediaArtifacts[0]
+        $caddyManifest = Get-Content -LiteralPath src/k5vision/data/caddy-donor-manifest.json -Raw | ConvertFrom-Json
+        $caddyArtifacts = @($caddyManifest.artifacts | Where-Object { $_.platform -eq "windows_amd64" })
+        if ($caddyArtifacts.Count -ne 1) { throw "Expected one pinned native Windows Caddy archive" }
+        $caddyArtifact = $caddyArtifacts[0]
+        $testTools = Get-Content -LiteralPath src/k5vision/data/mediamtx-donor-test-tools.json -Raw | ConvertFrom-Json
+        foreach ($field in @("url", "sha256", "version", "license", "source")) {
+          if ([string]::IsNullOrWhiteSpace([string]$testTools.$field)) {
+            throw "Development tool manifest is incomplete"
+          }
+        }
+        $toolRoot = Join-Path $env:RUNNER_TEMP ("K5 donor development tools " + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $toolRoot | Out-Null
+        "K5_DONOR_TOOL_ROOT=$toolRoot" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+
+        function Get-VerifiedArchive {
+          param([string]$Url, [string]$ExpectedHash, [string]$Archive, [string]$Destination)
+          if ($Url -notmatch '^https://[^\s]+$' -or $ExpectedHash -notmatch '^[a-fA-F0-9]{64}$') {
+            throw "Native tool archive identity is invalid"
+          }
+          Invoke-WebRequest -Uri $Url -OutFile $Archive -TimeoutSec 180
+          $actualHash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
+          if (-not [string]::Equals($actualHash, $ExpectedHash, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Native tool archive SHA256 mismatch"
+          }
+          Expand-Archive -LiteralPath $Archive -DestinationPath $Destination
+        }
+
+        $mediaDirectory = Join-Path $toolRoot "MediaMTX"
+        $caddyDirectory = Join-Path $toolRoot "Caddy"
+        $ffmpegDirectory = Join-Path $toolRoot "FFmpeg development only"
+        Get-VerifiedArchive -Url $mediaArtifact.url -ExpectedHash $mediaArtifact.sha256 -Archive (Join-Path $toolRoot "mediamtx.zip") -Destination $mediaDirectory
+        Get-VerifiedArchive -Url $caddyArtifact.url -ExpectedHash $caddyArtifact.sha256 -Archive (Join-Path $toolRoot "caddy.zip") -Destination $caddyDirectory
+        Get-VerifiedArchive -Url $testTools.url -ExpectedHash $testTools.sha256 -Archive (Join-Path $toolRoot "ffmpeg.zip") -Destination $ffmpegDirectory
+
+        function Get-SingleExecutable {
+          param([string]$Directory, [string]$Name)
+          $executables = @(Get-ChildItem -LiteralPath $Directory -Filter $Name -File -Recurse)
+          if ($executables.Count -ne 1) { throw "Expected exactly one supplied native executable" }
+          return $executables[0].FullName
+        }
+        $mediaExe = Get-SingleExecutable -Directory $mediaDirectory -Name "mediamtx.exe"
+        $caddyExe = Get-SingleExecutable -Directory $caddyDirectory -Name "caddy.exe"
+        foreach ($entry in @(@{Path=$mediaExe; Artifact=$mediaArtifact}, @{Path=$caddyExe; Artifact=$caddyArtifact})) {
+          $file = Get-Item -LiteralPath $entry.Path
+          $digest = (Get-FileHash -LiteralPath $entry.Path -Algorithm SHA256).Hash
+          if ($file.Length -ne $entry.Artifact.executable_bytes -or
+              -not [string]::Equals($digest, $entry.Artifact.executable_sha256, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Native executable content identity does not match its archive manifest"
+          }
+        }
+        $ffmpegExe = Get-SingleExecutable -Directory $ffmpegDirectory -Name "ffmpeg.exe"
+        $ffprobeExe = Get-SingleExecutable -Directory $ffmpegDirectory -Name "ffprobe.exe"
+
+        # Only verified archives have been extracted; execute nothing from an
+        # archive until its immutable SHA256 identity has been admitted.
+        $mediaVersion = @(& $mediaExe --version)
+        if ($LASTEXITCODE -ne 0 -or $mediaVersion.Count -ne 1 -or $mediaVersion[0].Trim() -ne $mediaManifest.version) {
+          throw "Native MediaMTX version does not match its manifest"
+        }
+        $caddyVersion = @(& $caddyExe version)
+        if ($LASTEXITCODE -ne 0 -or $caddyVersion.Count -eq 0 -or
+            $caddyVersion[0].Split(" ")[0] -ne $caddyManifest.version) {
+          throw "Native Caddy version does not match its manifest"
+        }
+        $ffmpegVersion = @(& $ffmpegExe -version)
+        if ($LASTEXITCODE -ne 0 -or $ffmpegVersion.Count -eq 0) { throw "FFmpeg development provenance failed" }
+        $ffprobeVersion = @(& $ffprobeExe -version)
+        if ($LASTEXITCODE -ne 0 -or $ffprobeVersion.Count -eq 0) { throw "ffprobe development provenance failed" }
+        $expectedVersion = [regex]::Escape([string]$testTools.version)
+        if ($ffmpegVersion[0] -notmatch "^ffmpeg version n?$expectedVersion(?:[-\s]|$)" -or
+            $ffprobeVersion[0] -notmatch "^ffprobe version n?$expectedVersion(?:[-\s]|$)") {
+          throw "FFmpeg development tool version does not match its manifest"
+        }
+        $buildConfiguration = @(& $ffmpegExe -buildconf 2>&1 | ForEach-Object { $_.ToString() }) -join "`n"
+        if ($LASTEXITCODE -ne 0) { throw "FFmpeg development build provenance failed" }
+        foreach ($flag in @("--enable-libx264", "--enable-gpl", "--enable-version3")) {
+          if (-not $buildConfiguration.Contains($flag)) { throw "FFmpeg development build is missing an admitted feature" }
+        }
+        if ($buildConfiguration.Contains("--enable-nonfree")) { throw "Nonfree FFmpeg development build is not admitted" }
+        Write-Host "MediaMTX native Windows: $($mediaVersion[0])"
+        Write-Host "Caddy native Windows: $($caddyVersion[0])"
+        Write-Host "FFmpeg development tool: $($ffmpegVersion[0])"
+        Write-Host "ffprobe development tool: $($ffprobeVersion[0])"
+        Write-Host "FFmpeg development build verified: libx264, GPL, version3; nonfree disabled"
+        Write-Host "Development tool license: $($testTools.license)"
+        Write-Host "Development tool source: $($testTools.source)"
+        "K5_MEDIAMTX_DONOR_EXE=$mediaExe" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+        "K5_CADDY_DONOR_EXE=$caddyExe" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+        "K5_DONOR_FFMPEG=$ffmpegExe" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+        "K5_DONOR_FFPROBE=$ffprobeExe" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8

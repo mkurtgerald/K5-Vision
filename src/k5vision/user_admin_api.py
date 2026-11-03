@@ -50,6 +50,7 @@ from k5vision.services.user_registry import (
     UserRegistry,
     UserRegistryCapacityError,
     UserRegistryConflictError,
+    UserRegistryLastAdministratorError,
     UserRegistryStorageError,
 )
 
@@ -542,6 +543,11 @@ def install_user_admin_api(
     ) -> UserAccount:
         try:
             user = require_registry().update(user_id, payload, actor=actor)
+        except UserRegistryLastAdministratorError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Activate another enabled administrator before removing this administrator",
+            ) from None
         except UserRegistryStorageError:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
