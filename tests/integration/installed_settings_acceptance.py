@@ -84,9 +84,7 @@ def _canonical_login(page, helpers, origin, account, *, diagnostic=None):
             return
         # Playwright's .headers may omit security-related headers; use
         # all_headers without ever serializing the bearer or source URL.
-        inventory_responses.append(
-            (response.request.all_headers().get("authorization"), response)
-        )
+        inventory_responses.append((response.request.all_headers().get("authorization"), response))
 
     if diagnostic is not None:
         diagnostic["settings_role_phase"] = "relogin_wait_auth_and_inventory"
