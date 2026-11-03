@@ -33,7 +33,7 @@ jobs:
       - name: Format check
         id: format
         continue-on-error: true
-        run: ruff format --check src tests
+        run: ruff format --check --diff src tests
 
       - name: Tests
         id: tests
