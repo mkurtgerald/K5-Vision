@@ -699,12 +699,26 @@ class OperatorProductService:
                 flush.result()
             except Exception:
                 pass
-        for process in (self._gateway, self._media):
-            if process is not None:
+        # Recorders are flushed and native readers joined before this point.
+        # Stop the two independent owned jobs together: serial grace windows
+        # unnecessarily delay the installed app's clean exit and restart.
+        processes = tuple(
+            process for process in (self._gateway, self._media) if process is not None
+        )
+        if processes:
+            stopped = asyncio.gather(
+                *(asyncio.to_thread(process.stop) for process in processes),
+                return_exceptions=True,
+            )
+            # A cancelled shutdown still owns both workers until both stop
+            # attempts finish. Never abandon a background thread at lease release.
+            while not stopped.done():
                 try:
-                    await asyncio.to_thread(process.stop)
-                except Exception:
-                    cleanup_failed = True
+                    await asyncio.shield(stopped)
+                except asyncio.CancelledError:
+                    cancelled = True
+            if any(isinstance(result, BaseException) for result in stopped.result()):
+                cleanup_failed = True
         if cleanup_failed:
             raise OperatorProductError("Native operator cleanup was incomplete") from None
         self._gateway = self._media = None

@@ -234,7 +234,6 @@ def test_stop_closes_each_active_writer_before_workers_without_rewriting_saved_c
         def stop_gateway():
             assert len(mutations) == 2
             assert all(not path["record"] for path in media.paths.values())
-            assert media.stopped == 0
             original_stop()
 
         monkeypatch.setattr(gateway, "stop", stop_gateway)
@@ -245,6 +244,37 @@ def test_stop_closes_each_active_writer_before_workers_without_rewriting_saved_c
         assert service._media_file.read_bytes() == saved
         assert all(settings["record"] for settings in json.loads(saved)["paths"].values())
         assert service._sources == original_sources and service._paths == original_paths
+        assert media.stopped == gateway.stopped == 1
+
+    asyncio.run(scenario())
+
+
+def test_stop_joins_both_native_workers_in_parallel_after_recording_flush(
+    native, monkeypatch
+):
+    mutations = _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        await service.start((_source(1), _source(2)))
+        media, gateway = service._media, service._gateway
+        barrier = threading.Barrier(2)
+
+        def checked_stop(process):
+            original = process.stop
+
+            def stop():
+                assert len(mutations) == 2
+                assert all(not path["record"] for path in media.paths.values())
+                # A serial stop would strand the first worker at this barrier.
+                barrier.wait(timeout=6)
+                original()
+
+            return stop
+
+        monkeypatch.setattr(gateway, "stop", checked_stop(gateway))
+        monkeypatch.setattr(media, "stop", checked_stop(media))
+        await service.stop()
         assert media.stopped == gateway.stopped == 1
 
     asyncio.run(scenario())
