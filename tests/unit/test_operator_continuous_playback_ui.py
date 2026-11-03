@@ -367,7 +367,6 @@ def test_event_seek_refreshes_stale_recording_inventory_once():
         assert len(requests) == 2
 
 
-
 def test_rolling_history_keeps_events_from_the_current_recorder_second():
     """A fresh event must not disappear because the history end was truncated to a second."""
     recorded_at = _NOW + timedelta(milliseconds=100)
