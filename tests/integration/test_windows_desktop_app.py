@@ -1597,11 +1597,16 @@ def _installed_analytics_journey(
         "Person event was not mapped to the fresh recording's UTC timestamp",
     )
     diagnostic["analytics_stage"] = "event_recording_navigation"
+    diagnostic["analytics_navigation_step"] = "history_range_click"
     page.locator("#last-24-hours").click()
+    diagnostic["analytics_navigation_step"] = "events_refresh_click"
     page.locator("#analytics-refresh").click()
+    diagnostic["analytics_navigation_step"] = "event_button_visible"
     event_button = page.locator(f'#analytics-events button[data-event-id="{detected["id"]}"]')
     event_button.wait_for(state="visible", timeout=15_000)
+    diagnostic["analytics_navigation_step"] = "event_button_click"
     event_button.click()
+    diagnostic["analytics_navigation_step"] = "playback_frames"
     expected_ms = (
         datetime.fromisoformat(detected["playback_at"].replace("Z", "+00:00")).timestamp() * 1000
     )
@@ -1615,6 +1620,7 @@ def _installed_analytics_journey(
         arg=expected_ms,
         timeout=20_000,
     )
+    diagnostic["analytics_navigation_step"] = "playback_decoded"
     event_frames = page.locator("#playback-video").evaluate(
         "video => video.getVideoPlaybackQuality().totalVideoFrames"
     )
@@ -1631,6 +1637,7 @@ def _installed_analytics_journey(
     browser_helpers._open_camera_watch(page, camera_id)
     browser_helpers._decoded_color(page, "live-video", "red")
     diagnostic["analytics_stage"] = "complete"
+    diagnostic["analytics_navigation_step"] = "complete"
     return {
         "product_analytics_enablement": True,
         "analytics_bundled_native_inference": True,

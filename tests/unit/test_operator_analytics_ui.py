@@ -118,6 +118,34 @@ def test_admin_enables_background_detection_and_events_open_exact_recorded_utc(a
     assert not errors
 
 
+def test_unchanged_polled_event_keeps_its_click_target_until_event_data_changes(analytics_page):
+    page, errors = analytics_page
+    page.evaluate(
+        """() => {
+          window.originalPersonButton = document.querySelector(
+            '#analytics-events button[data-event-id="12"]');
+        }"""
+    )
+    page.evaluate("() => window.analytics.refresh()")
+    assert page.evaluate(
+        """() => document.querySelector(
+          '#analytics-events button[data-event-id="12"]') === window.originalPersonButton"""
+    )
+    page.locator('#analytics-events button[data-event-id="12"]').click()
+    page.wait_for_function("window.seeks.length === 1")
+    assert page.evaluate("window.seeks[0].timestamp") == "2026-10-27T12:29:58Z"
+
+    page.evaluate(
+        "() => {window.eventRows[0].confidence=0.91; return window.analytics.refresh();}"
+    )
+    assert "91% confidence" in page.locator("#analytics-events").inner_text()
+    assert not page.evaluate(
+        """() => document.querySelector(
+          '#analytics-events button[data-event-id="12"]') === window.originalPersonButton"""
+    )
+    assert not errors
+
+
 def test_viewer_sees_events_without_settings_and_older_events_remain_camera_scoped(analytics_page):
     page, errors = analytics_page
     page.evaluate(

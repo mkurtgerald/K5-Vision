@@ -70,6 +70,7 @@
     let loading = false, saving = false, dirty = false, loadedOlder = false;
     let requestNumber = 0, eventRequestNumber = 0, providerRequestNumber = 0;
     let providerEvents = [], providerBefore = null, providerLoadedOlder = false;
+    let renderedEventSignature = null;
 
     container.classList.add("analytics-panel");
     container.setAttribute("aria-labelledby", "analytics-title");
@@ -173,6 +174,19 @@
     }
 
     function renderEvents() {
+      // Five-second polling must not detach an unchanged event while the
+      // operator is targeting its Play recording button.
+      const signature = JSON.stringify(events.map((event) => [
+        event.id, event.camera_id, event.occurred_at, event.playback_at,
+        event.confidence, event.person_count,
+      ]));
+      if (signature === renderedEventSignature) {
+        eventCount.textContent = String(events.length);
+        olderButton.hidden = !before || events.length >= MAX_EVENTS;
+        controls();
+        return;
+      }
+      renderedEventSignature = signature;
       const fragment = document.createDocumentFragment();
       for (const event of events) {
         const row = element("li", "analytics-event"); row.dataset.eventId = String(event.id);
