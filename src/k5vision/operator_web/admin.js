@@ -25,6 +25,7 @@
     let users = [], usersOffset = 0, auditOffset = 0;
     let usersRequest = 0, auditRequest = 0, profileRequest = 0, usersRefreshing = false;
     let editTarget = null, resetTarget = null, previousRole = "operator", profileData = null;
+    let renderedCameraChoices = "";
 
     function message(id, text = "", error = false) {
       $(id).textContent = text;
@@ -181,11 +182,20 @@
       void (next === "users" ? loadUsers() : loadAudit());
     }
 
-    function renderCameraChoices(ids = []) {
-      const chosen = new Set(ids), fragment = document.createDocumentFragment();
+    function cameraChoices(ids) {
       const cameras = getCameras();
       const missing = ids.filter((id) => !cameras.some((camera) => camera.device_id === id));
-      for (const camera of [...cameras, ...missing.map((id) => ({ device_id: id, name: `Unavailable camera · ${id}` }))]) {
+      return [...cameras, ...missing.map((id) => ({ device_id: id, name: `Unavailable camera · ${id}` }))];
+    }
+
+    function cameraChoicesKey(cameras) {
+      return JSON.stringify(cameras.map((camera) => [camera.device_id, camera.name]));
+    }
+
+    function renderCameraChoices(ids = []) {
+      const chosen = new Set(ids), fragment = document.createDocumentFragment();
+      const cameras = cameraChoices(ids);
+      for (const camera of cameras) {
         const label = document.createElement("label"); label.className = "admin-checkbox";
         const input = document.createElement("input"); input.type = "checkbox"; input.value = camera.device_id;
         input.checked = chosen.has(camera.device_id);
@@ -193,6 +203,7 @@
         label.append(input, name); fragment.append(label);
       }
       $("admin-camera-choices").replaceChildren(fragment);
+      renderedCameraChoices = cameraChoicesKey(cameras);
       renderAccess();
     }
 
@@ -426,7 +437,7 @@
       refreshCameras() {
         if ($("admin-user-dialog").open && !busy) {
           const ids = Array.from($("admin-camera-choices").querySelectorAll("input:checked"), (input) => input.value);
-          renderCameraChoices(ids);
+          if (cameraChoicesKey(cameraChoices(ids)) !== renderedCameraChoices) renderCameraChoices(ids);
         }
       },
     };
