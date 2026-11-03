@@ -940,15 +940,40 @@ def run_installed_settings_journey(
         button.wait_for(state="visible", timeout=15000)
         button.click()
         expected_ms = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() * 1000
-        page.wait_for_function(
-            """chosen => {
-              const v=document.querySelector('#playback-video');
-              return Math.abs(Date.parse(v.dataset.utcStart||'')-chosen)<1000 &&
-                v.readyState>=2 && v.getVideoPlaybackQuality().totalVideoFrames>=4;
-            }""",
-            arg=expected_ms,
-            timeout=20000,
-        )
+        try:
+            page.wait_for_function(
+                """chosen => {
+                  const v=document.querySelector('#playback-video');
+                  return Math.abs(Date.parse(v.dataset.utcStart||'')-chosen)<1000 &&
+                    v.readyState>=2 && v.getVideoPlaybackQuality().totalVideoFrames>=4;
+                }""",
+                arg=expected_ms,
+                timeout=20000,
+            )
+        except Exception:
+            # Bounded installed GUI state only; never include media source URLs.
+            diagnostic["settings_provider_playback_snapshot"] = page.evaluate(
+                """chosen => {
+                  const v=document.querySelector('#playback-video');
+                  const start=Date.parse(v?.dataset.utcStart||'');
+                  const from=Date.parse(document.getElementById('history-start')?.value||'');
+                  const to=Date.parse(document.getElementById('history-end')?.value||'');
+                  return {
+                    event_button_visible:!!document.querySelector('#analytics-provider-events button'),
+                    history_visible:!document.getElementById('history-panel')?.hidden,
+                    history_intervals:document.querySelectorAll('#history-list button').length,
+                    range_contains_event:Number.isFinite(from)&&Number.isFinite(to)&&from<=chosen&&chosen<to,
+                    playback_start_delta_ms:Number.isFinite(start)?Math.round(start-chosen):null,
+                    playback_ready_state:v?.readyState??null,
+                    playback_frames:v?.getVideoPlaybackQuality?.().totalVideoFrames??null,
+                    playback_paused:v?.paused??null,
+                    playback_error_code:v?.error?.code??null,
+                    playback_source_present:!!v?.currentSrc
+                  };
+                }""",
+                expected_ms,
+            )
+            raise
         provider_frames = page.locator("#playback-video").evaluate(
             "v=>v.getVideoPlaybackQuality().totalVideoFrames"
         )
