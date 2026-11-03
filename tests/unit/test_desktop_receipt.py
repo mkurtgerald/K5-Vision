@@ -24,6 +24,7 @@ _BETA_SPEC.loader.exec_module(_BETA_VERIFIER)
 _CASE = "test_native_windows_click_install_account_browser_tray_restart_uninstall"
 _REQUIRED_TRUE = (
     "native_windows_execution generated_media_only actual_gui_installer actual_gui_account_setup "
+    "installed_worker_bundle_verified "
     "administrator_login embedded_python_independent_of_path actual_edge_login_enrollment_live "
     "close_hides_to_tray recording_continues_after_browser_and_window_close "
     "second_click_reopens_single_instance graceful_owned_process_cleanup "
@@ -278,6 +279,14 @@ def test_desktop_receipt_requires_executed_time_health_displays(tmp_path, field,
 def test_desktop_receipt_refuses_unqualified_host_clock_step_claim(tmp_path, claim):
     receipt = _receipt()
     receipt["host_clock_step_acceptance"] = claim
+    with pytest.raises(ValueError):
+        _VERIFIER.verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("unverified", [False, 1, None, "true"])
+def test_desktop_receipt_refuses_unverified_installed_workers(tmp_path, unverified):
+    receipt = _receipt()
+    receipt["installed_worker_bundle_verified"] = unverified
     with pytest.raises(ValueError):
         _VERIFIER.verify(_report(tmp_path, receipt))
 

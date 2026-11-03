@@ -101,15 +101,24 @@ def _api(page, token, method, route, data=None):
     return response.status, result
 
 
-def _login(page, origin, username, password):
+def _login(page, origin, username, password, *, progress=None):
     __tracebackhide__ = True
+
+    def checkpoint(phase):
+        if progress is not None:
+            progress(phase)
+
+    checkpoint("navigate")
     page.goto(origin + "/operator/")
+    checkpoint("fill_credentials")
     page.locator("#username").fill(username)
     page.locator("#password").fill(password)
+    checkpoint("submit_credentials")
     with page.expect_response(
         lambda response: _route_response(response, "POST", "/api/v1/auth/login")
     ) as completed:
         page.locator("#sign-in-button").click()
+    checkpoint("login_response")
     _require(completed.value.status == 200, "Generated user could not sign in through the UI")
     value = completed.value.json()
     token = value.get("session_token")
@@ -117,7 +126,9 @@ def _login(page, origin, username, password):
         isinstance(token, str) and 32 <= len(token) <= 128,
         "User sign-in did not issue a bounded opaque session",
     )
+    checkpoint("wait_workspace")
     page.locator("#workspace").wait_for(state="visible")
+    checkpoint("workspace_visible")
     _require(page.locator("#password").input_value() == "", "Login retained a password field")
     return token
 

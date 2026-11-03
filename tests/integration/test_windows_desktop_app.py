@@ -333,7 +333,9 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
     """Drive the actual Inno wizard without suppressing its user interface."""
     __tracebackhide__ = True
     diagnostic = {} if diagnostic is None else diagnostic
-    diagnostic.update(installer_action="starting", installer_install_posted=False)
+    diagnostic.update(
+        installer_action="starting", installer_install_posted=False, installer_next_clicks=0
+    )
     process = subprocess.Popen(
         [
             str(setup),
@@ -391,6 +393,8 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                             diagnostic["installer_action"] = (
                                 "finish" if caption == "finish" else "next"
                             )
+                            if caption.startswith("next"):
+                                diagnostic["installer_next_clicks"] += 1
                             api.click(captions[caption])
                         clicked.add(caption)
                         break
@@ -400,6 +404,9 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
         _require(launch_unchecked, "Installer launch option was not available to the user")
         diagnostic["installer_action"] = "completed"
     finally:
+        diagnostic["installer_exit_code"] = process.poll()
+        diagnostic["installer_steps_seen"] = sorted(clicked)
+        diagnostic["installer_launch_unchecked"] = launch_unchecked
         if process.poll() is None:
             children = psutil.Process(process.pid).children(recursive=True)
             process.kill()
@@ -407,6 +414,69 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
             for child in children:
                 if child.is_running():
                     child.kill()
+
+
+def _verify_installed_worker_bundle(installed: Path) -> None:
+    """Check actual installed native worker bytes before first startup.
+
+    This is a local payload admission check, not a disconnected-network test.
+    No private paths, source URIs, or process output enter the receipt.
+    """
+    workers = installed / "workers"
+    manifest_path = workers / "donor-downloads.json"
+    _require(
+        manifest_path.is_file() and 0 < manifest_path.stat().st_size <= 65536,
+        "Installed native worker manifest is absent or oversized",
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    _require(
+        type(manifest) is dict and manifest.get("schema_version") == 1,
+        "Installed native worker manifest identity is invalid",
+    )
+    artifacts = manifest.get("artifacts")
+    _require(type(artifacts) is list and len(artifacts) == 2, "Installed worker count is invalid")
+    expected = {
+        "MediaMTX": ("mediamtx.exe", "mediamtx-LICENSE"),
+        "Caddy": ("caddy.exe", "caddy-LICENSE"),
+    }
+    seen = set()
+    for artifact in artifacts:
+        _require(type(artifact) is dict, "Installed worker entry is invalid")
+        component = artifact.get("component")
+        _require(
+            type(component) is str and component in expected and component not in seen,
+            "Installed native worker identity is invalid",
+        )
+        seen.add(component)
+        binary_name, license_name = expected[component]
+        _require(
+            artifact.get("executable") == binary_name
+            and artifact.get("payload_executable") == "workers/" + binary_name
+            and artifact.get("payload_license") == "workers/" + license_name,
+            "Installed native worker path identity is invalid",
+        )
+        for filename, size_field, digest_field in (
+            (binary_name, "executable_bytes", "executable_sha256"),
+            (license_name, "payload_license_bytes", "license_sha256"),
+        ):
+            candidate = workers / filename
+            _require(
+                candidate.is_file() and not candidate.is_symlink(), "Native worker file is absent"
+            )
+            size = artifact.get(size_field)
+            digest = artifact.get(digest_field)
+            _require(
+                type(size) is int
+                and 0 < size <= 128 * 1024 * 1024
+                and type(digest) is str
+                and len(digest) == 64,
+                "Installed native worker file identity is invalid",
+            )
+            _require(candidate.stat().st_size == size, "Installed native worker length mismatch")
+            with candidate.open("rb") as stream:
+                actual = hashlib.file_digest(stream, "sha256").hexdigest()
+            _require(actual == digest, "Installed native worker digest mismatch")
+    _require(seen == set(expected), "Installed native worker set is incomplete")
 
 
 def _start_app(installed, profile, port, cohort):
@@ -567,6 +637,23 @@ def test_browser_origin_is_retained_when_connection_closes_before_window_visibil
     assert len(watcher.origin_ancestries) == 1 and not watcher.failed
 
 
+def _retire_temporary_browser_processes(owned):
+    """Retire only browser descendants observed after native OS handoff.
+
+    Closing the test window is the graceful shutdown signal. A long idle
+    wait before terminating still-live descendants adds no observation.
+    Require their actual exit instead of silently accepting leaks.
+    """
+    _, alive = psutil.wait_procs(list(owned.values()), timeout=0.5)
+    for item in alive:
+        try:
+            item.terminate()
+        except psutil.NoSuchProcess:
+            pass
+    _, remaining = psutil.wait_procs(alive, timeout=5)
+    _require(not remaining, "Native browser handoff left owned processes running")
+
+
 def _default_browser_handoff(api, form, port, *, diagnostic=None):
     """Observe real OS dispatch, origin traffic and the new product browser window."""
     diagnostic = {} if diagnostic is None else diagnostic
@@ -662,16 +749,31 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
         diagnostic["browser_handoff_observer_stopped"] = watcher_finished
         if opened and api.api.IsWindow(opened):
             api.close(opened)
-        _, alive = psutil.wait_procs(list(owned.values()), timeout=5)
-        # Existing browser processes are never terminated; only the new window
-        # and processes introduced beneath its browser root are owned here.
-        for item in alive:
-            try:
-                item.terminate()
-            except psutil.NoSuchProcess:
-                pass
-        psutil.wait_procs(alive, timeout=5)
+        # Existing browsers are not owned. Only new descendants observed
+        # during this handoff may be terminated after its window closes.
+        _retire_temporary_browser_processes(owned)
         _require(watcher_finished, "Native browser launch observer did not finish")
+
+
+def test_native_browser_handoff_retires_only_observed_descendants(monkeypatch):
+    calls = []
+    child = SimpleNamespace(terminate=lambda: calls.append("terminated"))
+
+    def wait_procs(processes, timeout):
+        assert processes == [child]
+        calls.append(timeout)
+        return ([], [child]) if timeout == 0.5 else ([child], [])
+
+    monkeypatch.setattr(psutil, "wait_procs", wait_procs)
+    _retire_temporary_browser_processes({(123, 456): child})
+    assert calls == [0.5, "terminated", 5]
+
+
+def test_native_browser_handoff_rejects_unreaped_descendants(monkeypatch):
+    child = SimpleNamespace(terminate=lambda: None)
+    monkeypatch.setattr(psutil, "wait_procs", lambda _processes, timeout: ([], [child]))
+    with pytest.raises(pytest.fail.Exception, match="left owned processes running"):
+        _retire_temporary_browser_processes({(123, 456): child})
 
 
 def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
@@ -1601,25 +1703,59 @@ def _installed_analytics_journey(
     page.locator("#last-24-hours").click()
     diagnostic["analytics_navigation_step"] = "events_refresh_click"
     page.locator("#analytics-refresh").click()
-    diagnostic["analytics_navigation_step"] = "event_button_visible"
-    event_button = page.locator(f'#analytics-events button[data-event-id="{detected["id"]}"]')
-    event_button.wait_for(state="visible", timeout=15_000)
-    diagnostic["analytics_navigation_step"] = "event_button_click"
-    event_button.click()
-    diagnostic["analytics_navigation_step"] = "playback_frames"
     expected_ms = (
         datetime.fromisoformat(detected["playback_at"].replace("Z", "+00:00")).timestamp() * 1000
     )
-    page.wait_for_function(
-        """chosen => {
-          const video=document.getElementById('playback-video');
-          return Math.abs(Date.parse(video.dataset.utcStart || '')-chosen)<1000 &&
-            video.readyState>=2 && !video.paused &&
-            video.getVideoPlaybackQuality().totalVideoFrames>=4;
-        }""",
-        arg=expected_ms,
-        timeout=20_000,
-    )
+
+    def navigation_snapshot():
+        # Only bounded browser state, never video source URLs or bearer values.
+        return page.evaluate(
+            """expected => {
+              const video=document.getElementById('playback-video');
+              const start=Date.parse(video?.dataset.utcStart || '');
+              const from=Date.parse(document.getElementById('history-start')?.value || '');
+              const to=Date.parse(document.getElementById('history-end')?.value || '');
+              return {
+                history_visible:!document.getElementById('history-panel')?.hidden,
+                history_start_delta_seconds:Number.isFinite(from)?Math.round((from-expected)/1000):null,
+                history_end_delta_seconds:Number.isFinite(to)?Math.round((to-expected)/1000):null,
+                history_intervals:document.querySelectorAll('#history-list button').length,
+                person_event_buttons:document.querySelectorAll('#analytics-events button').length,
+                playback_start_delta_ms:Number.isFinite(start)?Math.round(start-expected):null,
+                playback_ready_state:video?.readyState ?? null,
+                playback_frame_count:video?.getVideoPlaybackQuality?.().totalVideoFrames ?? null,
+                playback_paused:video?.paused ?? null,
+                playback_error_code:video?.error?.code ?? null,
+                playback_source_present:!!video?.currentSrc
+              };
+            }""",
+            expected_ms,
+        )
+
+    diagnostic["analytics_navigation_step"] = "event_button_visible"
+    event_button = page.locator(f'#analytics-events button[data-event-id="{detected["id"]}"]')
+    try:
+        event_button.wait_for(state="visible", timeout=15_000)
+    except Exception:
+        diagnostic["analytics_navigation_snapshot"] = navigation_snapshot()
+        raise
+    diagnostic["analytics_navigation_step"] = "event_button_click"
+    event_button.click()
+    diagnostic["analytics_navigation_step"] = "playback_frames"
+    try:
+        page.wait_for_function(
+            """chosen => {
+              const video=document.getElementById('playback-video');
+              return Math.abs(Date.parse(video.dataset.utcStart || '')-chosen)<1000 &&
+                video.readyState>=2 && !video.paused &&
+                video.getVideoPlaybackQuality().totalVideoFrames>=4;
+            }""",
+            arg=expected_ms,
+            timeout=20_000,
+        )
+    except Exception:
+        diagnostic["analytics_navigation_snapshot"] = navigation_snapshot()
+        raise
     diagnostic["analytics_navigation_step"] = "playback_decoded"
     event_frames = page.locator("#playback-video").evaluate(
         "video => video.getVideoPlaybackQuality().totalVideoFrames"
@@ -2178,6 +2314,8 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
         _require((installed / "K5Vision.exe").is_file(), "Installed desktop executable is absent")
         _require((installed / "runtime/python.exe").is_file(), "Embedded Python was not installed")
+        _verify_installed_worker_bundle(installed)
+        receipt["installed_worker_bundle_verified"] = True
         receipt["actual_gui_installer"] = True
         reservations, ports = helpers._reserve_ports(5)
         port, upstream_ports = ports[0], ports[1:]

@@ -66,16 +66,68 @@ def _open(page, name):
 
 
 def _canonical_login(page, helpers, origin, account, *, diagnostic=None):
-    """Wait for the product's own inventory authority, with real core auth/me."""
+    """Prove the browser inventory came from the *new* authenticated session.
+
+    An in-flight camera poll using the revoked session may finish with 401 as
+    the page navigates to login. It is not the new login's inventory response.
+    Keep bearer values in memory only; diagnostics contain bounded counts.
+    """
+    inventory_responses = []
+    overflow = False
+
+    def observed(response):
+        nonlocal overflow
+        if not _route(response, "GET", "/api/v1/operator/cameras"):
+            return
+        if len(inventory_responses) >= 32:
+            overflow = True
+            return
+        # Playwright's .headers may omit security-related headers; use
+        # all_headers without ever serializing the bearer or source URL.
+        inventory_responses.append((response.request.all_headers().get("authorization"), response))
+
     if diagnostic is not None:
         diagnostic["settings_role_phase"] = "relogin_wait_auth_and_inventory"
-    with page.expect_response(lambda r: _route(r, "GET", "/api/v1/operator/cameras")) as inventory:
-        token = helpers._login(page, origin, account["username"], account["password"])
-    if diagnostic is not None:
-        diagnostic["settings_role_phase"] = "relogin_inventory_response"
-        diagnostic["settings_relogin_inventory_http_status"] = inventory.value.status
-    _require(inventory.value.status == 200, "Canonical camera authority was unavailable")
-    capabilities = inventory.value.json().get("capabilities", {})
+    page.on("response", observed)
+    try:
+
+        def login_progress(phase):
+            if diagnostic is not None:
+                diagnostic["settings_role_phase"] = "relogin_" + phase
+
+        token = helpers._login(
+            page, origin, account["username"], account["password"], progress=login_progress
+        )
+        if diagnostic is not None:
+            diagnostic["settings_role_phase"] = "relogin_await_canonical_inventory"
+        wanted = "Bearer " + token
+        deadline = time.monotonic() + 12
+        inventory = None
+        while time.monotonic() < deadline:
+            _require(not overflow, "Installed inventory response bound exceeded")
+            inventory = next(
+                (reply for bearer, reply in inventory_responses if bearer == wanted),
+                None,
+            )
+            if inventory is not None:
+                break
+            page.wait_for_timeout(100)
+        if diagnostic is not None:
+            diagnostic["settings_relogin_response_count"] = len(inventory_responses)
+            diagnostic["settings_relogin_stale_inventory_responses"] = sum(
+                bearer != wanted for bearer, _ in inventory_responses
+            )
+        _require(inventory is not None, "New session did not load its own camera inventory")
+        if diagnostic is not None:
+            diagnostic["settings_role_phase"] = "relogin_inventory_response"
+            diagnostic["settings_relogin_inventory_http_status"] = inventory.status
+            diagnostic["settings_relogin_stale_inventory_responses"] = sum(
+                bearer != wanted for bearer, _ in inventory_responses
+            )
+        _require(inventory.status == 200, "Canonical camera authority was unavailable")
+        capabilities = inventory.json().get("capabilities", {})
+    finally:
+        page.remove_listener("response", observed)
     if diagnostic is not None:
         diagnostic["settings_role_phase"] = "relogin_core_identity_request"
     status, core = helpers._api(page, token, "GET", "/api/v1/auth/me")
@@ -902,15 +954,41 @@ def run_installed_settings_journey(
         button.wait_for(state="visible", timeout=15000)
         button.click()
         expected_ms = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() * 1000
-        page.wait_for_function(
-            """chosen => {
-              const v=document.querySelector('#playback-video');
-              return Math.abs(Date.parse(v.dataset.utcStart||'')-chosen)<1000 &&
-                v.readyState>=2 && v.getVideoPlaybackQuality().totalVideoFrames>=4;
-            }""",
-            arg=expected_ms,
-            timeout=20000,
-        )
+        try:
+            page.wait_for_function(
+                """chosen => {
+                  const v=document.querySelector('#playback-video');
+                  return Math.abs(Date.parse(v.dataset.utcStart||'')-chosen)<1000 &&
+                    v.readyState>=2 && v.getVideoPlaybackQuality().totalVideoFrames>=4;
+                }""",
+                arg=expected_ms,
+                timeout=20000,
+            )
+        except Exception:
+            # Bounded installed GUI state only; never include media source URLs.
+            diagnostic["settings_provider_playback_snapshot"] = page.evaluate(
+                """chosen => {
+                  const v=document.querySelector('#playback-video');
+                  const start=Date.parse(v?.dataset.utcStart||'');
+                  const from=Date.parse(document.getElementById('history-start')?.value||'');
+                  const to=Date.parse(document.getElementById('history-end')?.value||'');
+                  return {
+                    event_button_visible:!!document.querySelector(
+                      '#analytics-provider-events button'),
+                    history_visible:!document.getElementById('history-panel')?.hidden,
+                    history_intervals:document.querySelectorAll('#history-list button').length,
+                    range_contains_event:Number.isFinite(from)&&Number.isFinite(to)&&from<=chosen&&chosen<to,
+                    playback_start_delta_ms:Number.isFinite(start)?Math.round(start-chosen):null,
+                    playback_ready_state:v?.readyState??null,
+                    playback_frames:v?.getVideoPlaybackQuality?.().totalVideoFrames??null,
+                    playback_paused:v?.paused??null,
+                    playback_error_code:v?.error?.code??null,
+                    playback_source_present:!!v?.currentSrc
+                  };
+                }""",
+                expected_ms,
+            )
+            raise
         provider_frames = page.locator("#playback-video").evaluate(
             "v=>v.getVideoPlaybackQuality().totalVideoFrames"
         )
