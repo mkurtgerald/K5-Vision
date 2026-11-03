@@ -470,7 +470,8 @@ def test_unchanged_camera_refresh_does_not_replace_active_permissions_controls(
             page.locator("#admin-save-user").click()
         assert created.value.status == 201
         assert created.value.json()["account"]["camera_access"] == {
-            "mode": "selected", "camera_ids": [_CAMERA]
+            "mode": "selected",
+            "camera_ids": [_CAMERA],
         }
         page.locator("#admin-credential-dialog").wait_for(state="visible")
         assert not errors
