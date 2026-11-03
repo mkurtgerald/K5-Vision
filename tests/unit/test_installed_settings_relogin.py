@@ -90,9 +90,7 @@ class _Helpers:
     ("stale_status", "current_status", "succeeds"),
     [(401, 200, True), (200, 401, False)],
 )
-def test_canonical_inventory_is_attributed_to_current_login(
-    stale_status, current_status, succeeds
-):
+def test_canonical_inventory_is_attributed_to_current_login(stale_status, current_status, succeeds):
     module = _helper()
     page = _Page()
     helpers = _Helpers(stale_status, current_status)
