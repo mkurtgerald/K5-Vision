@@ -408,7 +408,7 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
         diagnostic["installer_steps_seen"] = sorted(clicked)
         diagnostic["installer_launch_unchecked"] = launch_unchecked
         if process.poll() is None:
-            children = psutil.Process(process.pid).children(recursive=True
+            children = psutil.Process(process.pid).children(recursive=True)
             process.kill()
             process.wait(timeout=10)
             for child in children:
