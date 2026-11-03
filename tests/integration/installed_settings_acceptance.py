@@ -66,16 +66,56 @@ def _open(page, name):
 
 
 def _canonical_login(page, helpers, origin, account, *, diagnostic=None):
-    """Wait for the product's own inventory authority, with real core auth/me."""
+    """Prove the browser inventory came from the *new* authenticated session.
+
+    An in-flight camera poll using the revoked session may finish with 401 as
+    the page navigates to login. It is not the new login's inventory response.
+    Keep bearer values in memory only; diagnostics contain bounded counts.
+    """
+    inventory_responses = []
+    overflow = False
+
+    def observed(response):
+        nonlocal overflow
+        if not _route(response, "GET", "/api/v1/operator/cameras"):
+            return
+        if len(inventory_responses) >= 32:
+            overflow = True
+            return
+        # Playwright's .headers may omit security-related headers; use
+        # all_headers without ever serializing the bearer or source URL.
+        inventory_responses.append(
+            (response.request.all_headers().get("authorization"), response)
+        )
+
     if diagnostic is not None:
         diagnostic["settings_role_phase"] = "relogin_wait_auth_and_inventory"
-    with page.expect_response(lambda r: _route(r, "GET", "/api/v1/operator/cameras")) as inventory:
+    page.on("response", observed)
+    try:
         token = helpers._login(page, origin, account["username"], account["password"])
-    if diagnostic is not None:
-        diagnostic["settings_role_phase"] = "relogin_inventory_response"
-        diagnostic["settings_relogin_inventory_http_status"] = inventory.value.status
-    _require(inventory.value.status == 200, "Canonical camera authority was unavailable")
-    capabilities = inventory.value.json().get("capabilities", {})
+        wanted = "Bearer " + token
+        deadline = time.monotonic() + 12
+        inventory = None
+        while time.monotonic() < deadline:
+            _require(not overflow, "Installed inventory response bound exceeded")
+            inventory = next(
+                (reply for bearer, reply in inventory_responses if bearer == wanted),
+                None,
+            )
+            if inventory is not None:
+                break
+            page.wait_for_timeout(100)
+        _require(inventory is not None, "New session did not load its own camera inventory")
+        if diagnostic is not None:
+            diagnostic["settings_role_phase"] = "relogin_inventory_response"
+            diagnostic["settings_relogin_inventory_http_status"] = inventory.status
+            diagnostic["settings_relogin_stale_inventory_responses"] = sum(
+                bearer != wanted for bearer, _ in inventory_responses
+            )
+        _require(inventory.status == 200, "Canonical camera authority was unavailable")
+        capabilities = inventory.json().get("capabilities", {})
+    finally:
+        page.remove_listener("response", observed)
     if diagnostic is not None:
         diagnostic["settings_role_phase"] = "relogin_core_identity_request"
     status, core = helpers._api(page, token, "GET", "/api/v1/auth/me")
