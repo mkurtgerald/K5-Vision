@@ -90,7 +90,15 @@ def _canonical_login(page, helpers, origin, account, *, diagnostic=None):
         diagnostic["settings_role_phase"] = "relogin_wait_auth_and_inventory"
     page.on("response", observed)
     try:
-        token = helpers._login(page, origin, account["username"], account["password"])
+        def login_progress(phase):
+            if diagnostic is not None:
+                diagnostic["settings_role_phase"] = "relogin_" + phase
+
+        token = helpers._login(
+            page, origin, account["username"], account["password"], progress=login_progress
+        )
+        if diagnostic is not None:
+            diagnostic["settings_role_phase"] = "relogin_await_canonical_inventory"
         wanted = "Bearer " + token
         deadline = time.monotonic() + 12
         inventory = None
@@ -103,6 +111,11 @@ def _canonical_login(page, helpers, origin, account, *, diagnostic=None):
             if inventory is not None:
                 break
             page.wait_for_timeout(100)
+        if diagnostic is not None:
+            diagnostic["settings_relogin_response_count"] = len(inventory_responses)
+            diagnostic["settings_relogin_stale_inventory_responses"] = sum(
+                bearer != wanted for bearer, _ in inventory_responses
+            )
         _require(inventory is not None, "New session did not load its own camera inventory")
         if diagnostic is not None:
             diagnostic["settings_role_phase"] = "relogin_inventory_response"
