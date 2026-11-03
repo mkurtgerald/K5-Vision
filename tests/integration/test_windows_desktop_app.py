@@ -2211,24 +2211,39 @@ def _vm_clock_phase(
             diagnostic["vm_clock_guard"] = guard.receipt()
         except RuntimeError:
             diagnostic["vm_clock_guard"] = {"available": False}
-    diagnostic["vm_clock_stage"] = "restored_playback"
+    # Identify the exact failing post-restoration operation without exposing
+    # recorded media, camera addresses or authenticated request contents.
+    diagnostic["vm_clock_stage"] = "restored_closed_hashes"
     _require(_hashes_preserved(closed), "VM clock restoration changed closed footage hashes")
-    restored_history = client.json(route + "/history" + history_query)["spans"]
+    diagnostic["vm_clock_stage"] = "restored_history_query"
+    try:
+        restored_history = client.json(route + "/history" + history_query)["spans"]
+    finally:
+        # The local client reports transport failures as RuntimeError. Retain
+        # only its bounded, route-free exception class and elapsed time.
+        if client.transport_failure is not None:
+            diagnostic["vm_clock_history_transport"] = dict(client.transport_failure)
+    diagnostic["vm_clock_stage"] = "restored_history_unchanged"
     _require(
         all(span in restored_history for span in before_history),
         "VM clock restoration lost retained recording history",
     )
+    diagnostic["vm_clock_stage"] = "restored_browser_history_submit"
     page.locator("#history-tab").click()
     page.locator("#history-start").fill(browser_helpers._datetime_local_value(historical_start))
     page.locator("#history-end").fill(browser_helpers._datetime_local_value(historical_end))
     page.locator("#history-form").evaluate("form => form.requestSubmit()")
+    diagnostic["vm_clock_stage"] = "restored_browser_history_visible"
     page.locator(".history-item").first.wait_for(state="visible", timeout=15_000)
     page.locator(".history-item").first.click()
     page.locator("#play-recording").click()
+    diagnostic["vm_clock_stage"] = "restored_playback_frames"
     playback_frames = browser_helpers._decoded_color(page, "playback-video", "red")
     page.locator("#live-tab").click()
+    diagnostic["vm_clock_stage"] = "restored_live_frames"
     browser_helpers._decoded_color(page, "live-video", "red")
     _require(not non_loopback, "VM clock proof attempted an external request while shifted")
+    diagnostic["vm_clock_stage"] = "restored_guard_receipt"
     guard_receipt = guard.receipt()
     _require(
         guard_receipt["reason"] == "closed"
