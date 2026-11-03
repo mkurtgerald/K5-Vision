@@ -249,9 +249,7 @@ def test_stop_closes_each_active_writer_before_workers_without_rewriting_saved_c
     asyncio.run(scenario())
 
 
-def test_stop_joins_both_native_workers_in_parallel_after_recording_flush(
-    native, monkeypatch
-):
+def test_stop_joins_both_native_workers_in_parallel_after_recording_flush(native, monkeypatch):
     mutations = _fake_mutations(native, monkeypatch)
 
     async def scenario():
