@@ -430,7 +430,9 @@ def test_late_camera_refresh_preserves_administration_and_open_permissions_edito
 
 
 
-def test_unchanged_camera_refresh_does_not_replace_active_permissions_controls(workspace):
+def test_unchanged_camera_refresh_does_not_replace_active_permissions_controls(
+    workspace,
+):
     """Polling an unchanged inventory must not erase an in-progress camera grant."""
     with workspace() as (page, _state, _account, errors):
         _login(page)
@@ -457,6 +459,7 @@ def test_unchanged_camera_refresh_does_not_replace_active_permissions_controls(w
             else:
                 choice.check()
 
+        choice.check()
         page.locator("#admin-username").fill("stable-viewer")
         page.locator("#admin-display-name").fill("Stable viewer")
         page.locator("#admin-role").select_option("viewer")
@@ -466,5 +469,8 @@ def test_unchanged_camera_refresh_does_not_replace_active_permissions_controls(w
         ) as created:
             page.locator("#admin-save-user").click()
         assert created.value.status == 201
+        assert created.value.json()["account"]["camera_access"] == {
+            "mode": "selected", "camera_ids": [_CAMERA]
+        }
         page.locator("#admin-credential-dialog").wait_for(state="visible")
         assert not errors
