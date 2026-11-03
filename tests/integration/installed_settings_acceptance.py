@@ -826,12 +826,57 @@ def run_installed_settings_journey(
         contexts_to_close.append(oidc_context)
         oidc_page.goto(origin + "/operator/")
         oidc_page.locator("#sso-sign-in").wait_for(state="visible")
-        issued = _result(
-            oidc_page,
-            "POST",
-            "/api/v1/auth/oidc/complete",
-            lambda: oidc_page.locator("#sso-sign-in-button").click(),
-        )
+        # Observe only bounded route-class counts. Never retain the generated
+        # authorization URL, callback query, credentials, or issued token.
+        oidc_route_counts = {
+            "start_request": 0,
+            "start_response": 0,
+            "authorize_request": 0,
+            "callback_request": 0,
+            "complete_request": 0,
+            "complete_response": 0,
+        }
+
+        def observe_oidc_request(request):
+            route = urlsplit(request.url).path
+            key = {
+                "/api/v1/auth/oidc/start": "start_request",
+                "/authorize": "authorize_request",
+                "/api/v1/auth/oidc/callback": "callback_request",
+                "/api/v1/auth/oidc/complete": "complete_request",
+            }.get(route)
+            if key is not None:
+                oidc_route_counts[key] = min(32, oidc_route_counts[key] + 1)
+
+        def observe_oidc_response(response):
+            route = urlsplit(response.url).path
+            key = {
+                "/api/v1/auth/oidc/start": "start_response",
+                "/api/v1/auth/oidc/complete": "complete_response",
+            }.get(route)
+            if key is not None:
+                oidc_route_counts[key] = min(32, oidc_route_counts[key] + 1)
+
+        oidc_page.on("request", observe_oidc_request)
+        oidc_page.on("response", observe_oidc_response)
+        diagnostic["settings_oidc_phase"] = "await_signed_browser_completion"
+        try:
+            issued = _result(
+                oidc_page,
+                "POST",
+                "/api/v1/auth/oidc/complete",
+                lambda: oidc_page.locator("#sso-sign-in-button").click(),
+            )
+        except BaseException:
+            diagnostic["settings_oidc_route_counts"] = dict(oidc_route_counts)
+            diagnostic["settings_oidc_idp_token_requests"] = min(32, idp.token_requests)
+            diagnostic["settings_oidc_idp_pkce_verified"] = bool(idp.pkce_verified)
+            diagnostic["settings_oidc_idp_failed"] = bool(idp.failed)
+            raise
+        finally:
+            oidc_page.remove_listener("request", observe_oidc_request)
+            oidc_page.remove_listener("response", observe_oidc_response)
+        diagnostic["settings_oidc_phase"] = "signed_browser_completion_received"
         oidc_page.locator("#workspace").wait_for(state="visible")
         _require(
             issued.get("account", {}).get("id") == operator["id"]
