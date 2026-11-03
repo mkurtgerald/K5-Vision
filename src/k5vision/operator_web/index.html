@@ -47,9 +47,11 @@
         <main class="main-content">
           <div class="view-heading">
             <div><p class="eyebrow">CAMERA WORKSPACE</p><h1 id="camera-title">Select a camera</h1><p id="camera-subtitle" class="muted">Live view and recording history in one place.</p></div>
-            <div class="camera-indicators"><span id="connection-badge" class="status-badge" hidden></span><span id="recording-badge" class="recording-badge" hidden>Recording</span><button id="update-source-button" class="button secondary" type="button" hidden>Update source</button><button id="remove-camera-button" class="button quiet danger" type="button" hidden>Remove camera</button></div>
+            <div class="camera-indicators"><span id="connection-badge" class="status-badge" hidden></span><span id="recording-badge" class="recording-badge" hidden>Recording</span><button id="update-source-button" class="button secondary" type="button" hidden>Reconnect camera</button><button id="remove-camera-button" class="button quiet danger" type="button" hidden>Remove camera</button></div>
           </div>
           <div class="system-status" aria-label="Service and recording storage"><div><span id="service-status" role="status" aria-live="polite">Checking media service…</span><span id="storage-status" class="muted">Checking recording storage…</span></div><button id="connection-help-button" class="button quiet" type="button">Connection help</button></div>
+          <p id="recorder-time-status" class="field-help" role="status" aria-live="polite">Checking recorder time…</p>
+          <div id="recorder-time-warning" class="notice warning" role="status" aria-live="polite" hidden></div>
           <div id="worker-message" class="notice warning" role="status" aria-live="polite" hidden></div>
           <div id="workspace-message" class="notice" role="status" aria-live="polite" hidden></div>
 
@@ -105,13 +107,32 @@
     <dialog id="add-camera-dialog" aria-labelledby="add-camera-title">
       <form id="add-camera-form" autocomplete="off">
         <div class="dialog-heading"><div><p class="eyebrow">CAMERA SETUP</p><h2 id="add-camera-title">Add a camera</h2></div><button id="close-add-camera" class="icon-button" type="button" aria-label="Close camera setup">×</button></div>
-        <p id="camera-setup-description" class="muted">Connect an RTSP camera to live view and continuous recording.</p>
+        <p id="camera-setup-description" class="muted">Find an ONVIF camera on your network, then sign in to the camera. K5 finds its available video streams for you.</p>
+        <div id="camera-discovery-section" class="camera-discovery-section">
+          <button id="find-cameras" class="button secondary wide" type="button">Find cameras on this network</button>
+          <p id="camera-discovery-message" class="field-help" role="status" aria-live="polite">If Windows Firewall blocks discovery, enter the camera’s IP address below.</p>
+          <div id="discovered-cameras" class="discovered-cameras" aria-label="Cameras found on your network"></div>
+        </div>
         <label for="new-camera-name">Camera name</label><input id="new-camera-name" name="name" placeholder="Front entrance" required maxlength="128">
-        <label for="new-camera-host">Camera IP address</label><input id="new-camera-host" name="host" placeholder="192.168.1.20" required maxlength="45" spellcheck="false">
-        <label for="new-camera-source">RTSP stream address</label><input id="new-camera-source" name="source_uri" type="password" placeholder="rtsp://user:password@192.168.1.20/stream" required maxlength="4096" autocomplete="off" spellcheck="false">
-        <p class="field-help">Use the camera’s H.264 stream. The address is cleared after submission.</p>
+        <label for="new-camera-host">Camera IP address</label><input id="new-camera-host" name="host" placeholder="192.168.1.20" required maxlength="45" spellcheck="false" aria-describedby="camera-address-help">
+        <p id="camera-address-help" class="field-help">Choose a camera above, or enter the IP address used to open its settings.</p>
+        <div class="camera-connection-row">
+          <div><label for="new-camera-port">Camera settings port</label><input id="new-camera-port" name="port" type="number" min="1" max="65535" value="80" required inputmode="numeric"></div>
+          <label class="camera-secure-option" for="new-camera-secure"><input id="new-camera-secure" name="secure" type="checkbox">Use HTTPS for camera settings</label>
+        </div>
+        <div class="camera-credentials-row">
+          <div><label for="new-camera-username">Camera username</label><input id="new-camera-username" name="camera_username" placeholder="Camera username" maxlength="128" autocomplete="off" spellcheck="false"></div>
+          <div><label for="new-camera-password">Camera password</label><input id="new-camera-password" name="camera_password" type="password" maxlength="256" autocomplete="off"></div>
+        </div>
+        <p class="field-help">Use the account configured on this camera. Its password is cleared after testing.</p>
+        <button id="test-camera-connection" class="button secondary wide camera-test-button" type="button">Test connection</button>
+        <p id="camera-clock-status" class="field-help" role="status" aria-live="polite" hidden></p>
+        <div id="camera-profile-section" hidden>
+          <label for="camera-profile">Video stream</label><select id="camera-profile" name="profile" aria-describedby="camera-profile-help"></select>
+          <p id="camera-profile-help" class="field-help">Choose an H.264 stream for live video and continuous recording. K5 does not change camera settings.</p>
+        </div>
         <p id="add-camera-message" class="form-message" role="status" aria-live="polite"></p>
-        <div class="dialog-actions"><button id="cancel-add-camera" class="button secondary" type="button">Cancel</button><button id="save-camera" class="button primary" type="submit">Connect camera</button></div>
+        <div class="dialog-actions"><button id="cancel-add-camera" class="button secondary" type="button">Cancel</button><button id="save-camera" class="button primary" type="submit" disabled>Connect camera</button></div>
       </form>
     </dialog>
 
@@ -120,7 +141,7 @@
         <div class="dialog-heading"><div><p class="eyebrow">CAMERA ADMINISTRATION</p><h2 id="remove-camera-title">Remove camera?</h2></div><button id="close-remove-camera" class="icon-button" type="button" aria-label="Close camera removal">×</button></div>
         <p id="remove-camera-name" class="removal-camera-name"></p>
         <p id="remove-camera-consequences" class="muted">Live video and new recording will stop. This camera’s history and playback will disappear from the workspace.</p>
-        <p class="field-help">This action does not delete recording files. They remain subject to rolling retention. To restore access to retained recordings, re-add the camera with its original name, IP address and RTSP stream.</p>
+        <p class="field-help">This action does not delete recording files. They remain subject to rolling retention. To restore access to retained recordings, connect the camera again with its original name and IP address.</p>
         <p id="remove-camera-message" class="form-message" role="status" aria-live="polite"></p>
         <div class="dialog-actions"><button id="cancel-remove-camera" class="button secondary" type="button" autofocus>Keep camera</button><button id="confirm-remove-camera" class="button destructive" type="submit">Remove camera</button></div>
       </form>
@@ -131,9 +152,9 @@
       <p id="connection-help-status" class="muted"></p>
       <ol class="help-list">
         <li>Confirm the camera is powered on and reachable from this PC. Open its management page using the camera’s IP address.</li>
-        <li>Enable RTSP and select an H.264 video stream in the camera settings. Use the exact stream address provided by the camera manufacturer.</li>
-        <li>Use a numeric IP address when adding the camera. The RTSP address must point to that same camera.</li>
-        <li>After changing the camera password or stream path, select <strong>Update source</strong> and enter the complete RTSP address again.</li>
+        <li>Enable ONVIF access and an H.264 video stream in the camera settings. Some cameras require a separate ONVIF account.</li>
+        <li>Select <strong>Add camera</strong>, then <strong>Find cameras on this network</strong>. If discovery is blocked, enter the camera’s IP address and camera settings port.</li>
+        <li>Enter the camera username and password, select <strong>Test connection</strong>, then choose an H.264 stream. After changing a camera password, select <strong>Reconnect camera</strong> and test again.</li>
         <li>Use current Edge or Chrome. If K5 itself is unavailable, confirm K5 is running on this PC and check its startup message.</li>
       </ol>
       <p class="field-help">Closing the browser does not stop recording while K5 remains running. Live connection failures create gaps in recording history.</p>

@@ -508,6 +508,7 @@ def install_user_admin_api(
             account=account,
             session_token=session_token,
             expires_at=expires_at,
+            expires_in_seconds=session_manager.ttl_seconds,
         )
 
     @application.get(

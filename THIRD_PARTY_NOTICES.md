@@ -6,6 +6,29 @@ This file is the distribution-facing notice registry. Detailed source provenance
 
 ## Incorporated donor source
 
+### go2rtc ONVIF camera onboarding
+
+The operator's `src/k5vision/operator_onvif.py` adapts selected ONVIF discovery,
+SOAP/WS-Security envelope and camera stream-resolution source from
+[AlexxIT/go2rtc](https://github.com/AlexxIT/go2rtc), `v1.9.14`, commit
+`b5948cfb25404cc5cb37b166ecaa2dca20b11d4b`, specifically
+`pkg/onvif/client.go`, `pkg/onvif/envelope.go` and `pkg/onvif/helpers.go`.
+
+Copyright (c) 2022 Alexey Khit. This donor material remains under the **MIT
+License**. The complete unchanged upstream license is retained in
+`third_party/licenses/go2rtc-MIT.txt` and the installed desktop licenses
+directory. Preserve the full copyright and permission notice with copies or
+substantial portions of the adapted software. K5's surrounding source license
+does not replace the upstream MIT permissions.
+
+K5 adapts this source to a bounded Python standard-library connector with XML,
+address, response-size and timeout handling. The recording product discovers
+ONVIF cameras and resolves their stream addresses after the user supplies camera
+credentials and selects an H.264 profile. No go2rtc executable, Go runtime,
+ONVIF Device Manager source, `onvif-python`, lxml, or WSDL bundle is incorporated
+by this source adaptation. The selected functions and exact source/license hashes
+are recorded in `docs/DONOR_LEDGER.md`.
+
 K5 does not vendor Analytics Lab business logic. Its separately built engineering
 runtime package is described below; all upstream rights remain effective.
 
@@ -120,17 +143,21 @@ for exact donor identities, view limits, evidence and unresolved release gates.
 
 The separate graphical operator installer bundles the unchanged official
 CPython 3.12.10 Windows amd64 embeddable distribution and fifteen pinned binary
-Python distributions for the manual-RTSP recording operator. Its first graphical
+Python distributions for the recording operator with ONVIF camera onboarding.
+Its first graphical
 launch downloads MediaMTX v1.21.2 and Caddy v2.11.7 directly from their official
 releases, verifies their archive, executable and license hashes, and preserves
 their supplied licenses in the private profile. These worker executables are
 not bundled in the K5 installer. This packaging scope
 supersedes the earlier no-binary-bundling statements only for that explicit
-desktop installer. It does not bundle FFmpeg, ONVIF, Analytics Lab, OpenVINO,
-models, sample images or development/browser tools.
+desktop installer. The reviewed go2rtc ONVIF source adaptation above uses the
+bundled Python standard library; it adds no external ONVIF runtime or WSDL
+package. The installer does not bundle FFmpeg, Analytics Lab, OpenVINO, models,
+sample images or development/browser tools.
 
 The installed `licenses` directory retains the complete CPython binary-component
-terms, MediaMTX MIT and Caddy Apache-2.0 licenses, K5's license, this notice, and
+terms, MediaMTX MIT, Caddy Apache-2.0 and go2rtc MIT licenses, K5's license,
+this notice, and
 the dedicated `WINDOWS_DESKTOP_DEPENDENCIES.md` review. Every dependency's
 `.dist-info` directory and upstream license/notice files remain installed.
 `dependency-inventory.json` records exact wheel and retained-notice hashes.

@@ -98,7 +98,7 @@ def generate_mediamtx_configuration(
     rtsp_port: int = 8554,
     hls_port: int = 8888,
     segment_seconds: int = 60,
-    retention_seconds: int = 86_400,
+    retention_seconds: int = 0,
     max_readers: int = 16,
     allow_empty: bool = False,
 ) -> str:
@@ -108,6 +108,11 @@ def generate_mediamtx_configuration(
     access must pass through K5 authorization; native-worker credentials remain
     internal. The installer separately admits filesystem ownership and the exact
     executable version before starting this configuration.
+
+    Native filename/wall-clock age deletion is always disabled; the retained
+    ``retention_seconds`` argument accepts only zero. Configure elapsed retention
+    on ``RecordingStorage`` in the owning K5 service. Standalone donor users must
+    supply their own recording maintenance rather than relying on this config.
     """
     if not isinstance(credentials, MediaMTXCredentials):
         raise TypeError("private media credentials are required")
@@ -116,11 +121,13 @@ def generate_mediamtx_configuration(
         raise ValueError("media listener ports are invalid")
     if len(set(ports)) != len(ports):
         raise ValueError("media listeners require distinct ports")
+    if type(retention_seconds) is not int or retention_seconds != 0:
+        raise ValueError(
+            "Native age deletion must remain disabled; configure RecordingStorage retention instead"
+        )
     if (
         type(segment_seconds) is not int
         or not 1 <= segment_seconds <= 3600
-        or type(retention_seconds) is not int
-        or not segment_seconds <= retention_seconds <= 30 * 24 * 60 * 60
         or type(max_readers) is not int
         or not 1 <= max_readers <= 64
         or type(allow_empty) is not bool
@@ -140,12 +147,15 @@ def generate_mediamtx_configuration(
             "source": source.source_uri,
             "sourceOnDemand": False,
             "rtspTransport": "tcp",
+            "useAbsoluteTimestamp": False,
             "record": True,
             "recordPath": recording_path,
             "recordFormat": "fmp4",
             "recordPartDuration": "1s",
             "recordSegmentDuration": f"{segment_seconds}s",
-            "recordDeleteAfter": f"{retention_seconds}s",
+            # Native cleanup ages filenames against the adjustable wall clock.
+            # K5 owns retention using observed monotonic elapsed time instead.
+            "recordDeleteAfter": "0s",
             "maxReaders": max_readers,
         }
     permissions = [{"action": "api"}]

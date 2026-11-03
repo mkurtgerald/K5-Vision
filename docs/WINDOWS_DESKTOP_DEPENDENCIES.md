@@ -1,6 +1,7 @@
 # Native Windows desktop dependency review
 
-Reviewed on 2026-10-13. This record covers the recording-first desktop package:
+Reviewed on 2026-10-13; ONVIF source slice reviewed on 2026-10-18. This record
+covers the recording-first desktop package:
 an embedded CPython runtime, an exact minimal Python operator environment,
 official first-run native-worker provisioning, and an Inno Setup installer. The user installs
 and starts the application through Windows graphical controls. First launch
@@ -41,8 +42,11 @@ configured analytics remain outside this package.
 The desktop package installs the K5 wheel with dependency resolution disabled
 and separately provisions the following exact operator runtime. This is a
 deliberately smaller environment than the general-purpose dependency list in
-`pyproject.toml`. It supports the explicit RTSP enrollment and recording product;
-ONVIF discovery is outside this desktop package.
+`pyproject.toml`. It supports ONVIF camera discovery, credentials, H.264 profile
+selection and recording. The camera's standard RTSP stream is resolved
+automatically; the normal setup flow does not require the user to find or type a
+stream URL. The ONVIF connector uses the bundled Python standard library and
+adds no distribution to the exact list below.
 
 | Distribution | Version | Declared license |
 | --- | --- | --- |
@@ -91,7 +95,38 @@ added to a redistributed desktop product:
   6.1.3 `LICENSES.txt` states that its binary wheels bundle LGPL-2.1 iconv and
   describes some schematron extraction resources as unlicensed. The package's
   BSD declaration does not resolve those separate obligations or missing terms.
-  These packages and resources are excluded rather than relicensed by K5.
+
+These packages and resources are excluded rather than relicensed by K5.
+
+## Selected go2rtc ONVIF source adaptation
+
+- **Source:** [AlexxIT/go2rtc v1.9.14](https://github.com/AlexxIT/go2rtc/tree/b5948cfb25404cc5cb37b166ecaa2dca20b11d4b),
+  immutable commit `b5948cfb25404cc5cb37b166ecaa2dca20b11d4b`.
+- **Selected files:** `pkg/onvif/client.go`, `pkg/onvif/envelope.go` and
+  `pkg/onvif/helpers.go`, limited to camera discovery/scope names, SOAP and
+  WS-Security UsernameToken construction, capability/profile lookup and stream
+  URI resolution. The unrelated time-zone helper is not adopted.
+- **License/copyright:** MIT, Copyright (c) 2022 Alexey Khit. The unchanged
+  upstream `LICENSE` is retained in `third_party/licenses/go2rtc-MIT.txt` and
+  the installed `licenses` directory; 1,068 bytes, SHA-256
+  `b0dcf4855af5a72b4dfbd9117c207b330f4cc35658576a0b5351d6e2becac546`.
+  The complete source/blob/hash record is in `DONOR_LEDGER.md`.
+- **Integration:** selected source adapted into `operator_onvif.py`, with inline
+  attribution and full MIT notice. Python's bundled standard library supplies
+  the implementation; no Go executable/runtime, additional Python distribution,
+  `onvif-python`, zeep, lxml, requests, or WSDL files are shipped for this
+  connector. No ONVIF Device Manager code is copied.
+- **Changes:** bounded XML/network handling, numeric camera-address pinning,
+  response-size/deadline/concurrency limits, HTTP Digest and Media2 fallback.
+  The source slice does not implement ONVIF server behavior, PTZ, imaging or
+  camera configuration writes. MediaMTX continues to handle the resolved stream.
+- **Commercial-use conclusion:** MIT permits this exact selected-source use,
+  modification and redistribution with its copyright/permission notice
+  preserved. This bounded review does not admit unrelated go2rtc packages,
+  dependencies, models or binaries. K5-owned work retains its existing terms.
+- **Qualification:** the ONVIF GUI flow requires its own exact-build Windows
+  acceptance. Earlier manual-enrollment desktop evidence does not qualify the
+  new onboarding flow or establish compatibility with a physical camera.
 
 OpenVINO, NumPy, OpenCV, analytics model weights, the Analytics Lab engineering
 wrapper, FFmpeg, GStreamer, Playwright, and browser binaries are not included in

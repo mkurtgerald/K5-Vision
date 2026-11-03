@@ -6,6 +6,7 @@ import json
 import os
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -23,6 +24,7 @@ from k5vision.operator_product_service import (
     admit_native_executable,
 )
 from k5vision.operator_profile_lock import OperatorProfileLock, OperatorProfileLockError
+from k5vision.operator_time import HostClockObserver
 
 
 class _Process:
@@ -440,6 +442,9 @@ def test_diagnostics_projects_only_last_aggregate_storage_sample(
     native, total, free, allowed, reason
 ):
     service = native.service
+    service._clock = HostClockObserver(
+        utc_now=lambda: datetime(2026, 10, 18, tzinfo=UTC), monotonic=lambda: 100.0
+    )
     assert service.diagnostics()["storage"] is None
     service._storage_status = SimpleNamespace(
         total_bytes=total, free_bytes=free, recording_allowed=allowed
@@ -448,6 +453,14 @@ def test_diagnostics_projects_only_last_aggregate_storage_sample(
     assert result == {
         "worker_status": "unavailable",
         "max_recording_bytes": 20 * 1024**3,
+        "server_utc": "2026-10-18T00:00:00.000Z",
+        "clock": {
+            "status": "observing",
+            "last_step_seconds": 0.0,
+            "change_count": 0,
+            "last_change_at": None,
+            "sync_verified": False,
+        },
         "storage": {
             "recording_bytes": total,
             "free_bytes": free,
@@ -459,6 +472,41 @@ def test_diagnostics_projects_only_last_aggregate_storage_sample(
     assert service.credentials.password not in text
     assert str(service.state_root) not in text
     assert "rtsp://" not in text
+
+
+def test_maintenance_observes_clock_steps_without_pausing_recording(native, monkeypatch):
+    _fast_maintenance(native, monkeypatch)
+    samples = SimpleNamespace(count=0, monotonic=0.0)
+    epoch = datetime(2026, 10, 18, tzinfo=UTC)
+
+    def utc_now():
+        samples.count += 1
+        samples.monotonic += 2
+        step = 5 if samples.count >= 3 else 0
+        return epoch + timedelta(seconds=samples.monotonic + step)
+
+    service = native.service
+    service._clock = HostClockObserver(utc_now=utc_now, monotonic=lambda: samples.monotonic)
+
+    async def scenario():
+        try:
+            await service.start((_source(1),))
+            original = service._media, service._gateway
+            # No diagnostics call supplies the clock observations in this wait.
+            await _until(lambda: service._clock._change_count == 1)
+            assert samples.count >= 3
+            result = service.diagnostics()
+            assert result["clock"]["status"] == "changed"
+            assert result["clock"]["last_step_seconds"] == 5
+            assert result["clock"]["sync_verified"] is False
+            assert service.status() == "ready"
+            assert not service._disk_full
+            assert (service._media, service._gateway) == original
+            assert all(process.stopped == 0 for process in original)
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
 
 
 def test_partial_camera_update_is_reconciled_without_a_manual_process_crash(native, monkeypatch):

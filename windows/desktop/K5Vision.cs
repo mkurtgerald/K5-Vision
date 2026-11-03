@@ -589,7 +589,9 @@ namespace K5VisionDesktop
                     Process.StandardInput.Flush();
                     Process.StandardInput.Close();
                 }
-                Dictionary<string, object> result = Complete(20000);
+                // Allow a bounded camera connection to finish before recording
+                // flush and the two native-worker cleanup budgets run.
+                Dictionary<string, object> result = Complete(35000);
                 return (string)result["status"] == "stopped" && Process.ExitCode == 0;
             }
             catch { return false; }

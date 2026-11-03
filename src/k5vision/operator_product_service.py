@@ -23,6 +23,7 @@ from k5vision.media.mediamtx_provider import (
     _NoRedirect,
 )
 from k5vision.operator_media_gateway import generate_operator_gateway_configuration
+from k5vision.operator_time import HostClockObserver
 
 _RECORDING_FLUSH_SECONDS = 3.0
 
@@ -150,6 +151,7 @@ class OperatorProductService:
         self._storage = None
         self._storage_status = None
         self._health_failures = {"media": 0, "gateway": 0}
+        self._clock = HostClockObserver()
         self._media_file = self.state_root / "operator-mediamtx.json"
         self._gateway_file = self.state_root / "operator-gateway.json"
 
@@ -208,6 +210,7 @@ class OperatorProductService:
             "worker_status": self.status(),
             "max_recording_bytes": self.max_recording_bytes,
             "storage": snapshot,
+            **self._clock.snapshot(),
         }
 
     def _check_gateway(self) -> None:
@@ -376,6 +379,7 @@ class OperatorProductService:
         last_health = 0.0
         while not self._closing:
             await asyncio.sleep(2)
+            self._clock.observe()
             try:
                 async with self._lock:
                     if (

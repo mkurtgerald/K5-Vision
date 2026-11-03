@@ -102,3 +102,60 @@ def test_unknown_or_changed_dependency_wheel_is_refused(builder, tmp_path):
     wheel.write_bytes(wheel.read_bytes() + b"altered")
     with pytest.raises(ValueError, match="identity mismatch"):
         builder.inventory_wheels(tmp_path, [pin])
+
+
+def _onvif_payload(builder, tmp_path):
+    payload = tmp_path / "payload"
+    module, notice = payload / builder.ONVIF_MODULE_PATH, payload / builder.ONVIF_NOTICE_PATH
+    module.parent.mkdir(parents=True)
+    notice.parent.mkdir(parents=True)
+    module.write_bytes(b'"""Installed stdlib camera connector."""\n')
+    notice.write_bytes((builder.ROOT / builder.ONVIF_NOTICE).read_bytes())
+    return payload, module, notice
+
+
+def test_onvif_connector_and_retained_permission_notice_are_sealed(builder, tmp_path):
+    payload, module, notice = _onvif_payload(builder, tmp_path)
+    adaptation = builder.onvif_source_adaptation(payload)
+    assert adaptation["source_commit"] == "b5948cfb25404cc5cb37b166ecaa2dca20b11d4b"
+    assert adaptation["license"] == "MIT"
+    assert adaptation["retained_notice"] == {
+        "path": "licenses/go2rtc-MIT.txt",
+        "sha256": sha256(notice.read_bytes()).hexdigest(),
+    }
+    generated = tmp_path / "PayloadIdentity.generated.cs"
+    identity = builder.write_manifest(payload, "b" * 40, generated)
+    raw_manifest = (payload / "payload-manifest.json").read_bytes()
+    assert sha256(raw_manifest).hexdigest() == identity
+    files = {entry["path"]: entry for entry in json.loads(raw_manifest)["files"]}
+    for path in (module, notice):
+        relative = path.relative_to(payload).as_posix()
+        assert files[relative]["sha256"] == sha256(path.read_bytes()).hexdigest()
+        assert files[relative]["bytes"] == path.stat().st_size
+
+
+@pytest.mark.parametrize("missing", ["module", "notice"])
+def test_onvif_package_refuses_missing_required_material(builder, tmp_path, missing):
+    payload, module, notice = _onvif_payload(builder, tmp_path)
+    {"module": module, "notice": notice}[missing].unlink()
+    with pytest.raises(ValueError, match="material missing"):
+        builder.onvif_source_adaptation(payload)
+
+
+def test_onvif_notice_accepts_complete_windows_text_and_refuses_changed_terms(builder, tmp_path):
+    payload, _module, notice = _onvif_payload(builder, tmp_path)
+    canonical = notice.read_bytes().replace(b"\r\n", b"\n")
+    assert sha256(canonical).hexdigest() == (
+        "b0dcf4855af5a72b4dfbd9117c207b330f4cc35658576a0b5351d6e2becac546"
+    )
+    for representation in (canonical, canonical.replace(b"\n", b"\r\n")):
+        notice.write_bytes(representation)
+        retained = builder.onvif_source_adaptation(payload)["retained_notice"]
+        assert retained["sha256"] == sha256(representation).hexdigest()
+    for changed in (
+        canonical.replace(b"Alexey Khit", b"Another Name"),
+        canonical.replace(b"\n", b"\r\n", 1),
+    ):
+        notice.write_bytes(changed)
+        with pytest.raises(ValueError, match="notice identity mismatch"):
+            builder.onvif_source_adaptation(payload)

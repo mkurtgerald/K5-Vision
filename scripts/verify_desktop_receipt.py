@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -16,11 +17,13 @@ _TRUE = (
     "close_hides_to_tray recording_continues_after_browser_and_window_close "
     "second_click_reopens_single_instance graceful_owned_process_cleanup "
     "restart_preserves_account_camera_history uninstall_preserves_profile_and_media "
-    "no_console_windows owned_cleanup"
+    "no_console_windows owned_cleanup onvif_credential_profile_enrollment no_manual_stream_uri "
+    "onvif_wrong_password_rejected onvif_clock_skew_compensated "
+    "onvif_time_health_displayed recorder_time_health_displayed"
 ).split()
 _FALSE = (
     "physical_camera_acceptance capacity_acceptance endurance_acceptance windows_service "
-    "mocked_gui user_terminal_required"
+    "mocked_gui user_terminal_required host_clock_step_acceptance"
 ).split()
 
 
@@ -50,6 +53,11 @@ def verify(report: Path) -> dict:
     )
     for field, minimum in (("live_decoded_frames", 4), ("recorded_decoded_frames", 1)):
         _require(type(receipt.get(field)) is int and receipt[field] >= minimum)
+    offset = receipt.get("onvif_clock_offset_seconds")
+    _require(type(offset) in (int, float) and math.isfinite(offset))
+    _require(600 < abs(offset) < 86400)
+    reads = receipt.get("onvif_time_read_count")
+    _require(type(reads) is int and 1 <= reads <= 128)
     _require(type(receipt.get("duration_seconds")) in (int, float))
     _require(0 < receipt["duration_seconds"] < 240)
     return receipt
