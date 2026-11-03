@@ -305,6 +305,24 @@ def test_unchanged_provider_poll_preserves_focused_playback_button(analytics_pag
           '#analytics-provider-events [data-provider-event-id="external-event-34"] button')
           === window.originalProviderButton"""
     )
+    # A range transition changes request authority even when provider data
+    # remains identical; the refreshed button must bind the new epoch.
+    page.evaluate(
+        """() => {
+          window.previousProviderButton = document.querySelector(
+            '#analytics-provider-events [data-provider-event-id="external-event-34"] button');
+          window.analytics.setRange({
+            start:'2026-10-27T01:00:00Z',end:'2026-10-28T01:00:00Z'});
+        }"""
+    )
+    page.wait_for_function(
+        """() => document.querySelector(
+          '#analytics-provider-events [data-provider-event-id="external-event-34"] button')
+          !== window.previousProviderButton"""
+    )
+    page.locator('#analytics-provider-events [data-provider-event-id="external-event-34"] button').click()
+    page.wait_for_function("window.seeks.length === 2")
+    assert page.evaluate("window.seeks[1].timestamp") == "2026-10-26T23:59:12Z"
     assert not errors
 
 def test_unassigned_provider_event_is_rejected_and_custom_role_cannot_change_detection(
