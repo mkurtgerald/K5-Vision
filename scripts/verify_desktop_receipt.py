@@ -24,6 +24,7 @@ _SETTINGS_TRUE = (
 ).split()
 _TRUE = (
     "native_windows_execution generated_media_only actual_gui_installer actual_gui_account_setup "
+    "installed_worker_bundle_verified "
     "administrator_login embedded_python_independent_of_path actual_edge_login_enrollment_live "
     "close_hides_to_tray recording_continues_after_browser_and_window_close "
     "second_click_reopens_single_instance graceful_owned_process_cleanup "

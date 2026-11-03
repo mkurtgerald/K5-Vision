@@ -409,6 +409,66 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                     child.kill()
 
 
+
+def _verify_installed_worker_bundle(installed: Path) -> None:
+    """Check actual installed native worker bytes before first startup.
+
+    This is a local payload admission check, not a disconnected-network test.
+    No private paths, source URIs, or process output enter the receipt.
+    """
+    workers = installed / "workers"
+    manifest_path = workers / "donor-downloads.json"
+    _require(
+        manifest_path.is_file() and 0 < manifest_path.stat().st_size <= 65536,
+        "Installed native worker manifest is absent or oversized",
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    _require(
+        type(manifest) is dict and manifest.get("schema_version") == 1,
+        "Installed native worker manifest identity is invalid",
+    )
+    artifacts = manifest.get("artifacts")
+    _require(type(artifacts) is list and len(artifacts) == 2, "Installed worker count is invalid")
+    expected = {
+        "MediaMTX": ("mediamtx.exe", "mediamtx-LICENSE"),
+        "Caddy": ("caddy.exe", "caddy-LICENSE"),
+    }
+    seen = set()
+    for artifact in artifacts:
+        _require(type(artifact) is dict, "Installed worker entry is invalid")
+        component = artifact.get("component")
+        _require(
+            type(component) is str and component in expected and component not in seen,
+            "Installed native worker identity is invalid",
+        )
+        seen.add(component)
+        binary_name, license_name = expected[component]
+        _require(
+            artifact.get("executable") == binary_name
+            and artifact.get("payload_executable") == "workers/" + binary_name
+            and artifact.get("payload_license") == "workers/" + license_name,
+            "Installed native worker path identity is invalid",
+        )
+        for filename, size_field, digest_field in (
+            (binary_name, "executable_bytes", "executable_sha256"),
+            (license_name, "payload_license_bytes", "license_sha256"),
+        ):
+            candidate = workers / filename
+            _require(candidate.is_file() and not candidate.is_symlink(), "Native worker file is absent")
+            size = artifact.get(size_field)
+            digest = artifact.get(digest_field)
+            _require(
+                type(size) is int and 0 < size <= 128 * 1024 * 1024
+                and type(digest) is str and len(digest) == 64,
+                "Installed native worker file identity is invalid",
+            )
+            _require(candidate.stat().st_size == size, "Installed native worker length mismatch")
+            with candidate.open("rb") as stream:
+                actual = hashlib.file_digest(stream, "sha256").hexdigest()
+            _require(actual == digest, "Installed native worker digest mismatch")
+    _require(seen == set(expected), "Installed native worker set is incomplete")
+
+
 def _start_app(installed, profile, port, cohort):
     environment = dict(os.environ)
     environment["PATH"] = os.pathsep.join(
@@ -2169,6 +2229,8 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
         _require((installed / "K5Vision.exe").is_file(), "Installed desktop executable is absent")
         _require((installed / "runtime/python.exe").is_file(), "Embedded Python was not installed")
+        _verify_installed_worker_bundle(installed)
+        receipt["installed_worker_bundle_verified"] = True
         receipt["actual_gui_installer"] = True
         reservations, ports = helpers._reserve_ports(5)
         port, upstream_ports = ports[0], ports[1:]

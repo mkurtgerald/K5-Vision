@@ -33,7 +33,8 @@ authentication retry, server-anchored history or elapsed-time retention changes.
    **Install**, and leave **Launch K5 Vision** selected when choosing
    **Finish**. The supplied download may include an ONVIF qualification suffix
    in its filename.
-   First launch needs Internet access to download and verify the native workers.
+   Internal beta candidates contain hash-verified native workers. Disconnected-network
+   installation and startup still require separate field qualification.
    Later launches reuse the verified private cache.
 3. In the first-run window, choose an administrator username, enter a password
    of at least 12 characters twice, and select **Create account**. Sign in to
