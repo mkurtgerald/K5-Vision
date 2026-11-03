@@ -959,7 +959,8 @@ def run_installed_settings_journey(
                   const from=Date.parse(document.getElementById('history-start')?.value||'');
                   const to=Date.parse(document.getElementById('history-end')?.value||'');
                   return {
-                    event_button_visible:!!document.querySelector('#analytics-provider-events button'),
+                    event_button_visible:!!document.querySelector(
+                      '#analytics-provider-events button'),
                     history_visible:!document.getElementById('history-panel')?.hidden,
                     history_intervals:document.querySelectorAll('#history-list button').length,
                     range_contains_event:Number.isFinite(from)&&Number.isFinite(to)&&from<=chosen&&chosen<to,
