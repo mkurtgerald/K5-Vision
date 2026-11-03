@@ -429,7 +429,6 @@ def test_late_camera_refresh_preserves_administration_and_open_permissions_edito
         assert not errors
 
 
-
 def test_unchanged_camera_refresh_does_not_replace_active_permissions_controls(
     workspace,
 ):
