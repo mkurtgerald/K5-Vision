@@ -2337,6 +2337,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     processes, reservations = [], []
     admin_executor = None
     admin_future = None
+    settings_future = None
     cohort = _Cohort(api)
     playwright = browser = context = page = onvif_camera = None
     onvif_cameras, sources, publishers = [], [], []
@@ -2431,6 +2432,49 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                     admin_context.close()
             finally:
                 admin_browser.close()
+
+    def _parallel_settings_journey():
+        # Run the entire installed GUI settings/security/integrations proof
+        # with an independently authenticated administrator on its own Edge
+        # thread. The original administrator remains active for recording and
+        # timeline acceptance. The worker pool serializes this after the
+        # account/role/audit journey so those shared users are fully admitted.
+        _, private_state = admin_future.result(timeout=120)
+        with browser_api.sync_playwright() as settings_playwright:
+            settings_browser = settings_playwright.chromium.launch(channel="msedge", headless=True)
+            try:
+                settings_context = settings_browser.new_context(
+                    viewport={"width": 1440, "height": 900}
+                )
+                try:
+                    settings_page = settings_context.new_page()
+                    settings_page.set_default_timeout(25_000)
+                    settings_client = runtime._Client(port)
+                    settings_client.token = admin_helpers._login(
+                        settings_page,
+                        client.origin,
+                        secondary_admin_username,
+                        secondary_admin_password,
+                    )
+                    settings_diagnostic = {}
+                    evidence = settings_helpers.run_installed_settings_journey(
+                        settings_page,
+                        client=settings_client,
+                        admin_helpers=admin_helpers,
+                        browser_helpers=browser_helpers,
+                        admin_username=secondary_admin_username,
+                        admin_password=secondary_admin_password,
+                        camera_ids=camera_ids,
+                        private_state=private_state,
+                        analytics_event=analytics_event,
+                        parent=parent,
+                        diagnostic=settings_diagnostic,
+                    )
+                    return evidence, settings_diagnostic
+                finally:
+                    settings_context.close()
+            finally:
+                settings_browser.close()
 
     try:
         _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
@@ -2807,6 +2851,27 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         admin_executor = ThreadPoolExecutor(max_workers=1)
         admin_future = admin_executor.submit(_parallel_admin_journey)
         nvr_diagnostic["admin_parallel_started"] = True
+        _enter_stage("installed_continuous_person_analytics")
+        analytics_evidence, analytics_event = _installed_analytics_journey(
+            page=page,
+            client=client,
+            camera_id=camera_id,
+            parent=parent,
+            processes=processes,
+            publishers=publishers,
+            source_uri=source_uri,
+            ffmpeg=ffmpeg,
+            helpers=helpers,
+            browser_helpers=browser_helpers,
+            app=app,
+            publisher_credentials=primary_publisher_credentials,
+            diagnostic=nvr_diagnostic,
+        )
+        receipt.update(analytics_evidence)
+        # The heavy installed settings/UI security journey is queued behind
+        # the completed user-provisioning journey, then runs alongside NVR.
+        settings_future = admin_executor.submit(_parallel_settings_journey)
+        nvr_diagnostic["settings_parallel_started"] = True
         _enter_stage("installed_nvr_workspace")
         receipt.update(
             _desktop_nvr_journey(
@@ -2832,23 +2897,73 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["direct_rtsp_recording_bytes_before"] = receipt["camera_recording_bytes_before"][0]
         receipt["direct_rtsp_recording_bytes_after"] = receipt["camera_recording_bytes_after"][0]
         receipt["direct_rtsp_history_decoded_frames"] = receipt["timeline_playback_decoded_frames"]
-        _enter_stage("installed_continuous_person_analytics")
-        analytics_evidence, analytics_event = _installed_analytics_journey(
-            page=page,
-            client=client,
-            camera_id=camera_id,
-            parent=parent,
-            processes=processes,
-            publishers=publishers,
-            source_uri=source_uri,
-            ffmpeg=ffmpeg,
-            helpers=helpers,
-            browser_helpers=browser_helpers,
-            app=app,
-            publisher_credentials=primary_publisher_credentials,
-            diagnostic=nvr_diagnostic,
-        )
-        receipt.update(analytics_evidence)
+        _enter_stage("installed_user_administration")
+
+        _require(admin_future is not None, "Installed administrator proof was not started")
+        try:
+            admin_evidence, admin_private_state = admin_future.result(timeout=120)
+        except BaseException as error:
+            nvr_diagnostic["admin_parallel_failure_type"] = (
+                type(error).__name__
+                if type(error).__name__
+                in {
+                    "Failed",
+                    "TimeoutError",
+                    "Error",
+                    "RuntimeError",
+                    "AssertionError",
+                    "ValueError",
+                }
+                else "other"
+            )
+            _require(False, "Installed parallel administrator proof did not qualify")
+
+        nvr_diagnostic["admin_parallel_qualified"] = True
+        for field in (
+            "admin_user_management",
+            "role_permissions",
+            "camera_access_controls",
+            "admin_user_creation",
+            "admin_bootstrap_password_change",
+            "admin_password_reset",
+            "admin_disable_reenable",
+            "admin_live_media_revocation",
+            "admin_audit_visible",
+            "admin_viewer_live_decoded_frames",
+            "admin_operator_live_decoded_frames",
+            "admin_user_count_created",
+            "admin_audit_event_count",
+            "admin_denied_http_statuses",
+        ):
+            _require(field in admin_evidence, "Installed user administration proof is incomplete")
+            receipt[field] = admin_evidence[field]
+        # Security and MFA proofs must finish before the actual host clock
+        # shifts. Work overlaps independent live/NVR browser checks, never
+        # the native UTC-correction phase.
+        _enter_stage("installed_admin_settings_security_integrations")
+        _require(settings_future is not None, "Installed settings proof was not started")
+        try:
+            settings_evidence, settings_diagnostic = settings_future.result(timeout=120)
+        except BaseException as error:
+            nvr_diagnostic["settings_parallel_failure_type"] = (
+                type(error).__name__
+                if type(error).__name__
+                in {
+                    "Failed",
+                    "TimeoutError",
+                    "Error",
+                    "RuntimeError",
+                    "AssertionError",
+                    "ValueError",
+                }
+                else "other"
+            )
+            _require(False, "Installed parallel settings proof did not qualify")
+        nvr_diagnostic.update(settings_diagnostic)
+        receipt.update(settings_evidence)
+        nvr_diagnostic["settings_parallel_qualified"] = True
+        admin_executor.shutdown(wait=True)
+        admin_executor = None
         if vm_clock_enabled:
             _enter_stage("actual_vm_clock_changes")
             receipt["vm_clock"] = _vm_clock_phase(
@@ -2873,47 +2988,6 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 analytics_event=analytics_event,
             )
             receipt["host_clock_step_acceptance"] = True
-        _enter_stage("installed_user_administration")
-
-        _require(admin_future is not None, "Installed administrator proof was not started")
-        try:
-            admin_evidence, admin_private_state = admin_future.result(timeout=120)
-        except BaseException as error:
-            nvr_diagnostic["admin_parallel_failure_type"] = (
-                type(error).__name__
-                if type(error).__name__
-                in {
-                    "Failed",
-                    "TimeoutError",
-                    "Error",
-                    "RuntimeError",
-                    "AssertionError",
-                    "ValueError",
-                }
-                else "other"
-            )
-            _require(False, "Installed parallel administrator proof did not qualify")
-        admin_executor.shutdown(wait=True)
-        admin_executor = None
-        nvr_diagnostic["admin_parallel_qualified"] = True
-        for field in (
-            "admin_user_management",
-            "role_permissions",
-            "camera_access_controls",
-            "admin_user_creation",
-            "admin_bootstrap_password_change",
-            "admin_password_reset",
-            "admin_disable_reenable",
-            "admin_live_media_revocation",
-            "admin_audit_visible",
-            "admin_viewer_live_decoded_frames",
-            "admin_operator_live_decoded_frames",
-            "admin_user_count_created",
-            "admin_audit_event_count",
-            "admin_denied_http_statuses",
-        ):
-            _require(field in admin_evidence, "Installed user administration proof is incomplete")
-            receipt[field] = admin_evidence[field]
         _enter_stage("installed_analytics_permissions")
         receipt.update(
             _analytics_permission_journey(
@@ -2921,22 +2995,6 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 admin_helpers=admin_helpers,
                 camera_ids=camera_ids,
                 private_state=admin_private_state,
-                diagnostic=nvr_diagnostic,
-            )
-        )
-        _enter_stage("installed_admin_settings_security_integrations")
-        receipt.update(
-            settings_helpers.run_installed_settings_journey(
-                page,
-                client=client,
-                admin_helpers=admin_helpers,
-                browser_helpers=browser_helpers,
-                admin_username=username,
-                admin_password=password,
-                camera_ids=camera_ids,
-                private_state=admin_private_state,
-                analytics_event=analytics_event,
-                parent=parent,
                 diagnostic=nvr_diagnostic,
             )
         )
