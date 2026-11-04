@@ -297,6 +297,10 @@ def install_user_admin_api(
         limit=login_rate_limit,
         window_seconds=rate_window_seconds,
     )
+    # Scrypt is CPU/memory expensive. Keep it off the event loop so login
+    # cannot stall recording control, health checks or other browser requests.
+    # Bound in-flight verifications as well as the existing login rate.
+    login_verification_slots = asyncio.Semaphore(2)
     application.add_middleware(_BoundedUserRequestBody, max_bytes=max_request_bytes)
     application.state.user_registry = registry
     application.state.user_session_manager = session_manager
@@ -539,10 +543,13 @@ def install_user_admin_api(
         security = getattr(application.state, "operator_identity_security", None)
         started_epoch = None if security is None else security.primary_started()
         try:
-            verified = require_registry().verify_password_snapshot(
-                username=payload.username,
-                password=payload.password,
-            )
+            registry = require_registry()
+            async with login_verification_slots:
+                verified = await asyncio.to_thread(
+                    registry.verify_password_snapshot,
+                    username=payload.username,
+                    password=payload.password,
+                )
         except UserRegistryStorageError:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
