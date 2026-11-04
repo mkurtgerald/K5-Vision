@@ -2408,27 +2408,32 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     }
 
     def admin_progress(phase):
-        if phase in {
-            "admin_create_accounts",
-            "admin_activate_viewer",
-            "admin_activate_operator",
-            "admin_revoke_camera_access",
-            "admin_disable_and_reenable",
-            "admin_reset_password",
-            "admin_visible_audit",
-        } or phase.startswith("admin_operator_") or any(
-            phase == f"admin_{role}_{step}"
-            for role in ("viewer", "operator")
-            for step in (
-                "open_tab",
-                "wait_panel",
-                "open_users",
-                "wait_users",
-                "open_editor",
-                "wait_editor",
-                "submit_create",
-                "one_time_credential",
-                "wait_created_row",
+        if (
+            phase
+            in {
+                "admin_create_accounts",
+                "admin_activate_viewer",
+                "admin_activate_operator",
+                "admin_revoke_camera_access",
+                "admin_disable_and_reenable",
+                "admin_reset_password",
+                "admin_visible_audit",
+            }
+            or phase.startswith("admin_operator_")
+            or any(
+                phase == f"admin_{role}_{step}"
+                for role in ("viewer", "operator")
+                for step in (
+                    "open_tab",
+                    "wait_panel",
+                    "open_users",
+                    "wait_users",
+                    "open_editor",
+                    "wait_editor",
+                    "submit_create",
+                    "one_time_credential",
+                    "wait_created_row",
+                )
             )
         ):
             nvr_diagnostic["admin_stage"] = phase
@@ -2454,12 +2459,14 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                         admin_page,
                         admin_username=secondary_admin_username,
                         admin_password=secondary_admin_password,
-                        # Distinct viewer and operator access still decode
-                        # independently owned live cameras; avoid the red feed
-                        # that the simultaneous NVR playback/export exercises.
-                        # Red live is independently decoded by the main browser.
-                        camera_ids=[camera_ids[2], camera_ids[3]],
-                        colors=("lime", "yellow"),
+                        # Viewer and operator decode independent generated
+                        # lime/blue feeds while NVR exercises red live/export.
+                        # The operator still receives the red camera grant
+                        # required to prove its real recorded person event;
+                        # neither limited account receives the yellow camera.
+                        camera_ids=[camera_ids[2], camera_ids[1]],
+                        colors=("lime", "blue"),
+                        operator_event_camera_id=camera_ids[0],
                         client=client,
                         progress=admin_progress,
                     )
