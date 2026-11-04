@@ -2411,11 +2411,17 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 try:
                     admin_page = admin_context.new_page()
                     admin_page.set_default_timeout(25_000)
-                    admin_helpers._login(admin_page, client.origin, username, password)
+                    admin_helpers._activate(
+                        admin_page,
+                        client.origin,
+                        secondary_admin_username,
+                        secondary_admin_credential,
+                        secondary_admin_password,
+                    )
                     return admin_helpers.run_admin_journey(
                         admin_page,
-                        admin_username=username,
-                        admin_password=password,
+                        admin_username=secondary_admin_username,
+                        admin_password=secondary_admin_password,
                         camera_ids=camera_ids,
                         colors=tuple(color for _, _, color in _DESKTOP_CAMERAS),
                         client=client,
@@ -2756,9 +2762,48 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["direct_rtsp_live_decoded_frames"] = receipt["live_decoded_frames"]
         receipt["actual_edge_login_enrollment_live"] = True
         _wait(lambda: _recording_bytes(profile) > 0, "Desktop recording bytes", process=app)
-        # Run the same full user/role/audit proof on a separate real Edge
-        # session while recording, playback and analytics remain active.
-        # All original checks and the six-minute VM limit remain required.
+        # Sessions are intentionally single-active-token per user. Provision a
+        # separate administrator through the installed UI, without revoking
+        # the original administrator's session used by NVR and clock checks.
+        secondary_admin_username = "concurrent-admin-" + secrets.token_hex(4)
+        secondary_admin_password = secrets.token_urlsafe(24)
+        admin_helpers._open_admin(page)
+        page.locator("#admin-create-user").click()
+        page.locator("#admin-user-dialog").wait_for(state="visible")
+        page.locator("#admin-username").fill(secondary_admin_username)
+        page.locator("#admin-display-name").fill("Generated concurrent administrator")
+        page.locator("#admin-role").select_option("administrator")
+        page.locator("#admin-enabled").set_checked(True)
+        _require(
+            page.locator("#admin-access-mode").input_value() == "all",
+            "Concurrent administrator was not assigned all-camera authority",
+        )
+        with page.expect_response(
+            lambda response: admin_helpers._route_response(
+                response, "POST", "/api/v1/operator/admin/users"
+            )
+        ) as secondary_created:
+            page.locator("#admin-save-user").click()
+        _require(
+            secondary_created.value.status == 201,
+            "Installed administrator could not provision independent test administrator",
+        )
+        secondary_issue = secondary_created.value.json()
+        secondary_account = secondary_issue.get("account", {})
+        _require(
+            secondary_account.get("username") == secondary_admin_username
+            and secondary_account.get("role") == "administrator"
+            and secondary_account.get("camera_access", {}).get("mode") == "all",
+            "Independent installed administrator received incorrect durable role or scope",
+        )
+        secondary_admin_credential = admin_helpers._credential(page, secondary_admin_username)
+        _require(
+            secondary_admin_credential == secondary_issue.get("temporary_credential"),
+            "Independent installed administrator received the wrong one-time credential",
+        )
+        admin_helpers._return_to_cameras(page)
+        # Full lower-role, camera-access, revocation, and audit verification runs
+        # in another real Edge instance while the original session stays live.
         admin_executor = ThreadPoolExecutor(max_workers=1)
         admin_future = admin_executor.submit(_parallel_admin_journey)
         nvr_diagnostic["admin_parallel_started"] = True
