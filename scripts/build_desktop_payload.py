@@ -782,18 +782,26 @@ def build(args: argparse.Namespace) -> None:
             "-I",
             "-B",
             "-c",
-            "import fastapi,pydantic,psutil,uvicorn; import k5vision.desktop_setup; "
+            "print('embedded smoke: python_started', flush=True); "
+            "import fastapi,pydantic,psutil,uvicorn; "
+            "print('embedded smoke: core_imports', flush=True); "
+            "import k5vision.desktop_setup; "
             "import k5vision.operator_product; import k5vision.operator_product_api; "
             "import k5vision.operator_onvif; import k5vision.operator_time; "
             "import k5vision.operator_rtsp; import k5vision.operator_rtsp_api; "
             "import k5vision.operator_admin_api; "
             + IDENTITY_CRYPTO_SMOKE
-            + "import cv2,numpy,openvino,re; "
+            + "print('embedded smoke: identity_imports', flush=True); "
+            "import cv2,numpy; print('embedded smoke: cv2_numpy', flush=True); "
+            "import openvino,re; print('embedded smoke: openvino', flush=True); "
             "from k5vision.operator_analytics_person import "
             "load_installed_person_configuration,_PersonDetector; "
             "person=load_installed_person_configuration({}); assert person is not None; "
+            "print('embedded smoke: person_configuration', flush=True); "
             "detector=_PersonDetector(person); "
+            "print('embedded smoke: person_detector', flush=True); "
             "assert detector.infer(bytes(544*320*4),544,320,544*4,0)==(); "
+            "print('embedded smoke: person_inference', flush=True); "
             r"assert re.search(r'FFMPEG:\s+YES',cv2.getBuildInformation()); "
             "import importlib.util; "
             "assert importlib.util.find_spec('onvif') is None; "
