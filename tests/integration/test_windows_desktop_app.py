@@ -1718,8 +1718,7 @@ def _installed_analytics_journey(
         try:
             state = client.json(route + "/analytics")
             diagnostic["analytics_failure_state"] = {
-                key: state.get(key)
-                for key in ("status", "processed_frames", "event_count")
+                key: state.get(key) for key in ("status", "processed_frames", "event_count")
             }
         except Exception:
             diagnostic["analytics_failure_state"] = {"available": False}

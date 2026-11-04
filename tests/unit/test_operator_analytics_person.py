@@ -174,7 +174,6 @@ def test_native_model_read_uses_verified_immutable_bytes_after_admission(admitte
         module._model_bytes(config)
 
 
-
 def test_model_byte_read_rejects_same_content_replaced_inode(admitted, monkeypatch):
     config, _manifest, _files = admitted
     original = module._local_path
