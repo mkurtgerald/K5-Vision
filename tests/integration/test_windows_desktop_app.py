@@ -2335,6 +2335,8 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     installed, profile = parent / "installed app with spaces", parent / "profile with spaces"
     username, password = "fixture-admin", secrets.token_urlsafe(32)
     processes, reservations = [], []
+    admin_executor = None
+    admin_future = None
     cohort = _Cohort(api)
     playwright = browser = context = page = onvif_camera = None
     onvif_cameras, sources, publishers = [], [], []
@@ -2372,6 +2374,58 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         "browser_channel": "msedge",
         "playwright_version": "1.58.0",
     }
+
+    def admin_progress(phase):
+        if phase in {
+            "admin_create_accounts",
+            "admin_activate_viewer",
+            "admin_activate_operator",
+            "admin_revoke_camera_access",
+            "admin_disable_and_reenable",
+            "admin_reset_password",
+            "admin_visible_audit",
+        } or any(
+            phase == f"admin_{role}_{step}"
+            for role in ("viewer", "operator")
+            for step in (
+                "open_tab",
+                "wait_panel",
+                "open_users",
+                "wait_users",
+                "open_editor",
+                "wait_editor",
+                "submit_create",
+                "one_time_credential",
+                "wait_created_row",
+            )
+        ):
+            nvr_diagnostic["admin_stage"] = phase
+
+
+    def _parallel_admin_journey():
+        # Own Playwright and Chromium entirely on this thread. Concurrent
+        # user administration must still exercise the installed product UI.
+        with browser_api.sync_playwright() as admin_playwright:
+            admin_browser = admin_playwright.chromium.launch(channel="msedge", headless=True)
+            try:
+                admin_context = admin_browser.new_context(viewport={"width": 1440, "height": 900})
+                try:
+                    admin_page = admin_context.new_page()
+                    admin_page.set_default_timeout(25_000)
+                    admin_helpers._login(admin_page, client.origin, username, password)
+                    return admin_helpers.run_admin_journey(
+                        admin_page,
+                        admin_username=username,
+                        admin_password=password,
+                        camera_ids=camera_ids,
+                        colors=tuple(color for _, _, color in _DESKTOP_CAMERAS),
+                        client=client,
+                        progress=admin_progress,
+                    )
+                finally:
+                    admin_context.close()
+            finally:
+                admin_browser.close()
     try:
         _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
         _require((installed / "K5Vision.exe").is_file(), "Installed desktop executable is absent")
@@ -2702,6 +2756,12 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["direct_rtsp_live_decoded_frames"] = receipt["live_decoded_frames"]
         receipt["actual_edge_login_enrollment_live"] = True
         _wait(lambda: _recording_bytes(profile) > 0, "Desktop recording bytes", process=app)
+        # Run the same full user/role/audit proof on a separate real Edge
+        # session while recording, playback and analytics remain active.
+        # All original checks and the six-minute VM limit remain required.
+        admin_executor = ThreadPoolExecutor(max_workers=1)
+        admin_future = admin_executor.submit(_parallel_admin_journey)
+        nvr_diagnostic["admin_parallel_started"] = True
         _enter_stage("installed_nvr_workspace")
         receipt.update(
             _desktop_nvr_journey(
@@ -2770,41 +2830,20 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             receipt["host_clock_step_acceptance"] = True
         _enter_stage("installed_user_administration")
 
-        def admin_progress(phase):
-            if phase in {
-                "admin_create_accounts",
-                "admin_activate_viewer",
-                "admin_activate_operator",
-                "admin_revoke_camera_access",
-                "admin_disable_and_reenable",
-                "admin_reset_password",
-                "admin_visible_audit",
-            } or any(
-                phase == f"admin_{role}_{step}"
-                for role in ("viewer", "operator")
-                for step in (
-                    "open_tab",
-                    "wait_panel",
-                    "open_users",
-                    "wait_users",
-                    "open_editor",
-                    "wait_editor",
-                    "submit_create",
-                    "one_time_credential",
-                    "wait_created_row",
-                )
-            ):
-                nvr_diagnostic["admin_stage"] = phase
-
-        admin_evidence, admin_private_state = admin_helpers.run_admin_journey(
-            page,
-            admin_username=username,
-            admin_password=password,
-            camera_ids=camera_ids,
-            colors=tuple(color for _, _, color in _DESKTOP_CAMERAS),
-            client=client,
-            progress=admin_progress,
-        )
+        _require(admin_future is not None, "Installed administrator proof was not started")
+        try:
+            admin_evidence, admin_private_state = admin_future.result(timeout=120)
+        except BaseException as error:
+            nvr_diagnostic["admin_parallel_failure_type"] = (
+                type(error).__name__
+                if type(error).__name__
+                in {"Failed", "TimeoutError", "Error", "RuntimeError", "AssertionError", "ValueError"}
+                else "other"
+            )
+            _require(False, "Installed parallel administrator proof did not qualify")
+        admin_executor.shutdown(wait=True)
+        admin_executor = None
+        nvr_diagnostic["admin_parallel_qualified"] = True
         for field in (
             "admin_user_management",
             "role_permissions",
@@ -3212,6 +3251,11 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         except BaseException:
             desktop_status = "unresponsive"
             desktop_probe = {"available": False}
+        if admin_executor is not None:
+            try:
+                admin_executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                cleanup_failed = True
         process_counts = _cohort_diagnostic(cohort)
         app_exit_code = app.poll() if app else None
         form_alive = bool(form and api.api.IsWindow(form))
