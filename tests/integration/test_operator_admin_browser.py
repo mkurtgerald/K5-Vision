@@ -234,7 +234,10 @@ def _create_user(page, username, role, identifiers, *, progress=None):
 
     def observe_submission(request):
         nonlocal request_seen
-        if request.method == "POST" and urlsplit(request.url).path == "/api/v1/operator/admin/users":
+        if (
+            request.method == "POST"
+            and urlsplit(request.url).path == "/api/v1/operator/admin/users"
+        ):
             request_seen = True
 
     page.on("request", observe_submission)
@@ -251,11 +254,8 @@ def _create_user(page, username, role, identifiers, *, progress=None):
             create_form_valid=page.locator("#admin-user-form").evaluate(
                 "form => form.checkValidity()"
             ),
-            create_form_busy=page.locator("#admin-user-form").get_attribute("aria-busy")
-            == "true",
-            create_dialog_open=page.locator("#admin-user-dialog").evaluate(
-                "dialog => dialog.open"
-            ),
+            create_form_busy=page.locator("#admin-user-form").get_attribute("aria-busy") == "true",
+            create_dialog_open=page.locator("#admin-user-dialog").evaluate("dialog => dialog.open"),
         )
         raise
     finally:
