@@ -2475,15 +2475,18 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["rtsp_anonymous_read_rejected"] = True
         receipt["rtsp_wrong_password_rejected"] = True
         _enter_stage("actual_browser_enrollment")
+        readiness_diagnostic["browser_enrollment_step"] = "launch_browser"
         playwright = browser_api.sync_playwright().start()
         browser = playwright.chromium.launch(channel="msedge", headless=True)
         receipt["browser_version"] = browser.version
         context = browser.new_context(viewport={"width": 1440, "height": 900})
         page = context.new_page()
         page.set_default_timeout(25_000)
+        readiness_diagnostic["browser_enrollment_step"] = "navigate_operator"
         page.goto(client.origin + "/operator/")
         page.locator("#username").fill(username)
         page.locator("#password").fill(password)
+        readiness_diagnostic["browser_enrollment_step"] = "submit_login"
         with page.expect_response(
             lambda response: (
                 response.request.method == "POST" and response.url.endswith("/api/v1/auth/login")
@@ -2500,7 +2503,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         # Observe the backend using the browser's current session without a
         # second login that would revoke the active browser.
         client.token = browser_token
+        readiness_diagnostic["browser_enrollment_step"] = "workspace_ready"
         page.locator("#workspace").wait_for(state="visible")
+        readiness_diagnostic["browser_enrollment_step"] = "recorder_time_health"
         browser_helpers._assert_recorder_time_health(page, client)
         receipt["recorder_time_health_displayed"] = True
         camera_ids = []
@@ -2508,15 +2513,19 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         for index, ((name, _, _), camera_fixture) in enumerate(
             zip(_DESKTOP_CAMERAS, onvif_cameras, strict=True)
         ):
+            readiness_diagnostic["browser_enrollment_step"] = "onvif_enroll"
+            readiness_diagnostic["browser_onvif_camera_number"] = index + 1
             enrolled, discovery = browser_helpers._onvif_enroll(
                 page,
                 name=name,
                 fixture=camera_fixture,
                 reject_wrong=index == 0,
                 run_discovery=index == 0,
+                diagnostic=readiness_diagnostic,
             )
             camera_ids.append(enrolled["device_id"])
             discovery_completed = discovery_completed or discovery
+        readiness_diagnostic["browser_enrollment_step"] = "onvif_enrollment_complete"
         _require(len(set(camera_ids)) == 4, "Installed NVR merged distinct camera sources")
         camera_id = camera_ids[0]
         camera_directories = [
