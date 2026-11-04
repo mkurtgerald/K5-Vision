@@ -541,7 +541,9 @@ def install_user_admin_api(
     async def login(payload: UserLogin, response: Response) -> UserSessionIssue:
         response.headers["Cache-Control"] = "no-store"
         security = getattr(application.state, "operator_identity_security", None)
-        started_epoch = None if security is None else await asyncio.to_thread(security.primary_started)
+        started_epoch = (
+            None if security is None else await asyncio.to_thread(security.primary_started)
+        )
         try:
             registry = require_registry()
             async with login_verification_slots:
