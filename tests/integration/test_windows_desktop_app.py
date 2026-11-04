@@ -2916,6 +2916,23 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 }
                 else "other"
             )
+            # Only fixed assertion names can enter the public diagnostic.
+            # Never emit an exception body, credentials, media, or source URI.
+            nvr_diagnostic["admin_parallel_assertion"] = {
+                "User could not replace the one-time credential": "activation",
+                "Generated user could not sign in through the UI": "sign_in",
+                "User sign-in did not issue a bounded opaque session": "session",
+                "Login retained a password field": "password_clearance",
+                "Viewer received administration UI": "viewer_admin_ui",
+                "Viewer received camera setup": "viewer_camera_setup",
+                "Viewer inventory exposed a camera outside its assigned set": "viewer_scope",
+                "Viewer could not read assigned-camera recording history": "viewer_history",
+                "Viewer capabilities did not match its permitted role": "viewer_capabilities",
+                "Viewer received recording administration controls": "viewer_recording_controls",
+                "A limited account received an unauthorized operation": "authorization_denial",
+                "Viewer could not obtain assigned-camera media": "viewer_media",
+                "Camera media left the authorized same-origin gateway": "viewer_gateway",
+            }.get(str(error), "other")
             _require(False, "Installed parallel administrator proof did not qualify")
 
         nvr_diagnostic["admin_parallel_qualified"] = True
