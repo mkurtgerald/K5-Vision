@@ -12,11 +12,11 @@ import hashlib
 import json
 import os
 import threading
-from platform import system
 from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
+from platform import system
 
 from k5vision.analytics_config import _local_path, _unique_object
 from k5vision.analytics_runtime import OwnedAnalyticsProvider, _AnalyticsSession
