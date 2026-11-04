@@ -174,7 +174,18 @@ def extract_python(archive: Path, runtime: Path) -> None:
 
 
 def run(arguments: list[str]) -> None:
-    subprocess.run(arguments, cwd=ROOT, check=True)
+    completed = subprocess.run(arguments, cwd=ROOT, check=False)
+    if completed.returncode:
+        # Only the fixed build phase and integer native exit status are safe
+        # to expose. Never emit command arguments, paths or donor URLs.
+        print(
+            json.dumps(
+                {"desktop_payload_child_stage": _BUILD_PHASE, "exit_code": completed.returncode}
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        raise RuntimeError("Desktop payload subprocess failed") from None
 
 
 def provision_identity_crypto_material(payload: Path, pin: dict) -> dict:
