@@ -259,7 +259,9 @@ def _assert_recorder_time_health(page, client):
     return diagnostics
 
 
-def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=False, diagnostic=None):
+def _onvif_enroll(
+    page, *, name, fixture, reject_wrong=False, run_discovery=False, diagnostic=None
+):
     """Use actual credential/profile controls without entering a stream address."""
     __tracebackhide__ = True
     source_requests = []
