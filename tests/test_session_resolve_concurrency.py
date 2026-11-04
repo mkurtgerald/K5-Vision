@@ -20,6 +20,8 @@ def test_blocked_registry_read_does_not_hold_session_lock():
     entered, release = threading.Event(), threading.Event()
 
     def slow_authority(current, supplied_version):
+        if current.id == other.id:
+            return current
         assert current.id == account.id and supplied_version == version
         entered.set()
         assert release.wait(timeout=4)
