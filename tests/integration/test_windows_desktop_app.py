@@ -3229,7 +3229,8 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         except BaseException as error:
             nvr_diagnostic["analytics_permissions_parallel_failure_type"] = (
                 type(error).__name__
-                if type(error).__name__ in {"TimeoutError", "Error", "Failed", "RuntimeError", "AssertionError"}
+                if type(error).__name__
+                in {"TimeoutError", "Error", "Failed", "RuntimeError", "AssertionError"}
                 else "other"
             )
             _require(False, "Installed parallel analytics permissions proof did not qualify")
