@@ -2882,7 +2882,14 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             nvr_diagnostic["admin_parallel_failure_type"] = (
                 type(error).__name__
                 if type(error).__name__
-                in {"Failed", "TimeoutError", "Error", "RuntimeError", "AssertionError", "ValueError"}
+                in {
+                    "Failed",
+                    "TimeoutError",
+                    "Error",
+                    "RuntimeError",
+                    "AssertionError",
+                    "ValueError",
+                }
                 else "other"
             )
             _require(False, "Installed parallel administrator proof did not qualify")
