@@ -497,18 +497,24 @@ def run_admin_journey(
         phase("admin_activate_operator")
         operator_context, operator = _new_user_page(page)
         contexts.append(operator_context)
+        phase("admin_operator_browser_created")
         operator.on(
             "pageerror", lambda error: user_script_errors.append(helpers._script_error_code(error))
         )
         operator_token = _activate(
             operator, origin, operator_name, operator_temporary, operator_password
         )
+        phase("admin_operator_activated")
         operator_temporary = ""
         _require(operator.locator("#admin-tab").is_hidden(), "Operator received administration UI")
+        phase("admin_operator_role_checked")
+        phase("admin_operator_decode_live")
         evidence["admin_operator_live_decoded_frames"] = _visible_live(
             operator, camera_ids[1], colors[1]
         )
+        phase("admin_operator_live_decoded")
         denial(operator, operator_token, "GET", "/api/v1/operator/admin/users", 403)
+        phase("admin_operator_capabilities")
         status, capabilities = _api(
             operator, operator_token, "GET", "/api/v1/operator/capabilities"
         )
