@@ -174,6 +174,12 @@ def _open_admin(page, *, progress=None):
 def _set_access(page, identifiers):
     page.locator("#admin-access-mode").select_option("selected")
     choices = page.locator("#admin-camera-choices input[type=checkbox]")
+    # The camera choices are populated asynchronously after the editor opens.
+    # Do not silently submit an empty grant while the list is still loading.
+    for identifier in identifiers:
+        page.locator(
+            f'#admin-camera-choices input[type=checkbox][value="{identifier}"]'
+        ).wait_for(state="attached")
     for index in range(choices.count()):
         checkbox = choices.nth(index)
         checkbox.set_checked(checkbox.get_attribute("value") in identifiers)
@@ -592,7 +598,7 @@ def run_admin_journey(
         _return_to_cameras(page)
 
 
-def assert_admin_restart(page, *, private_state, camera_ids, client=None):
+def assert_admin_restart(page, *, private_state, camera_ids, client=None, viewer_color="red"):
     """Verify durable users/grants and a real limited-user login after app restart."""
     __tracebackhide__ = True
     del client
@@ -659,7 +665,9 @@ def assert_admin_restart(page, *, private_state, camera_ids, client=None):
             "Restarted viewer inventory exceeded its persisted grants",
         )
         _ADMIN_RESTART_DIAGNOSTIC["phase"] = "viewer_video"
-        frames = _visible_live(viewer, camera_ids[0], "red", diagnostic=_ADMIN_RESTART_DIAGNOSTIC)
+        frames = _visible_live(
+            viewer, camera_ids[0], viewer_color, diagnostic=_ADMIN_RESTART_DIAGNOSTIC
+        )
         _ADMIN_RESTART_DIAGNOSTIC["decoded_frames"] = frames
         status, _ = _api(viewer, token, "GET", f"/api/v1/operator/cameras/{camera_ids[1]}/history")
         _require(status == 404, "Restart granted the viewer an unassigned camera")
