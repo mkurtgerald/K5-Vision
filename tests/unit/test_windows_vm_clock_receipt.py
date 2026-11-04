@@ -528,13 +528,34 @@ def test_vm_receipt_requires_real_inference_without_accuracy_claims(tmp_path, fi
         ("analytics_background_event_count_after", 100001),
         # The original eight-result proof omits the added viewer person-event denial.
         ("analytics_denied_http_statuses", [404, 404, 403, 404, 404, 403, 401, 401]),
-        ("analytics_denied_http_statuses", [404.0, 404, 404, 403, 404, 404, 403, 401, 401]),
-        ("analytics_denied_http_statuses", [True, 404, 404, 403, 404, 404, 403, 401, 401]),
-        ("analytics_denied_http_statuses", ["404", 404, 404, 403, 404, 404, 403, 401, 401]),
-        ("analytics_denied_http_statuses", [404, 404, 403, 404, 404, 404, 403, 401, 401]),
-        ("analytics_denied_http_statuses", [404, 404, 404, 403, 404, 404, 403, 401, 200]),
-        ("analytics_denied_http_statuses", [404, 404, 403, 404, 404, 404, 403, 401, 401]),
-        ("analytics_denied_http_statuses", [404, 404, 404, 403, 404, 404, 403, 401, 401, 401]),
+        (
+            "analytics_denied_http_statuses",
+            [404.0, 404, 404, 403, 404, 404, 403, 401, 401],
+        ),
+        (
+            "analytics_denied_http_statuses",
+            [True, 404, 404, 403, 404, 404, 403, 401, 401],
+        ),
+        (
+            "analytics_denied_http_statuses",
+            ["404", 404, 404, 403, 404, 404, 403, 401, 401],
+        ),
+        (
+            "analytics_denied_http_statuses",
+            [404, 404, 403, 404, 404, 404, 403, 401, 401],
+        ),
+        (
+            "analytics_denied_http_statuses",
+            [404, 404, 404, 403, 404, 404, 403, 401, 200],
+        ),
+        (
+            "analytics_denied_http_statuses",
+            [404, 404, 404, 404, 403, 404, 403, 401, 401],
+        ),
+        (
+            "analytics_denied_http_statuses",
+            [404, 404, 404, 403, 404, 404, 403, 401, 401, 401],
+        ),
         ("analytics_denied_http_statuses", [404] * 8),
         ("analytics_denied_http_statuses", _MISSING),
     ],
