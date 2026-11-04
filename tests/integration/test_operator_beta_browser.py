@@ -259,7 +259,7 @@ def _assert_recorder_time_health(page, client):
     return diagnostics
 
 
-def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=False):
+def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=False, diagnostic=None):
     """Use actual credential/profile controls without entering a stream address."""
     __tracebackhide__ = True
     source_requests = []
@@ -271,10 +271,13 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
 
     page.on("request", observe)
     discovery_completed = False
+    diagnostic = {} if diagnostic is None else diagnostic
     try:
+        diagnostic["onvif_enrollment_step"] = "open_dialog"
         page.locator("#add-camera-button").click()
         _require(page.locator("#new-camera-source").count() == 0, "Manual stream field remained")
         if run_discovery:
+            diagnostic["onvif_enrollment_step"] = "discovery"
             with page.expect_response(
                 lambda response: (
                     response.request.method == "POST"
@@ -291,6 +294,7 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
         page.locator("#new-camera-port").fill(str(fixture.port))
         page.locator("#new-camera-username").fill(fixture.username)
         if reject_wrong:
+            diagnostic["onvif_enrollment_step"] = "reject_wrong_credentials"
             page.locator("#new-camera-password").fill("deliberately-wrong-fixture-password")
             with page.expect_response(
                 lambda response: (
@@ -310,6 +314,7 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
             page.wait_for_function(
                 "() => document.getElementById('new-camera-password').value === ''"
             )
+        diagnostic["onvif_enrollment_step"] = "request_profiles"
         page.locator("#new-camera-password").fill(fixture.password)
         with page.expect_response(
             lambda response: (
@@ -337,6 +342,7 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
             if item.get("codec") == "H264" and item.get("supported") is True
         ]
         _require(bool(selected), "Generated H264 camera profile was not offered")
+        diagnostic["onvif_enrollment_step"] = "verify_profile_and_clock"
         page.locator("#camera-profile").select_option(selected[0]["id"])
         _assert_onvif_time_health(page, fixture, profile_payload["clock"])
         _require(
@@ -348,6 +354,7 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
             "ONVIF profile acceptance claimed unverified video readiness",
         )
         page.wait_for_function("() => document.getElementById('new-camera-password').value === ''")
+        diagnostic["onvif_enrollment_step"] = "connect_camera"
         with page.expect_response(
             lambda response: (
                 response.request.method == "POST"
@@ -364,12 +371,14 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
             ),
             "Connection response exposed private camera execution material",
         )
+        diagnostic["onvif_enrollment_step"] = "verify_connected_camera"
         page.locator("#add-camera-dialog").wait_for(state="hidden")
         _require(
             fixture.qualified_requests(), "Actual authenticated ONVIF SOAP flow was incomplete"
         )
         _require(not source_requests, "Browser sent a manual camera stream address")
         _require(fixture._stream_uri not in page.content(), "Camera stream address entered the DOM")
+        diagnostic["onvif_enrollment_step"] = "completed"
         return camera, discovery_completed
     finally:
         page.remove_listener("request", observe)

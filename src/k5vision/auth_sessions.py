@@ -81,6 +81,7 @@ class UserSessionManager:
         self._sessions: dict[bytes, _SessionRecord] = {}
         self._user_tokens: dict[UUID, bytes] = {}
         self._lock = asyncio.Lock()
+        self._resolve_slots = asyncio.Semaphore(4)
         self._revocation_listeners: set[Callable[[UUID], None]] = set()
 
     def add_revocation_listener(self, callback: Callable[[UUID], None]) -> Callable[[], None]:
@@ -146,7 +147,7 @@ class UserSessionManager:
         return token, expires_at
 
     async def resolve(self, token: str) -> UserAccount | None:
-        """Resolve one non-expired session without retaining its plaintext token."""
+        """Resolve current authority without blocking the HTTP event loop."""
         if not self._token_is_valid(token):
             return None
         digest = self._digest(token)
@@ -159,15 +160,39 @@ class UserSessionManager:
                 if self._user_tokens.get(record.account.id) == digest:
                     self._user_tokens.pop(record.account.id, None)
                 return None
-            current = (
-                record.account
-                if self._resolve_account is None
-                else self._resolve_account(record.account, record.credential_version)
+            if self._resolve_account is None:
+                return record.account
+
+        # The durable registry read is synchronous SQLite I/O. Never run it
+        # inside the event loop or hold the session lock while it is in flight.
+        # The bounded slots prevent simultaneous reads from flooding a private
+        # SQLite registry when many authenticated browser requests arrive.
+        async with self._resolve_slots:
+            worker = asyncio.create_task(
+                asyncio.to_thread(self._resolve_account, record.account, record.credential_version)
             )
-            if current is None:
+            try:
+                current = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # The read cannot be canceled once started in a thread. Keep
+                # its slot until completion, rather than leaking unbounded
+                # registry work through canceled client requests.
+                try:
+                    await worker
+                except Exception:
+                    pass
+                raise
+
+        async with self._lock:
+            # Revocation, password replacement, or another login may have
+            # superseded this session during the authority read.
+            if self._sessions.get(digest) is not record:
+                return None
+            if record.deadline <= monotonic() or current is None:
                 self._sessions.pop(digest, None)
                 if self._user_tokens.get(record.account.id) == digest:
                     self._user_tokens.pop(record.account.id, None)
+                return None
             return current
 
     async def revoke(self, token: str) -> bool:

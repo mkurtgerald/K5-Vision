@@ -297,6 +297,10 @@ def install_user_admin_api(
         limit=login_rate_limit,
         window_seconds=rate_window_seconds,
     )
+    # Scrypt is CPU/memory expensive. Keep it off the event loop so login
+    # cannot stall recording control, health checks or other browser requests.
+    # Bound in-flight verifications as well as the existing login rate.
+    login_verification_slots = asyncio.Semaphore(2)
     application.add_middleware(_BoundedUserRequestBody, max_bytes=max_request_bytes)
     application.state.user_registry = registry
     application.state.user_session_manager = session_manager
@@ -537,12 +541,17 @@ def install_user_admin_api(
     async def login(payload: UserLogin, response: Response) -> UserSessionIssue:
         response.headers["Cache-Control"] = "no-store"
         security = getattr(application.state, "operator_identity_security", None)
-        started_epoch = None if security is None else security.primary_started()
+        started_epoch = (
+            None if security is None else await asyncio.to_thread(security.primary_started)
+        )
         try:
-            verified = require_registry().verify_password_snapshot(
-                username=payload.username,
-                password=payload.password,
-            )
+            registry = require_registry()
+            async with login_verification_slots:
+                verified = await asyncio.to_thread(
+                    registry.verify_password_snapshot,
+                    username=payload.username,
+                    password=payload.password,
+                )
         except UserRegistryStorageError:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -565,8 +574,11 @@ def install_user_admin_api(
             )
 
             try:
-                primary_epoch = security.password_authenticated(
-                    account, credential_version, started_epoch=started_epoch
+                primary_epoch = await asyncio.to_thread(
+                    security.password_authenticated,
+                    account,
+                    credential_version,
+                    started_epoch=started_epoch,
                 )
             except SecondFactorRequired as challenge:
                 return JSONResponse(
@@ -584,8 +596,14 @@ def install_user_admin_api(
         current = await session_manager.resolve(session_token)
         if security is not None:
             try:
-                security.validate_primary_proof(account, credential_version, primary_epoch)
-                factor_enabled = security.store.status(account.id)["mfa_enabled"]
+                # Durable authority and MFA-state reads may block on the user
+                # registry. Keep the paired post-issuance check together in one
+                # worker, then revoke the session on any failed verification.
+                def verify_issued_session():
+                    security.validate_primary_proof(account, credential_version, primary_epoch)
+                    return security.store.status(account.id)["mfa_enabled"]
+
+                factor_enabled = await asyncio.to_thread(verify_issued_session)
             except AccountSecurityUnavailable:
                 await session_manager.revoke(session_token)
                 raise HTTPException(503, "Account security unavailable") from None

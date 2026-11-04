@@ -174,6 +174,12 @@ def _open_admin(page, *, progress=None):
 def _set_access(page, identifiers):
     page.locator("#admin-access-mode").select_option("selected")
     choices = page.locator("#admin-camera-choices input[type=checkbox]")
+    # The camera choices are populated asynchronously after the editor opens.
+    # Do not silently submit an empty grant while the list is still loading.
+    for identifier in identifiers:
+        page.locator(f'#admin-camera-choices input[type=checkbox][value="{identifier}"]').wait_for(
+            state="attached"
+        )
     for index in range(choices.count()):
         checkbox = choices.nth(index)
         checkbox.set_checked(checkbox.get_attribute("value") in identifiers)
@@ -218,10 +224,42 @@ def _create_user(page, username, role, identifiers, *, progress=None):
     page.locator("#admin-enabled").set_checked(True)
     _set_access(page, identifiers)
     checkpoint("submit_create")
-    with page.expect_response(
-        lambda response: _route_response(response, "POST", "/api/v1/operator/admin/users")
-    ) as created:
-        page.locator("#admin-save-user").click()
+    # Preserve the browser's own validation gate and identify whether a
+    # failure happened before the authorized POST or after the server saw it.
+    _require(
+        page.locator("#admin-user-form").evaluate("form => form.checkValidity()"),
+        "Generated account form did not pass browser validation",
+    )
+    request_seen = False
+
+    def observe_submission(request):
+        nonlocal request_seen
+        if (
+            request.method == "POST"
+            and urlsplit(request.url).path == "/api/v1/operator/admin/users"
+        ):
+            request_seen = True
+
+    page.on("request", observe_submission)
+    try:
+        with page.expect_response(
+            lambda response: _route_response(response, "POST", "/api/v1/operator/admin/users")
+        ) as created:
+            page.locator("#admin-save-user").click()
+    except BaseException:
+        # Only fixed boolean signals enter test logs, never form values,
+        # generated credentials, request bodies, or source addresses.
+        _ADMIN_DENIAL_DIAGNOSTIC.update(
+            create_request_seen=request_seen,
+            create_form_valid=page.locator("#admin-user-form").evaluate(
+                "form => form.checkValidity()"
+            ),
+            create_form_busy=page.locator("#admin-user-form").get_attribute("aria-busy") == "true",
+            create_dialog_open=page.locator("#admin-user-dialog").evaluate("dialog => dialog.open"),
+        )
+        raise
+    finally:
+        page.remove_listener("request", observe_submission)
     _require(created.value.status == 201, "Administrator could not create a user through the UI")
     result = created.value.json()
     account = result.get("account", {})
@@ -294,6 +332,20 @@ def _visible_live(page, identifier, color, *, diagnostic=None):
     return helpers._decoded_color(page, "live-video", color, diagnostic=diagnostic)
 
 
+def _operator_camera_grants(live_camera_ids, event_camera_id=None):
+    """Preserve separate decoded-live identity and recorded-event authority."""
+    grants = list(live_camera_ids[:2])
+    if event_camera_id is not None and event_camera_id not in grants:
+        grants.append(event_camera_id)
+    return grants
+
+
+def test_operator_camera_grants_keep_distinct_live_and_event_scope():
+    assert _operator_camera_grants(["lime", "blue"]) == ["lime", "blue"]
+    assert _operator_camera_grants(["lime", "blue"], "red") == ["lime", "blue", "red"]
+    assert _operator_camera_grants(["lime", "blue"], "blue") == ["lime", "blue"]
+
+
 def run_admin_journey(
     page,
     *,
@@ -303,6 +355,7 @@ def run_admin_journey(
     colors=("red", "blue"),
     client=None,
     progress=None,
+    operator_event_camera_id=None,
 ):
     """Exercise actual admin UI and concurrent limited user browsers.
 
@@ -323,10 +376,27 @@ def run_admin_journey(
     viewer_name, operator_name = "viewer-" + suffix, "operator-" + suffix
     viewer_password, operator_password = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
     private = {"users": []}
+    operator_access_ids = _operator_camera_grants(camera_ids, operator_event_camera_id)
+    _require(
+        operator_event_camera_id is None or operator_event_camera_id != camera_ids[0],
+        "Recorded-event camera must remain outside the viewer's grants",
+    )
 
     def phase(name):
         if progress is not None:
             progress(name)
+            if name in {
+                "admin_viewer_create_browser",
+                "admin_viewer_activate_credentials",
+                "admin_viewer_assert_role_ui",
+                "admin_viewer_decode_live",
+                "admin_viewer_read_history",
+                "admin_viewer_capabilities",
+                "admin_viewer_access_denials",
+                "admin_viewer_media_grant",
+                "admin_viewer_proof_complete",
+            }:
+                print("Installed administration phase: " + name, flush=True)
 
     def denial(user_page, token, method, route, expected, data=None):
         status, _ = _api(user_page, token, method, route, data)
@@ -360,17 +430,20 @@ def run_admin_journey(
             page, viewer_name, "viewer", camera_ids[:1], progress=phase
         )
         operator_id, operator_temporary = _create_user(
-            page, operator_name, "operator", camera_ids[:2], progress=phase
+            page, operator_name, "operator", operator_access_ids, progress=phase
         )
         evidence["admin_user_creation"] = True
 
         phase("admin_activate_viewer")
+        phase("admin_viewer_create_browser")
         viewer_context, viewer = _new_user_page(page)
         contexts.append(viewer_context)
         viewer.on(
             "pageerror", lambda error: user_script_errors.append(helpers._script_error_code(error))
         )
+        phase("admin_viewer_activate_credentials")
         viewer_token = _activate(viewer, origin, viewer_name, viewer_temporary, viewer_password)
+        phase("admin_viewer_assert_role_ui")
         viewer_temporary = ""
         _require(viewer.locator("#admin-tab").is_hidden(), "Viewer received administration UI")
         _require(viewer.locator("#add-camera-button").is_hidden(), "Viewer received camera setup")
@@ -380,9 +453,11 @@ def run_admin_journey(
             and {camera["device_id"] for camera in cameras["cameras"]} == {camera_ids[0]},
             "Viewer inventory exposed a camera outside its assigned set",
         )
+        phase("admin_viewer_decode_live")
         evidence["admin_viewer_live_decoded_frames"] = _visible_live(
             viewer, camera_ids[0], colors[0]
         )
+        phase("admin_viewer_read_history")
         status, history = _api(
             viewer, viewer_token, "GET", f"/api/v1/operator/cameras/{camera_ids[0]}/history"
         )
@@ -390,6 +465,7 @@ def run_admin_journey(
             status == 200 and isinstance(history.get("spans"), list),
             "Viewer could not read assigned-camera recording history",
         )
+        phase("admin_viewer_capabilities")
         status, capabilities = _api(viewer, viewer_token, "GET", "/api/v1/operator/capabilities")
         _require(
             status == 200
@@ -403,6 +479,7 @@ def run_admin_journey(
             viewer.locator("#toggle-recording").is_hidden(),
             "Viewer received recording administration controls",
         )
+        phase("admin_viewer_access_denials")
         for method, route, expected, data in (
             ("GET", "/api/v1/operator/admin/users", 403, None),
             ("GET", "/api/v1/users", 404, None),
@@ -419,6 +496,7 @@ def run_admin_journey(
             ("DELETE", f"/api/v1/operator/cameras/{camera_ids[0]}", 403, None),
         ):
             denial(viewer, viewer_token, method, route, expected, data)
+        phase("admin_viewer_media_grant")
         status, grant = _api(
             viewer, viewer_token, "POST", f"/api/v1/operator/cameras/{camera_ids[0]}/media-session"
         )
@@ -434,22 +512,29 @@ def run_admin_journey(
         )
         denial(viewer, "", "GET", export_url, 403)
         evidence["role_permissions"] = True
+        phase("admin_viewer_proof_complete")
 
         phase("admin_activate_operator")
         operator_context, operator = _new_user_page(page)
         contexts.append(operator_context)
+        phase("admin_operator_browser_created")
         operator.on(
             "pageerror", lambda error: user_script_errors.append(helpers._script_error_code(error))
         )
         operator_token = _activate(
             operator, origin, operator_name, operator_temporary, operator_password
         )
+        phase("admin_operator_activated")
         operator_temporary = ""
         _require(operator.locator("#admin-tab").is_hidden(), "Operator received administration UI")
+        phase("admin_operator_role_checked")
+        phase("admin_operator_decode_live")
         evidence["admin_operator_live_decoded_frames"] = _visible_live(
             operator, camera_ids[1], colors[1]
         )
+        phase("admin_operator_live_decoded")
         denial(operator, operator_token, "GET", "/api/v1/operator/admin/users", 403)
+        phase("admin_operator_capabilities")
         status, capabilities = _api(
             operator, operator_token, "GET", "/api/v1/operator/capabilities"
         )
@@ -557,7 +642,7 @@ def run_admin_journey(
                 "password": operator_password,
                 "role": "operator",
                 "enabled": True,
-                "camera_access": {"mode": "selected", "camera_ids": list(camera_ids[:2])},
+                "camera_access": {"mode": "selected", "camera_ids": list(operator_access_ids)},
             },
         ]
         helpers._assert_no_browser_storage(page)
@@ -571,7 +656,7 @@ def run_admin_journey(
         _return_to_cameras(page)
 
 
-def assert_admin_restart(page, *, private_state, camera_ids, client=None):
+def assert_admin_restart(page, *, private_state, camera_ids, client=None, viewer_color="red"):
     """Verify durable users/grants and a real limited-user login after app restart."""
     __tracebackhide__ = True
     del client
@@ -638,7 +723,9 @@ def assert_admin_restart(page, *, private_state, camera_ids, client=None):
             "Restarted viewer inventory exceeded its persisted grants",
         )
         _ADMIN_RESTART_DIAGNOSTIC["phase"] = "viewer_video"
-        frames = _visible_live(viewer, camera_ids[0], "red", diagnostic=_ADMIN_RESTART_DIAGNOSTIC)
+        frames = _visible_live(
+            viewer, camera_ids[0], viewer_color, diagnostic=_ADMIN_RESTART_DIAGNOSTIC
+        )
         _ADMIN_RESTART_DIAGNOSTIC["decoded_frames"] = frames
         status, _ = _api(viewer, token, "GET", f"/api/v1/operator/cameras/{camera_ids[1]}/history")
         _require(status == 404, "Restart granted the viewer an unassigned camera")

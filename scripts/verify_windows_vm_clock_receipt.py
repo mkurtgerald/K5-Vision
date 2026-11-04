@@ -189,7 +189,8 @@ def _nvr_journey(receipt):
     )
     denials = receipt.get("analytics_denied_http_statuses")
     _require(type(denials) is list and all(type(value) is int for value in denials))
-    _require(denials == [404, 404, 403, 404, 404, 403, 401, 401])
+    # Preserve independent viewer person-event denial before operator and anonymous checks.
+    _require(denials == [404, 404, 404, 403, 404, 404, 403, 401, 401])
 
 
 def _utc(value):

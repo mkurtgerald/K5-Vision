@@ -990,6 +990,7 @@ def _failure_detail(error):
         ("Actual timeline track is unavailable", "timeline_track_unavailable"),
         ("Timeline playback clip crosses its recorded interval", "timeline_clip_outside_span"),
         ("Decoded video did not match the selected generated camera", "decoded_camera_mismatch"),
+        ("Local operator request did not complete", "operator_transport_failure"),
     ):
         if marker in text:
             return code
@@ -1342,7 +1343,20 @@ def _desktop_nvr_journey(
     def all_progress(before, indices=range(4)):
         return all(after > prior for after, prior in zip(sizes(indices), before, strict=True))
 
-    diagnostic["nvr_stage"] = "four_recorders"
+    nvr_phase_clock = time.monotonic()
+    previous_nvr_phase = "start"
+    nvr_phase_seconds = []
+    diagnostic["nvr_phase_seconds"] = nvr_phase_seconds
+
+    def mark_nvr_phase(name):
+        nonlocal nvr_phase_clock, previous_nvr_phase
+        now = time.monotonic()
+        nvr_phase_seconds.append((previous_nvr_phase, round(now - nvr_phase_clock, 2)))
+        previous_nvr_phase = name
+        nvr_phase_clock = now
+        diagnostic["nvr_stage"] = name
+
+    mark_nvr_phase("four_recorders")
     before = sizes()
     _wait(lambda: all_progress(before), "Installed four-camera recording progress", process=app)
     evidence = {
@@ -1350,7 +1364,7 @@ def _desktop_nvr_journey(
         "camera_recording_bytes_before": before,
         "camera_recording_bytes_after": sizes(),
     }
-    diagnostic["nvr_stage"] = "outage_wall_admission"
+    mark_nvr_phase("outage_wall_admission")
     browser_helpers._wall_frames(page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS])
     unaffected = [0, 2, 3]
     selectors = [
@@ -1365,7 +1379,7 @@ def _desktop_nvr_journey(
         nvr_outage_other_frames_before=frames,
         nvr_outage_other_recording_bytes_before=others_before,
     )
-    diagnostic["nvr_stage"] = "outage_stop_source"
+    mark_nvr_phase("outage_stop_source")
     helpers._stop_owned(publishers[1])
     diagnostic["nvr_outage_publisher_exit_code"] = publishers[1].poll()
 
@@ -1404,9 +1418,9 @@ def _desktop_nvr_journey(
             views[camera_ids[index]]["status"] == "live" for index in unaffected
         )
 
-    diagnostic["nvr_stage"] = "outage_camera_status"
+    mark_nvr_phase("outage_camera_status")
     _wait(isolated_offline, "Installed isolated camera outage", process=app, timeout=20)
-    diagnostic["nvr_stage"] = "outage_other_live_progress"
+    mark_nvr_phase("outage_other_live_progress")
 
     def other_live_progress():
         samples = sample_survivors()
@@ -1416,7 +1430,7 @@ def _desktop_nvr_journey(
         )
 
     _wait(other_live_progress, "Other installed wall videos advance", process=app, timeout=15)
-    diagnostic["nvr_stage"] = "outage_other_recording_progress"
+    mark_nvr_phase("outage_other_recording_progress")
 
     def other_recording_progress():
         sample_survivors()
@@ -1436,7 +1450,7 @@ def _desktop_nvr_journey(
     evidence["outage_other_live_frames_after"] = [
         handle.evaluate("v => v.getVideoPlaybackQuality().totalVideoFrames") for handle in handles
     ]
-    diagnostic["nvr_stage"] = "outage_camera_reconnect"
+    mark_nvr_phase("outage_camera_reconnect")
     publishers[1] = _publish_fixture(parent, ffmpeg, sources[1], helpers, color="blue")
     processes.append(publishers[1])
     browser_helpers._decoded_video(
@@ -1446,7 +1460,7 @@ def _desktop_nvr_journey(
     _wait(lambda: all_progress(recovered), "Installed camera recording recovery", process=app)
     evidence["isolated_camera_outage_reconnect"] = True
 
-    diagnostic["nvr_stage"] = "pause_recording"
+    mark_nvr_phase("pause_recording")
     browser_helpers._open_camera_watch(page, camera_ids[0])
     before_live = browser_helpers._decoded_color(page, "live-video", "red")
     live = page.locator("#live-video").element_handle()
@@ -1510,14 +1524,14 @@ def _desktop_nvr_journey(
     evidence["paused_recording_bytes"] = paused_bytes
     evidence["resumed_recording_bytes"] = sizes()[0]
 
-    diagnostic["nvr_stage"] = "historical_navigation"
+    mark_nvr_phase("historical_navigation")
     seeded = browser_helpers._seed_recorded_history(camera_directories[0], ffmpeg, parent)
     evidence.update(
         browser_helpers._recording_navigation_journey(
             page, device_id=camera_ids[0], seeded=seeded, diagnostic=diagnostic
         )
     )
-    diagnostic["nvr_stage"] = "timeline_and_export"
+    mark_nvr_phase("timeline_and_export")
     browser_helpers._open_camera_recordings(page, camera_ids[0])
     evidence["timeline_playback_decoded_frames"] = browser_helpers._timeline_play(
         page,
@@ -1544,7 +1558,7 @@ def _desktop_nvr_journey(
 
     # Leave a real choice paused across the following native restart. The
     # primary source remains recording for tray and actual-VM clock checks.
-    diagnostic["nvr_stage"] = "persist_paused_choice"
+    mark_nvr_phase("persist_paused_choice")
     browser_helpers._open_camera_watch(page, camera_ids[3])
     preference_route = f"/api/v1/operator/cameras/{camera_ids[3]}/recording"
     browser_helpers._recording_control_diagnostic(None, False, diagnostic)
@@ -1563,7 +1577,7 @@ def _desktop_nvr_journey(
     )
     browser_helpers._open_camera_watch(page, camera_ids[0])
     browser_helpers._decoded_color(page, "live-video", "red")
-    diagnostic["nvr_stage"] = "complete"
+    mark_nvr_phase("complete")
     return evidence
 
 
@@ -1692,12 +1706,24 @@ def _installed_analytics_journey(
             and 0.5 <= detected["confidence"] <= 1
         )
 
-    _wait(
-        positive_event,
-        "Installed native detector records a real person event",
-        process=app,
-        timeout=25,
-    )
+    try:
+        _wait(
+            positive_event,
+            "Installed native detector records a real person event",
+            process=app,
+            timeout=25,
+        )
+    except BaseException:
+        # Distinguish a detector startup fault from a healthy but lagging
+        # recorder using only typed, credential-free backend status.
+        try:
+            state = client.json(route + "/analytics")
+            diagnostic["analytics_failure_state"] = {
+                key: state.get(key) for key in ("status", "processed_frames", "event_count")
+            }
+        except Exception:
+            diagnostic["analytics_failure_state"] = {"available": False}
+        raise
     occurred = datetime.fromisoformat(detected["occurred_at"].replace("Z", "+00:00"))
     _require(
         abs((datetime.now(UTC) - occurred).total_seconds()) < 30,
@@ -1765,17 +1791,23 @@ def _installed_analytics_journey(
     event_frames = page.locator("#playback-video").evaluate(
         "video => video.getVideoPlaybackQuality().totalVideoFrames"
     )
+    diagnostic["analytics_navigation_step"] = "analytics_status_fetch"
     status = client.json(route + "/analytics")
+    diagnostic["analytics_navigation_step"] = "analytics_status_verified"
     _require(
         status.get("processed_frames", 0) >= 1 and status.get("event_count", 0) >= 1,
         "Installed detector reported an event without processing recorded frames",
     )
+    diagnostic["analytics_navigation_step"] = "person_publisher_stop"
     helpers._stop_owned(publishers[0])
+    diagnostic["analytics_navigation_step"] = "red_publisher_restart"
     publishers[0] = _publish_fixture(
         parent, ffmpeg, source_uri, helpers, credentials=publisher_credentials
     )
     processes.append(publishers[0])
+    diagnostic["analytics_navigation_step"] = "red_live_watch_open"
     browser_helpers._open_camera_watch(page, camera_id)
+    diagnostic["analytics_navigation_step"] = "red_live_decode"
     browser_helpers._decoded_color(page, "live-video", "red")
     diagnostic["analytics_stage"] = "complete"
     diagnostic["analytics_navigation_step"] = "complete"
@@ -1795,7 +1827,9 @@ def _installed_analytics_journey(
     }, detected
 
 
-def _analytics_permission_journey(page, *, admin_helpers, camera_ids, private_state, diagnostic):
+def _analytics_permission_journey(
+    page, *, admin_helpers, camera_ids, private_state, analytics_event, diagnostic
+):
     """Use the same bounded browser observer as the installed admin journey."""
     __tracebackhide__ = True
     denied = []
@@ -1826,7 +1860,15 @@ def _analytics_permission_journey(page, *, admin_helpers, camera_ids, private_st
                 isinstance(token, str) and 32 <= len(token) <= 128,
                 "Limited analytics observer did not receive an opaque session",
             )
-            allowed = f"/api/v1/operator/cameras/{camera_ids[0]}"
+            permitted = set(account["camera_access"]["camera_ids"])
+            _require(
+                permitted
+                and permitted.issubset(set(camera_ids))
+                and camera_ids[3] not in permitted,
+                "Analytics role fixture lost its selected-camera boundary",
+            )
+            assigned_id = next(identifier for identifier in camera_ids if identifier in permitted)
+            allowed = f"/api/v1/operator/cameras/{assigned_id}"
             restricted = f"/api/v1/operator/cameras/{camera_ids[3]}"
             for suffix in ("/analytics", "/events"):
                 _require(
@@ -1836,6 +1878,27 @@ def _analytics_permission_journey(page, *, admin_helpers, camera_ids, private_st
                 status = request("unassigned_camera_read", token, "GET", restricted + suffix)[0]
                 _require(status == 404, "Unassigned camera analytics were exposed")
                 denied.append(status)
+            # The live person-event camera changes stream while other installed
+            # user checks run. The viewer must be denied its event history;
+            # the separately authorized operator must retrieve the actual
+            # captured event. Both still prove live video on generated cameras.
+            person_events = f"/api/v1/operator/cameras/{camera_ids[0]}/events"
+            if account["role"] == "viewer":
+                status, _ = request("viewer_person_events_denied", token, "GET", person_events)
+                _require(status == 404, "Viewer received unassigned person analytics")
+                denied.append(status)
+            else:
+                _require(account["role"] == "operator", "Unknown analytics test user role")
+                status, events = request("operator_person_events", token, "GET", person_events)
+                _require(
+                    status == 200
+                    and isinstance(events, dict)
+                    and any(
+                        isinstance(event, dict) and event.get("id") == analytics_event["id"]
+                        for event in events.get("events", [])
+                    ),
+                    "Authorized operator could not read the recorded person event",
+                )
             status = request(
                 "limited_analytics_write",
                 token,
@@ -2310,6 +2373,12 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     installed, profile = parent / "installed app with spaces", parent / "profile with spaces"
     username, password = "fixture-admin", secrets.token_urlsafe(32)
     processes, reservations = [], []
+    admin_executor = None
+    admin_future = None
+    settings_future = None
+    settings_diagnostic = {}
+    permissions_executor = None
+    permissions_future = None
     cohort = _Cohort(api)
     playwright = browser = context = page = onvif_camera = None
     onvif_cameras, sources, publishers = [], [], []
@@ -2347,6 +2416,149 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         "browser_channel": "msedge",
         "playwright_version": "1.58.0",
     }
+
+    def admin_progress(phase):
+        if (
+            phase
+            in {
+                "admin_create_accounts",
+                "admin_activate_viewer",
+                "admin_activate_operator",
+                "admin_revoke_camera_access",
+                "admin_disable_and_reenable",
+                "admin_reset_password",
+                "admin_visible_audit",
+            }
+            or phase.startswith("admin_operator_")
+            or any(
+                phase == f"admin_{role}_{step}"
+                for role in ("viewer", "operator")
+                for step in (
+                    "open_tab",
+                    "wait_panel",
+                    "open_users",
+                    "wait_users",
+                    "open_editor",
+                    "wait_editor",
+                    "submit_create",
+                    "one_time_credential",
+                    "wait_created_row",
+                )
+            )
+        ):
+            nvr_diagnostic["admin_stage"] = phase
+
+    def _parallel_admin_journey():
+        # Own Playwright and Chromium entirely on this thread. Concurrent
+        # user administration must still exercise the installed product UI.
+        with browser_api.sync_playwright() as admin_playwright:
+            admin_browser = admin_playwright.chromium.launch(channel="msedge", headless=True)
+            try:
+                admin_context = admin_browser.new_context(viewport={"width": 1440, "height": 900})
+                try:
+                    admin_page = admin_context.new_page()
+                    admin_page.set_default_timeout(25_000)
+                    admin_helpers._activate(
+                        admin_page,
+                        client.origin,
+                        secondary_admin_username,
+                        secondary_admin_credential,
+                        secondary_admin_password,
+                    )
+                    return admin_helpers.run_admin_journey(
+                        admin_page,
+                        admin_username=secondary_admin_username,
+                        admin_password=secondary_admin_password,
+                        # Viewer and operator decode independent generated
+                        # lime/blue feeds while NVR exercises red live/export.
+                        # The operator still receives the red camera grant
+                        # required to prove its real recorded person event;
+                        # neither limited account receives the yellow camera.
+                        camera_ids=[camera_ids[2], camera_ids[1]],
+                        colors=("lime", "blue"),
+                        operator_event_camera_id=camera_ids[0],
+                        client=client,
+                        progress=admin_progress,
+                    )
+                finally:
+                    admin_context.close()
+            finally:
+                admin_browser.close()
+
+    def _parallel_settings_journey():
+        # Run the entire installed GUI settings/security/integrations proof
+        # with an independently authenticated administrator on its own Edge
+        # thread. The original administrator remains active for recording and
+        # timeline acceptance. The worker pool serializes this after the
+        # account/role/audit journey so those shared users are fully admitted.
+        _, private_state = admin_future.result(timeout=120)
+        with browser_api.sync_playwright() as settings_playwright:
+            settings_browser = settings_playwright.chromium.launch(channel="msedge", headless=True)
+            try:
+                settings_context = settings_browser.new_context(
+                    viewport={"width": 1440, "height": 900}
+                )
+                try:
+                    settings_page = settings_context.new_page()
+                    settings_page.set_default_timeout(25_000)
+                    settings_client = runtime._Client(port)
+                    settings_client.token = admin_helpers._login(
+                        settings_page,
+                        client.origin,
+                        secondary_admin_username,
+                        secondary_admin_password,
+                    )
+                    evidence = settings_helpers.run_installed_settings_journey(
+                        settings_page,
+                        client=settings_client,
+                        admin_helpers=admin_helpers,
+                        browser_helpers=browser_helpers,
+                        admin_username=secondary_admin_username,
+                        admin_password=secondary_admin_password,
+                        camera_ids=camera_ids,
+                        private_state=private_state,
+                        analytics_event=analytics_event,
+                        parent=parent,
+                        diagnostic=settings_diagnostic,
+                    )
+                    return evidence, settings_diagnostic
+                finally:
+                    settings_context.close()
+            finally:
+                settings_browser.close()
+
+    def _parallel_analytics_permissions_journey():
+        # A separate, owned Edge instance proves all post-clock limited-role
+        # authorization checks while the primary UI is exercised through
+        # sign-out, tray operation and browser-closed recording. This preserves
+        # every HTTP denial and the exact event access assertion.
+        with browser_api.sync_playwright() as permission_playwright:
+            permission_browser = permission_playwright.chromium.launch(
+                channel="msedge", headless=True
+            )
+            try:
+                permission_context = permission_browser.new_context(
+                    viewport={"width": 1440, "height": 900}
+                )
+                try:
+                    permission_page = permission_context.new_page()
+                    permission_page.set_default_timeout(12_000)
+                    permission_page.goto(client.origin + "/operator/")
+                    permission_diagnostic = {}
+                    evidence = _analytics_permission_journey(
+                        permission_page,
+                        admin_helpers=admin_helpers,
+                        camera_ids=camera_ids,
+                        private_state=admin_private_state,
+                        analytics_event=analytics_event,
+                        diagnostic=permission_diagnostic,
+                    )
+                    return evidence, permission_diagnostic
+                finally:
+                    permission_context.close()
+            finally:
+                permission_browser.close()
+
     try:
         _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
         _require((installed / "K5Vision.exe").is_file(), "Installed desktop executable is absent")
@@ -2475,15 +2687,18 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["rtsp_anonymous_read_rejected"] = True
         receipt["rtsp_wrong_password_rejected"] = True
         _enter_stage("actual_browser_enrollment")
+        readiness_diagnostic["browser_enrollment_step"] = "launch_browser"
         playwright = browser_api.sync_playwright().start()
         browser = playwright.chromium.launch(channel="msedge", headless=True)
         receipt["browser_version"] = browser.version
         context = browser.new_context(viewport={"width": 1440, "height": 900})
         page = context.new_page()
         page.set_default_timeout(25_000)
+        readiness_diagnostic["browser_enrollment_step"] = "navigate_operator"
         page.goto(client.origin + "/operator/")
         page.locator("#username").fill(username)
         page.locator("#password").fill(password)
+        readiness_diagnostic["browser_enrollment_step"] = "submit_login"
         with page.expect_response(
             lambda response: (
                 response.request.method == "POST" and response.url.endswith("/api/v1/auth/login")
@@ -2500,7 +2715,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         # Observe the backend using the browser's current session without a
         # second login that would revoke the active browser.
         client.token = browser_token
+        readiness_diagnostic["browser_enrollment_step"] = "workspace_ready"
         page.locator("#workspace").wait_for(state="visible")
+        readiness_diagnostic["browser_enrollment_step"] = "recorder_time_health"
         browser_helpers._assert_recorder_time_health(page, client)
         receipt["recorder_time_health_displayed"] = True
         camera_ids = []
@@ -2508,15 +2725,19 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         for index, ((name, _, _), camera_fixture) in enumerate(
             zip(_DESKTOP_CAMERAS, onvif_cameras, strict=True)
         ):
+            readiness_diagnostic["browser_enrollment_step"] = "onvif_enroll"
+            readiness_diagnostic["browser_onvif_camera_number"] = index + 1
             enrolled, discovery = browser_helpers._onvif_enroll(
                 page,
                 name=name,
                 fixture=camera_fixture,
                 reject_wrong=index == 0,
                 run_discovery=index == 0,
+                diagnostic=readiness_diagnostic,
             )
             camera_ids.append(enrolled["device_id"])
             discovery_completed = discovery_completed or discovery
+        readiness_diagnostic["browser_enrollment_step"] = "onvif_enrollment_complete"
         _require(len(set(camera_ids)) == 4, "Installed NVR merged distinct camera sources")
         camera_id = camera_ids[0]
         camera_directories = [
@@ -2668,6 +2889,72 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["direct_rtsp_live_decoded_frames"] = receipt["live_decoded_frames"]
         receipt["actual_edge_login_enrollment_live"] = True
         _wait(lambda: _recording_bytes(profile) > 0, "Desktop recording bytes", process=app)
+        # Sessions are intentionally single-active-token per user. Provision a
+        # separate administrator through the installed UI, without revoking
+        # the original administrator's session used by NVR and clock checks.
+        secondary_admin_username = "concurrent-admin-" + secrets.token_hex(4)
+        secondary_admin_password = secrets.token_urlsafe(24)
+        admin_helpers._open_admin(page)
+        page.locator("#admin-create-user").click()
+        page.locator("#admin-user-dialog").wait_for(state="visible")
+        page.locator("#admin-username").fill(secondary_admin_username)
+        page.locator("#admin-display-name").fill("Generated concurrent administrator")
+        page.locator("#admin-role").select_option("administrator")
+        page.locator("#admin-enabled").set_checked(True)
+        _require(
+            page.locator("#admin-access-mode").input_value() == "all",
+            "Concurrent administrator was not assigned all-camera authority",
+        )
+        with page.expect_response(
+            lambda response: admin_helpers._route_response(
+                response, "POST", "/api/v1/operator/admin/users"
+            )
+        ) as secondary_created:
+            page.locator("#admin-save-user").click()
+        _require(
+            secondary_created.value.status == 201,
+            "Installed administrator could not provision independent test administrator",
+        )
+        secondary_issue = secondary_created.value.json()
+        secondary_account = secondary_issue.get("account", {})
+        _require(
+            secondary_account.get("username") == secondary_admin_username
+            and secondary_account.get("role") == "administrator"
+            and secondary_account.get("camera_access", {}).get("mode") == "all",
+            "Independent installed administrator received incorrect durable role or scope",
+        )
+        secondary_admin_credential = admin_helpers._credential(page, secondary_admin_username)
+        _require(
+            secondary_admin_credential == secondary_issue.get("temporary_credential"),
+            "Independent installed administrator received the wrong one-time credential",
+        )
+        admin_helpers._return_to_cameras(page)
+        # Full lower-role, camera-access, revocation, and audit verification runs
+        # in another real Edge instance while the original session stays live.
+        admin_executor = ThreadPoolExecutor(max_workers=1)
+        admin_future = admin_executor.submit(_parallel_admin_journey)
+        nvr_diagnostic["admin_parallel_started"] = True
+        _enter_stage("installed_continuous_person_analytics")
+        analytics_evidence, analytics_event = _installed_analytics_journey(
+            page=page,
+            client=client,
+            camera_id=camera_id,
+            parent=parent,
+            processes=processes,
+            publishers=publishers,
+            source_uri=source_uri,
+            ffmpeg=ffmpeg,
+            helpers=helpers,
+            browser_helpers=browser_helpers,
+            app=app,
+            publisher_credentials=primary_publisher_credentials,
+            diagnostic=nvr_diagnostic,
+        )
+        receipt.update(analytics_evidence)
+        # The heavy installed settings/UI security journey is queued behind
+        # the completed user-provisioning journey, then runs alongside NVR.
+        settings_future = admin_executor.submit(_parallel_settings_journey)
+        nvr_diagnostic["settings_parallel_started"] = True
         _enter_stage("installed_nvr_workspace")
         receipt.update(
             _desktop_nvr_journey(
@@ -2693,25 +2980,99 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["direct_rtsp_recording_bytes_before"] = receipt["camera_recording_bytes_before"][0]
         receipt["direct_rtsp_recording_bytes_after"] = receipt["camera_recording_bytes_after"][0]
         receipt["direct_rtsp_history_decoded_frames"] = receipt["timeline_playback_decoded_frames"]
-        _enter_stage("installed_continuous_person_analytics")
-        analytics_evidence, analytics_event = _installed_analytics_journey(
-            page=page,
-            client=client,
-            camera_id=camera_id,
-            parent=parent,
-            processes=processes,
-            publishers=publishers,
-            source_uri=source_uri,
-            ffmpeg=ffmpeg,
-            helpers=helpers,
-            browser_helpers=browser_helpers,
-            app=app,
-            publisher_credentials=primary_publisher_credentials,
-            diagnostic=nvr_diagnostic,
-        )
-        receipt.update(analytics_evidence)
+        _enter_stage("installed_user_administration")
+
+        _require(admin_future is not None, "Installed administrator proof was not started")
+        try:
+            admin_evidence, admin_private_state = admin_future.result(timeout=120)
+        except BaseException as error:
+            nvr_diagnostic["admin_parallel_failure_type"] = (
+                type(error).__name__
+                if type(error).__name__
+                in {
+                    "Failed",
+                    "TimeoutError",
+                    "Error",
+                    "RuntimeError",
+                    "AssertionError",
+                    "ValueError",
+                }
+                else "other"
+            )
+            # Only fixed assertion names can enter the public diagnostic.
+            # Never emit an exception body, credentials, media, or source URI.
+            nvr_diagnostic["admin_parallel_assertion"] = {
+                "User could not replace the one-time credential": "activation",
+                "Generated user could not sign in through the UI": "sign_in",
+                "User sign-in did not issue a bounded opaque session": "session",
+                "Login retained a password field": "password_clearance",
+                "Viewer received administration UI": "viewer_admin_ui",
+                "Viewer received camera setup": "viewer_camera_setup",
+                "Viewer inventory exposed a camera outside its assigned set": "viewer_scope",
+                "Viewer could not read assigned-camera recording history": "viewer_history",
+                "Viewer capabilities did not match its permitted role": "viewer_capabilities",
+                "Viewer received recording administration controls": "viewer_recording_controls",
+                "A limited account received an unauthorized operation": "authorization_denial",
+                "Viewer could not obtain assigned-camera media": "viewer_media",
+                "Camera media left the authorized same-origin gateway": "viewer_gateway",
+                "Account activation retained a credential field": "credential_clearance",
+                "Operator received administration UI": "operator_admin_ui",
+                "Decoded video did not match the selected generated camera": "live_color",
+            }.get(str(error), "other")
+            _require(False, "Installed parallel administrator proof did not qualify")
+
+        nvr_diagnostic["admin_parallel_qualified"] = True
+        for field in (
+            "admin_user_management",
+            "role_permissions",
+            "camera_access_controls",
+            "admin_user_creation",
+            "admin_bootstrap_password_change",
+            "admin_password_reset",
+            "admin_disable_reenable",
+            "admin_live_media_revocation",
+            "admin_audit_visible",
+            "admin_viewer_live_decoded_frames",
+            "admin_operator_live_decoded_frames",
+            "admin_user_count_created",
+            "admin_audit_event_count",
+            "admin_denied_http_statuses",
+        ):
+            _require(field in admin_evidence, "Installed user administration proof is incomplete")
+            receipt[field] = admin_evidence[field]
+        # Security and MFA proofs must finish before the actual host clock
+        # shifts. Work overlaps independent live/NVR browser checks, never
+        # the native UTC-correction phase.
+        _enter_stage("installed_admin_settings_security_integrations")
+        _require(settings_future is not None, "Installed settings proof was not started")
+        try:
+            settings_evidence, settings_diagnostic = settings_future.result(timeout=120)
+        except BaseException as error:
+            # The installed settings worker keeps finite, sanitized phase
+            # evidence even when it raises rather than returning a receipt.
+            nvr_diagnostic["settings_parallel_worker_done"] = settings_future.done()
+            nvr_diagnostic.update(settings_diagnostic)
+            nvr_diagnostic["settings_parallel_failure_type"] = (
+                type(error).__name__
+                if type(error).__name__
+                in {
+                    "Failed",
+                    "TimeoutError",
+                    "Error",
+                    "RuntimeError",
+                    "AssertionError",
+                    "ValueError",
+                }
+                else "other"
+            )
+            _require(False, "Installed parallel settings proof did not qualify")
+        nvr_diagnostic.update(settings_diagnostic)
+        receipt.update(settings_evidence)
+        nvr_diagnostic["settings_parallel_qualified"] = True
+        admin_executor.shutdown(wait=True)
+        admin_executor = None
         if vm_clock_enabled:
-            stage = "actual_vm_clock_changes"
+            _enter_stage("actual_vm_clock_changes")
             receipt["vm_clock"] = _vm_clock_phase(
                 page=page,
                 context=context,
@@ -2734,87 +3095,10 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 analytics_event=analytics_event,
             )
             receipt["host_clock_step_acceptance"] = True
-        _enter_stage("installed_user_administration")
-
-        def admin_progress(phase):
-            if phase in {
-                "admin_create_accounts",
-                "admin_activate_viewer",
-                "admin_activate_operator",
-                "admin_revoke_camera_access",
-                "admin_disable_and_reenable",
-                "admin_reset_password",
-                "admin_visible_audit",
-            } or any(
-                phase == f"admin_{role}_{step}"
-                for role in ("viewer", "operator")
-                for step in (
-                    "open_tab",
-                    "wait_panel",
-                    "open_users",
-                    "wait_users",
-                    "open_editor",
-                    "wait_editor",
-                    "submit_create",
-                    "one_time_credential",
-                    "wait_created_row",
-                )
-            ):
-                nvr_diagnostic["admin_stage"] = phase
-
-        admin_evidence, admin_private_state = admin_helpers.run_admin_journey(
-            page,
-            admin_username=username,
-            admin_password=password,
-            camera_ids=camera_ids,
-            colors=tuple(color for _, _, color in _DESKTOP_CAMERAS),
-            client=client,
-            progress=admin_progress,
-        )
-        for field in (
-            "admin_user_management",
-            "role_permissions",
-            "camera_access_controls",
-            "admin_user_creation",
-            "admin_bootstrap_password_change",
-            "admin_password_reset",
-            "admin_disable_reenable",
-            "admin_live_media_revocation",
-            "admin_audit_visible",
-            "admin_viewer_live_decoded_frames",
-            "admin_operator_live_decoded_frames",
-            "admin_user_count_created",
-            "admin_audit_event_count",
-            "admin_denied_http_statuses",
-        ):
-            _require(field in admin_evidence, "Installed user administration proof is incomplete")
-            receipt[field] = admin_evidence[field]
         _enter_stage("installed_analytics_permissions")
-        receipt.update(
-            _analytics_permission_journey(
-                page,
-                admin_helpers=admin_helpers,
-                camera_ids=camera_ids,
-                private_state=admin_private_state,
-                diagnostic=nvr_diagnostic,
-            )
-        )
-        _enter_stage("installed_admin_settings_security_integrations")
-        receipt.update(
-            settings_helpers.run_installed_settings_journey(
-                page,
-                client=client,
-                admin_helpers=admin_helpers,
-                browser_helpers=browser_helpers,
-                admin_username=username,
-                admin_password=password,
-                camera_ids=camera_ids,
-                private_state=admin_private_state,
-                analytics_event=analytics_event,
-                parent=parent,
-                diagnostic=nvr_diagnostic,
-            )
-        )
+        permissions_executor = ThreadPoolExecutor(max_workers=1)
+        permissions_future = permissions_executor.submit(_parallel_analytics_permissions_journey)
+        nvr_diagnostic["analytics_permissions_parallel_started"] = True
         _enter_stage("wall_logout_resource_cleanup")
         browser_helpers._wall_frames(page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS])
         wall_videos = page.locator("#wall-panel video").element_handles()
@@ -2942,6 +3226,23 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         }
         _require(current_python_pids == previous_python_pids, "Second click duplicated backend")
         receipt["second_click_reopens_single_instance"] = True
+        _enter_stage("installed_analytics_permissions_completion")
+        _require(permissions_future is not None, "Analytics permissions proof was not started")
+        try:
+            permission_evidence, permission_diagnostic = permissions_future.result(timeout=30)
+        except BaseException as error:
+            nvr_diagnostic["analytics_permissions_parallel_failure_type"] = (
+                type(error).__name__
+                if type(error).__name__
+                in {"TimeoutError", "Error", "Failed", "RuntimeError", "AssertionError"}
+                else "other"
+            )
+            _require(False, "Installed parallel analytics permissions proof did not qualify")
+        nvr_diagnostic.update(permission_diagnostic)
+        receipt.update(permission_evidence)
+        nvr_diagnostic["analytics_permissions_parallel_qualified"] = True
+        permissions_executor.shutdown(wait=True)
+        permissions_executor = None
         _enter_stage("graceful_stop_and_quit")
         _stop_app(app, reopened, api, cohort, diagnostic=nvr_diagnostic)
         receipt["graceful_owned_process_cleanup"] = True
@@ -3073,8 +3374,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         admin_restarted = admin_helpers.assert_admin_restart(
             page,
             private_state=admin_private_state,
-            camera_ids=camera_ids,
+            camera_ids=[camera_ids[2], camera_ids[0]],
             client=client,
+            viewer_color="lime",
         )
         for field in ("admin_state_persisted", "admin_restart_viewer_live_decoded_frames"):
             _require(field in admin_restarted, "Restarted user administration proof is incomplete")
@@ -3178,6 +3480,16 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         except BaseException:
             desktop_status = "unresponsive"
             desktop_probe = {"available": False}
+        if admin_executor is not None:
+            try:
+                admin_executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                cleanup_failed = True
+        if permissions_executor is not None:
+            try:
+                permissions_executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                cleanup_failed = True
         process_counts = _cohort_diagnostic(cohort)
         app_exit_code = app.poll() if app else None
         form_alive = bool(form and api.api.IsWindow(form))
@@ -3247,6 +3559,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         print(
             "Desktop VM clock phase seconds: "
             + json.dumps(vm_clock_diagnostic.get("vm_clock_phase_seconds", []))
+        )
+        print(
+            "Desktop NVR phase seconds: " + json.dumps(nvr_diagnostic.get("nvr_phase_seconds", []))
         )
     _require(
         elapsed < 360,
