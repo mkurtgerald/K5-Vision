@@ -2376,6 +2376,8 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     admin_executor = None
     admin_future = None
     settings_future = None
+    permissions_executor = None
+    permissions_future = None
     cohort = _Cohort(api)
     playwright = browser = context = page = onvif_camera = None
     onvif_cameras, sources, publishers = [], [], []
@@ -2524,6 +2526,38 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                     settings_context.close()
             finally:
                 settings_browser.close()
+
+    def _parallel_analytics_permissions_journey():
+        # A separate, owned Edge instance proves all post-clock limited-role
+        # authorization checks while the primary UI is exercised through
+        # sign-out, tray operation and browser-closed recording. This preserves
+        # every HTTP denial and the exact event access assertion.
+        with browser_api.sync_playwright() as permission_playwright:
+            permission_browser = permission_playwright.chromium.launch(
+                channel="msedge", headless=True
+            )
+            try:
+                permission_context = permission_browser.new_context(
+                    viewport={"width": 1440, "height": 900}
+                )
+                try:
+                    permission_page = permission_context.new_page()
+                    permission_page.set_default_timeout(12_000)
+                    permission_page.goto(client.origin + "/operator/")
+                    permission_diagnostic = {}
+                    evidence = _analytics_permission_journey(
+                        permission_page,
+                        admin_helpers=admin_helpers,
+                        camera_ids=camera_ids,
+                        private_state=admin_private_state,
+                        analytics_event=analytics_event,
+                        diagnostic=permission_diagnostic,
+                    )
+                    return evidence, permission_diagnostic
+                finally:
+                    permission_context.close()
+            finally:
+                permission_browser.close()
 
     try:
         _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
@@ -3058,16 +3092,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             )
             receipt["host_clock_step_acceptance"] = True
         _enter_stage("installed_analytics_permissions")
-        receipt.update(
-            _analytics_permission_journey(
-                page,
-                admin_helpers=admin_helpers,
-                camera_ids=camera_ids,
-                private_state=admin_private_state,
-                analytics_event=analytics_event,
-                diagnostic=nvr_diagnostic,
-            )
-        )
+        permissions_executor = ThreadPoolExecutor(max_workers=1)
+        permissions_future = permissions_executor.submit(_parallel_analytics_permissions_journey)
+        nvr_diagnostic["analytics_permissions_parallel_started"] = True
         _enter_stage("wall_logout_resource_cleanup")
         browser_helpers._wall_frames(page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS])
         wall_videos = page.locator("#wall-panel video").element_handles()
@@ -3195,6 +3222,22 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         }
         _require(current_python_pids == previous_python_pids, "Second click duplicated backend")
         receipt["second_click_reopens_single_instance"] = True
+        _enter_stage("installed_analytics_permissions_completion")
+        _require(permissions_future is not None, "Analytics permissions proof was not started")
+        try:
+            permission_evidence, permission_diagnostic = permissions_future.result(timeout=30)
+        except BaseException as error:
+            nvr_diagnostic["analytics_permissions_parallel_failure_type"] = (
+                type(error).__name__
+                if type(error).__name__ in {"TimeoutError", "Error", "Failed", "RuntimeError", "AssertionError"}
+                else "other"
+            )
+            _require(False, "Installed parallel analytics permissions proof did not qualify")
+        nvr_diagnostic.update(permission_diagnostic)
+        receipt.update(permission_evidence)
+        nvr_diagnostic["analytics_permissions_parallel_qualified"] = True
+        permissions_executor.shutdown(wait=True)
+        permissions_executor = None
         _enter_stage("graceful_stop_and_quit")
         _stop_app(app, reopened, api, cohort, diagnostic=nvr_diagnostic)
         receipt["graceful_owned_process_cleanup"] = True
@@ -3435,6 +3478,11 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         if admin_executor is not None:
             try:
                 admin_executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                cleanup_failed = True
+        if permissions_executor is not None:
+            try:
+                permissions_executor.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 cleanup_failed = True
         process_counts = _cohort_diagnostic(cohort)
