@@ -169,9 +169,7 @@ class UserSessionManager:
         # SQLite registry when many authenticated browser requests arrive.
         async with self._resolve_slots:
             worker = asyncio.create_task(
-                asyncio.to_thread(
-                    self._resolve_account, record.account, record.credential_version
-                )
+                asyncio.to_thread(self._resolve_account, record.account, record.credential_version)
             )
             try:
                 current = await asyncio.shield(worker)
