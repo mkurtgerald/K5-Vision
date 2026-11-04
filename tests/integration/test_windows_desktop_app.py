@@ -1855,7 +1855,8 @@ def _analytics_permission_journey(
             )
             permitted = set(account["camera_access"]["camera_ids"])
             _require(
-                permitted and permitted.issubset(set(camera_ids))
+                permitted
+                and permitted.issubset(set(camera_ids))
                 and camera_ids[3] not in permitted,
                 "Analytics role fixture lost its selected-camera boundary",
             )
@@ -1881,9 +1882,7 @@ def _analytics_permission_journey(
                 denied.append(status)
             else:
                 _require(account["role"] == "operator", "Unknown analytics test user role")
-                status, events = request(
-                    "operator_person_events", token, "GET", person_events
-                )
+                status, events = request("operator_person_events", token, "GET", person_events)
                 _require(
                     status == 200
                     and isinstance(events, dict)
