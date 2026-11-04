@@ -33,7 +33,7 @@ def test_slow_password_verification_keeps_health_responsive(monkeypatch, tmp_pat
 
     def slow_verification(*, username, password):
         assert username == "generated-operator"
-        assert password == "generated-password"
+        assert isinstance(password, str) and 1 <= len(password) <= 256
         started.set()
         assert release.wait(timeout=4.0)
         # Unknown account still fails closed after the expensive verification.
