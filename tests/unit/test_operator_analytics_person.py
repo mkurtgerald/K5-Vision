@@ -42,6 +42,25 @@ def document(root):
     }
 
 
+def test_windows_native_cpu_dispatch_caps_amx_and_bf16_before_inference(monkeypatch):
+    # GitHub-hosted Windows has previously hard-exited inside OpenVINO infer.
+    # Keep actual detection and model admission unchanged while constraining
+    # unsupported native kernel selection to the OpenVINO 2026 AVX2 floor.
+    monkeypatch.setattr(module, "system", lambda: "Windows")
+    for name in ("ONEDNN_MAX_CPU_ISA", "OV_CPU_MAX_ISA"):
+        monkeypatch.setenv(name, "AVX512_CORE_AMX")
+    module._cap_windows_native_cpu_isa()
+    for name in ("ONEDNN_MAX_CPU_ISA", "OV_CPU_MAX_ISA"):
+        assert module.os.environ[name] == "AVX2"
+
+    monkeypatch.setattr(module, "system", lambda: "Linux")
+    for name in ("ONEDNN_MAX_CPU_ISA", "OV_CPU_MAX_ISA"):
+        monkeypatch.setenv(name, "AVX512_CORE_AMX")
+    module._cap_windows_native_cpu_isa()
+    for name in ("ONEDNN_MAX_CPU_ISA", "OV_CPU_MAX_ISA"):
+        assert module.os.environ[name] == "AVX512_CORE_AMX"
+
+
 def test_absent_optional_config_does_not_admit_or_construct_native(monkeypatch):
     monkeypatch.setattr(module, "validate_person_runtime", lambda _config: pytest.fail("admitted"))
     assert module.load_person_configuration({}) is None
