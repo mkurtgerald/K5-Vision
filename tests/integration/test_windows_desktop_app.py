@@ -1820,7 +1820,9 @@ def _installed_analytics_journey(
     }, detected
 
 
-def _analytics_permission_journey(page, *, admin_helpers, camera_ids, private_state, diagnostic):
+def _analytics_permission_journey(
+    page, *, admin_helpers, camera_ids, private_state, analytics_event, diagnostic
+):
     """Use the same bounded browser observer as the installed admin journey."""
     __tracebackhide__ = True
     denied = []
@@ -1851,7 +1853,14 @@ def _analytics_permission_journey(page, *, admin_helpers, camera_ids, private_st
                 isinstance(token, str) and 32 <= len(token) <= 128,
                 "Limited analytics observer did not receive an opaque session",
             )
-            allowed = f"/api/v1/operator/cameras/{camera_ids[0]}"
+            permitted = set(account["camera_access"]["camera_ids"])
+            _require(
+                permitted and permitted.issubset(set(camera_ids))
+                and camera_ids[3] not in permitted,
+                "Analytics role fixture lost its selected-camera boundary",
+            )
+            assigned_id = next(identifier for identifier in camera_ids if identifier in permitted)
+            allowed = f"/api/v1/operator/cameras/{assigned_id}"
             restricted = f"/api/v1/operator/cameras/{camera_ids[3]}"
             for suffix in ("/analytics", "/events"):
                 _require(
@@ -1861,6 +1870,29 @@ def _analytics_permission_journey(page, *, admin_helpers, camera_ids, private_st
                 status = request("unassigned_camera_read", token, "GET", restricted + suffix)[0]
                 _require(status == 404, "Unassigned camera analytics were exposed")
                 denied.append(status)
+            # The live person-event camera changes stream while other installed
+            # user checks run. The viewer must be denied its event history;
+            # the separately authorized operator must retrieve the actual
+            # captured event. Both still prove live video on generated cameras.
+            person_events = f"/api/v1/operator/cameras/{camera_ids[0]}/events"
+            if account["role"] == "viewer":
+                status, _ = request("viewer_person_events_denied", token, "GET", person_events)
+                _require(status == 404, "Viewer received unassigned person analytics")
+                denied.append(status)
+            else:
+                _require(account["role"] == "operator", "Unknown analytics test user role")
+                status, events = request(
+                    "operator_person_events", token, "GET", person_events
+                )
+                _require(
+                    status == 200
+                    and isinstance(events, dict)
+                    and any(
+                        isinstance(event, dict) and event.get("id") == analytics_event["id"]
+                        for event in events.get("events", [])
+                    ),
+                    "Authorized operator could not read the recorded person event",
+                )
             status = request(
                 "limited_analytics_write",
                 token,
@@ -2423,8 +2455,11 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                         admin_page,
                         admin_username=secondary_admin_username,
                         admin_password=secondary_admin_password,
-                        camera_ids=camera_ids,
-                        colors=tuple(color for _, _, color in _DESKTOP_CAMERAS),
+                        # The admin proof must not decode a stream while the
+                        # independent analytics/outage acceptance replaces it.
+                        # Lime stays live; red is proven later by the operator.
+                        camera_ids=[camera_ids[2], camera_ids[0]],
+                        colors=("lime", "red"),
                         client=client,
                         progress=admin_progress,
                     )
@@ -3012,6 +3047,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 admin_helpers=admin_helpers,
                 camera_ids=camera_ids,
                 private_state=admin_private_state,
+                analytics_event=analytics_event,
                 diagnostic=nvr_diagnostic,
             )
         )
@@ -3273,8 +3309,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         admin_restarted = admin_helpers.assert_admin_restart(
             page,
             private_state=admin_private_state,
-            camera_ids=camera_ids,
+            camera_ids=[camera_ids[2], camera_ids[0]],
             client=client,
+            viewer_color="lime",
         )
         for field in ("admin_state_persisted", "admin_restart_viewer_live_decoded_frames"):
             _require(field in admin_restarted, "Restarted user administration proof is incomplete")
