@@ -990,6 +990,7 @@ def _failure_detail(error):
         ("Actual timeline track is unavailable", "timeline_track_unavailable"),
         ("Timeline playback clip crosses its recorded interval", "timeline_clip_outside_span"),
         ("Decoded video did not match the selected generated camera", "decoded_camera_mismatch"),
+        ("Local operator request did not complete", "operator_transport_failure"),
     ):
         if marker in text:
             return code
@@ -1790,17 +1791,23 @@ def _installed_analytics_journey(
     event_frames = page.locator("#playback-video").evaluate(
         "video => video.getVideoPlaybackQuality().totalVideoFrames"
     )
+    diagnostic["analytics_navigation_step"] = "analytics_status_fetch"
     status = client.json(route + "/analytics")
+    diagnostic["analytics_navigation_step"] = "analytics_status_verified"
     _require(
         status.get("processed_frames", 0) >= 1 and status.get("event_count", 0) >= 1,
         "Installed detector reported an event without processing recorded frames",
     )
+    diagnostic["analytics_navigation_step"] = "person_publisher_stop"
     helpers._stop_owned(publishers[0])
+    diagnostic["analytics_navigation_step"] = "red_publisher_restart"
     publishers[0] = _publish_fixture(
         parent, ffmpeg, source_uri, helpers, credentials=publisher_credentials
     )
     processes.append(publishers[0])
+    diagnostic["analytics_navigation_step"] = "red_live_watch_open"
     browser_helpers._open_camera_watch(page, camera_id)
+    diagnostic["analytics_navigation_step"] = "red_live_decode"
     browser_helpers._decoded_color(page, "live-video", "red")
     diagnostic["analytics_stage"] = "complete"
     diagnostic["analytics_navigation_step"] = "complete"
