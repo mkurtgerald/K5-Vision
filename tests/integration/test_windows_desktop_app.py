@@ -2376,6 +2376,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     admin_executor = None
     admin_future = None
     settings_future = None
+    settings_diagnostic = {}
     permissions_executor = None
     permissions_future = None
     cohort = _Cohort(api)
@@ -2507,7 +2508,6 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                         secondary_admin_username,
                         secondary_admin_password,
                     )
-                    settings_diagnostic = {}
                     evidence = settings_helpers.run_installed_settings_journey(
                         settings_page,
                         client=settings_client,
@@ -3048,6 +3048,10 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         try:
             settings_evidence, settings_diagnostic = settings_future.result(timeout=120)
         except BaseException as error:
+            # The installed settings worker keeps finite, sanitized phase
+            # evidence even when it raises rather than returning a receipt.
+            nvr_diagnostic["settings_parallel_worker_done"] = settings_future.done()
+            nvr_diagnostic.update(settings_diagnostic)
             nvr_diagnostic["settings_parallel_failure_type"] = (
                 type(error).__name__
                 if type(error).__name__

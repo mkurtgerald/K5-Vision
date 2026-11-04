@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -468,6 +469,9 @@ def _ready(api):
         assert response.status_code == 200
         if response.json()["status"] in {"ready", "failed"}:
             break
+        # Export finalization is asynchronous. Yield to its worker instead of
+        # exhausting the same 100 HTTP polls before it can publish the file.
+        time.sleep(0.02)
     assert response.json()["status"] == "ready", response.text
     return response.json()
 
