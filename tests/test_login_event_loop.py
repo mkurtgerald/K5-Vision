@@ -101,12 +101,15 @@ def test_slow_security_authority_checks_do_not_block_http_health(monkeypatch, tm
         ),
         actor="setup-admin",
     )
-    assert registry.activate_bootstrap_password(
-        username=username,
-        temporary_credential=temporary,
-        new_password=password,
-        actor="bootstrap-user",
-    ) == account
+    assert (
+        registry.activate_bootstrap_password(
+            username=username,
+            temporary_credential=temporary,
+            new_password=password,
+            actor="bootstrap-user",
+        )
+        == account
+    )
 
     started, release = threading.Event(), threading.Event()
     security_calls = []
