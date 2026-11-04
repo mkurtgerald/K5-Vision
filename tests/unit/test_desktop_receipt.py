@@ -29,6 +29,7 @@ _REQUIRED_TRUE = (
     "close_hides_to_tray recording_continues_after_browser_and_window_close "
     "second_click_reopens_single_instance graceful_owned_process_cleanup "
     "restart_preserves_account_camera_history uninstall_preserves_profile_and_media "
+    "stopped_same_setup_reinstall_preserves_profile "
     "no_console_windows owned_cleanup onvif_credential_profile_enrollment no_manual_stream_uri "
     "onvif_clock_skew_compensated onvif_wrong_password_rejected "
     "onvif_time_health_displayed recorder_time_health_displayed"
@@ -201,6 +202,17 @@ def test_desktop_receipt_accepts_full_playback_export_and_analytics_scope_within
 def test_desktop_receipt_rejects_invalid_or_over_budget_full_product_journey(tmp_path, seconds):
     receipt = _receipt()
     receipt["duration_seconds"] = seconds
+    with pytest.raises(ValueError):
+        _VERIFIER.verify(_report(tmp_path, receipt))
+
+
+@pytest.mark.parametrize("value", [None, False, 0, "true"])
+def test_desktop_receipt_refuses_missing_or_false_same_setup_reinstall(tmp_path, value):
+    receipt = _receipt()
+    if value is None:
+        del receipt["stopped_same_setup_reinstall_preserves_profile"]
+    else:
+        receipt["stopped_same_setup_reinstall_preserves_profile"] = value
     with pytest.raises(ValueError):
         _VERIFIER.verify(_report(tmp_path, receipt))
 
