@@ -2416,7 +2416,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "admin_disable_and_reenable",
             "admin_reset_password",
             "admin_visible_audit",
-        } or any(
+        } or phase.startswith("admin_operator_") or any(
             phase == f"admin_{role}_{step}"
             for role in ("viewer", "operator")
             for step in (
@@ -2454,11 +2454,12 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                         admin_page,
                         admin_username=secondary_admin_username,
                         admin_password=secondary_admin_password,
-                        # The admin proof must not decode a stream while the
-                        # independent analytics/outage acceptance replaces it.
-                        # Lime stays live; red is proven later by the operator.
-                        camera_ids=[camera_ids[2], camera_ids[0]],
-                        colors=("lime", "red"),
+                        # Distinct viewer and operator access still decode
+                        # independently owned live cameras; avoid the red feed
+                        # that the simultaneous NVR playback/export exercises.
+                        # Red live is independently decoded by the main browser.
+                        camera_ids=[camera_ids[2], camera_ids[3]],
+                        colors=("lime", "yellow"),
                         client=client,
                         progress=admin_progress,
                     )
@@ -2966,6 +2967,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 "A limited account received an unauthorized operation": "authorization_denial",
                 "Viewer could not obtain assigned-camera media": "viewer_media",
                 "Camera media left the authorized same-origin gateway": "viewer_gateway",
+                "Account activation retained a credential field": "credential_clearance",
+                "Operator received administration UI": "operator_admin_ui",
+                "Decoded video did not match the selected generated camera": "live_color",
             }.get(str(error), "other")
             _require(False, "Installed parallel administrator proof did not qualify")
 
