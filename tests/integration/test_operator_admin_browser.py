@@ -332,6 +332,20 @@ def _visible_live(page, identifier, color, *, diagnostic=None):
     return helpers._decoded_color(page, "live-video", color, diagnostic=diagnostic)
 
 
+def _operator_camera_grants(live_camera_ids, event_camera_id=None):
+    """Preserve separate decoded-live identity and recorded-event authority."""
+    grants = list(live_camera_ids[:2])
+    if event_camera_id is not None and event_camera_id not in grants:
+        grants.append(event_camera_id)
+    return grants
+
+
+def test_operator_camera_grants_keep_distinct_live_and_event_scope():
+    assert _operator_camera_grants(["lime", "blue"]) == ["lime", "blue"]
+    assert _operator_camera_grants(["lime", "blue"], "red") == ["lime", "blue", "red"]
+    assert _operator_camera_grants(["lime", "blue"], "blue") == ["lime", "blue"]
+
+
 def run_admin_journey(
     page,
     *,
@@ -341,6 +355,7 @@ def run_admin_journey(
     colors=("red", "blue"),
     client=None,
     progress=None,
+    operator_event_camera_id=None,
 ):
     """Exercise actual admin UI and concurrent limited user browsers.
 
@@ -361,6 +376,11 @@ def run_admin_journey(
     viewer_name, operator_name = "viewer-" + suffix, "operator-" + suffix
     viewer_password, operator_password = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
     private = {"users": []}
+    operator_access_ids = _operator_camera_grants(camera_ids, operator_event_camera_id)
+    _require(
+        operator_event_camera_id is None or operator_event_camera_id != camera_ids[0],
+        "Recorded-event camera must remain outside the viewer's grants",
+    )
 
     def phase(name):
         if progress is not None:
@@ -410,7 +430,7 @@ def run_admin_journey(
             page, viewer_name, "viewer", camera_ids[:1], progress=phase
         )
         operator_id, operator_temporary = _create_user(
-            page, operator_name, "operator", camera_ids[:2], progress=phase
+            page, operator_name, "operator", operator_access_ids, progress=phase
         )
         evidence["admin_user_creation"] = True
 
@@ -622,7 +642,7 @@ def run_admin_journey(
                 "password": operator_password,
                 "role": "operator",
                 "enabled": True,
-                "camera_access": {"mode": "selected", "camera_ids": list(camera_ids[:2])},
+                "camera_access": {"mode": "selected", "camera_ids": list(operator_access_ids)},
             },
         ]
         helpers._assert_no_browser_storage(page)
