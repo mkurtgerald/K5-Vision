@@ -186,7 +186,8 @@ def _nvr_journey(receipt):
     )
     denials = receipt.get("analytics_denied_http_statuses")
     _require(type(denials) is list and all(type(value) is int for value in denials))
-    _require(denials == [404, 404, 403, 404, 404, 403, 401, 401])
+    # Viewer person-event denial is now independently required before the operator checks.
+    _require(denials == [404, 404, 404, 403, 404, 404, 403, 401, 401])
 
 
 def verify(report: Path) -> dict:
