@@ -174,6 +174,89 @@ def test_native_model_read_uses_verified_immutable_bytes_after_admission(admitte
         module._model_bytes(config)
 
 
+
+def test_native_person_model_compilation_reuses_admitted_core(admitted, monkeypatch):
+    """Do not initialize a second OpenVINO Core before the first real event."""
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    config, _manifest, _files = admitted
+    cores = []
+
+    class FakeCore:
+        def __init__(self):
+            cores.append(self)
+
+        def read_model(self, *, model, weights):
+            assert model == "reviewed-xml" and weights == b"reviewed-weights"
+            return SimpleNamespace(
+                inputs=[object()],
+                outputs=[object()],
+                input=lambda name: SimpleNamespace(shape=[1, 3, 320, 544]),
+                output=lambda index: SimpleNamespace(shape=[1, 1, 200, 7]),
+            )
+
+        def compile_model(self, model, device, options):
+            assert self is cores[0]
+            assert len(model.inputs) == 1 and device == "CPU"
+            assert options == {"INFERENCE_NUM_THREADS": 2, "NUM_STREAMS": "1"}
+            return SimpleNamespace(create_infer_request=lambda: object())
+
+    class FakePrePost:
+        def __init__(self, model):
+            self._model = model
+
+        def input(self):
+            return self
+
+        def tensor(self):
+            return self
+
+        def set_element_type(self, *_args):
+            return self
+
+        def set_layout(self, *_args):
+            return self
+
+        def set_color_format(self, *_args):
+            return self
+
+        def set_spatial_dynamic_shape(self):
+            return self
+
+        def preprocess(self):
+            return self
+
+        def resize(self, *_args):
+            return self
+
+        def model(self):
+            return self
+
+        def build(self):
+            return self._model
+
+    fake_np = ModuleType("numpy")
+    fake_np.uint8 = "u8"
+    fake_np.frombuffer = lambda raw, dtype: raw
+    fake_ov = ModuleType("openvino")
+    fake_ov.Core = FakeCore
+    fake_ov.Tensor = lambda value: value
+    fake_ov.Type = SimpleNamespace(u8="u8")
+    fake_ov.Layout = lambda value: value
+    fake_preprocess = ModuleType("openvino.preprocess")
+    fake_preprocess.PrePostProcessor = FakePrePost
+    fake_preprocess.ColorFormat = SimpleNamespace(BGR="bgr")
+    fake_preprocess.ResizeAlgorithm = SimpleNamespace(RESIZE_LINEAR="linear")
+    monkeypatch.setitem(sys.modules, "numpy", fake_np)
+    monkeypatch.setitem(sys.modules, "openvino", fake_ov)
+    monkeypatch.setitem(sys.modules, "openvino.preprocess", fake_preprocess)
+
+    detector = module._PersonDetector(config)
+    assert detector._request is not None
+    assert len(cores) == 1
+
+
 def test_model_byte_read_rejects_same_content_replaced_inode(admitted, monkeypatch):
     config, _manifest, _files = admitted
     original = module._local_path

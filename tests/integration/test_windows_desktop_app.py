@@ -1705,12 +1705,25 @@ def _installed_analytics_journey(
             and 0.5 <= detected["confidence"] <= 1
         )
 
-    _wait(
-        positive_event,
-        "Installed native detector records a real person event",
-        process=app,
-        timeout=25,
-    )
+    try:
+        _wait(
+            positive_event,
+            "Installed native detector records a real person event",
+            process=app,
+            timeout=25,
+        )
+    except BaseException:
+        # Distinguish a detector startup fault from a healthy but lagging
+        # recorder using only typed, credential-free backend status.
+        try:
+            state = client.json(route + "/analytics")
+            diagnostic["analytics_failure_state"] = {
+                key: state.get(key)
+                for key in ("status", "processed_frames", "event_count")
+            }
+        except Exception:
+            diagnostic["analytics_failure_state"] = {"available": False}
+        raise
     occurred = datetime.fromisoformat(detected["occurred_at"].replace("Z", "+00:00"))
     _require(
         abs((datetime.now(UTC) - occurred).total_seconds()) < 30,
