@@ -3271,8 +3271,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             + json.dumps(vm_clock_diagnostic.get("vm_clock_phase_seconds", []))
         )
         print(
-            "Desktop NVR phase seconds: "
-            + json.dumps(nvr_diagnostic.get("nvr_phase_seconds", []))
+            "Desktop NVR phase seconds: " + json.dumps(nvr_diagnostic.get("nvr_phase_seconds", []))
         )
     _require(
         elapsed < 360,
