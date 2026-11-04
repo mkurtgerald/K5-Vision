@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
+from platform import system
 from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib import metadata
@@ -164,9 +166,22 @@ class _PersonDetection:
     box: _PersonBox
 
 
+def _cap_windows_native_cpu_isa() -> None:
+    """Avoid unsupported AMX/BF16 JIT selection on Windows CPU workers.
+
+    OpenVINO 2026 needs AVX2. Set both OpenVINO and oneDNN dispatch
+    bounds before the first native import/CPU inference in this process.
+    This changes the kernel selection, never the inference assertions.
+    """
+    if system() == "Windows":
+        os.environ["ONEDNN_MAX_CPU_ISA"] = "AVX2"
+        os.environ["OV_CPU_MAX_ISA"] = "AVX2"
+
+
 class _PersonDetector:
     def __init__(self, config: OperatorPersonConfiguration) -> None:
         validate_person_runtime(config)
+        _cap_windows_native_cpu_isa()
         import numpy as np
         import openvino as ov
         from openvino.preprocess import ColorFormat, PrePostProcessor, ResizeAlgorithm
