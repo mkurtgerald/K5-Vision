@@ -177,9 +177,9 @@ def _set_access(page, identifiers):
     # The camera choices are populated asynchronously after the editor opens.
     # Do not silently submit an empty grant while the list is still loading.
     for identifier in identifiers:
-        page.locator(
-            f'#admin-camera-choices input[type=checkbox][value="{identifier}"]'
-        ).wait_for(state="attached")
+        page.locator(f'#admin-camera-choices input[type=checkbox][value="{identifier}"]').wait_for(
+            state="attached"
+        )
     for index in range(choices.count()):
         checkbox = choices.nth(index)
         checkbox.set_checked(checkbox.get_attribute("value") in identifiers)
@@ -224,10 +224,42 @@ def _create_user(page, username, role, identifiers, *, progress=None):
     page.locator("#admin-enabled").set_checked(True)
     _set_access(page, identifiers)
     checkpoint("submit_create")
-    with page.expect_response(
-        lambda response: _route_response(response, "POST", "/api/v1/operator/admin/users")
-    ) as created:
-        page.locator("#admin-save-user").click()
+    # Preserve the browser's own validation gate and identify whether a
+    # failure happened before the authorized POST or after the server saw it.
+    _require(
+        page.locator("#admin-user-form").evaluate("form => form.checkValidity()"),
+        "Generated account form did not pass browser validation",
+    )
+    request_seen = False
+
+    def observe_submission(request):
+        nonlocal request_seen
+        if request.method == "POST" and urlsplit(request.url).path == "/api/v1/operator/admin/users":
+            request_seen = True
+
+    page.on("request", observe_submission)
+    try:
+        with page.expect_response(
+            lambda response: _route_response(response, "POST", "/api/v1/operator/admin/users")
+        ) as created:
+            page.locator("#admin-save-user").click()
+    except BaseException:
+        # Only fixed boolean signals enter test logs, never form values,
+        # generated credentials, request bodies, or source addresses.
+        _ADMIN_DENIAL_DIAGNOSTIC.update(
+            create_request_seen=request_seen,
+            create_form_valid=page.locator("#admin-user-form").evaluate(
+                "form => form.checkValidity()"
+            ),
+            create_form_busy=page.locator("#admin-user-form").get_attribute("aria-busy")
+            == "true",
+            create_dialog_open=page.locator("#admin-user-dialog").evaluate(
+                "dialog => dialog.open"
+            ),
+        )
+        raise
+    finally:
+        page.remove_listener("request", observe_submission)
     _require(created.value.status == 201, "Administrator could not create a user through the UI")
     result = created.value.json()
     account = result.get("account", {})
