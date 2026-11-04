@@ -327,6 +327,18 @@ def run_admin_journey(
     def phase(name):
         if progress is not None:
             progress(name)
+            if name in {
+                "admin_viewer_create_browser",
+                "admin_viewer_activate_credentials",
+                "admin_viewer_assert_role_ui",
+                "admin_viewer_decode_live",
+                "admin_viewer_read_history",
+                "admin_viewer_capabilities",
+                "admin_viewer_access_denials",
+                "admin_viewer_media_grant",
+                "admin_viewer_proof_complete",
+            }:
+                print("Installed administration phase: " + name, flush=True)
 
     def denial(user_page, token, method, route, expected, data=None):
         status, _ = _api(user_page, token, method, route, data)
@@ -365,12 +377,15 @@ def run_admin_journey(
         evidence["admin_user_creation"] = True
 
         phase("admin_activate_viewer")
+        phase("admin_viewer_create_browser")
         viewer_context, viewer = _new_user_page(page)
         contexts.append(viewer_context)
         viewer.on(
             "pageerror", lambda error: user_script_errors.append(helpers._script_error_code(error))
         )
+        phase("admin_viewer_activate_credentials")
         viewer_token = _activate(viewer, origin, viewer_name, viewer_temporary, viewer_password)
+        phase("admin_viewer_assert_role_ui")
         viewer_temporary = ""
         _require(viewer.locator("#admin-tab").is_hidden(), "Viewer received administration UI")
         _require(viewer.locator("#add-camera-button").is_hidden(), "Viewer received camera setup")
@@ -380,9 +395,11 @@ def run_admin_journey(
             and {camera["device_id"] for camera in cameras["cameras"]} == {camera_ids[0]},
             "Viewer inventory exposed a camera outside its assigned set",
         )
+        phase("admin_viewer_decode_live")
         evidence["admin_viewer_live_decoded_frames"] = _visible_live(
             viewer, camera_ids[0], colors[0]
         )
+        phase("admin_viewer_read_history")
         status, history = _api(
             viewer, viewer_token, "GET", f"/api/v1/operator/cameras/{camera_ids[0]}/history"
         )
@@ -390,6 +407,7 @@ def run_admin_journey(
             status == 200 and isinstance(history.get("spans"), list),
             "Viewer could not read assigned-camera recording history",
         )
+        phase("admin_viewer_capabilities")
         status, capabilities = _api(viewer, viewer_token, "GET", "/api/v1/operator/capabilities")
         _require(
             status == 200
@@ -403,6 +421,7 @@ def run_admin_journey(
             viewer.locator("#toggle-recording").is_hidden(),
             "Viewer received recording administration controls",
         )
+        phase("admin_viewer_access_denials")
         for method, route, expected, data in (
             ("GET", "/api/v1/operator/admin/users", 403, None),
             ("GET", "/api/v1/users", 404, None),
@@ -419,6 +438,7 @@ def run_admin_journey(
             ("DELETE", f"/api/v1/operator/cameras/{camera_ids[0]}", 403, None),
         ):
             denial(viewer, viewer_token, method, route, expected, data)
+        phase("admin_viewer_media_grant")
         status, grant = _api(
             viewer, viewer_token, "POST", f"/api/v1/operator/cameras/{camera_ids[0]}/media-session"
         )
@@ -434,6 +454,7 @@ def run_admin_journey(
         )
         denial(viewer, "", "GET", export_url, 403)
         evidence["role_permissions"] = True
+        phase("admin_viewer_proof_complete")
 
         phase("admin_activate_operator")
         operator_context, operator = _new_user_page(page)
