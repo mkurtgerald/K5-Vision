@@ -2401,7 +2401,6 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         ):
             nvr_diagnostic["admin_stage"] = phase
 
-
     def _parallel_admin_journey():
         # Own Playwright and Chromium entirely on this thread. Concurrent
         # user administration must still exercise the installed product UI.
@@ -2426,6 +2425,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                     admin_context.close()
             finally:
                 admin_browser.close()
+
     try:
         _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
         _require((installed / "K5Vision.exe").is_file(), "Installed desktop executable is absent")
