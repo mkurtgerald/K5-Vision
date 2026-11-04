@@ -1342,7 +1342,20 @@ def _desktop_nvr_journey(
     def all_progress(before, indices=range(4)):
         return all(after > prior for after, prior in zip(sizes(indices), before, strict=True))
 
-    diagnostic["nvr_stage"] = "four_recorders"
+    nvr_phase_clock = time.monotonic()
+    previous_nvr_phase = "start"
+    nvr_phase_seconds = []
+    diagnostic["nvr_phase_seconds"] = nvr_phase_seconds
+
+    def mark_nvr_phase(name):
+        nonlocal nvr_phase_clock, previous_nvr_phase
+        now = time.monotonic()
+        nvr_phase_seconds.append((previous_nvr_phase, round(now - nvr_phase_clock, 2)))
+        previous_nvr_phase = name
+        nvr_phase_clock = now
+        diagnostic["nvr_stage"] = name
+
+    mark_nvr_phase("four_recorders")
     before = sizes()
     _wait(lambda: all_progress(before), "Installed four-camera recording progress", process=app)
     evidence = {
@@ -1350,7 +1363,7 @@ def _desktop_nvr_journey(
         "camera_recording_bytes_before": before,
         "camera_recording_bytes_after": sizes(),
     }
-    diagnostic["nvr_stage"] = "outage_wall_admission"
+    mark_nvr_phase("outage_wall_admission")
     browser_helpers._wall_frames(page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS])
     unaffected = [0, 2, 3]
     selectors = [
@@ -1365,7 +1378,7 @@ def _desktop_nvr_journey(
         nvr_outage_other_frames_before=frames,
         nvr_outage_other_recording_bytes_before=others_before,
     )
-    diagnostic["nvr_stage"] = "outage_stop_source"
+    mark_nvr_phase("outage_stop_source")
     helpers._stop_owned(publishers[1])
     diagnostic["nvr_outage_publisher_exit_code"] = publishers[1].poll()
 
@@ -1404,9 +1417,9 @@ def _desktop_nvr_journey(
             views[camera_ids[index]]["status"] == "live" for index in unaffected
         )
 
-    diagnostic["nvr_stage"] = "outage_camera_status"
+    mark_nvr_phase("outage_camera_status")
     _wait(isolated_offline, "Installed isolated camera outage", process=app, timeout=20)
-    diagnostic["nvr_stage"] = "outage_other_live_progress"
+    mark_nvr_phase("outage_other_live_progress")
 
     def other_live_progress():
         samples = sample_survivors()
@@ -1416,7 +1429,7 @@ def _desktop_nvr_journey(
         )
 
     _wait(other_live_progress, "Other installed wall videos advance", process=app, timeout=15)
-    diagnostic["nvr_stage"] = "outage_other_recording_progress"
+    mark_nvr_phase("outage_other_recording_progress")
 
     def other_recording_progress():
         sample_survivors()
@@ -1436,7 +1449,7 @@ def _desktop_nvr_journey(
     evidence["outage_other_live_frames_after"] = [
         handle.evaluate("v => v.getVideoPlaybackQuality().totalVideoFrames") for handle in handles
     ]
-    diagnostic["nvr_stage"] = "outage_camera_reconnect"
+    mark_nvr_phase("outage_camera_reconnect")
     publishers[1] = _publish_fixture(parent, ffmpeg, sources[1], helpers, color="blue")
     processes.append(publishers[1])
     browser_helpers._decoded_video(
@@ -1446,7 +1459,7 @@ def _desktop_nvr_journey(
     _wait(lambda: all_progress(recovered), "Installed camera recording recovery", process=app)
     evidence["isolated_camera_outage_reconnect"] = True
 
-    diagnostic["nvr_stage"] = "pause_recording"
+    mark_nvr_phase("pause_recording")
     browser_helpers._open_camera_watch(page, camera_ids[0])
     before_live = browser_helpers._decoded_color(page, "live-video", "red")
     live = page.locator("#live-video").element_handle()
@@ -1510,14 +1523,14 @@ def _desktop_nvr_journey(
     evidence["paused_recording_bytes"] = paused_bytes
     evidence["resumed_recording_bytes"] = sizes()[0]
 
-    diagnostic["nvr_stage"] = "historical_navigation"
+    mark_nvr_phase("historical_navigation")
     seeded = browser_helpers._seed_recorded_history(camera_directories[0], ffmpeg, parent)
     evidence.update(
         browser_helpers._recording_navigation_journey(
             page, device_id=camera_ids[0], seeded=seeded, diagnostic=diagnostic
         )
     )
-    diagnostic["nvr_stage"] = "timeline_and_export"
+    mark_nvr_phase("timeline_and_export")
     browser_helpers._open_camera_recordings(page, camera_ids[0])
     evidence["timeline_playback_decoded_frames"] = browser_helpers._timeline_play(
         page,
@@ -1544,7 +1557,7 @@ def _desktop_nvr_journey(
 
     # Leave a real choice paused across the following native restart. The
     # primary source remains recording for tray and actual-VM clock checks.
-    diagnostic["nvr_stage"] = "persist_paused_choice"
+    mark_nvr_phase("persist_paused_choice")
     browser_helpers._open_camera_watch(page, camera_ids[3])
     preference_route = f"/api/v1/operator/cameras/{camera_ids[3]}/recording"
     browser_helpers._recording_control_diagnostic(None, False, diagnostic)
@@ -1563,7 +1576,7 @@ def _desktop_nvr_journey(
     )
     browser_helpers._open_camera_watch(page, camera_ids[0])
     browser_helpers._decoded_color(page, "live-video", "red")
-    diagnostic["nvr_stage"] = "complete"
+    mark_nvr_phase("complete")
     return evidence
 
 
@@ -2720,7 +2733,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         )
         receipt.update(analytics_evidence)
         if vm_clock_enabled:
-            stage = "actual_vm_clock_changes"
+            _enter_stage("actual_vm_clock_changes")
             receipt["vm_clock"] = _vm_clock_phase(
                 page=page,
                 context=context,
@@ -3257,6 +3270,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "Desktop VM clock phase seconds: "
             + json.dumps(vm_clock_diagnostic.get("vm_clock_phase_seconds", []))
         )
+        print("Desktop NVR phase seconds: " + json.dumps(nvr_diagnostic.get("nvr_phase_seconds", [])))
     _require(
         elapsed < 360,
         "Desktop qualification exceeded its bounded VM duration"
