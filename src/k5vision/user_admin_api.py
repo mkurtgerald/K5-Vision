@@ -541,7 +541,7 @@ def install_user_admin_api(
     async def login(payload: UserLogin, response: Response) -> UserSessionIssue:
         response.headers["Cache-Control"] = "no-store"
         security = getattr(application.state, "operator_identity_security", None)
-        started_epoch = None if security is None else security.primary_started()
+        started_epoch = None if security is None else await asyncio.to_thread(security.primary_started)
         try:
             registry = require_registry()
             async with login_verification_slots:
@@ -572,8 +572,11 @@ def install_user_admin_api(
             )
 
             try:
-                primary_epoch = security.password_authenticated(
-                    account, credential_version, started_epoch=started_epoch
+                primary_epoch = await asyncio.to_thread(
+                    security.password_authenticated,
+                    account,
+                    credential_version,
+                    started_epoch=started_epoch,
                 )
             except SecondFactorRequired as challenge:
                 return JSONResponse(
@@ -591,8 +594,14 @@ def install_user_admin_api(
         current = await session_manager.resolve(session_token)
         if security is not None:
             try:
-                security.validate_primary_proof(account, credential_version, primary_epoch)
-                factor_enabled = security.store.status(account.id)["mfa_enabled"]
+                # Durable authority and MFA-state reads may block on the user
+                # registry. Keep the paired post-issuance check together in one
+                # worker, then revoke the session on any failed verification.
+                def verify_issued_session():
+                    security.validate_primary_proof(account, credential_version, primary_epoch)
+                    return security.store.status(account.id)["mfa_enabled"]
+
+                factor_enabled = await asyncio.to_thread(verify_issued_session)
             except AccountSecurityUnavailable:
                 await session_manager.revoke(session_token)
                 raise HTTPException(503, "Account security unavailable") from None
