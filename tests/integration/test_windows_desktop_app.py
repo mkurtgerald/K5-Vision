@@ -3399,6 +3399,57 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         browser.close()
         browser = None
         _stop_app(app, form, api, cohort, diagnostic=nvr_diagnostic)
+        _enter_stage("stopped_same_setup_reinstall")
+        # Exercise a second, real graphical installation of the *same* qualified
+        # setup after an orderly stop. This does not claim cross-version rollback.
+        # Check immutable closed media bytes before reopening the application.
+        retained_samples = [
+            (path, hashlib.sha256(path.read_bytes()).digest()) for path in saved_files[:3]
+        ]
+        _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
+        _require(
+            identity_state.load_identity_state(profile / "identity").site_id == identity.site_id,
+            "Stopped reinstall replaced the existing account identity",
+        )
+        _require(
+            all(
+                path.is_file() and hashlib.sha256(path.read_bytes()).digest() == digest
+                for path, digest in retained_samples
+            ),
+            "Stopped reinstall changed or removed retained recording bytes",
+        )
+        app = _start_app(installed, profile, port, cohort)
+        form = _wait(lambda: api.form(app.pid), "Reinstalled desktop window", process=app)
+        client = runtime._Client(port)
+        _wait(
+            lambda: _healthy(client, readiness_diagnostic),
+            "Reinstalled embedded product",
+            process=app,
+            timeout=45,
+        )
+        runtime._login(client, username, password)
+        reinstalled_cameras = client.json("/api/v1/operator/cameras")["cameras"]
+        _require(
+            len(reinstalled_cameras) == 4
+            and {camera["device_id"] for camera in reinstalled_cameras} == set(camera_ids)
+            and next(
+                camera for camera in reinstalled_cameras if camera["device_id"] == camera_ids[3]
+            ).get("recording_enabled")
+            is False,
+            "Stopped reinstall lost enrolled cameras or recording preferences",
+        )
+        _require(
+            bool(client.json(route + "/history")["spans"]),
+            "Stopped reinstall lost retained recording history",
+        )
+        _require(
+            export_proof["path"].is_file()
+            and hashlib.sha256(export_proof["path"].read_bytes()).hexdigest()
+            == export_proof["sha256"],
+            "Stopped reinstall altered the exported MP4",
+        )
+        receipt["stopped_same_setup_reinstall_preserves_profile"] = True
+        _stop_app(app, form, api, cohort, diagnostic=nvr_diagnostic)
         _enter_stage("uninstall_preserves_profile")
         uninstaller = installed / "unins000.exe"
         _require(uninstaller.is_file(), "Native GUI uninstaller was not installed")
