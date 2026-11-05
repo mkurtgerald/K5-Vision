@@ -9,10 +9,10 @@ from uuid import UUID
 
 import httpx
 import pytest
-
-from k5vision.services.user_registry import UserRegistryStorageError
 import test_operator_product_api as helpers
 from test_operator_admin_api import _activate, _create
+
+from k5vision.services.user_registry import UserRegistryStorageError
 
 product = helpers.product
 _ADMIN = "/api/v1/operator/admin"
@@ -76,7 +76,6 @@ def test_durable_user_mutation_does_not_stall_unrelated_http(
     assert asyncio.run(product.sessions.resolve(token)) is None
 
 
-
 @pytest.mark.parametrize(
     ("storage_method", "http_method", "payload"),
     [
@@ -110,9 +109,7 @@ def test_revocation_precedes_a_failed_post_commit_response_read(
     path = _ADMIN + f"/users/{user_id}"
     if storage_method == "reset_bootstrap":
         path += "/reset-password"
-    response = getattr(product.client, http_method)(
-        path, headers=product.headers, json=payload
-    )
+    response = getattr(product.client, http_method)(path, headers=product.headers, json=payload)
     assert response.status_code == 503
     assert response.json()["detail"] == "admin_unavailable"
     assert completed.is_set(), "The mutation must have committed before response failure"
