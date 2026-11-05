@@ -12,6 +12,7 @@ on:
       - scripts/verify_desktop_receipt.py
       - src/k5vision/**
       - tests/integration/test_windows_desktop_app.py
+      - tests/integration/test_windows_desktop_upgrade.py
       - tests/integration/windows_vm_clock.py
       - tests/integration/windows_time_configuration.py
       - tests/integration/test_windows_time_administration.py
@@ -422,5 +423,134 @@ jobs:
             vm-clock-windows.xml
             vm-clock-windows-receipt.json
             vm-clock-input/desktop-package.json
+          if-no-files-found: warn
+          retention-days: 14
+
+
+  cross-revision-upgrade:
+    name: Install baseline, qualify stopped upgrade and manual reversal
+    needs: [native-desktop, focused-windows]
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      K5_DESKTOP_BASELINE_HEAD_SHA: b21cdfb1bb5b8605c77f7dac0957cc6651bd0bd5
+      K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout exact candidate acceptance controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install development test runner
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install test dependencies outside packaged applications
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Cross-revision test dependency installation failed" }
+      - name: Provision immutable native worker build tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Checkout previously qualified immutable baseline revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: b21cdfb1bb5b8605c77f7dac0957cc6651bd0bd5
+          path: baseline-source
+          persist-credentials: false
+      - name: Build complete native baseline package from pinned source
+        shell: pwsh
+        timeout-minutes: 12
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or $env:RUNNER_OS -ne "Windows") {
+            throw "Cross-revision test requires a disposable hosted Windows VM"
+          }
+          python baseline-source/scripts/build_desktop_payload.py --output baseline-build --head-sha $env:K5_DESKTOP_BASELINE_HEAD_SHA --media-exe $env:K5_MEDIAMTX_DONOR_EXE --gateway-exe $env:K5_CADDY_DONOR_EXE
+          if ($LASTEXITCODE -ne 0) { throw "Previously qualified baseline payload could not be reproduced" }
+      - name: Compile exact historical graphical supervisor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $compiler = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw "Native C# compiler unavailable" }
+          $source = (Resolve-Path -LiteralPath baseline-source/windows/desktop/K5Vision.cs).Path
+          $identity = (Resolve-Path -LiteralPath baseline-build/PayloadIdentity.generated.cs).Path
+          $launcher = Join-Path $env:GITHUB_WORKSPACE "baseline-build\payload\K5Vision.exe"
+          & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll ('/out:' + $launcher) $source $identity
+          if ($LASTEXITCODE -ne 0) { throw "Native historical supervisor compilation failed" }
+          "K5_DESKTOP_BASELINE_LAUNCHER_SHA256=$((Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash.ToLowerInvariant())" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Install byte-admitted Inno Setup compiler on disposable VM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = (Get-Content -LiteralPath baseline-source/windows/desktop/donors.json -Raw | ConvertFrom-Json).inno_setup
+          $root = Join-Path $env:RUNNER_TEMP ("k5-upgrade-inno-" + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $archive = Join-Path $root "innosetup-6.4.3.exe"
+          Invoke-WebRequest -Uri $pin.url -OutFile $archive -TimeoutSec 180
+          if ((Get-Item -LiteralPath $archive).Length -ne $pin.bytes -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pin.sha256) {
+            throw "Inno Setup baseline compiler byte identity mismatch"
+          }
+          $install = Join-Path $root "compiler"
+          $process = Start-Process -FilePath $archive -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', ('/DIR="' + $install + '"')) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Inno Setup compiler installation failed" }
+          $iscc = Join-Path $install "ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) { throw "Exact installer compiler unavailable" }
+          "K5_UPGRADE_ISCC=$iscc" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Build baseline graphical installer with historical source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $payload = (Resolve-Path -LiteralPath baseline-build/payload).Path
+          $output = Join-Path $env:GITHUB_WORKSPACE "baseline-build\installer"
+          New-Item -ItemType Directory -Path $output | Out-Null
+          $launcher = Join-Path $payload "K5Vision.exe"
+          $hash = (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash.ToLowerInvariant()
+          $configuration = (Resolve-Path -LiteralPath baseline-source/windows/desktop/K5Vision.iss).Path
+          $messages = @(& $env:K5_UPGRADE_ISCC ('/DPayloadRoot=' + $payload) ('/DOutputRoot=' + $output) ('/DLauncherSha=' + $hash) $configuration 2>&1 | ForEach-Object { $_.ToString() })
+          $result = $LASTEXITCODE
+          if ($result -ne 0 -or @($messages | Where-Object { $_ -match '^Compiler engine version: Inno Setup 6\.4\.3(?:\s|$)' }).Count -ne 1) {
+            throw "Baseline Inno Setup compile failed or engine identity changed"
+          }
+          $setup = Join-Path $output "K5VisionSetup.exe"
+          if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "Baseline installer unavailable" }
+          "K5_DESKTOP_BASELINE_SETUP=$setup" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_BASELINE_SETUP_SHA256=$((Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant())" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Retrieve exact installer verified by the current source VM
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: k5-vision-windows-setup-${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate-setup
+      - name: Admit candidate executable and complete release manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $meta = Get-Content -LiteralPath candidate-setup/desktop-package.json -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath candidate-setup/payload-manifest.json -Raw | ConvertFrom-Json
+          $setup = Get-Item -LiteralPath candidate-setup/K5VisionSetup.exe
+          $hash = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($meta.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $meta.setup_sha256 -ne $hash -or $meta.setup_bytes -ne $setup.Length -or
+              $meta.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath candidate-setup/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
+              $meta.launcher_sha256 -notmatch '^[a-f0-9]{64}$') {
+            throw "Candidate installer exact product identity mismatch"
+          }
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_SETUP_SHA256=$hash" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_LAUNCHER_SHA256=$($meta.launcher_sha256)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Exercise real graphical baseline, live-refusal, upgrade and reversal
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          python -m pytest tests/integration/test_windows_desktop_upgrade.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=180 --junitxml=desktop-upgrade-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve bounded cross-revision acceptance only
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: desktop-upgrade-windows-witness-${{ github.run_id }}
+          path: desktop-upgrade-windows.xml
           if-no-files-found: warn
           retention-days: 14
