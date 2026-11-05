@@ -247,17 +247,20 @@ def install_operator_admin_api(
         response.headers["Cache-Control"] = "no-store"
         async with mutations:
             actor, _ = await mutation_admin(session)
-            account = target(user_id)
-            require_grant(app, actor, effective_permissions(app, account))
-            if payload.role is not None:
-                require_grant(app, actor, BASE_PERMISSIONS[payload.role])
-            previous_account = account
-            access = (
-                policy(payload.camera_access, payload.role or account.role)
-                if payload.camera_access is not None
-                else None
-            )
-            try:
+
+            def write_user():
+                # Keep the existing grant, role-policy and camera checks inside
+                # the serialized mutation, but run all SQLite work off-loop.
+                account = target(user_id)
+                require_grant(app, actor, effective_permissions(app, account))
+                if payload.role is not None:
+                    require_grant(app, actor, BASE_PERMISSIONS[payload.role])
+                previous_account = account
+                access = (
+                    policy(payload.camera_access, payload.role or account.role)
+                    if payload.camera_access is not None
+                    else None
+                )
                 previous_access = users.get_camera_access(user_id)
                 fields = payload.model_dump(exclude={"camera_access"}, exclude_none=True)
                 role_policy = getattr(app.state, "operator_roles", None)
@@ -280,11 +283,15 @@ def install_operator_admin_api(
                     or access_identity(users.get_camera_access(user_id))
                     != access_identity(previous_access)
                 )
+                return row(account), changed_authority
+
+            try:
+                result, changed_authority = await asyncio.to_thread(write_user)
                 if changed_authority:
                     await sessions.revoke_user(user_id)
                     if user_id != actor.id:
                         await current_admin(session)
-                return row(account)
+                return result
             except (
                 UserRegistryStorageError,
                 UserRegistryLastAdministratorError,
@@ -337,9 +344,12 @@ def install_operator_admin_api(
         response.headers["Cache-Control"] = "no-store"
         async with mutations:
             actor, _ = await mutation_admin(session)
-            account = target(user_id)
-            require_grant(app, actor, effective_permissions(app, account))
-            try:
+
+            def write_reset():
+                # Permission and last-administrator guards remain in the same
+                # serialized operation as the durable credential reset.
+                account = target(user_id)
+                require_grant(app, actor, effective_permissions(app, account))
                 role_policy = getattr(app.state, "operator_roles", None)
                 if role_policy is not None:
                     role_policy.guard_credential_reset(users, target(user_id))
@@ -347,14 +357,18 @@ def install_operator_admin_api(
                 if result is None:
                     raise HTTPException(404, "admin_user_not_found")
                 account, credential, expires = result
-                await sessions.revoke_user(user_id)
-                if user_id != actor.id:
-                    await current_admin(session)
                 return {
                     "account": row(account),
                     "temporary_credential": credential,
                     "expires_at": expires,
                 }
+
+            try:
+                result = await asyncio.to_thread(write_reset)
+                await sessions.revoke_user(user_id)
+                if user_id != actor.id:
+                    await current_admin(session)
+                return result
             except (
                 UserRegistryStorageError,
                 UserRegistryLastAdministratorError,
