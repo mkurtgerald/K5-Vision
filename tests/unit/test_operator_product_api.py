@@ -692,6 +692,62 @@ def test_media_cookie_is_host_only_strict_http_only_and_origin_checked(product):
     assert "Max-Age=0" in cleared.headers["set-cookie"]
 
 
+@pytest.mark.parametrize("operation", ["grant", "continuous_media_auth"])
+@pytest.mark.parametrize("blocked_read", ["device_registry", "camera_policy"])
+def test_live_media_durable_authorization_keeps_other_requests_responsive(
+    product, monkeypatch, operation, blocked_read
+):
+    """A slow registry or viewer-policy read cannot stall other operator requests."""
+    device_id = product.enroll()
+    token = product.token
+    if blocked_read == "camera_policy":
+        account = product.users.create(
+            UserCreate(
+                username="live-media-viewer", display_name="Media viewer", role=UserRole.VIEWER
+            ),
+            actor="test",
+        )
+        token, _ = _initialized_session(product, account)
+        owner, method = product.users, "get_camera_access"
+    else:
+        owner, method = product.registry, "get"
+
+    if operation == "grant":
+        route = f"/api/v1/operator/cameras/{device_id}/media-session"
+        request = product.client.post
+        headers = {**product.headers, "Authorization": "Bearer " + token}
+    else:
+        path = MediaMTXBinding(product.service.site_id, UUID(device_id)).path_name
+        route = "/api/v1/operator/media-auth"
+        request = product.client.get
+        headers = product.media_headers(f"/media/live/{path}/index.m3u8", token=token)
+
+    entered, released = threading.Event(), threading.Event()
+    original = getattr(owner, method)
+
+    def controlled_read(*args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            assert released.wait(timeout=5), "Controlled durable authority read was not released"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, method, controlled_read)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            media = executor.submit(request, route, headers=headers)
+            assert entered.wait(timeout=3), "Media request did not reach durable authority"
+            liveness = executor.submit(product.client.get, "/openapi.json")
+            assert liveness.result(timeout=1.5).status_code == 200
+            assert not media.done(), "Media authorization finished before durable read released"
+        finally:
+            released.set()
+        response = media.result(timeout=5)
+    assert response.status_code == 200
+    if operation == "grant":
+        assert "HttpOnly" in response.headers["set-cookie"]
+        assert response.json()["live_url"].startswith("/media/live/k5_")
+
+
 @pytest.mark.parametrize("wall_step", [172800, -172800])
 @pytest.mark.parametrize("end_session", ["expiry", "revoke"])
 def test_media_cookie_survives_host_clock_steps_but_never_extends_human_session(
