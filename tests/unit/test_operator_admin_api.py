@@ -186,6 +186,43 @@ def test_admin_creation_durable_write_keeps_unrelated_http_responsive(product, m
     assert product.users.get(UUID(created["account"]["id"])) is not None
 
 
+
+def test_camera_access_durable_edit_keeps_unrelated_http_responsive(product, monkeypatch):
+    """A held camera-permission write cannot freeze the installed HTTP API."""
+    first, second = _two_cameras(product)
+    issue = _create(product, camera_ids=[first], username="camera-access-edit-reader")
+    account_id = issue["account"]["id"]
+    entered, released = threading.Event(), threading.Event()
+    original = product.users.set_camera_access
+
+    def controlled_update(*args, **kwargs):
+        entered.set()
+        assert released.wait(timeout=5), "Controlled camera-access write was not released"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(product.users, "set_camera_access", controlled_update)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            edit = executor.submit(
+                product.client.put,
+                _ADMIN + f"/users/{account_id}/camera-access",
+                headers=product.headers,
+                json={"mode": "selected", "camera_ids": [second]},
+            )
+            assert entered.wait(timeout=3), "Camera-access edit did not reach durable storage"
+            liveness = executor.submit(product.client.get, "/openapi.json")
+            assert liveness.result(timeout=1.5).status_code == 200
+            assert not edit.done(), "Camera-access edit completed before release"
+        finally:
+            released.set()
+        response = edit.result(timeout=5)
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["camera_access"]["camera_ids"] == [second]
+    assert product.users.get_camera_access(UUID(account_id))["camera_ids"] == [UUID(second)]
+
+
 def test_selected_viewer_permissions_cover_list_grants_history_media_and_export(product):
     first, second = _two_cameras(product)
     token, headers = _activate(product, _create(product, camera_ids=[first]))
