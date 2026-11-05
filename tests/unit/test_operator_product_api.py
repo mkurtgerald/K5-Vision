@@ -990,6 +990,118 @@ def test_selected_playback_interval_is_bounded_and_foreign_path_is_denied(produc
 
 @pytest.mark.parametrize("blocked_read", ["device_registry", "camera_policy"])
 @pytest.mark.parametrize("block_after_provider", [False, True])
+def test_camera_list_storage_reads_do_not_block_other_http_requests(
+    product, monkeypatch, blocked_read, block_after_provider
+):
+    """Camera polling must remain responsive around live-worker I/O."""
+    device_id = product.enroll()
+    if blocked_read == "camera_policy":
+        viewer = product.users.create(
+            UserCreate(
+                username="camera-list-policy-reader", display_name="Reader", role=UserRole.VIEWER
+            ),
+            actor="test",
+        )
+        token, _ = _initialized_session(product, viewer)
+        headers = {"Authorization": "Bearer " + token}
+        owner, method = product.users, "get_camera_access"
+    else:
+        headers = product.headers
+        owner, method = product.registry, "get"
+
+    original = getattr(owner, method)
+    original_snapshot = product.service.provider.path_snapshot
+    entered, released = threading.Event(), threading.Event()
+    counter_lock = threading.Lock()
+    calls = 0
+    snapshot_calls = []
+    provider_completed = threading.Event()
+
+    async def observed_snapshot(bindings):
+        snapshot_calls.append(bindings)
+        result = await original_snapshot(bindings)
+        provider_completed.set()
+        return result
+
+    def controlled_read(*args, **kwargs):
+        nonlocal calls
+        with counter_lock:
+            calls += 1
+            # The camera store validates enrolled devices internally, so a
+            # single selection may call registry.get more than once. Gate on
+            # completed provider I/O, not an assumed read-call ordinal.
+            block_this_read = not entered.is_set() and (
+                provider_completed.is_set() if block_after_provider else calls == 1
+            )
+            if block_this_read:
+                entered.set()
+        if block_this_read:
+            assert released.wait(timeout=5), "Controlled camera-list read was not released"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(product.service.provider, "path_snapshot", observed_snapshot)
+    monkeypatch.setattr(owner, method, controlled_read)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            listing = executor.submit(
+                product.client.get, "/api/v1/operator/cameras", headers=headers
+            )
+            assert entered.wait(timeout=3), "Camera list did not reach authority storage"
+            liveness = executor.submit(product.client.get, "/openapi.json")
+            assert liveness.result(timeout=1.5).status_code == 200
+            assert not listing.done(), "Camera list completed before authority read release"
+            assert len(snapshot_calls) == (1 if block_after_provider else 0)
+        finally:
+            released.set()
+        response = listing.result(timeout=5)
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["cameras"][0]["device_id"] == device_id
+    assert len(snapshot_calls) == 1
+    assert calls >= 2
+
+
+def test_capabilities_policy_read_keeps_unrelated_http_responsive(product, monkeypatch):
+    """Viewing account capabilities must not block other HTTP requests on SQLite."""
+    viewer = product.users.create(
+        UserCreate(
+            username="capabilities-policy-reader", display_name="Reader", role=UserRole.VIEWER
+        ),
+        actor="test",
+    )
+    token, _ = _initialized_session(product, viewer)
+    original = product.users.get_camera_access
+    entered, released = threading.Event(), threading.Event()
+
+    def controlled_read(*args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            assert released.wait(timeout=5), "Controlled capabilities read was not released"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(product.users, "get_camera_access", controlled_read)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            listing = executor.submit(
+                product.client.get,
+                "/api/v1/operator/capabilities",
+                headers={"Authorization": "Bearer " + token},
+            )
+            assert entered.wait(timeout=3), "Capabilities did not reach durable policy"
+            liveness = executor.submit(product.client.get, "/openapi.json")
+            assert liveness.result(timeout=1.5).status_code == 200
+            assert not listing.done(), "Capabilities completed before policy release"
+        finally:
+            released.set()
+        response = listing.result(timeout=5)
+
+    assert response.status_code == 200
+    assert response.json()["camera_access"]["mode"] == "all"
+
+
+@pytest.mark.parametrize("blocked_read", ["device_registry", "camera_policy"])
+@pytest.mark.parametrize("block_after_provider", [False, True])
 def test_history_registry_lock_does_not_block_other_http_requests(
     product, monkeypatch, blocked_read, block_after_provider
 ):

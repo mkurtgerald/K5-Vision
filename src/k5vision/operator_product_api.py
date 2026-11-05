@@ -463,6 +463,13 @@ def install_operator_product_api(
             raise HTTPException(404, "Camera not found")
         return selection(device_id)
 
+    def permitted_selections(account: UserAccount) -> tuple[MediaMTXSource, ...]:
+        # Camera and viewer-policy selection can perform synchronous SQLite reads.
+        # Preserve a complete authorization snapshot on a worker thread.
+        return tuple(
+            source for source in selections() if permitted(account, source.binding.device_id)
+        )
+
     def capabilities(account: UserAccount) -> dict:
         access = access_policy(account)
         permissions = effective_permissions(app, account)
@@ -490,7 +497,8 @@ def install_operator_product_api(
             connection_started.clear()
             recording_started.clear()
             recording_changed.clear()
-            recording_changed.update((item.binding.device_id, now) for item in selections())
+            selected = await asyncio.to_thread(selections)
+            recording_changed.update((item.binding.device_id, now) for item in selected)
             media_generation = generation
         identifier = source.binding.device_id
         connection_started.setdefault(identifier, now)
@@ -726,7 +734,7 @@ def install_operator_product_api(
         response: Response, session: tuple[UserAccount, str] = read_session
     ):
         response.headers["Cache-Control"] = "no-store"
-        return capabilities(session[0])
+        return await asyncio.to_thread(capabilities, session[0])
 
     @app.get(_PREFIX + "/status", tags=["operator"])
     async def operator_status(response: Response, _session: tuple[UserAccount, str] = read_session):
@@ -736,9 +744,7 @@ def install_operator_product_api(
     @app.get(_PREFIX + "/cameras", tags=["operator"])
     async def list_cameras(response: Response, session: tuple[UserAccount, str] = read_session):
         response.headers["Cache-Control"] = "no-store"
-        selected = tuple(
-            source for source in selections() if permitted(session[0], source.binding.device_id)
-        )
+        selected = await asyncio.to_thread(permitted_selections, session[0])
         snapshot = {}
         if selected and service.status() in {"ready", "disk_full"}:
             try:
@@ -749,9 +755,7 @@ def install_operator_product_api(
                 snapshot = {source.binding: error.code for source in selected}
 
         current, _ = await authenticate(session[1])
-        selected = tuple(
-            source for source in selections() if permitted(current, source.binding.device_id)
-        )
+        selected = await asyncio.to_thread(permitted_selections, current)
 
         return {
             "cameras": [
@@ -762,7 +766,7 @@ def install_operator_product_api(
                 for source in selected
             ],
             "worker_status": service.status(),
-            "capabilities": capabilities(current),
+            "capabilities": await asyncio.to_thread(capabilities, current),
         }
 
     async def enroll_camera_source(
