@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
@@ -97,6 +99,44 @@ def test_admin_user_creation_and_audit_keep_stored_credentials_private(product):
     assert any(event["action"] == "camera-access-updated" for event in events)
     assert issue["temporary_credential"] not in users.text + next_page.text + audit.text
     assert second not in str(account["camera_access"])
+
+
+def test_admin_creation_durable_write_keeps_unrelated_http_responsive(product, monkeypatch):
+    """A slow SQLite-backed account creation must not freeze independent requests."""
+    entered, released = threading.Event(), threading.Event()
+    original = product.users.create_with_bootstrap
+
+    def controlled_create(*args, **kwargs):
+        entered.set()
+        assert released.wait(timeout=5), "Controlled account write was not released"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(product.users, "create_with_bootstrap", controlled_create)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            creation = executor.submit(
+                product.client.post,
+                _ADMIN + "/users",
+                headers=product.headers,
+                json={
+                    "username": "nonblocking-admin-create",
+                    "display_name": "Admin test viewer",
+                    "role": "viewer",
+                    "camera_access": {"mode": "selected", "camera_ids": []},
+                },
+            )
+            assert entered.wait(timeout=3), "User creation did not reach durable storage"
+            liveness = executor.submit(product.client.get, "/openapi.json")
+            assert liveness.result(timeout=1.5).status_code == 200
+            assert not creation.done(), "Account creation was not held during liveness check"
+        finally:
+            released.set()
+        result = creation.result(timeout=5)
+    assert result.status_code == 201
+    created = result.json()
+    assert created["account"]["username"] == "nonblocking-admin-create"
+    assert created["account"]["role"] == "viewer"
+    assert product.users.get(UUID(created["account"]["id"])) is not None
 
 
 def test_selected_viewer_permissions_cover_list_grants_history_media_and_export(product):
