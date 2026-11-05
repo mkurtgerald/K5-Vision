@@ -1101,7 +1101,9 @@ def install_operator_product_api(
         session: tuple[UserAccount, str] = read_session,
     ):
         admit_origin(request)
-        source = authorized_selection(session[0], device_id)
+        # Grant live and playback media only after durable source and camera-policy
+        # admission. Slow SQLite reads must not block unrelated operator traffic.
+        source = await asyncio.to_thread(authorized_selection, session[0], device_id)
         response.set_cookie(
             _COOKIE,
             session[1],
@@ -1170,10 +1172,17 @@ def install_operator_product_api(
             path = _media_selection(uris[0])
         except (ValueError, OverflowError):
             raise _unauthorized() from None
-        if not any(
-            source.binding.path_name == path and permitted(current, source.binding.device_id)
-            for source in selections()
-        ):
+
+        def current_media_authority() -> bool:
+            # MediaMTX calls this on every playlist/segment request. Checking the
+            # bounded registry snapshot and per-camera policy can read SQLite;
+            # preserve authorization, but never block the API event loop.
+            return any(
+                source.binding.path_name == path and permitted(current, source.binding.device_id)
+                for source in selections()
+            )
+
+        if not await asyncio.to_thread(current_media_authority):
             raise _unauthorized()
         if urlsplit(uris[0]).path == "/media/playback":
             values = dict(parse_qsl(urlsplit(uris[0]).query))
@@ -1181,6 +1190,6 @@ def install_operator_product_api(
                 from k5vision.operator_role_policy_api import require_permission
 
                 require_permission(app, current, "cameras.export")
-        if service.status() not in {"ready", "disk_full"}:
+        if (await asyncio.to_thread(service.status)) not in {"ready", "disk_full"}:
             raise HTTPException(503, "Media unavailable")
         return Response(status_code=200)
