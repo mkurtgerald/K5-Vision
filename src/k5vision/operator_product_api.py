@@ -350,6 +350,7 @@ def install_operator_product_api(
         principal = await sessions.resolve(token)
         if principal is None:
             raise _unauthorized()
+
         # The registry shares a bounded SQLite connection with administration.
         # Its synchronous lock and busy timeout must never block the ASGI loop
         # while recording, history, and live requests are being served.
