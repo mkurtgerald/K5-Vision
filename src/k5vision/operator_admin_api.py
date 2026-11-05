@@ -24,6 +24,23 @@ from k5vision.user_admin_api import _UserRateLimiter
 _PREFIX = "/api/v1/operator/admin"
 
 
+async def _complete_critical(operation):
+    """Never abandon a durable write or session revocation on request cancellation.
+
+    A thread cannot be stopped by cancellation. Keep the mutation lease until
+    the owned work finishes, even when the HTTP request is already gone.
+    """
+    pending = asyncio.create_task(operation)
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(pending), cancelled
+        except asyncio.CancelledError:
+            cancelled = True
+            if pending.done():
+                return pending.result(), True
+
+
 class _CameraAccess(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -286,11 +303,16 @@ def install_operator_admin_api(
                 return account, changed_authority
 
             try:
-                result, changed_authority = await asyncio.to_thread(write_user)
+                (result, changed_authority), cancelled = await _complete_critical(
+                    asyncio.to_thread(write_user)
+                )
                 if changed_authority:
-                    await sessions.revoke_user(user_id)
-                    if user_id != actor.id:
+                    _, revoke_cancelled = await _complete_critical(sessions.revoke_user(user_id))
+                    cancelled |= revoke_cancelled
+                    if user_id != actor.id and not cancelled:
                         await current_admin(session)
+                if cancelled:
+                    raise asyncio.CancelledError
                 return await asyncio.to_thread(row, result)
             except (
                 UserRegistryStorageError,
@@ -359,10 +381,13 @@ def install_operator_admin_api(
                 return result
 
             try:
-                result = await asyncio.to_thread(write_reset)
-                await sessions.revoke_user(user_id)
-                if user_id != actor.id:
+                result, cancelled = await _complete_critical(asyncio.to_thread(write_reset))
+                _, revoke_cancelled = await _complete_critical(sessions.revoke_user(user_id))
+                cancelled |= revoke_cancelled
+                if user_id != actor.id and not cancelled:
                     await current_admin(session)
+                if cancelled:
+                    raise asyncio.CancelledError
                 account, credential, expires = result
                 return {
                     "account": await asyncio.to_thread(row, account),
