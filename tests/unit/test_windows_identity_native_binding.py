@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -74,3 +77,22 @@ def test_failed_native_binding_initialization_is_not_cached(monkeypatch):
         with pytest.raises(security.WindowsIdentitySecurityError, match="binding unavailable"):
             security.check_windows_security("C:\\private\\identity", private=True)
     assert len(attempts) == 2
+
+
+def test_native_install_and_uninstall_pins_match_reviewed_helper_bytes():
+    # The PowerShell installer and uninstaller execute a checkout/installed
+    # security helper only after matching one of the reviewed byte hashes.
+    # CI should detect source drift before a native Windows installer fails.
+    root = Path(__file__).resolve().parents[2]
+    source = (root / "src/k5vision/windows_identity_security.py").read_bytes()
+    normalized = source.replace(b"\r\n", b"\n")
+    expected = {
+        hashlib.sha256(normalized).hexdigest(),
+        hashlib.sha256(normalized.replace(b"\n", b"\r\n")).hexdigest(),
+    }
+    pattern = r"helper_pins=\{'([a-f0-9]{64})',\s*'([a-f0-9]{64})'\}"
+    for name in ("Install-K5Operator.ps1", "Uninstall-K5Operator.ps1"):
+        script = (root / "scripts" / name).read_text(encoding="utf-8")
+        pins = re.search(pattern, script)
+        assert pins is not None, f"{name} has no explicit reviewed helper pins"
+        assert set(pins.groups()) == expected, f"{name} does not pin the reviewed helper"
