@@ -130,8 +130,8 @@ helper=package/'src/k5vision/windows_identity_security.py';ordinary(helper,'file
 # Only these exact reviewed checkout byte representations may execute bootstrap
 # code. Mutable wheel/release metadata never certifies the admission helper.
 helper_bytes=helper.read_bytes()
-helper_pins={'a5ca5fbdef60960de07384138d3290d6c6a1c7e8f688362f6cfd8c7976537ae9',
-             '33493f384a73eb078a6d0481429e5254d20302408876248da0e43326234123f7'}
+helper_pins={'846e3558120f8811d0e3673aade458e78ed6333a63acf0b49a5c9312a6483d02',
+             '2dfa701e566bfcaf00b98b5e0bc1f6fd25376fe360ba1f152a884fd2fdf0c140'}
 if hashlib.sha256(helper_bytes).hexdigest() not in helper_pins: raise ValueError('Unreviewed bootstrap refused')
 spec=importlib.util.spec_from_file_location('k5_install_security',helper)
 security=importlib.util.module_from_spec(spec);sys.modules[spec.name]=security

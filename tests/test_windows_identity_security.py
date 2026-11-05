@@ -258,6 +258,8 @@ def native(monkeypatch):
         raising=False,
     )
     state.api = security._NativeSecurity()
+    # Bind this fixture's native mock for this test only; restore it on teardown.
+    monkeypatch.setattr(security, "_NATIVE_SECURITY_INSTANCE", state.api)
     state.buffers = (user, installer, acl)
     return state
 
@@ -328,6 +330,7 @@ def test_native_unresolved_wrong_service_and_invalid_sid_fail(native):
     ],
 )
 def test_ambiguous_paths_fail_before_native_queries(monkeypatch, path):
+    monkeypatch.setattr(security, "_NATIVE_SECURITY_INSTANCE", None)
     monkeypatch.setattr(security, "_NativeSecurity", lambda: pytest.fail("native query attempted"))
     with pytest.raises(ERROR):
         security.check_windows_volume(path)

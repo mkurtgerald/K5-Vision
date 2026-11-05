@@ -12,6 +12,7 @@ import re
 import struct
 from dataclasses import dataclass
 from pathlib import PureWindowsPath
+from threading import Lock
 
 _ADMINISTRATORS = "S-1-5-32-544"
 _SYSTEM = "S-1-5-18"
@@ -237,6 +238,23 @@ class _NativeSecurity:
                 self.kernel.LocalFree(descriptor)
 
 
+# The policy below still examines the volume, owner and ACL on every admission.
+# Keep only the immutable ctypes DLL/function signatures alive for the process:
+# constructing/rebinding WinDLL functions on concurrent media-auth requests is
+# unnecessary native loader work, and could overlap between Windows workers.
+_NATIVE_SECURITY_LOCK = Lock()
+_NATIVE_SECURITY_INSTANCE: _NativeSecurity | None = None
+
+
+def _native_security() -> _NativeSecurity:
+    global _NATIVE_SECURITY_INSTANCE
+    if _NATIVE_SECURITY_INSTANCE is None:
+        with _NATIVE_SECURITY_LOCK:
+            if _NATIVE_SECURITY_INSTANCE is None:
+                _NATIVE_SECURITY_INSTANCE = _NativeSecurity()
+    return _NATIVE_SECURITY_INSTANCE
+
+
 def check_windows_volume(path: str | os.PathLike[str]) -> None:
     """Reject remote/ambiguous/aliased volumes before any path/ACL lookup."""
     value = PureWindowsPath(path)
@@ -253,7 +271,7 @@ def check_windows_volume(path: str | os.PathLike[str]) -> None:
         )
     ):
         raise WindowsIdentitySecurityError("Windows identity requires an ordinary local path")
-    native = _NativeSecurity()
+    native = _native_security()
     if native.kernel.GetDriveTypeW(value.anchor) != 3:
         raise WindowsIdentitySecurityError("Windows identity requires a fixed local volume")
     mapping = ctypes.create_unicode_buffer(32768)
@@ -272,7 +290,7 @@ def check_windows_security(
     require_file_inheritance: bool = False,
 ) -> None:
     """Inspect an existing path; never modify its ownership or security settings."""
-    native = _NativeSecurity()
+    native = _native_security()
     owner, entries = native.descriptor(os.fspath(path))
     installer_used = owner == _TRUSTED_INSTALLER or any(
         entry.sid == _TRUSTED_INSTALLER for entry in entries
