@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
@@ -97,6 +99,53 @@ def test_admin_user_creation_and_audit_keep_stored_credentials_private(product):
     assert any(event["action"] == "camera-access-updated" for event in events)
     assert issue["temporary_credential"] not in users.text + next_page.text + audit.text
     assert second not in str(account["camera_access"])
+
+
+@pytest.mark.parametrize(
+    ("route", "method", "key"),
+    [
+        ("users?limit=1", "list", "users"),
+        ("audit?limit=1", "audit_events", "events"),
+    ],
+)
+def test_admin_durable_list_and_audit_reads_do_not_block_other_http(
+    product, monkeypatch, route, method, key
+):
+    """A slow audit or account read must not block unrelated live APIs."""
+    _create(product, username="durable-list-reader")
+    entered, released = threading.Event(), threading.Event()
+    original = getattr(product.users, method)
+    counter_lock = threading.Lock()
+    calls = 0
+
+    def controlled_read(*args, **kwargs):
+        nonlocal calls
+        with counter_lock:
+            calls += 1
+            current = calls
+        if current == 1:
+            entered.set()
+            assert released.wait(timeout=5), "Controlled durable read was not released"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(product.users, method, controlled_read)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            listing = executor.submit(
+                product.client.get, _ADMIN + "/" + route, headers=product.headers
+            )
+            assert entered.wait(timeout=3), "Admin endpoint did not reach durable storage"
+            liveness = executor.submit(product.client.get, "/openapi.json")
+            assert liveness.result(timeout=1.5).status_code == 200
+            assert not listing.done(), "Admin read completed before release"
+        finally:
+            released.set()
+        response = listing.result(timeout=5)
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    result = response.json()
+    assert result[key]
+    assert isinstance(result["has_more"], bool)
 
 
 def test_selected_viewer_permissions_cover_list_grants_history_media_and_export(product):
