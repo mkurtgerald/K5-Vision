@@ -150,13 +150,19 @@ def install_operator_admin_api(
         _session: tuple[UserAccount, str] = admin_session,
     ):
         response.headers["Cache-Control"] = "no-store"
-        try:
+
+        def snapshot():
+            # Durable listing and row enrichment can synchronously read SQLite.
+            # Keep the event loop available for live video and other requests.
             return {
                 "users": [row(account) for account in users.list(offset=offset, limit=limit)],
                 "has_more": bool(users.list(offset=offset + limit, limit=1)),
                 "offset": offset,
                 "limit": limit,
             }
+
+        try:
+            return await asyncio.to_thread(snapshot)
         except UserRegistryStorageError:
             raise HTTPException(503, "admin_unavailable") from None
 
@@ -168,7 +174,10 @@ def install_operator_admin_api(
         _session: tuple[UserAccount, str] = admin_session,
     ):
         response.headers["Cache-Control"] = "no-store"
-        try:
+
+        def snapshot():
+            # Both audit enumeration and username enrichment require durable
+            # reads. Preserve their ordering and authorization off-thread.
             events = users.audit_events(offset=offset, limit=limit, newest_first=True)
             entries = []
             for event in events:
@@ -187,6 +196,9 @@ def install_operator_admin_api(
                 "offset": offset,
                 "limit": limit,
             }
+
+        try:
+            return await asyncio.to_thread(snapshot)
         except UserRegistryStorageError:
             raise HTTPException(503, "admin_unavailable") from None
 
