@@ -144,7 +144,7 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
 
         def assert_preserved() -> None:
             assert retained.is_file() and _digest(retained) == retained_hash
-            assert identity_state.load_identity_state(profile / "identity").site_id == original_site
+            assert str(identity_state.load_identity_state(profile / "identity").site_id) == original_site
 
         # Prove the candidate's Inno guard refuses replacement of a live
         # product before it changes the currently installed executable.
