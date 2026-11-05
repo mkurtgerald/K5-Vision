@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Literal
 from uuid import UUID
 
@@ -198,9 +199,12 @@ def install_operator_admin_api(
         response.headers["Cache-Control"] = "no-store"
         async with mutations:
             actor, _ = await mutation_admin(session)
-            require_grant(app, actor, BASE_PERMISSIONS[payload.role])
-            access = policy(payload.camera_access, payload.role)
-            try:
+
+            def write_user():
+                # The complete durable operation, including permission and camera
+                # checks and response enrichment, must not stall other HTTP work.
+                require_grant(app, actor, BASE_PERMISSIONS[payload.role])
+                access = policy(payload.camera_access, payload.role)
                 request = UserCreate.model_validate(payload.model_dump(exclude={"camera_access"}))
                 account, credential, expires = users.create_with_bootstrap(
                     request, actor=actor.username, camera_access=access
@@ -210,6 +214,9 @@ def install_operator_admin_api(
                     "temporary_credential": credential,
                     "expires_at": expires,
                 }
+
+            try:
+                return await asyncio.to_thread(write_user)
             except (
                 UserRegistryStorageError,
                 UserRegistryCapacityError,
