@@ -32,7 +32,8 @@ RestartApplications=no
 UninstallDisplayIcon={app}\K5Vision.exe
 OutputDir={#OutputRoot}
 OutputBaseFilename=K5VisionSetup
-Compression=lzma2/max
+; Favor fast, low-memory extraction for the offline Windows setup; all installed payload hashes remain verified.
+Compression=zip/7
 SolidCompression=yes
 LicenseFile={#PayloadRoot}\licenses\INSTALLATION-LICENSE.txt
 
