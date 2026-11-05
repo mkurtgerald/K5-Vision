@@ -1056,7 +1056,9 @@ def test_camera_list_storage_reads_do_not_block_other_http_requests(
 def test_capabilities_policy_read_keeps_unrelated_http_responsive(product, monkeypatch):
     """Viewing account capabilities must not block other HTTP requests on SQLite."""
     viewer = product.users.create(
-        UserCreate(username="capabilities-policy-reader", display_name="Reader", role=UserRole.VIEWER),
+        UserCreate(
+            username="capabilities-policy-reader", display_name="Reader", role=UserRole.VIEWER
+        ),
         actor="test",
     )
     token, _ = _initialized_session(product, viewer)
