@@ -1172,6 +1172,7 @@ def install_operator_product_api(
             path = _media_selection(uris[0])
         except (ValueError, OverflowError):
             raise _unauthorized() from None
+
         def current_media_authority() -> bool:
             # MediaMTX calls this on every playlist/segment request. Checking the
             # bounded registry snapshot and per-camera policy can read SQLite;
