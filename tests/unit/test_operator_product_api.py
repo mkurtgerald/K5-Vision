@@ -930,6 +930,71 @@ def test_selected_playback_interval_is_bounded_and_foreign_path_is_denied(produc
     assert denied.status_code == 401
 
 
+@pytest.mark.parametrize("blocked_read", ["device_registry", "camera_policy"])
+@pytest.mark.parametrize("block_after_provider", [False, True])
+def test_history_registry_lock_does_not_block_other_http_requests(
+    product, monkeypatch, blocked_read, block_after_provider
+):
+    """Before and after provider I/O, locked authority reads cannot stall the API."""
+    device_id = product.enroll()
+    if blocked_read == "camera_policy":
+        account = product.users.create(
+            UserCreate(
+                username="history-policy-reader",
+                display_name="Reader",
+                role=UserRole.VIEWER,
+            ),
+            actor="test",
+        )
+        token, _ = _initialized_session(product, account)
+        headers = {"Authorization": "Bearer " + token}
+        owner, method = product.users, "get_camera_access"
+    else:
+        headers = product.headers
+        owner, method = product.registry, "get"
+
+    # Camera selection performs two device-registry reads per admission;
+    # policy lookup performs one. Hit both sides of provider I/O.
+    reads_per_admission = 2 if blocked_read == "device_registry" else 1
+    block_call = 1 + (reads_per_admission if block_after_provider else 0)
+    original = getattr(owner, method)
+    entered, released = threading.Event(), threading.Event()
+    counter_lock = threading.Lock()
+    calls = 0
+
+    def controlled_read(*args, **kwargs):
+        nonlocal calls
+        with counter_lock:
+            calls += 1
+            observed = calls
+        if observed == block_call:
+            entered.set()
+            assert released.wait(timeout=5), "Controlled registry read was not released"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, method, controlled_read)
+    route = f"/api/v1/operator/cameras/{device_id}/history"
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            protected = executor.submit(
+                product.client.get,
+                route,
+                headers=headers,
+                params={
+                    "start": "2026-10-11T12:00:00Z",
+                    "end": "2026-10-11T12:01:00Z",
+                },
+            )
+            assert entered.wait(timeout=3), "History did not reach controlled authority read"
+            liveness = executor.submit(product.client.get, "/openapi.json")
+            assert liveness.result(timeout=1.5).status_code == 200
+            assert not protected.done(), "History was not held during HTTP liveness probe"
+        finally:
+            released.set()
+        assert protected.result(timeout=5).status_code == 200
+    assert calls == 2 * reads_per_admission
+
+
 def test_history_respects_aware_interval_and_hides_donor_errors(product):
     device_id = product.enroll()
     route = f"/api/v1/operator/cameras/{device_id}/history"

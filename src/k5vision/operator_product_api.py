@@ -968,7 +968,7 @@ def install_operator_product_api(
         session: tuple[UserAccount, str] = read_session,
     ):
         response.headers["Cache-Control"] = "no-store"
-        source = authorized_selection(session[0], device_id)
+        source = await asyncio.to_thread(authorized_selection, session[0], device_id)
         try:
             first, last = _interval(start, end)
         except (ValueError, OverflowError):
@@ -982,7 +982,7 @@ def install_operator_product_api(
         except MediaWorkerError:
             raise HTTPException(503, "Playback inventory unavailable") from None
         current, _ = await authenticate(session[1])
-        authorized_selection(current, device_id)
+        await asyncio.to_thread(authorized_selection, current, device_id)
         return {
             "spans": [
                 {
