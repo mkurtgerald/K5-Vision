@@ -1368,6 +1368,69 @@ def test_person_view_reauthorizes_after_inference_before_returning_boxes(product
 
 
 @pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
+@pytest.mark.parametrize("blocked_read", ["device_registry", "camera_policy"])
+@pytest.mark.parametrize("block_after_inference", [False, True])
+def test_person_view_authorization_storage_does_not_block_other_http_requests(
+    product, monkeypatch, blocked_read, block_after_inference
+):
+    """Slow durable permission reads must not freeze the API or weaken revalidation."""
+    device_id = product.enroll()
+    if blocked_read == "camera_policy":
+        account = product.users.create(
+            UserCreate(
+                username="person-policy-reader", display_name="Reader", role=UserRole.VIEWER
+            ),
+            actor="test",
+        )
+        token, _ = _initialized_session(product, account)
+        headers = _person_headers(product, Authorization="Bearer " + token)
+        owner, method = product.users, "get_camera_access"
+    else:
+        headers = _person_headers(product)
+        owner, method = product.registry, "get"
+
+    # Each authorization performs two registry reads or one viewer-policy read.
+    reads_per_admission = 2 if blocked_read == "device_registry" else 1
+    blocked_call = 1 + (reads_per_admission if block_after_inference else 0)
+    original = getattr(owner, method)
+    entered, released = threading.Event(), threading.Event()
+    counter_lock = threading.Lock()
+    calls = 0
+
+    def controlled_read(*args, **kwargs):
+        nonlocal calls
+        with counter_lock:
+            calls += 1
+            observed = calls
+        if observed == blocked_call:
+            entered.set()
+            assert released.wait(timeout=5), "Controlled authorization read was not released"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, method, controlled_read)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            protected = executor.submit(
+                product.client.post,
+                _person_url(device_id),
+                headers=headers,
+                content=bytes(16),
+            )
+            assert entered.wait(timeout=3), "Person view did not reach authority storage"
+            liveness = executor.submit(product.client.get, "/openapi.json")
+            assert liveness.result(timeout=1.5).status_code == 200
+            assert not protected.done(), "Person view was not held during liveness check"
+            assert len(product.analytics.submissions) == (1 if block_after_inference else 0)
+        finally:
+            released.set()
+        response = protected.result(timeout=5)
+    assert response.status_code == 200
+    assert response.json() == {"status": "active", "frame_id": 17, "boxes": []}
+    assert len(product.analytics.submissions) == 1
+    assert calls == 2 * reads_per_admission
+
+
+@pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
 def test_cookie_clear_closes_revoked_analytics_owner_without_admitting_media(product):
     product.enroll()
     asyncio.run(product.sessions.revoke(product.token))
@@ -1448,19 +1511,23 @@ def test_person_view_rejects_fifth_request_before_reading_its_body(product):
 
     async def concurrent_views():
         gate = asyncio.Event()
+        all_admitted = asyncio.Event()
 
         async def wait(_submission):
+            # Signal from the fourth inference admission instead of spinning
+            # the event loop while durable permissions run in worker threads.
+            if len(product.analytics.submissions) == 4:
+                all_admitted.set()
             await gate.wait()
 
         product.analytics.callback = wait
-        # Fill the four inference slots before issuing the fifth request.
-        # Authentication can yield to worker threads; task creation order
-        # alone does not prove the first four reached the inference boundary.
+        # Task creation order does not prove which requests have passed
+        # threaded authorization. Admit all four before testing overload.
         tasks = [asyncio.create_task(_person_asgi(product, device_id)) for _ in range(4)]
         try:
             async with asyncio.timeout(2):
-                while len(product.analytics.submissions) < 4:
-                    await asyncio.sleep(0)
+                await all_admitted.wait()
+                assert len(product.analytics.submissions) == 4
                 fifth = asyncio.create_task(_person_asgi(product, device_id))
                 tasks.append(fifth)
                 rejected = await fifth
