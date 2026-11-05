@@ -33,8 +33,7 @@ _INPUTS = (
     "K5_DESKTOP_LAUNCHER_SHA256",
 )
 pytestmark = pytest.mark.skipif(
-    os.name != "nt" or any(not os.environ.get(key) for key in _INPUTS),
-    reason="Cross-revision smoke needs both exact graphical Windows setups",
+    os.name != "nt", reason="Cross-revision smoke requires actual Windows execution"
 )
 
 
@@ -72,6 +71,7 @@ def _free_local_port() -> int:
 def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_property):
     import subprocess
 
+    assert all(os.environ.get(name) for name in _INPUTS), "Missing exact upgrade test input"
     d = _desktop_helpers()
     runtime = d._helpers("test_operator_product_runtime")
     baseline = Path(os.environ["K5_DESKTOP_BASELINE_SETUP"]).resolve(strict=True)
