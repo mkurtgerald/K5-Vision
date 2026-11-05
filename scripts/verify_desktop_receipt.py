@@ -29,6 +29,7 @@ _TRUE = (
     "close_hides_to_tray recording_continues_after_browser_and_window_close "
     "second_click_reopens_single_instance graceful_owned_process_cleanup "
     "restart_preserves_account_camera_history uninstall_preserves_profile_and_media "
+    "stopped_same_setup_reinstall_preserves_profile "
     "no_console_windows owned_cleanup onvif_credential_profile_enrollment no_manual_stream_uri "
     "onvif_wrong_password_rejected onvif_clock_skew_compensated "
     "onvif_time_health_displayed recorder_time_health_displayed "

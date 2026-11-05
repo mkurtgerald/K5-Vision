@@ -3252,6 +3252,25 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         _require(decoded > 0, "Desktop recordings did not contain decodable media")
         receipt["recorded_decoded_frames"] = decoded
         _require(not cohort.console_seen and not cohort.failed, "Desktop opened a console window")
+        _enter_stage("stopped_same_setup_reinstall")
+        # Reinstall the exact already-qualified Setup while the product is fully
+        # stopped, then reuse the existing full restart/account/media witness.
+        # This is NOT a different-version upgrade or rollback acceptance.
+        retained_samples = [
+            (path, hashlib.sha256(path.read_bytes()).digest()) for path in saved_files[:3]
+        ]
+        _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
+        _require(
+            identity_state.load_identity_state(profile / "identity").site_id == identity.site_id,
+            "Stopped reinstall replaced the existing account identity",
+        )
+        _require(
+            all(
+                path.is_file() and hashlib.sha256(path.read_bytes()).digest() == digest
+                for path, digest in retained_samples
+            ),
+            "Stopped reinstall changed or removed retained recording bytes",
+        )
         _enter_stage("durable_profile_restart")
         app = _start_app(installed, profile, port, cohort)
         form = _wait(lambda: api.form(app.pid), "Returning desktop window", process=app)
@@ -3317,6 +3336,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             ffprobe, export_proof["path"]
         )
         receipt["export_download_survives_product_restart"] = True
+        # The existing restart journey above has now proved the reinstalled
+        # account, camera IDs, paused preference, history and exported bytes.
+        receipt["stopped_same_setup_reinstall_preserves_profile"] = True
         _enter_stage("relaunch_recording_preference_ui")
         browser = playwright.chromium.launch(channel="msedge", headless=True)
         context = browser.new_context(viewport={"width": 1440, "height": 900})
