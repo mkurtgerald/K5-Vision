@@ -1330,12 +1330,17 @@ def test_person_view_rejects_fifth_request_before_reading_its_body(product):
             await gate.wait()
 
         product.analytics.callback = wait
-        tasks = [asyncio.create_task(_person_asgi(product, device_id)) for _ in range(5)]
+        # Fill the four inference slots before issuing the fifth request.
+        # Authentication can yield to worker threads; task creation order
+        # alone does not prove the first four reached the inference boundary.
+        tasks = [asyncio.create_task(_person_asgi(product, device_id)) for _ in range(4)]
         try:
             async with asyncio.timeout(2):
                 while len(product.analytics.submissions) < 4:
                     await asyncio.sleep(0)
-                rejected = await tasks[4]
+                fifth = asyncio.create_task(_person_asgi(product, device_id))
+                tasks.append(fifth)
+                rejected = await fifth
             assert rejected[0:2] == (429, 0)
         finally:
             gate.set()
