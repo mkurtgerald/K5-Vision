@@ -186,7 +186,6 @@ def test_admin_creation_durable_write_keeps_unrelated_http_responsive(product, m
     assert product.users.get(UUID(created["account"]["id"])) is not None
 
 
-
 def test_camera_access_durable_edit_keeps_unrelated_http_responsive(product, monkeypatch):
     """A held camera-permission write cannot freeze the installed HTTP API."""
     first, second = _two_cameras(product)
