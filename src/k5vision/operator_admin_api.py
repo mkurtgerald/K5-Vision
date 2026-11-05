@@ -24,6 +24,23 @@ from k5vision.user_admin_api import _UserRateLimiter
 _PREFIX = "/api/v1/operator/admin"
 
 
+async def _complete_critical(operation):
+    """Never abandon a durable write or session revocation on request cancellation.
+
+    A thread cannot be stopped by cancellation. Keep the mutation lease until
+    the owned work finishes, even when the HTTP request is already gone.
+    """
+    pending = asyncio.create_task(operation)
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(pending), cancelled
+        except asyncio.CancelledError:
+            cancelled = True
+            if pending.done():
+                return pending.result(), True
+
+
 class _CameraAccess(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -247,17 +264,20 @@ def install_operator_admin_api(
         response.headers["Cache-Control"] = "no-store"
         async with mutations:
             actor, _ = await mutation_admin(session)
-            account = target(user_id)
-            require_grant(app, actor, effective_permissions(app, account))
-            if payload.role is not None:
-                require_grant(app, actor, BASE_PERMISSIONS[payload.role])
-            previous_account = account
-            access = (
-                policy(payload.camera_access, payload.role or account.role)
-                if payload.camera_access is not None
-                else None
-            )
-            try:
+
+            def write_user():
+                # Keep the existing grant, role-policy and camera checks inside
+                # the serialized mutation, but run all SQLite work off-loop.
+                account = target(user_id)
+                require_grant(app, actor, effective_permissions(app, account))
+                if payload.role is not None:
+                    require_grant(app, actor, BASE_PERMISSIONS[payload.role])
+                previous_account = account
+                access = (
+                    policy(payload.camera_access, payload.role or account.role)
+                    if payload.camera_access is not None
+                    else None
+                )
                 previous_access = users.get_camera_access(user_id)
                 fields = payload.model_dump(exclude={"camera_access"}, exclude_none=True)
                 role_policy = getattr(app.state, "operator_roles", None)
@@ -280,11 +300,20 @@ def install_operator_admin_api(
                     or access_identity(users.get_camera_access(user_id))
                     != access_identity(previous_access)
                 )
+                return account, changed_authority
+
+            try:
+                (result, changed_authority), cancelled = await _complete_critical(
+                    asyncio.to_thread(write_user)
+                )
                 if changed_authority:
-                    await sessions.revoke_user(user_id)
-                    if user_id != actor.id:
+                    _, revoke_cancelled = await _complete_critical(sessions.revoke_user(user_id))
+                    cancelled |= revoke_cancelled
+                    if user_id != actor.id and not cancelled:
                         await current_admin(session)
-                return row(account)
+                if cancelled:
+                    raise asyncio.CancelledError
+                return await asyncio.to_thread(row, result)
             except (
                 UserRegistryStorageError,
                 UserRegistryLastAdministratorError,
@@ -337,21 +366,31 @@ def install_operator_admin_api(
         response.headers["Cache-Control"] = "no-store"
         async with mutations:
             actor, _ = await mutation_admin(session)
-            account = target(user_id)
-            require_grant(app, actor, effective_permissions(app, account))
-            try:
+
+            def write_reset():
+                # Permission and last-administrator guards remain in the same
+                # serialized operation as the durable credential reset.
+                account = target(user_id)
+                require_grant(app, actor, effective_permissions(app, account))
                 role_policy = getattr(app.state, "operator_roles", None)
                 if role_policy is not None:
                     role_policy.guard_credential_reset(users, target(user_id))
                 result = users.reset_bootstrap(user_id, actor=actor.username)
                 if result is None:
                     raise HTTPException(404, "admin_user_not_found")
-                account, credential, expires = result
-                await sessions.revoke_user(user_id)
-                if user_id != actor.id:
+                return result
+
+            try:
+                result, cancelled = await _complete_critical(asyncio.to_thread(write_reset))
+                _, revoke_cancelled = await _complete_critical(sessions.revoke_user(user_id))
+                cancelled |= revoke_cancelled
+                if user_id != actor.id and not cancelled:
                     await current_admin(session)
+                if cancelled:
+                    raise asyncio.CancelledError
+                account, credential, expires = result
                 return {
-                    "account": row(account),
+                    "account": await asyncio.to_thread(row, account),
                     "temporary_credential": credential,
                     "expires_at": expires,
                 }
