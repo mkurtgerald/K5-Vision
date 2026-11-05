@@ -97,7 +97,7 @@ def _assert_running_upgrade_refused(setup: Path, installed: Path, api) -> None:
                 controls = api.windows(form)
                 captions = {api.text(control).strip().casefold(): control for control in controls}
                 if any(
-                    label.startswith("K5 Vision is still running. Choose Stop and Exit")
+                    label.startswith("k5 vision is still running. choose stop and exit")
                     for label in captions
                 ):
                     ok = captions.get("ok") or captions.get("&ok")
