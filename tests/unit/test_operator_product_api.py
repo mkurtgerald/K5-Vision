@@ -1319,7 +1319,9 @@ def test_person_view_authorization_storage_does_not_block_other_http_requests(
     device_id = product.enroll()
     if blocked_read == "camera_policy":
         account = product.users.create(
-            UserCreate(username="person-policy-reader", display_name="Reader", role=UserRole.VIEWER),
+            UserCreate(
+                username="person-policy-reader", display_name="Reader", role=UserRole.VIEWER
+            ),
             actor="test",
         )
         token, _ = _initialized_session(product, account)
