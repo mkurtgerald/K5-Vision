@@ -1010,7 +1010,7 @@ def install_operator_product_api(
         origin = urlsplit(request.headers["origin"])
         if origin.scheme != request.url.scheme or origin.hostname != request.url.hostname:
             raise HTTPException(403, "Invalid operator origin")
-        authorized_selection(session[0], device_id)
+        await asyncio.to_thread(authorized_selection, session[0], device_id)
         if analytics is None:
             raise HTTPException(503, "Person view is not configured")
         try:
@@ -1085,7 +1085,7 @@ def install_operator_product_api(
             except Exception:
                 raise HTTPException(503, "Person view unavailable") from None
             current, _ = await authenticate(session[1])
-            authorized_selection(current, device_id)
+            await asyncio.to_thread(authorized_selection, current, device_id)
             response.headers["Cache-Control"] = "no-store"
             return value
         finally:
