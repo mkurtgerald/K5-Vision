@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
@@ -9,8 +10,11 @@ from threading import Event
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from k5vision import identity_state
+from k5vision import operator_recording_api as recording_api
 from k5vision import operator_recording_storage as storage_module
 from k5vision.operator_recording_storage import RecordingStorage, RecordingStorageError
 
@@ -841,3 +845,53 @@ def test_progress_never_returns_nonfinite_or_negative_age(root, monkeypatch, clo
     clock.now = next_tick
     sample = storage.recording_progress(active.parent.name)
     assert sample["observed_bytes"] == 10 and sample["last_progress_age_seconds"] is None
+
+
+def test_recording_catalog_http_scan_does_not_block_other_requests(tmp_path, monkeypatch) -> None:
+    """A durable catalog scan must not occupy the installed ASGI event loop."""
+    session_token = secrets.token_urlsafe(32)
+
+    class Sessions:
+        async def resolve(self, token):
+            return object() if token == session_token else None
+
+    # The route under test requires an installed catalog, not native capture.
+    monkeypatch.setattr(recording_api, "BoundedOperatorPlaybackTimeline", lambda *_args: object())
+    monkeypatch.setattr(recording_api, "BoundedOperatorExportCoordinator", lambda *_args: object())
+    app = FastAPI()
+    recording_api.install_operator_recording_api(
+        app,
+        registry=object(),
+        session_manager=Sessions(),
+        source_resolver=None,
+        recording_root=tmp_path,
+    )
+    catalog = app.state.operator_recording_catalog
+    assert catalog is not None
+    original_page = catalog.page
+    entered, released = Event(), Event()
+
+    def controlled_page(*, source_id=None, limit=100):
+        entered.set()
+        assert released.wait(timeout=5), "Controlled catalog scan was not released"
+        return original_page(source_id=source_id, limit=limit)
+
+    monkeypatch.setattr(catalog, "page", controlled_page)
+    with TestClient(app) as client:
+        assert client.get("/api/v1/operator/recordings").status_code == 401
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            try:
+                listing = executor.submit(
+                    client.get,
+                    "/api/v1/operator/recordings",
+                    headers={"Authorization": "Bearer " + session_token},
+                )
+                assert entered.wait(timeout=3), "Catalog scan was not reached"
+                liveness = executor.submit(client.get, "/openapi.json")
+                assert liveness.result(timeout=1.5).status_code == 200
+                assert not listing.done(), "Catalog scan completed before its release"
+            finally:
+                released.set()
+            response = listing.result(timeout=5)
+    assert response.status_code == 200
+    assert response.json()["entries"] == []
