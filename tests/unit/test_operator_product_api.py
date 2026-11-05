@@ -2186,6 +2186,7 @@ def test_rtsp_probe_ttl_capacity_and_logout_are_monotonic(product, rtsp, monkeyp
     product.client.delete("/api/v1/operator/media-session", headers=product.headers)
     assert not product.app.state.operator_rtsp_probes._probes
 
+
 @pytest.mark.parametrize("blocked_read", ["get", "credential_status"])
 def test_slow_identity_registry_read_does_not_block_operator_event_loop(
     product, monkeypatch, blocked_read
