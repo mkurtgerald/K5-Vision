@@ -350,11 +350,19 @@ def install_operator_product_api(
         principal = await sessions.resolve(token)
         if principal is None:
             raise _unauthorized()
-        try:
+
+        # The registry shares a bounded SQLite connection with administration.
+        # Its synchronous lock and busy timeout must never block the ASGI loop
+        # while recording, history, and live requests are being served.
+        def current_authority() -> tuple[UserAccount | None, bool]:
             current = users.get(principal.id)
             credential_active = (
                 current is not None and users.credential_status(current.id) == "active"
             )
+            return current, credential_active
+
+        try:
+            current, credential_active = await asyncio.to_thread(current_authority)
         except UserRegistryStorageError:
             raise HTTPException(503, "Operator identity unavailable") from None
         if (
