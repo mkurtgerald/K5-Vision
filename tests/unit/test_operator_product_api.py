@@ -931,9 +931,9 @@ def test_selected_playback_interval_is_bounded_and_foreign_path_is_denied(produc
 
 
 @pytest.mark.parametrize("blocked_read", ["device_registry", "camera_policy"])
-@pytest.mark.parametrize("block_call", [1, 2])
+@pytest.mark.parametrize("block_after_provider", [False, True])
 def test_history_registry_lock_does_not_block_other_http_requests(
-    product, monkeypatch, blocked_read, block_call
+    product, monkeypatch, blocked_read, block_after_provider
 ):
     """Before and after provider I/O, locked authority reads cannot stall the API."""
     device_id = product.enroll()
@@ -953,6 +953,10 @@ def test_history_registry_lock_does_not_block_other_http_requests(
         headers = product.headers
         owner, method = product.registry, "get"
 
+    # Camera selection performs two device-registry reads per admission;
+    # policy lookup performs one. Hit both sides of provider I/O.
+    reads_per_admission = 2 if blocked_read == "device_registry" else 1
+    block_call = 1 + (reads_per_admission if block_after_provider else 0)
     original = getattr(owner, method)
     entered, released = threading.Event(), threading.Event()
     counter_lock = threading.Lock()
@@ -988,7 +992,7 @@ def test_history_registry_lock_does_not_block_other_http_requests(
         finally:
             released.set()
         assert protected.result(timeout=5).status_code == 200
-    assert calls == 2
+    assert calls == 2 * reads_per_admission
 
 
 def test_history_respects_aware_interval_and_hides_donor_errors(product):
