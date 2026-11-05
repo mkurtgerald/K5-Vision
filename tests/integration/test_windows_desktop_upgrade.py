@@ -68,9 +68,66 @@ def _free_local_port() -> int:
         return listener.getsockname()[1]
 
 
-def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_property):
+def _assert_running_upgrade_refused(setup: Path, installed: Path, api) -> None:
+    """Exercise a real double-click-style refusal, not a hidden modal installer."""
     import subprocess
+    import time
 
+    import psutil
+
+    process = subprocess.Popen(
+        [str(setup), "/SP-", "/NORESTART", "/DIR=" + str(installed)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    observed_refusal = False
+    deadline = time.monotonic() + 45
+    try:
+        while process.poll() is None and time.monotonic() < deadline:
+            try:
+                root = psutil.Process(process.pid)
+                children = root.children(recursive=True)
+                pids = {root.pid, *(child.pid for child in children)}
+            except psutil.NoSuchProcess:
+                pids = {process.pid}
+            for form in api.windows():
+                if api.pid(form) not in pids or not api.api.IsWindowVisible(form):
+                    continue
+                controls = api.windows(form)
+                captions = {api.text(control).strip().casefold(): control for control in controls}
+                if any(
+                    label.startswith("K5 Vision is still running. Choose Stop and Exit")
+                    for label in captions
+                ):
+                    ok = captions.get("ok") or captions.get("&ok")
+                    if ok is not None:
+                        api.click(ok)
+                        observed_refusal = True
+                elif "install" in captions or "next >" in captions:
+                    pytest.fail("Running upgrade reached installer wizard instead of refusing")
+            time.sleep(0.1)
+        assert process.poll() is not None, "Running-upgrade refusal did not exit within 45s"
+        assert observed_refusal, "Actual installer did not show the running-product refusal"
+        assert process.returncode != 0, "Running installer refusal returned success"
+    finally:
+        if process.poll() is None:
+            try:
+                children = psutil.Process(process.pid).children(recursive=True)
+            except psutil.NoSuchProcess:
+                children = []
+            process.kill()
+            process.wait(timeout=10)
+            for child in children:
+                try:
+                    if child.is_running():
+                        child.kill()
+                        child.wait(timeout=10)
+                except psutil.NoSuchProcess:
+                    pass
+
+
+def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_property):
     assert all(os.environ.get(name) for name in _INPUTS), "Missing exact upgrade test input"
     d = _desktop_helpers()
     runtime = d._helpers("test_operator_product_runtime")
@@ -159,22 +216,7 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
             process=app,
             timeout=60,
         )
-        refused = subprocess.run(
-            [
-                str(candidate),
-                "/VERYSILENT",
-                "/SUPPRESSMSGBOXES",
-                "/NORESTART",
-                "/SP-",
-                "/DIR=" + str(installed),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=45,
-            check=False,
-        )
-        assert refused.returncode != 0, "Running upgrade unexpectedly overwrote a live installation"
+        _assert_running_upgrade_refused(candidate, installed, api)
         _assert_installed(installed, old_head, old_launcher)
         assert_preserved()
         d._stop_app(app, form, api, cohort)
