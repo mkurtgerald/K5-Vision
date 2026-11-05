@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from threading import Lock
 from typing import Annotated
 from uuid import UUID
 
@@ -176,6 +178,13 @@ def install_operator_recording_api(
     application.state.operator_playback_timeline = timeline_coordinator
     application.state.operator_export_coordinator = export_coordinator
     application.state.operator_recording_catalog = recording_catalog
+    # Keep the scan lock in the worker thread: HTTP cancellation must not
+    # release serialization while a disk scan is still running.
+    catalog_reads = Lock()
+
+    def catalog_page(*, source_id: UUID | None, limit: int) -> RecordingCatalogPage:
+        with catalog_reads:
+            return recording_catalog.page(source_id=source_id, limit=limit)
 
     async def resolve_principal(authorization: list[str] | None):
         credential = _extract_bearer(authorization)
@@ -259,7 +268,7 @@ def install_operator_recording_api(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Operator recording catalog is not configured",
             )
-        return recording_catalog.page(source_id=source_id, limit=limit)
+        return await asyncio.to_thread(catalog_page, source_id=source_id, limit=limit)
 
     @application.get(
         "/api/v1/operator/recordings/{recording_id}/timeline",
