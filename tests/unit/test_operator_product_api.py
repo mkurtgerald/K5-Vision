@@ -703,7 +703,9 @@ def test_live_media_durable_authorization_keeps_other_requests_responsive(
     if blocked_read == "camera_policy":
         account = product.users.create(
             UserCreate(
-                username="live-media-viewer", display_name="Media viewer", role=UserRole.VIEWER
+                username="live-media-viewer",
+                display_name="Media viewer",
+                role=UserRole.VIEWER,
             ),
             actor="test",
         )
@@ -728,17 +730,17 @@ def test_live_media_durable_authorization_keeps_other_requests_responsive(
     def controlled_read(*args, **kwargs):
         if not entered.is_set():
             entered.set()
-            assert released.wait(timeout=5), "Controlled durable authority read was not released"
+            assert released.wait(timeout=5), "Authority read was not released"
         return original(*args, **kwargs)
 
     monkeypatch.setattr(owner, method, controlled_read)
     with ThreadPoolExecutor(max_workers=2) as executor:
         try:
             media = executor.submit(request, route, headers=headers)
-            assert entered.wait(timeout=3), "Media request did not reach durable authority"
+            assert entered.wait(timeout=3), "Media request did not reach storage"
             liveness = executor.submit(product.client.get, "/openapi.json")
             assert liveness.result(timeout=1.5).status_code == 200
-            assert not media.done(), "Media authorization finished before durable read released"
+            assert not media.done(), "Media authorization completed before release"
         finally:
             released.set()
         response = media.result(timeout=5)
