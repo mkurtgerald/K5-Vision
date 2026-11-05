@@ -1015,18 +1015,27 @@ def test_camera_list_storage_reads_do_not_block_other_http_requests(
     counter_lock = threading.Lock()
     calls = 0
     snapshot_calls = []
+    provider_completed = threading.Event()
 
     async def observed_snapshot(bindings):
         snapshot_calls.append(bindings)
-        return await original_snapshot(bindings)
+        result = await original_snapshot(bindings)
+        provider_completed.set()
+        return result
 
     def controlled_read(*args, **kwargs):
         nonlocal calls
         with counter_lock:
             calls += 1
-            observed = calls
-        if observed == (2 if block_after_provider else 1):
-            entered.set()
+            # The camera store validates enrolled devices internally, so a
+            # single selection may call registry.get more than once. Gate on
+            # completed provider I/O, not an assumed read-call ordinal.
+            block_this_read = not entered.is_set() and (
+                provider_completed.is_set() if block_after_provider else calls == 1
+            )
+            if block_this_read:
+                entered.set()
+        if block_this_read:
             assert released.wait(timeout=5), "Controlled camera-list read was not released"
         return original(*args, **kwargs)
 
