@@ -10,9 +10,9 @@ import ctypes
 import os
 import re
 import struct
-from threading import Lock
 from dataclasses import dataclass
 from pathlib import PureWindowsPath
+from threading import Lock
 
 _ADMINISTRATORS = "S-1-5-32-544"
 _SYSTEM = "S-1-5-18"

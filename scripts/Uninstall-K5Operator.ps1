@@ -56,8 +56,8 @@ def ordinary(path,directory=False):
   elif not stat.S_ISDIR(info.st_mode): raise ValueError('Directory required')
 helper=root/'windows_identity_security.py';ordinary(helper)
 helper_bytes=helper.read_bytes()
-helper_pins={'91e1d2ef51f64c69c2ca1febd374ed3ec2aecfa60541c5360e2a88dc92791760',
-             '5cd23c72278ed9f20c03e7bcf6bdb8c1b413bf3a0db5899fe44dc7c7f04e510d'}
+helper_pins={'846e3558120f8811d0e3673aade458e78ed6333a63acf0b49a5c9312a6483d02',
+             '2dfa701e566bfcaf00b98b5e0bc1f6fd25376fe360ba1f152a884fd2fdf0c140'}
 if hashlib.sha256(helper_bytes).hexdigest() not in helper_pins:
  raise ValueError('Bootstrap identity refused')
 spec=importlib.util.spec_from_file_location('k5_uninstall_security',helper);security=importlib.util.module_from_spec(spec);sys.modules[spec.name]=security
