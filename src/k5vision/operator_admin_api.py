@@ -283,7 +283,7 @@ def install_operator_admin_api(
                     or access_identity(users.get_camera_access(user_id))
                     != access_identity(previous_access)
                 )
-                return row(account), changed_authority
+                return account, changed_authority
 
             try:
                 result, changed_authority = await asyncio.to_thread(write_user)
@@ -291,7 +291,7 @@ def install_operator_admin_api(
                     await sessions.revoke_user(user_id)
                     if user_id != actor.id:
                         await current_admin(session)
-                return result
+                return await asyncio.to_thread(row, result)
             except (
                 UserRegistryStorageError,
                 UserRegistryLastAdministratorError,
@@ -356,19 +356,19 @@ def install_operator_admin_api(
                 result = users.reset_bootstrap(user_id, actor=actor.username)
                 if result is None:
                     raise HTTPException(404, "admin_user_not_found")
-                account, credential, expires = result
-                return {
-                    "account": row(account),
-                    "temporary_credential": credential,
-                    "expires_at": expires,
-                }
+                return result
 
             try:
                 result = await asyncio.to_thread(write_reset)
                 await sessions.revoke_user(user_id)
                 if user_id != actor.id:
                     await current_admin(session)
-                return result
+                account, credential, expires = result
+                return {
+                    "account": await asyncio.to_thread(row, account),
+                    "temporary_credential": credential,
+                    "expires_at": expires,
+                }
             except (
                 UserRegistryStorageError,
                 UserRegistryLastAdministratorError,
