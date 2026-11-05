@@ -2185,3 +2185,36 @@ def test_rtsp_probe_ttl_capacity_and_logout_are_monotonic(product, rtsp, monkeyp
     assert _rtsp_probe(product).status_code == 200
     product.client.delete("/api/v1/operator/media-session", headers=product.headers)
     assert not product.app.state.operator_rtsp_probes._probes
+
+@pytest.mark.parametrize("blocked_read", ["get", "credential_status"])
+def test_slow_identity_registry_read_does_not_block_operator_event_loop(
+    product, monkeypatch, blocked_read
+):
+    """A locked identity database cannot freeze unrelated installed HTTP work."""
+    import time
+
+    assert product.client.get("/openapi.json").status_code == 200
+    entered, released = threading.Event(), threading.Event()
+    original = getattr(product.users, blocked_read)
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        if not released.wait(timeout=5):
+            raise AssertionError("Test-controlled identity read was never released")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(product.users, blocked_read, blocked)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            protected = executor.submit(
+                product.client.get, "/api/v1/operator/status", headers=product.headers
+            )
+            assert entered.wait(timeout=3), "The authenticated request never reached registry I/O"
+            started = time.monotonic()
+            liveness = executor.submit(product.client.get, "/openapi.json")
+            assert liveness.result(timeout=1.5).status_code == 200
+            assert time.monotonic() - started < 1.5
+            assert not protected.done(), "Identity read was not held during the liveness probe"
+        finally:
+            released.set()
+        assert protected.result(timeout=5).status_code == 200
