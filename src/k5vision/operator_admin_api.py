@@ -304,17 +304,26 @@ def install_operator_admin_api(
         response.headers["Cache-Control"] = "no-store"
         async with mutations:
             actor, _ = await mutation_admin(session)
-            account = target(user_id)
-            require_grant(app, actor, effective_permissions(app, account))
-            access = policy(payload, account.role)
-            try:
+
+            def update_camera_access():
+                # Camera membership checks, durable writes and response enrichment
+                # can read SQLite. Keep all existing authority checks inside the
+                # serialized mutation while leaving unrelated HTTP work responsive.
+                account = target(user_id)
+                require_grant(app, actor, effective_permissions(app, account))
+                access = policy(payload, account.role)
                 previous_access = users.get_camera_access(user_id)
                 users.set_camera_access(user_id, actor=actor.username, **access)
-                if access_identity(previous_access) != access_identity(access):
+                changed_authority = access_identity(previous_access) != access_identity(access)
+                return row(account), changed_authority
+
+            try:
+                result, changed_authority = await asyncio.to_thread(update_camera_access)
+                if changed_authority:
                     await sessions.revoke_user(user_id)
                     if user_id != actor.id:
                         await current_admin(session)
-                return row(account)
+                return result
             except (UserRegistryStorageError, ValueError) as error:
                 raise registry_error(error) from None
 
