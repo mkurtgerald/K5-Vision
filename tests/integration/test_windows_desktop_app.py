@@ -1779,12 +1779,68 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
     _require(button.is_enabled(), "Installed sampled-person control was not enabled")
     route = f"/api/v1/operator/cameras/{camera_id}/person-view"
     diagnostic["analytics_sample_stage"] = "native_frame_request"
-    with page.expect_response(
-        lambda response: response.request.method == "POST" and urlsplit(response.url).path == route,
-        timeout=20_000,
-    ) as first:
-        button.click()
-    response = first.value
+    # Observe only route identity and bounded finite counts/statuses. Never
+    # retain URLs, query parameters, upload pixels or request/response bodies.
+    traffic = {"requests": 0, "responses": 0, "failed": 0, "http_status": 0}
+
+    def is_sample(request):
+        return request.method == "POST" and urlsplit(request.url).path == route
+
+    def observed_request(request):
+        if is_sample(request):
+            traffic["requests"] = min(5, traffic["requests"] + 1)
+
+    def observed_response(response):
+        if is_sample(response.request):
+            traffic["responses"] = min(5, traffic["responses"] + 1)
+            traffic["http_status"] = (
+                response.status if response.status in {200, 400, 401, 403, 404, 408, 413, 415, 422, 429, 503} else 0
+            )
+
+    def observed_failure(request):
+        if is_sample(request):
+            traffic["failed"] = min(5, traffic["failed"] + 1)
+
+    page.on("request", observed_request)
+    page.on("response", observed_response)
+    page.on("requestfailed", observed_failure)
+    try:
+        with page.expect_response(
+            lambda response: is_sample(response.request),
+            timeout=20_000,
+        ) as first:
+            button.click()
+        response = first.value
+    except Exception:
+        diagnostic["analytics_sample_request_traffic"] = dict(traffic)
+        try:
+            diagnostic["analytics_sample_request_state"] = page.evaluate(
+                """() => {
+                  const message = document.getElementById('person-view-message')?.textContent || '';
+                  const video = document.getElementById('live-video');
+                  const button = document.getElementById('toggle-person-view');
+                  const classification = message.startsWith('Processing a sampled frame') ? 'processing'
+                    : message.startsWith('Person detection is busy') ? 'busy'
+                    : message.startsWith('Person detection is unavailable') ? 'unavailable'
+                    : message.startsWith('Sampled view stopped') ? 'stopped'
+                    : message.includes(' in this sample') ? 'sample_received'
+                    : 'other';
+                  return {
+                    message_class: classification,
+                    enabled: button?.getAttribute('aria-pressed') === 'true',
+                    sample_button_enabled: !!button && !button.disabled,
+                    live_playing: !!video && !video.paused && video.readyState >= 2,
+                    canvas_visible: !document.getElementById('person-view-canvas')?.hidden
+                  };
+                }"""
+            )
+        except Exception:
+            diagnostic["analytics_sample_request_state"] = {"available": False}
+        raise
+    finally:
+        page.remove_listener("request", observed_request)
+        page.remove_listener("response", observed_response)
+        page.remove_listener("requestfailed", observed_failure)
     _require(
         response.status == 200 and response.headers.get("cache-control") == "no-store",
         "Installed sampled-person response was refused or could be cached",
