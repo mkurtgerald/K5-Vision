@@ -191,6 +191,9 @@ def create_operator_product_app(
                         await analytics_task
             finally:
                 try:
+                    preparation = getattr(app.state, "operator_person_preparation", None)
+                    if preparation is not None:
+                        preparation.close()
                     if analytics is not None:
                         await analytics.aclose()
                 finally:
