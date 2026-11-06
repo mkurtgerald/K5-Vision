@@ -1292,7 +1292,6 @@ def test_second_product_application_cannot_start_workers_for_an_active_identity(
     _assert_profile_lease_available(tmp_path / "identity")
 
 
-
 def test_native_person_warmup_waits_for_quiet_camera_enrollment():
     from k5vision.operator_product_api import _NativePersonWarmupGate
 
