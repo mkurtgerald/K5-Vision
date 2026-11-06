@@ -1164,10 +1164,11 @@ def test_configured_person_broker_closes_even_when_recording_startup_fails(
     import k5vision.operator_analytics_person as person_module
 
     closed = []
+    view_limits = []
 
     class Broker:
-        def __init__(self, _config):
-            pass
+        def __init__(self, _config, *, max_views):
+            view_limits.append(max_views)
 
         async def aclose(self):
             closed.append(True)
@@ -1181,9 +1182,45 @@ def test_configured_person_broker_closes_even_when_recording_startup_fails(
     with pytest.raises(OperatorProductError, match="startup"):
         with TestClient(app):
             pass
+    assert view_limits == [4]
     assert closed == [True]
     assert calls == [("start", ()), ("stop", ())]
     assert app.state.operator_camera_store.closed
+    _assert_profile_lease_available(tmp_path / "identity")
+
+
+def test_bundled_person_model_enables_bounded_sampled_view_without_override(
+    native, tmp_path, monkeypatch
+):
+    import k5vision.operator_analytics as broker_module
+    import k5vision.operator_analytics_person as person_module
+
+    view_limits = []
+    closed = []
+
+    class Broker:
+        def __init__(self, _config, *, max_views):
+            view_limits.append(max_views)
+
+        async def expire_idle(self):
+            pass
+
+        async def aclose(self):
+            closed.append(True)
+
+    monkeypatch.delenv(person_module.PERSON_CONFIG_ENV, raising=False)
+    monkeypatch.setattr(
+        person_module, "load_installed_person_configuration", lambda _environment: object()
+    )
+    monkeypatch.setattr(broker_module, "OperatorAnalyticsBroker", Broker)
+    app, calls = _product_application(native, tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.get("/api/v1/health").status_code == 200
+        assert app.state.operator_person_status == "configured"
+        assert calls == [("start", ())]
+    assert view_limits == [1]
+    assert closed == [True]
+    assert calls == [("start", ()), ("stop",)]
     _assert_profile_lease_available(tmp_path / "identity")
 
 
