@@ -35,6 +35,13 @@ namespace K5VisionDesktop
                 return TimeAdministration.Execute(arguments[1], arguments[2]);
             if (arguments.Length == 1 && arguments[0] == "--installation-check")
                 return InstallationCheck();
+            if (arguments.Length == 1 && arguments[0] == "--installation-payload-check")
+            {
+                // Used by the actual Windows installer after file extraction.
+                // Verify sealed release bytes without opening a window or touching user state.
+                try { Custody.VerifyPayload(Path.GetDirectoryName(Application.ExecutablePath)); return 0; }
+                catch { return 1; }
+            }
             if (arguments.Length == 2 && arguments[0] == "--installation-identity")
             {
                 try
