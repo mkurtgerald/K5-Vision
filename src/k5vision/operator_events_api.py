@@ -58,11 +58,24 @@ def install_operator_events_api(
             raise HTTPException(503, "analytics_unavailable")
         return events
 
+    async def current_selection(token, camera_id: UUID) -> None:
+        """Authenticate and check current camera rights without caching a denial."""
+        try:
+            account, _ = await authenticate(token)
+            await asyncio.to_thread(authorized_selection, account, camera_id)
+        except HTTPException as error:
+            # FastAPI's exception handler creates a new response, so headers
+            # placed on the endpoint's Response are not used for revoked access.
+            raise HTTPException(
+                error.status_code,
+                error.detail,
+                headers={**(error.headers or {}), "Cache-Control": "no-store"},
+            ) from None
+
     @app.get(_PREFIX + "/{camera_id}/analytics", tags=["operator analytics"])
     async def analytics_status(camera_id: UUID, response: Response, session=session_dependency):
         response.headers["Cache-Control"] = "no-store"
-        account, _ = await authenticate(session[1])
-        await asyncio.to_thread(authorized_selection, account, camera_id)
+        await current_selection(session[1], camera_id)
         try:
             # Durable settings and summary reads use SQLite; keep the ASGI
             # loop available for live playback and unrelated operator traffic.
@@ -70,8 +83,7 @@ def install_operator_events_api(
         except OperatorEventsError:
             raise HTTPException(503, "analytics_unavailable") from None
         # A camera grant or session may have been revoked during the read.
-        current, _ = await authenticate(session[1])
-        await asyncio.to_thread(authorized_selection, current, camera_id)
+        await current_selection(session[1], camera_id)
         return snapshot
 
     @app.patch(_PREFIX + "/{camera_id}/analytics", tags=["operator analytics"])
@@ -107,8 +119,7 @@ def install_operator_events_api(
         session=session_dependency,
     ):
         response.headers["Cache-Control"] = "no-store"
-        account, _ = await authenticate(session[1])
-        await asyncio.to_thread(authorized_selection, account, camera_id)
+        await current_selection(session[1], camera_id)
         first, last = _range(start, end)
         try:
             # Bounded recorded-event history performs SQLite reads that can
@@ -123,6 +134,5 @@ def install_operator_events_api(
             )
         except OperatorEventsError:
             raise HTTPException(503, "analytics_unavailable") from None
-        current, _ = await authenticate(session[1])
-        await asyncio.to_thread(authorized_selection, current, camera_id)
+        await current_selection(session[1], camera_id)
         return snapshot
