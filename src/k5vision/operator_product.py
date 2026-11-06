@@ -85,11 +85,13 @@ def create_operator_product_app(
     analytics_status = "disabled"
     try:
         person_config = load_installed_person_configuration(os.environ)
-        if person_config is not None and PERSON_CONFIG_ENV in os.environ:
-            # Preserve the explicitly opted-in engineering sample overlay.
-            # Installed users get recorder-owned events without this second,
-            # browser-supplied inference path or another native CPU allocation.
-            analytics = OperatorAnalyticsBroker(person_config)
+        if person_config is not None:
+            # The sealed installed person model supports both recorder-owned
+            # background events and opt-in, transient, same-frame sample boxes.
+            # Limit the additional native view worker to one in installed mode;
+            # the engineering override retains its four-view test capacity.
+            views = 4 if PERSON_CONFIG_ENV in os.environ else 1
+            analytics = OperatorAnalyticsBroker(person_config, max_views=views)
             analytics_status = "configured"
     except OperatorPersonConfigurationError:
         # An optional rejected detector cannot prevent camera recording. It
