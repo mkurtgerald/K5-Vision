@@ -81,8 +81,10 @@ def decode(path: str):
 def main() -> int:
     detector = None
     artifact_root = None
+    phase = "protocol"
     try:
         while True:
+            phase = "protocol"
             raw = sys.stdin.buffer.readline(8193)
             if not raw:
                 return 0
@@ -105,6 +107,7 @@ def main() -> int:
                 return 1
             if artifact_root is not None and artifact_root != request["artifact_root"]:
                 return 1
+            phase = "decode"
             result = decode(request["path"])
             if result is None:
                 sys.stdout.buffer.write(b'{"status":"empty"}\n')
@@ -122,11 +125,14 @@ def main() -> int:
                     )
 
                     artifact_root = request["artifact_root"]
+                    phase = "model"
                     detector = _PersonDetector(OperatorPersonConfiguration(Path(artifact_root)))
+                phase = "inference"
                 detections = [
                     {"category": item.category, "confidence": item.confidence}
                     for item in detector.infer(pixels, 544, 320, 544 * 4, int(elapsed * 1000))
                 ]
+            phase = "protocol"
             header = json.dumps(
                 {
                     "status": "ready",
@@ -138,7 +144,15 @@ def main() -> int:
             sys.stdout.buffer.write(header + b"\n" + pixels)
             sys.stdout.buffer.flush()
     except BaseException:
-        # Native/module/filesystem exception details never cross the worker pipe.
+        # Send a fixed, source-free phase to the owning parent only. Never
+        # serialize exception text, model paths, source URIs or recording bytes.
+        try:
+            sys.stdout.buffer.write(
+                json.dumps({"status": "failed", "phase": phase}).encode("ascii") + b"\\n"
+            )
+            sys.stdout.buffer.flush()
+        except (OSError, ValueError):
+            pass
         return 1
 
 
