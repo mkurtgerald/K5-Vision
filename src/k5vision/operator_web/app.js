@@ -947,7 +947,7 @@
         stopPersonView("Person detection is unavailable. Live video and recording continue. Start sampled view to retry.");
         return;
       }
-      if (result.status === "busy") message("person-view-message", "Person detection is busy. Waiting for the next sample…");
+      if (result.status === "busy" && $("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
       else {
         // The response belongs to this exact frozen sample, never the moving
         // live player. Publish frame and boxes together in one canvas update.
@@ -967,7 +967,7 @@
       }
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.personEpoch || !state.token) return;
-      if (error.status === 429) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
+      if (error.status === 429 && $("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
       else stopPersonView(apiMessage(error, "Person detection is unavailable. Live video and recording continue. Start sampled view to retry."));
     } finally {
       pixels?.fill(0);
