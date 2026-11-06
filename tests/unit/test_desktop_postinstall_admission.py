@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_native_setup_verifies_bytes_during_extraction_and_exact_tree_before_success():
     setup = (ROOT / "windows/desktop/K5Vision.iss").read_text(encoding="utf-8")
     files = setup.split("[Files]", 1)[1].split("[Icons]", 1)[0]
-    assert files.index('Source: "{#PayloadRoot}\\*"' ) < files.index(
+    assert files.index('Source: "{#PayloadRoot}\\*"') < files.index(
         "AfterInstall: AdmitExtractedPayload"
     )
     assert 'DestDir: "{tmp}"' in files
