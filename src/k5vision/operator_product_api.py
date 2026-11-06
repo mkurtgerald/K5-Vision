@@ -291,6 +291,48 @@ def _media_selection(uri: str) -> str:
     return path
 
 
+class _NativePersonWarmupGate:
+    """Compile the optional sealed model only after camera setup has been quiet.
+
+    A busy installer may enroll several ONVIF cameras consecutively. Starting
+    CPU-heavy native model compilation after camera one can contend with camera
+    two's credential/profile deadline. Only a timer is retained: no camera,
+    frame, credential, source URI or human identity is captured.
+    """
+
+    def __init__(self, analytics, *, quiet_seconds: float = 18.0):
+        if not 0 < quiet_seconds <= 30:
+            raise ValueError("Native preparation quiet period is invalid")
+        self._analytics = analytics
+        self._quiet_seconds = quiet_seconds
+        self._handle: asyncio.TimerHandle | None = None
+        self._started = False
+        self._closed = False
+
+    def schedule(self, *, enrollment: bool = False) -> None:
+        if self._closed or self._started:
+            return
+        if self._handle is not None:
+            if not enrollment:
+                return
+            self._handle.cancel()
+        self._handle = asyncio.get_running_loop().call_later(
+            self._quiet_seconds, self._begin
+        )
+
+    def _begin(self) -> None:
+        self._handle = None
+        if not self._closed and not self._started:
+            self._started = True
+            self._analytics.start_preparing()
+
+    def close(self) -> None:
+        self._closed = True
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+
+
 def install_operator_product_api(
     app: FastAPI,
     *,
@@ -321,6 +363,10 @@ def install_operator_product_api(
         raise ValueError("operator accounts belong to another site")
     mutations = asyncio.Lock()
     person_slots = asyncio.Semaphore(4)
+    native_person_preparation = (
+        _NativePersonWarmupGate(analytics) if prepare_native_person_on_camera else None
+    )
+    app.state.operator_person_preparation = native_person_preparation
     seen_live: set[UUID] = set()
     connection_started: dict[UUID, float] = {}
     recording_started: dict[UUID, float] = {}
@@ -773,11 +819,10 @@ def install_operator_product_api(
             "worker_status": service.status(),
             "capabilities": await asyncio.to_thread(capabilities, current),
         }
-        # No native model compilation during a fresh account's startup/login.
-        # Only an authenticated view of enrolled cameras schedules optional
-        # media-free preparation; authorization and response data are unchanged.
-        if selected and prepare_native_person_on_camera:
-            analytics.start_preparing()
+        # Do not compete with consecutive ONVIF credential/profile probes.
+        # The optional sealed model starts after a quiet camera setup interval.
+        if selected and native_person_preparation is not None:
+            native_person_preparation.schedule()
         return result
 
     async def enroll_camera_source(
@@ -886,10 +931,10 @@ def install_operator_product_api(
             except (DeviceRegistryStorageError, RuntimeError, OSError, ValueError):
                 raise HTTPException(503, "Camera configuration unavailable") from None
         result = await camera_view(source)
-        # The first successfully enrolled camera can now use the sealed native
-        # model without competing with GUI account creation and authentication.
-        if prepare_native_person_on_camera:
-            analytics.start_preparing()
+        # A later enrollment resets the quiet period so native CPU model
+        # compilation cannot collide with the next camera's ONVIF probe.
+        if native_person_preparation is not None:
+            native_person_preparation.schedule(enrollment=True)
         return result
 
     @app.post(_PREFIX + "/cameras", status_code=201, tags=["operator"])
