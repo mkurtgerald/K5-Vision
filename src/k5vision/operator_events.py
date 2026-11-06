@@ -824,18 +824,15 @@ class OperatorEventService:
             state["status"] = "waiting"
             # Finite status vocabulary, independent of local recording identity.
             outcome = getattr(self._sampler, "_capture_outcome", "no_frame")
-            state["sample_phase"] = (
-                outcome
-                if outcome in {
-                    "closing",
-                    "recording_directory_absent",
-                    "inventory_unavailable",
-                    "baseline",
-                    "no_growth",
-                    "no_decoded_frame",
-                }
-                else "no_frame"
-            )
+            safe_outcomes = {
+                "closing",
+                "recording_directory_absent",
+                "inventory_unavailable",
+                "baseline",
+                "no_growth",
+                "no_decoded_frame",
+            }
+            state["sample_phase"] = outcome if outcome in safe_outcomes else "no_frame"
             return
         if sample.detections is not None:
             detections = sample.detections
