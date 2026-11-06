@@ -330,12 +330,40 @@ def _uncheck_launch(api, controls):
     return False
 
 
+def _classify_installer_modal(api, forms, diagnostic):
+    """Classify only finite modal evidence; never retain window text or paths."""
+    for form in forms:
+        if api.class_name(form) not in {"#32770", "TMessageForm", "TTaskDialog"}:
+            continue
+        if not api.api.IsWindowVisible(form):
+            continue
+        diagnostic["installer_modal_visible"] = True
+        children = api.windows(form)
+        diagnostic["installer_modal_controls"] = min(64, len(children))
+        # Window labels may contain local installation paths. Inspect in memory
+        # for fixed phrases, and emit only this bounded, non-identifying code.
+        labels = [api.text(form), *(api.text(child) for child in children[:64])]
+        message = " ".join(labels).casefold()
+        if "could not verify the installed application" in message:
+            diagnostic["installer_modal_classification"] = "payload_refusal"
+        elif "still running" in message or "another setup" in message:
+            diagnostic["installer_modal_classification"] = "active_instance"
+        elif "file" in message and ("in use" in message or "access" in message):
+            diagnostic["installer_modal_classification"] = "file_access"
+        else:
+            diagnostic["installer_modal_classification"] = "unclassified"
+        return
+
+
 def _install_gui(setup, installed, api, *, diagnostic=None):
     """Drive the actual Inno wizard without suppressing its user interface."""
     __tracebackhide__ = True
     diagnostic = {} if diagnostic is None else diagnostic
     diagnostic.update(
-        installer_action="starting", installer_install_posted=False, installer_next_clicks=0
+        installer_action="starting",
+        installer_install_posted=False,
+        installer_next_clicks=0,
+        installer_modal_visible=False,
     )
     process = subprocess.Popen(
         [
@@ -357,6 +385,8 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
             root = psutil.Process(process.pid)
             pids = {root.pid, *(child.pid for child in root.children(recursive=True))}
             forms = [window for window in api.windows() if api.pid(window) in pids]
+            if diagnostic["installer_install_posted"]:
+                _classify_installer_modal(api, forms, diagnostic)
             for form in forms:
                 controls = [
                     window
