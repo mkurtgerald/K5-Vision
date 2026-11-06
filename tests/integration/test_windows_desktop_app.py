@@ -2233,6 +2233,7 @@ def _vm_clock_phase(
                 )
                 mark_clock_phase(direction + "_two_maintenance_cycles")
                 diagnostic["vm_clock_stage"] = direction + "_live"
+                diagnostic["vm_clock_stage"] = direction + "_live_media"
                 live_status = context.request.get(live_url, timeout=5000).status
                 diagnostic["vm_clock_media_http_status"] = live_status
                 _require(live_status == 200, "VM clock step expired authenticated live media")
@@ -2240,6 +2241,7 @@ def _vm_clock_phase(
                     page.locator("#workspace").is_visible(),
                     "VM clock step signed out the browser's existing human session",
                 )
+                diagnostic["vm_clock_stage"] = direction + "_live_decode"
                 frames_before = browser_helpers._decoded_color(page, "live-video", "red")
                 page.wait_for_function(
                     """before => {
@@ -2251,6 +2253,7 @@ def _vm_clock_phase(
                     timeout=10_000,
                 )
                 frames_after = browser_helpers._decoded_color(page, "live-video", "red")
+                diagnostic["vm_clock_stage"] = direction + "_recording_progress"
                 recording = {}
                 _wait(
                     lambda before=bytes_before, result=recording: _tray_recording(
@@ -2282,12 +2285,14 @@ def _vm_clock_phase(
                         for span in spans
                     )
 
+                diagnostic["vm_clock_stage"] = direction + "_history_poll"
                 _wait(
                     shifted_history,
                     "VM clock shifted recorder UTC history query",
                     process=app,
                     timeout=10,
                 )
+                diagnostic["vm_clock_stage"] = direction + "_events_fetch"
                 retained_events = client.json(route + "/events")["events"]
                 _require(
                     any(
@@ -3164,27 +3169,36 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         admin_executor = None
         if vm_clock_enabled:
             _enter_stage("actual_vm_clock_changes")
-            receipt["vm_clock"] = _vm_clock_phase(
-                page=page,
-                context=context,
-                client=client,
-                profile=profile,
-                camera_id=camera_id,
-                parent=parent,
-                processes=processes,
-                source_uri=source_uri,
-                ffmpeg=ffmpeg,
-                ffprobe=ffprobe,
-                helpers=helpers,
-                browser_helpers=browser_helpers,
-                app=app,
-                setup_sha256=setup_sha256,
-                diagnostic=vm_clock_diagnostic,
-                publisher=publishers[0],
-                camera_directory=camera_directories[0],
-                publisher_credentials=primary_publisher_credentials,
-                analytics_event=analytics_event,
-            )
+            try:
+                receipt["vm_clock"] = _vm_clock_phase(
+                    page=page,
+                    context=context,
+                    client=client,
+                    profile=profile,
+                    camera_id=camera_id,
+                    parent=parent,
+                    processes=processes,
+                    source_uri=source_uri,
+                    ffmpeg=ffmpeg,
+                    ffprobe=ffprobe,
+                    helpers=helpers,
+                    browser_helpers=browser_helpers,
+                    app=app,
+                    setup_sha256=setup_sha256,
+                    diagnostic=vm_clock_diagnostic,
+                    publisher=publishers[0],
+                    camera_directory=camera_directories[0],
+                    publisher_credentials=primary_publisher_credentials,
+                    analytics_event=analytics_event,
+                )
+            except RuntimeError:
+                # The local transport records only bounded type/timing classes.
+                # Never retain camera routes, credential tokens or source addresses.
+                if client.transport_failure is not None:
+                    vm_clock_diagnostic["vm_clock_transport_failure"] = dict(
+                        client.transport_failure
+                    )
+                raise
             receipt["host_clock_step_acceptance"] = True
         _enter_stage("installed_analytics_permissions")
         permissions_executor = ThreadPoolExecutor(max_workers=1)
