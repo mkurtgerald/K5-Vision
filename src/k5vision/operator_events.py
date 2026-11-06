@@ -801,9 +801,7 @@ class OperatorEventService:
         # Preserve the finite parent/child hierarchy on the first compiled
         # person frame (18s child + 2s termination margin). The installed GUI
         # event acceptance deadline remains the unchanged 25 seconds.
-        wait_seconds = (
-            20 if getattr(self._sampler, "_configuration", None) is not None else 12
-        )
+        wait_seconds = 20 if getattr(self._sampler, "_configuration", None) is not None else 12
         sample = await asyncio.wait_for(asyncio.shield(wrapped), wait_seconds)
         if sample is None:
             state["status"] = "waiting"
