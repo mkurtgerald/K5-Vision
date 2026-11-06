@@ -23,6 +23,24 @@ _CAMERA = "e4fd401d-ae8e-4ac2-9f92-e8287f241532"
 _OTHER = "2cad3cbb-c56a-4368-b3e6-e5032576b77a"
 
 
+def test_busy_person_sample_preserves_last_verified_canvas_until_new_active_sample():
+    """A transient native-capacity busy response has no boxes to redraw."""
+    source = (
+        Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js"
+    ).read_text(encoding="utf-8")
+    busy_branch = 'if (result.status === "busy") {'
+    assert source.count(busy_branch) == 1
+    after_busy = source.split(busy_branch, 1)[1]
+    busy_body, active_body = after_busy.split("} else {", 1)
+    assert '"person-view-canvas").hidden' in busy_body
+    assert "putImageData" not in busy_body
+    assert "canvas.width =" not in busy_body
+    assert "output.putImageData(snapshot, 0, 0);" in active_body
+    assert "output.strokeRect" in active_body
+
+
+
+
 def _ui_core(account):
     return {
         "id": account.get("id", "a22c22bc-4089-45b7-a370-f360bb9d33c0"),
