@@ -384,6 +384,52 @@ def test_stalled_owned_native_worker_is_killed_and_reaped_before_next_launch(mon
     worker.close()
 
 
+def test_recorded_person_native_cold_budget_becomes_steady_only_after_valid_ack(
+    monkeypatch, tmp_path
+):
+    import io
+    import json
+
+    import k5vision.operator_events as module
+
+    worker = module._RecordedNativeWorker(
+        SimpleNamespace(artifact_root=tmp_path / "private-model")
+    )
+    assert worker._request_timeout() == 18.0
+    assert module._NATIVE_REQUEST_SECONDS == 8.0
+    assert module._NATIVE_COLD_PERSON_REQUEST_SECONDS < 20
+
+    # A complete real-shaped native response, including zero detections, proves
+    # that the owned child reached native model inference. No camera media is used.
+    pixels = bytes(544 * 320 * 4)
+    header = json.dumps(
+        {"status": "ready", "elapsed": 1.5, "bytes": len(pixels), "detections": []}
+    ).encode("ascii") + b"\\n"
+
+    class Process:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(header + pixels)
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 0
+
+    process = Process()
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", process))
+    elapsed, output, detections = worker.request(tmp_path / "private-snapshot.mp4")
+    assert (elapsed, len(output), detections) == (1.5, len(pixels), ())
+    assert worker._request_timeout() == module._NATIVE_REQUEST_SECONDS
+    worker.close()
+
+    # Source-only decoding has no model-compilation exception.
+    assert module._RecordedNativeWorker(None)._request_timeout() == 8.0
+
+
 def test_closed_native_worker_permanently_refuses_another_birth(monkeypatch, tmp_path):
     import k5vision.operator_events as module
 
