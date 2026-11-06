@@ -1220,7 +1220,7 @@ def test_bundled_person_model_enables_bounded_sampled_view_without_override(
         assert calls == [("start", ())]
     assert view_limits == [1]
     assert closed == [True]
-    assert calls == [("start", ()), ("stop",)]
+    assert calls == [("start", ()), ("stop", ())]
     _assert_profile_lease_available(tmp_path / "identity")
 
 
