@@ -127,10 +127,10 @@ def _gui_completion(process, reject: bool):
                 if reject:
                     assert "k5 vision installation failed" in text
                     assert "do not use this installation" in text
-                    assert "has been installed" not in text
+                    assert "setup has finished installing" not in text
                     assert not any(api.class_name(w) == "TNewCheckListBox" for w in controls)
                 else:
-                    assert "has been installed" in text
+                    assert "setup has finished installing" in text
                 api.click(captions["finish"])
                 continue
             if "i accept the agreement" in captions:
