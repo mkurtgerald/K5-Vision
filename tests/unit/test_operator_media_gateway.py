@@ -61,17 +61,19 @@ def test_fixed_gateway_authorizes_each_media_request_before_private_proxy(assets
                 yield from proxies(child)
 
     worker_proxies = list(proxies(document))
-    assert len(worker_proxies) == 8
+    assert len(worker_proxies) == 9
     for proxy in worker_proxies:
         # Every route must retire pooled connections before Uvicorn's 5s
         # idle limit; a failed mutation is never replayed as a workaround.
         transport = proxy["transport"]
         assert transport["keep_alive"] == {"idle_timeout": "2s"}
         assert transport["max_conns_per_host"] == 32
-        assert transport["read_timeout"] in {"15s", "80s"}
+        assert transport["read_timeout"] in {"15s", "23s", "80s"}
         assert transport["write_timeout"] == "10s"
-        if transport["read_timeout"] == "80s":
-            assert transport["response_header_timeout"] == "80s"
+        if transport["read_timeout"] in {"23s", "80s"}:
+            assert transport["response_header_timeout"] == transport["read_timeout"]
+        else:
+            assert transport["response_header_timeout"] == "10s"
         assert not any(key.startswith("lb_try") for key in proxy)
     assert document["admin"] == {"disabled": True}
     server = document["apps"]["http"]["servers"]["operator"]
@@ -128,6 +130,7 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
         "/api/v1/operator/cameras/*/time",
         "/api/v1/operator/cameras/*/time/*",
         "/api/v1/auth/oidc/*",
+        "/api/v1/operator/cameras/*/person-view",
         "/api/*",
         "/media/exports/*",
         "/media/hls.js",
@@ -159,6 +162,35 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
     assert javascript["headers"]["request"]["delete"] == ["Cookie", "Authorization"]
     assert routes[-1]["handle"] == [{"handler": "static_response", "status_code": 404}]
     assert "browse" not in _configuration(assets)
+
+
+def test_cold_native_person_sampling_uses_bounded_dedicated_proxy(assets):
+    document = json.loads(_configuration(assets))
+    routes = document["apps"]["http"]["servers"]["operator"]["routes"]
+    matched = [
+        (index, route)
+        for index, route in enumerate(routes)
+        if route.get("match")
+        == [{"method": ["POST"], "path": ["/api/v1/operator/cameras/*/person-view"]}]
+    ]
+    assert len(matched) == 1
+    index, route = matched[0]
+    assert index < next(
+        i for i, value in enumerate(routes) if value.get("match") == [{"path": ["/api/*"]}]
+    )
+    assert route["terminal"] is True
+    assert len(route["handle"]) == 1
+    sample = route["handle"][0]
+    assert sample["handler"] == "reverse_proxy"
+    assert sample["upstreams"] == [{"dial": "127.0.0.1:18081"}]
+    assert "rewrite" not in sample and "headers" not in sample
+    assert sample["transport"]["response_header_timeout"] == "23s"
+    assert sample["transport"]["read_timeout"] == "23s"
+    assert sample["transport"]["write_timeout"] == "10s"
+    generic = routes[index + 1]
+    assert generic["match"] == [{"path": ["/api/*"]}]
+    assert generic["handle"][0]["transport"]["response_header_timeout"] == "10s"
+    assert generic["handle"][0]["transport"]["read_timeout"] == "15s"
 
 
 def test_export_files_only_reach_the_application_authority(assets):
