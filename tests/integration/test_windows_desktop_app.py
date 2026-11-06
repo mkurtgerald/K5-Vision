@@ -1808,6 +1808,22 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
     def observed_failure(request):
         if is_sample(request):
             traffic["failed"] = min(5, traffic["failed"] + 1)
+            if first_sent_at[0] is not None:
+                traffic["first_failure_ms"] = min(
+                    120000, max(0, int((time.monotonic() - first_sent_at[0]) * 1000))
+                )
+            # Preserve only a finite transport classification, never the
+            # request URL, uploaded frame, headers or browser exception text.
+            failure = request.failure
+            traffic["failure_class"] = (
+                "aborted"
+                if failure == "net::ERR_ABORTED"
+                else "timed_out"
+                if failure == "net::ERR_TIMED_OUT"
+                else "connection_closed"
+                if failure in {"net::ERR_CONNECTION_CLOSED", "net::ERR_CONNECTION_RESET"}
+                else "other"
+            )
 
     page.on("request", observed_request)
     page.on("response", observed_response)
@@ -1834,7 +1850,11 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
                     ? 'processing'
                     : message.startsWith('Person detection is busy') ? 'busy'
                     : message.startsWith('Person detection is unavailable') ? 'unavailable'
-                    : message.startsWith('Sampled view stopped') ? 'stopped'
+                    : message.startsWith('Sampled view stopped while live video is paused') ? 'paused'
+                    : message.startsWith('Sampled view stopped while live video is buffering') ? 'buffering'
+                    : message.startsWith('Sampled view stopped while live video is unavailable') ? 'video_unavailable'
+                    : message.startsWith('Sampled view stopped while the camera is unavailable') ? 'camera_unavailable'
+                    : message.startsWith('Sampled view stopped') ? 'stopped_other'
                     : message.includes(' in this sample') ? 'sample_received'
                     : 'other';
                   return {
