@@ -1850,10 +1850,14 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
                     ? 'processing'
                     : message.startsWith('Person detection is busy') ? 'busy'
                     : message.startsWith('Person detection is unavailable') ? 'unavailable'
-                    : message.startsWith('Sampled view stopped while live video is paused') ? 'paused'
-                    : message.startsWith('Sampled view stopped while live video is buffering') ? 'buffering'
-                    : message.startsWith('Sampled view stopped while live video is unavailable') ? 'video_unavailable'
-                    : message.startsWith('Sampled view stopped while the camera is unavailable') ? 'camera_unavailable'
+                    : message.startsWith('Sampled view stopped while live video is paused')
+                      ? 'paused'
+                    : message.startsWith('Sampled view stopped while live video is buffering')
+                      ? 'buffering'
+                    : message.startsWith('Sampled view stopped while live video is unavailable')
+                      ? 'video_unavailable'
+                    : message.startsWith('Sampled view stopped while the camera is unavailable')
+                      ? 'camera_unavailable'
                     : message.startsWith('Sampled view stopped') ? 'stopped_other'
                     : message.includes(' in this sample') ? 'sample_received'
                     : 'other';
