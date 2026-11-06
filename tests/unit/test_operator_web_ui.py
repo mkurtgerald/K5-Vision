@@ -25,9 +25,9 @@ _OTHER = "2cad3cbb-c56a-4368-b3e6-e5032576b77a"
 
 def test_busy_person_sample_preserves_last_verified_canvas_until_new_active_sample():
     """A transient native-capacity busy response has no boxes to redraw."""
-    source = (
-        Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js"
-    ).read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
     busy_branch = 'if (result.status === "busy") {'
     assert source.count(busy_branch) == 1
     after_busy = source.split(busy_branch, 1)[1]
@@ -37,8 +37,6 @@ def test_busy_person_sample_preserves_last_verified_canvas_until_new_active_samp
     assert "canvas.width =" not in busy_body
     assert "output.putImageData(snapshot, 0, 0);" in active_body
     assert "output.strokeRect" in active_body
-
-
 
 
 def _ui_core(account):
