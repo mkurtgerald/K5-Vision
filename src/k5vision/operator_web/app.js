@@ -10,6 +10,7 @@
   const TIME_SAMPLE_MAX_AGE = 30000;
   const RETRY_DELAYS = [1000, 2000, 4000, 8000, 10000];
   const PERSON_BUFFER_GRACE_MS = 5000;
+  const CAMERA_PROFILE_REQUEST_MS = 20000;
   const ROLE_PERMISSIONS = Object.freeze({
     viewer: ["cameras.view_live", "cameras.playback"],
     operator: ["cameras.view_live", "cameras.playback", "cameras.export"],
@@ -2338,6 +2339,9 @@
     try {
       const tested = await request(direct ? "/api/v1/operator/camera-stream-probe" : "/api/v1/operator/camera-profiles", {
         method: "POST", body: credentials, signal: controller.signal,
+        // Allow the bounded native ONVIF probe and 18-second proxy budget to finish.
+        // RTSP probe and all other API requests retain the normal 15-second limit.
+        ...(direct ? {} : { timeout: CAMERA_PROFILE_REQUEST_MS }),
       });
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       if (typeof tested.probe_id !== "string" || !tested.probe_id || tested.probe_id.length > 256 || tested.probe_id.includes("://") ||

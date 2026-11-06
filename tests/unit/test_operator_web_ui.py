@@ -508,6 +508,13 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
               // Playback itself is qualified by the actual media acceptance.
               // Keep the authentic media-session DTO while disabling transport.
               window.Hls = {isSupported: () => false};
+              // Capture actual production request deadlines, without clock sleeps.
+              window.__k5RequestDeadlines = [];
+              const realDeadline = AbortSignal.timeout.bind(AbortSignal);
+              AbortSignal.timeout = (ms) => {
+                window.__k5RequestDeadlines.push(ms);
+                return realDeadline(ms);
+              };
               const RealDate = Date;
               window.Date = class extends RealDate {
                 constructor(...args) { super(...(args.length ? args : [RealDate.now() + shift])); }
@@ -797,6 +804,9 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
         expect(page.locator("#sign-in")).to_be_visible()
         expect(notice).not_to_be_visible()
         assert calls == {"profiles": 2, "connect": 1}
+        # Both ONVIF profile probes use the finite 20s UI budget; the
+        # installed backend may legitimately use most of its 12s socket limit.
+        assert page.evaluate("window.__k5RequestDeadlines.filter(ms => ms === 20000).length") >= 2
         assert not script_errors
     finally:
         if context is not None:

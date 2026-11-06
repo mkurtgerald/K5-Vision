@@ -263,15 +263,43 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
     """Use actual credential/profile controls without entering a stream address."""
     __tracebackhide__ = True
     source_requests = []
+    discovery_completed = False
+    diagnostic = {} if diagnostic is None else diagnostic
+    # A previous camera may have succeeded before this one fails. Never
+    # report that previous camera's HTTP 200 as this camera's response.
+    diagnostic.pop("onvif_profiles_http_status", None)
+    diagnostic["onvif_profiles_request_dispatched"] = False
+    diagnostic["onvif_profiles_response_headers"] = False
+    diagnostic["onvif_profiles_request_finished"] = False
+    diagnostic["onvif_profiles_request_failed"] = False
+
+    def profile_request(request):
+        return request.method == "POST" and urlsplit(request.url).path == "/api/v1/operator/camera-profiles"
 
     def observe(request):
         material = request.url + (request.post_data or "")
         if "rtsp://" in material.lower() or '"source_uri"' in material:
             source_requests.append(True)
+        if profile_request(request):
+            diagnostic["onvif_profiles_request_dispatched"] = True
+
+    def observe_profile_response(response):
+        if profile_request(response.request):
+            diagnostic["onvif_profiles_response_headers"] = True
+            diagnostic["onvif_profiles_http_status"] = response.status
+
+    def observe_profile_finished(request):
+        if profile_request(request):
+            diagnostic["onvif_profiles_request_finished"] = True
+
+    def observe_profile_failed(request):
+        if profile_request(request):
+            diagnostic["onvif_profiles_request_failed"] = True
 
     page.on("request", observe)
-    discovery_completed = False
-    diagnostic = {} if diagnostic is None else diagnostic
+    page.on("response", observe_profile_response)
+    page.on("requestfinished", observe_profile_finished)
+    page.on("requestfailed", observe_profile_failed)
     try:
         diagnostic["onvif_enrollment_step"] = "open_dialog"
         page.locator("#add-camera-button").click()
@@ -390,6 +418,9 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
         return camera, discovery_completed
     finally:
         page.remove_listener("request", observe)
+        page.remove_listener("response", observe_profile_response)
+        page.remove_listener("requestfinished", observe_profile_finished)
+        page.remove_listener("requestfailed", observe_profile_failed)
 
 
 def _rtsp_enroll(
