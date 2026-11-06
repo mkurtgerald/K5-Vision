@@ -364,6 +364,12 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                     if api.api.IsWindowVisible(window) and api.api.IsWindowEnabled(window)
                 ]
                 captions = {_normalized_caption(api.text(window)): window for window in controls}
+                if any(
+                    caption.startswith("k5 vision could not verify the installed application")
+                    for caption in captions
+                ):
+                    diagnostic["installer_action"] = "payload_admission_refused"
+                    pytest.fail("Installer rejected the extracted sealed payload", pytrace=False)
                 if "i accept the agreement" in captions:
                     diagnostic["installer_action"] = "accept_license"
                     api.click(captions["i accept the agreement"])
@@ -3259,6 +3265,27 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         retained_samples = [
             (path, hashlib.sha256(path.read_bytes()).digest()) for path in saved_files[:3]
         ]
+        # Re-admit the exact installed sealed tree after real recording and
+        # shutdown. This distinguishes a runtime-created foreign file from a
+        # verifier rejection that only occurs during Inno's second extraction.
+        try:
+            payload_check = subprocess.run(
+                [str(installed / "K5Vision.exe"), "--installation-payload-check"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=90,
+            ).returncode
+        except subprocess.TimeoutExpired:
+            payload_check = -1
+        readiness_diagnostic["stopped_payload_precheck"] = (
+            "admitted" if payload_check == 0 else "refused"
+        )
+        _require(
+            payload_check == 0,
+            "Stopped installed payload could not be re-admitted before reinstall",
+        )
         _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
         _require(
             identity_state.load_identity_state(profile / "identity").site_id == identity.site_id,
