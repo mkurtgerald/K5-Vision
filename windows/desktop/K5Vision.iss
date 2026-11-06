@@ -44,8 +44,9 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "{#PayloadRoot}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; This admitted copy runs before any existing installation is trusted.
 Source: "{#PayloadRoot}\K5Vision.exe"; DestName: "K5VisionInstallGuard.exe"; Flags: dontcopy
-; Runs after all product files were extracted but before Setup finalizes its
-; uninstall log, so a failed payload admission cannot be reported as success.
+; Two-phase admission: each sealed file and its ACL is checked during
+; extraction, then the entire installed tree is rechecked after uninstall log
+; finalization and before Setup may display success.
 Source: "{#PayloadRoot}\payload-manifest.json"; DestDir: "{tmp}"; DestName: "k5-install-seal.json"; Flags: deleteafterinstall; AfterInstall: AdmitExtractedPayload
 
 [Icons]
@@ -152,17 +153,26 @@ var
   ExitCode: Integer;
 begin
   // File extraction is complete, but the uninstaller log is not yet finalized.
-  // Check the *installed* manifest, every included hash and the sealed tree.
-  // Reject the candidate before the Setup success/activation phase.
-  if not Exec(ExpandConstant('{app}\K5Vision.exe'), '--installation-payload-check', '',
+  // Check all installed sealed bytes, owner and ACL before log commit.
+  // Inno may still have in-flight uninstall files here. The final strict-tree
+  // admission below cannot tolerate any unlisted installed file.
+  if not Exec(ExpandConstant('{app}\K5Vision.exe'), '--installation-extraction-check', '',
     SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
     RaiseException('K5 Vision could not verify the installed application. Your account and recordings were preserved.');
 end;
 
 procedure CurStepChanged(Step: TSetupStep);
+var
+  ExitCode: Integer;
 begin
-  // A successful file-admission check was required during [Files] extraction.
-  if Step = ssPostInstall then ReleaseInstallationLease();
+  if Step = ssPostInstall then begin
+    // Inno's uninstall bookkeeping has been finalized. Reject any remaining
+    // unlisted installed file, before the Finish page can report success.
+    if not Exec(ExpandConstant('{app}\K5Vision.exe'), '--installation-payload-check', '',
+      SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
+      RaiseException('K5 Vision could not verify the installed application. Your account and recordings were preserved.');
+    ReleaseInstallationLease();
+  end;
 end;
 
 procedure DeinitializeSetup();
