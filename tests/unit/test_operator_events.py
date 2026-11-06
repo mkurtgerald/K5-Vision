@@ -392,9 +392,7 @@ def test_recorded_person_native_cold_budget_becomes_steady_only_after_valid_ack(
 
     import k5vision.operator_events as module
 
-    worker = module._RecordedNativeWorker(
-        SimpleNamespace(artifact_root=tmp_path / "private-model")
-    )
+    worker = module._RecordedNativeWorker(SimpleNamespace(artifact_root=tmp_path / "private-model"))
     assert worker._request_timeout() == 18.0
     assert module._NATIVE_REQUEST_SECONDS == 8.0
     assert module._NATIVE_COLD_PERSON_REQUEST_SECONDS < 20
@@ -402,9 +400,12 @@ def test_recorded_person_native_cold_budget_becomes_steady_only_after_valid_ack(
     # A complete real-shaped native response, including zero detections, proves
     # that the owned child reached native model inference. No camera media is used.
     pixels = bytes(544 * 320 * 4)
-    header = json.dumps(
-        {"status": "ready", "elapsed": 1.5, "bytes": len(pixels), "detections": []}
-    ).encode("ascii") + b"\n"
+    header = (
+        json.dumps(
+            {"status": "ready", "elapsed": 1.5, "bytes": len(pixels), "detections": []}
+        ).encode("ascii")
+        + b"\n"
+    )
 
     class Process:
         stdin = io.BytesIO()
