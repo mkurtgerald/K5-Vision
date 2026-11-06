@@ -404,7 +404,7 @@ def test_recorded_person_native_cold_budget_becomes_steady_only_after_valid_ack(
     pixels = bytes(544 * 320 * 4)
     header = json.dumps(
         {"status": "ready", "elapsed": 1.5, "bytes": len(pixels), "detections": []}
-    ).encode("ascii") + b"\\n"
+    ).encode("ascii") + b"\n"
 
     class Process:
         stdin = io.BytesIO()
