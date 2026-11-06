@@ -316,9 +316,7 @@ class _NativePersonWarmupGate:
             if not enrollment:
                 return
             self._handle.cancel()
-        self._handle = asyncio.get_running_loop().call_later(
-            self._quiet_seconds, self._begin
-        )
+        self._handle = asyncio.get_running_loop().call_later(self._quiet_seconds, self._begin)
 
     def _begin(self) -> None:
         self._handle = None
