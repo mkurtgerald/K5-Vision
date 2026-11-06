@@ -1808,8 +1808,11 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
     page.on("requestfailed", observed_failure)
     try:
         with page.expect_response(
-            lambda response: is_sample(response.request),
-            timeout=20_000,
+            # The product explicitly treats transient HTTP 429 as busy and retries.
+            # Only accept a real successful inference response; the positive
+            # same-frame box and canvas checks below remain mandatory.
+            lambda response: is_sample(response.request) and response.status == 200,
+            timeout=27_000,
         ) as first:
             button.click()
         response = first.value
@@ -1844,6 +1847,10 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
         page.remove_listener("request", observed_request)
         page.remove_listener("response", observed_response)
         page.remove_listener("requestfailed", observed_failure)
+    diagnostic["analytics_sample_request_traffic"] = dict(traffic)
+    diagnostic["analytics_sample_response_no_store"] = (
+        response.headers.get("cache-control") == "no-store"
+    )
     _require(
         response.status == 200 and response.headers.get("cache-control") == "no-store",
         "Installed sampled-person response was refused or could be cached",

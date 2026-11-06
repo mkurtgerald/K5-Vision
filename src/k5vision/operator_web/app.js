@@ -934,7 +934,7 @@
       const frameId = state.personFrameId = (state.personFrameId + 1) % 2147483648;
       const query = new URLSearchParams({ width: String(width), height: String(height), frame_id: String(frameId) });
       const result = await request(`/api/v1/operator/cameras/${encodeURIComponent(cameraId)}/person-view?${query}`, {
-        method: "POST", rawBody: pixels, signal: controller.signal,
+        method: "POST", rawBody: pixels, signal: controller.signal, timeout: 24000,
       });
       if (epoch !== state.personEpoch || !state.personEnabled || cameraId !== state.selected || !canSamplePerson()) return;
       if (!result || result.frame_id !== frameId || !["active", "busy", "unavailable"].includes(result.status)
