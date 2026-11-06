@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import socket
@@ -378,7 +379,17 @@ def _classify_installed_seal_refusal(installed):
                 return "unbounded_installed_tree"
             if file.is_file():
                 observed.add(file.relative_to(installed).as_posix().casefold())
-        if observed - declared - allowed:
+        extras = observed - declared - allowed
+        if extras:
+            # Inno may reserve or create additional uninstall siblings during an
+            # upgrade. Report only a fixed class; never disclose their names or
+            # trust these files in the product verifier.
+            if all(re.fullmatch(r"unins[0-9]{3}\.(?:exe|dat|msg|tmp)", name) for name in extras):
+                return "inno_uninstaller_sibling"
+            if all(re.fullmatch(r"unins[0-9]{3}\.(?:tmp|new|old)", name) for name in extras):
+                return "inno_uninstaller_transient"
+            if any(name.startswith("runtime/") or name.startswith("workers/") for name in extras):
+                return "unlisted_worker_or_runtime_file"
             return "unlisted_installed_file"
         if declared - observed:
             return "missing_sealed_file"
@@ -427,8 +438,8 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
             if diagnostic["installer_install_posted"]:
                 _classify_installer_modal(api, forms, diagnostic)
                 if diagnostic.get("installer_modal_classification") == "payload_refusal":
-                    diagnostic["installer_seal_refusal_category"] = _classify_installed_seal_refusal(
-                        installed
+                    diagnostic["installer_seal_refusal_category"] = (
+                        _classify_installed_seal_refusal(installed)
                     )
                     pytest.fail("Installer refused its extracted sealed payload", pytrace=False)
             for form in forms:
