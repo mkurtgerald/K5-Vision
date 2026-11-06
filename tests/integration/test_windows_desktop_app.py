@@ -27,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from uuid import UUID, uuid4
 
 import psutil
@@ -1724,6 +1724,122 @@ def _installed_person_fixture(parent, ffmpeg):
     return video
 
 
+
+def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic):
+    """Prove native boxes are visible on the same transient installed browser frame.
+
+    No sampled pixels, camera URI, request body, screenshot or bearer token is
+    copied to CI evidence. A painted native rectangle is required, not merely a
+    successful person-detection API response.
+    """
+    __tracebackhide__ = True
+    diagnostic["analytics_sample_stage"] = "live_player"
+    browser_helpers._open_camera_watch(page, camera_id)
+    page.locator("#person-view-panel").wait_for(state="visible")
+    page.wait_for_function(
+        """() => {
+          const video = document.getElementById('live-video');
+          return video && !video.paused && video.readyState >= 2 &&
+            video.videoWidth > 0 && video.videoHeight > 0 &&
+            video.getVideoPlaybackQuality().totalVideoFrames >= 4;
+        }""",
+        timeout=25_000,
+    )
+    button = page.locator("#toggle-person-view")
+    _require(button.is_enabled(), "Installed sampled-person control was not enabled")
+    route = f"/api/v1/operator/cameras/{camera_id}/person-view"
+    diagnostic["analytics_sample_stage"] = "native_frame_request"
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "POST" and urlsplit(response.url).path == route
+        ),
+        timeout=20_000,
+    ) as first:
+        button.click()
+    response = first.value
+    _require(
+        response.status == 200 and response.headers.get("cache-control") == "no-store",
+        "Installed sampled-person response was refused or could be cached",
+    )
+    query = parse_qs(urlsplit(response.url).query, strict_parsing=True)
+    _require(
+        set(query) == {"width", "height", "frame_id"}
+        and all(len(values) == 1 for values in query.values()),
+        "Installed person frame used an unexpected bounded request contract",
+    )
+    width, height, frame_id = (int(query[name][0]) for name in ("width", "height", "frame_id"))
+    received = response.json()
+    payload = response.request.post_data_buffer
+    _require(
+        1 <= width <= 544
+        and 1 <= height <= 320
+        and 1 <= frame_id < 2**31
+        and isinstance(payload, bytes)
+        and len(payload) == width * height * 4
+        and type(received) is dict
+        and set(received) == {"status", "frame_id", "boxes"}
+        and received["frame_id"] == frame_id
+        and received["status"] in {"active", "busy"}
+        and type(received["boxes"]) is list
+        and len(received["boxes"]) <= 32,
+        "Installed native person sampling did not bind to the captured live frame",
+    )
+    diagnostic["analytics_sample_stage"] = "same_frame_canvas"
+    # Inspect only finite booleans, geometry and the number of the precise
+    # RGB stroke pixels used by the shipped renderer. Never snapshot media.
+    painted = page.wait_for_function(
+        """() => {
+          const canvas = document.getElementById('person-view-canvas');
+          const video = document.getElementById('live-video');
+          const message = document.getElementById('person-view-message')?.textContent || '';
+          if (!canvas || canvas.hidden || !video || video.paused ||
+              video.getVideoPlaybackQuality().totalVideoFrames < 4 ||
+              canvas.width <= 0 || canvas.height <= 0 ||
+              canvas.width > 544 || canvas.height > 320 ||
+              !message.includes(' in this sample') || message.startsWith('0 ')) return false;
+          const pixels = canvas.getContext('2d').getImageData(
+            0, 0, canvas.width, canvas.height).data;
+          let green = 0;
+          for (let i = 0; i < pixels.length; i += 4) {
+            if (pixels[i] === 104 && pixels[i + 1] === 210 &&
+                pixels[i + 2] === 164 && pixels[i + 3] === 255) green++;
+          }
+          if (green < 12) return false;
+          return {
+            overlay_pixels: green,
+            live_frames: video.getVideoPlaybackQuality().totalVideoFrames
+          };
+        }""",
+        timeout=30_000,
+    ).json_value()
+    _require(
+        type(painted) is dict
+        and type(painted.get("overlay_pixels")) is int
+        and 12 <= painted["overlay_pixels"] <= 544 * 320
+        and type(painted.get("live_frames")) is int
+        and 4 <= painted["live_frames"] <= 1_000_000,
+        "Installed person rectangle was not painted over its immutable sample",
+    )
+    diagnostic["analytics_sample_stage"] = "clear_sample"
+    button.click()
+    page.wait_for_function(
+        """() => {
+          const canvas = document.getElementById('person-view-canvas');
+          return canvas && canvas.hidden && canvas.width === 0 && canvas.height === 0;
+        }""",
+        timeout=5_000,
+    )
+    browser_helpers._open_camera_recordings(page, camera_id)
+    diagnostic["analytics_sample_stage"] = "complete"
+    return {
+        "analytics_sampled_native_boxes": True,
+        "analytics_sampled_same_frame_overlay": True,
+        "analytics_sampled_canvas_cleared": True,
+        "analytics_sampled_overlay_pixels": painted["overlay_pixels"],
+        "analytics_sampled_live_decoded_frames": painted["live_frames"],
+    }
+
+
 def _installed_analytics_journey(
     *,
     page,
@@ -1820,6 +1936,9 @@ def _installed_analytics_journey(
         abs((datetime.now(UTC) - occurred).total_seconds()) < 30,
         "Person event was not mapped to the fresh recording's UTC timestamp",
     )
+    sampled_evidence = _installed_sampled_person_boxes(
+        page, camera_id, browser_helpers, diagnostic
+    )
     diagnostic["analytics_stage"] = "event_recording_navigation"
     diagnostic["analytics_navigation_step"] = "history_range_click"
     page.locator("#last-24-hours").click()
@@ -1915,6 +2034,7 @@ def _installed_analytics_journey(
         "analytics_mock_inference": False,
         "analytics_accuracy_acceptance": False,
         "analytics_public_fixture_only": True,
+        **sampled_evidence,
     }, detected
 
 
