@@ -1290,3 +1290,59 @@ def test_second_product_application_cannot_start_workers_for_an_active_identity(
             probe.close()
     assert first_calls == [("start", ()), ("stop", ())]
     _assert_profile_lease_available(tmp_path / "identity")
+
+
+
+def test_native_person_warmup_waits_for_quiet_camera_enrollment():
+    from k5vision.operator_product_api import _NativePersonWarmupGate
+
+    calls = []
+
+    class Broker:
+        def start_preparing(self):
+            calls.append("prepare")
+
+    async def exercise():
+        gate = _NativePersonWarmupGate(Broker(), quiet_seconds=10)
+        gate.schedule()
+        first = gate._handle
+        assert first is not None and not first.cancelled()
+        gate.schedule()
+        assert gate._handle is first
+        gate.schedule(enrollment=True)
+        second = gate._handle
+        assert first.cancelled()
+        assert second is not None and second is not first and not second.cancelled()
+        assert not calls
+        gate._begin()
+        assert calls == ["prepare"]
+        gate.schedule(enrollment=True)
+        assert calls == ["prepare"]
+        gate.close()
+        assert gate._closed
+
+    asyncio.run(exercise())
+
+
+def test_native_person_warmup_cancelled_on_product_shutdown():
+    from k5vision.operator_product_api import _NativePersonWarmupGate
+
+    calls = []
+
+    class Broker:
+        def start_preparing(self):
+            calls.append("prepare")
+
+    async def exercise():
+        gate = _NativePersonWarmupGate(Broker(), quiet_seconds=10)
+        gate.schedule()
+        pending = gate._handle
+        assert pending is not None
+        gate.close()
+        assert pending.cancelled()
+        assert gate._handle is None
+        gate._begin()
+        gate.schedule(enrollment=True)
+        assert calls == []
+
+    asyncio.run(exercise())
