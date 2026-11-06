@@ -195,9 +195,7 @@ def test_native_model_read_uses_verified_immutable_bytes_after_admission(admitte
         module._model_bytes(config)
 
 
-def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(
-    admitted, monkeypatch
-):
+def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(admitted, monkeypatch):
     """Cold native view compilation must reuse the core that admitted the model."""
     config, _manifest, _files = admitted
     calls = []
