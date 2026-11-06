@@ -145,10 +145,18 @@ begin
 end;
 
 procedure CurStepChanged(Step: TSetupStep);
+var
+  ExitCode: Integer;
 begin
-  // All payload, shortcut and installer-registry writes have finished. The
-  // normal Finish-page Launch choice can now start the verified application.
-  if Step = ssPostInstall then ReleaseInstallationLease();
+  // A successful extraction is not yet a verified installation. Admit every
+  // sealed payload byte through the actual installed launcher before Setup
+  // reports success or offers the operator the first-run Launch choice.
+  if Step = ssPostInstall then begin
+    if not Exec(ExpandConstant('{app}\K5Vision.exe'), '--installation-payload-check', '',
+      SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
+      RaiseException('K5 Vision could not verify the installed application. Your account and recordings were preserved.');
+    ReleaseInstallationLease();
+  end;
 end;
 
 procedure DeinitializeSetup();
