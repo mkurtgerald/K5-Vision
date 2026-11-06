@@ -340,6 +340,7 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
     person_probe_statuses = {"authorized": None, "revoked": None, "anonymous": None}
     script_errors = []
     request_failures = {}
+    pixel_evidence = {}
     started = time.monotonic()
     baseline_threads = {thread.ident for thread in threading.enumerate()}
     receipt = {
@@ -555,6 +556,11 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         )
         matching_fraction = canvas["matching"]
         overlay_pixels = canvas["added_overlay"]
+        # Aggregate proof only: never retain the sample, video, URL or screenshot.
+        pixel_evidence = {
+            "frame_match_permille": min(1000, max(0, int(matching_fraction * 1000))),
+            "added_overlay_pixels": min(544 * 320, max(0, int(overlay_pixels))),
+        }
         stage = "sample_frame_and_box_pixels"
         stage = "positive_sample_controls"
         _require(
@@ -748,6 +754,7 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
             "person_probe_statuses": person_probe_statuses,
             "script_error_codes": script_errors[:32],
             "request_failure_counts": request_failures,
+            "positive_sample_pixel_evidence": pixel_evidence,
             "cleanup_failure_codes": cleanup_failures,
             "product_thread_alive": bool(product and product.thread.is_alive()),
             "product_thread_failed": bool(product and product.failed),

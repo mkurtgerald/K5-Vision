@@ -1870,6 +1870,27 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
     width, height, frame_id = (int(query[name][0]) for name in ("width", "height", "frame_id"))
     received = response.json()
     payload = response.request.post_data_buffer
+    # Restrict failure evidence to the server's finite status and booleans.
+    # Neither transient frames nor response bodies enter the CI receipt.
+    native_status = received.get("status") if type(received) is dict else None
+    diagnostic["analytics_sample_response_contract"] = {
+        "native_status": (
+            native_status
+            if type(native_status) is str
+            and native_status in {"active", "busy", "unavailable"}
+            else "invalid"
+        ),
+        "frame_correlated": (
+            type(received) is dict and received.get("frame_id") == frame_id
+        ),
+        "post_bytes_valid": isinstance(payload, bytes)
+        and len(payload) == width * height * 4,
+        "box_count": (
+            min(33, len(received["boxes"]))
+            if type(received) is dict and type(received.get("boxes")) is list
+            else -1
+        ),
+    }
     _require(
         1 <= width <= 544
         and 1 <= height <= 320
