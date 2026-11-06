@@ -1196,11 +1196,15 @@ def test_bundled_person_model_enables_bounded_sampled_view_without_override(
     import k5vision.operator_analytics_person as person_module
 
     view_limits = []
+    preparing = []
     closed = []
 
     class Broker:
         def __init__(self, _config, *, max_views):
             view_limits.append(max_views)
+
+        def start_preparing(self):
+            preparing.append(True)
 
         async def expire_idle(self):
             pass
@@ -1219,6 +1223,7 @@ def test_bundled_person_model_enables_bounded_sampled_view_without_override(
         assert app.state.operator_person_status == "configured"
         assert calls == [("start", ())]
     assert view_limits == [1]
+    assert preparing == [True]
     assert closed == [True]
     assert calls == [("start", ()), ("stop", ())]
     _assert_profile_lease_available(tmp_path / "identity")
