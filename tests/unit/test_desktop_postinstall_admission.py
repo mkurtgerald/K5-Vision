@@ -9,7 +9,7 @@ def test_native_setup_refuses_success_before_finalizing_uninstall_log():
     setup = (ROOT / "windows/desktop/K5Vision.iss").read_text(encoding="utf-8")
     files = setup.split("[Files]", 1)[1].split("[Icons]", 1)[0]
     assert files.index('Source: "{#PayloadRoot}\\*"') < files.index(
-        'AfterInstall: AdmitExtractedPayload'
+        "AfterInstall: AdmitExtractedPayload"
     )
     assert 'DestDir: "{tmp}"' in files
     assert "deleteafterinstall" in files
