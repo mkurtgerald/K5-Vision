@@ -1724,7 +1724,6 @@ def _installed_person_fixture(parent, ffmpeg):
     return video
 
 
-
 def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic):
     """Prove native boxes are visible on the same transient installed browser frame.
 
