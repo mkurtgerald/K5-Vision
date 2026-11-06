@@ -177,4 +177,3 @@ def test_fragment_decoder_reopens_unchanged_snapshot_after_unusable_rewind(monke
     assert captures[0].seek_positions == [8000, 0]
     assert captures[1].seek_positions == []
     assert all(capture.released for capture in captures)
-
