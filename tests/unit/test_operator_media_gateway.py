@@ -188,9 +188,7 @@ def test_cold_native_person_sampling_uses_bounded_dedicated_proxy(assets):
     assert sample["transport"]["response_header_timeout"] == "23s"
     assert sample["transport"]["read_timeout"] == "23s"
     assert sample["transport"]["write_timeout"] == "10s"
-    generic = next(
-        route for route in routes if route.get("match") == [{"path": ["/api/*"]}]
-    )
+    generic = next(route for route in routes if route.get("match") == [{"path": ["/api/*"]}])
     assert index < routes.index(generic)
     assert generic["match"] == [{"path": ["/api/*"]}]
     assert generic["handle"][0]["transport"]["response_header_timeout"] == "10s"
@@ -200,15 +198,12 @@ def test_cold_native_person_sampling_uses_bounded_dedicated_proxy(assets):
 def test_onvif_profile_probe_has_a_dedicated_bounded_upstream_deadline(assets):
     document = json.loads(_configuration(assets))
     routes = document["apps"]["http"]["servers"]["operator"]["routes"]
-    expected = [
-        {"method": ["POST"], "path": ["/api/v1/operator/camera-profiles"]}
-    ]
+    expected = [{"method": ["POST"], "path": ["/api/v1/operator/camera-profiles"]}]
     matched = [(i, route) for i, route in enumerate(routes) if route.get("match") == expected]
     assert len(matched) == 1
     index, route = matched[0]
     generic_index = next(
-        i for i, other in enumerate(routes)
-        if other.get("match") == [{"path": ["/api/*"]}]
+        i for i, other in enumerate(routes) if other.get("match") == [{"path": ["/api/*"]}]
     )
     assert index < generic_index
     assert route["terminal"] is True
