@@ -103,3 +103,78 @@ def test_unreadable_fragment_never_fabricates_a_frame_or_timestamp(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "cv2", cv2)
     assert decoder.decode("unreadable-snapshot.mp4") is None
+
+
+def test_fragment_decoder_reopens_unchanged_snapshot_after_unusable_rewind(monkeypatch):
+    class Pixels:
+        def tobytes(self, *, order):
+            assert order == "C"
+            return b"frame-pixels"
+
+    captures = []
+
+    class Capture:
+        def __init__(self):
+            self.index = len(captures)
+            self.released = False
+            self.seek_positions = []
+            self.reads = 0
+            captures.append(self)
+
+        def isOpened(self):
+            return True
+
+        def get(self, key):
+            if key == 3:
+                return 320
+            if key == 4:
+                return 240
+            if key == 7:
+                return 150
+            if key == 5:
+                return 15
+            if key == 0:
+                return 750
+            raise AssertionError("Unexpected video property")
+
+        def set(self, key, value):
+            assert key == 0
+            self.seek_positions.append(value)
+            return False
+
+        def read(self):
+            self.reads += 1
+            if self.index == 1 and self.reads == 1:
+                return True, object()
+            return False, None
+
+        def release(self):
+            self.released = True
+
+    def open_capture(path, backend, options):
+        assert path == "private-snapshot.mp4"
+        assert backend == 1900
+        assert options == [53, 1500, 54, 1500]
+        return Capture()
+
+    cv2 = SimpleNamespace(
+        CAP_FFMPEG=1900,
+        CAP_PROP_OPEN_TIMEOUT_MSEC=53,
+        CAP_PROP_READ_TIMEOUT_MSEC=54,
+        CAP_PROP_FRAME_WIDTH=3,
+        CAP_PROP_FRAME_HEIGHT=4,
+        CAP_PROP_FRAME_COUNT=7,
+        CAP_PROP_FPS=5,
+        CAP_PROP_POS_MSEC=0,
+        COLOR_BGR2BGRA=123,
+        VideoCapture=open_capture,
+        resize=lambda frame, size: frame,
+        cvtColor=lambda frame, conversion: Pixels(),
+    )
+    monkeypatch.setitem(sys.modules, "cv2", cv2)
+    assert decoder.decode("private-snapshot.mp4") == (0.75, b"frame-pixels")
+    assert len(captures) == 2
+    assert captures[0].seek_positions == [8000, 0]
+    assert captures[1].seek_positions == []
+    assert all(capture.released for capture in captures)
+
