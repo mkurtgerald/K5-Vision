@@ -224,9 +224,7 @@ def generate_operator_gateway_configuration(
             "terminal": True,
         },
         {
-            "match": [
-                {"method": ["POST"], "path": ["/api/v1/operator/camera-profiles"]}
-            ],
+            "match": [{"method": ["POST"], "path": ["/api/v1/operator/camera-profiles"]}],
             "handle": [camera_profiles],
             "terminal": True,
         },
