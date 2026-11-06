@@ -299,6 +299,7 @@ def install_operator_product_api(
     public_port: int,
     analytics=None,
     analytics_status: str = "disabled",
+    prepare_native_person_on_camera: bool = False,
     state_root: Path | None = None,
 ) -> None:
     """Install the local product contract without exposing execution credentials."""
@@ -306,6 +307,10 @@ def install_operator_product_api(
         raise ValueError("operator public port is invalid")
     if analytics_status not in {"disabled", "configured", "unavailable"}:
         raise ValueError("operator person view status is invalid")
+    if type(prepare_native_person_on_camera) is not bool or (
+        prepare_native_person_on_camera and analytics is None
+    ):
+        raise ValueError("operator person preparation configuration is invalid")
     person_status = "configured" if analytics is not None else analytics_status
     registry = app.state.device_registry
     users = app.state.user_registry
@@ -757,7 +762,7 @@ def install_operator_product_api(
         current, _ = await authenticate(session[1])
         selected = await asyncio.to_thread(permitted_selections, current)
 
-        return {
+        result = {
             "cameras": [
                 await camera_view(
                     source,
@@ -768,6 +773,12 @@ def install_operator_product_api(
             "worker_status": service.status(),
             "capabilities": await asyncio.to_thread(capabilities, current),
         }
+        # No native model compilation during a fresh account's startup/login.
+        # Only an authenticated view of enrolled cameras schedules optional
+        # media-free preparation; authorization and response data are unchanged.
+        if selected and prepare_native_person_on_camera:
+            analytics.start_preparing()
+        return result
 
     async def enroll_camera_source(
         *,
@@ -874,7 +885,12 @@ def install_operator_product_api(
                 raise HTTPException(409, "Camera capacity reached") from None
             except (DeviceRegistryStorageError, RuntimeError, OSError, ValueError):
                 raise HTTPException(503, "Camera configuration unavailable") from None
-        return await camera_view(source)
+        result = await camera_view(source)
+        # The first successfully enrolled camera can now use the sealed native
+        # model without competing with GUI account creation and authentication.
+        if prepare_native_person_on_camera:
+            analytics.start_preparing()
+        return result
 
     @app.post(_PREFIX + "/cameras", status_code=201, tags=["operator"])
     async def enroll_camera(
