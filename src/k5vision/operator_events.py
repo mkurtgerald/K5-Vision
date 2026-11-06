@@ -520,6 +520,8 @@ class RecordedFrameSampler:
         self._active_files: dict[UUID, tuple[str, ...]] = {}
         self._closing = threading.Event()
         self._worker_lock = threading.RLock()
+        # Finite in-memory outcome; never a path, source URI or recorded frame.
+        self._capture_outcome = "not_started"
 
     def prune(self, active: set[UUID]) -> None:
         """Forget removed camera hints without touching retained recording files."""
@@ -544,13 +546,16 @@ class RecordedFrameSampler:
         ).astimezone(UTC)
 
     def capture(self, source) -> RecordedPersonFrame | None:
+        self._capture_outcome = "source_check"
         if self._closing.is_set():
+            self._capture_outcome = "closing"
             return None
         identity_state._same_directory(self._root, self._root_identity)
         directory = self._root / source.binding.path_name
         try:
             directory_info = directory.lstat()
         except FileNotFoundError:
+            self._capture_outcome = "recording_directory_absent"
             return None
         if not stat.S_ISDIR(directory_info.st_mode) or directory.is_symlink():
             raise OperatorEventsError("Analytics recording source refused")
@@ -561,6 +566,7 @@ class RecordedFrameSampler:
         if self._recording_files is not None:
             inventory = self._recording_files(source.binding)
             if inventory is None:
+                self._capture_outcome = "inventory_unavailable"
                 return None
             if type(inventory) is not dict or len(inventory) > MAX_RECORDING_ENTRIES:
                 raise OperatorEventsError("Analytics recording scan limit reached")
@@ -594,6 +600,7 @@ class RecordedFrameSampler:
                 hints = sorted(inventory, key=lambda name: inventory[name][5], reverse=True)[:2]
                 self._active_files[source.binding.device_id] = tuple(hints)
                 self._observations[source.binding.device_id] = current
+                self._capture_outcome = "baseline"
                 return None
             candidates.sort(key=lambda name: (name in previous, -current[name][2]))
             candidates = list(
@@ -630,6 +637,7 @@ class RecordedFrameSampler:
                         changed.append((path, info))
         self._observations[source.binding.device_id] = current
         if not changed:
+            self._capture_outcome = "no_growth"
             return None
         # Normally one open segment grows. At a rollover, prefer the new file;
         # its bytes belong to the same scan, independent of UTC ordering.
@@ -651,11 +659,14 @@ class RecordedFrameSampler:
                     or after.st_size < info.st_size
                 ):
                     continue
+                self._capture_outcome = "decode_attempt"
                 result = self.decode(raw, self._started(path.name), path.name)
                 if result is not None:
+                    self._capture_outcome = "frame_ready"
                     return result
             except (OSError, ValueError):
                 continue
+        self._capture_outcome = "no_decoded_frame"
         return None
 
     def decode(
@@ -763,6 +774,8 @@ class OperatorEventService:
             "status": status,
             "last_sample_at": state.get("last_sample_at"),
             "processed_frames": state.get("processed_frames", 0),
+            "sample_attempts": state.get("sample_attempts", 0),
+            "sample_phase": state.get("sample_phase", "not_started"),
             **self.store.summary(camera_id),
             "sample_interval_seconds": SAMPLE_INTERVAL_SECONDS,
             "max_parallel_cameras": 1,
@@ -790,10 +803,14 @@ class OperatorEventService:
         state = self._states.setdefault(identifier, {"processed_frames": 0})
         if not source.recording_enabled:
             state["status"] = "waiting"
+            state["sample_phase"] = "recording_paused"
             return
         if self._native_pending is not None and not self._native_pending.done():
             state["status"] = "waiting"
+            state["sample_phase"] = "native_pending"
             return
+        state["sample_attempts"] = min(2**63 - 1, state.get("sample_attempts", 0) + 1)
+        state["sample_phase"] = "capture_pending"
         self._native_pending = self._executor.submit(self._sampler.capture, source)
         wrapped = asyncio.wrap_future(self._native_pending)
         # Native decoder exceptions are sanitized before crossing API/UI boundaries.
@@ -805,6 +822,20 @@ class OperatorEventService:
         sample = await asyncio.wait_for(asyncio.shield(wrapped), wait_seconds)
         if sample is None:
             state["status"] = "waiting"
+            # Finite status vocabulary, independent of local recording identity.
+            outcome = getattr(self._sampler, "_capture_outcome", "no_frame")
+            state["sample_phase"] = (
+                outcome
+                if outcome in {
+                    "closing",
+                    "recording_directory_absent",
+                    "inventory_unavailable",
+                    "baseline",
+                    "no_growth",
+                    "no_decoded_frame",
+                }
+                else "no_frame"
+            )
             return
         if sample.detections is not None:
             detections = sample.detections
@@ -846,6 +877,7 @@ class OperatorEventService:
         if emitted:
             self._last_events[identifier] = now
         state["status"] = "active"
+        state["sample_phase"] = "person_detected" if selected else "no_person"
         state["last_sample_at"] = _utc(sample.occurred_at)
         state["processed_frames"] = min(2**63 - 1, state["processed_frames"] + 1)
 
@@ -887,7 +919,9 @@ class OperatorEventService:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self._states.setdefault(identifier, {})["status"] = "unavailable"
+                state = self._states.setdefault(identifier, {})
+                state["status"] = "unavailable"
+                state["sample_phase"] = "native_failed"
                 if self._provider is not None:
                     try:
                         await self._provider.aclose()
