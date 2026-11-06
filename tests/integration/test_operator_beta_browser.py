@@ -327,7 +327,12 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
         # the authenticated request, private camera endpoint, or SOAP response.
         diagnostic["onvif_profiles_http_status"] = profiles.value.status
         _require(profiles.value.status == 200, "Actual ONVIF credential/profile request failed")
+        # Receiving HTTP headers does not establish that the installed backend
+        # completed its response body. Mark this boundary without retaining
+        # any camera endpoint, credentials, profile, SOAP, or media payload.
+        diagnostic["onvif_enrollment_step"] = "read_profile_response_body"
         profile_payload = profiles.value.json()
+        diagnostic["onvif_enrollment_step"] = "validate_profile_response"
         _require(
             set(profile_payload) == {"probe_id", "expires_in_seconds", "profiles", "clock"},
             "Profile response left the bounded public contract",
