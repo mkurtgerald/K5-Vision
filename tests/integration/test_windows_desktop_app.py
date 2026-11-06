@@ -355,6 +355,45 @@ def _classify_installer_modal(api, forms, diagnostic):
         return
 
 
+def _classify_installed_seal_refusal(installed):
+    """Use only bounded codes to distinguish an in-flight Inno file from bad payload.
+
+    Never emit a filename, source URI, local directory, manifest entry or hash.
+    This is diagnostic-only, invoked after the *real* installer refuses admission.
+    """
+    try:
+        manifest = json.loads((installed / "payload-manifest.json").read_text(encoding="utf-8"))
+        entries = manifest["files"]
+        declared = {entry["path"].casefold() for entry in entries}
+        allowed = {
+            "k5vision.exe",
+            "payload-manifest.json",
+            "unins000.exe",
+            "unins000.dat",
+            "unins000.msg",
+        }
+        observed = set()
+        for i, file in enumerate(installed.rglob("*")):
+            if i >= 10000:
+                return "unbounded_installed_tree"
+            if file.is_file():
+                observed.add(file.relative_to(installed).as_posix().casefold())
+        if observed - declared - allowed:
+            return "unlisted_installed_file"
+        if declared - observed:
+            return "missing_sealed_file"
+        for entry in entries:
+            path = installed.joinpath(*entry["path"].split("/"))
+            if path.stat().st_size != entry["bytes"]:
+                return "changed_sealed_file_size"
+            with path.open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != entry["sha256"]:
+                    return "changed_sealed_file_hash"
+        return "native_admission_or_inflight_installer_metadata"
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return "bounded_inspection_incomplete"
+
+
 def _install_gui(setup, installed, api, *, diagnostic=None):
     """Drive the actual Inno wizard without suppressing its user interface."""
     __tracebackhide__ = True
@@ -387,6 +426,11 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
             forms = [window for window in api.windows() if api.pid(window) in pids]
             if diagnostic["installer_install_posted"]:
                 _classify_installer_modal(api, forms, diagnostic)
+                if diagnostic.get("installer_modal_classification") == "payload_refusal":
+                    diagnostic["installer_seal_refusal_category"] = _classify_installed_seal_refusal(
+                        installed
+                    )
+                    pytest.fail("Installer refused its extracted sealed payload", pytrace=False)
             for form in forms:
                 controls = [
                     window
