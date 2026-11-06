@@ -39,6 +39,11 @@ MAX_EVENT_ROWS = 100_000
 MAX_RECORDING_ENTRIES = 100_000
 MAX_RECORDING_BYTES = 128 * 1024 * 1024
 _NATIVE_REQUEST_SECONDS = 8.0
+# The first native person inference compiles the admitted OpenVINO CPU model.
+# The installed view broker allows 15s for this same cold preparation. Do not
+# kill the recording detector at 8s before its first inference can finish.
+# Subsequent requests retain the original tight deadline.
+_NATIVE_COLD_PERSON_REQUEST_SECONDS = 18.0
 _DATABASE = "operator-events.sqlite3"
 
 
@@ -339,6 +344,12 @@ class _RecordedNativeWorker:
         self._job = None
         self._lock = threading.RLock()
         self._closing = threading.Event()
+        self._person_ready = False
+
+    def _request_timeout(self) -> float:
+        if self._configuration is not None and not self._person_ready:
+            return _NATIVE_COLD_PERSON_REQUEST_SECONDS
+        return _NATIVE_REQUEST_SECONDS
 
     def _start(self) -> None:
         from k5vision.operator_native_process import _WindowsJob
@@ -363,6 +374,8 @@ class _RecordedNativeWorker:
             if job is not None:
                 job.assign(process)
             self._process, self._job = process, job
+            # A replacement child has not compiled its sealed person model.
+            self._person_ready = False
         except BaseException:
             if process is not None:
                 process.kill()
@@ -389,7 +402,7 @@ class _RecordedNativeWorker:
                 except OSError:
                     pass
 
-            timer = threading.Timer(_NATIVE_REQUEST_SECONDS, deadline)
+            timer = threading.Timer(self._request_timeout(), deadline)
             timer.daemon = True
             timer.start()
             failed = False
@@ -437,6 +450,9 @@ class _RecordedNativeWorker:
                             raise ValueError
                         detections.append(SimpleNamespace(category="person", confidence=confidence))
                     detections = tuple(detections)
+                    # This acknowledgement came from the owning native child.
+                    # An empty frame never admits readiness for a later request.
+                    self._person_ready = True
                 return elapsed, payload, detections
             except Exception:
                 failed = True
@@ -782,7 +798,13 @@ class OperatorEventService:
         wrapped = asyncio.wrap_future(self._native_pending)
         # Native decoder exceptions are sanitized before crossing API/UI boundaries.
         wrapped.add_done_callback(lambda future: None if future.cancelled() else future.exception())
-        sample = await asyncio.wait_for(asyncio.shield(wrapped), 12)
+        # Preserve the finite parent/child hierarchy on the first compiled
+        # person frame (18s child + 2s termination margin). The installed GUI
+        # event acceptance deadline remains the unchanged 25 seconds.
+        wait_seconds = (
+            20 if getattr(self._sampler, "_configuration", None) is not None else 12
+        )
+        sample = await asyncio.wait_for(asyncio.shield(wrapped), wait_seconds)
         if sample is None:
             state["status"] = "waiting"
             return
