@@ -2065,6 +2065,7 @@ def _installed_analytics_journey(
         credentials=publisher_credentials,
     )
     processes.append(publishers[0])
+    positive_source_switched_at = datetime.now(UTC)
     detected = {}
 
     def positive_event():
@@ -2092,11 +2093,41 @@ def _installed_analytics_journey(
         # recorder using only typed, credential-free backend status.
         try:
             state = client.json(route + "/analytics")
+            sampled_at = state.get("last_sample_at")
+            try:
+                fresh_sample = (
+                    datetime.fromisoformat(sampled_at.replace("Z", "+00:00"))
+                    >= positive_source_switched_at
+                )
+            except (AttributeError, TypeError, ValueError):
+                fresh_sample = False
             diagnostic["analytics_failure_state"] = {
                 key: state.get(key) for key in ("status", "processed_frames", "event_count")
             }
+            diagnostic["analytics_failure_state"]["sample_after_source_switch"] = fresh_sample
         except Exception:
             diagnostic["analytics_failure_state"] = {"available": False}
+        try:
+            inventory = client.json("/api/v1/operator/cameras")
+            camera = next(
+                item for item in inventory["cameras"] if item.get("device_id") == camera_id
+            )
+            recording = camera.get("recording_status") or {}
+            observed = recording.get("observed_bytes")
+            progress_age = recording.get("last_progress_age_seconds")
+            recording_state = camera.get("recording_state")
+            diagnostic["analytics_failure_recorder"] = {
+                "publisher_running": publishers[0].poll() is None,
+                "camera_live": camera.get("status") == "live",
+                "state": recording_state
+                if recording_state in {"recording", "waiting", "paused", "stalled", "error"}
+                else "other",
+                "observed_bytes_positive": type(observed) is int and observed > 0,
+                "recent_disk_progress": type(progress_age) in (int, float)
+                and 0 <= progress_age <= 15,
+            }
+        except Exception:
+            diagnostic["analytics_failure_recorder"] = {"available": False}
         raise
     occurred = datetime.fromisoformat(detected["occurred_at"].replace("Z", "+00:00"))
     _require(
