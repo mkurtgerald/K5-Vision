@@ -323,6 +323,9 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
             )
         ) as profiles:
             page.locator("#test-camera-connection").click()
+        # The public HTTP status is safe qualification evidence; never retain
+        # the authenticated request, private camera endpoint, or SOAP response.
+        diagnostic["onvif_profiles_http_status"] = profiles.value.status
         _require(profiles.value.status == 200, "Actual ONVIF credential/profile request failed")
         profile_payload = profiles.value.json()
         _require(
