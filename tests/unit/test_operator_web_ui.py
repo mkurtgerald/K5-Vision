@@ -944,7 +944,18 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
         assert baseline_sources[-1] == media_urls(_CAMERA)["live_url"]
         page.evaluate("window.__selectedHlsIndex = window.__hlsPlayers.length - 1")
         if outcome == "logout_race":
-            page.locator("#sign-out-button").click()
+            # The request event can precede route interception on Windows.
+            # Wait for the intentionally withheld logout route rather than
+            # assuming the handler has already run when click() returns.
+            with page.expect_request(
+                lambda request: urlsplit(request.url).path == "/api/v1/auth/logout",
+                timeout=10_000,
+            ):
+                page.locator("#sign-out-button").click()
+            for _ in range(100):
+                if pending:
+                    break
+                page.wait_for_timeout(50)
             assert len(pending) == 1
             page.locator("#wall-tab").click()
             page.evaluate("""async () => {
