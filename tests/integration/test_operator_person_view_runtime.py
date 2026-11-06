@@ -519,8 +519,7 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         ) as sample:
             with page.expect_request(
                 lambda request: (
-                    request.method == "POST"
-                    and urlsplit(request.url).path == sample_route
+                    request.method == "POST" and urlsplit(request.url).path == sample_route
                 )
             ):
                 page.locator("#toggle-person-view").click()
