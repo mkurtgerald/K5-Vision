@@ -25,20 +25,33 @@ def decode(path: str):
             return None
         count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
         fps = capture.get(cv2.CAP_PROP_FPS)
-        if math.isfinite(count) and math.isfinite(fps) and count > 0 and fps > 0:
-            capture.set(cv2.CAP_PROP_POS_MSEC, max(0, (count / fps - 2) * 1000))
+        tail_offset = (
+            max(0, (count / fps - 2) * 1000)
+            if math.isfinite(count) and math.isfinite(fps) and count > 0 and fps > 0
+            else 0
+        )
+        if tail_offset > 0:
+            capture.set(cv2.CAP_PROP_POS_MSEC, tail_offset)
         selected = None
         deadline = time.monotonic() + 3
-        for _index in range(8192):
-            if time.monotonic() >= deadline:
+        # A growing fragmented MP4 can expose dimensions/count before its last
+        # fragment supports seeking. An empty tail seek is not an empty recording.
+        # Rewind only within the same three-second decode budget; never invent
+        # timestamps or source a frame from outside the owned recorder snapshot.
+        for attempt in range(2 if tail_offset > 0 else 1):
+            for _index in range(8192):
+                if time.monotonic() >= deadline:
+                    break
+                ready, frame = capture.read()
+                if not ready:
+                    break
+                elapsed = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000
+                # Event UTC must use the recorded presentation timestamp only.
+                if math.isfinite(elapsed) and 0 <= elapsed <= 3605:
+                    selected = frame, elapsed
+            if selected is not None or attempt or time.monotonic() >= deadline:
                 break
-            ready, frame = capture.read()
-            if not ready:
-                break
-            elapsed = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000
-            # No arrival-time or guessed-FPS fallback may become event UTC.
-            if math.isfinite(elapsed) and 0 <= elapsed <= 3605:
-                selected = frame, elapsed
+            capture.set(cv2.CAP_PROP_POS_MSEC, 0)
         if selected is None:
             return None
         frame, elapsed = selected
