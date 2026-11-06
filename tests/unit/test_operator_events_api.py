@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -178,3 +180,81 @@ def test_private_database_failure_returns_fixed_unavailable(event_product, monke
     response = product.client.get(f"{_PREFIX}/{camera}/analytics", headers=product.headers)
     assert response.status_code == 503
     assert response.json() == {"detail": "analytics_unavailable"}
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "storage_method"),
+    [("events", "events"), ("analytics", "summary")],
+)
+def test_durable_analytics_reads_do_not_block_other_operator_http(
+    event_product, monkeypatch, endpoint, storage_method
+):
+    """Even an occupied SQLite reader must not freeze the installed ASGI loop."""
+    product, service = event_product
+    camera = product.enroll()
+    entered, released = threading.Event(), threading.Event()
+    original = getattr(service.store, storage_method)
+
+    def held_read(*args, **kwargs):
+        entered.set()
+        assert released.wait(timeout=5), "Controlled analytics read was not released"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service.store, storage_method, held_read)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            pending = executor.submit(
+                product.client.get,
+                f"{_PREFIX}/{camera}/{endpoint}",
+                headers=product.headers,
+            )
+            assert entered.wait(timeout=3), "Analytics read was not reached"
+            health = executor.submit(product.client.get, "/openapi.json")
+            assert health.result(timeout=1.5).status_code == 200
+            assert not pending.done(), "Analytics read finished before release"
+        finally:
+            released.set()
+        result = pending.result(timeout=5)
+
+    assert result.status_code == 200
+    assert result.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "storage_method"),
+    [("events", "events"), ("analytics", "summary")],
+)
+def test_inflight_analytics_read_rechecks_revoked_user(
+    event_product, monkeypatch, endpoint, storage_method
+):
+    """Returning the snapshot must never bypass an intervening account disable."""
+    product, service = event_product
+    camera = product.enroll()
+    issue = admin_helpers._create(product, camera_ids=[camera])
+    _token, headers = admin_helpers._activate(product, issue)
+    entered, released = threading.Event(), threading.Event()
+    original = getattr(service.store, storage_method)
+
+    def held_read(*args, **kwargs):
+        entered.set()
+        assert released.wait(timeout=5), "Controlled analytics read was not released"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service.store, storage_method, held_read)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        try:
+            pending = executor.submit(
+                product.client.get,
+                f"{_PREFIX}/{camera}/{endpoint}",
+                headers=headers,
+            )
+            assert entered.wait(timeout=3), "Analytics read was not reached"
+            product.users.update(
+                UUID(issue["account"]["id"]), UserPatch(enabled=False), actor="test"
+            )
+        finally:
+            released.set()
+        result = pending.result(timeout=5)
+
+    assert result.status_code == 401
+    assert result.headers.get("cache-control") == "no-store"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -57,15 +58,33 @@ def install_operator_events_api(
             raise HTTPException(503, "analytics_unavailable")
         return events
 
+    async def current_selection(token, camera_id: UUID) -> None:
+        """Authenticate and check current camera rights without caching a denial."""
+        try:
+            account, _ = await authenticate(token)
+            await asyncio.to_thread(authorized_selection, account, camera_id)
+        except HTTPException as error:
+            # FastAPI's exception handler creates a new response, so headers
+            # placed on the endpoint's Response are not used for revoked access.
+            raise HTTPException(
+                error.status_code,
+                error.detail,
+                headers={**(error.headers or {}), "Cache-Control": "no-store"},
+            ) from None
+
     @app.get(_PREFIX + "/{camera_id}/analytics", tags=["operator analytics"])
     async def analytics_status(camera_id: UUID, response: Response, session=session_dependency):
         response.headers["Cache-Control"] = "no-store"
-        account, _ = await authenticate(session[1])
-        authorized_selection(account, camera_id)
+        await current_selection(session[1], camera_id)
         try:
-            return service().status(camera_id)
+            # Durable settings and summary reads use SQLite; keep the ASGI
+            # loop available for live playback and unrelated operator traffic.
+            snapshot = await asyncio.to_thread(service().status, camera_id)
         except OperatorEventsError:
             raise HTTPException(503, "analytics_unavailable") from None
+        # A camera grant or session may have been revoked during the read.
+        await current_selection(session[1], camera_id)
+        return snapshot
 
     @app.patch(_PREFIX + "/{camera_id}/analytics", tags=["operator analytics"])
     async def configure_analytics(
@@ -100,12 +119,20 @@ def install_operator_events_api(
         session=session_dependency,
     ):
         response.headers["Cache-Control"] = "no-store"
-        account, _ = await authenticate(session[1])
-        authorized_selection(account, camera_id)
+        await current_selection(session[1], camera_id)
         first, last = _range(start, end)
         try:
-            return service().store.events(
-                camera_id, start=first, end=last, limit=limit, before=before
+            # Bounded recorded-event history performs SQLite reads that can
+            # otherwise block camera streaming and live sample inference.
+            snapshot = await asyncio.to_thread(
+                service().store.events,
+                camera_id,
+                start=first,
+                end=last,
+                limit=limit,
+                before=before,
             )
         except OperatorEventsError:
             raise HTTPException(503, "analytics_unavailable") from None
+        await current_selection(session[1], camera_id)
+        return snapshot
