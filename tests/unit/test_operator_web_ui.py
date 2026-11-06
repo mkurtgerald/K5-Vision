@@ -806,7 +806,10 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
         assert calls == {"profiles": 2, "connect": 1}
         # Both ONVIF profile probes use the finite 20s UI budget; the
         # installed backend may legitimately use most of its 12s socket limit.
-        assert page.evaluate("window.__k5RequestDeadlines.filter(ms => ms === 20000).length") >= 2
+        assert (
+            page.evaluate("window.__k5RequestDeadlines.filter(ms => ms === 20000).length")
+            >= 2
+        )
         assert not script_errors
     finally:
         if context is not None:

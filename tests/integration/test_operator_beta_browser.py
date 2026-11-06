@@ -274,7 +274,10 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
     diagnostic["onvif_profiles_request_failed"] = False
 
     def profile_request(request):
-        return request.method == "POST" and urlsplit(request.url).path == "/api/v1/operator/camera-profiles"
+        return (
+            request.method == "POST"
+            and urlsplit(request.url).path == "/api/v1/operator/camera-profiles"
+        )
 
     def observe(request):
         material = request.url + (request.post_data or "")
