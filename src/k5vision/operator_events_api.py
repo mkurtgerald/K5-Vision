@@ -61,11 +61,17 @@ def install_operator_events_api(
     async def analytics_status(camera_id: UUID, response: Response, session=session_dependency):
         response.headers["Cache-Control"] = "no-store"
         account, _ = await authenticate(session[1])
-        authorized_selection(account, camera_id)
+        await asyncio.to_thread(authorized_selection, account, camera_id)
         try:
-            return service().status(camera_id)
+            # Durable settings and summary reads use SQLite; keep the ASGI
+            # loop available for live playback and unrelated operator traffic.
+            snapshot = await asyncio.to_thread(service().status, camera_id)
         except OperatorEventsError:
             raise HTTPException(503, "analytics_unavailable") from None
+        # A camera grant or session may have been revoked during the read.
+        current, _ = await authenticate(session[1])
+        await asyncio.to_thread(authorized_selection, current, camera_id)
+        return snapshot
 
     @app.patch(_PREFIX + "/{camera_id}/analytics", tags=["operator analytics"])
     async def configure_analytics(
@@ -101,11 +107,21 @@ def install_operator_events_api(
     ):
         response.headers["Cache-Control"] = "no-store"
         account, _ = await authenticate(session[1])
-        authorized_selection(account, camera_id)
+        await asyncio.to_thread(authorized_selection, account, camera_id)
         first, last = _range(start, end)
         try:
-            return service().store.events(
-                camera_id, start=first, end=last, limit=limit, before=before
+            # Bounded recorded-event history performs SQLite reads that can
+            # otherwise block camera streaming and live sample inference.
+            snapshot = await asyncio.to_thread(
+                service().store.events,
+                camera_id,
+                start=first,
+                end=last,
+                limit=limit,
+                before=before,
             )
         except OperatorEventsError:
             raise HTTPException(503, "analytics_unavailable") from None
+        current, _ = await authenticate(session[1])
+        await asyncio.to_thread(authorized_selection, current, camera_id)
+        return snapshot
