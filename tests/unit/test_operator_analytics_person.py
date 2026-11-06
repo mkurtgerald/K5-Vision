@@ -195,7 +195,6 @@ def test_native_model_read_uses_verified_immutable_bytes_after_admission(admitte
         module._model_bytes(config)
 
 
-
 def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(
     admitted, monkeypatch
 ):
