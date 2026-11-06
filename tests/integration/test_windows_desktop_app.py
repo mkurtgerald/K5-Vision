@@ -1876,15 +1876,11 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
     diagnostic["analytics_sample_response_contract"] = {
         "native_status": (
             native_status
-            if type(native_status) is str
-            and native_status in {"active", "busy", "unavailable"}
+            if type(native_status) is str and native_status in {"active", "busy", "unavailable"}
             else "invalid"
         ),
-        "frame_correlated": (
-            type(received) is dict and received.get("frame_id") == frame_id
-        ),
-        "post_bytes_valid": isinstance(payload, bytes)
-        and len(payload) == width * height * 4,
+        "frame_correlated": (type(received) is dict and received.get("frame_id") == frame_id),
+        "post_bytes_valid": isinstance(payload, bytes) and len(payload) == width * height * 4,
         "box_count": (
             min(33, len(received["boxes"]))
             if type(received) is dict and type(received.get("boxes")) is list
