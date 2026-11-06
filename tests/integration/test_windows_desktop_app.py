@@ -1732,26 +1732,55 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
     successful person-detection API response.
     """
     __tracebackhide__ = True
-    diagnostic["analytics_sample_stage"] = "live_player"
+    diagnostic["analytics_sample_stage"] = "open_live"
     browser_helpers._open_camera_watch(page, camera_id)
-    page.locator("#person-view-panel").wait_for(state="visible")
-    page.wait_for_function(
-        """() => {
-          const video = document.getElementById('live-video');
-          return video && !video.paused && video.readyState >= 2 &&
-            video.videoWidth > 0 && video.videoHeight > 0 &&
-            video.getVideoPlaybackQuality().totalVideoFrames >= 4;
-        }""",
-        timeout=25_000,
-    )
+    try:
+        diagnostic["analytics_sample_stage"] = "panel_visible"
+        page.locator("#person-view-panel").wait_for(state="visible")
+        diagnostic["analytics_sample_stage"] = "live_decoded"
+        page.wait_for_function(
+            """() => {
+              const video = document.getElementById('live-video');
+              return video && !video.paused && video.readyState >= 2 &&
+                video.videoWidth > 0 && video.videoHeight > 0 &&
+                video.getVideoPlaybackQuality().totalVideoFrames >= 4;
+            }""",
+            timeout=25_000,
+        )
+    except Exception:
+        # Keep only finite player and control states; never inspect or retain
+        # the source URL, session, request body, video frame or screenshot.
+        try:
+            diagnostic["analytics_sample_live_state"] = page.evaluate(
+                """() => {
+                  const video = document.getElementById('live-video');
+                  const panel = document.getElementById('person-view-panel');
+                  const quality = video?.getVideoPlaybackQuality?.();
+                  const frames = quality?.totalVideoFrames;
+                  return {
+                    panel_visible: !!panel && !panel.hidden,
+                    live_visible: !document.getElementById('live-panel')?.hidden,
+                    paused: video?.paused ?? null,
+                    ready_state: video?.readyState ?? null,
+                    has_dimensions: !!video && video.videoWidth > 0 && video.videoHeight > 0,
+                    decoded_frames: Number.isSafeInteger(frames) ?
+                      Math.min(frames, 1000000) : null,
+                    video_error: video?.error?.code ?? null,
+                    retry_visible: !document.getElementById('retry-live')?.hidden,
+                    play_visible: !document.getElementById('play-live')?.hidden,
+                    sample_button_enabled: !document.getElementById('toggle-person-view')?.disabled
+                  };
+                }"""
+            )
+        except Exception:
+            diagnostic["analytics_sample_live_state"] = {"available": False}
+        raise
     button = page.locator("#toggle-person-view")
     _require(button.is_enabled(), "Installed sampled-person control was not enabled")
     route = f"/api/v1/operator/cameras/{camera_id}/person-view"
     diagnostic["analytics_sample_stage"] = "native_frame_request"
     with page.expect_response(
-        lambda response: (
-            response.request.method == "POST" and urlsplit(response.url).path == route
-        ),
+        lambda response: response.request.method == "POST" and urlsplit(response.url).path == route,
         timeout=20_000,
     ) as first:
         button.click()
@@ -1935,9 +1964,7 @@ def _installed_analytics_journey(
         abs((datetime.now(UTC) - occurred).total_seconds()) < 30,
         "Person event was not mapped to the fresh recording's UTC timestamp",
     )
-    sampled_evidence = _installed_sampled_person_boxes(
-        page, camera_id, browser_helpers, diagnostic
-    )
+    sampled_evidence = _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic)
     diagnostic["analytics_stage"] = "event_recording_navigation"
     diagnostic["analytics_navigation_step"] = "history_range_click"
     page.locator("#last-24-hours").click()
