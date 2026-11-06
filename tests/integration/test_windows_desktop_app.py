@@ -405,6 +405,20 @@ def _classify_installed_seal_refusal(installed):
         return "bounded_inspection_incomplete"
 
 
+def _installer_page_signature(api, controls):
+    """Ephemeral native wizard-page identity, never written to diagnostics.
+
+    The same Next control is reused across pages. A queued native click must
+    not be queued again until actual visible wizard controls change.
+    """
+    return tuple(
+        sorted(
+            (api.api.GetDlgCtrlID(window), api.class_name(window), api.text(window))
+            for window in controls
+        )
+    )
+
+
 def _install_gui(setup, installed, api, *, diagnostic=None):
     """Drive the actual Inno wizard without suppressing its user interface."""
     __tracebackhide__ = True
@@ -429,6 +443,7 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
         stderr=subprocess.DEVNULL,
     )
     deadline, clicked, launch_unchecked = time.monotonic() + 90, set(), False
+    last_next_page = None
     try:
         while process.poll() is None:
             _require(time.monotonic() < deadline, "Actual installer wizard exceeded its deadline")
@@ -486,8 +501,19 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                                 "finish" if caption == "finish" else "next"
                             )
                             if caption.startswith("next"):
+                                # Inno's Next handler can synchronously prepare
+                                # an offline payload. SendMessageTimeout's 5s
+                                # control deadline is not an install deadline.
+                                # Queue one real BM_CLICK per observed page;
+                                # retain the unchanged 90s process deadline.
+                                page = _installer_page_signature(api, controls)
+                                if page == last_next_page:
+                                    break
                                 diagnostic["installer_next_clicks"] += 1
-                            api.click(captions[caption])
+                                api.post_click(captions[caption])
+                                last_next_page = page
+                            else:
+                                api.click(captions[caption])
                         clicked.add(caption)
                         break
             time.sleep(0.2)
