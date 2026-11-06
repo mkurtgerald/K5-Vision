@@ -2103,7 +2103,13 @@ def _installed_analytics_journey(
                 fresh_sample = False
             diagnostic["analytics_failure_state"] = {
                 key: state.get(key)
-                for key in ("status", "processed_frames", "event_count", "sample_attempts", "sample_phase")
+                for key in (
+                    "status",
+                    "processed_frames",
+                    "event_count",
+                    "sample_attempts",
+                    "sample_phase",
+                )
             }
             diagnostic["analytics_failure_state"]["sample_after_source_switch"] = fresh_sample
         except Exception:
