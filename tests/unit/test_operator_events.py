@@ -265,6 +265,7 @@ def test_background_sampling_persists_events_without_browser_and_cooldown_is_mon
             service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.7)
             await service.cycle()
             assert service.status(source.binding.device_id)["status"] == "active"
+            assert service.status(source.binding.device_id)["sample_phase"] == "person_detected"
             assert store.summary(source.binding.device_id)["event_count"] == 1
             clock[0] += 5
             sampler.when -= timedelta(hours=48)
@@ -276,6 +277,7 @@ def test_background_sampling_persists_events_without_browser_and_cooldown_is_mon
             assert len(rows) == 2 and rows[0]["occurred_at"] == "2026-10-26T12:00:00.000Z"
             assert rows[0]["person_count"] == 1
             assert service.status(source.binding.device_id)["processed_frames"] == 3
+            assert service.status(source.binding.device_id)["sample_attempts"] == 3
         finally:
             await service.aclose()
 
@@ -493,6 +495,35 @@ def test_paused_recording_and_disabled_detector_do_not_start_native_work(store):
             await service.cycle()
             assert sampler.index == 0
             assert service.status(source.binding.device_id)["status"] == "waiting"
+            assert service.status(source.binding.device_id)["sample_phase"] == "recording_paused"
+            assert service.status(source.binding.device_id)["sample_attempts"] == 0
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_empty_native_sample_reports_only_bounded_source_free_reason(store):
+    class EmptySampler:
+        # A malicious or broken donor must not turn a diagnostic into a
+        # path, camera URI or arbitrary upstream payload echo.
+        _capture_outcome = "untrusted-private-string"
+
+        def capture(self, _source):
+            return None
+
+    source = _source()
+    service, _sampler, _provider = _service(store, source, sampler=EmptySampler())
+
+    async def run():
+        try:
+            service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
+            await service.cycle()
+            status = service.status(source.binding.device_id)
+            assert status["status"] == "waiting"
+            assert status["sample_phase"] == "no_frame"
+            assert status["sample_attempts"] == 1
+            assert status["processed_frames"] == 0
         finally:
             await service.aclose()
 
@@ -513,6 +544,7 @@ def test_decoder_failure_is_isolated_and_closes_cleanly(store):
             await service.start()
             await asyncio.sleep(0.1)
             assert service.status(source.binding.device_id)["status"] == "unavailable"
+            assert service.status(source.binding.device_id)["sample_phase"] == "native_failed"
             assert store.events(source.binding.device_id)["events"] == []
         finally:
             await service.aclose()
