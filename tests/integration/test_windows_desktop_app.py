@@ -1782,6 +1782,7 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
     # Observe only route identity and bounded finite counts/statuses. Never
     # retain URLs, query parameters, upload pixels or request/response bodies.
     traffic = {"requests": 0, "responses": 0, "failed": 0, "http_status": 0}
+    first_sent_at = [None]
 
     def is_sample(request):
         return request.method == "POST" and urlsplit(request.url).path == route
@@ -1789,15 +1790,20 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
     def observed_request(request):
         if is_sample(request):
             traffic["requests"] = min(5, traffic["requests"] + 1)
+            if first_sent_at[0] is None:
+                first_sent_at[0] = time.monotonic()
 
     def observed_response(response):
         if is_sample(response.request):
             traffic["responses"] = min(5, traffic["responses"] + 1)
-            traffic["http_status"] = (
-                response.status
-                if response.status in {200, 400, 401, 403, 404, 408, 413, 415, 422, 429, 503}
-                else 0
-            )
+            # HTTP status and elapsed time are finite transport evidence, not
+            # response content. Preserve unexpected 5xx classes to distinguish
+            # proxy/backend faults from a native inference refusal.
+            traffic["http_status"] = response.status if 100 <= response.status <= 599 else 0
+            if first_sent_at[0] is not None:
+                traffic["first_response_ms"] = min(
+                    120000, max(0, int((time.monotonic() - first_sent_at[0]) * 1000))
+                )
 
     def observed_failure(request):
         if is_sample(request):
