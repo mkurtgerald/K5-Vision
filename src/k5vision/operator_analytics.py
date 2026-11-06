@@ -225,10 +225,14 @@ class OperatorAnalyticsBroker:
                     # A canceled request cannot cancel the shared, media-free
                     # native initialization. Only the first view claims it.
                     await asyncio.shield(self._prewarm_task)
+                    if view.closed or self._closed:
+                        return OperatorAnalyticsResult("unavailable", frame_id)
                     view.provider, self._prewarmed_provider = (
                         self._prewarmed_provider,
                         None,
                     )
+                if view.closed or self._closed:
+                    return OperatorAnalyticsResult("unavailable", frame_id)
                 if view.provider is None:
                     view.provider = await self._factory()
             if view.closed or self._closed:
