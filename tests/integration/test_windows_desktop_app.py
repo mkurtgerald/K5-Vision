@@ -1794,7 +1794,9 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
         if is_sample(response.request):
             traffic["responses"] = min(5, traffic["responses"] + 1)
             traffic["http_status"] = (
-                response.status if response.status in {200, 400, 401, 403, 404, 408, 413, 415, 422, 429, 503} else 0
+                response.status
+                if response.status in {200, 400, 401, 403, 404, 408, 413, 415, 422, 429, 503}
+                else 0
             )
 
     def observed_failure(request):
@@ -1819,7 +1821,8 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
                   const message = document.getElementById('person-view-message')?.textContent || '';
                   const video = document.getElementById('live-video');
                   const button = document.getElementById('toggle-person-view');
-                  const classification = message.startsWith('Processing a sampled frame') ? 'processing'
+                  const classification = message.startsWith('Processing a sampled frame')
+                    ? 'processing'
                     : message.startsWith('Person detection is busy') ? 'busy'
                     : message.startsWith('Person detection is unavailable') ? 'unavailable'
                     : message.startsWith('Sampled view stopped') ? 'stopped'
