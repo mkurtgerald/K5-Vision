@@ -161,6 +161,9 @@ def create_operator_product_app(
         public_port=service.public_port,
         analytics=analytics,
         analytics_status=analytics_status,
+        prepare_native_person_on_camera=(
+            analytics is not None and PERSON_CONFIG_ENV not in os.environ
+        ),
         state_root=identity.directory,
     )
     previous_lifespan = application.router.lifespan_context
@@ -267,12 +270,6 @@ def create_operator_product_app(
                         analytics_task = asyncio.create_task(
                             maintain_analytics(), name="operator-transient-person-views"
                         )
-                        if PERSON_CONFIG_ENV not in os.environ:
-                            # Installed-model CPU compilation runs before live
-                            # camera enrollment, never in the GUI request path.
-                            # Explicit engineering configurations keep their
-                            # existing per-view initialization behavior.
-                            analytics.start_preparing()
                     if open_browser:
                         asyncio.get_running_loop().call_later(
                             0.5,
