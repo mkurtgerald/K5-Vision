@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import os
 import sqlite3
 import subprocess
@@ -600,3 +601,43 @@ def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch
         directory.symlink_to(identity.directory, target_is_directory=True)
         with pytest.raises(OperatorEventsError, match="source refused"):
             sampler.capture(source)
+
+@pytest.mark.parametrize(
+    "child_phase,expected",
+    [
+        ("model", "native_model_failed"),
+        ("decode", "native_decode_failed"),
+        ("inference", "native_inference_failed"),
+        ("rtsp://private-source", "native_transport_failed"),
+    ],
+)
+def test_native_worker_failure_phase_is_finite_and_source_free(
+    monkeypatch, tmp_path, child_phase, expected
+):
+    import json
+
+    import k5vision.operator_events as module
+
+    worker = module._RecordedNativeWorker(None)
+
+    class Process:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(
+            (json.dumps({"status": "failed", "phase": child_phase}) + "\n").encode()
+        )
+
+        def poll(self):
+            return 1
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 1
+
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", Process()))
+    with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+        worker.request(tmp_path / "private-snapshot.mp4")
+    assert worker._failure_phase == expected
+    assert worker._process is None
+    worker.close()

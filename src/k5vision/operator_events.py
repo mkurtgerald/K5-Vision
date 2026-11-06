@@ -345,6 +345,7 @@ class _RecordedNativeWorker:
         self._lock = threading.RLock()
         self._closing = threading.Event()
         self._person_ready = False
+        self._failure_phase = "native_not_started"
 
     def _request_timeout(self) -> float:
         if self._configuration is not None and not self._person_ready:
@@ -388,7 +389,9 @@ class _RecordedNativeWorker:
         with self._lock:
             if self._closing.is_set():
                 raise OperatorEventsError("Analytics worker is closed")
+            self._failure_phase = "native_launch_failed"
             self._start()
+            self._failure_phase = "native_transport_failed"
             process = self._process
             if self._closing.is_set():
                 self.close()
@@ -417,8 +420,23 @@ class _RecordedNativeWorker:
                 process.stdin.flush()
                 raw = process.stdout.readline(4097)
                 if not raw.endswith(b"\n") or len(raw) > 4096:
+                    self._failure_phase = "native_reply_missing"
                     raise ValueError
                 header = json.loads(raw)
+                if header.get("status") == "failed":
+                    failure_phases = {
+                        "protocol": "native_protocol_failed",
+                        "decode": "native_decode_failed",
+                        "model": "native_model_failed",
+                        "inference": "native_inference_failed",
+                    }
+                    phase = header.get("phase")
+                    self._failure_phase = (
+                        failure_phases.get(phase, "native_transport_failed")
+                        if type(phase) is str
+                        else "native_transport_failed"
+                    )
+                    raise ValueError
                 if header.get("status") == "empty":
                     return None
                 if header.get("status") != "ready" or header.get("bytes") != 544 * 320 * 4:
@@ -453,8 +471,11 @@ class _RecordedNativeWorker:
                     # This acknowledgement came from the owning native child.
                     # An empty frame never admits readiness for a later request.
                     self._person_ready = True
+                self._failure_phase = "native_none"
                 return elapsed, payload, detections
             except Exception:
+                if expired.is_set():
+                    self._failure_phase = "native_timeout"
                 failed = True
                 raise OperatorEventsError("Analytics native frame unavailable") from None
             finally:
@@ -918,7 +939,23 @@ class OperatorEventService:
             except Exception:
                 state = self._states.setdefault(identifier, {})
                 state["status"] = "unavailable"
-                state["sample_phase"] = "native_failed"
+                failure_phase = "native_failed"
+                if isinstance(self._sampler, RecordedFrameSampler):
+                    worker = getattr(self._sampler, "_worker", None)
+                    if isinstance(worker, _RecordedNativeWorker):
+                        candidate = worker._failure_phase
+                        if candidate in {
+                            "native_launch_failed",
+                            "native_transport_failed",
+                            "native_reply_missing",
+                            "native_protocol_failed",
+                            "native_decode_failed",
+                            "native_model_failed",
+                            "native_inference_failed",
+                            "native_timeout",
+                        }:
+                            failure_phase = candidate
+                state["sample_phase"] = failure_phase
                 if self._provider is not None:
                     try:
                         await self._provider.aclose()

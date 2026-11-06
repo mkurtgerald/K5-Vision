@@ -148,7 +148,7 @@ def main() -> int:
         # serialize exception text, model paths, source URIs or recording bytes.
         try:
             sys.stdout.buffer.write(
-                json.dumps({"status": "failed", "phase": phase}).encode("ascii") + b"\\n"
+                json.dumps({"status": "failed", "phase": phase}).encode("ascii") + b"\n"
             )
             sys.stdout.buffer.flush()
         except (OSError, ValueError):
