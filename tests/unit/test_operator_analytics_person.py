@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sys
 import threading
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -191,6 +193,84 @@ def test_native_model_read_uses_verified_immutable_bytes_after_admission(admitte
     assert weights == b"reviewed-weights" and xml == b"reviewed-xml"
     with pytest.raises(ValueError, match="bytes were refused"):
         module._model_bytes(config)
+
+
+
+def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(
+    admitted, monkeypatch
+):
+    """Cold native view compilation must reuse the core that admitted the model."""
+    config, _manifest, _files = admitted
+    calls = []
+
+    class Model:
+        inputs = (object(),)
+        outputs = (object(),)
+
+        def input(self, name):
+            assert name == "data"
+            return SimpleNamespace(shape=(1, 3, 320, 544))
+
+        def output(self, index):
+            assert index == 0
+            return SimpleNamespace(shape=(1, 1, 200, 7))
+
+    model = Model()
+
+    class Core:
+        def __init__(self):
+            calls.append("core")
+
+        def read_model(self, *, model: str, weights):
+            assert model == "reviewed-xml"
+            assert weights == b"reviewed-weights"
+            calls.append("read")
+            return admitted_model
+
+        def compile_model(self, value, device, settings):
+            assert value is admitted_model
+            assert device == "CPU"
+            assert settings == {"INFERENCE_NUM_THREADS": 2, "NUM_STREAMS": "1"}
+            calls.append("compile")
+            return SimpleNamespace(create_infer_request=lambda: "ready")
+
+    admitted_model = model
+
+    class Chain:
+        def __getattr__(self, _name):
+            return lambda *args, **kwargs: self
+
+    class PrePost:
+        def __init__(self, value):
+            assert value is admitted_model
+
+        def input(self):
+            return Chain()
+
+        def build(self):
+            return admitted_model
+
+    numpy_stub = ModuleType("numpy")
+    numpy_stub.uint8 = object()
+    numpy_stub.frombuffer = lambda raw, dtype: raw
+    openvino_stub = ModuleType("openvino")
+    openvino_stub.__path__ = []
+    openvino_stub.Core = Core
+    openvino_stub.Tensor = lambda data: data
+    openvino_stub.Type = SimpleNamespace(u8=object())
+    openvino_stub.Layout = lambda text: text
+    preprocess_stub = ModuleType("openvino.preprocess")
+    preprocess_stub.ColorFormat = SimpleNamespace(BGR="BGR")
+    preprocess_stub.ResizeAlgorithm = SimpleNamespace(RESIZE_LINEAR="linear")
+    preprocess_stub.PrePostProcessor = PrePost
+    monkeypatch.setitem(sys.modules, "numpy", numpy_stub)
+    monkeypatch.setitem(sys.modules, "openvino", openvino_stub)
+    monkeypatch.setitem(sys.modules, "openvino.preprocess", preprocess_stub)
+    monkeypatch.setattr(module, "_cap_windows_native_cpu_isa", lambda: None)
+
+    detector = module._PersonDetector(config)
+    assert detector._request == "ready"
+    assert calls == ["core", "read", "compile"]
 
 
 def test_model_byte_read_rejects_same_content_replaced_inode(admitted, monkeypatch):
