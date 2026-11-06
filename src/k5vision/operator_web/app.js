@@ -9,6 +9,7 @@
   const DAY = 86400000;
   const TIME_SAMPLE_MAX_AGE = 30000;
   const RETRY_DELAYS = [1000, 2000, 4000, 8000, 10000];
+  const PERSON_BUFFER_GRACE_MS = 5000;
   const ROLE_PERMISSIONS = Object.freeze({
     viewer: ["cameras.view_live", "cameras.playback"],
     operator: ["cameras.view_live", "cameras.playback", "cameras.export"],
@@ -57,6 +58,7 @@
     recorderTime: null, sessionExpiresAt: null, sessionExpirySteady: null,
     removeTarget: null, removing: false,
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
+    personBufferTimer: null,
     personFrameId: 0,
     recordingBusy: false, cameraListEpoch: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
     playbackStart: null, playbackEnd: null, playbackPosition: null, playbackEpoch: 0, selectedStatus: null,
@@ -887,6 +889,8 @@
     state.personEpoch += 1;
     clearTimeout(state.personTimer);
     state.personTimer = null;
+    clearTimeout(state.personBufferTimer);
+    state.personBufferTimer = null;
     state.personController?.abort();
     state.personController = null;
     const canvas = $("person-view-canvas");
@@ -1917,13 +1921,29 @@
   $("play-live").addEventListener("click", () => void $("live-video").play().catch(() => message("live-state", "Unable to play live video. Try reconnecting.")));
   $("live-video").addEventListener("playing", () => {
     if (!state.token || state.view !== "live") return;
+    // A transient HLS rebuffer must not abort an immutable person-frame POST.
+    clearTimeout(state.personBufferTimer);
+    state.personBufferTimer = null;
     $("live-placeholder").hidden = true; $("live-video-label").hidden = false; $("play-live").hidden = true;
     message("live-state", "Live video connected");
     renderPersonControls();
   });
   $("live-video").addEventListener("pause", () => { if (state.personEnabled) stopPersonView("Sampled view stopped while live video is paused."); });
   $("live-video").addEventListener("waiting", () => {
-    if (state.personEnabled) stopPersonView("Sampled view stopped while live video is buffering. Start it again when video returns.");
+    if (state.personEnabled && state.personBufferTimer === null) {
+      const epoch = state.personEpoch;
+      const video = $("live-video");
+      const frames = video.getVideoPlaybackQuality?.().totalVideoFrames;
+      state.personBufferTimer = setTimeout(() => {
+        state.personBufferTimer = null;
+        if (!state.personEnabled || state.personEpoch !== epoch) return;
+        const current = video.getVideoPlaybackQuality?.().totalVideoFrames;
+        if (video.paused || video.readyState < 2 || !Number.isFinite(frames)
+          || !Number.isFinite(current) || current <= frames) {
+          stopPersonView("Sampled view stopped while live video is buffering. Start it again when video returns.");
+        }
+      }, PERSON_BUFFER_GRACE_MS);
+    }
     if (state.token && state.view === "live") {
       $("live-video-label").hidden = true;
       message("live-state", "Buffering live video…");
