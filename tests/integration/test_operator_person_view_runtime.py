@@ -582,9 +582,17 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
             matching_fraction >= 0.90 and overlay_pixels >= 100,
             "The person canvas did not combine the submitted frozen frame and visible boxes",
         )
+        sample_message_correlated = "in this sample" in page.locator(
+            "#person-view-message"
+        ).inner_text()
+        sample_toggle_pressed = (
+            page.locator("#toggle-person-view").get_attribute("aria-pressed") == "true"
+        )
+        # Fixed booleans only; never copy camera text, pixels or request bodies.
+        pixel_evidence["sample_message_correlated"] = sample_message_correlated
+        pixel_evidence["sample_toggle_pressed"] = sample_toggle_pressed
         _require(
-            "in this sample" in page.locator("#person-view-message").inner_text()
-            and page.locator("#toggle-person-view").get_attribute("aria-pressed") == "true",
+            sample_message_correlated and sample_toggle_pressed,
             "The positive person sample was not visible in the real operator UI",
         )
         receipt.update(
