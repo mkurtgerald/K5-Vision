@@ -44,6 +44,9 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "{#PayloadRoot}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; This admitted copy runs before any existing installation is trusted.
 Source: "{#PayloadRoot}\K5Vision.exe"; DestName: "K5VisionInstallGuard.exe"; Flags: dontcopy
+; Runs after all product files were extracted but before Setup finalizes its
+; uninstall log, so a failed payload admission cannot be reported as success.
+Source: "{#PayloadRoot}\payload-manifest.json"; DestDir: "{tmp}"; DestName: "k5-install-seal.json"; Flags: deleteafterinstall; AfterInstall: AdmitExtractedPayload
 
 [Icons]
 Name: "{userprograms}\K5 Vision"; Filename: "{app}\K5Vision.exe"; WorkingDir: "{app}"
@@ -144,19 +147,22 @@ begin
   Result := AdmittedGuard(ExpandConstant('{tmp}\K5VisionInstallGuard.exe'));
 end;
 
-procedure CurStepChanged(Step: TSetupStep);
+procedure AdmitExtractedPayload();
 var
   ExitCode: Integer;
 begin
-  // A successful extraction is not yet a verified installation. Admit every
-  // sealed payload byte through the actual installed launcher before Setup
-  // reports success or offers the operator the first-run Launch choice.
-  if Step = ssPostInstall then begin
-    if not Exec(ExpandConstant('{app}\K5Vision.exe'), '--installation-payload-check', '',
-      SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
-      RaiseException('K5 Vision could not verify the installed application. Your account and recordings were preserved.');
-    ReleaseInstallationLease();
-  end;
+  // File extraction is complete, but the uninstaller log is not yet finalized.
+  // Check the *installed* manifest, every included hash and the sealed tree.
+  // Reject the candidate before the Setup success/activation phase.
+  if not Exec(ExpandConstant('{app}\K5Vision.exe'), '--installation-payload-check', '',
+    SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
+    RaiseException('K5 Vision could not verify the installed application. Your account and recordings were preserved.');
+end;
+
+procedure CurStepChanged(Step: TSetupStep);
+begin
+  // A successful file-admission check was required during [Files] extraction.
+  if Step = ssPostInstall then ReleaseInstallationLease();
 end;
 
 procedure DeinitializeSetup();
