@@ -112,6 +112,34 @@ class OperatorAnalyticsBroker:
         self._clock: Callable[[], float] = time.monotonic
         self._views: dict[tuple[UUID, UUID], _View] = {}
         self._closed = False
+        self._prewarm_task: asyncio.Task[None] | None = None
+        self._prewarmed_provider: OwnedAnalyticsProvider | None = None
+
+    def start_preparing(self) -> None:
+        """Prepare one sealed native worker ahead of a first installed frame.
+
+        This owns no camera, human session, frame or source URI. The worker is
+        handed to exactly one authenticated view on its first actual request.
+        """
+        if not self._closed and self._prewarm_task is None:
+            self._prewarm_task = asyncio.create_task(
+                self._prepare(), name="operator-native-person-preparation"
+            )
+
+    async def _prepare(self) -> None:
+        try:
+            provider = await self._factory()
+        except Exception:
+            # A failed optional warmup never prevents recording or startup.
+            # The first real frame may still attempt the normal cold path.
+            return
+        if self._closed:
+            try:
+                await provider.aclose()
+            except Exception:
+                pass
+        else:
+            self._prewarmed_provider = provider
 
     @staticmethod
     def _validate(owner_id: UUID, camera_id: UUID, frame_id: int, frame) -> None:
@@ -193,7 +221,16 @@ class OperatorAnalyticsBroker:
 
         async def run() -> OperatorAnalyticsResult:
             if view.provider is None:
-                view.provider = await self._factory()
+                if self._prewarm_task is not None:
+                    # A canceled request cannot cancel the shared, media-free
+                    # native initialization. Only the first view claims it.
+                    await asyncio.shield(self._prewarm_task)
+                    view.provider, self._prewarmed_provider = (
+                        self._prewarmed_provider,
+                        None,
+                    )
+                if view.provider is None:
+                    view.provider = await self._factory()
             if view.closed or self._closed:
                 return OperatorAnalyticsResult("unavailable", frame_id)
             # Caller timing is a view correlation hint, never tracker authority.
@@ -253,6 +290,19 @@ class OperatorAnalyticsBroker:
 
     async def aclose(self) -> None:
         self._closed = True
+        preparation, self._prewarm_task = self._prewarm_task, None
+        if preparation is not None:
+            preparation.cancel()
+            try:
+                await preparation
+            except (Exception, asyncio.CancelledError):
+                pass
+        prepared, self._prewarmed_provider = self._prewarmed_provider, None
+        if prepared is not None:
+            try:
+                await prepared.aclose()
+            except Exception:
+                pass
         selected = tuple(self._views.values())
         self._views.clear()
         for view in selected:
