@@ -46,9 +46,7 @@ def test_wizard_page_signature_changes_only_with_observed_native_page():
 
 
 def test_wizard_signature_tracks_control_identity_not_only_caption():
-    wizard = _Wizard(
-        {1: ("TNewStaticText", "Ready"), 2: ("TNewButton", "Next >")}
-    )
+    wizard = _Wizard({1: ("TNewStaticText", "Ready"), 2: ("TNewButton", "Next >")})
     current = _DESKTOP._installer_page_signature(wizard, [1, 2])
     wizard.controls[3] = ("TNewStaticText", "Ready")
     assert current != _DESKTOP._installer_page_signature(wizard, [2, 3])
