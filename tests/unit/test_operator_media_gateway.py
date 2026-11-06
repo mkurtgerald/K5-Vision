@@ -61,16 +61,16 @@ def test_fixed_gateway_authorizes_each_media_request_before_private_proxy(assets
                 yield from proxies(child)
 
     worker_proxies = list(proxies(document))
-    assert len(worker_proxies) == 9
+    assert len(worker_proxies) == 10
     for proxy in worker_proxies:
         # Every route must retire pooled connections before Uvicorn's 5s
         # idle limit; a failed mutation is never replayed as a workaround.
         transport = proxy["transport"]
         assert transport["keep_alive"] == {"idle_timeout": "2s"}
         assert transport["max_conns_per_host"] == 32
-        assert transport["read_timeout"] in {"15s", "23s", "80s"}
+        assert transport["read_timeout"] in {"15s", "18s", "23s", "80s"}
         assert transport["write_timeout"] == "10s"
-        if transport["read_timeout"] in {"23s", "80s"}:
+        if transport["read_timeout"] in {"18s", "23s", "80s"}:
             assert transport["response_header_timeout"] == transport["read_timeout"]
         else:
             assert transport["response_header_timeout"] == "10s"
@@ -131,6 +131,7 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
         "/api/v1/operator/cameras/*/time/*",
         "/api/v1/auth/oidc/*",
         "/api/v1/operator/cameras/*/person-view",
+        "/api/v1/operator/camera-profiles",
         "/api/*",
         "/media/exports/*",
         "/media/hls.js",
@@ -187,10 +188,41 @@ def test_cold_native_person_sampling_uses_bounded_dedicated_proxy(assets):
     assert sample["transport"]["response_header_timeout"] == "23s"
     assert sample["transport"]["read_timeout"] == "23s"
     assert sample["transport"]["write_timeout"] == "10s"
-    generic = routes[index + 1]
+    generic = next(
+        route for route in routes if route.get("match") == [{"path": ["/api/*"]}]
+    )
+    assert index < routes.index(generic)
     assert generic["match"] == [{"path": ["/api/*"]}]
     assert generic["handle"][0]["transport"]["response_header_timeout"] == "10s"
     assert generic["handle"][0]["transport"]["read_timeout"] == "15s"
+
+
+def test_onvif_profile_probe_has_a_dedicated_bounded_upstream_deadline(assets):
+    document = json.loads(_configuration(assets))
+    routes = document["apps"]["http"]["servers"]["operator"]["routes"]
+    expected = [
+        {"method": ["POST"], "path": ["/api/v1/operator/camera-profiles"]}
+    ]
+    matched = [(i, route) for i, route in enumerate(routes) if route.get("match") == expected]
+    assert len(matched) == 1
+    index, route = matched[0]
+    generic_index = next(
+        i for i, other in enumerate(routes)
+        if other.get("match") == [{"path": ["/api/*"]}]
+    )
+    assert index < generic_index
+    assert route["terminal"] is True
+    assert len(route["handle"]) == 1
+    proxy = route["handle"][0]
+    assert proxy["handler"] == "reverse_proxy"
+    assert proxy["upstreams"] == [{"dial": "127.0.0.1:18081"}]
+    assert "rewrite" not in proxy and "headers" not in proxy
+    assert proxy["transport"]["response_header_timeout"] == "18s"
+    assert proxy["transport"]["read_timeout"] == "18s"
+    assert proxy["transport"]["write_timeout"] == "10s"
+    generic = routes[generic_index]["handle"][0]
+    assert generic["transport"]["response_header_timeout"] == "10s"
+    assert generic["transport"]["read_timeout"] == "15s"
 
 
 def test_export_files_only_reach_the_application_authority(assets):
