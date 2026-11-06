@@ -5,18 +5,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_native_setup_refuses_success_before_installed_payload_admission():
+def test_native_setup_refuses_success_before_finalizing_uninstall_log():
     setup = (ROOT / "windows/desktop/K5Vision.iss").read_text(encoding="utf-8")
-    code = setup.split("procedure CurStepChanged(Step: TSetupStep);", 1)[1].split(
-        "procedure DeinitializeSetup();", 1
+    files = setup.split("[Files]", 1)[1].split("[Icons]", 1)[0]
+    assert files.index('Source: "{#PayloadRoot}\\*"') < files.index(
+        'AfterInstall: AdmitExtractedPayload'
+    )
+    assert 'DestDir: "{tmp}"' in files
+    assert "deleteafterinstall" in files
+    code = setup.split("procedure AdmitExtractedPayload();", 1)[1].split(
+        "procedure CurStepChanged(Step: TSetupStep);", 1
     )[0]
-    assert "if Step = ssPostInstall then begin" in code
     assert "ExpandConstant('{app}\\K5Vision.exe')" in code
     assert "'--installation-payload-check'" in code
     assert "ewWaitUntilTerminated" in code
     assert "(ExitCode <> 0)" in code
     assert "RaiseException(" in code
-    assert code.index("RaiseException(") < code.index("ReleaseInstallationLease();")
+    assert "ReleaseInstallationLease();" not in code
 
 
 def test_supervisor_payload_admission_uses_sealed_hashes_without_profile_mutation():
