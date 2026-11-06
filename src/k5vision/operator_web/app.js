@@ -948,8 +948,11 @@
         stopPersonView("Person detection is unavailable. Live video and recording continue. Start sampled view to retry.");
         return;
       }
-      if (result.status === "busy" && $("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
-      else {
+      if (result.status === "busy") {
+        // Busy has no boxes. Never erase the last valid frozen-frame overlay
+        // while another native worker owns inference capacity.
+        if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
+      } else {
         // The response belongs to this exact frozen sample, never the moving
         // live player. Publish frame and boxes together in one canvas update.
         const canvas = $("person-view-canvas");
