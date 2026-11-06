@@ -517,7 +517,23 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         with page.expect_response(
             lambda response: urlsplit(response.url).path == sample_route
         ) as sample:
-            page.locator("#toggle-person-view").click()
+            with page.expect_request(
+                lambda request: (
+                    request.method == "POST"
+                    and urlsplit(request.url).path == sample_route
+                )
+            ):
+                page.locator("#toggle-person-view").click()
+            # Reproduce a transient HLS waiting notification while the exact
+            # captured-frame inference is in flight. The production UI must
+            # keep that request alive and recover on playing; no substitute
+            # detection response or acceptance shortcut is provided here.
+            page.locator("#live-video").dispatch_event("waiting")
+            _require(
+                page.locator("#toggle-person-view").get_attribute("aria-pressed") == "true",
+                "Brief live buffering aborted an in-flight sampled person frame",
+            )
+            page.locator("#live-video").dispatch_event("playing")
         result, posted_pixels = _sample_contract(sample.value)
         stage = "positive_sample_canvas"
         page.locator("#person-view-canvas").wait_for(state="visible")
