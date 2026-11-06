@@ -15,6 +15,7 @@ import os
 import secrets
 import shutil
 import socket
+import subprocess
 from pathlib import Path
 from uuid import uuid4
 
@@ -60,6 +61,18 @@ def _assert_installed(installed: Path, head: str, launcher_hash: str) -> None:
     manifest = json.loads((installed / "payload-manifest.json").read_text(encoding="utf-8"))
     assert manifest["head_sha"] == head
     assert _digest(installed / "K5Vision.exe") == launcher_hash
+
+
+def _installed_payload_check(installed: Path) -> int:
+    """Run the actual installed supervisor without starting backend or emitting artifacts."""
+    return subprocess.run(
+        [str(installed / "K5Vision.exe"), "--installation-payload-check"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=90,
+    ).returncode
 
 
 def _free_local_port() -> int:
@@ -225,6 +238,19 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
 
         d._install_gui(candidate, installed, api)
         _assert_installed(installed, new_head, new_launcher)
+        assert _installed_payload_check(installed) == 0
+        # A changed installed licensing byte must fail the same admission used
+        # by Setup, with no backend started and no state or camera files read.
+        licensed = installed / "licenses" / "INSTALLATION-LICENSE.txt"
+        assert licensed.is_file()
+        original = licensed.read_bytes()
+        assert original
+        try:
+            licensed.write_bytes(original + b"\nunauthorized change")
+            assert _installed_payload_check(installed) != 0
+        finally:
+            licensed.write_bytes(original)
+        assert _installed_payload_check(installed) == 0
         assert_preserved()
         assert start_and_login(first=False) == original_site
         verified.append("new_revision_login")

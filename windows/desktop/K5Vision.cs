@@ -35,6 +35,21 @@ namespace K5VisionDesktop
                 return TimeAdministration.Execute(arguments[1], arguments[2]);
             if (arguments.Length == 1 && arguments[0] == "--installation-check")
                 return InstallationCheck();
+            if (arguments.Length == 1 && arguments[0] == "--installation-payload-check")
+            {
+                // Used by the actual Windows installer after file extraction.
+                // Verify sealed release bytes without opening a window or touching user state.
+                try { Custody.VerifyPayload(Path.GetDirectoryName(Application.ExecutablePath)); return 0; }
+                catch { return 1; }
+            }
+            if (arguments.Length == 1 && arguments[0] == "--installation-extraction-check")
+            {
+                // Inno's uninstall metadata may still be in-flight inside [Files].
+                // Admit every sealed file/ACL now, then require a strict full-tree
+                // check after Inno has finalized the uninstall log and before Finish.
+                try { Custody.VerifySealedFiles(Path.GetDirectoryName(Application.ExecutablePath)); return 0; }
+                catch { return 1; }
+            }
             if (arguments.Length == 2 && arguments[0] == "--installation-identity")
             {
                 try
@@ -217,7 +232,17 @@ namespace K5VisionDesktop
                 return BitConverter.ToString(algorithm.ComputeHash(bytes)).Replace("-", "").ToLowerInvariant();
         }
 
+        internal static void VerifySealedFiles(string root)
+        {
+            VerifyPayload(root, false);
+        }
+
         internal static void VerifyPayload(string root)
+        {
+            VerifyPayload(root, true);
+        }
+
+        private static void VerifyPayload(string root, bool requireFullTree)
         {
             Admit(root, root);
             string manifestPath = Path.Combine(root, "payload-manifest.json");
@@ -253,7 +278,7 @@ namespace K5VisionDesktop
                 throw new InvalidOperationException();
             foreach (string bootstrap in new[] { "K5Vision.exe", "payload-manifest.json", "unins000.exe", "unins000.dat", "unins000.msg" })
                 admitted.Add(bootstrap);
-            VerifyTree(root, root, admitted);
+            if (requireFullTree) VerifyTree(root, root, admitted);
         }
 
         private static void VerifyTree(string directory, string root, HashSet<string> admitted)

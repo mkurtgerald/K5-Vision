@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import socket
@@ -330,12 +331,89 @@ def _uncheck_launch(api, controls):
     return False
 
 
+def _classify_installer_modal(api, forms, diagnostic):
+    """Classify only finite modal evidence; never retain window text or paths."""
+    for form in forms:
+        if api.class_name(form) not in {"#32770", "TMessageForm", "TTaskDialog"}:
+            continue
+        if not api.api.IsWindowVisible(form):
+            continue
+        diagnostic["installer_modal_visible"] = True
+        children = api.windows(form)
+        diagnostic["installer_modal_controls"] = min(64, len(children))
+        # Window labels may contain local installation paths. Inspect in memory
+        # for fixed phrases, and emit only this bounded, non-identifying code.
+        labels = [api.text(form), *(api.text(child) for child in children[:64])]
+        message = " ".join(labels).casefold()
+        if "could not verify the installed application" in message:
+            diagnostic["installer_modal_classification"] = "payload_refusal"
+        elif "still running" in message or "another setup" in message:
+            diagnostic["installer_modal_classification"] = "active_instance"
+        elif "file" in message and ("in use" in message or "access" in message):
+            diagnostic["installer_modal_classification"] = "file_access"
+        else:
+            diagnostic["installer_modal_classification"] = "unclassified"
+        return
+
+
+def _classify_installed_seal_refusal(installed):
+    """Use only bounded codes to distinguish an in-flight Inno file from bad payload.
+
+    Never emit a filename, source URI, local directory, manifest entry or hash.
+    This is diagnostic-only, invoked after the *real* installer refuses admission.
+    """
+    try:
+        manifest = json.loads((installed / "payload-manifest.json").read_text(encoding="utf-8"))
+        entries = manifest["files"]
+        declared = {entry["path"].casefold() for entry in entries}
+        allowed = {
+            "k5vision.exe",
+            "payload-manifest.json",
+            "unins000.exe",
+            "unins000.dat",
+            "unins000.msg",
+        }
+        observed = set()
+        for i, file in enumerate(installed.rglob("*")):
+            if i >= 10000:
+                return "unbounded_installed_tree"
+            if file.is_file():
+                observed.add(file.relative_to(installed).as_posix().casefold())
+        extras = observed - declared - allowed
+        if extras:
+            # Inno may reserve or create additional uninstall siblings during an
+            # upgrade. Report only a fixed class; never disclose their names or
+            # trust these files in the product verifier.
+            if all(re.fullmatch(r"unins[0-9]{3}\.(?:exe|dat|msg|tmp)", name) for name in extras):
+                return "inno_uninstaller_sibling"
+            if all(re.fullmatch(r"unins[0-9]{3}\.(?:tmp|new|old)", name) for name in extras):
+                return "inno_uninstaller_transient"
+            if any(name.startswith("runtime/") or name.startswith("workers/") for name in extras):
+                return "unlisted_worker_or_runtime_file"
+            return "unlisted_installed_file"
+        if declared - observed:
+            return "missing_sealed_file"
+        for entry in entries:
+            path = installed.joinpath(*entry["path"].split("/"))
+            if path.stat().st_size != entry["bytes"]:
+                return "changed_sealed_file_size"
+            with path.open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != entry["sha256"]:
+                    return "changed_sealed_file_hash"
+        return "native_admission_or_inflight_installer_metadata"
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return "bounded_inspection_incomplete"
+
+
 def _install_gui(setup, installed, api, *, diagnostic=None):
     """Drive the actual Inno wizard without suppressing its user interface."""
     __tracebackhide__ = True
     diagnostic = {} if diagnostic is None else diagnostic
     diagnostic.update(
-        installer_action="starting", installer_install_posted=False, installer_next_clicks=0
+        installer_action="starting",
+        installer_install_posted=False,
+        installer_next_clicks=0,
+        installer_modal_visible=False,
     )
     process = subprocess.Popen(
         [
@@ -357,6 +435,13 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
             root = psutil.Process(process.pid)
             pids = {root.pid, *(child.pid for child in root.children(recursive=True))}
             forms = [window for window in api.windows() if api.pid(window) in pids]
+            if diagnostic["installer_install_posted"]:
+                _classify_installer_modal(api, forms, diagnostic)
+                if diagnostic.get("installer_modal_classification") == "payload_refusal":
+                    diagnostic["installer_seal_refusal_category"] = (
+                        _classify_installed_seal_refusal(installed)
+                    )
+                    pytest.fail("Installer refused its extracted sealed payload", pytrace=False)
             for form in forms:
                 controls = [
                     window
@@ -364,6 +449,12 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                     if api.api.IsWindowVisible(window) and api.api.IsWindowEnabled(window)
                 ]
                 captions = {_normalized_caption(api.text(window)): window for window in controls}
+                if any(
+                    caption.startswith("k5 vision could not verify the installed application")
+                    for caption in captions
+                ):
+                    diagnostic["installer_action"] = "payload_admission_refused"
+                    pytest.fail("Installer rejected the extracted sealed payload", pytrace=False)
                 if "i accept the agreement" in captions:
                     diagnostic["installer_action"] = "accept_license"
                     api.click(captions["i accept the agreement"])
@@ -2142,6 +2233,7 @@ def _vm_clock_phase(
                 )
                 mark_clock_phase(direction + "_two_maintenance_cycles")
                 diagnostic["vm_clock_stage"] = direction + "_live"
+                diagnostic["vm_clock_stage"] = direction + "_live_media"
                 live_status = context.request.get(live_url, timeout=5000).status
                 diagnostic["vm_clock_media_http_status"] = live_status
                 _require(live_status == 200, "VM clock step expired authenticated live media")
@@ -2149,6 +2241,7 @@ def _vm_clock_phase(
                     page.locator("#workspace").is_visible(),
                     "VM clock step signed out the browser's existing human session",
                 )
+                diagnostic["vm_clock_stage"] = direction + "_live_decode"
                 frames_before = browser_helpers._decoded_color(page, "live-video", "red")
                 page.wait_for_function(
                     """before => {
@@ -2160,6 +2253,7 @@ def _vm_clock_phase(
                     timeout=10_000,
                 )
                 frames_after = browser_helpers._decoded_color(page, "live-video", "red")
+                diagnostic["vm_clock_stage"] = direction + "_recording_progress"
                 recording = {}
                 _wait(
                     lambda before=bytes_before, result=recording: _tray_recording(
@@ -2191,12 +2285,14 @@ def _vm_clock_phase(
                         for span in spans
                     )
 
+                diagnostic["vm_clock_stage"] = direction + "_history_poll"
                 _wait(
                     shifted_history,
                     "VM clock shifted recorder UTC history query",
                     process=app,
                     timeout=10,
                 )
+                diagnostic["vm_clock_stage"] = direction + "_events_fetch"
                 retained_events = client.json(route + "/events")["events"]
                 _require(
                     any(
@@ -3073,27 +3169,36 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         admin_executor = None
         if vm_clock_enabled:
             _enter_stage("actual_vm_clock_changes")
-            receipt["vm_clock"] = _vm_clock_phase(
-                page=page,
-                context=context,
-                client=client,
-                profile=profile,
-                camera_id=camera_id,
-                parent=parent,
-                processes=processes,
-                source_uri=source_uri,
-                ffmpeg=ffmpeg,
-                ffprobe=ffprobe,
-                helpers=helpers,
-                browser_helpers=browser_helpers,
-                app=app,
-                setup_sha256=setup_sha256,
-                diagnostic=vm_clock_diagnostic,
-                publisher=publishers[0],
-                camera_directory=camera_directories[0],
-                publisher_credentials=primary_publisher_credentials,
-                analytics_event=analytics_event,
-            )
+            try:
+                receipt["vm_clock"] = _vm_clock_phase(
+                    page=page,
+                    context=context,
+                    client=client,
+                    profile=profile,
+                    camera_id=camera_id,
+                    parent=parent,
+                    processes=processes,
+                    source_uri=source_uri,
+                    ffmpeg=ffmpeg,
+                    ffprobe=ffprobe,
+                    helpers=helpers,
+                    browser_helpers=browser_helpers,
+                    app=app,
+                    setup_sha256=setup_sha256,
+                    diagnostic=vm_clock_diagnostic,
+                    publisher=publishers[0],
+                    camera_directory=camera_directories[0],
+                    publisher_credentials=primary_publisher_credentials,
+                    analytics_event=analytics_event,
+                )
+            except RuntimeError:
+                # The local transport records only bounded type/timing classes.
+                # Never retain camera routes, credential tokens or source addresses.
+                if client.transport_failure is not None:
+                    vm_clock_diagnostic["vm_clock_transport_failure"] = dict(
+                        client.transport_failure
+                    )
+                raise
             receipt["host_clock_step_acceptance"] = True
         _enter_stage("installed_analytics_permissions")
         permissions_executor = ThreadPoolExecutor(max_workers=1)
@@ -3259,6 +3364,27 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         retained_samples = [
             (path, hashlib.sha256(path.read_bytes()).digest()) for path in saved_files[:3]
         ]
+        # Re-admit the exact installed sealed tree after real recording and
+        # shutdown. This distinguishes a runtime-created foreign file from a
+        # verifier rejection that only occurs during Inno's second extraction.
+        try:
+            payload_check = subprocess.run(
+                [str(installed / "K5Vision.exe"), "--installation-payload-check"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=90,
+            ).returncode
+        except subprocess.TimeoutExpired:
+            payload_check = -1
+        readiness_diagnostic["stopped_payload_precheck"] = (
+            "admitted" if payload_check == 0 else "refused"
+        )
+        _require(
+            payload_check == 0,
+            "Stopped installed payload could not be re-admitted before reinstall",
+        )
         _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
         _require(
             identity_state.load_identity_state(profile / "identity").site_id == identity.site_id,
