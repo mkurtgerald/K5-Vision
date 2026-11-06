@@ -83,7 +83,6 @@ def harness(monkeypatch, tmp_path):
     )
 
 
-
 def test_unowned_native_preparation_is_claimed_only_by_an_authorized_view(harness):
     async def run():
         broker = harness.make(max_views=1)
@@ -93,9 +92,7 @@ def test_unowned_native_preparation_is_claimed_only_by_an_authorized_view(harnes
         assert len(harness.providers) == 1
         assert harness.calls == []
         owner, camera = uuid4(), uuid4()
-        result = await broker.infer(
-            owner_id=owner, camera_id=camera, frame_id=1, frame=frame(7)
-        )
+        result = await broker.infer(owner_id=owner, camera_id=camera, frame_id=1, frame=frame(7))
         assert result.status == "active"
         assert len(harness.providers) == 1
         assert harness.calls[0][0] is harness.providers[0]
@@ -134,9 +131,7 @@ def test_cancelled_view_does_not_cancel_media_free_model_preparation(harness):
         release.set()
         await broker._prewarm_task
         assert len(harness.providers) == 1 and harness.calls == []
-        result = await broker.infer(
-            owner_id=owner, camera_id=camera, frame_id=2, frame=frame(5)
-        )
+        result = await broker.infer(owner_id=owner, camera_id=camera, frame_id=2, frame=frame(5))
         assert result.status == "active"
         assert harness.calls[0][0] is harness.providers[0]
         await broker.aclose()
