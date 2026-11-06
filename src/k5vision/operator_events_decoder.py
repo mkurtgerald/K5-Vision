@@ -36,9 +36,10 @@ def decode(path: str):
         deadline = time.monotonic() + 3
         # A growing fragmented MP4 can expose dimensions/count before its last
         # fragment supports seeking. An empty tail seek is not an empty recording.
-        # Rewind only within the same three-second decode budget; never invent
-        # timestamps or source a frame from outside the owned recorder snapshot.
-        for attempt in range(2 if tail_offset > 0 else 1):
+        # Try a rewind and, if necessary, a fresh decoder on the same immutable
+        # snapshot. Keep all attempts inside the same three-second decode budget;
+        # never invent timestamps or inspect a different recording.
+        for attempt in range(3 if tail_offset > 0 else 1):
             for _index in range(8192):
                 if time.monotonic() >= deadline:
                     break
@@ -49,9 +50,25 @@ def decode(path: str):
                 # Event UTC must use the recorded presentation timestamp only.
                 if math.isfinite(elapsed) and 0 <= elapsed <= 3605:
                     selected = frame, elapsed
-            if selected is not None or attempt or time.monotonic() >= deadline:
+            if selected is not None or time.monotonic() >= deadline:
                 break
-            capture.set(cv2.CAP_PROP_POS_MSEC, 0)
+            if attempt == 0:
+                capture.set(cv2.CAP_PROP_POS_MSEC, 0)
+            elif attempt == 1:
+                # Some FFmpeg backends cannot rewind a fragmented index in
+                # place. Reopening resets the decoder without changing bytes.
+                capture.release()
+                capture = cv2.VideoCapture(
+                    path,
+                    cv2.CAP_FFMPEG,
+                    [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 1500, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1500],
+                )
+                if (
+                    not capture.isOpened()
+                    or capture.get(cv2.CAP_PROP_FRAME_WIDTH) != width
+                    or capture.get(cv2.CAP_PROP_FRAME_HEIGHT) != height
+                ):
+                    break
         if selected is None:
             return None
         frame, elapsed = selected
