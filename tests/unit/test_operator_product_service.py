@@ -1222,8 +1222,21 @@ def test_bundled_person_model_enables_bounded_sampled_view_without_override(
         assert client.get("/api/v1/health").status_code == 200
         assert app.state.operator_person_status == "configured"
         assert calls == [("start", ())]
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "pilot-admin", "password": "local-test-password"},
+        )
+        assert login.status_code == 200
+        result = client.get(
+            "/api/v1/operator/cameras",
+            headers={"Authorization": "Bearer " + login.json()["session_token"]},
+        )
+        assert result.status_code == 200 and result.json()["cameras"] == []
+        # A fresh account has no camera to prepare. Preserve login/API
+        # responsiveness while keeping the sealed native broker configured.
+        assert preparing == []
     assert view_limits == [1]
-    assert preparing == [True]
+    assert preparing == []
     assert closed == [True]
     assert calls == [("start", ()), ("stop", ())]
     _assert_profile_lease_available(tmp_path / "identity")
