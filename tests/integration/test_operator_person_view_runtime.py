@@ -582,9 +582,9 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
             matching_fraction >= 0.90 and overlay_pixels >= 100,
             "The person canvas did not combine the submitted frozen frame and visible boxes",
         )
-        sample_message_correlated = "in this sample" in page.locator(
-            "#person-view-message"
-        ).inner_text()
+        sample_message_correlated = (
+            "in this sample" in page.locator("#person-view-message").inner_text()
+        )
         sample_toggle_pressed = (
             page.locator("#toggle-person-view").get_attribute("aria-pressed") == "true"
         )
