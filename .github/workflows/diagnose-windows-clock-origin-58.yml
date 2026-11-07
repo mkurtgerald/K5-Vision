@@ -1,0 +1,138 @@
+name: Windows clock origin diagnostic (58a0973)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/diagnose-windows-clock-origin-58.yml
+      - scripts/diagnose_windows_clock_origin_58.py
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  installed-clock-origin:
+    name: Locate the clock journey failure using the exact 58 installer
+    runs-on: windows-2025
+    timeout-minutes: 18
+    env:
+      K5_DESKTOP_HEAD_SHA: "58a097370627afa152a36288bc8e0db20ad209a7"
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_VM_CLOCK_ACCEPTANCE: "1"
+      K5_VM_CLOCK_DISPOSABLE_GUEST: "1"
+      PYTHONPATH: src
+    steps:
+      - name: Checkout the diagnostic wrapper and its frozen application parent
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify disposable hosted Windows and unchanged application acceptance sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or
+              $env:RUNNER_OS -ne "Windows" -or $env:K5_VM_CLOCK_ACCEPTANCE -ne "1" -or
+              $env:K5_VM_CLOCK_DISPOSABLE_GUEST -ne "1") {
+            throw "Actual clock diagnostic requires the disposable GitHub-hosted Windows VM"
+          }
+          $changed = @(git diff --name-only $env:K5_DESKTOP_HEAD_SHA -- src/k5vision tests pyproject.toml windows/desktop .github/actions/provision-operator-tools .github/workflows/operator-desktop-windows.yml)
+          if ($LASTEXITCODE -ne 0 -or $changed.Count -ne 0) {
+            throw "Clock diagnostic changed the application, clock guard or original acceptance journey"
+          }
+      - name: Set up development Python on the isolated VM
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12.10"
+          cache: pip
+      - name: Install test automation before changing guest time
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Clock diagnostic dependency install failed" }
+      - name: Provision all immutable recording tools before changing guest time
+        uses: ./.github/actions/provision-operator-tools
+      - name: Admit the public person fixture before changing guest time
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Clock diagnostic analytics fixtures refused" }
+      - name: Check the source run and immutable installer artifact identity
+        shell: pwsh
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $headers = @{
+            Authorization="Bearer $env:GH_READ_TOKEN"
+            Accept="application/vnd.github+json"
+            "X-GitHub-Api-Version"="2022-11-28"
+          }
+          $artifact = Invoke-RestMethod -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/actions/artifacts/13591480449" -Headers $headers
+          if ($artifact.id -ne 13591480449 -or
+              $artifact.name -ne "k5-vision-windows-setup-58a097370627afa152a36288bc8e0db20ad209a7" -or
+              $artifact.workflow_run.id -ne 42414363684 -or
+              $artifact.workflow_run.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $artifact.expired -ne $false -or $artifact.size_in_bytes -ne 205521045 -or
+              $artifact.digest -ne "sha256:23da19034f795628d7b2ab50f7de3705b2b4fe2e706262ef28f1c5ee057e6dce") {
+            throw "Frozen clock diagnostic installer artifact identity mismatch"
+          }
+      - name: Download the exact existing installer without rebuilding
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          github-token: ${{ github.token }}
+          repository: mkurtgerald/K5-Vision
+          run-id: 42414363684
+          artifact-ids: "13591480449"
+          merge-multiple: true
+          path: vm-clock-input
+      - name: Bind the direct clock diagnostic to the tested Setup and payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or
+              $env:RUNNER_OS -ne "Windows") {
+            throw "Real clock tests require a disposable GitHub-hosted Windows VM"
+          }
+          $package = Get-Content -LiteralPath vm-clock-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifestPath = "vm-clock-input/payload-manifest.json"
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          $setup = Get-Item -LiteralPath vm-clock-input/K5VisionSetup.exe
+          $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
+              $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()) {
+            throw "Clock diagnostic installer source or content identity mismatch"
+          }
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_SETUP_SHA256=$sha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Call the original installed clock journey with sanitized diagnostics
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          python -u scripts/diagnose_windows_clock_origin_58.py --output clock-origin-58-diagnostic.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve only the terminal diagnostic report after restoration
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: clock-origin-58-diagnostic-${{ github.run_id }}
+          path: clock-origin-58-diagnostic.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Remove only owned development tools
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrEmpty($env:K5_DONOR_TOOL_ROOT)) { exit 0 }
+          $toolRoot = [IO.Path]::GetFullPath($env:K5_DONOR_TOOL_ROOT)
+          $expected = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar)
+          if (-not [string]::Equals([IO.Directory]::GetParent($toolRoot).FullName, $expected, [StringComparison]::OrdinalIgnoreCase) -or
+              [IO.Path]::GetFileName($toolRoot) -notmatch '^K5 donor development tools [a-f0-9]{32}$') {
+            throw "Clock diagnostic cleanup ownership refused"
+          }
+          if (Test-Path -LiteralPath $toolRoot) { Remove-Item -LiteralPath $toolRoot -Recurse -Force }
