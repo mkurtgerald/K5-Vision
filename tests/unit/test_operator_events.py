@@ -509,14 +509,14 @@ def test_owned_native_child_launch_uses_isolated_embedded_python(monkeypatch):
         lambda: SimpleNamespace(assign=lambda child: None, close=lambda: None),
     )
     monkeypatch.setattr(
-        module.subprocess, "Popen", lambda arguments, **options: captured.append(arguments) or Child()
+        module.subprocess,
+        "Popen",
+        lambda arguments, **options: captured.append(arguments) or Child(),
     )
     worker = module._RecordedNativeWorker(None)
     try:
         worker._start()
-        assert captured == [
-            [sys.executable, "-I", "-B", "-m", "k5vision.operator_events_decoder"]
-        ]
+        assert captured == [[sys.executable, "-I", "-B", "-m", "k5vision.operator_events_decoder"]]
     finally:
         worker.close()
 
