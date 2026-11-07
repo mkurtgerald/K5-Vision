@@ -72,14 +72,14 @@ _SOURCE_PHASES = {
 
 
 NATIVE_DECODER_CHILD_SMOKE = (
-    "from pathlib import Path\\n"
-    "from k5vision.operator_events import _RecordedNativeWorker\\n"
-    "worker = _RecordedNativeWorker(None)\\n"
-    "try:\\n"
-    "    assert worker.request(Path.cwd() / '__k5_missing_native_probe__.mp4') is None\\n"
-    "finally:\\n"
-    "    worker.close()\\n"
-    "print('embedded smoke: native_decoder_child', flush=True)\\n"
+    "from pathlib import Path\n"
+    "from k5vision.operator_events import _RecordedNativeWorker\n"
+    "worker = _RecordedNativeWorker(None)\n"
+    "try:\n"
+    "    assert worker.request(Path.cwd() / '__k5_missing_native_probe__.mp4') is None\n"
+    "finally:\n"
+    "    worker.close()\n"
+    "print('embedded smoke: native_decoder_child', flush=True)\n"
 )
 
 IDENTITY_CRYPTO_SMOKE = (
