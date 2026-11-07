@@ -913,9 +913,7 @@ def test_model_priming_is_owned_and_nonblocking_when_recorded_person_is_enabled(
         asyncio.run(service.aclose())
 
 
-@pytest.mark.parametrize(
-    ("child_status", "expected_requests"), [(None, 0), (1, 1)]
-)
+@pytest.mark.parametrize(("child_status", "expected_requests"), [(None, 0), (1, 1)])
 def test_model_prime_rechecks_child_liveness_before_trusting_cached_readiness(
     identity, monkeypatch, child_status, expected_requests
 ):
