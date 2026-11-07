@@ -638,6 +638,99 @@ def test_recorder_growth_after_utc_rollback_selects_new_file_not_future_filename
     assert sampler.capture(source) is None
 
 
+
+def test_cached_recording_inventory_finds_live_rollover_before_next_storage_scan(
+    identity, monkeypatch
+):
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    source = _source()
+    directory = root / source.binding.path_name
+    directory.mkdir(mode=0o700)
+    old = directory / "2026-10-28_12-00-00-000000_+0000.mp4"
+    old.write_bytes(b"previous-camera-segment")
+
+    def stale_inventory(binding):
+        assert binding == source.binding
+        owner, file = directory.stat(), old.stat()
+        return {
+            old.name: (
+                owner.st_dev,
+                owner.st_ino,
+                file.st_dev,
+                file.st_ino,
+                file.st_size,
+                file.st_mtime_ns,
+                file.st_ctime_ns,
+            )
+        }
+
+    sampler = RecordedFrameSampler(root, recording_files=stale_inventory)
+    decoded = []
+
+    def decode(raw, when, key):
+        decoded.append((raw, when, key))
+        return _sample(1, when)
+
+    monkeypatch.setattr(sampler, "decode", decode)
+    assert sampler.capture(source) is None  # Cached inventory cold baseline.
+    fresh = directory / "2026-10-28_12-00-15-000000_+0000.mp4"
+    fresh.write_bytes(b"new-fragment")
+    # A segment missing from the storage cache must first be observed.
+    assert sampler.capture(source) is None
+    fresh.write_bytes(b"new-fragment-growing-after-rollover")
+    # Backoff must preserve the previous observation, not reset its baseline.
+    assert sampler.capture(source) is None
+    assert fresh.name in sampler._observations[source.binding.device_id]
+    sampler._last_uncached_scan.clear()  # Simulate the next bounded rescan.
+    result = sampler.capture(source)
+    assert result is not None
+    assert result.occurred_at == datetime(2026, 10, 28, 12, 0, 15, tzinfo=UTC)
+    assert decoded == [
+        (
+            b"new-fragment-growing-after-rollover",
+            datetime(2026, 10, 28, 12, 0, 15, tzinfo=UTC),
+            fresh.name,
+        )
+    ]
+    assert sampler.capture(source) is None
+
+
+def test_cached_inventory_does_not_replay_unseen_static_historical_segments(
+    identity, monkeypatch
+):
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    source = _source()
+    directory = root / source.binding.path_name
+    directory.mkdir(mode=0o700)
+    known = directory / "2026-10-28_12-00-00-000000_+0000.mp4"
+    known.write_bytes(b"cached")
+    # This retained file is deliberately missing from a stale inventory.
+    unseen = directory / "2026-10-26_12-00-00-000000_+0000.mp4"
+    unseen.write_bytes(b"old-history")
+    owner, file = directory.stat(), known.stat()
+    inventory = {
+        known.name: (
+            owner.st_dev,
+            owner.st_ino,
+            file.st_dev,
+            file.st_ino,
+            file.st_size,
+            file.st_mtime_ns,
+            file.st_ctime_ns,
+        )
+    }
+    sampler = RecordedFrameSampler(root, recording_files=lambda _binding: inventory)
+    decoded = []
+    monkeypatch.setattr(sampler, "decode", lambda *args: decoded.append(args))
+    assert sampler.capture(source) is None
+    for _ in range(3):
+        sampler._last_uncached_scan.clear()
+        assert sampler.capture(source) is None
+    assert not decoded
+
+
 def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch):
     import k5vision.operator_events as module
 
