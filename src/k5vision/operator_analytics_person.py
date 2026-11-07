@@ -207,8 +207,22 @@ class _PersonDetector:
         processing.input().preprocess().resize(ResizeAlgorithm.RESIZE_LINEAR)
         processing.input().model().set_layout(ov.Layout("NCHW"))
         compiled = core.compile_model(
-            processing.build(), "CPU", {"INFERENCE_NUM_THREADS": 2, "NUM_STREAMS": "1"}
+            processing.build(),
+            "CPU",
+            {
+                "INFERENCE_NUM_THREADS": 2,
+                "NUM_STREAMS": "1",
+                # A fixed FP32 contract refuses native BF16/AMX dispatch
+                # without changing the admitted model or confidence threshold.
+                "INFERENCE_PRECISION_HINT": ov.Type.f32,
+            },
         )
+        try:
+            precision = compiled.get_property("INFERENCE_PRECISION_HINT")
+        except Exception:
+            raise ValueError("Person CPU precision was refused") from None
+        if precision != ov.Type.f32:
+            raise ValueError("Person CPU precision was refused")
         self._numpy = np
         self._request = compiled.create_infer_request()
 

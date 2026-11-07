@@ -195,8 +195,11 @@ def test_native_model_read_uses_verified_immutable_bytes_after_admission(admitte
         module._model_bytes(config)
 
 
-def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(admitted, monkeypatch):
-    """Cold native view compilation must reuse the core that admitted the model."""
+@pytest.mark.parametrize("precision_status", ["fp32", "rejected", "unavailable"])
+def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(
+    admitted, monkeypatch, precision_status
+):
+    """Cold native view compilation must reuse the core and admit FP32 only."""
     config, _manifest, _files = admitted
     calls = []
 
@@ -227,9 +230,24 @@ def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(admi
         def compile_model(self, value, device, settings):
             assert value is admitted_model
             assert device == "CPU"
-            assert settings == {"INFERENCE_NUM_THREADS": 2, "NUM_STREAMS": "1"}
+            assert settings == {
+                "INFERENCE_NUM_THREADS": 2,
+                "NUM_STREAMS": "1",
+                "INFERENCE_PRECISION_HINT": openvino_stub.Type.f32,
+            }
             calls.append("compile")
-            return SimpleNamespace(create_infer_request=lambda: "ready")
+
+            def get_property(name):
+                assert name == "INFERENCE_PRECISION_HINT"
+                if precision_status == "unavailable":
+                    raise RuntimeError("Native details must remain private")
+                if precision_status == "rejected":
+                    return openvino_stub.Type.u8
+                return openvino_stub.Type.f32
+
+            return SimpleNamespace(
+                create_infer_request=lambda: "ready", get_property=get_property
+            )
 
     admitted_model = model
 
@@ -254,7 +272,7 @@ def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(admi
     openvino_stub.__path__ = []
     openvino_stub.Core = Core
     openvino_stub.Tensor = lambda data: data
-    openvino_stub.Type = SimpleNamespace(u8=object())
+    openvino_stub.Type = SimpleNamespace(u8=object(), f32=object())
     openvino_stub.Layout = lambda text: text
     preprocess_stub = ModuleType("openvino.preprocess")
     preprocess_stub.ColorFormat = SimpleNamespace(BGR="BGR")
@@ -265,8 +283,12 @@ def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(admi
     monkeypatch.setitem(sys.modules, "openvino.preprocess", preprocess_stub)
     monkeypatch.setattr(module, "_cap_windows_native_cpu_isa", lambda: None)
 
-    detector = module._PersonDetector(config)
-    assert detector._request == "ready"
+    if precision_status == "fp32":
+        detector = module._PersonDetector(config)
+        assert detector._request == "ready"
+    else:
+        with pytest.raises(ValueError, match="Person CPU precision was refused"):
+            module._PersonDetector(config)
     assert calls == ["core", "read", "compile"]
 
 
