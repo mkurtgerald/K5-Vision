@@ -1161,7 +1161,7 @@
   function setLastDay() {
     const current = recorderNow();
     if (current === null) return false;
-    const end = new Date(current); end.setUTCMilliseconds(0);
+    const end = new Date(current);
     $("history-start").value = utcInput(new Date(end.getTime() - state.historyRangeMs), true);
     $("history-end").value = utcInput(end, true);
     $("history-day").value = "";
@@ -1546,12 +1546,17 @@
       if (!await pending.task || !active()) return;
     }
     const first = parseUtc($("history-start").value).getTime(), last = parseUtc($("history-end").value).getTime();
-    if (!Number.isFinite(first) || at < first || at >= last) {
+    const outsideRange = !Number.isFinite(first) || at < first || at >= last;
+    if (outsideRange) {
       const dayStart = new Date(at); dayStart.setUTCHours(0, 0, 0, 0);
       $("history-start").value = utcInput(dayStart, true);
       $("history-end").value = utcInput(new Date(dayStart.getTime() + DAY), true);
+    }
+    if (outsideRange || !state.spans.some((span) => span.start <= at && at < span.end)) {
+      // An event can arrive before a new recording appears in the cached history.
+      // Keep this UTC interval stable while checking current recorder coverage.
       state.historyRolling = false;
-      if (!await loadHistory()) return;
+      if (!await loadHistory() || !active()) return;
     }
     if (active()) seekRecording(at);
   }

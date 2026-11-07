@@ -122,8 +122,8 @@
               <div class="day-picker"><label for="history-day">Jump to day</label><input id="history-day" type="date"><button id="history-15-minutes" class="button secondary" type="button">15 min</button><button id="history-last-hour" class="button secondary" type="button">1 hour</button><button id="last-24-hours" class="button secondary" type="button">24 hours</button></div>
             </div>
             <form id="history-form" class="interval-form">
-              <div><label for="history-start">From · UTC</label><input id="history-start" type="datetime-local" step="1" required></div>
-              <div><label for="history-end">To · UTC</label><input id="history-end" type="datetime-local" step="1" required></div>
+              <div><label for="history-start">From · UTC</label><input id="history-start" type="datetime-local" step="0.001" required></div>
+              <div><label for="history-end">To · UTC</label><input id="history-end" type="datetime-local" step="0.001" required></div>
               <button id="load-history" class="button primary" type="submit">Show history</button>
             </form>
             <p id="history-message" class="form-message" role="status" aria-live="polite"></p>
