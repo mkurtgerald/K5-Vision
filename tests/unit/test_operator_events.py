@@ -707,9 +707,7 @@ def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch
             sampler.capture(source)
 
 
-def test_native_worker_reaps_pre_response_broken_pipe_then_retries_once(
-    monkeypatch, tmp_path
-):
+def test_native_worker_reaps_pre_response_broken_pipe_then_retries_once(monkeypatch, tmp_path):
     import k5vision.operator_events as module
 
     class BrokenInput(io.BytesIO):
