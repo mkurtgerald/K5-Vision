@@ -731,6 +731,46 @@ def test_cached_inventory_does_not_replay_unseen_static_historical_segments(
     assert not decoded
 
 
+
+def test_cached_inventory_ignores_segment_removed_during_rollover(identity, monkeypatch):
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    source = _source()
+    directory = root / source.binding.path_name
+    directory.mkdir(mode=0o700)
+    previous = directory / "2026-10-28_12-00-00-000000_+0000.mp4"
+    previous.write_bytes(b"current")
+    owner, old = directory.stat(), previous.stat()
+    inventory = {
+        previous.name: (
+            owner.st_dev,
+            owner.st_ino,
+            old.st_dev,
+            old.st_ino,
+            old.st_size,
+            old.st_mtime_ns,
+            old.st_ctime_ns,
+        )
+    }
+    sampler = RecordedFrameSampler(root, recording_files=lambda _binding: inventory)
+    assert sampler.capture(source) is None
+    rolling = directory / "2026-10-28_12-00-10-000000_+0000.mp4"
+    rolling.write_bytes(b"partial")
+    regular_file = identity_state._regular_file
+
+    def disappears(path):
+        if path == rolling:
+            raise FileNotFoundError
+        return regular_file(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(identity_state, "_regular_file", disappears)
+        assert sampler.capture(source) is None
+    assert rolling.name not in sampler._observations[source.binding.device_id]
+    sampler._last_uncached_scan.clear()
+    assert sampler.capture(source) is None  # The replacement is only baseline.
+
+
 def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch):
     import k5vision.operator_events as module
 
