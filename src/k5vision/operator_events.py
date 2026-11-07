@@ -797,6 +797,7 @@ class OperatorEventService:
             "processed_frames": state.get("processed_frames", 0),
             "sample_attempts": state.get("sample_attempts", 0),
             "sample_phase": state.get("sample_phase", "not_started"),
+            "last_completed_phase": state.get("last_completed_phase", "not_started"),
             **self.store.summary(camera_id),
             "sample_interval_seconds": SAMPLE_INTERVAL_SECONDS,
             "max_parallel_cameras": 1,
@@ -854,6 +855,7 @@ class OperatorEventService:
                 "no_decoded_frame",
             }
             state["sample_phase"] = outcome if outcome in safe_outcomes else "no_frame"
+            state["last_completed_phase"] = state["sample_phase"]
             return
         if sample.detections is not None:
             detections = sample.detections
@@ -896,6 +898,7 @@ class OperatorEventService:
             self._last_events[identifier] = now
         state["status"] = "active"
         state["sample_phase"] = "person_detected" if selected else "no_person"
+        state["last_completed_phase"] = state["sample_phase"]
         state["last_sample_at"] = _utc(sample.occurred_at)
         state["processed_frames"] = min(2**63 - 1, state["processed_frames"] + 1)
 
@@ -956,6 +959,7 @@ class OperatorEventService:
                         }:
                             failure_phase = candidate
                 state["sample_phase"] = failure_phase
+                state["last_completed_phase"] = failure_phase
                 if self._provider is not None:
                     try:
                         await self._provider.aclose()

@@ -2109,6 +2109,7 @@ def _installed_analytics_journey(
                     "event_count",
                     "sample_attempts",
                     "sample_phase",
+                    "last_completed_phase",
                 )
             }
             diagnostic["analytics_failure_state"]["sample_after_source_switch"] = fresh_sample

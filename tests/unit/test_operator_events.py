@@ -523,9 +523,65 @@ def test_empty_native_sample_reports_only_bounded_source_free_reason(store):
             status = service.status(source.binding.device_id)
             assert status["status"] == "waiting"
             assert status["sample_phase"] == "no_frame"
+            assert status["last_completed_phase"] == "no_frame"
             assert status["sample_attempts"] == 1
             assert status["processed_frames"] == 0
         finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_last_completed_sample_phase_survives_an_inflight_capture(store):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class TwoPhaseSampler:
+        def __init__(self):
+            self.calls = 0
+            self._capture_outcome = "not_started"
+
+        def capture(self, _source):
+            self.calls += 1
+            if self.calls == 1:
+                self._capture_outcome = "no_growth"
+                return None
+            entered.set()
+            if not release.wait(timeout=2):
+                raise AssertionError("Timed out releasing test capture")
+            self._capture_outcome = "no_decoded_frame"
+            return None
+
+    source = _source()
+    service, sampler, _provider = _service(store, source, sampler=TwoPhaseSampler())
+
+    async def run():
+        try:
+            service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
+            await service.cycle()
+            initial = service.status(source.binding.device_id)
+            assert initial["sample_phase"] == "no_growth"
+            assert initial["last_completed_phase"] == "no_growth"
+
+            pending_cycle = asyncio.create_task(service.cycle())
+            for _ in range(50):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.02)
+            assert entered.is_set()
+            pending = service.status(source.binding.device_id)
+            assert pending["sample_phase"] == "capture_pending"
+            assert pending["last_completed_phase"] == "no_growth"
+
+            release.set()
+            await pending_cycle
+            completed = service.status(source.binding.device_id)
+            assert completed["sample_phase"] == "no_decoded_frame"
+            assert completed["last_completed_phase"] == "no_decoded_frame"
+            assert completed["sample_attempts"] == 2
+            assert sampler.calls == 2
+        finally:
+            release.set()
             await service.aclose()
 
     asyncio.run(run())
@@ -546,6 +602,7 @@ def test_decoder_failure_is_isolated_and_closes_cleanly(store):
             await asyncio.sleep(0.1)
             assert service.status(source.binding.device_id)["status"] == "unavailable"
             assert service.status(source.binding.device_id)["sample_phase"] == "native_failed"
+            assert service.status(source.binding.device_id)["last_completed_phase"] == "native_failed"
             assert store.events(source.binding.device_id)["events"] == []
         finally:
             await service.aclose()
