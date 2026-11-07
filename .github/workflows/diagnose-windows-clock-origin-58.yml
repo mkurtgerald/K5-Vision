@@ -28,7 +28,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 3
+          # Frozen installer ancestry must remain available even after probe-only commits.
+          fetch-depth: 0
           persist-credentials: false
       - name: Verify disposable hosted Windows and unchanged application acceptance sources
         shell: pwsh
@@ -53,6 +54,11 @@ jobs:
         run: |
           python -m pip install -e ".[dev]" "playwright==1.58.0"
           if ($LASTEXITCODE -ne 0) { throw "Clock diagnostic dependency install failed" }
+      - name: Verify non-qualifying diagnostic cannot fabricate a person event
+        shell: pwsh
+        run: |
+          python -m pytest scripts/test_clock_origin_diagnostic.py -o addopts= --no-cov -q
+          if ($LASTEXITCODE -ne 0) { throw "Clock diagnostic isolation regression failed" }
       - name: Provision all immutable recording tools before changing guest time
         uses: ./.github/actions/provision-operator-tools
       - name: Admit the public person fixture before changing guest time
