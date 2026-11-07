@@ -543,9 +543,6 @@ class RecordedFrameSampler:
         self._observations: dict[UUID, dict[str, tuple[int, int, int]]] = {}
         self._recording_files = recording_files
         self._active_files: dict[UUID, tuple[str, ...]] = {}
-        # The retention inventory refreshes every 15s. A recorder segment can
-        # roll over between scans; admit its new bytes via a bounded live check.
-        self._last_uncached_scan: dict[UUID, float] = {}
         self._closing = threading.Event()
         self._worker_lock = threading.RLock()
         # Finite in-memory outcome; never a path, source URI or recorded frame.
@@ -561,11 +558,6 @@ class RecordedFrameSampler:
         self._active_files = {
             identifier: value
             for identifier, value in self._active_files.items()
-            if identifier in active
-        }
-        self._last_uncached_scan = {
-            identifier: value
-            for identifier, value in self._last_uncached_scan.items()
             if identifier in active
         }
 
@@ -668,53 +660,6 @@ class RecordedFrameSampler:
                     current[entry.name] = signature
                     if previous is not None and previous.get(entry.name) != signature:
                         changed.append((path, info))
-        if self._recording_files is not None and previous is not None and not changed:
-            # The cached storage inventory is refreshed by 15-second maintenance.
-            # When the formerly active file stops growing, a newly opened fMP4
-            # segment may not be nominated there yet. Inspect only the owned
-            # camera directory, with the same finite entry/time limits as the
-            # noncached sampler. A file absent from the preceding observation is
-            # a baseline, NOT proof of new recording: require growth of the same
-            # device/inode across two sampler observations before decoding it.
-            identifier = source.binding.device_id
-            now = time.monotonic()
-            last = self._last_uncached_scan.get(identifier)
-            if last is not None and last <= now < last + 3:
-                # Keep newly discovered baselines across the rescan backoff.
-                # Otherwise a growing segment can never earn two observations.
-                for name, signature in previous.items():
-                    current.setdefault(name, signature)
-            else:
-                self._last_uncached_scan[identifier] = now
-                deadline = now + 3
-                with os.scandir(directory) as entries:
-                    for index, entry in enumerate(entries):
-                        if index >= MAX_RECORDING_ENTRIES or time.monotonic() >= deadline:
-                            raise OperatorEventsError("Analytics recording scan limit reached")
-                        if _SEGMENT_NAME.fullmatch(entry.name) is None:
-                            continue
-                        path = directory / entry.name
-                        try:
-                            info = identity_state._regular_file(path)
-                        except FileNotFoundError:
-                            # MediaMTX may finalize or remove a segment while
-                            # the bounded scan is reading its directory.
-                            current.pop(entry.name, None)
-                            continue
-                        signature = info.st_dev, info.st_ino, info.st_size
-                        old = previous.get(entry.name)
-                        current[entry.name] = signature
-                        if (
-                            old is not None
-                            and old[:2] == signature[:2]
-                            and signature[2] > old[2]
-                        ):
-                            changed.append((path, info))
-        if self._recording_files is not None and previous is not None and changed:
-            # A simultaneous cached-file update must not discard an uncached
-            # segment's earlier baseline before the next bounded rescan.
-            for name, signature in previous.items():
-                current.setdefault(name, signature)
         self._observations[source.binding.device_id] = current
         if not changed:
             self._capture_outcome = "no_growth"
