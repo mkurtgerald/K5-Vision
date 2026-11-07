@@ -194,6 +194,7 @@ def test_decoder_emits_only_fixed_failure_phase_without_paths(monkeypatch):
     assert decoder.main() == 1
     assert output.getvalue() == b'{"status": "failed", "phase": "decode"}\n'
 
+
 def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monkeypatch):
     from k5vision import operator_analytics_person as person
 
@@ -204,9 +205,7 @@ def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monke
     )
     request = json.dumps({"path": "", "artifact_root": "private-model"}).encode()
     output = io.BytesIO()
-    monkeypatch.setattr(
-        decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n"))
-    )
+    monkeypatch.setattr(decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n")))
     monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
     assert decoder.main() == 0
     assert len(initialized) == 1
@@ -216,9 +215,7 @@ def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monke
 def test_person_model_prime_cannot_run_without_an_admitted_configuration(monkeypatch):
     request = json.dumps({"path": "", "artifact_root": None}).encode()
     output = io.BytesIO()
-    monkeypatch.setattr(
-        decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n"))
-    )
+    monkeypatch.setattr(decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n")))
     monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
     assert decoder.main() == 1
     assert output.getvalue() == b""

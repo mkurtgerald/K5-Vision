@@ -880,6 +880,7 @@ def test_native_worker_failure_phase_is_finite_and_source_free(
     assert worker._process is None
     worker.close()
 
+
 def test_model_priming_is_owned_and_nonblocking_when_recorded_person_is_enabled(
     identity, store, monkeypatch
 ):
@@ -916,6 +917,7 @@ def test_recorded_native_model_prime_requires_matching_reply_and_reuses_child(
     monkeypatch, tmp_path
 ):
     import json
+
     import k5vision.operator_events as module
 
     worker = module._RecordedNativeWorker(
