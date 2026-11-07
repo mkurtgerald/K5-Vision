@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -284,6 +285,55 @@ def test_background_sampling_persists_events_without_browser_and_cooldown_is_mon
 
     asyncio.run(run())
     assert provider.closed
+
+
+@pytest.mark.parametrize(("cycle_seconds", "expected_sleep"), [(0.5, 1.5), (5.0, 0.0)])
+def test_recorded_person_sampler_does_not_wait_again_after_slow_native_cycle(
+    store, monkeypatch, cycle_seconds, expected_sleep
+):
+    # Synthetic elapsed time tests the production start-to-start cadence
+    # without sleeping or depending on hosted runner CPU timing.
+    import k5vision.operator_events as module
+
+    clock = [100.0]
+    service, _, _ = _service(store, _source(), clock=clock)
+    sleeps = []
+
+    async def simulated_cycle():
+        clock[0] += cycle_seconds
+        service._closing = True
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(service, "cycle", simulated_cycle)
+    monkeypatch.setattr(module.asyncio, "sleep", record_sleep)
+
+    async def run():
+        try:
+            await service._run()
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+    assert sleeps == [expected_sleep]
+
+
+def test_pending_native_capture_reports_finite_stage_without_exposing_source(store):
+    source = _source()
+    service, sampler, _ = _service(store, source)
+    camera_id = source.binding.device_id
+    service.configure(camera_id, enabled=True, confidence_threshold=0.5)
+    service._states[camera_id] = {"sample_phase": "capture_pending"}
+    service._native_pending = Future()
+    sampler._capture_outcome = "native_request"
+    assert service.status(camera_id)["sample_phase"] == "native_request"
+    assert service.status(camera_id)["last_completed_phase"] == "not_started"
+    sampler._capture_outcome = "private-sensitive-media-path"
+    assert service.status(camera_id)["sample_phase"] == "capture_pending"
+    service._native_pending.set_result(None)
+    assert service.status(camera_id)["sample_phase"] == "capture_pending"
+    asyncio.run(service.aclose())
 
 
 def test_reconfigure_during_inference_discards_result(store):
