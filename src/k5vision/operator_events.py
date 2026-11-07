@@ -465,6 +465,7 @@ class _RecordedNativeWorker:
                         "inference": "native_inference_active",
                     }[phase]
                 else:
+                    self._failure_phase = "native_header_invalid"
                     raise ValueError
                 if header.get("status") == "primed":
                     if path is not None or set(header) != {"status"}:
