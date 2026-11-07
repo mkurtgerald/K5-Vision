@@ -88,15 +88,16 @@ def test_installed_person_poll_refuses_auth_and_nontransient_errors(status):
 def test_installed_person_poll_requires_a_valid_envelope_and_positive_event():
     route = "/api/v1/operator/cameras/synthetic"
     diagnostic = {}
-    assert _DESKTOP._poll_installed_person_event(
-        _EventPollClient(200), route, diagnostic
-    ) is None
+    assert _DESKTOP._poll_installed_person_event(_EventPollClient(200), route, diagnostic) is None
     assert diagnostic == {"analytics_event_poll_status": 200}
 
     event = {"camera_id": "synthetic", "person_count": 1, "confidence": 0.9}
-    assert _DESKTOP._poll_installed_person_event(
-        _EventPollClient(200, {"events": [event]}), route, diagnostic
-    ) == event
+    assert (
+        _DESKTOP._poll_installed_person_event(
+            _EventPollClient(200, {"events": [event]}), route, diagnostic
+        )
+        == event
+    )
     with pytest.raises(pytest.fail.Exception):
         _DESKTOP._poll_installed_person_event(
             _EventPollClient(200, {"events": "malformed"}), route, diagnostic
