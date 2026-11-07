@@ -631,7 +631,6 @@ def test_diagnostics_projects_only_last_aggregate_storage_sample(
     assert "rtsp://" not in text
 
 
-
 def test_active_recorded_person_inventory_interest_refreshes_private_storage_cache(
     native, monkeypatch
 ):
