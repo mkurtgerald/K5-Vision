@@ -1,0 +1,67 @@
+name: Windows person CPU diagnostic (9cbeb30)
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/diagnose-person-cpu-9cbeb30.yml
+      - scripts/diagnose_windows_person_cpu_9cbeb30.py
+
+permissions:
+  contents: read
+
+jobs:
+  same-vm-precision:
+    name: Compare default and FP32 native inference on one Windows VM
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Checkout diagnostic head with frozen application parent
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Set up development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install the exact admitted native runtime and diagnostic dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "openvino==2026.3.1" "numpy==2.2.6" "openvino-telemetry==2025.2.0"
+          if ($LASTEXITCODE -ne 0) { throw "Pinned native diagnostic dependencies failed" }
+      - name: Provision immutable fixture decoder
+        uses: ./.github/actions/provision-operator-tools
+      - name: Admit the pinned model and official positive fixture
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Native diagnostic artifacts refused" }
+      - name: Exercise actual inference in bounded owned children
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          python -u scripts/diagnose_windows_person_cpu_9cbeb30.py --output person-cpu-9cbeb30-diagnostic.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve only sanitized diagnostic JSON
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: person-cpu-9cbeb30-diagnostic-${{ github.run_id }}
+          path: person-cpu-9cbeb30-diagnostic.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Remove only owned development fixtures
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrEmpty($env:K5_DONOR_TOOL_ROOT)) { exit 0 }
+          $toolRoot = [IO.Path]::GetFullPath($env:K5_DONOR_TOOL_ROOT)
+          $expected = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar)
+          if (-not [string]::Equals([IO.Directory]::GetParent($toolRoot).FullName, $expected, [StringComparison]::OrdinalIgnoreCase) -or
+              [IO.Path]::GetFileName($toolRoot) -notmatch '^K5 donor development tools [a-f0-9]{32}$') {
+            throw "Diagnostic cleanup ownership refused"
+          }
+          if (Test-Path -LiteralPath $toolRoot) { Remove-Item -LiteralPath $toolRoot -Recurse -Force }
