@@ -543,6 +543,10 @@ class RecordedFrameSampler:
         self._observations: dict[UUID, dict[str, tuple[int, int, int]]] = {}
         self._recording_files = recording_files
         self._active_files: dict[UUID, tuple[str, ...]] = {}
+        # Directory names establish a cold, content-free baseline so cache
+        # lag cannot mistake retained footage for newly arriving segments.
+        self._known_names: dict[UUID, set[str]] = {}
+        self._directory_mtime: dict[UUID, int] = {}
         self._closing = threading.Event()
         self._worker_lock = threading.RLock()
         # Finite in-memory outcome; never a path, source URI or recorded frame.
@@ -560,6 +564,14 @@ class RecordedFrameSampler:
             for identifier, value in self._active_files.items()
             if identifier in active
         }
+        self._known_names = {
+            identifier: value for identifier, value in self._known_names.items() if identifier in active
+        }
+        self._directory_mtime = {
+            identifier: value
+            for identifier, value in self._directory_mtime.items()
+            if identifier in active
+        }
 
     @staticmethod
     def _started(name: str) -> datetime:
@@ -569,6 +581,19 @@ class RecordedFrameSampler:
         return datetime.strptime(
             match["stamp"] + match["offset"], "%Y-%m-%d_%H-%M-%S-%f_%z"
         ).astimezone(UTC)
+
+    @staticmethod
+    def _recording_names(directory: Path) -> set[str]:
+        """Bounded name-only scan; never read retained frames or infer file age."""
+        names: set[str] = set()
+        deadline = time.monotonic() + 3
+        with os.scandir(directory) as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAX_RECORDING_ENTRIES or time.monotonic() >= deadline:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
+                if _SEGMENT_NAME.fullmatch(entry.name) is not None:
+                    names.add(entry.name)
+        return names
 
     def capture(self, source) -> RecordedPersonFrame | None:
         self._capture_outcome = "source_check"
@@ -624,6 +649,11 @@ class RecordedFrameSampler:
                 # bytes become events until new byte growth is actually observed.
                 hints = sorted(inventory, key=lambda name: inventory[name][5], reverse=True)[:2]
                 self._active_files[source.binding.device_id] = tuple(hints)
+                # The maintenance cache can predate the sampler by several
+                # seconds. A cold directory scan excludes all existing names,
+                # even if they were absent from that older cache snapshot.
+                self._known_names[source.binding.device_id] = self._recording_names(directory)
+                self._directory_mtime[source.binding.device_id] = directory_info.st_mtime_ns
                 self._observations[source.binding.device_id] = current
                 self._capture_outcome = "baseline"
                 return None
@@ -644,6 +674,27 @@ class RecordedFrameSampler:
                 if signature != previous.get(name):
                     changed.append((path, info))
                 current[name] = signature
+            # A fresh recorder segment may exist before the slower maintenance
+            # inventory lists it. Only an actual directory change triggers the
+            # bounded name scan, and only names absent from the cold baseline
+            # can supply fresh bytes. Active files still use byte high-water.
+            identifier = source.binding.device_id
+            if self._directory_mtime.get(identifier) != directory_info.st_mtime_ns:
+                seen = self._known_names.setdefault(identifier, set())
+                names = self._recording_names(directory)
+                for name in names - seen:
+                    if name in current:
+                        continue
+                    path = directory / name
+                    try:
+                        info = identity_state._regular_file(path)
+                    except FileNotFoundError:
+                        continue
+                    current[name] = info.st_dev, info.st_ino, info.st_size
+                    if info.st_size > 0:
+                        changed.append((path, info))
+                seen.update(names)
+                self._directory_mtime[identifier] = directory_info.st_mtime_ns
         else:
             # Source-only integrations may have no recorder cache. Their fallback
             # has the same inventory ceiling as storage and a finite scan budget.
