@@ -665,10 +665,10 @@ def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch
     "reply,write_fails,expected",
     [
         (b"", True, "native_write_failed"),
-        (b"not-json\\n", False, "native_header_invalid"),
-        (b'{"status":"ready","bytes":1}\\n', False, "native_header_invalid"),
+        (b"not-json\n", False, "native_header_invalid"),
+        (b'{"status":"ready","bytes":1}\n', False, "native_header_invalid"),
         (
-            b'{"status":"ready","bytes":696320,"elapsed":1.0,"detections":[]}\\n',
+            b'{"status":"ready","bytes":696320,"elapsed":1.0,"detections":[]}\n',
             False,
             "native_payload_incomplete",
         ),
