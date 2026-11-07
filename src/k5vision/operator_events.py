@@ -416,8 +416,26 @@ class _RecordedNativeWorker:
                     if self._configuration is None
                     else str(self._configuration.artifact_root),
                 }
-                process.stdin.write(json.dumps(request).encode("utf-8") + b"\n")
-                process.stdin.flush()
+                payload = json.dumps(request).encode("utf-8") + b"\n"
+                try:
+                    process.stdin.write(payload)
+                    process.stdin.flush()
+                except BrokenPipeError:
+                    # The Windows child can exit before accepting its first
+                    # snapshot. Reap it before one replacement; never retry a
+                    # model, decoder, inference or response-protocol failure.
+                    # The original deadline also owns the replacement.
+                    if expired.is_set() or self._closing.is_set():
+                        raise
+                    self.close(final=False)
+                    self._start()
+                    process = self._process
+                    self._failure_phase = "native_write_failed"
+                    if expired.is_set() or self._closing.is_set():
+                        process.kill()
+                        raise TimeoutError
+                    process.stdin.write(payload)
+                    process.stdin.flush()
                 self._failure_phase = "native_reply_missing"
                 raw = process.stdout.readline(4097)
                 if not raw.endswith(b"\n") or len(raw) > 4096:
