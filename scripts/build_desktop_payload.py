@@ -71,6 +71,17 @@ _SOURCE_PHASES = {
 }
 
 
+NATIVE_DECODER_CHILD_SMOKE = (
+    "from pathlib import Path\\n"
+    "from k5vision.operator_events import _RecordedNativeWorker\\n"
+    "worker = _RecordedNativeWorker(None)\\n"
+    "try:\\n"
+    "    assert worker.request(Path.cwd() / '__k5_missing_native_probe__.mp4') is None\\n"
+    "finally:\\n"
+    "    worker.close()\\n"
+    "print('embedded smoke: native_decoder_child', flush=True)\\n"
+)
+
 IDENTITY_CRYPTO_SMOKE = (
     "import jwt,cffi,cryptography,base64; "
     "from cryptography.hazmat.primitives.asymmetric import rsa; "
@@ -810,6 +821,12 @@ def build(args: argparse.Namespace) -> None:
             "assert importlib.util.find_spec('pip') is None",
         ]
     )
+    # Package admission must exercise a real child decoder over the same
+    # embedded Python executable and Windows Job Object used by recording
+    # analytics, not merely import native modules in the parent interpreter.
+    # The probe references an intentionally nonexistent synthetic file only.
+    phase("embedded_runtime_execution")
+    run([str(runtime / "python.exe"), "-I", "-B", "-c", NATIVE_DECODER_CHILD_SMOKE])
     generated = output / "PayloadIdentity.generated.cs"
     phase("payload_manifest")
     manifest_sha = write_manifest(payload, args.head_sha, generated)
