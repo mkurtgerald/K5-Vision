@@ -95,7 +95,8 @@ def main() -> int:
                 type(request) is not dict
                 or request.keys() != {"path", "artifact_root"}
                 or not isinstance(request["path"], str)
-                or not 1 <= len(request["path"]) <= 4096
+                or not 0 <= len(request["path"]) <= 4096
+                or (not request["path"] and request["artifact_root"] is None)
                 or (
                     request["artifact_root"] is not None
                     and (
@@ -107,6 +108,24 @@ def main() -> int:
                 return 1
             if artifact_root is not None and artifact_root != request["artifact_root"]:
                 return 1
+            if request["path"] == "":
+                # A model-only warmup has no camera source, stored pixels or
+                # presentation timestamp. It uses the normal bounded worker.
+                if detector is None:
+                    from pathlib import Path
+
+                    from k5vision.operator_analytics_person import (
+                        OperatorPersonConfiguration,
+                        _PersonDetector,
+                    )
+
+                    artifact_root = request["artifact_root"]
+                    phase = "model"
+                    detector = _PersonDetector(OperatorPersonConfiguration(Path(artifact_root)))
+                phase = "protocol"
+                sys.stdout.buffer.write(b'{"status":"primed"}\n')
+                sys.stdout.buffer.flush()
+                continue
             phase = "decode"
             result = decode(request["path"])
             if result is None:

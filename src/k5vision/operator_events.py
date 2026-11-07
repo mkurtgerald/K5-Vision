@@ -385,8 +385,11 @@ class _RecordedNativeWorker:
                 job.close()
             raise OperatorEventsError("Analytics worker ownership unavailable") from None
 
-    def request(self, path: Path):
+    def request(self, path: Path | None):
+        """A None path primes the bundled model without opening camera media."""
         with self._lock:
+            if path is None and self._configuration is None:
+                raise OperatorEventsError("Analytics model priming unavailable")
             if self._closing.is_set():
                 raise OperatorEventsError("Analytics worker is closed")
             self._failure_phase = "native_launch_failed"
@@ -411,7 +414,7 @@ class _RecordedNativeWorker:
             failed = False
             try:
                 request = {
-                    "path": str(path),
+                    "path": "" if path is None else str(path),
                     "artifact_root": None
                     if self._configuration is None
                     else str(self._configuration.artifact_root),
@@ -443,6 +446,14 @@ class _RecordedNativeWorker:
                     raise ValueError
                 self._failure_phase = "native_header_invalid"
                 header = json.loads(raw)
+                if type(header) is not dict:
+                    raise ValueError
+                if header.get("status") == "primed":
+                    if path is not None or set(header) != {"status"}:
+                        raise ValueError
+                    self._person_ready = True
+                    self._failure_phase = "native_none"
+                    return None
                 if header.get("status") == "failed":
                     failure_phases = {
                         "protocol": "native_protocol_failed",
@@ -816,6 +827,25 @@ class RecordedFrameSampler:
         finally:
             path.unlink(missing_ok=True)
 
+    def prime(self) -> None:
+        """Compile the optional model on enable, before fresh recording is sampled."""
+        if self._closing.is_set() or getattr(self, "_configuration", None) is None:
+            return
+        with self._worker_lock:
+            if self._closing.is_set():
+                return
+            if not hasattr(self, "_worker"):
+                self._worker = _RecordedNativeWorker(self._configuration)
+            worker = self._worker
+            if worker._person_ready:
+                return
+        try:
+            worker.request(None)
+        except OperatorEventsError:
+            # A failed prime is not proof the detector works. The next actual
+            # recording request still must satisfy native and event admission.
+            pass
+
     def begin_close(self) -> None:
         self._closing.set()
         with self._worker_lock:
@@ -916,6 +946,16 @@ class OperatorEventService:
             self._configuration_generation.get(camera_id, 0) + 1
         )
         self._states.pop(camera_id, None)
+        if (
+            enabled
+            and not self._closing
+            and isinstance(self._sampler, RecordedFrameSampler)
+            and getattr(self._sampler, "_configuration", None) is not None
+            and (self._native_pending is None or self._native_pending.done())
+        ):
+            # Warm the same bounded child used for subsequent recorded frames.
+            # No camera snapshots or credentials are needed to compile a model.
+            self._native_pending = self._executor.submit(self._sampler.prime)
         return self.status(camera_id)
 
     async def start(self) -> None:

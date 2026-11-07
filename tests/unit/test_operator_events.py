@@ -879,3 +879,70 @@ def test_native_worker_failure_phase_is_finite_and_source_free(
     assert worker._failure_phase == expected
     assert worker._process is None
     worker.close()
+
+def test_model_priming_is_owned_and_nonblocking_when_recorded_person_is_enabled(
+    identity, store, monkeypatch
+):
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    sampler = RecordedFrameSampler(root)
+    source = _source()
+    entered, release = threading.Event(), threading.Event()
+
+    def prime_without_media():
+        entered.set()
+        assert release.wait(3)
+
+    monkeypatch.setattr(sampler, "prime", prime_without_media)
+    service = OperatorEventService(
+        store=store,
+        cameras=SimpleNamespace(list_sources=lambda: (source,)),
+        recording_root=root,
+        configuration=SimpleNamespace(artifact_root=identity.directory / "model"),
+        sampler=sampler,
+    )
+    try:
+        service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
+        assert entered.wait(2)
+        assert service._native_pending is not None
+        assert not service._native_pending.done()
+        assert sampler._observations == {}
+    finally:
+        release.set()
+        asyncio.run(service.aclose())
+
+
+def test_recorded_native_model_prime_requires_matching_reply_and_reuses_child(
+    monkeypatch, tmp_path
+):
+    import json
+    import k5vision.operator_events as module
+
+    worker = module._RecordedNativeWorker(
+        SimpleNamespace(artifact_root=tmp_path / "sealed-person-model")
+    )
+    assert worker._request_timeout() == 18.0
+
+    class Process:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(b'{"status":"primed"}\n')
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 0
+
+    process = Process()
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", process))
+    assert worker.request(None) is None
+    assert worker._person_ready
+    assert worker._request_timeout() == module._NATIVE_REQUEST_SECONDS
+    assert json.loads(process.stdin.getvalue()) == {
+        "path": "",
+        "artifact_root": str(tmp_path / "sealed-person-model"),
+    }
+    worker.close()
