@@ -694,7 +694,13 @@ class RecordedFrameSampler:
                         if _SEGMENT_NAME.fullmatch(entry.name) is None:
                             continue
                         path = directory / entry.name
-                        info = identity_state._regular_file(path)
+                        try:
+                            info = identity_state._regular_file(path)
+                        except FileNotFoundError:
+                            # MediaMTX may finalize or remove a segment while
+                            # the bounded scan is reading its directory.
+                            current.pop(entry.name, None)
+                            continue
                         signature = info.st_dev, info.st_ino, info.st_size
                         old = previous.get(entry.name)
                         current[entry.name] = signature
