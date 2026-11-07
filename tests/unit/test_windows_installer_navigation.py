@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+
+import pytest
 from pathlib import Path
 
 _SOURCE = Path(__file__).resolve().parents[1] / "integration" / "test_windows_desktop_app.py"
@@ -50,3 +53,51 @@ def test_wizard_signature_tracks_control_identity_not_only_caption():
     current = _DESKTOP._installer_page_signature(wizard, [1, 2])
     wizard.controls[3] = ("TNewStaticText", "Ready")
     assert current != _DESKTOP._installer_page_signature(wizard, [2, 3])
+
+
+class _EventPollClient:
+    def __init__(self, status, envelope=None):
+        self.status = status
+        self.envelope = envelope if envelope is not None else {"events": []}
+
+    def get(self, route):
+        assert route == "/api/v1/operator/cameras/synthetic/events"
+        return self.status, json.dumps(self.envelope).encode("utf-8"), {}
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_installed_person_poll_retries_only_gateway_reconnects(status):
+    diagnostic = {}
+    event = _DESKTOP._poll_installed_person_event(
+        _EventPollClient(status), "/api/v1/operator/cameras/synthetic", diagnostic
+    )
+    assert event is None
+    assert diagnostic == {"analytics_event_poll_status": status}
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500])
+def test_installed_person_poll_refuses_auth_and_nontransient_errors(status):
+    diagnostic = {}
+    with pytest.raises(pytest.fail.Exception):
+        _DESKTOP._poll_installed_person_event(
+            _EventPollClient(status), "/api/v1/operator/cameras/synthetic", diagnostic
+        )
+    assert diagnostic == {"analytics_event_poll_status": status}
+
+
+def test_installed_person_poll_requires_a_valid_envelope_and_positive_event():
+    route = "/api/v1/operator/cameras/synthetic"
+    diagnostic = {}
+    assert _DESKTOP._poll_installed_person_event(
+        _EventPollClient(200), route, diagnostic
+    ) is None
+    assert diagnostic == {"analytics_event_poll_status": 200}
+
+    event = {"camera_id": "synthetic", "person_count": 1, "confidence": 0.9}
+    assert _DESKTOP._poll_installed_person_event(
+        _EventPollClient(200, {"events": [event]}), route, diagnostic
+    ) == event
+    with pytest.raises(pytest.fail.Exception):
+        _DESKTOP._poll_installed_person_event(
+            _EventPollClient(200, {"events": "malformed"}), route, diagnostic
+        )
