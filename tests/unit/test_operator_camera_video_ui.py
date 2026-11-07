@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -96,6 +97,7 @@ def workspace():
                 "recording_state": "waiting",
                 "analytics_status": "disabled",
                 "source_revision": _REVISION,
+                "connection_type": "onvif",
             }
             for index, value in enumerate((_CAMERA, _OTHER))
         ]
@@ -111,6 +113,7 @@ def workspace():
             "apply_error": None,
             "reject_session": False,
             "expires": 120,
+            "held_inventory": [],
         }
         with browser_api.sync_playwright() as api:
             browser = api.chromium.launch(
@@ -178,25 +181,75 @@ def workspace():
                 if path == "/api/v1/operator/cameras":
                     if state.get("inventory_error"):
                         return respond(route, {"detail": "unavailable"}, state["inventory_error"])
+                    value = {
+                        "cameras": cameras,
+                        "worker_status": "ready",
+                        "capabilities": {
+                            "account": {
+                                **account,
+                                "role_profile_id": None,
+                                "effective_permissions": grants,
+                            },
+                            "effective_permissions": grants,
+                            "can_export": "cameras.export" in grants,
+                            "can_manage_users": "users.manage" in grants,
+                            "can_manage_cameras": "cameras.manage" in grants,
+                            "can_view_history": "cameras.playback" in grants,
+                        },
+                    }
+                    if state.get("hold_inventory"):
+                        state.setdefault("held_inventory", []).append(
+                            (route, json.loads(json.dumps(value)))
+                        )
+                        return None
+                    return respond(route, value)
+                if path in {
+                    "/api/v1/operator/camera-stream-probe",
+                    "/api/v1/operator/camera-profiles",
+                } and state.get("reconnect_kind"):
                     return respond(
                         route,
                         {
-                            "cameras": cameras,
-                            "worker_status": "ready",
-                            "capabilities": {
-                                "account": {
-                                    **account,
-                                    "role_profile_id": None,
-                                    "effective_permissions": grants,
-                                },
-                                "effective_permissions": grants,
-                                "can_export": "cameras.export" in grants,
-                                "can_manage_users": "users.manage" in grants,
-                                "can_manage_cameras": "cameras.manage" in grants,
-                                "can_view_history": "cameras.playback" in grants,
-                            },
+                            "probe_id": "generated-reconnect-probe-0123456789012345",
+                            "expires_in_seconds": 120,
+                            "profiles": [
+                                {
+                                    "id": "generated-new-profile",
+                                    "name": "Generated new profile",
+                                    "codec": "H264",
+                                    "width": 640,
+                                    "height": 360,
+                                    "supported": True,
+                                }
+                            ],
                         },
                     )
+                if path in {
+                    "/api/v1/operator/cameras/stream-connect",
+                    "/api/v1/operator/cameras/connect",
+                } and state.get("reconnect_kind"):
+                    updated = {
+                        **cameras[0],
+                        "source_revision": "generated-reconnected-source-revision-0002",
+                        "connection_type": state["reconnect_kind"],
+                    }
+                    cameras[0] = updated
+                    value = {**_inspection(), "source_revision": updated["source_revision"]}
+                    if state["reconnect_kind"] == "rtsp":
+                        value.update(
+                            status="unavailable",
+                            current=None,
+                            options=None,
+                            writable=False,
+                            writable_reason="video_unsupported",
+                            shared_profile_count=0,
+                        )
+                        value.pop("settings_handle")
+                        value.pop("expires_in_seconds")
+                    state["inspection"] = value
+                    if state.get("invalid_connect_ack"):
+                        return respond(route, {**updated, "device_id": _OTHER}, 201)
+                    return respond(route, updated, 201)
                 if path.endswith("/media-session"):
                     return respond(
                         route,
@@ -611,3 +664,86 @@ def test_unavailable_authority_pauses_changes_without_discarding_dirty_fields(wo
         page.locator("#camera-video-refresh").click()
         page.wait_for_function("!document.querySelector('#video-frame-rate').disabled")
         assert page.locator("#video-frame-rate").input_value() == "25"
+
+
+@pytest.mark.parametrize("kind, invalid_ack", [("rtsp", False), ("onvif", False), ("rtsp", True)])
+def test_reconnect_publishes_ack_before_delayed_inventory_for_video_settings(
+    workspace, kind, invalid_ack
+):
+    with workspace() as (page, state):
+        page.locator(".camera-item").first.click()
+        state.update(hold_inventory=True, reconnect_kind=kind, invalid_connect_ack=invalid_ack)
+        page.locator("#refresh-cameras").click()
+        deadline = time.monotonic() + 2
+        while not state["held_inventory"] and time.monotonic() < deadline:
+            page.wait_for_timeout(10)
+        assert state["held_inventory"]
+        old_route, old_inventory = state["held_inventory"][0]
+        page.locator("#update-source-button").click()
+        page.locator("#camera-connection-type").select_option(kind)
+        if kind == "rtsp":
+            page.locator("#new-camera-stream-uri").fill("rtsp://127.0.0.1/reconnected")
+        else:
+            page.locator("#new-camera-username").fill("generated-camera-user")
+            page.locator("#new-camera-password").fill("generated-camera-password")
+        page.locator("#test-camera-connection").click()
+        page.locator("#save-camera").wait_for(state="visible")
+        page.wait_for_function("!document.getElementById('save-camera').disabled")
+        page.locator("#save-camera").click()
+        if invalid_ack:
+            page.wait_for_function(
+                "document.getElementById('add-camera-form').getAttribute('aria-busy') === 'false'"
+            )
+            assert "connection was updated" in page.locator("#add-camera-message").inner_text()
+            assert page.locator("#add-camera-dialog").is_visible()
+            assert page.locator("#save-camera").is_disabled()
+            page.locator("#add-camera-form").evaluate(
+                "form=>form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}))"
+            )
+            assert len([call for call in state["calls"] if call[1].endswith("stream-connect")]) == 1
+            for route, inventory in state["held_inventory"]:
+                if inventory["cameras"][0]["source_revision"] == _REVISION:
+                    route.fulfill(content_type="application/json", body=json.dumps(inventory))
+            page.wait_for_timeout(50)
+            page.locator("#cancel-add-camera").click()
+            assert page.locator("#camera-video-button").is_hidden()
+            assert not _patches(state)
+            return
+        deadline = time.monotonic() + 2
+        fresh = []
+        while not fresh and time.monotonic() < deadline:
+            fresh = [
+                item
+                for item in state["held_inventory"]
+                if item[1]["cameras"][0]["source_revision"] != _REVISION
+            ]
+            if fresh:
+                break
+            page.wait_for_timeout(10)
+        assert fresh
+        _, fresh_inventory = fresh[0]
+        assert old_inventory["cameras"][0]["source_revision"] == _REVISION
+        assert fresh_inventory["cameras"][0]["source_revision"] != _REVISION
+        page.locator("#add-camera-dialog").wait_for(state="hidden")
+        page.locator("#camera-video-button").click()
+        page.wait_for_function(
+            "document.getElementById('camera-video-form').getAttribute('aria-busy') === 'false'"
+        )
+        if kind == "rtsp":
+            assert "ONVIF encoder controls" in page.locator("#camera-video-message").inner_text()
+            assert page.locator("#camera-video-values").is_hidden()
+            assert page.locator("#camera-video-apply").is_disabled()
+        else:
+            assert page.locator("#video-frame-rate").is_enabled()
+            assert page.locator("#video-frame-rate").input_value() == "25"
+        for route, inventory in fresh:
+            route.fulfill(content_type="application/json", body=json.dumps(inventory))
+        for route, inventory in state["held_inventory"]:
+            if inventory["cameras"][0]["source_revision"] == _REVISION:
+                route.fulfill(content_type="application/json", body=json.dumps(inventory))
+        page.wait_for_timeout(50)
+        assert "connection changed" not in page.locator("#camera-video-message").inner_text()
+        assert page.locator("#camera-video-dialog").is_visible()
+        if kind == "onvif":
+            assert page.locator("#video-frame-rate").is_enabled()
+        assert not _patches(state)

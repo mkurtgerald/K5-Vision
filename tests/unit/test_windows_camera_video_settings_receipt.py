@@ -433,3 +433,57 @@ def test_network_probe_still_rejects_only_three_timed_frames(
     assert diagnostic["probe_reason"] == "frame_count"
     if leading_untimed:
         assert diagnostic["probe_timed_frames"] == 3
+
+
+@pytest.mark.parametrize(
+    "error,kind",
+    [(TimeoutError, "timeout"), (pytest.fail.Exception, "assertion"), (RuntimeError, "exception")],
+)
+@pytest.mark.parametrize(
+    "filename,function,file",
+    [
+        ("test_windows_camera_video_settings.py", "run_camera_video_journey", "camera"),
+        ("test_operator_beta_browser.py", "_rtsp_enroll", "browser"),
+    ],
+)
+def test_failure_note_preserves_deepest_public_call_without_private_values(
+    probe_module, error, kind, filename, function, file
+):
+    private = "rtsp://private-account:private-password@camera.invalid/private-path"
+    namespace = {"error": error, "private": private}
+    source = f"def {function}():\n    _require()\ndef _require():\n    raise error(private)\n"
+    exec(compile(source, "/private/profile/" + filename, "exec"), namespace)
+    diagnostic = {"stage": "unsupported_direct_rtsp"}
+    with pytest.raises(error) as raised:
+        namespace[function]()
+    probe_module._failure_note(diagnostic, raised.value)
+    assert diagnostic == {
+        "stage": "unsupported_direct_rtsp",
+        "failure_kind": kind,
+        "failure_file": file,
+        "failure_function": function,
+        "failure_line": 2,
+    }
+    published = json.dumps(diagnostic)
+    assert private not in published and "/private/profile" not in published
+    assert "_require" not in published
+
+
+@pytest.mark.parametrize(
+    "filename,function",
+    [
+        ("private-runtime.py", "_rtsp_enroll"),
+        ("test_operator_beta_browser.py", "private_account_password"),
+    ],
+)
+def test_failure_note_omits_unrecognized_files_and_function_names(probe_module, filename, function):
+    namespace = {}
+    exec(
+        compile(f"def {function}():\n    raise RuntimeError('private-value')\n", filename, "exec"),
+        namespace,
+    )
+    with pytest.raises(RuntimeError) as raised:
+        namespace[function]()
+    diagnostic = {}
+    probe_module._failure_note(diagnostic, raised.value)
+    assert diagnostic == {"failure_kind": "exception"}

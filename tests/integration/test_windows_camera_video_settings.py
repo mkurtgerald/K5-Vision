@@ -74,6 +74,77 @@ def _require(condition, message):
         pytest.fail(message, pytrace=False)
 
 
+def _failure_note(diagnostic, error):
+    """Expose a fixed error category and public test location, never private exception text."""
+    diagnostic["failure_kind"] = (
+        "timeout"
+        if type(error).__name__ == "TimeoutError"
+        else "assertion"
+        if isinstance(error, pytest.fail.Exception)
+        else "exception"
+    )
+    locations = {
+        "test_windows_camera_video_settings.py": (
+            "camera",
+            {
+                "_helpers",
+                "__init__",
+                "_key",
+                "change",
+                "_probe",
+                "_stream_proof",
+                "ready",
+                "_open_wall",
+                "_decoded_geometry",
+                "_closed_subset",
+                "_wall_probe",
+                "_settings_read",
+                "_apply",
+                "run_camera_video_journey",
+                "test_native_windows_camera_video_settings_and_automatic_wall",
+            },
+        ),
+        "test_operator_beta_browser.py": (
+            "browser",
+            {
+                "_onvif_clock_proof",
+                "_assert_onvif_time_health",
+                "_assert_recorder_time_health",
+                "_onvif_enroll",
+                "_rtsp_enroll",
+                "test_connection",
+                "_decoded_color",
+                "_decoded_video",
+                "_decoded_video_proof",
+                "_open_camera_watch",
+                "_open_camera_recordings",
+                "_wall_frames",
+                "_wall_frames_proof",
+                "_wall_layout_proof",
+                "_normal_download_directory",
+                "_recorded_utc_state",
+                "_seek_recorded_utc",
+                "_navigation_decode",
+                "_recording_navigation_journey",
+                "_timeline_play",
+                "_download_recording",
+                "_assert_no_browser_storage",
+            },
+        ),
+    }
+    current = error.__traceback__
+    while current is not None:
+        code = current.tb_frame.f_code
+        location = locations.get(Path(code.co_filename).name)
+        if location is not None and code.co_name in location[1]:
+            diagnostic.update(
+                failure_file=location[0],
+                failure_function=code.co_name,
+                failure_line=min(10000, max(1, current.tb_lineno)),
+            )
+        current = current.tb_next
+
+
 def _helpers(name):
     spec = importlib.util.spec_from_file_location(
         "k5_camera_video_" + name, Path(__file__).with_name(name + ".py")
@@ -1297,7 +1368,8 @@ def test_native_windows_camera_video_settings_and_automatic_wall(record_testsuit
             "Camera gate uninstall changed retained profile or footage",
         )
         receipt["uninstall_preserves_profile"] = True
-    except BaseException:
+    except BaseException as error:
+        _failure_note(diagnostic, error)
         failed = True
     finally:
         for resource in (context, browser, playwright):
@@ -1340,6 +1412,10 @@ def test_native_windows_camera_video_settings_and_automatic_wall(record_testsuit
                 if key
                 in {
                     "stage",
+                    "failure_kind",
+                    "failure_file",
+                    "failure_function",
+                    "failure_line",
                     "installer_action",
                     "installer_install_posted",
                     "health_http_status",

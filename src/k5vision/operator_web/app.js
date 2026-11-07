@@ -2689,11 +2689,30 @@
         method: "POST", body: camera, signal: controller.signal,
       });
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
+      clearCameraProbe();
+      // The connection reply is newer than any outstanding inventory read.
+      state.cameraListEpoch += 1;
+      const deviceId = created?.device_id || created?.camera?.device_id;
+      const cameraStatus = created?.camera || created;
+      if (!cameraStatus || typeof deviceId !== "string" || !deviceId || cameraStatus.device_id !== deviceId
+        || typeof cameraStatus.name !== "string" || !cameraStatus.name || typeof cameraStatus.host !== "string"
+        || updating && deviceId !== state.cameraSetupTarget
+        || cameraStatus.source_revision != null && (typeof cameraStatus.source_revision !== "string"
+          || cameraStatus.source_revision.length < 16 || cameraStatus.source_revision.length > 256)) {
+        suspendCapabilities();
+        message("add-camera-message", "The connection was updated, but the camera details could not be verified. Refresh the camera list before making another change.", true);
+        return;
+      }
+      // Replace the whole row so a legacy reply cannot retain an old revision.
+      cameraVideoSettings?.close();
+      const connected = { ...cameraStatus };
+      state.cameras = state.cameras.some((item) => item.device_id === deviceId)
+        ? state.cameras.map((item) => item.device_id === deviceId ? connected : item)
+        : [...state.cameras, connected];
+      renderCameras();
       closeAddCamera();
       const completedEpoch = state.cameraSetupEpoch;
       const navigationEpoch = state.navigationEpoch;
-      const deviceId = created.device_id || created.camera?.device_id;
-      const cameraStatus = created.camera || created;
       state.cameraConnectionNotice = deviceId || null;
       const connection = cameraConnectionStatus(cameraStatus, state.workerStatus);
       notice(connection.text, connection.error, "camera_connection");

@@ -11,6 +11,7 @@ import ctypes
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import secrets
@@ -1512,6 +1513,116 @@ def _installed_person_fixture(parent, ffmpeg):
     return video
 
 
+def _installed_analytics_failure_snapshot(*, client, camera_id, publishers, cohort, diagnostic):
+    """Failure-only public state; never include IDs, paths, addresses or error text."""
+
+    def count(value):
+        return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+    def seconds(value, minimum=0):
+        if type(value) not in (int, float) or not math.isfinite(value):
+            return None
+        return round(min(86400, max(minimum, value)), 3)
+
+    def timestamp_age(value):
+        if type(value) is not str:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return None
+            return seconds((datetime.now(UTC) - parsed).total_seconds(), -86400)
+        except (ValueError, OverflowError):
+            return None
+
+    snapshot = {}
+    diagnostic["analytics_failure_snapshot"] = snapshot
+    transport_failure = getattr(client, "transport_failure", None)
+    try:
+        status = client.json(f"/api/v1/operator/cameras/{camera_id}/analytics")
+        if type(status) is not dict:
+            raise ValueError
+        allowed = {"disabled", "unavailable", "starting", "waiting", "active"}
+        snapshot["analytics"] = {
+            "status": status.get("status") if status.get("status") in allowed else "unknown",
+            "processed_frames": count(status.get("processed_frames")),
+            "event_count": count(status.get("event_count")),
+            "last_sample_age_seconds": timestamp_age(status.get("last_sample_at")),
+            "last_event_age_seconds": timestamp_age(status.get("last_event_at")),
+        }
+    except BaseException:
+        snapshot["analytics_probe_failed"] = True
+    try:
+        response = client.json("/api/v1/operator/cameras")
+        cameras = response.get("cameras") if type(response) is dict else None
+        if type(cameras) is not list or len(cameras) > 64:
+            raise ValueError
+        camera = next(
+            (item for item in cameras if type(item) is dict and item.get("device_id") == camera_id),
+            None,
+        )
+        if camera is None:
+            raise ValueError
+        recording = camera.get("recording_status")
+        if type(recording) is not dict:
+            raise ValueError
+        connection_states = {"live", "connecting", "disconnected", "unavailable"}
+        recording_states = {"waiting", "recording", "paused", "stalled", "error"}
+        reasons = {
+            "worker_unavailable",
+            "operator_paused",
+            "storage_paused",
+            "camera_unavailable",
+            "configuration_mismatch",
+            "storage_inspection",
+            "disk_progress",
+            "no_disk_progress",
+            "awaiting_disk_progress",
+        }
+        snapshot["camera"] = {
+            "status": camera.get("status")
+            if camera.get("status") in connection_states
+            else "unknown",
+            "recording": camera.get("recording") is True,
+            "recording_enabled": camera.get("recording_enabled") is True,
+            "recording_state": camera.get("recording_state")
+            if camera.get("recording_state") in recording_states
+            else "unknown",
+            "reason": recording.get("reason") if recording.get("reason") in reasons else "unknown",
+            "observed_bytes": count(recording.get("observed_bytes")),
+            "last_progress_age_seconds": seconds(recording.get("last_progress_age_seconds")),
+        }
+    except BaseException:
+        snapshot["camera_probe_failed"] = True
+    finally:
+        client.transport_failure = transport_failure
+    try:
+        code = publishers[0].poll()
+        snapshot["publisher_running"] = code is None
+        snapshot["publisher_exit_code"] = (
+            code if type(code) is int and -(2**31) <= code <= 2**32 - 1 else None
+        )
+    except BaseException:
+        snapshot["publisher_probe_failed"] = True
+    try:
+        # Reuse the cohort's remembered process/birth identities. Never look up a
+        # possibly recycled PID or discover fresh descendants after the failure.
+        with cohort.lock:
+            owned = tuple(cohort.processes.values())
+        decoder_count = 0
+        for process in owned:
+            try:
+                if not process.is_running():
+                    continue
+                if "k5vision.operator_events_decoder" in process.cmdline():
+                    decoder_count += 1
+            except (psutil.Error, OSError):
+                continue
+        snapshot["decoder_running_count"] = min(32, decoder_count)
+    except BaseException:
+        snapshot["decoder_probe_failed"] = True
+
+
 def _installed_analytics_journey(
     *,
     page,
@@ -1525,6 +1636,7 @@ def _installed_analytics_journey(
     helpers,
     browser_helpers,
     app,
+    cohort,
     publisher_credentials,
     diagnostic,
 ):
@@ -1585,12 +1697,25 @@ def _installed_analytics_journey(
             and 0.5 <= detected["confidence"] <= 1
         )
 
-    _wait(
-        positive_event,
-        "Installed native detector records a real person event",
-        process=app,
-        timeout=25,
-    )
+    try:
+        _wait(
+            positive_event,
+            "Installed native detector records a real person event",
+            process=app,
+            timeout=25,
+        )
+    except BaseException:
+        try:
+            _installed_analytics_failure_snapshot(
+                client=client,
+                camera_id=camera_id,
+                publishers=publishers,
+                cohort=cohort,
+                diagnostic=diagnostic,
+            )
+        except BaseException:
+            diagnostic["analytics_failure_probe_failed"] = True
+        raise
     occurred = datetime.fromisoformat(detected["occurred_at"].replace("Z", "+00:00"))
     _require(
         abs((datetime.now(UTC) - occurred).total_seconds()) < 30,
@@ -2484,6 +2609,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             helpers=helpers,
             browser_helpers=browser_helpers,
             app=app,
+            cohort=cohort,
             publisher_credentials=primary_publisher_credentials,
             diagnostic=nvr_diagnostic,
         )
