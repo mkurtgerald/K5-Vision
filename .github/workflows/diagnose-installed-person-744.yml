@@ -1,0 +1,132 @@
+name: Windows installed person diagnostic (744cf89)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/diagnose-installed-person-744.yml
+      - scripts/diagnose_installed_person_744.py
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  installed-person-failure:
+    name: Observe actual installed person analytics using the exact 744 installer
+    runs-on: windows-2025
+    timeout-minutes: 18
+    env:
+      K5_DESKTOP_HEAD_SHA: "744cf89e79c58d0946699ca7af1f03f4425634ca"
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_BETA_HEAD_SHA: "744cf89e79c58d0946699ca7af1f03f4425634ca"
+      PYTHONPATH: src
+    steps:
+      - name: Checkout the diagnostic wrapper and its frozen application parent
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify application and original acceptance sources remain at 744
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $changed = @(git diff --name-only $env:K5_DESKTOP_HEAD_SHA -- src/k5vision tests pyproject.toml windows/desktop .github/actions/provision-operator-tools scripts/provision_operator_person_acceptance.py)
+          if ($LASTEXITCODE -ne 0 -or $changed.Count -ne 0) {
+            throw "Diagnostic changed the application, dependencies or original acceptance journey"
+          }
+      - name: Set up development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install acceptance dependencies in development Python
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Installed person diagnostic dependency install failed" }
+      - name: Provision the same immutable generated-media tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Provision the same admitted public person fixture
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Installed analytics fixture admission failed" }
+      - name: Check the source run and immutable artifact identity
+        shell: pwsh
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $headers = @{
+            Authorization="Bearer $env:GH_READ_TOKEN"
+            Accept="application/vnd.github+json"
+            "X-GitHub-Api-Version"="2022-11-28"
+          }
+          $artifact = Invoke-RestMethod -Uri "https://api.github.com/repos/mkurtgerald/K5-Vision/actions/artifacts/13588981370" -Headers $headers
+          if ($artifact.id -ne 13588981370 -or
+              $artifact.name -ne "k5-vision-windows-setup-744cf89e79c58d0946699ca7af1f03f4425634ca" -or
+              $artifact.workflow_run.id -ne 42408392892 -or
+              $artifact.workflow_run.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $artifact.expired -ne $false -or $artifact.size_in_bytes -ne 205538085 -or
+              $artifact.digest -ne "sha256:78060786a30faee91226b7dae53ff0c2e5453f6a066768b675add2dc5968957e") {
+            throw "Frozen installer artifact identity mismatch"
+          }
+      - name: Download the exact existing installer without rebuilding
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          github-token: ${{ github.token }}
+          repository: mkurtgerald/K5-Vision
+          run-id: 42408392892
+          artifact-ids: "13588981370"
+          merge-multiple: true
+          path: installed-person-input
+      - name: Bind the direct diagnostic to the tested Setup and payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Get-Content -LiteralPath installed-person-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifestPath = "installed-person-input/payload-manifest.json"
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          $setup = Get-Item -LiteralPath installed-person-input/K5VisionSetup.exe
+          $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $sha -ne "764b86dbf72625e216e864b1ce93a6f6af6d916496c5588d82d2ffd8fc0b598f" -or
+              $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
+              $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant() -or
+              $package.camera_video_settings -ne $true -or $package.automatic_wall_layout -ne $true -or
+              $package.motion_recording -ne $false -or $package.camera_trigger_zones -ne $false -or
+              @($package.writable_video_codecs).Count -ne 1 -or $package.writable_video_codecs[0] -ne 'H264') {
+            throw "Installed person diagnostic source, Setup, payload or feature mismatch"
+          }
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_SETUP_SHA256=$sha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Call the original installed journey with sanitized diagnostic callbacks
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          python -u scripts/diagnose_installed_person_744.py --output installed-person-744-diagnostic.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve only the terminal diagnostic report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: installed-person-744-diagnostic-${{ github.run_id }}
+          path: installed-person-744-diagnostic.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Remove only owned development tools
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrEmpty($env:K5_DONOR_TOOL_ROOT)) { exit 0 }
+          $toolRoot = [IO.Path]::GetFullPath($env:K5_DONOR_TOOL_ROOT)
+          $expected = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar)
+          if (-not [string]::Equals([IO.Directory]::GetParent($toolRoot).FullName, $expected, [StringComparison]::OrdinalIgnoreCase) -or
+              [IO.Path]::GetFileName($toolRoot) -notmatch '^K5 donor development tools [a-f0-9]{32}$') {
+            throw "Diagnostic cleanup ownership refused"
+          }
+          if (Test-Path -LiteralPath $toolRoot) { Remove-Item -LiteralPath $toolRoot -Recurse -Force }
