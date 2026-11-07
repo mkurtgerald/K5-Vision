@@ -433,7 +433,7 @@ class _RecordedNativeWorker:
                     self._failure_phase = "native_write_failed"
                     if expired.is_set() or self._closing.is_set():
                         process.kill()
-                        raise TimeoutError
+                        raise TimeoutError from None
                     process.stdin.write(payload)
                     process.stdin.flush()
                 self._failure_phase = "native_reply_missing"
