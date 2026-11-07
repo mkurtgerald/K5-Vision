@@ -68,7 +68,10 @@ def test_embedded_decoder_child_probe_uses_real_worker_with_no_camera_media(buil
     # embedded Python import path must work before packaging is admitted.
     script = builder.NATIVE_DECODER_CHILD_SMOKE
     compile(script, "<embedded decoder-child smoke>", "exec")
-    assert "_RecordedNativeWorker(None)" in script
+    assert "load_installed_person_configuration" in script
+    assert "_RecordedNativeWorker(person)" in script
+    assert "worker.request(None)" in script
+    assert "worker._person_ready" in script
     assert "__k5_missing_native_probe__.mp4" in script
     assert "worker.close()" in script
 

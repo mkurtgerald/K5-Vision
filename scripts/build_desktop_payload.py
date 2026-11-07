@@ -74,12 +74,17 @@ _SOURCE_PHASES = {
 NATIVE_DECODER_CHILD_SMOKE = (
     "from pathlib import Path\n"
     "from k5vision.operator_events import _RecordedNativeWorker\n"
-    "worker = _RecordedNativeWorker(None)\n"
+    "from k5vision.operator_analytics_person import load_installed_person_configuration\n"
+    "person = load_installed_person_configuration({})\n"
+    "assert person is not None\n"
+    "worker = _RecordedNativeWorker(person)\n"
     "try:\n"
+    "    assert worker.request(None) is None\n"
+    "    assert worker._person_ready\n"
     "    assert worker.request(Path.cwd() / '__k5_missing_native_probe__.mp4') is None\n"
     "finally:\n"
     "    worker.close()\n"
-    "print('embedded smoke: native_decoder_child', flush=True)\n"
+    "print('embedded smoke: native_detector_child', flush=True)\n"
 )
 
 IDENTITY_CRYPTO_SMOKE = (
@@ -821,10 +826,10 @@ def build(args: argparse.Namespace) -> None:
             "assert importlib.util.find_spec('pip') is None",
         ]
     )
-    # Package admission must exercise a real child decoder over the same
-    # embedded Python executable and Windows Job Object used by recording
-    # analytics, not merely import native modules in the parent interpreter.
-    # The probe references an intentionally nonexistent synthetic file only.
+    # Package admission must exercise the sealed model and a subsequent decode
+    # through the real child and Windows Job Object, not just the parent import.
+    # The child primes on synthetic zero pixels; the only path it reads for
+    # decoding is intentionally nonexistent. No camera media is involved.
     phase("embedded_runtime_execution")
     run([str(runtime / "python.exe"), "-I", "-B", "-c", NATIVE_DECODER_CHILD_SMOKE])
     generated = output / "PayloadIdentity.generated.cs"
