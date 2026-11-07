@@ -615,6 +615,9 @@ class RecordedFrameSampler:
         previous = self._observations.get(source.binding.device_id)
         current = {}
         changed = []
+        # A new segment can be created at zero bytes before the recorder writes
+        # its first fragment. Keep a bounded file-identity hint for later growth.
+        pending_zero: list[str] = []
         if self._recording_files is not None:
             inventory = self._recording_files(source.binding)
             if inventory is None:
@@ -695,6 +698,8 @@ class RecordedFrameSampler:
                     current[name] = info.st_dev, info.st_ino, info.st_size
                     if info.st_size > 0:
                         changed.append((path, info))
+                    else:
+                        pending_zero.append(name)
                 seen.update(names)
                 self._directory_mtime[identifier] = directory_info.st_mtime_ns
         else:
@@ -715,12 +720,19 @@ class RecordedFrameSampler:
                         changed.append((path, info))
         self._observations[source.binding.device_id] = current
         if not changed:
+            if pending_zero:
+                previous_active = self._active_files.get(source.binding.device_id, ())
+                self._active_files[source.binding.device_id] = tuple(
+                    dict.fromkeys(pending_zero[:2] + list(previous_active))
+                )[:2]
             self._capture_outcome = "no_growth"
             return None
         # Normally one open segment grows. At a rollover, prefer the new file;
         # its bytes belong to the same scan, independent of UTC ordering.
         changed.sort(key=lambda item: (item[0].name in previous, -item[1].st_size))
-        self._active_files[source.binding.device_id] = tuple(path.name for path, _ in changed[:2])
+        self._active_files[source.binding.device_id] = tuple(
+            dict.fromkeys(pending_zero[:2] + [path.name for path, _ in changed[:2]])
+        )[:2]
         for path, info in changed[:2]:
             if not 1 <= info.st_size <= MAX_RECORDING_BYTES:
                 continue
