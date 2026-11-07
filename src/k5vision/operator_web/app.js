@@ -1933,6 +1933,25 @@
     renderPersonControls();
   });
   $("live-video").addEventListener("pause", () => { if (state.personEnabled) stopPersonView("Sampled view stopped while live video is paused."); });
+  function checkPersonBuffer(epoch, video, frames) {
+    if (!state.personEnabled || state.personEpoch !== epoch) return;
+    const current = video.getVideoPlaybackQuality?.().totalVideoFrames;
+    if (video.paused || video.readyState < 2 || !Number.isFinite(frames)
+      || !Number.isFinite(current) || current <= frames) {
+      if (state.personController) {
+        // An immutable sample is already in flight. Buffering the subsequent
+        // live frames must not abort its authenticated, bounded inference.
+        // Session revocation, camera changes and actual stream teardown still
+        // call stopPersonView() and abort it immediately.
+        state.personBufferTimer = setTimeout(() => {
+          state.personBufferTimer = null;
+          checkPersonBuffer(epoch, video, frames);
+        }, 1000);
+      } else {
+        stopPersonView("Sampled view stopped while live video is buffering. Start it again when video returns.");
+      }
+    }
+  }
   $("live-video").addEventListener("waiting", () => {
     if (state.personEnabled && state.personBufferTimer === null) {
       const epoch = state.personEpoch;
@@ -1940,12 +1959,7 @@
       const frames = video.getVideoPlaybackQuality?.().totalVideoFrames;
       state.personBufferTimer = setTimeout(() => {
         state.personBufferTimer = null;
-        if (!state.personEnabled || state.personEpoch !== epoch) return;
-        const current = video.getVideoPlaybackQuality?.().totalVideoFrames;
-        if (video.paused || video.readyState < 2 || !Number.isFinite(frames)
-          || !Number.isFinite(current) || current <= frames) {
-          stopPersonView("Sampled view stopped while live video is buffering. Start it again when video returns.");
-        }
+        checkPersonBuffer(epoch, video, frames);
       }, PERSON_BUFFER_GRACE_MS);
     }
     if (state.token && state.view === "live") {

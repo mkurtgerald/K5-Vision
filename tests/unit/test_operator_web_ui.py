@@ -39,6 +39,24 @@ def test_busy_person_sample_preserves_last_verified_canvas_until_new_active_samp
     assert "output.strokeRect" in active_body
 
 
+def test_buffering_does_not_cancel_an_already_submitted_person_frame():
+    """One frozen authorized sample must finish independently of later HLS buffering."""
+    source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    buffer = source.split("function checkPersonBuffer(", 1)[1].split(
+        '$("live-video").addEventListener("waiting"', 1
+    )[0]
+    assert "if (state.personController)" in buffer
+    assert "checkPersonBuffer(epoch, video, frames)" in buffer
+    assert "stopPersonView(" in buffer
+    # Actual revocation and camera teardown must still abort pending samples.
+    stop = source.split("function stopPersonView(", 1)[1].split(
+        "function validPersonBox(", 1
+    )[0]
+    assert "state.personController?.abort();" in stop
+
+
 def _ui_core(account):
     return {
         "id": account.get("id", "a22c22bc-4089-45b7-a370-f360bb9d33c0"),
