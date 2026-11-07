@@ -385,7 +385,61 @@ def analytics_ui_state(page):
     return result
 
 
-def observe_analytics(original, result, source_root):
+
+def resume_clock_diagnostic_after_navigation_timeout(kwargs, publisher_factory):
+    """Continue only this non-qualifying clock probe after a real event exists.
+
+    The unchanged installed-product acceptance still fails. This separate
+    diagnostic only bypasses a failed *event UI navigation*, never a missing
+    event or detector inference. It restores the generated red camera stream
+    before probing the genuine Windows clock shift.
+    """
+    if kwargs["diagnostic"].get("analytics_stage") != "event_recording_navigation":
+        return None
+    camera_id = kwargs["camera_id"]
+    response = kwargs["client"].json(f"/api/v1/operator/cameras/{camera_id}/events")
+    events = response.get("events") if type(response) is dict else None
+    if type(events) is not list or not 1 <= len(events) <= 64:
+        return None
+    event = next(
+        (
+            item
+            for item in events
+            if type(item) is dict
+            and item.get("camera_id") == camera_id
+            and type(item.get("id")) is str
+            and 1 <= len(item["id"]) <= 128
+            and type(item.get("person_count")) is int
+            and 1 <= item["person_count"] <= 32
+            and type(item.get("confidence")) in (int, float)
+            and math.isfinite(item["confidence"])
+            and 0.5 <= item["confidence"] <= 1
+            and type(item.get("occurred_at")) is str
+            and type(item.get("playback_at")) is str
+        ),
+        None,
+    )
+    if event is None:
+        return None
+    helpers = kwargs["helpers"]
+    publishers = kwargs["publishers"]
+    helpers._stop_owned(publishers[0])
+    replacement = publisher_factory(
+        kwargs["parent"],
+        kwargs["ffmpeg"],
+        kwargs["source_uri"],
+        helpers,
+        credentials=kwargs["publisher_credentials"],
+    )
+    publishers[0] = replacement
+    kwargs["processes"].append(replacement)
+    browser = kwargs["browser_helpers"]
+    browser._open_camera_watch(kwargs["page"], camera_id)
+    browser._decoded_color(kwargs["page"], "live-video", "red")
+    return {}, event
+
+
+def observe_analytics(original, result, source_root, publisher_factory):
     def observed(*args, **kwargs):
         try:
             return original(*args, **kwargs)
@@ -409,6 +463,18 @@ def observe_analytics(original, result, source_root):
             note["ui_observed_after_exception_ms"] = min(
                 90000, max(0, round((time.monotonic() - began) * 1000))
             )
+            if note["kind"] == "timeout":
+                try:
+                    continued = resume_clock_diagnostic_after_navigation_timeout(
+                        kwargs, publisher_factory
+                    )
+                    if continued is not None:
+                        note["clock_only_continuation"] = "after_failed_event_navigation"
+                        # The real graphical navigation assertion remains failed.
+                        # Never turn this separate origin probe into a release receipt.
+                        return continued
+                except BaseException:
+                    note["clock_only_continuation_failed"] = True
             raise
 
     return observed
@@ -514,7 +580,7 @@ def run(output):
 
         module._Cohort, module._vm_clock_phase = ObservedCohort, phase
         module._installed_analytics_journey = observe_analytics(
-            module._installed_analytics_journey, result, root
+            module._installed_analytics_journey, result, root, module._publish_fixture
         )
 
         def property_callback(name, value):
