@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 _SOURCE = Path(__file__).resolve().parents[1] / "integration" / "test_windows_desktop_app.py"
 _SPEC = importlib.util.spec_from_file_location("k5_desktop_navigation_under_test", _SOURCE)
