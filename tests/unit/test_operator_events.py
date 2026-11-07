@@ -351,9 +351,7 @@ def test_pending_native_capture_reports_finite_stage_without_exposing_source(sto
         ("private-rtsp-uri-or-other-untrusted-phase", "native_request"),
     ],
 )
-def test_pending_native_worker_distinguishes_bounded_inflight_stage(
-    store, worker_phase, expected
-):
+def test_pending_native_worker_distinguishes_bounded_inflight_stage(store, worker_phase, expected):
     source = _source()
     service, sampler, _ = _service(store, source)
     camera_id = source.binding.device_id
