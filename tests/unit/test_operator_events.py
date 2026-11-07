@@ -671,9 +671,7 @@ def test_cached_inventory_detects_new_recorder_file_without_replaying_older_medi
     fresh.write_bytes(b"new-native-segment")
     sample = sampler.capture(source)
     assert sample is not None
-    assert decoded == [
-        (b"new-native-segment", datetime(2026, 10, 27, 12, tzinfo=UTC), fresh.name)
-    ]
+    assert decoded == [(b"new-native-segment", datetime(2026, 10, 27, 12, tzinfo=UTC), fresh.name)]
     assert sampler.capture(source) is None
     assert len(decoded) == 1
 
