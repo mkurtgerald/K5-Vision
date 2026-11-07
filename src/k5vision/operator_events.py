@@ -837,7 +837,10 @@ class RecordedFrameSampler:
             if not hasattr(self, "_worker"):
                 self._worker = _RecordedNativeWorker(self._configuration)
             worker = self._worker
-            if worker._person_ready:
+            # A primed child may have exited since its previous response.
+            # Never treat cached readiness as valid for a dead native process.
+            process = worker._process
+            if worker._person_ready and process is not None and process.poll() is None:
                 return
         try:
             worker.request(None)

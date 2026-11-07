@@ -913,6 +913,33 @@ def test_model_priming_is_owned_and_nonblocking_when_recorded_person_is_enabled(
         asyncio.run(service.aclose())
 
 
+@pytest.mark.parametrize(
+    ("child_status", "expected_requests"), [(None, 0), (1, 1)]
+)
+def test_model_prime_rechecks_child_liveness_before_trusting_cached_readiness(
+    identity, monkeypatch, child_status, expected_requests
+):
+    import k5vision.operator_events as module
+
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    sampler = RecordedFrameSampler(root)
+    sampler._configuration = SimpleNamespace(artifact_root=identity.directory / "model")
+    worker = module._RecordedNativeWorker(sampler._configuration)
+    worker._person_ready = True
+
+    class Child:
+        def poll(self):
+            return child_status
+
+    worker._process = Child()
+    requests = []
+    monkeypatch.setattr(worker, "request", lambda path: requests.append(path))
+    sampler._worker = worker
+    sampler.prime()
+    assert requests == [None] * expected_requests
+
+
 def test_recorded_native_model_prime_requires_matching_reply_and_reuses_child(
     monkeypatch, tmp_path
 ):
