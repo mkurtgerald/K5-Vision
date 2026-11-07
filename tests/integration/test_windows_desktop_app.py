@@ -2007,6 +2007,35 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
     }
 
 
+def _poll_installed_person_event(client, route, diagnostic):
+    """Tolerate only bounded gateway reconnection during the original 25s gate.
+
+    The real positive person-event and same-frame box requirements remain
+    mandatory. Retain only a finite HTTP status, never any response content.
+    """
+    status, body, _ = client.get(route + "/events")
+    if status != 200:
+        diagnostic["analytics_event_poll_status"] = (
+            status if status in {401, 403, 404, 429, 500, 502, 503, 504} else "other"
+        )
+        if status in {502, 503, 504}:
+            return None
+        _require(False, "Installed person-event endpoint refused its authenticated poll")
+    diagnostic["analytics_event_poll_status"] = 200
+    payload = json.loads(body)
+    _require(
+        type(payload) is dict and type(payload.get("events")) is list,
+        "Installed person-event endpoint returned an invalid event envelope",
+    )
+    if not payload["events"]:
+        return None
+    _require(
+        type(payload["events"][0]) is dict,
+        "Installed person-event endpoint returned an invalid event",
+    )
+    return payload["events"][0]
+
+
 def _installed_analytics_journey(
     *,
     page,
@@ -2069,10 +2098,10 @@ def _installed_analytics_journey(
     detected = {}
 
     def positive_event():
-        result = client.json(route + "/events")["events"]
-        if not result:
+        event = _poll_installed_person_event(client, route, diagnostic)
+        if event is None:
             return False
-        detected.update(result[0])
+        detected.update(event)
         return (
             detected.get("camera_id") == camera_id
             and type(detected.get("person_count")) is int
