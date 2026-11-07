@@ -1,0 +1,46 @@
+name: Windows browser collector diagnostic (744cf89)
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/diagnose-browser-collector-744cf89.yml
+      - scripts/browser-collector-744cf89/**
+
+permissions:
+  contents: read
+
+jobs:
+  controlled-collector:
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - name: Checkout diagnostic head and frozen application history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Use the exact failing interpreter version
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12.10"
+          cache: pip
+      - name: Install the exact diagnostic driver versions
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0" "greenlet==3.5.6" "pytest==8.4.2"
+          if ($LASTEXITCODE -ne 0) { throw "Pinned collector diagnostic dependencies failed" }
+      - name: Compare owned native browser workloads with and without timed dumps
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          python -u scripts/browser-collector-744cf89/diagnostic_parent.py --repo . --output browser-collector-744cf89-summary.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve only sanitized aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: browser-collector-744cf89-diagnostic-${{ github.run_id }}
+          path: browser-collector-744cf89-summary.json
+          if-no-files-found: warn
+          retention-days: 14
