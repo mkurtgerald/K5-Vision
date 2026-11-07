@@ -6,10 +6,11 @@ Explorer or Task Manager. Follow [the desktop guide](WINDOWS_DESKTOP_BETA.md) fo
 setup; there is no terminal, separate Python installation or manual stream URL
 step.
 
-The delivered candidate at
-`a581098a1510d3b214c11fbfa3d28625b9419d49` passed
-[native graphical Windows acceptance](https://github.com/mkurtgerald/K5-Vision/actions/runs/39159696655)
-and [five-lane Windows regression](https://github.com/mkurtgerald/K5-Vision/actions/runs/39159647805).
+The released administration baseline at
+[`34a77a5`](https://github.com/mkurtgerald/K5-Vision/releases/tag/k5-windows-admin-integrations-34a77a5)
+passed [native graphical Windows acceptance, time administration and actual
++/-48-hour host clock corrections](https://github.com/mkurtgerald/K5-Vision/actions/runs/41220620116)
+and [native Windows regression](https://github.com/mkurtgerald/K5-Vision/actions/runs/41220620112).
 The GUI test used generated H.264 media and a real SOAP camera fixture for
 credentials, profiles and automatic stream resolution. It ran discovery but
 used numeric-IP fallback because its fixture was not discovered. Separate
@@ -19,9 +20,11 @@ endurance remain pending.
 Record failures with the exact candidate revision and step. Leave every
 unattempted or incomplete gate **pending**.
 
-The time-critical increment described below requires a new exact-build Windows
-receipt. The earlier linked candidate does not qualify its clock reports,
-authentication retry, server-anchored history or elapsed-time retention changes.
+Every new candidate must repeat the exact-build Windows and clock gates. The
+camera-video-settings and automatic-wall increment additionally needs its own
+installed camera-controls receipt; the older baseline does not qualify those
+new controls. Generated-media automation does not complete the physical-camera
+and reference-time checks below.
 
 ## Prepare the Windows station
 
@@ -71,14 +74,14 @@ PC clock-step cases. Windows Date & time settings provide the graphical controls
 camera time/NTP changes use that camera's settings. Restore the approved
 automatic-time configuration afterward. No tester terminal is required.
 
-Maintainer automation is adding a separate disposable GitHub-hosted Windows VM
-gate using the exact same EXE artifact as desktop qualification. An independent
+Maintainer automation uses a separate disposable GitHub-hosted Windows VM
+gate with the exact same EXE artifact as desktop qualification. An independent
 watchdog is armed before guest time services are temporarily controlled and
 the guest's UTC clock is moved +48 hours and -48 hours. The gate must check
 session lifetime, live video, recording, closed-file SHA-256 hashes and UTC
-history, then restore UTC and the time services before evidence upload. Its status
-remains **pending**
-until the exact-build workflow receipt passes. A generated-media VM result does
+history, then restore UTC and the time services before evidence upload. This
+passed for the linked released baseline and must pass again for each new
+candidate. A generated-media VM result does
 not complete physical-camera time/NTP accuracy, UTC/DST field checks, capacity
 or endurance qualification. Testers do not run this automation themselves.
 

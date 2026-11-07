@@ -164,6 +164,18 @@ def create_operator_product_app(
     previous_lifespan = application.router.lifespan_context
     profile_lock = profile_lease or OperatorProfileLock(identity.directory)
 
+    async def close_camera_settings():
+        try:
+            video_settings = getattr(application.state, "operator_camera_settings_vault", None)
+            if video_settings is not None:
+                await video_settings.aclose()
+        finally:
+            remove_listener = getattr(
+                application.state, "operator_camera_settings_revocation_cleanup", None
+            )
+            if remove_listener is not None:
+                remove_listener()
+
     @asynccontextmanager
     async def lifespan(app):
         analytics_task = None
@@ -202,9 +214,12 @@ def create_operator_product_app(
                                 await time_admin.aclose()
                             finally:
                                 try:
-                                    await service.stop()
+                                    await close_camera_settings()
                                 finally:
-                                    close_admin_state()
+                                    try:
+                                        await service.stop()
+                                    finally:
+                                        close_admin_state()
 
         try:
             if profile_lease is None:
@@ -217,6 +232,7 @@ def create_operator_product_app(
             if events is not None:
                 await events.aclose()
             await time_admin.aclose()
+            await close_camera_settings()
             close_admin_state()
             raise
         try:

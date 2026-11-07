@@ -3,7 +3,7 @@ name: Native Windows Desktop Installer
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta, codex/windows-onvif-onboarding, codex/windows-surveillance-workspace]
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta, codex/windows-onvif-onboarding, codex/windows-surveillance-workspace, codex/video-wall-roadmap-20261101]
     paths:
       - .github/workflows/operator-desktop-windows.yml
       - .github/actions/provision-operator-tools/**
@@ -12,6 +12,10 @@ on:
       - scripts/verify_desktop_receipt.py
       - src/k5vision/**
       - tests/integration/test_windows_desktop_app.py
+      - tests/integration/test_windows_camera_video_settings.py
+      - tests/integration/onvif_video_camera_fixture.py
+      - scripts/verify_windows_camera_video_settings_receipt.py
+      - tests/unit/test_windows_camera_video_settings_receipt.py
       - tests/integration/windows_vm_clock.py
       - tests/integration/windows_time_configuration.py
       - tests/integration/test_windows_time_administration.py
@@ -87,13 +91,13 @@ jobs:
         if: matrix.lane == 'onvif'
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_rtsp.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_admin_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py tests/unit/test_operator_analytics_ui.py tests/unit/test_operator_continuous_playback_ui.py tests/unit/test_operator_settings_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_camera_settings.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_rtsp.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_camera_video_ui.py tests/unit/test_operator_admin_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py tests/unit/test_operator_analytics_ui.py tests/unit/test_operator_continuous_playback_ui.py tests/unit/test_operator_settings_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify camera administration and atomic reconnect on Windows
         if: matrix.lane == 'cameras'
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_admin_api.py tests/unit/test_operator_product_state.py tests/unit/test_operator_events.py tests/unit/test_operator_events_api.py tests/unit/test_operator_exports.py tests/unit/test_operator_export_audit.py tests/unit/test_operator_audit.py tests/unit/test_operator_audit_api.py tests/unit/test_operator_role_policy.py tests/unit/test_operator_role_policy_review.py tests/unit/test_operator_integrations.py tests/unit/test_operator_storage_settings.py tests/unit/test_operator_storage_settings_api.py tests/test_device_registry.py tests/test_user_registry.py tests/test_user_admin_api.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_product_route_boundary.py tests/unit/test_operator_camera_settings_api.py tests/unit/test_operator_admin_api.py tests/unit/test_operator_product_state.py tests/unit/test_operator_events.py tests/unit/test_operator_events_api.py tests/unit/test_operator_exports.py tests/unit/test_operator_export_audit.py tests/unit/test_operator_audit.py tests/unit/test_operator_audit_api.py tests/unit/test_operator_role_policy.py tests/unit/test_operator_role_policy_review.py tests/unit/test_operator_integrations.py tests/unit/test_operator_storage_settings.py tests/unit/test_operator_storage_settings_api.py tests/test_device_registry.py tests/test_user_registry.py tests/test_user_admin_api.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   native-desktop:
@@ -314,6 +318,8 @@ jobs:
             workers_bundled=$false; first_launch_internet_required=$true
             onvif_camera_onboarding=$true; manual_stream_uri_required=$false
             direct_rtsp_enrollment=$true
+            camera_video_settings=$true; automatic_wall_layout=$true
+            motion_recording=$false; camera_trigger_zones=$false; writable_video_codecs=@('H264')
             admin_user_management=$true; role_permissions=$true; camera_access_controls=$true
             person_analytics_bundled=$true; background_person_events=$true
             storage_settings=$true; windows_time_administration=$true; camera_time_administration=$true
@@ -337,6 +343,81 @@ jobs:
           path: |
             desktop-build/desktop-windows.xml
             desktop-build/desktop-windows-receipt.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  camera-video:
+    name: Exercise installed ONVIF video settings and automatic camera wall
+    needs: [native-desktop]
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_NATIVE_CAMERA_VIDEO_ACCEPTANCE: "1"
+    steps:
+      - name: Checkout the tested installer revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up development Python for the separate camera gate
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install acceptance dependencies in development Python
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Camera acceptance dependency install failed" }
+      - name: Provision immutable generated-media tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Download the exact installer exercised by the first VM
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: k5-vision-windows-setup-${{ github.event.pull_request.head.sha || github.sha }}
+          path: camera-video-input
+      - name: Bind camera qualification to the exact tested installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Get-Content -LiteralPath camera-video-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath camera-video-input/payload-manifest.json -Raw | ConvertFrom-Json
+          $setup = Get-Item -LiteralPath camera-video-input/K5VisionSetup.exe
+          $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
+              $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath camera-video-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
+              $package.camera_video_settings -ne $true -or $package.automatic_wall_layout -ne $true -or
+              $package.motion_recording -ne $false -or $package.camera_trigger_zones -ne $false -or
+              @($package.writable_video_codecs).Count -ne 1 -or $package.writable_video_codecs[0] -ne 'H264') {
+            throw "Camera qualification source, installer or feature identity mismatch"
+          }
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_SETUP_SHA256=$sha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Verify strict camera evidence admission
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_windows_camera_video_settings_receipt.py -o addopts= --no-cov --tb=short
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exercise real installed camera controls and bounded automatic players
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_camera_video_settings.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=90 --junitxml=camera-video-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_windows_camera_video_settings_receipt.py camera-video-windows.xml camera-video-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve the separate finite camera-video witness
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: camera-video-windows-witness-${{ github.run_id }}
+          path: |
+            camera-video-windows.xml
+            camera-video-windows-receipt.json
           if-no-files-found: warn
           retention-days: 14
 

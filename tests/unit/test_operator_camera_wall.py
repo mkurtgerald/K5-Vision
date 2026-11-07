@@ -35,6 +35,7 @@ def wall_page():
             window.fixture = {
               session: {token: 'generated-browser-session', epoch: 1},
               calls: [], players: [], pending: [], opened: [], hold: false, failAdmission: {},
+              peakPlayers: 0,
             };
             HTMLMediaElement.prototype.play = function () {
               this.dispatchEvent(new Event('playing'));
@@ -49,6 +50,8 @@ def wall_page():
               static isSupported() { return true; }
               constructor() {
                 this.events = {}; this.destroyed = false; fixture.players.push(this);
+                fixture.peakPlayers = Math.max(fixture.peakPlayers,
+                  fixture.players.filter(player => !player.destroyed).length);
               }
               on(event, callback) { this.events[event] = callback; }
               emit(event, data) { this.events[event]?.(event, data); }
@@ -102,6 +105,7 @@ def wall_page():
 
 def test_wall_layout_paging_reconciles_players_and_admits_only_confirmed_recording(wall_page):
     page = wall_page
+    page.locator("#wall-layout").select_option("4")
     page.evaluate("wall.show(cameras(14))")
     page.wait_for_function("fixture.players.length === 4")
     assert page.locator(".camera-wall-tile").count() == 4
@@ -143,6 +147,156 @@ def test_wall_layout_paging_reconciles_players_and_admits_only_confirmed_recordi
     assert page.locator(".camera-wall-tile").count() == 0
     assert page.evaluate("fixture.players.every(player => player.destroyed)")
     assert page.evaluate("fixture.calls.every(call => call.signal.aborted)")
+
+
+@pytest.mark.parametrize(
+    ("camera_count", "capacity"), [(0, 0), (1, 1), (2, 4), (4, 4), (5, 9), (9, 9), (10, 9), (64, 9)]
+)
+def test_auto_layout_uses_authorized_camera_count_and_bounds_visible_readers(
+    wall_page, camera_count, capacity
+):
+    page = wall_page
+    page.evaluate("count => wall.show(cameras(count))", camera_count)
+    assert page.locator("#wall-layout").input_value() == "auto"
+    assert page.locator(".camera-wall-grid").get_attribute("data-layout") == str(capacity)
+    shown = min(camera_count, capacity)
+    page.wait_for_function("count => fixture.players.length===count", arg=shown)
+    assert page.locator(".camera-wall-tile").count() == shown
+    assert page.evaluate("fixture.calls.length") == shown
+    assert page.evaluate("fixture.peakPlayers") == shown
+    assert page.locator(".camera-wall-empty").is_visible() == (camera_count == 0)
+    assert page.locator("#wall-page-previous").is_disabled()
+    assert page.locator("#wall-page-next").is_disabled() == (camera_count <= capacity)
+    assert page.locator(".camera-wall-pages").inner_text() == (
+        f"Page 1 of {max(1, (camera_count + max(capacity, 1) - 1) // max(capacity, 1))}"
+    )
+
+
+def test_auto_enrollment_removal_and_offline_polls_preserve_unchanged_tiles(wall_page):
+    page = wall_page
+    page.evaluate("wall.show(cameras(1))")
+    page.wait_for_function("fixture.players.length===1")
+    page.evaluate("fixture.originalTile=document.querySelector('[data-camera-id=\"camera-0\"]')")
+    for count, capacity in [(2, 4), (4, 4), (5, 9), (10, 9)]:
+        page.evaluate("count => wall.update(cameras(count))", count)
+        page.wait_for_function(
+            "count => fixture.players.filter(player => !player.destroyed).length===count",
+            arg=min(count, 9),
+        )
+        assert page.locator("#wall-layout").input_value() == "auto"
+        assert page.locator(".camera-wall-grid").get_attribute("data-layout") == str(capacity)
+        assert page.evaluate(
+            "fixture.originalTile===document.querySelector('[data-camera-id=\"camera-0\"]')"
+        )
+    page.evaluate("""() => {
+      const offline=cameras(10); offline.forEach(camera => camera.status='disconnected');
+      wall.update(offline); wall.update(offline);
+    }""")
+    assert page.locator(".camera-wall-grid").get_attribute("data-layout") == "9"
+    assert page.locator(".camera-wall-tile").count() == 9
+    assert page.locator(".camera-wall-status").all_text_contents() == ["Camera disconnected"] * 9
+    assert page.evaluate("fixture.calls.length") == 9
+
+    page.evaluate(
+        "fixture.authorized=cameras(10).filter(camera => camera.device_id!=='camera-1'); "
+        "wall.update(fixture.authorized)"
+    )
+    page.wait_for_function("fixture.players.length===10")
+    assert page.locator('[data-camera-id="camera-1"]').count() == 0
+    assert page.evaluate(
+        "fixture.calls.filter(call => call.id==='camera-1').every(call => call.signal.aborted)"
+    )
+    assert page.evaluate("fixture.players[1].destroyed")
+    page.evaluate("fixture.players[1].emit('error',{fatal:true,response:{code:401}})")
+    assert page.evaluate("fixture.calls.length") == 10
+    assert page.evaluate("fixture.calls.filter(call => call.id==='camera-0').length") == 1
+    for count, capacity in [(4, 4), (1, 1), (0, 0)]:
+        page.evaluate("count => wall.update(fixture.authorized.slice(0,count))", count)
+        assert page.locator(".camera-wall-grid").get_attribute("data-layout") == str(capacity)
+        assert page.locator(".camera-wall-tile").count() == count
+        assert page.evaluate("fixture.players.filter(player => !player.destroyed).length") == count
+    assert page.locator(".camera-wall-empty").is_visible()
+    assert page.evaluate("fixture.peakPlayers") == 9
+    assert page.evaluate("fixture.calls.every(call => call.signal.aborted)")
+
+
+def test_auto_paging_preserves_current_page_then_clamps_after_removal(wall_page):
+    page = wall_page
+    page.evaluate("wall.show(cameras(64))")
+    page.wait_for_function("fixture.players.length===9")
+    for _ in range(7):
+        page.locator("#wall-page-next").click()
+    assert page.locator(".camera-wall-pages").inner_text() == "Page 8 of 8"
+    assert page.locator(".camera-wall-tile").get_attribute("data-camera-id") == "camera-63"
+    assert page.locator("#wall-page-next").is_disabled()
+    page.evaluate(
+        "fixture.lastTile=document.querySelector('[data-camera-id=\"camera-63\"]'); "
+        "wall.update(cameras(64))"
+    )
+    assert page.locator(".camera-wall-pages").inner_text() == "Page 8 of 8"
+    assert page.evaluate(
+        "fixture.lastTile===document.querySelector('[data-camera-id=\"camera-63\"]')"
+    )
+    page.evaluate("wall.update(cameras(10))")
+    assert page.locator(".camera-wall-pages").inner_text() == "Page 2 of 2"
+    assert page.locator(".camera-wall-tile").get_attribute("data-camera-id") == "camera-9"
+    page.evaluate("wall.update(cameras(9))")
+    assert page.locator(".camera-wall-pages").inner_text() == "Page 1 of 1"
+    assert page.locator(".camera-wall-tile").count() == 9
+    assert page.evaluate("fixture.peakPlayers") == 9
+    assert page.evaluate(
+        "fixture.calls.filter(call => call.id==='camera-63').every(call => call.signal.aborted)"
+    )
+    assert page.locator("#wall-page-previous").is_disabled()
+
+
+@pytest.mark.parametrize("manual_layout", ["1", "4", "9"])
+def test_manual_layout_survives_inventory_polls_until_auto_is_selected(wall_page, manual_layout):
+    page = wall_page
+    page.evaluate("wall.show(cameras(10))")
+    page.locator("#wall-layout").select_option(manual_layout)
+    for count in [1, 5, 64, 2, 0, 10]:
+        page.evaluate("count => {wall.update(cameras(count));wall.update(cameras(count));}", count)
+        assert page.locator("#wall-layout").input_value() == manual_layout
+        assert page.locator(".camera-wall-grid").get_attribute("data-layout") == manual_layout
+        assert page.locator(".camera-wall-tile").count() == min(count, int(manual_layout))
+    page.locator("#wall-page-next").click()
+    page.evaluate("wall.update(cameras(10))")
+    assert page.locator(".camera-wall-pages").inner_text().startswith("Page 2 of ")
+    page.locator("#wall-layout").select_option("auto")
+    assert page.locator(".camera-wall-grid").get_attribute("data-layout") == "9"
+    page.evaluate("wall.update(cameras(1))")
+    assert page.locator("#wall-layout").input_value() == "auto"
+    assert page.locator(".camera-wall-grid").get_attribute("data-layout") == "1"
+
+
+def test_auto_resize_and_revocation_discard_late_admissions_and_session_callbacks(wall_page):
+    page = wall_page
+    page.evaluate("fixture.hold=true;wall.show(cameras(10))")
+    assert page.evaluate("fixture.pending.length") == 9
+    page.evaluate("wall.update(cameras(1))")
+    assert page.evaluate("fixture.calls.slice(1).every(call => call.signal.aborted)")
+    page.evaluate("fixture.pending.splice(0).forEach(resolve => resolve())")
+    page.wait_for_function("fixture.players.length===1")
+    page.evaluate("""() => {
+      fixture.hold=false;
+      fixture.session={token:'replacement-generated-session',epoch:2};
+      wall.update(cameras(10));
+    }""")
+    page.wait_for_function("fixture.players.length===10")
+    assert page.evaluate("fixture.players[0].destroyed")
+    assert page.locator(".camera-wall-tile").count() == 9
+    page.evaluate(
+        "fixture.session={token:'',epoch:3};wall.update(cameras(64)); "
+        "fixture.players.forEach(player => player.emit('error',"
+        "{fatal:true,response:{code:401}}))"
+    )
+    assert page.locator("#wall-panel").is_hidden()
+    assert page.locator(".camera-wall-tile").count() == 0
+    assert page.evaluate("fixture.players.every(player => player.destroyed)")
+    assert page.evaluate("fixture.calls.every(call => call.signal.aborted)")
+    assert page.evaluate("fixture.calls.length") == 18
+    assert page.evaluate("fixture.peakPlayers") == 9
 
 
 def test_media_cookie_refresh_is_once_per_tile_generation_and_other_player_survives(wall_page):
@@ -277,3 +431,13 @@ def test_unchanged_camera_poll_keeps_actual_fullscreen_tile_mounted(wall_page):
     assert result == {"moved": False, "fullscreen": True, "connected": True}
     assert tile.locator(".camera-wall-name").inner_text() == "Updated camera name"
     assert page.evaluate("fixture.players.length") == 4
+    resized = page.evaluate("""async () => {
+      const original=document.fullscreenElement;
+      for (const count of [1,2,5,4]) wall.update(cameras(count));
+      await new Promise(requestAnimationFrame);
+      await new Promise(requestAnimationFrame);
+      return {fullscreen:document.fullscreenElement===original,connected:original.isConnected,
+        sameTile:original===document.querySelector('[data-camera-id="camera-0"]')};
+    }""")
+    assert resized == {"fullscreen": True, "connected": True, "sameTile": True}
+    assert page.evaluate("fixture.calls.filter(call => call.id==='camera-0').length") == 1

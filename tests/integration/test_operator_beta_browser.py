@@ -506,7 +506,7 @@ def _wall_state(page):
                 available:true,viewport:{width:innerWidth,height:innerHeight},
                 scroll:{window:scrollY,main:document.querySelector('.main-content')?.scrollTop??null},
                 panel_visible:visible(document.getElementById('wall-panel')),
-                layout:['1','4','9'].includes(layout)?layout:'unknown',
+                layout:['auto','1','4','9'].includes(layout)?layout:'unknown',
                 visible_warning_count:Array.from(document.querySelectorAll('.warning,[role=alert]'))
                   .filter(visible).length,
                 clock_warning_visible:visible(document.getElementById('recorder-time-warning')),
