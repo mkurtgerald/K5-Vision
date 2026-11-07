@@ -947,18 +947,34 @@ class OperatorEventService:
                 # source identity. This distinguishes decode from CPU inference.
                 worker = getattr(self._sampler, "_worker", None)
                 child_phase = getattr(worker, "_failure_phase", None)
-                if child_phase in {
-                    "native_decoder_active",
-                    "native_model_active",
-                    "native_inference_active",
-                }:
-                    candidate = child_phase
+                # These are finite *in-flight* stages, not native error
+                # details. A child that has not yet emitted its first phase
+                # must be distinguishable from decoding/model/inference stalls
+                # on installed Windows. The parent still owns the same timer.
+                in_flight = {
+                    "native_launch_failed": "native_worker_starting",
+                    "native_write_failed": "native_request_writing",
+                    "native_reply_missing": "native_reply_waiting",
+                    "native_header_invalid": "native_header_reading",
+                    "native_payload_incomplete": "native_payload_reading",
+                    "native_reply_invalid": "native_reply_validating",
+                    "native_decoder_active": "native_decoder_active",
+                    "native_model_active": "native_model_active",
+                    "native_inference_active": "native_inference_active",
+                }
+                candidate = in_flight.get(child_phase, "native_request")
             if candidate in {
                 "queued",
                 "source_check",
                 "snapshot_read",
                 "decode_attempt",
                 "native_request",
+                "native_worker_starting",
+                "native_request_writing",
+                "native_reply_waiting",
+                "native_header_reading",
+                "native_payload_reading",
+                "native_reply_validating",
                 "native_decoder_active",
                 "native_model_active",
                 "native_inference_active",
