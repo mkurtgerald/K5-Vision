@@ -631,6 +631,48 @@ def test_diagnostics_projects_only_last_aggregate_storage_sample(
     assert "rtsp://" not in text
 
 
+
+def test_active_recorded_person_inventory_interest_refreshes_private_storage_cache(
+    native, monkeypatch
+):
+    _fast_maintenance(native, monkeypatch)
+    sampled_paths = []
+    scans = []
+    original_prune = _Storage.prune
+
+    def private_inventory(_storage, path):
+        sampled_paths.append(path)
+        return {}
+
+    def tracked_prune(storage):
+        scans.append(native.module.time.monotonic())
+        return original_prune(storage)
+
+    monkeypatch.setattr(_Storage, "recording_files", private_inventory, raising=False)
+    monkeypatch.setattr(_Storage, "prune", tracked_prune)
+    service = native.service
+    source = _source(1)
+
+    async def scenario():
+        try:
+            await service.start((source,))
+            await _until(lambda: len(scans) >= 1)
+            previous = len(scans)
+            request_time = native.module.time.monotonic()
+            assert service.recording_files(source.binding) == {}
+            assert sampled_paths == [source.binding.path_name]
+            # The recorder continues to use its bounded cache, but a recent
+            # analytics consumer must see the next retention scan before the
+            # idle 15-second cadence, without walking the directory itself.
+            await _until(lambda: len(scans) > previous)
+            assert 0 <= scans[previous] - request_time <= 10
+            assert service.status() == "ready"
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
 def test_maintenance_observes_clock_steps_without_pausing_recording(native, monkeypatch):
     _fast_maintenance(native, monkeypatch)
     samples = SimpleNamespace(count=0, monotonic=0.0)
