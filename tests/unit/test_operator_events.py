@@ -707,6 +707,44 @@ def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch
             sampler.capture(source)
 
 
+def test_native_worker_reaps_pre_response_broken_pipe_then_retries_once(
+    monkeypatch, tmp_path
+):
+    import k5vision.operator_events as module
+
+    class BrokenInput(io.BytesIO):
+        def write(self, _payload):
+            raise BrokenPipeError
+
+    class Child:
+        def __init__(self, broken):
+            self.broken = broken
+            self.stdin = BrokenInput() if broken else io.BytesIO()
+            self.stdout = io.BytesIO(b'{"status":"empty"}\\n')
+            self.killed = False
+
+        def poll(self):
+            return 1 if self.broken or self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=2):
+            return 1 if self.broken or self.killed else 0
+
+    first, replacement = Child(True), Child(False)
+    births = iter((first, replacement))
+    worker = module._RecordedNativeWorker(None)
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", next(births)))
+    try:
+        assert worker.request(tmp_path / "private-snapshot.mp4") is None
+        assert first.stdin.closed and first.stdout.closed
+        assert replacement.stdin.getvalue().endswith(b"\n")
+        assert worker._process is replacement
+    finally:
+        worker.close()
+
+
 @pytest.mark.parametrize(
     "reply,write_fails,expected",
     [
