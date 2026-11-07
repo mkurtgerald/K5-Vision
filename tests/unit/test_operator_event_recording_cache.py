@@ -79,7 +79,7 @@ def test_large_cached_history_still_samples_fresh_growth_between_storage_scans(
         if Path(path) == directory:
             directory_scans += 1
             if directory_scans > permitted_scans:
-                raise AssertionError("Recorded-frame polling rescanned an unchanged directory")
+                raise AssertionError("Repeated scan of unchanged recording directory")
         return original(path)
 
     # A single name-only cold scan is required to exclude retained segments
