@@ -199,16 +199,26 @@ def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monke
     from k5vision import operator_analytics_person as person
 
     initialized = []
+    warmed = []
+
+    class Detector:
+        def infer(self, pixels, width, height, stride, elapsed):
+            assert type(pixels) is bytes and len(pixels) == 544 * 320 * 4
+            assert not any(pixels)
+            assert (width, height, stride, elapsed) == (544, 320, 544 * 4, 0)
+            warmed.append(True)
+            return (object(),)
+
     monkeypatch.setattr(person, "OperatorPersonConfiguration", lambda root: root)
     monkeypatch.setattr(
-        person, "_PersonDetector", lambda config: initialized.append(config) or object()
+        person, "_PersonDetector", lambda config: initialized.append(config) or Detector()
     )
     request = json.dumps({"path": "", "artifact_root": "private-model"}).encode()
     output = io.BytesIO()
     monkeypatch.setattr(decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n")))
     monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
     assert decoder.main() == 0
-    assert len(initialized) == 1
+    assert len(initialized) == 1 and warmed == [True]
     assert output.getvalue() == b'{"status":"primed"}\n'
 
 

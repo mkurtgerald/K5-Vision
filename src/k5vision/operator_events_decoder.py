@@ -122,6 +122,12 @@ def main() -> int:
                     artifact_root = request["artifact_root"]
                     phase = "model"
                     detector = _PersonDetector(OperatorPersonConfiguration(Path(artifact_root)))
+                # CPU kernels may finish JIT initialization only on their
+                # first inference. Exercise that boundary with synthetic zero
+                # pixels before the recording sampler enters the 25s event gate.
+                # Never emit the synthetic result as a real person event.
+                phase = "inference"
+                detector.infer(bytes(544 * 320 * 4), 544, 320, 544 * 4, 0)
                 phase = "protocol"
                 sys.stdout.buffer.write(b'{"status":"primed"}\n')
                 sys.stdout.buffer.flush()
