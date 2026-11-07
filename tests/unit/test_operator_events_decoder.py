@@ -232,7 +232,12 @@ def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monke
     monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
     assert decoder.main() == 0
     assert len(initialized) == 1 and warmed == [True]
-    assert output.getvalue() == b'{"status":"primed"}\n'
+    assert output.getvalue() == (
+        b'{"status":"phase","phase":"model"}\n'
+        b'{"status":"phase","phase":"inference"}\n'
+        b'{"status":"primed"}\n'
+    )
+    assert b"private-model" not in output.getvalue()
 
 
 def test_person_model_prime_cannot_run_without_an_admitted_configuration(monkeypatch):
@@ -242,3 +247,24 @@ def test_person_model_prime_cannot_run_without_an_admitted_configuration(monkeyp
     monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
     assert decoder.main() == 1
     assert output.getvalue() == b""
+
+
+def test_model_prime_failure_reports_finite_stage_without_native_details(monkeypatch):
+    from k5vision import operator_analytics_person as person
+
+    def broken_model(_config):
+        raise RuntimeError("rtsp://private-source-with-credentials")
+
+    monkeypatch.setattr(person, "OperatorPersonConfiguration", lambda root: root)
+    monkeypatch.setattr(person, "_PersonDetector", broken_model)
+    request = json.dumps({"path": "", "artifact_root": "private-model"}).encode()
+    output = io.BytesIO()
+    monkeypatch.setattr(decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n")))
+    monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
+    assert decoder.main() == 1
+    assert output.getvalue() == (
+        b'{"status":"phase","phase":"model"}\n'
+        b'{"status": "failed", "phase": "model"}\n'
+    )
+    assert b"private-model" not in output.getvalue()
+    assert b"private-source" not in output.getvalue()
