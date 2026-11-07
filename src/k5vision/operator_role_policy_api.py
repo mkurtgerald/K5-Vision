@@ -130,6 +130,8 @@ def request_permission(path: str, method: str):
                 return "recording.manage"
             if operation == "time":
                 return "time.manage"
+            if operation == "video-settings":
+                return "cameras.manage"
             if operation == "analytics" and method not in {"GET", "HEAD"}:
                 return "analytics.manage"
         if method not in {"GET", "HEAD"} and (len(parts) == 1 or parts[-1] != "media-session"):

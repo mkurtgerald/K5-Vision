@@ -303,6 +303,9 @@ def test_timeout_keeps_worker_slot_until_real_read_completes() -> None:
         # completion before asserting the capacity slot is reusable on Windows.
         await asyncio.wait_for(asyncio.shield(pending[0]), timeout=2)
         assert not provider._requests
+        # The 20ms deadline above forces a timeout; it is not a Windows thread
+        # scheduling guarantee for the subsequent healthy capacity-reuse check.
+        provider._timeout_seconds = 1
         assert (await provider.info()).version == MEDIAMTX_VERSION
 
     asyncio.run(scenario())

@@ -85,7 +85,7 @@
           </details>
           <div class="view-heading">
             <div><p class="eyebrow">SURVEILLANCE WORKSPACE</p><h1 id="camera-title">All cameras</h1><p id="camera-subtitle" class="muted">Live cameras, recording activity and your recorded video.</p></div>
-            <div class="camera-indicators"><span id="connection-badge" class="status-badge" hidden></span><span id="recording-badge" class="recording-badge" hidden>Checking recording</span><button id="toggle-recording" class="button secondary" type="button" hidden>Pause recording</button><button id="recent-recordings" class="button secondary" type="button" hidden>Latest recording</button><button id="update-source-button" class="button quiet" type="button" hidden>Reconnect camera</button><button id="remove-camera-button" class="button quiet danger" type="button" hidden>Remove camera</button></div>
+            <div class="camera-indicators"><span id="connection-badge" class="status-badge" hidden></span><span id="recording-badge" class="recording-badge" hidden>Checking recording</span><button id="toggle-recording" class="button secondary" type="button" hidden>Pause recording</button><button id="recent-recordings" class="button secondary" type="button" hidden>Latest recording</button><button id="camera-video-button" class="button quiet" type="button" hidden>Camera settings</button><button id="update-source-button" class="button quiet" type="button" hidden>Reconnect camera</button><button id="remove-camera-button" class="button quiet danger" type="button" hidden>Remove camera</button></div>
           </div>
           <p id="recording-state-detail" class="field-help" role="status" aria-live="polite" hidden></p>
           <div class="system-status" aria-label="Service and recording storage"><div><span id="service-status" role="status" aria-live="polite">Checking media service…</span><span id="storage-status" class="muted">Checking recording storage…</span></div><button id="connection-help-button" class="button quiet" type="button">Connection help</button></div>
@@ -122,8 +122,8 @@
               <div class="day-picker"><label for="history-day">Jump to day</label><input id="history-day" type="date"><button id="history-15-minutes" class="button secondary" type="button">15 min</button><button id="history-last-hour" class="button secondary" type="button">1 hour</button><button id="last-24-hours" class="button secondary" type="button">24 hours</button></div>
             </div>
             <form id="history-form" class="interval-form">
-              <div><label for="history-start">From · UTC</label><input id="history-start" type="datetime-local" step="1" required></div>
-              <div><label for="history-end">To · UTC</label><input id="history-end" type="datetime-local" step="1" required></div>
+              <div><label for="history-start">From · UTC</label><input id="history-start" type="datetime-local" step="0.001" required></div>
+              <div><label for="history-end">To · UTC</label><input id="history-end" type="datetime-local" step="0.001" required></div>
               <button id="load-history" class="button primary" type="submit">Show history</button>
             </form>
             <p id="history-message" class="form-message" role="status" aria-live="polite"></p>
@@ -248,6 +248,37 @@
         </div>
         <p id="add-camera-message" class="form-message" role="status" aria-live="polite"></p>
         <div class="dialog-actions"><button id="cancel-add-camera" class="button secondary" type="button">Cancel</button><button id="save-camera" class="button primary" type="submit" disabled>Connect camera</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="camera-video-dialog" aria-labelledby="camera-video-title" aria-describedby="camera-video-description">
+      <form id="camera-video-form" autocomplete="off">
+        <div class="dialog-heading"><div><p class="eyebrow">CAMERA SETTINGS</p><h2 id="camera-video-title">Video settings</h2></div><button id="camera-video-close" class="icon-button" type="button" aria-label="Close video settings">×</button></div>
+        <p id="camera-video-target" class="muted"></p>
+        <p id="camera-video-description" class="field-help">Read the enrolled camera’s ONVIF encoder settings. Applying changes can interrupt live video and new recording. Retained recordings remain available.</p>
+        <p id="camera-video-message" class="form-message" role="status" aria-live="polite"></p>
+        <p id="camera-video-verification" class="field-help"></p>
+        <label class="camera-video-check"><input id="camera-video-use-account" type="checkbox">Use a different camera management account</label>
+        <div id="camera-video-account" hidden>
+          <div class="camera-credentials-row"><div><label for="camera-video-username">Management username</label><input id="camera-video-username" maxlength="256" autocomplete="off"></div><div><label for="camera-video-password">Management password</label><input id="camera-video-password" type="password" maxlength="256" autocomplete="new-password"></div></div>
+          <p class="field-help">Used for this read and its one-time change authorization. Both fields are cleared immediately after reading. Leave both blank only for an anonymous camera account.</p>
+          <button id="camera-video-read" class="button secondary" type="button">Read with this account</button>
+        </div>
+        <fieldset id="camera-video-values" class="camera-video-values" disabled>
+          <legend>Camera-reported encoder settings</legend>
+          <div class="camera-video-grid">
+            <div id="video-codec-field"><label for="video-codec">Video codec</label><select id="video-codec" data-video-field="codec"></select><p id="video-codec-help" class="field-help"></p></div>
+            <div id="video-resolution-field"><label for="video-resolution">Resolution</label><select id="video-resolution" data-video-field="resolution"></select><p id="video-resolution-help" class="field-help"></p></div>
+            <div id="video-frame-rate-field"><label for="video-frame-rate">Frame rate (fps)</label><input id="video-frame-rate" type="number" data-video-field="frame_rate"><p id="video-frame-rate-help" class="field-help"></p></div>
+            <div id="video-bitrate-kbps-field"><label for="video-bitrate-kbps">Bitrate limit (kbps)</label><input id="video-bitrate-kbps" type="number" data-video-field="bitrate_kbps"><p id="video-bitrate-kbps-help" class="field-help"></p></div>
+            <div id="video-gop-field"><label for="video-gop">Keyframe interval (frames)</label><input id="video-gop" type="number" data-video-field="gop"><p id="video-gop-help" class="field-help"></p></div>
+            <div id="video-quality-field"><label for="video-quality">Quality</label><input id="video-quality" type="number" data-video-field="quality"><p id="video-quality-help" class="field-help"></p></div>
+            <div id="video-encoding-interval-field"><label for="video-encoding-interval">Encoding interval</label><input id="video-encoding-interval" type="number" data-video-field="encoding_interval"><p id="video-encoding-interval-help" class="field-help"></p></div>
+          </div>
+        </fieldset>
+        <div id="camera-video-shared" class="notice warning" hidden><p id="camera-video-shared-notice"></p><label class="camera-video-check"><input id="video-shared-ack" type="checkbox">I understand this changes the shared encoder configuration.</label></div>
+        <p class="field-help">Refresh discards unsaved edits and reads current settings using the saved connection account. Every apply attempt consumes its authorization; read fresh settings before another change.</p>
+        <div class="dialog-actions"><button id="camera-video-cancel" class="button secondary" type="button">Cancel</button><button id="camera-video-refresh" class="button secondary" type="button">Refresh</button><button id="camera-video-apply" class="button primary" type="submit" disabled>Apply video settings</button></div>
       </form>
     </dialog>
 

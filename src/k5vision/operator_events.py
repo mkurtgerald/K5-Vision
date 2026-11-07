@@ -502,6 +502,7 @@ class RecordedFrameSampler:
         self._observations: dict[UUID, dict[str, tuple[int, int, int]]] = {}
         self._recording_files = recording_files
         self._active_files: dict[UUID, tuple[str, ...]] = {}
+        self._directory_versions: dict[UUID, tuple[int, int, int, int]] = {}
         self._closing = threading.Event()
         self._worker_lock = threading.RLock()
 
@@ -517,6 +518,18 @@ class RecordedFrameSampler:
             for identifier, value in self._active_files.items()
             if identifier in active
         }
+
+        self._directory_versions = {
+            identifier: value
+            for identifier, value in self._directory_versions.items()
+            if identifier in active
+        }
+
+    @staticmethod
+    def _directory_version(info) -> tuple[int, int, int, int]:
+        # Metadata only invalidates a filename inventory. It never orders media
+        # or supplies an event timestamp; changes in either direction invalidate.
+        return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns
 
     @staticmethod
     def _started(name: str) -> datetime:
@@ -540,6 +553,7 @@ class RecordedFrameSampler:
             raise OperatorEventsError("Analytics recording source refused")
         identity_state._windows_admission(directory, private=True, directory=True)
         previous = self._observations.get(source.binding.device_id)
+        directory_version = self._directory_version(directory_info)
         current = {}
         changed = []
         if self._recording_files is not None:
@@ -577,8 +591,36 @@ class RecordedFrameSampler:
                 # bytes become events until new byte growth is actually observed.
                 hints = sorted(inventory, key=lambda name: inventory[name][5], reverse=True)[:2]
                 self._active_files[source.binding.device_id] = tuple(hints)
+                identity_state._same_directory(directory, directory_info)
+                self._directory_versions[source.binding.device_id] = directory_version
                 self._observations[source.binding.device_id] = current
                 return None
+            if self._directory_versions.get(source.binding.device_id) != directory_version:
+                # The storage cache can predate a reconnect or segment rollover.
+                # Discover new names only after directory metadata changes; a
+                # normal cached poll still stats at most four active candidates.
+                deadline = time.monotonic() + 3
+                with os.scandir(directory) as entries:
+                    for index, entry in enumerate(entries):
+                        if index >= MAX_RECORDING_ENTRIES or time.monotonic() >= deadline:
+                            raise OperatorEventsError("Analytics recording scan limit reached")
+                        if (
+                            _SEGMENT_NAME.fullmatch(entry.name) is None
+                            or entry.name in previous
+                            or entry.name in current
+                        ):
+                            continue
+                        if entry.name not in current and len(current) >= MAX_RECORDING_ENTRIES:
+                            raise OperatorEventsError("Analytics recording scan limit reached")
+                        info = identity_state._regular_file(directory / entry.name)
+                        current[entry.name] = info.st_dev, info.st_ino, info.st_size
+                        candidates.append(entry.name)
+                identity_state._same_directory(directory, directory_info)
+                if time.monotonic() >= deadline:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
+                # Retain the BEFORE-scan version: a new name arriving during
+                # enumeration must invalidate and be discovered on the next poll.
+                self._directory_versions[source.binding.device_id] = directory_version
             candidates.sort(key=lambda name: (name in previous, -current[name][2]))
             candidates = list(
                 dict.fromkeys(
@@ -595,6 +637,8 @@ class RecordedFrameSampler:
                 signature = info.st_dev, info.st_ino, info.st_size
                 if signature != previous.get(name):
                     changed.append((path, info))
+                if name not in current and len(current) >= MAX_RECORDING_ENTRIES:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
                 current[name] = signature
         else:
             # Source-only integrations may have no recorder cache. Their fallback

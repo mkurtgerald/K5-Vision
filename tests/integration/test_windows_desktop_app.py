@@ -10,7 +10,9 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import importlib.util
+import itertools
 import json
+import math
 import os
 import platform
 import secrets
@@ -1512,6 +1514,489 @@ def _installed_person_fixture(parent, ffmpeg):
     return video
 
 
+_NATIVE_FAILURE_WORKERS = {"ready", "unavailable", "disk_full"}
+_NATIVE_FAILURE_CAMERAS = {"live", "connecting", "disconnected", "unavailable"}
+_NATIVE_FAILURE_RECORDINGS = {"waiting", "recording", "paused", "stalled", "error"}
+_NATIVE_FAILURE_REASONS = {
+    "worker_unavailable",
+    "operator_paused",
+    "storage_paused",
+    "camera_unavailable",
+    "configuration_mismatch",
+    "storage_inspection",
+    "disk_progress",
+    "no_disk_progress",
+    "awaiting_disk_progress",
+}
+
+
+def _native_failure_count(value):
+    return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+
+def _native_failure_signed_seconds(value, *, limit=86400):
+    if type(value) not in (int, float):
+        return None
+    try:
+        return round(min(limit, max(-limit, value)), 3) if math.isfinite(value) else None
+    except OverflowError:
+        return None
+
+
+def _native_failure_seconds(value):
+    if type(value) not in (int, float):
+        return None
+    try:
+        return round(min(86400, max(0, value)), 3) if math.isfinite(value) else None
+    except OverflowError:
+        return None
+
+
+def _native_failure_enum(value, allowed):
+    return value if type(value) is str and value in allowed else "unknown"
+
+
+def _native_clock_response_note(response):
+    value = response.status
+    note = {"status": value if type(value) is int and 100 <= value <= 599 else None}
+    try:
+        header = response.headers.get("content-type", "")
+        mime = header.split(";", 1)[0].strip().lower() if type(header) is str else ""
+        note["content_type"] = {
+            "": "missing",
+            "text/plain": "text_plain",
+            "application/json": "application_json",
+            "text/html": "text_html",
+        }.get(mime, "other")
+        body = response.body()
+        if type(body) is not bytes:
+            raise ValueError("body admission")
+        note["body_bytes"] = min(2**32 - 1, len(body))
+        note["body_class"] = (
+            "media_access_denied"
+            if body == b"Media access denied"
+            else "empty"
+            if not body
+            else "other"
+        )
+    except BaseException:
+        note["body_probe_failed"] = True
+    return note
+
+
+def _native_failure_public_json(client, route, label, result):
+    status, body, _ = client.get(route, max_bytes=32768)
+    result[label + "_http_status"] = (
+        status if type(status) is int and 100 <= status <= 599 else None
+    )
+    if type(body) is not bytes or len(body) > 32768:
+        raise ValueError("public response admission")
+    value = json.loads(body)
+    if status != 200:
+        detail = value.get("detail") if type(value) is dict else None
+        if type(detail) is dict:
+            detail = detail.get("code")
+        codes = {
+            "Operator identity unavailable": "identity_unavailable",
+            "Camera state unavailable": "camera_state_unavailable",
+            "roles_unavailable": "roles_unavailable",
+            "Media unavailable": "media_unavailable",
+        }
+        result[label + "_error_code"] = (
+            codes.get(detail, "other") if type(detail) is str else "other"
+        )
+        raise ValueError("public status admission")
+    return value
+
+
+def _native_clock_post_snapshot(client, camera_id, cohort, *, received_at=None):
+    """These are later observations, not an atomic snapshot of the failed response."""
+    result = {"timing": "post_response"}
+    began = time.monotonic() if received_at is None else received_at
+
+    def elapsed_ms():
+        return min(90000, max(0, round((time.monotonic() - began) * 1000)))
+
+    transport_failure = getattr(client, "transport_failure", None)
+    try:
+        with cohort.lock:
+            owned = tuple(itertools.islice(cohort.processes.values(), 64))
+            truncated = len(cohort.processes) > len(owned)
+        result["owned_identity_sample_count"] = len(owned)
+        result["owned_identity_sample_truncated"] = truncated
+        names = {
+            "k5vision.exe": "desktop",
+            "python.exe": "python",
+            "pythonw.exe": "python",
+            "mediamtx.exe": "mediamtx",
+            "caddy.exe": "caddy",
+        }
+        counts = dict.fromkeys(["desktop", "python", "mediamtx", "caddy", "other"], 0)
+        failed = not_running = 0
+        for process in owned:
+            try:
+                if process.is_running():
+                    counts[names.get(process.name().casefold(), "other")] += 1
+                else:
+                    not_running += 1
+            except BaseException:
+                failed += 1
+        result["owned_process_counts"] = counts
+        result["owned_identity_inspection_failed_count"] = failed
+        result["owned_identity_not_running_count"] = not_running
+    except BaseException:
+        result["cohort_probe_failed"] = True
+    result["owned_process_observed_after_response_ms"] = elapsed_ms()
+    try:
+        try:
+            status = _native_failure_public_json(
+                client, "/api/v1/operator/status", "status", result
+            )
+            if type(status) is not dict:
+                raise ValueError("status admission")
+            storage = status.get("storage")
+            clock = status.get("clock")
+            result["worker_status"] = _native_failure_enum(
+                status.get("worker_status"), _NATIVE_FAILURE_WORKERS
+            )
+            if type(storage) is dict:
+                result["storage"] = {
+                    "reason": _native_failure_enum(
+                        storage.get("reason"), {"ready", "free_space", "capacity", "inspection"}
+                    ),
+                    "recording_allowed": storage.get("recording_allowed") is True,
+                    "recording_bytes": _native_failure_count(storage.get("recording_bytes")),
+                }
+            if type(clock) is dict:
+                result["clock"] = {
+                    "status": _native_failure_enum(
+                        clock.get("status"), {"observing", "changed", "unavailable"}
+                    ),
+                    "change_count": _native_failure_count(clock.get("change_count")),
+                }
+        except BaseException:
+            result["status_probe_failed"] = True
+        result["status_observed_after_response_ms"] = elapsed_ms()
+        try:
+            response = _native_failure_public_json(
+                client, "/api/v1/operator/cameras", "cameras", result
+            )
+            cameras = response.get("cameras") if type(response) is dict else None
+            if type(cameras) is not list or len(cameras) > 64:
+                raise ValueError("camera admission")
+            states = {key: 0 for key in sorted(_NATIVE_FAILURE_CAMERAS | {"unknown"})}
+            for camera in cameras:
+                if type(camera) is dict:
+                    states[_native_failure_enum(camera.get("status"), _NATIVE_FAILURE_CAMERAS)] += 1
+            result["camera_status_counts"] = states
+            target = next(
+                (
+                    item
+                    for item in cameras
+                    if type(item) is dict and item.get("device_id") == camera_id
+                ),
+                None,
+            )
+            if target is not None:
+                recording = target.get("recording_status")
+                result["target"] = {
+                    "status": _native_failure_enum(target.get("status"), _NATIVE_FAILURE_CAMERAS),
+                    "recording": target.get("recording") is True,
+                    "recording_enabled": target.get("recording_enabled") is True,
+                    "recording_state": _native_failure_enum(
+                        target.get("recording_state"), _NATIVE_FAILURE_RECORDINGS
+                    ),
+                }
+                if type(recording) is dict:
+                    result["target"].update(
+                        reason=_native_failure_enum(
+                            recording.get("reason"), _NATIVE_FAILURE_REASONS
+                        ),
+                        observed_bytes=_native_failure_count(recording.get("observed_bytes")),
+                        last_progress_age_seconds=_native_failure_seconds(
+                            recording.get("last_progress_age_seconds")
+                        ),
+                    )
+        except BaseException:
+            result["camera_probe_failed"] = True
+        result["cameras_observed_after_response_ms"] = elapsed_ms()
+    finally:
+        client.transport_failure = transport_failure
+    return result
+
+
+def _native_failure_frames(error):
+    source_root = Path(__file__).resolve().parents[2]
+    locations = {
+        (source_root / "tests/integration/test_windows_desktop_app.py").resolve(): (
+            "desktop",
+            {
+                "_installed_analytics_journey",
+                "_installed_person_fixture",
+                "_wait",
+                "_vm_clock_phase",
+                "test_native_windows_click_install_account_browser_tray_restart_uninstall",
+                "_closed_hashes",
+                "_recorded_segment_frames",
+                "_desktop_nvr_journey",
+            },
+        ),
+        (source_root / "tests/integration/test_operator_beta_browser.py").resolve(): (
+            "browser",
+            {
+                "_open_camera_recordings",
+                "_open_camera_watch",
+                "_decoded_color",
+                "_decoded_video",
+                "_decoded_video_proof",
+            },
+        ),
+    }
+    frames = []
+    current = error.__traceback__
+    while current is not None:
+        code = current.tb_frame.f_code
+        location = locations.get(Path(code.co_filename).resolve())
+        if location is not None and code.co_name in location[1]:
+            frames.append(
+                {
+                    "file": location[0],
+                    "function": code.co_name,
+                    "line": min(10000, max(1, current.tb_lineno)),
+                }
+            )
+            frames = frames[-4:]
+        current = current.tb_next
+    return frames
+
+
+def _native_failure_ui(page, *, occurred=None):
+    event_ms = event_age = None
+    if isinstance(occurred, datetime) and occurred.tzinfo is not None:
+        try:
+            if occurred.utcoffset() is not None:
+                candidate = occurred.timestamp() * 1000
+                if math.isfinite(candidate):
+                    event_ms = candidate
+                    event_age = _native_failure_signed_seconds(
+                        (datetime.now(UTC) - occurred).total_seconds()
+                    )
+        except (ValueError, OverflowError, OSError):
+            pass
+    raw = page.wait_for_function(
+        """eventEpochMs => {
+      const visible = id => {
+        const node = document.getElementById(id);
+        return Boolean(node && !node.hidden && node.getClientRects().length);
+      };
+      const result = {
+        history_visible: visible('history-panel'), live_visible: visible('live-panel'),
+        wall_visible: visible('wall-panel'),
+        event_button_count:
+          document.querySelectorAll('#analytics-events button[data-event-id]').length,
+        history_item_count: document.querySelectorAll('.history-item').length
+      };
+      for (const name of ['playback', 'live']) {
+        const video = document.getElementById(name + '-video');
+        result[name + '_present'] = Boolean(video);
+        if (!video) continue;
+        result[name + '_ready_state'] = video.readyState;
+        result[name + '_paused'] = video.paused;
+        result[name + '_time_seconds'] = Number.isFinite(video.currentTime)
+          ? video.currentTime : null;
+        result[name + '_duration_seconds'] = Number.isFinite(video.duration)
+          ? video.duration : null;
+        result[name + '_width'] = video.videoWidth;
+        result[name + '_height'] = video.videoHeight;
+        result[name + '_decoded_frames'] = video.getVideoPlaybackQuality().totalVideoFrames;
+        result[name + '_error_code'] = video.error ? video.error.code : null;
+        result[name + '_has_source'] = Boolean(video.getAttribute('src') || video.currentSrc);
+      }
+      const historyStart = document.getElementById('history-start');
+      const parsedStart = historyStart ? Date.parse(historyStart.value + 'Z') : NaN;
+      const historyEnd = document.getElementById('history-end');
+      const parsedEnd = historyEnd ? Date.parse(historyEnd.value + 'Z') : NaN;
+      result.history_end_age_seconds = Number.isFinite(parsedEnd)
+        ? (Date.now() - parsedEnd) / 1000 : null;
+      const validRange = Number.isFinite(parsedStart) && Number.isFinite(parsedEnd)
+        && parsedEnd > parsedStart && parsedEnd - parsedStart <= 86400000;
+      const validEvent = typeof eventEpochMs === 'number' && Number.isFinite(eventEpochMs);
+      result.event_within_displayed_range = validRange && validEvent
+        ? parsedStart <= eventEpochMs && eventEpochMs < parsedEnd : null;
+      result.history_end_minus_event_ms = validRange && validEvent
+        ? parsedEnd - eventEpochMs : null;
+      const playback = document.getElementById('playback-video');
+      result.playback_utc_start_present = Boolean(playback && playback.dataset.utcStart);
+      return result;
+    }""",
+        arg=event_ms,
+        timeout=2000,
+    ).json_value()
+    if type(raw) is not dict:
+        return {"available": False}
+    result = {"available": True, "event_age_seconds": event_age}
+    within = raw.get("event_within_displayed_range")
+    result["event_within_displayed_range"] = within if type(within) is bool else None
+    result["history_end_minus_event_ms"] = _native_failure_signed_seconds(
+        raw.get("history_end_minus_event_ms"), limit=86400000
+    )
+    age = raw.get("history_end_age_seconds")
+    try:
+        result["history_end_age_seconds"] = (
+            round(min(86400, max(-86400, age)), 3)
+            if type(age) in (int, float) and math.isfinite(age)
+            else None
+        )
+    except OverflowError:
+        result["history_end_age_seconds"] = None
+    bools = {"history_visible", "live_visible", "wall_visible", "playback_utc_start_present"}
+    bools.update(
+        name + suffix
+        for name in ("playback", "live")
+        for suffix in ("_present", "_paused", "_has_source")
+    )
+    for key in bools:
+        result[key] = raw.get(key) if type(raw.get(key)) is bool else None
+    for key in ("event_button_count", "history_item_count"):
+        value = raw.get(key)
+        result[key] = value if type(value) is int and 0 <= value <= 256 else None
+    for name in ("playback", "live"):
+        for suffix, maximum in (
+            ("_ready_state", 4),
+            ("_error_code", 4),
+            ("_width", 16384),
+            ("_height", 16384),
+            ("_decoded_frames", 2**32 - 1),
+        ):
+            key, value = name + suffix, raw.get(name + suffix)
+            result[key] = value if type(value) is int and 0 <= value <= maximum else None
+        for suffix in ("_time_seconds", "_duration_seconds"):
+            result[name + suffix] = _native_failure_seconds(raw.get(name + suffix))
+    return result
+
+
+def _native_clock_failure_snapshot(response, *, client, camera_id, cohort):
+    began = time.monotonic()
+    result = _native_clock_response_note(response)
+    result["post_response"] = _native_clock_post_snapshot(
+        client, camera_id, cohort, received_at=began
+    )
+    result["post_response"]["elapsed_after_response_ms"] = min(
+        90000, max(0, round((time.monotonic() - began) * 1000))
+    )
+    return result
+
+
+def _installed_analytics_failure_snapshot(*, client, camera_id, publishers, cohort, diagnostic):
+    """Failure-only public state; never include IDs, paths, addresses or error text."""
+
+    def count(value):
+        return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+    def seconds(value, minimum=0):
+        if type(value) not in (int, float) or not math.isfinite(value):
+            return None
+        return round(min(86400, max(minimum, value)), 3)
+
+    def timestamp_age(value):
+        if type(value) is not str:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return None
+            return seconds((datetime.now(UTC) - parsed).total_seconds(), -86400)
+        except (ValueError, OverflowError):
+            return None
+
+    snapshot = {}
+    diagnostic["analytics_failure_snapshot"] = snapshot
+    transport_failure = getattr(client, "transport_failure", None)
+    try:
+        status = client.json(f"/api/v1/operator/cameras/{camera_id}/analytics")
+        if type(status) is not dict:
+            raise ValueError
+        allowed = {"disabled", "unavailable", "starting", "waiting", "active"}
+        snapshot["analytics"] = {
+            "status": status.get("status") if status.get("status") in allowed else "unknown",
+            "processed_frames": count(status.get("processed_frames")),
+            "event_count": count(status.get("event_count")),
+            "last_sample_age_seconds": timestamp_age(status.get("last_sample_at")),
+            "last_event_age_seconds": timestamp_age(status.get("last_event_at")),
+        }
+    except BaseException:
+        snapshot["analytics_probe_failed"] = True
+    try:
+        response = client.json("/api/v1/operator/cameras")
+        cameras = response.get("cameras") if type(response) is dict else None
+        if type(cameras) is not list or len(cameras) > 64:
+            raise ValueError
+        camera = next(
+            (item for item in cameras if type(item) is dict and item.get("device_id") == camera_id),
+            None,
+        )
+        if camera is None:
+            raise ValueError
+        recording = camera.get("recording_status")
+        if type(recording) is not dict:
+            raise ValueError
+        connection_states = {"live", "connecting", "disconnected", "unavailable"}
+        recording_states = {"waiting", "recording", "paused", "stalled", "error"}
+        reasons = {
+            "worker_unavailable",
+            "operator_paused",
+            "storage_paused",
+            "camera_unavailable",
+            "configuration_mismatch",
+            "storage_inspection",
+            "disk_progress",
+            "no_disk_progress",
+            "awaiting_disk_progress",
+        }
+        snapshot["camera"] = {
+            "status": camera.get("status")
+            if camera.get("status") in connection_states
+            else "unknown",
+            "recording": camera.get("recording") is True,
+            "recording_enabled": camera.get("recording_enabled") is True,
+            "recording_state": camera.get("recording_state")
+            if camera.get("recording_state") in recording_states
+            else "unknown",
+            "reason": recording.get("reason") if recording.get("reason") in reasons else "unknown",
+            "observed_bytes": count(recording.get("observed_bytes")),
+            "last_progress_age_seconds": seconds(recording.get("last_progress_age_seconds")),
+        }
+    except BaseException:
+        snapshot["camera_probe_failed"] = True
+    finally:
+        client.transport_failure = transport_failure
+    try:
+        code = publishers[0].poll()
+        snapshot["publisher_running"] = code is None
+        snapshot["publisher_exit_code"] = (
+            code if type(code) is int and -(2**31) <= code <= 2**32 - 1 else None
+        )
+    except BaseException:
+        snapshot["publisher_probe_failed"] = True
+    try:
+        # Reuse the cohort's remembered process/birth identities. Never look up a
+        # possibly recycled PID or discover fresh descendants after the failure.
+        with cohort.lock:
+            owned = tuple(cohort.processes.values())
+        decoder_count = 0
+        for process in owned:
+            try:
+                if not process.is_running():
+                    continue
+                if "k5vision.operator_events_decoder" in process.cmdline():
+                    decoder_count += 1
+            except (psutil.Error, OSError):
+                continue
+        snapshot["decoder_running_count"] = min(32, decoder_count)
+    except BaseException:
+        snapshot["decoder_probe_failed"] = True
+
+
 def _installed_analytics_journey(
     *,
     page,
@@ -1525,6 +2010,7 @@ def _installed_analytics_journey(
     helpers,
     browser_helpers,
     app,
+    cohort,
     publisher_credentials,
     diagnostic,
 ):
@@ -1585,51 +2071,72 @@ def _installed_analytics_journey(
             and 0.5 <= detected["confidence"] <= 1
         )
 
-    _wait(
-        positive_event,
-        "Installed native detector records a real person event",
-        process=app,
-        timeout=25,
-    )
+    try:
+        _wait(
+            positive_event,
+            "Installed native detector records a real person event",
+            process=app,
+            timeout=25,
+        )
+    except BaseException:
+        try:
+            _installed_analytics_failure_snapshot(
+                client=client,
+                camera_id=camera_id,
+                publishers=publishers,
+                cohort=cohort,
+                diagnostic=diagnostic,
+            )
+        except BaseException:
+            diagnostic["analytics_failure_probe_failed"] = True
+        raise
     occurred = datetime.fromisoformat(detected["occurred_at"].replace("Z", "+00:00"))
     _require(
         abs((datetime.now(UTC) - occurred).total_seconds()) < 30,
         "Person event was not mapped to the fresh recording's UTC timestamp",
     )
     diagnostic["analytics_stage"] = "event_recording_navigation"
-    page.locator("#last-24-hours").click()
-    page.locator("#analytics-refresh").click()
-    event_button = page.locator(f'#analytics-events button[data-event-id="{detected["id"]}"]')
-    event_button.wait_for(state="visible", timeout=15_000)
-    event_button.click()
-    expected_ms = (
-        datetime.fromisoformat(detected["playback_at"].replace("Z", "+00:00")).timestamp() * 1000
-    )
-    page.wait_for_function(
-        """chosen => {
+    try:
+        page.locator("#last-24-hours").click()
+        page.locator("#analytics-refresh").click()
+        event_button = page.locator(f'#analytics-events button[data-event-id="{detected["id"]}"]')
+        event_button.wait_for(state="visible", timeout=15_000)
+        event_button.click()
+        expected_ms = (
+            datetime.fromisoformat(detected["playback_at"].replace("Z", "+00:00")).timestamp()
+            * 1000
+        )
+        page.wait_for_function(
+            """chosen => {
           const video=document.getElementById('playback-video');
           return Math.abs(Date.parse(video.dataset.utcStart || '')-chosen)<1000 &&
             video.readyState>=2 && !video.paused &&
             video.getVideoPlaybackQuality().totalVideoFrames>=4;
         }""",
-        arg=expected_ms,
-        timeout=20_000,
-    )
-    event_frames = page.locator("#playback-video").evaluate(
-        "video => video.getVideoPlaybackQuality().totalVideoFrames"
-    )
-    status = client.json(route + "/analytics")
-    _require(
-        status.get("processed_frames", 0) >= 1 and status.get("event_count", 0) >= 1,
-        "Installed detector reported an event without processing recorded frames",
-    )
-    helpers._stop_owned(publishers[0])
-    publishers[0] = _publish_fixture(
-        parent, ffmpeg, source_uri, helpers, credentials=publisher_credentials
-    )
-    processes.append(publishers[0])
-    browser_helpers._open_camera_watch(page, camera_id)
-    browser_helpers._decoded_color(page, "live-video", "red")
+            arg=expected_ms,
+            timeout=20_000,
+        )
+        event_frames = page.locator("#playback-video").evaluate(
+            "video => video.getVideoPlaybackQuality().totalVideoFrames"
+        )
+        status = client.json(route + "/analytics")
+        _require(
+            status.get("processed_frames", 0) >= 1 and status.get("event_count", 0) >= 1,
+            "Installed detector reported an event without processing recorded frames",
+        )
+        helpers._stop_owned(publishers[0])
+        publishers[0] = _publish_fixture(
+            parent, ffmpeg, source_uri, helpers, credentials=publisher_credentials
+        )
+        processes.append(publishers[0])
+        browser_helpers._open_camera_watch(page, camera_id)
+        browser_helpers._decoded_color(page, "live-video", "red")
+    except BaseException:
+        try:
+            diagnostic["analytics_event_failure_ui"] = _native_failure_ui(page, occurred=occurred)
+        except BaseException:
+            diagnostic["analytics_event_ui_probe_failed"] = True
+        raise
     diagnostic["analytics_stage"] = "complete"
     return {
         "product_analytics_enablement": True,
@@ -1738,6 +2245,7 @@ def _vm_clock_phase(
     helpers,
     browser_helpers,
     app,
+    cohort,
     setup_sha256,
     diagnostic,
     publisher,
@@ -1908,8 +2416,16 @@ def _vm_clock_phase(
                     timeout=15,
                 )
                 diagnostic["vm_clock_stage"] = direction + "_live"
-                live_status = context.request.get(live_url, timeout=5000).status
+                live_response = context.request.get(live_url, timeout=5000)
+                live_status = live_response.status
                 diagnostic["vm_clock_media_http_status"] = live_status
+                if live_status != 200:
+                    try:
+                        diagnostic["vm_clock_failure_snapshot"] = _native_clock_failure_snapshot(
+                            live_response, client=client, camera_id=camera_id, cohort=cohort
+                        )
+                    except BaseException:
+                        diagnostic["vm_clock_failure_probe_failed"] = True
                 _require(live_status == 200, "VM clock step expired authenticated live media")
                 _require(
                     page.locator("#workspace").is_visible(),
@@ -2484,6 +3000,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             helpers=helpers,
             browser_helpers=browser_helpers,
             app=app,
+            cohort=cohort,
             publisher_credentials=primary_publisher_credentials,
             diagnostic=nvr_diagnostic,
         )
@@ -2504,6 +3021,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 helpers=helpers,
                 browser_helpers=browser_helpers,
                 app=app,
+                cohort=cohort,
                 setup_sha256=setup_sha256,
                 diagnostic=vm_clock_diagnostic,
                 publisher=publishers[0],
@@ -2882,6 +3400,18 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["uninstall_preserves_profile_and_media"] = True
         receipt["no_console_windows"] = not cohort.console_seen and not cohort.failed
     except BaseException as error:
+        try:
+            nvr_diagnostic["failure_frames"] = _native_failure_frames(error)
+        except BaseException:
+            nvr_diagnostic["failure_frame_probe_failed"] = True
+        if page is not None and not any(
+            key in nvr_diagnostic
+            for key in ("analytics_event_failure_ui", "analytics_event_ui_probe_failed")
+        ):
+            try:
+                nvr_diagnostic["failure_ui"] = _native_failure_ui(page)
+            except BaseException:
+                nvr_diagnostic["failure_ui_probe_failed"] = True
         nvr_diagnostic["failure_type"] = (
             type(error).__name__
             if type(error).__name__
