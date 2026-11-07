@@ -336,6 +336,42 @@ def test_pending_native_capture_reports_finite_stage_without_exposing_source(sto
     asyncio.run(service.aclose())
 
 
+@pytest.mark.parametrize(
+    ("worker_phase", "expected"),
+    [
+        ("native_launch_failed", "native_worker_starting"),
+        ("native_write_failed", "native_request_writing"),
+        ("native_reply_missing", "native_reply_waiting"),
+        ("native_header_invalid", "native_header_reading"),
+        ("native_payload_incomplete", "native_payload_reading"),
+        ("native_reply_invalid", "native_reply_validating"),
+        ("native_decoder_active", "native_decoder_active"),
+        ("native_model_active", "native_model_active"),
+        ("native_inference_active", "native_inference_active"),
+        ("private-rtsp-uri-or-other-untrusted-phase", "native_request"),
+    ],
+)
+def test_pending_native_worker_distinguishes_bounded_inflight_stage(
+    store, worker_phase, expected
+):
+    source = _source()
+    service, sampler, _ = _service(store, source)
+    camera_id = source.binding.device_id
+    service.configure(camera_id, enabled=True, confidence_threshold=0.5)
+    service._states[camera_id] = {"sample_phase": "capture_pending"}
+    service._native_pending = Future()
+    sampler._capture_outcome = "native_request"
+    sampler._worker = SimpleNamespace(_failure_phase=worker_phase)
+    try:
+        state = service.status(camera_id)
+        assert state["sample_phase"] == expected
+        assert state["last_completed_phase"] == "not_started"
+        assert "private" not in state["sample_phase"]
+    finally:
+        service._native_pending.set_result(None)
+        asyncio.run(service.aclose())
+
+
 def test_reconfigure_during_inference_discards_result(store):
     source = _source()
     service, _sampler, provider = _service(store, source)
