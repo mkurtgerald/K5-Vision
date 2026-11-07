@@ -225,7 +225,7 @@ jobs:
         timeout-minutes: 12
         shell: pwsh
         run: |
-          python -m pytest tests/integration/test_windows_desktop_app.py -o addopts= --no-cov -s -o faulthandler_timeout=180 --junitxml=desktop-build/desktop-windows.xml
+          python -m pytest tests/integration/test_windows_desktop_app.py -o addopts= --no-cov -s -o faulthandler_timeout=400 --junitxml=desktop-build/desktop-windows.xml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/verify_desktop_receipt.py desktop-build/desktop-windows.xml desktop-build/desktop-windows-receipt.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -406,7 +406,7 @@ jobs:
         timeout-minutes: 8
         shell: pwsh
         run: |
-          python -m pytest tests/integration/test_windows_camera_video_settings.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=90 --junitxml=camera-video-windows.xml
+          python -m pytest tests/integration/test_windows_camera_video_settings.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=400 --junitxml=camera-video-windows.xml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/verify_windows_camera_video_settings_receipt.py camera-video-windows.xml camera-video-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -488,7 +488,7 @@ jobs:
         timeout-minutes: 10
         shell: pwsh
         run: |
-          python -m pytest tests/integration/test_windows_desktop_app.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=180 --junitxml=vm-clock-windows.xml
+          python -m pytest tests/integration/test_windows_desktop_app.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=400 --junitxml=vm-clock-windows.xml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/verify_windows_vm_clock_receipt.py vm-clock-windows.xml vm-clock-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
