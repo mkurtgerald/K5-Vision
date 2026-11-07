@@ -704,6 +704,11 @@ class RecordedFrameSampler:
                             and signature[2] > old[2]
                         ):
                             changed.append((path, info))
+        if self._recording_files is not None and previous is not None and changed:
+            # A simultaneous cached-file update must not discard an uncached
+            # segment's earlier baseline before the next bounded rescan.
+            for name, signature in previous.items():
+                current.setdefault(name, signature)
         self._observations[source.binding.device_id] = current
         if not changed:
             self._capture_outcome = "no_growth"
