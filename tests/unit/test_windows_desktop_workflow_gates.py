@@ -2,12 +2,8 @@
 
 from pathlib import Path
 
-
 _WORKFLOW = (
-    Path(__file__).resolve().parents[2]
-    / ".github"
-    / "workflows"
-    / "operator-desktop-windows.yml"
+    Path(__file__).resolve().parents[2] / ".github" / "workflows" / "operator-desktop-windows.yml"
 )
 
 
@@ -19,10 +15,7 @@ def test_failed_gui_analytics_does_not_skip_independent_upgrade_reversal():
         "k5-vision-windows-upgrade-candidate-"
         "${{ github.event.pull_request.head.sha || github.sha }}"
     )
-    qualified = (
-        "k5-vision-windows-setup-"
-        "${{ github.event.pull_request.head.sha || github.sha }}"
-    )
+    qualified = "k5-vision-windows-setup-${{ github.event.pull_request.head.sha || github.sha }}"
 
     assert (
         desktop.index("Build click-through native Windows installer")

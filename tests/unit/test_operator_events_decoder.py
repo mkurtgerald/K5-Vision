@@ -263,8 +263,7 @@ def test_model_prime_failure_reports_finite_stage_without_native_details(monkeyp
     monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
     assert decoder.main() == 1
     assert output.getvalue() == (
-        b'{"status":"phase","phase":"model"}\n'
-        b'{"status": "failed", "phase": "model"}\n'
+        b'{"status":"phase","phase":"model"}\n{"status": "failed", "phase": "model"}\n'
     )
     assert b"private-model" not in output.getvalue()
     assert b"private-source" not in output.getvalue()
