@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import runpy
+import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
@@ -204,3 +205,231 @@ def test_delivered_fps_comes_from_decoded_frame_timestamps_not_declared_rate(
         "fps": 10.0,
         "frames": 6 if leading_untimed else 5,
     }
+
+
+@pytest.fixture
+def probe_module():
+    path = Path(__file__).parents[1] / "integration/test_windows_camera_video_settings.py"
+    spec = importlib.util.spec_from_file_location("camera_probe_diagnostics", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _probe_payload():
+    return {
+        "streams": [{"codec_name": "h264", "width": 640, "height": 360}],
+        "frames": [
+            {"best_effort_timestamp_time": str(i / 10), "width": 640, "height": 360}
+            for i in range(5)
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "case,reason",
+    [
+        ("nonzero", "nonzero_exit"),
+        ("oversized", "oversized_output"),
+        ("invalid", "invalid_json"),
+        ("streams", "stream_count"),
+        ("frames", "frame_count"),
+        ("untimed", "untimed_frames"),
+        ("untimed_middle", "untimed_frames"),
+        ("few_timed", "frame_count"),
+        ("nonmonotonic", "nonmonotonic_pts"),
+        ("geometry", "geometry_mismatch"),
+    ],
+)
+def test_probe_diagnostics_identify_rejection_without_publishing_input(
+    probe_module, monkeypatch, case, reason
+):
+    payload = _probe_payload()
+    if case == "streams":
+        payload["streams"] = []
+    elif case == "frames":
+        payload["frames"] = payload["frames"][:3]
+    elif case == "untimed":
+        payload["frames"][:0] = [{"width": 640, "height": 360}] * 3
+    elif case == "untimed_middle":
+        payload["frames"][1].pop("best_effort_timestamp_time")
+    elif case == "few_timed":
+        payload["frames"] = payload["frames"][:4]
+        payload["frames"][0].pop("best_effort_timestamp_time")
+    elif case == "nonmonotonic":
+        payload["frames"][1]["best_effort_timestamp_time"] = "0"
+    elif case == "geometry":
+        payload["frames"][1]["width"] = 320
+    raw = (
+        b"private-camera-text"
+        if case == "invalid"
+        else b"x" * 262145
+        if case == "oversized"
+        else json.dumps(payload).encode()
+    )
+
+    def run(command, **kwargs):
+        assert kwargs["timeout"] == 8
+        assert kwargs["stderr"] == subprocess.DEVNULL
+        assert command[-1] == "rtsp://private-user:private-password@private-camera/stream"
+        return SimpleNamespace(returncode=3221225501 if case == "nonzero" else 0, stdout=raw)
+
+    monkeypatch.setattr(probe_module.subprocess, "run", run)
+    diagnostic = {"probe_fps": 999, "probe_width": 999}
+    actual = probe_module._probe(
+        Path("generated-ffprobe"),
+        "rtsp://private-user:private-password@private-camera/stream",
+        diagnostic=diagnostic,
+    )
+    assert actual is None and diagnostic["probe_reason"] == reason
+    assert diagnostic["probe_attempts"] == 1
+    assert 0 <= diagnostic["probe_elapsed_ms"] <= 900000
+    assert "probe_fps" not in diagnostic and "probe_width" not in diagnostic
+    assert "private" not in json.dumps(diagnostic)
+    assert "rtsp://" not in json.dumps(diagnostic)
+
+
+def test_probe_timeout_records_only_bounded_numeric_progress(probe_module, monkeypatch):
+    def timeout(command, **kwargs):
+        assert kwargs["timeout"] == 8
+        raise subprocess.TimeoutExpired(command, 8, output=b"private partial JSON")
+
+    monkeypatch.setattr(probe_module.subprocess, "run", timeout)
+    diagnostic = {}
+    for _ in range(2):
+        with pytest.raises(subprocess.TimeoutExpired):
+            probe_module._probe(
+                Path("generated-ffprobe"), "rtsp://private-camera/stream", diagnostic=diagnostic
+            )
+    assert diagnostic["probe_reason"] == "timeout"
+    assert diagnostic["probe_attempts"] == diagnostic["probe_timeouts"] == 2
+    assert diagnostic["probe_output_bytes"] == len(b"private partial JSON")
+    assert "private" not in json.dumps(diagnostic)
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        ({"fps": 15.0}, "rate_mismatch"),
+        ({"width": 320}, "expected_geometry_mismatch"),
+        ({"codec": "mpeg4"}, "expected_codec_mismatch"),
+    ],
+)
+def test_stream_mismatch_keeps_exact_cadence_and_geometry_gate(
+    probe_module, monkeypatch, change, reason
+):
+    payload = _probe_payload()
+    monkeypatch.setattr(
+        probe_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(payload).encode()),
+    )
+
+    def wait(condition, _label, *, timeout, process):
+        assert timeout == 20 and process is None
+        assert condition() is False
+        raise TimeoutError("controlled readiness deadline")
+
+    expected = {"codec": "h264", "width": 640, "height": 360, "fps": 10.0, **change}
+    diagnostic = {}
+    with pytest.raises(TimeoutError, match="controlled readiness"):
+        probe_module._stream_proof(
+            Path("generated-ffprobe"),
+            "rtsp://private-camera/stream",
+            expected,
+            SimpleNamespace(_wait=wait),
+            diagnostic=diagnostic,
+            phase="initial",
+        )
+    assert diagnostic["probe_reason"] == reason
+    assert diagnostic["probe_phase"] == "initial"
+    assert diagnostic["probe_fps"] == 10.0
+    assert diagnostic["probe_width"] == 640 and diagnostic["probe_height"] == 360
+    assert diagnostic["probe_frame_count"] == diagnostic["probe_timed_frames"] == 5
+    assert diagnostic["probe_expected_fps"] == expected["fps"]
+    assert "private" not in json.dumps(diagnostic)
+
+
+def test_probe_notes_do_not_publish_nonfinite_or_string_values(probe_module):
+    diagnostic = {}
+    probe_module._probe_note(
+        diagnostic,
+        "private invalid reason",
+        probe_module.time.monotonic(),
+        probe_fps=float("nan"),
+        probe_width="private-camera",
+        probe_height=float("inf"),
+        private_raw_json="refused",
+    )
+    assert diagnostic["probe_reason"] == "invalid_json"
+    assert set(diagnostic) == {"probe_reason", "probe_elapsed_ms"}
+    assert "private" not in json.dumps(diagnostic)
+
+
+@pytest.mark.parametrize("network", [True, False])
+def test_probe_bounds_network_analysis_and_preserves_file_export_command(
+    probe_module, monkeypatch, network
+):
+    payload = _probe_payload()
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        assert kwargs["timeout"] == 8
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload).encode())
+
+    monkeypatch.setattr(probe_module.subprocess, "run", run)
+    result = probe_module._probe(Path("generated-ffprobe"), "generated-only-input", network=network)
+    assert result["fps"] == 10.0
+    network_options = (
+        [
+            "-rtsp_transport",
+            "tcp",
+            "-analyzeduration",
+            "1000000",
+            "-probesize",
+            "1048576",
+            "-read_intervals",
+            "%+1",
+        ]
+        if network
+        else []
+    )
+    assert calls == [
+        [
+            "generated-ffprobe",
+            "-v",
+            "error",
+            *network_options,
+            "-select_streams",
+            "v:0",
+            "-show_frames",
+            "-show_entries",
+            "stream=codec_name,width,height:frame=best_effort_timestamp_time,width,height",
+            "-of",
+            "json",
+            "generated-only-input",
+        ]
+    ]
+
+
+@pytest.mark.parametrize("leading_untimed", [0, 1, 2])
+def test_network_probe_still_rejects_only_three_timed_frames(
+    probe_module, monkeypatch, leading_untimed
+):
+    payload = _probe_payload()
+    payload["frames"] = [{"width": 640, "height": 360}] * leading_untimed + payload["frames"][:3]
+    monkeypatch.setattr(
+        probe_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(payload).encode()),
+    )
+    diagnostic = {}
+    result = probe_module._probe(
+        Path("generated-ffprobe"), "generated-only-input", diagnostic=diagnostic
+    )
+    assert result is None
+    assert diagnostic["probe_reason"] == "frame_count"
+    if leading_untimed:
+        assert diagnostic["probe_timed_frames"] == 3

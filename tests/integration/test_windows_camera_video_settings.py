@@ -12,6 +12,7 @@ import ctypes
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import secrets
@@ -180,10 +181,70 @@ class PublisherController:
         self.processes.append(self.process)
 
 
-def _probe(ffprobe, source, *, network=True):
+_PROBE_REASONS = frozenset(
+    {
+        "started",
+        "timeout",
+        "nonzero_exit",
+        "oversized_output",
+        "invalid_json",
+        "stream_count",
+        "frame_count",
+        "untimed_frames",
+        "nonmonotonic_pts",
+        "geometry_mismatch",
+        "valid",
+        "rate_mismatch",
+        "expected_geometry_mismatch",
+        "expected_codec_mismatch",
+    }
+)
+_PROBE_NUMBERS = frozenset(
+    {
+        "probe_exit_code",
+        "probe_output_bytes",
+        "probe_frame_count",
+        "probe_timed_frames",
+        "probe_untimed_frames",
+        "probe_width",
+        "probe_height",
+        "probe_fps",
+    }
+)
+
+
+def _probe_note(diagnostic, reason, started, **numbers):
+    if diagnostic is None:
+        return
+    diagnostic["probe_reason"] = reason if reason in _PROBE_REASONS else "invalid_json"
+    diagnostic["probe_elapsed_ms"] = min(
+        900_000, max(0, round((time.monotonic() - started) * 1000))
+    )
+    for name, value in numbers.items():
+        finite = type(value) is int or (type(value) is float and math.isfinite(value))
+        if name in _PROBE_NUMBERS and finite:
+            diagnostic[name] = min(2**32 - 1, max(-(2**31), value))
+
+
+def _probe(ffprobe, source, *, network=True, diagnostic=None):
+    started = time.monotonic()
+    if diagnostic is not None:
+        for name in _PROBE_NUMBERS:
+            diagnostic.pop(name, None)
+        diagnostic["probe_attempts"] = min(100, diagnostic.get("probe_attempts", 0) + 1)
+    _probe_note(diagnostic, "started", started)
     command = [str(ffprobe), "-v", "error"]
     if network:
-        command += ["-rtsp_transport", "tcp", "-read_intervals", "%+1"]
+        command += [
+            "-rtsp_transport",
+            "tcp",
+            "-analyzeduration",
+            "1000000",
+            "-probesize",
+            "1048576",
+            "-read_intervals",
+            "%+1",
+        ]
     command += [
         "-select_streams",
         "v:0",
@@ -194,13 +255,31 @@ def _probe(ffprobe, source, *, network=True):
         "json",
         str(source),
     ]
-    result = subprocess.run(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        timeout=8,
-        check=False,
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        if diagnostic is not None:
+            diagnostic["probe_timeouts"] = min(100, diagnostic.get("probe_timeouts", 0) + 1)
+        _probe_note(
+            diagnostic,
+            "timeout",
+            started,
+            probe_output_bytes=len(error.stdout or b""),
+        )
+        raise
+    _probe_note(
+        diagnostic,
+        "nonzero_exit" if result.returncode else "oversized_output",
+        started,
+        probe_exit_code=result.returncode,
+        probe_output_bytes=len(result.stdout),
     )
     if result.returncode != 0 or len(result.stdout) > 262144:
         return None
@@ -208,14 +287,17 @@ def _probe(ffprobe, source, *, network=True):
         document = json.loads(result.stdout)
         streams = document["streams"]
         if len(streams) != 1:
+            _probe_note(diagnostic, "stream_count", started)
             return None
         value = streams[0]
         frames = document["frames"]
+        _probe_note(diagnostic, "frame_count", started, probe_frame_count=len(frames))
         if not 4 <= len(frames) <= 10000:
             return None
         missing = [
             index for index, frame in enumerate(frames) if "best_effort_timestamp_time" not in frame
         ]
+        _probe_note(diagnostic, "untimed_frames", started, probe_untimed_frames=len(missing))
         # Joining RTSP can yield one cached decoder reference frame before the
         # first timed packet. It is decoded, but cannot measure cadence.
         if missing != list(range(len(missing))) or len(missing) > 2:
@@ -225,38 +307,67 @@ def _probe(ffprobe, source, *, network=True):
             for frame in frames
             if "best_effort_timestamp_time" in frame
         ]
+        _probe_note(diagnostic, "frame_count", started, probe_timed_frames=len(times))
         if len(times) < 4:
             return None
         if not all(end > start for start, end in zip(times[:-1], times[1:], strict=True)):
+            _probe_note(diagnostic, "nonmonotonic_pts", started)
             return None
         if any(
             frame.get("width") != value["width"] or frame.get("height") != value["height"]
             for frame in frames
         ):
+            _probe_note(diagnostic, "geometry_mismatch", started)
             return None
-        return {
+        value = {
             "codec": value["codec_name"],
             "width": int(value["width"]),
             "height": int(value["height"]),
             "fps": round((len(times) - 1) / (times[-1] - times[0]), 3),
             "frames": len(frames),
         }
+        _probe_note(
+            diagnostic,
+            "valid",
+            started,
+            probe_fps=value["fps"],
+            probe_width=value["width"],
+            probe_height=value["height"],
+        )
+        return value
     except (ValueError, KeyError, TypeError, ZeroDivisionError):
+        _probe_note(diagnostic, "invalid_json", started)
         return None
 
 
-def _stream_proof(ffprobe, source, expected, desktop, *, app=None):
+def _stream_proof(ffprobe, source, expected, desktop, *, app=None, diagnostic=None, phase=None):
     observed = {}
+    if diagnostic is not None:
+        diagnostic["probe_phase"] = (
+            phase if phase in {"initial", "changed", "external", "restored"} else "unavailable"
+        )
+        wanted_rate = expected["fps"]
+        if type(wanted_rate) in (int, float) and math.isfinite(wanted_rate):
+            diagnostic["probe_expected_fps"] = wanted_rate
 
     def ready():
         try:
-            value = _probe(ffprobe, source)
+            value = _probe(ffprobe, source, diagnostic=diagnostic)
         except subprocess.TimeoutExpired:
             return False
         if value is None:
             return False
         observed.update(value)
-        return value["frames"] >= 4 and all(value[k] == v for k, v in expected.items())
+        matches = value["frames"] >= 4 and all(value[k] == v for k, v in expected.items())
+        if not matches and diagnostic is not None:
+            diagnostic["probe_reason"] = (
+                "rate_mismatch"
+                if value["fps"] != expected["fps"]
+                else "expected_geometry_mismatch"
+                if any(value[name] != expected[name] for name in ("width", "height"))
+                else "expected_codec_mismatch"
+            )
+        return matches
 
     desktop._wait(ready, "Generated delivered encoder output", timeout=20, process=app)
     return observed
@@ -574,6 +685,7 @@ def run_camera_video_journey(
         admin_helpers._return_to_cameras(page)
         browser_helpers._open_camera_watch(page, target)
         browser_helpers._decoded_color(page, "live-video", "red")
+        diagnostic["stage"] = "initial_encoder_stream"
         evidence["streams"] = {
             "before": _stream_proof(
                 ffprobe,
@@ -581,6 +693,8 @@ def run_camera_video_journey(
                 {"codec": "h264", "width": 320, "height": 240, "fps": 15.0},
                 desktop,
                 app=app,
+                diagnostic=diagnostic,
+                phase="initial",
             )
         }
         desktop._wait(
@@ -632,12 +746,15 @@ def run_camera_video_journey(
             fixtures[0].current() == _CHANGED, "Actual camera did not apply encoder configuration"
         )
         page.locator("#camera-video-cancel").click()
+        diagnostic["stage"] = "changed_encoder_stream"
         evidence["streams"]["changed"] = _stream_proof(
             ffprobe,
             sources[0],
             {"codec": "h264", "width": 640, "height": 360, "fps": 10.0},
             desktop,
             app=app,
+            diagnostic=diagnostic,
+            phase="changed",
         )
         _decoded_geometry(page, "#live-video", "red", 640, 360)
         desktop._wait(
@@ -650,12 +767,15 @@ def run_camera_video_journey(
         _require(bool(retained), "No pre-change footage was finalized")
         diagnostic["stage"] = "unsupported_external_codec"
         fixtures[0].external_codec("MPEG4")
+        diagnostic["stage"] = "external_encoder_stream"
         evidence["streams"]["external"] = _stream_proof(
             ffprobe,
             sources[0],
             {"codec": "mpeg4", "width": 640, "height": 360, "fps": 10.0},
             desktop,
             app=app,
+            diagnostic=diagnostic,
+            phase="external",
         )
         restored = _settings_read(page, route, open_dialog=True)
         _require(
@@ -665,12 +785,15 @@ def run_camera_video_journey(
         result, selected = _apply(page, route, {"codec": "H264", "gop": 10})
         changed |= selected
         page.locator("#camera-video-cancel").click()
+        diagnostic["stage"] = "restored_encoder_stream"
         evidence["streams"]["restored"] = _stream_proof(
             ffprobe,
             sources[0],
             {"codec": "h264", "width": 640, "height": 360, "fps": 10.0},
             desktop,
             app=app,
+            diagnostic=diagnostic,
+            phase="restored",
         )
         _decoded_geometry(page, "#live-video", "red", 640, 360)
         diagnostic["stage"] = "shared_encoder_acknowledgement"
@@ -1227,6 +1350,20 @@ def test_native_windows_camera_video_settings_and_automatic_wall(record_testsuit
                     "timeline_span_count",
                     "export_stage",
                     "export_job_status",
+                    "probe_phase",
+                    "probe_reason",
+                    "probe_attempts",
+                    "probe_timeouts",
+                    "probe_elapsed_ms",
+                    "probe_exit_code",
+                    "probe_output_bytes",
+                    "probe_frame_count",
+                    "probe_timed_frames",
+                    "probe_untimed_frames",
+                    "probe_width",
+                    "probe_height",
+                    "probe_fps",
+                    "probe_expected_fps",
                 }
             }
             safe.update(failed=failed, cleanup_failed=cleanup_failed)

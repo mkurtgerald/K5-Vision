@@ -148,7 +148,7 @@ def workspace():
                             ".css": "text/css",
                             ".html": "text/html",
                         }[asset.suffix],
-                        body=asset.read_text(),
+                        body=asset.read_text(encoding="utf-8"),
                     )
                 body = route.request.post_data_json if route.request.post_data else None
                 state["calls"].append((method, path, body))
