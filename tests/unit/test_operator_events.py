@@ -602,6 +602,7 @@ def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch
         with pytest.raises(OperatorEventsError, match="source refused"):
             sampler.capture(source)
 
+
 @pytest.mark.parametrize(
     "child_phase,expected",
     [
