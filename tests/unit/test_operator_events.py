@@ -638,6 +638,56 @@ def test_recorder_growth_after_utc_rollback_selects_new_file_not_future_filename
     assert sampler.capture(source) is None
 
 
+
+
+def test_cached_inventory_detects_new_recorder_file_without_replaying_older_media(
+    identity, monkeypatch
+):
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    source = _source()
+    directory = root / source.binding.path_name
+    directory.mkdir(mode=0o700)
+    retained = directory / "2026-10-28_12-00-00-000000_+0000.mp4"
+    retained.write_bytes(b"retained-before-first-sample")
+
+    # A valid cached storage scan may precede the sampler's first observation.
+    # Its empty result must not authorize replay of already-retained files.
+    sampler = RecordedFrameSampler(root, recording_files=lambda _binding: {})
+    decoded = []
+
+    def decode(raw, when, key):
+        decoded.append((raw, when, key))
+        return _sample(index=len(decoded), when=when)
+
+    monkeypatch.setattr(sampler, "decode", decode)
+    assert sampler.capture(source) is None
+    assert sampler._capture_outcome == "baseline"
+    assert sampler.capture(source) is None
+    assert decoded == []
+
+    # The active recorder rolls a new file before the 6-second maintenance
+    # inventory refresh. Directory creation, not UTC filename ordering or an
+    # old cached high-water, makes this source eligible for a real read.
+    fresh = directory / "2026-10-27_12-00-00-000000_+0000.mp4"
+    fresh.write_bytes(b"new-native-segment")
+    sample = sampler.capture(source)
+    assert sample is not None
+    assert decoded == [
+        (b"new-native-segment", datetime(2026, 10, 27, 12, tzinfo=UTC), fresh.name)
+    ]
+    assert sampler.capture(source) is None
+    assert len(decoded) == 1
+
+    # An existing active segment continues from actual byte growth even when
+    # the background storage inventory has not yet caught up.
+    with fresh.open("ab") as output:
+        output.write(b"-next-fragment")
+    assert sampler.capture(source) is not None
+    assert decoded[-1][0] == b"new-native-segment-next-fragment"
+    assert len(decoded) == 2
+
+
 def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch):
     import k5vision.operator_events as module
 
