@@ -364,7 +364,10 @@ class _RecordedNativeWorker:
         process = None
         try:
             process = subprocess.Popen(
-                [sys.executable, "-B", "-m", "k5vision.operator_events_decoder"],
+                # Match the exact isolated embedded-runtime child admission
+                # exercised during desktop packaging. Never load modules from
+                # the installed working directory or inherited Python paths.
+                [sys.executable, "-I", "-B", "-m", "k5vision.operator_events_decoder"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -456,7 +459,9 @@ class _RecordedNativeWorker:
                         break
                     phase = header.get("phase")
                     if set(header) != {"status", "phase"} or phase not in {
-                        "decode", "model", "inference"
+                        "decode",
+                        "model",
+                        "inference",
                     }:
                         raise ValueError
                     self._failure_phase = {

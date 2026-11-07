@@ -484,6 +484,43 @@ def test_recorded_person_native_cold_budget_becomes_steady_only_after_valid_ack(
     assert module._RecordedNativeWorker(None)._request_timeout() == 8.0
 
 
+def test_owned_native_child_launch_uses_isolated_embedded_python(monkeypatch):
+    import k5vision.operator_events as module
+    import k5vision.operator_native_process as native_process
+
+    captured = []
+
+    class Child:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO()
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 0
+
+    monkeypatch.setattr(
+        native_process,
+        "_WindowsJob",
+        lambda: SimpleNamespace(assign=lambda child: None, close=lambda: None),
+    )
+    monkeypatch.setattr(
+        module.subprocess, "Popen", lambda arguments, **options: captured.append(arguments) or Child()
+    )
+    worker = module._RecordedNativeWorker(None)
+    try:
+        worker._start()
+        assert captured == [
+            [sys.executable, "-I", "-B", "-m", "k5vision.operator_events_decoder"]
+        ]
+    finally:
+        worker.close()
+
+
 def test_closed_native_worker_permanently_refuses_another_birth(monkeypatch, tmp_path):
     import k5vision.operator_events as module
 
@@ -837,37 +874,40 @@ def test_native_worker_tracks_bounded_child_phases_without_source_content(monkey
         worker.close()
 
 
-def test_native_worker_rejects_unbounded_or_untrusted_progress(monkeypatch, tmp_path):
-    import k5vision.operator_events as module
-
-    for replies in (
+@pytest.mark.parametrize(
+    "replies",
+    [
         b'{"status":"phase","phase":"rtsp://private"}\n',
         b'{"status":"phase","phase":"decode"}\n' * 4,
-    ):
-        worker = module._RecordedNativeWorker(None)
+    ],
+)
+def test_native_worker_rejects_unbounded_or_untrusted_progress(monkeypatch, tmp_path, replies):
+    import k5vision.operator_events as module
 
-        class Child:
-            stdin = io.BytesIO()
+    worker = module._RecordedNativeWorker(None)
 
-            def __init__(self):
-                self.stdout = io.BytesIO(replies)
+    class Child:
+        stdin = io.BytesIO()
 
-            def poll(self):
-                return None
+        def __init__(self):
+            self.stdout = io.BytesIO(replies)
 
-            def kill(self):
-                pass
+        def poll(self):
+            return None
 
-            def wait(self, timeout=2):
-                return 0
+        def kill(self):
+            pass
 
-        monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", Child()))
-        try:
-            with pytest.raises(OperatorEventsError, match="native frame unavailable"):
-                worker.request(tmp_path / "private-snapshot.mp4")
-            assert worker._failure_phase == "native_header_invalid"
-        finally:
-            worker.close()
+        def wait(self, timeout=2):
+            return 0
+
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", Child()))
+    try:
+        with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+            worker.request(tmp_path / "private-snapshot.mp4")
+        assert worker._failure_phase == "native_header_invalid"
+    finally:
+        worker.close()
 
 
 @pytest.mark.parametrize(

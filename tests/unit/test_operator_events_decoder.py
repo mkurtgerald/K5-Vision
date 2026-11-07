@@ -193,8 +193,7 @@ def test_decoder_emits_only_fixed_failure_phase_without_paths(monkeypatch):
     monkeypatch.setattr(decoder, "decode", invalid_recording)
     assert decoder.main() == 1
     assert output.getvalue() == (
-        b'{"status":"phase","phase":"decode"}\n'
-        b'{"status": "failed", "phase": "decode"}\n'
+        b'{"status":"phase","phase":"decode"}\n{"status": "failed", "phase": "decode"}\n'
     )
 
 
@@ -205,10 +204,7 @@ def test_decoder_progress_reports_only_fixed_stage_and_never_source(monkeypatch)
     monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
     monkeypatch.setattr(decoder, "decode", lambda path: None)
     assert decoder.main() == 0
-    assert output.getvalue() == (
-        b'{"status":"phase","phase":"decode"}\n'
-        b'{"status":"empty"}\n'
-    )
+    assert output.getvalue() == (b'{"status":"phase","phase":"decode"}\n{"status":"empty"}\n')
     assert b"private-recording" not in output.getvalue()
 
 
