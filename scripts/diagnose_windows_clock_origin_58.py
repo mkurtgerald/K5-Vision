@@ -272,6 +272,148 @@ def after_response_snapshot(client, camera_id, cohort, *, received_at=None):
     return result
 
 
+def analytics_failure_frames(error, source_root):
+    locations = {
+        (source_root / "tests/integration/test_windows_desktop_app.py").resolve(): (
+            "desktop",
+            {"_installed_analytics_journey", "_installed_person_fixture", "_wait"},
+        ),
+        (source_root / "tests/integration/test_operator_beta_browser.py").resolve(): (
+            "browser",
+            {
+                "_open_camera_recordings",
+                "_open_camera_watch",
+                "_decoded_color",
+                "_decoded_video",
+                "_decoded_video_proof",
+            },
+        ),
+    }
+    frames = []
+    current = error.__traceback__
+    while current is not None:
+        code = current.tb_frame.f_code
+        location = locations.get(Path(code.co_filename).resolve())
+        if location is not None and code.co_name in location[1]:
+            frames.append(
+                {
+                    "file": location[0],
+                    "function": code.co_name,
+                    "line": min(10000, max(1, current.tb_lineno)),
+                }
+            )
+            frames = frames[-4:]
+        current = current.tb_next
+    return frames
+
+
+def analytics_ui_state(page):
+    raw = page.wait_for_function(
+        """() => {
+      const visible = id => {
+        const node = document.getElementById(id);
+        return Boolean(node && !node.hidden && node.getClientRects().length);
+      };
+      const result = {
+        history_visible: visible('history-panel'), live_visible: visible('live-panel'),
+        wall_visible: visible('wall-panel'),
+        event_button_count:
+          document.querySelectorAll('#analytics-events button[data-event-id]').length,
+        history_item_count: document.querySelectorAll('.history-item').length
+      };
+      for (const name of ['playback', 'live']) {
+        const video = document.getElementById(name + '-video');
+        result[name + '_present'] = Boolean(video);
+        if (!video) continue;
+        result[name + '_ready_state'] = video.readyState;
+        result[name + '_paused'] = video.paused;
+        result[name + '_time_seconds'] = Number.isFinite(video.currentTime)
+          ? video.currentTime : null;
+        result[name + '_duration_seconds'] = Number.isFinite(video.duration)
+          ? video.duration : null;
+        result[name + '_width'] = video.videoWidth;
+        result[name + '_height'] = video.videoHeight;
+        result[name + '_decoded_frames'] = video.getVideoPlaybackQuality().totalVideoFrames;
+        result[name + '_error_code'] = video.error ? video.error.code : null;
+        result[name + '_has_source'] = Boolean(video.getAttribute('src') || video.currentSrc);
+      }
+      const historyEnd = document.getElementById('history-end');
+      const parsedEnd = historyEnd ? Date.parse(historyEnd.value + 'Z') : NaN;
+      result.history_end_age_seconds = Number.isFinite(parsedEnd)
+        ? (Date.now() - parsedEnd) / 1000 : null;
+      const playback = document.getElementById('playback-video');
+      result.playback_utc_start_present = Boolean(playback && playback.dataset.utcStart);
+      return result;
+    }""",
+        timeout=2000,
+    ).json_value()
+    if type(raw) is not dict:
+        return {"available": False}
+    result = {"available": True}
+    age = raw.get("history_end_age_seconds")
+    try:
+        result["history_end_age_seconds"] = (
+            round(min(86400, max(-86400, age)), 3)
+            if type(age) in (int, float) and math.isfinite(age)
+            else None
+        )
+    except OverflowError:
+        result["history_end_age_seconds"] = None
+    bools = {"history_visible", "live_visible", "wall_visible", "playback_utc_start_present"}
+    bools.update(
+        name + suffix
+        for name in ("playback", "live")
+        for suffix in ("_present", "_paused", "_has_source")
+    )
+    for key in bools:
+        result[key] = raw.get(key) if type(raw.get(key)) is bool else None
+    for key in ("event_button_count", "history_item_count"):
+        value = raw.get(key)
+        result[key] = value if type(value) is int and 0 <= value <= 256 else None
+    for name in ("playback", "live"):
+        for suffix, maximum in (
+            ("_ready_state", 4),
+            ("_error_code", 4),
+            ("_width", 16384),
+            ("_height", 16384),
+            ("_decoded_frames", 2**32 - 1),
+        ):
+            key, value = name + suffix, raw.get(name + suffix)
+            result[key] = value if type(value) is int and 0 <= value <= maximum else None
+        for suffix in ("_time_seconds", "_duration_seconds"):
+            result[name + suffix] = finite_seconds(raw.get(name + suffix))
+    return result
+
+
+def observe_analytics(original, result, source_root):
+    def observed(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except BaseException as error:
+            began = time.monotonic()
+            note = {
+                "timing": "after_analytics_exception",
+                "kind": "timeout"
+                if type(error).__name__ == "TimeoutError"
+                else ("assertion" if isinstance(error, pytest.fail.Exception) else "exception"),
+            }
+            result["analytics_failure"] = note
+            try:
+                note["frames"] = analytics_failure_frames(error, source_root)
+            except BaseException:
+                note["frame_probe_failed"] = True
+            try:
+                note["ui"] = analytics_ui_state(kwargs.get("page"))
+            except BaseException:
+                note["ui_probe_failed"] = True
+            note["ui_observed_after_exception_ms"] = min(
+                90000, max(0, round((time.monotonic() - began) * 1000))
+            )
+            raise
+
+    return observed
+
+
 class RequestObserver:
     def __init__(self, request, diagnostic, client, camera_id, captured, result):
         self.request, self.diagnostic = request, diagnostic
@@ -371,6 +513,9 @@ def run(output):
             return original_phase(**kwargs)
 
         module._Cohort, module._vm_clock_phase = ObservedCohort, phase
+        module._installed_analytics_journey = observe_analytics(
+            module._installed_analytics_journey, result, root
+        )
 
         def property_callback(name, value):
             if name == "desktop_windows_diagnostic":
