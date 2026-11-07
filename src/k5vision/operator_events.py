@@ -960,6 +960,18 @@ class OperatorEventService:
 
     async def start(self) -> None:
         if self._task is None:
+            if (
+                not self._unavailable
+                and isinstance(self._sampler, RecordedFrameSampler)
+                and getattr(self._sampler, "_configuration", None) is not None
+                and self._native_pending is None
+            ):
+                # Warm the sealed, camera-free native model as the service starts.
+                # Waiting until analytics is enabled spends the first portion
+                # of the 25-second installed person-event gate compiling kernels.
+                # A failed prime never admits an event or suppresses later
+                # real-frame validation.
+                self._native_pending = self._executor.submit(self._sampler.prime)
             self._task = asyncio.create_task(self._run(), name="operator-recorded-person-events")
 
     async def _sample(self, source, settings) -> None:
