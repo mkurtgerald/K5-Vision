@@ -601,8 +601,9 @@ def test_decoder_failure_is_isolated_and_closes_cleanly(store):
             await service.start()
             await asyncio.sleep(0.1)
             assert service.status(source.binding.device_id)["status"] == "unavailable"
-            assert service.status(source.binding.device_id)["sample_phase"] == "native_failed"
-            assert service.status(source.binding.device_id)["last_completed_phase"] == "native_failed"
+            status = service.status(source.binding.device_id)
+            assert status["sample_phase"] == "native_failed"
+            assert status["last_completed_phase"] == "native_failed"
             assert store.events(source.binding.device_id)["events"] == []
         finally:
             await service.aclose()
@@ -658,6 +659,53 @@ def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch
         directory.symlink_to(identity.directory, target_is_directory=True)
         with pytest.raises(OperatorEventsError, match="source refused"):
             sampler.capture(source)
+
+
+@pytest.mark.parametrize(
+    "reply,write_fails,expected",
+    [
+        (b"", True, "native_write_failed"),
+        (b"not-json\\n", False, "native_header_invalid"),
+        (b'{"status":"ready","bytes":1}\\n', False, "native_header_invalid"),
+        (
+            b'{"status":"ready","bytes":696320,"elapsed":1.0,"detections":[]}\\n',
+            False,
+            "native_payload_incomplete",
+        ),
+    ],
+)
+def test_native_worker_distinguishes_transport_failure_boundaries(
+    monkeypatch, tmp_path, reply, write_fails, expected
+):
+    import k5vision.operator_events as module
+
+    class PrivateStdin(io.BytesIO):
+        def write(self, payload):
+            if write_fails:
+                raise BrokenPipeError
+            return super().write(payload)
+
+    class Process:
+        def __init__(self):
+            self.stdin = PrivateStdin()
+            self.stdout = io.BytesIO(reply)
+
+        def poll(self):
+            return 1
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 1
+
+    worker = module._RecordedNativeWorker(None)
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", Process()))
+    with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+        worker.request(tmp_path / "private-snapshot.mp4")
+    assert worker._failure_phase == expected
+    assert worker._process is None
+    worker.close()
 
 
 @pytest.mark.parametrize(

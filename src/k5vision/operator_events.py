@@ -391,7 +391,7 @@ class _RecordedNativeWorker:
                 raise OperatorEventsError("Analytics worker is closed")
             self._failure_phase = "native_launch_failed"
             self._start()
-            self._failure_phase = "native_transport_failed"
+            self._failure_phase = "native_write_failed"
             process = self._process
             if self._closing.is_set():
                 self.close()
@@ -418,10 +418,12 @@ class _RecordedNativeWorker:
                 }
                 process.stdin.write(json.dumps(request).encode("utf-8") + b"\n")
                 process.stdin.flush()
+                self._failure_phase = "native_reply_missing"
                 raw = process.stdout.readline(4097)
                 if not raw.endswith(b"\n") or len(raw) > 4096:
                     self._failure_phase = "native_reply_missing"
                     raise ValueError
+                self._failure_phase = "native_header_invalid"
                 header = json.loads(raw)
                 if header.get("status") == "failed":
                     failure_phases = {
@@ -441,9 +443,11 @@ class _RecordedNativeWorker:
                     return None
                 if header.get("status") != "ready" or header.get("bytes") != 544 * 320 * 4:
                     raise ValueError
+                self._failure_phase = "native_payload_incomplete"
                 payload = process.stdout.read(544 * 320 * 4)
                 if len(payload) != 544 * 320 * 4:
                     raise ValueError
+                self._failure_phase = "native_reply_invalid"
                 elapsed = header["elapsed"]
                 if (
                     type(elapsed) not in (int, float)
@@ -950,7 +954,11 @@ class OperatorEventService:
                         if candidate in {
                             "native_launch_failed",
                             "native_transport_failed",
+                            "native_write_failed",
                             "native_reply_missing",
+                            "native_header_invalid",
+                            "native_payload_incomplete",
+                            "native_reply_invalid",
                             "native_protocol_failed",
                             "native_decode_failed",
                             "native_model_failed",
