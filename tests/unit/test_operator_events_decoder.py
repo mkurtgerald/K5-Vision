@@ -180,6 +180,7 @@ def test_fragment_decoder_reopens_unchanged_snapshot_after_unusable_rewind(monke
     assert captures[1].seek_positions == []
     assert all(capture.released for capture in captures)
 
+
 def test_decoder_emits_only_fixed_failure_phase_without_paths(monkeypatch):
     request = json.dumps({"path": "private-recording.mp4", "artifact_root": None}).encode()
     output = io.BytesIO()
