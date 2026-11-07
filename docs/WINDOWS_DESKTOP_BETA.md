@@ -131,6 +131,15 @@ active-session revocation, account activity and restart persistence. Its clock g
 forward/back Windows clock corrections and retained-file integrity. Earlier
 clock-only evidence does not qualify the new workspace.
 
+The dedicated clock VM repeats graphical setup, camera enrollment, recording,
+analytics and playback before stepping Windows time by 48 hours in each
+direction and restoring it. Its receipt requires the full GUI journey's raw
+report and receipt, plus the actual installer bundle, from the same source,
+workflow run and attempt. The full GUI journey remains mandatory. The clock
+journey retains its 360-second limit, one 90-second watchdog across both steps,
+and a hold of at least 10 seconds at each corrected time. A separate Windows
+Time administration gate verifies configuration, resynchronization and restore.
+
 Physical-camera compatibility, independent NTP/UTC accuracy, measured capacity
 and endurance still require [field qualification](WINDOWS_BETA_FIELD_TEST.md).
 This increment does not deliver a boot service, bundled AI workflow, PTZ controls,
