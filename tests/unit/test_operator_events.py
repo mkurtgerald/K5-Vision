@@ -638,8 +638,6 @@ def test_recorder_growth_after_utc_rollback_selects_new_file_not_future_filename
     assert sampler.capture(source) is None
 
 
-
-
 def test_cached_inventory_detects_new_recorder_file_without_replaying_older_media(
     identity, monkeypatch
 ):
