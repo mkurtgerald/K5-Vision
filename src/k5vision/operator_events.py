@@ -679,7 +679,12 @@ class RecordedFrameSampler:
             identifier = source.binding.device_id
             now = time.monotonic()
             last = self._last_uncached_scan.get(identifier)
-            if last is None or now < last or now - last >= 3:
+            if last is not None and last <= now < last + 3:
+                # Keep newly discovered baselines across the rescan backoff.
+                # Otherwise a growing segment can never earn two observations.
+                for name, signature in previous.items():
+                    current.setdefault(name, signature)
+            else:
                 self._last_uncached_scan[identifier] = now
                 deadline = now + 3
                 with os.scandir(directory) as entries:
