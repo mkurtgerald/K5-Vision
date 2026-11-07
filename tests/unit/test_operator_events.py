@@ -720,7 +720,7 @@ def test_native_worker_reaps_pre_response_broken_pipe_then_retries_once(
         def __init__(self, broken):
             self.broken = broken
             self.stdin = BrokenInput() if broken else io.BytesIO()
-            self.stdout = io.BytesIO(b'{"status":"empty"}\\n')
+            self.stdout = io.BytesIO(b'{"status":"empty"}\n')
             self.killed = False
 
         def poll(self):
