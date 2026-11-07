@@ -183,9 +183,7 @@ def test_fragment_decoder_reopens_unchanged_snapshot_after_unusable_rewind(monke
 def test_decoder_emits_only_fixed_failure_phase_without_paths(monkeypatch):
     request = json.dumps({"path": "private-recording.mp4", "artifact_root": None}).encode()
     output = io.BytesIO()
-    monkeypatch.setattr(
-        decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n"))
-    )
+    monkeypatch.setattr(decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n")))
     monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
 
     def invalid_recording(_path):
