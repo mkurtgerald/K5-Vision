@@ -218,6 +218,40 @@ jobs:
           }
           "K5_DESKTOP_SETUP=$(Join-Path $output 'K5VisionSetup.exe')" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           "K5_DESKTOP_PAYLOAD=$payload" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Stage byte-admitted unqualified candidate for independent upgrade testing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = Get-Item -LiteralPath $env:K5_DESKTOP_SETUP
+          $payload = (Resolve-Path -LiteralPath desktop-build/payload).Path
+          $manifestPath = Join-Path $payload "payload-manifest.json"
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA) {
+            throw "Unqualified upgrade candidate manifest head mismatch"
+          }
+          $launcher = Get-Item -LiteralPath (Join-Path $payload "K5Vision.exe")
+          $candidate = Join-Path $env:GITHUB_WORKSPACE "desktop-build/upgrade-candidate"
+          New-Item -ItemType Directory -Force -Path $candidate | Out-Null
+          Copy-Item -LiteralPath $setup.FullName -Destination (Join-Path $candidate "K5VisionSetup.exe")
+          Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $candidate "payload-manifest.json")
+          # This artifact is NOT a release or a passed graphical witness. It
+          # exists so cross-version upgrade/reversal can run when person boxes
+          # still block the independent installed GUI acceptance.
+          @{
+            schema_version=1; qualification_status='unqualified';
+            head_sha=$env:K5_DESKTOP_HEAD_SHA;
+            setup_sha256=(Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant();
+            setup_bytes=$setup.Length;
+            launcher_sha256=(Get-FileHash -LiteralPath $launcher.FullName -Algorithm SHA256).Hash.ToLowerInvariant();
+            payload_manifest_sha256=(Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $candidate "desktop-package.json") -Encoding utf8
+      - name: Upload non-release candidate for independent upgrade and reversal qualification
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: k5-vision-windows-upgrade-candidate-${{ github.event.pull_request.head.sha || github.sha }}
+          path: desktop-build/upgrade-candidate/
+          if-no-files-found: error
+          retention-days: 14
       - name: Exercise actual installer, first-run account, tray, media and uninstall
         timeout-minutes: 12
         shell: pwsh
@@ -433,6 +467,10 @@ jobs:
   cross-revision-upgrade:
     name: Install baseline, qualify stopped upgrade and manual reversal
     needs: [native-desktop, focused-windows]
+    # Independent upgrade/reversal is not a graphical acceptance bypass.
+    # Run even when the other VM fails person-event acceptance, provided the
+    # focused Windows gates passed; a missing candidate artifact fails closed.
+    if: ${{ always() && needs.focused-windows.result == 'success' && (needs.native-desktop.result == 'success' || needs.native-desktop.result == 'failure') }}
     runs-on: windows-2025
     timeout-minutes: 30
     env:
@@ -521,10 +559,10 @@ jobs:
           if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "Baseline installer unavailable" }
           "K5_DESKTOP_BASELINE_SETUP=$setup" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           "K5_DESKTOP_BASELINE_SETUP_SHA256=$((Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant())" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
-      - name: Retrieve exact installer verified by the current source VM
+      - name: Retrieve exact unqualified candidate for independent upgrade testing
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          name: k5-vision-windows-setup-${{ github.event.pull_request.head.sha || github.sha }}
+          name: k5-vision-windows-upgrade-candidate-${{ github.event.pull_request.head.sha || github.sha }}
           path: candidate-setup
       - name: Admit candidate executable and complete release manifest
         shell: pwsh
@@ -534,7 +572,8 @@ jobs:
           $manifest = Get-Content -LiteralPath candidate-setup/payload-manifest.json -Raw | ConvertFrom-Json
           $setup = Get-Item -LiteralPath candidate-setup/K5VisionSetup.exe
           $hash = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($meta.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+          if ($meta.qualification_status -ne "unqualified" -or
+              $meta.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
               $meta.setup_sha256 -ne $hash -or $meta.setup_bytes -ne $setup.Length -or
               $meta.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath candidate-setup/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
               $meta.launcher_sha256 -notmatch '^[a-f0-9]{64}$') {
