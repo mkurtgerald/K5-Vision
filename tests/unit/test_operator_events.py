@@ -1064,6 +1064,53 @@ def test_model_priming_is_owned_and_nonblocking_when_recorded_person_is_enabled(
         asyncio.run(service.aclose())
 
 
+@pytest.mark.parametrize("prime_fails", [False, True])
+def test_completed_startup_prime_is_not_repeated_on_analytics_enable(
+    identity, store, monkeypatch, prime_fails
+):
+    # A finished or failed startup prewarm must not consume another cold
+    # inference budget after the operator enables real recorded-frame analysis.
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    sampler = RecordedFrameSampler(root)
+    source = _source()
+    requests = []
+
+    def prime_once():
+        requests.append("prime")
+        if prime_fails:
+            raise OperatorEventsError("synthetic model preparation unavailable")
+
+    monkeypatch.setattr(sampler, "prime", prime_once)
+    service = OperatorEventService(
+        store=store,
+        cameras=SimpleNamespace(list_sources=lambda: (source,)),
+        recording_root=root,
+        configuration=SimpleNamespace(artifact_root=identity.directory / "model"),
+        sampler=sampler,
+    )
+
+    async def run():
+        try:
+            await service.start()
+            first = service._native_pending
+            assert first is not None
+            if prime_fails:
+                with pytest.raises(
+                    OperatorEventsError, match="synthetic model preparation unavailable"
+                ):
+                    await asyncio.wrap_future(first)
+            else:
+                await asyncio.wrap_future(first)
+            service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
+            assert service._native_pending is first
+            assert requests == ["prime"]
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(("child_status", "expected_requests"), [(None, 0), (1, 1)])
 def test_model_prime_rechecks_child_liveness_before_trusting_cached_readiness(
     identity, monkeypatch, child_status, expected_requests
