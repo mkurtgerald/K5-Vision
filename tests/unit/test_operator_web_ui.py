@@ -51,9 +51,7 @@ def test_buffering_does_not_cancel_an_already_submitted_person_frame():
     assert "checkPersonBuffer(epoch, video, frames)" in buffer
     assert "stopPersonView(" in buffer
     # Actual revocation and camera teardown must still abort pending samples.
-    stop = source.split("function stopPersonView(", 1)[1].split(
-        "function validPersonBox(", 1
-    )[0]
+    stop = source.split("function stopPersonView(", 1)[1].split("function validPersonBox(", 1)[0]
     assert "state.personController?.abort();" in stop
 
 
