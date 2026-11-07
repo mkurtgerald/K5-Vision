@@ -83,6 +83,77 @@ def harness(monkeypatch, tmp_path):
     )
 
 
+def test_unowned_native_preparation_is_claimed_only_by_an_authorized_view(harness):
+    async def run():
+        broker = harness.make(max_views=1)
+        broker.start_preparing()
+        broker.start_preparing()
+        await broker._prewarm_task
+        assert len(harness.providers) == 1
+        assert harness.calls == []
+        owner, camera = uuid4(), uuid4()
+        result = await broker.infer(owner_id=owner, camera_id=camera, frame_id=1, frame=frame(7))
+        assert result.status == "active"
+        assert len(harness.providers) == 1
+        assert harness.calls[0][0] is harness.providers[0]
+        assert broker._prewarmed_provider is None
+        await broker.close_owner(owner)
+        assert harness.providers[0].closed == 1
+        await broker.aclose()
+        assert len(harness.providers) == 1
+
+    asyncio.run(run())
+
+
+def test_cancelled_view_does_not_cancel_media_free_model_preparation(harness):
+    async def run():
+        broker = harness.make(max_views=1)
+        started, release = asyncio.Event(), asyncio.Event()
+        original = broker._factory
+
+        async def delayed_factory():
+            started.set()
+            await release.wait()
+            return await original()
+
+        broker._factory = delayed_factory
+        broker.start_preparing()
+        await started.wait()
+        owner, camera = uuid4(), uuid4()
+        pending = asyncio.create_task(
+            broker.infer(owner_id=owner, camera_id=camera, frame_id=1, frame=frame())
+        )
+        await asyncio.sleep(0)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert harness.providers == []
+        release.set()
+        await broker._prewarm_task
+        assert len(harness.providers) == 1 and harness.calls == []
+        result = await broker.infer(owner_id=owner, camera_id=camera, frame_id=2, frame=frame(5))
+        assert result.status == "active"
+        assert harness.calls[0][0] is harness.providers[0]
+        await broker.aclose()
+        assert harness.providers[0].closed == 1
+
+    asyncio.run(run())
+
+
+def test_unused_prepared_model_is_closed_without_receiving_camera_media(harness):
+    async def run():
+        broker = harness.make(max_views=1)
+        broker.start_preparing()
+        await broker._prewarm_task
+        assert len(harness.providers) == 1 and harness.calls == []
+        await broker.aclose()
+        assert harness.providers[0].closed == 1
+        broker.start_preparing()
+        assert len(harness.providers) == 1
+
+    asyncio.run(run())
+
+
 def test_person_boxes_only_and_no_producer_identity_or_media_retained(harness):
     harness.values[0] = (
         detection(),

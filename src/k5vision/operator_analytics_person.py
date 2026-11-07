@@ -187,7 +187,10 @@ class _PersonDetector:
         from openvino.preprocess import ColorFormat, PrePostProcessor, ResizeAlgorithm
 
         xml, weights = _model_bytes(config)
-        model = ov.Core().read_model(
+        # A single native Core owns model admission and CPU compilation. Cold
+        # installed sampled views must not initialize a second OpenVINO core.
+        core = ov.Core()
+        model = core.read_model(
             model=xml.decode("utf-8"), weights=ov.Tensor(np.frombuffer(weights, dtype=np.uint8))
         )
         if (
@@ -203,7 +206,7 @@ class _PersonDetector:
         ).set_color_format(ColorFormat.BGR).set_spatial_dynamic_shape()
         processing.input().preprocess().resize(ResizeAlgorithm.RESIZE_LINEAR)
         processing.input().model().set_layout(ov.Layout("NCHW"))
-        compiled = ov.Core().compile_model(
+        compiled = core.compile_model(
             processing.build(), "CPU", {"INFERENCE_NUM_THREADS": 2, "NUM_STREAMS": "1"}
         )
         self._numpy = np

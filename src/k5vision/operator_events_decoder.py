@@ -25,20 +25,50 @@ def decode(path: str):
             return None
         count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
         fps = capture.get(cv2.CAP_PROP_FPS)
-        if math.isfinite(count) and math.isfinite(fps) and count > 0 and fps > 0:
-            capture.set(cv2.CAP_PROP_POS_MSEC, max(0, (count / fps - 2) * 1000))
+        tail_offset = (
+            max(0, (count / fps - 2) * 1000)
+            if math.isfinite(count) and math.isfinite(fps) and count > 0 and fps > 0
+            else 0
+        )
+        if tail_offset > 0:
+            capture.set(cv2.CAP_PROP_POS_MSEC, tail_offset)
         selected = None
         deadline = time.monotonic() + 3
-        for _index in range(8192):
-            if time.monotonic() >= deadline:
+        # A growing fragmented MP4 can expose dimensions/count before its last
+        # fragment supports seeking. An empty tail seek is not an empty recording.
+        # Try a rewind and, if necessary, a fresh decoder on the same immutable
+        # snapshot. Keep all attempts inside the same three-second decode budget;
+        # never invent timestamps or inspect a different recording.
+        for attempt in range(3 if tail_offset > 0 else 1):
+            for _index in range(8192):
+                if time.monotonic() >= deadline:
+                    break
+                ready, frame = capture.read()
+                if not ready:
+                    break
+                elapsed = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000
+                # Event UTC must use the recorded presentation timestamp only.
+                if math.isfinite(elapsed) and 0 <= elapsed <= 3605:
+                    selected = frame, elapsed
+            if selected is not None or time.monotonic() >= deadline:
                 break
-            ready, frame = capture.read()
-            if not ready:
-                break
-            elapsed = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000
-            # No arrival-time or guessed-FPS fallback may become event UTC.
-            if math.isfinite(elapsed) and 0 <= elapsed <= 3605:
-                selected = frame, elapsed
+            if attempt == 0:
+                capture.set(cv2.CAP_PROP_POS_MSEC, 0)
+            elif attempt == 1:
+                # Some FFmpeg backends cannot rewind a fragmented index in
+                # place. Reopening resets the decoder without changing bytes.
+                capture.release()
+                capture = cv2.VideoCapture(
+                    path,
+                    cv2.CAP_FFMPEG,
+                    [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 1500, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1500],
+                )
+                if (
+                    not capture.isOpened()
+                    or capture.get(cv2.CAP_PROP_FRAME_WIDTH) != width
+                    or capture.get(cv2.CAP_PROP_FRAME_HEIGHT) != height
+                ):
+                    break
         if selected is None:
             return None
         frame, elapsed = selected
@@ -51,8 +81,10 @@ def decode(path: str):
 def main() -> int:
     detector = None
     artifact_root = None
+    phase = "protocol"
     try:
         while True:
+            phase = "protocol"
             raw = sys.stdin.buffer.readline(8193)
             if not raw:
                 return 0
@@ -63,7 +95,8 @@ def main() -> int:
                 type(request) is not dict
                 or request.keys() != {"path", "artifact_root"}
                 or not isinstance(request["path"], str)
-                or not 1 <= len(request["path"]) <= 4096
+                or not 0 <= len(request["path"]) <= 4096
+                or (not request["path"] and request["artifact_root"] is None)
                 or (
                     request["artifact_root"] is not None
                     and (
@@ -75,6 +108,35 @@ def main() -> int:
                 return 1
             if artifact_root is not None and artifact_root != request["artifact_root"]:
                 return 1
+            if request["path"] == "":
+                # A model-only warmup has no camera source, stored pixels or
+                # presentation timestamp. It uses the normal bounded worker.
+                if detector is None:
+                    from pathlib import Path
+
+                    from k5vision.operator_analytics_person import (
+                        OperatorPersonConfiguration,
+                        _PersonDetector,
+                    )
+
+                    artifact_root = request["artifact_root"]
+                    phase = "model"
+                    detector = _PersonDetector(OperatorPersonConfiguration(Path(artifact_root)))
+                # CPU kernels may finish JIT initialization only on their
+                # first inference. Exercise that boundary with synthetic zero
+                # pixels before the recording sampler enters the 25s event gate.
+                # Never emit the synthetic result as a real person event.
+                phase = "inference"
+                detector.infer(bytes(544 * 320 * 4), 544, 320, 544 * 4, 0)
+                phase = "protocol"
+                sys.stdout.buffer.write(b'{"status":"primed"}\n')
+                sys.stdout.buffer.flush()
+                continue
+            phase = "decode"
+            # A finite, source-free phase notice distinguishes slow decoding from
+            # model compilation without publishing any recording identity or pixels.
+            sys.stdout.buffer.write(b'{"status":"phase","phase":"decode"}\n')
+            sys.stdout.buffer.flush()
             result = decode(request["path"])
             if result is None:
                 sys.stdout.buffer.write(b'{"status":"empty"}\n')
@@ -92,11 +154,18 @@ def main() -> int:
                     )
 
                     artifact_root = request["artifact_root"]
+                    phase = "model"
+                    sys.stdout.buffer.write(b'{"status":"phase","phase":"model"}\n')
+                    sys.stdout.buffer.flush()
                     detector = _PersonDetector(OperatorPersonConfiguration(Path(artifact_root)))
+                phase = "inference"
+                sys.stdout.buffer.write(b'{"status":"phase","phase":"inference"}\n')
+                sys.stdout.buffer.flush()
                 detections = [
                     {"category": item.category, "confidence": item.confidence}
                     for item in detector.infer(pixels, 544, 320, 544 * 4, int(elapsed * 1000))
                 ]
+            phase = "protocol"
             header = json.dumps(
                 {
                     "status": "ready",
@@ -108,7 +177,15 @@ def main() -> int:
             sys.stdout.buffer.write(header + b"\n" + pixels)
             sys.stdout.buffer.flush()
     except BaseException:
-        # Native/module/filesystem exception details never cross the worker pipe.
+        # Send a fixed, source-free phase to the owning parent only. Never
+        # serialize exception text, model paths, source URIs or recording bytes.
+        try:
+            sys.stdout.buffer.write(
+                json.dumps({"status": "failed", "phase": phase}).encode("ascii") + b"\n"
+            )
+            sys.stdout.buffer.flush()
+        except (OSError, ValueError):
+            pass
         return 1
 
 

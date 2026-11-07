@@ -160,6 +160,21 @@ def generate_operator_gateway_configuration(
     # through cancellation. Do not cut that operation off at the media timeout.
     administration["transport"]["response_header_timeout"] = "80s"
     administration["transport"]["read_timeout"] = "80s"
+    # Sampled native person inference may initialize a sealed CPU model for up
+    # to 15 seconds and then process a frame for up to 2 seconds. The ordinary
+    # ten-second HTTP response-header deadline drops legitimate cold requests.
+    # Give only this authenticated POST a 23-second upstream budget, below the
+    # browser's 24-second deadline; all other API and media deadlines stay put.
+    person_sample = _proxy(control_port)
+    person_sample["transport"]["response_header_timeout"] = "23s"
+    person_sample["transport"]["read_timeout"] = "23s"
+    # The bounded native ONVIF credential/profile probe may spend up to 15
+    # seconds on a camera. The generic ten-second upstream header deadline
+    # otherwise returns HTTP 504 before that authorized probe can finish.
+    # Only credential/profile POST receives an 18-second upstream budget.
+    camera_profiles = _proxy(control_port)
+    camera_profiles["transport"]["response_header_timeout"] = "18s"
+    camera_profiles["transport"]["read_timeout"] = "18s"
     if public_port == 80:
         # Browsers omit the default HTTP port from Host even when the URL
         # explicitly contains it. Both forms still address this one listener.
@@ -196,6 +211,21 @@ def generate_operator_gateway_configuration(
                 }
             ],
             "handle": [administration],
+            "terminal": True,
+        },
+        {
+            "match": [
+                {
+                    "method": ["POST"],
+                    "path": ["/api/v1/operator/cameras/*/person-view"],
+                }
+            ],
+            "handle": [person_sample],
+            "terminal": True,
+        },
+        {
+            "match": [{"method": ["POST"], "path": ["/api/v1/operator/camera-profiles"]}],
+            "handle": [camera_profiles],
             "terminal": True,
         },
         {

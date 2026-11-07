@@ -340,6 +340,7 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
     person_probe_statuses = {"authorized": None, "revoked": None, "anonymous": None}
     script_errors = []
     request_failures = {}
+    pixel_evidence = {}
     started = time.monotonic()
     baseline_threads = {thread.ident for thread in threading.enumerate()}
     receipt = {
@@ -516,7 +517,22 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         with page.expect_response(
             lambda response: urlsplit(response.url).path == sample_route
         ) as sample:
-            page.locator("#toggle-person-view").click()
+            with page.expect_request(
+                lambda request: (
+                    request.method == "POST" and urlsplit(request.url).path == sample_route
+                )
+            ):
+                page.locator("#toggle-person-view").click()
+            # Reproduce a transient HLS waiting notification while the exact
+            # captured-frame inference is in flight. The production UI must
+            # keep that request alive and recover on playing; no substitute
+            # detection response or acceptance shortcut is provided here.
+            page.locator("#live-video").dispatch_event("waiting")
+            _require(
+                page.locator("#toggle-person-view").get_attribute("aria-pressed") == "true",
+                "Brief live buffering aborted an in-flight sampled person frame",
+            )
+            page.locator("#live-video").dispatch_event("playing")
         result, posted_pixels = _sample_contract(sample.value)
         stage = "positive_sample_canvas"
         page.locator("#person-view-canvas").wait_for(state="visible")
@@ -555,15 +571,28 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         )
         matching_fraction = canvas["matching"]
         overlay_pixels = canvas["added_overlay"]
+        # Aggregate proof only: never retain the sample, video, URL or screenshot.
+        pixel_evidence = {
+            "frame_match_permille": min(1000, max(0, int(matching_fraction * 1000))),
+            "added_overlay_pixels": min(544 * 320, max(0, int(overlay_pixels))),
+        }
         stage = "sample_frame_and_box_pixels"
         stage = "positive_sample_controls"
         _require(
             matching_fraction >= 0.90 and overlay_pixels >= 100,
             "The person canvas did not combine the submitted frozen frame and visible boxes",
         )
-        _require(
+        sample_message_correlated = (
             "in this sample" in page.locator("#person-view-message").inner_text()
-            and page.locator("#toggle-person-view").get_attribute("aria-pressed") == "true",
+        )
+        sample_toggle_pressed = (
+            page.locator("#toggle-person-view").get_attribute("aria-pressed") == "true"
+        )
+        # Fixed booleans only; never copy camera text, pixels or request bodies.
+        pixel_evidence["sample_message_correlated"] = sample_message_correlated
+        pixel_evidence["sample_toggle_pressed"] = sample_toggle_pressed
+        _require(
+            sample_message_correlated and sample_toggle_pressed,
             "The positive person sample was not visible in the real operator UI",
         )
         receipt.update(
@@ -748,6 +777,7 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
             "person_probe_statuses": person_probe_statuses,
             "script_error_codes": script_errors[:32],
             "request_failure_counts": request_failures,
+            "positive_sample_pixel_evidence": pixel_evidence,
             "cleanup_failure_codes": cleanup_failures,
             "product_thread_alive": bool(product and product.thread.is_alive()),
             "product_thread_failed": bool(product and product.failed),

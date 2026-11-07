@@ -9,6 +9,8 @@
   const DAY = 86400000;
   const TIME_SAMPLE_MAX_AGE = 30000;
   const RETRY_DELAYS = [1000, 2000, 4000, 8000, 10000];
+  const PERSON_BUFFER_GRACE_MS = 5000;
+  const CAMERA_PROFILE_REQUEST_MS = 20000;
   const ROLE_PERMISSIONS = Object.freeze({
     viewer: ["cameras.view_live", "cameras.playback"],
     operator: ["cameras.view_live", "cameras.playback", "cameras.export"],
@@ -57,6 +59,7 @@
     recorderTime: null, sessionExpiresAt: null, sessionExpirySteady: null,
     removeTarget: null, removing: false,
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
+    personBufferTimer: null,
     personFrameId: 0,
     recordingBusy: false, cameraListEpoch: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
     playbackStart: null, playbackEnd: null, playbackPosition: null, playbackEpoch: 0, selectedStatus: null,
@@ -887,6 +890,8 @@
     state.personEpoch += 1;
     clearTimeout(state.personTimer);
     state.personTimer = null;
+    clearTimeout(state.personBufferTimer);
+    state.personBufferTimer = null;
     state.personController?.abort();
     state.personController = null;
     const canvas = $("person-view-canvas");
@@ -934,7 +939,7 @@
       const frameId = state.personFrameId = (state.personFrameId + 1) % 2147483648;
       const query = new URLSearchParams({ width: String(width), height: String(height), frame_id: String(frameId) });
       const result = await request(`/api/v1/operator/cameras/${encodeURIComponent(cameraId)}/person-view?${query}`, {
-        method: "POST", rawBody: pixels, signal: controller.signal,
+        method: "POST", rawBody: pixels, signal: controller.signal, timeout: 24000,
       });
       if (epoch !== state.personEpoch || !state.personEnabled || cameraId !== state.selected || !canSamplePerson()) return;
       if (!result || result.frame_id !== frameId || !["active", "busy", "unavailable"].includes(result.status)
@@ -943,8 +948,11 @@
         stopPersonView("Person detection is unavailable. Live video and recording continue. Start sampled view to retry.");
         return;
       }
-      if (result.status === "busy") message("person-view-message", "Person detection is busy. Waiting for the next sample…");
-      else {
+      if (result.status === "busy") {
+        // Busy has no boxes. Never erase the last valid frozen-frame overlay
+        // while another native worker owns inference capacity.
+        if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
+      } else {
         // The response belongs to this exact frozen sample, never the moving
         // live player. Publish frame and boxes together in one canvas update.
         const canvas = $("person-view-canvas");
@@ -963,7 +971,7 @@
       }
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.personEpoch || !state.token) return;
-      if (error.status === 429) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
+      if (error.status === 429 && $("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
       else stopPersonView(apiMessage(error, "Person detection is unavailable. Live video and recording continue. Start sampled view to retry."));
     } finally {
       pixels?.fill(0);
@@ -1917,13 +1925,43 @@
   $("play-live").addEventListener("click", () => void $("live-video").play().catch(() => message("live-state", "Unable to play live video. Try reconnecting.")));
   $("live-video").addEventListener("playing", () => {
     if (!state.token || state.view !== "live") return;
+    // A transient HLS rebuffer must not abort an immutable person-frame POST.
+    clearTimeout(state.personBufferTimer);
+    state.personBufferTimer = null;
     $("live-placeholder").hidden = true; $("live-video-label").hidden = false; $("play-live").hidden = true;
     message("live-state", "Live video connected");
     renderPersonControls();
   });
   $("live-video").addEventListener("pause", () => { if (state.personEnabled) stopPersonView("Sampled view stopped while live video is paused."); });
+  function checkPersonBuffer(epoch, video, frames) {
+    if (!state.personEnabled || state.personEpoch !== epoch) return;
+    const current = video.getVideoPlaybackQuality?.().totalVideoFrames;
+    if (video.paused || video.readyState < 2 || !Number.isFinite(frames)
+      || !Number.isFinite(current) || current <= frames) {
+      if (state.personController) {
+        // An immutable sample is already in flight. Buffering the subsequent
+        // live frames must not abort its authenticated, bounded inference.
+        // Session revocation, camera changes and actual stream teardown still
+        // call stopPersonView() and abort it immediately.
+        state.personBufferTimer = setTimeout(() => {
+          state.personBufferTimer = null;
+          checkPersonBuffer(epoch, video, frames);
+        }, 1000);
+      } else {
+        stopPersonView("Sampled view stopped while live video is buffering. Start it again when video returns.");
+      }
+    }
+  }
   $("live-video").addEventListener("waiting", () => {
-    if (state.personEnabled) stopPersonView("Sampled view stopped while live video is buffering. Start it again when video returns.");
+    if (state.personEnabled && state.personBufferTimer === null) {
+      const epoch = state.personEpoch;
+      const video = $("live-video");
+      const frames = video.getVideoPlaybackQuality?.().totalVideoFrames;
+      state.personBufferTimer = setTimeout(() => {
+        state.personBufferTimer = null;
+        checkPersonBuffer(epoch, video, frames);
+      }, PERSON_BUFFER_GRACE_MS);
+    }
     if (state.token && state.view === "live") {
       $("live-video-label").hidden = true;
       message("live-state", "Buffering live video…");
@@ -2318,6 +2356,9 @@
     try {
       const tested = await request(direct ? "/api/v1/operator/camera-stream-probe" : "/api/v1/operator/camera-profiles", {
         method: "POST", body: credentials, signal: controller.signal,
+        // Allow the bounded native ONVIF probe and 18-second proxy budget to finish.
+        // RTSP probe and all other API requests retain the normal 15-second limit.
+        ...(direct ? {} : { timeout: CAMERA_PROFILE_REQUEST_MS }),
       });
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       if (typeof tested.probe_id !== "string" || !tested.probe_id || tested.probe_id.length > 256 || tested.probe_id.includes("://") ||

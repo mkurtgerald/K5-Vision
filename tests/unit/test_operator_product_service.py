@@ -631,6 +631,47 @@ def test_diagnostics_projects_only_last_aggregate_storage_sample(
     assert "rtsp://" not in text
 
 
+def test_active_recorded_person_inventory_interest_refreshes_private_storage_cache(
+    native, monkeypatch
+):
+    _fast_maintenance(native, monkeypatch)
+    sampled_paths = []
+    scans = []
+    original_prune = _Storage.prune
+
+    def private_inventory(_storage, path):
+        sampled_paths.append(path)
+        return {}
+
+    def tracked_prune(storage):
+        scans.append(native.module.time.monotonic())
+        return original_prune(storage)
+
+    monkeypatch.setattr(_Storage, "recording_files", private_inventory, raising=False)
+    monkeypatch.setattr(_Storage, "prune", tracked_prune)
+    service = native.service
+    source = _source(1)
+
+    async def scenario():
+        try:
+            await service.start((source,))
+            await _until(lambda: len(scans) >= 1)
+            previous = len(scans)
+            request_time = native.module.time.monotonic()
+            assert service.recording_files(source.binding) == {}
+            assert sampled_paths == [source.binding.path_name]
+            # The recorder continues to use its bounded cache, but a recent
+            # analytics consumer must see the next retention scan before the
+            # idle 15-second cadence, without walking the directory itself.
+            await _until(lambda: len(scans) > previous)
+            assert 0 <= scans[previous] - request_time <= 10
+            assert service.status() == "ready"
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
 def test_maintenance_observes_clock_steps_without_pausing_recording(native, monkeypatch):
     _fast_maintenance(native, monkeypatch)
     samples = SimpleNamespace(count=0, monotonic=0.0)
@@ -1164,10 +1205,11 @@ def test_configured_person_broker_closes_even_when_recording_startup_fails(
     import k5vision.operator_analytics_person as person_module
 
     closed = []
+    view_limits = []
 
     class Broker:
-        def __init__(self, _config):
-            pass
+        def __init__(self, _config, *, max_views):
+            view_limits.append(max_views)
 
         async def aclose(self):
             closed.append(True)
@@ -1181,9 +1223,63 @@ def test_configured_person_broker_closes_even_when_recording_startup_fails(
     with pytest.raises(OperatorProductError, match="startup"):
         with TestClient(app):
             pass
+    assert view_limits == [4]
     assert closed == [True]
     assert calls == [("start", ()), ("stop", ())]
     assert app.state.operator_camera_store.closed
+    _assert_profile_lease_available(tmp_path / "identity")
+
+
+def test_bundled_person_model_enables_bounded_sampled_view_without_override(
+    native, tmp_path, monkeypatch
+):
+    import k5vision.operator_analytics as broker_module
+    import k5vision.operator_analytics_person as person_module
+
+    view_limits = []
+    preparing = []
+    closed = []
+
+    class Broker:
+        def __init__(self, _config, *, max_views):
+            view_limits.append(max_views)
+
+        def start_preparing(self):
+            preparing.append(True)
+
+        async def expire_idle(self):
+            pass
+
+        async def aclose(self):
+            closed.append(True)
+
+    monkeypatch.delenv(person_module.PERSON_CONFIG_ENV, raising=False)
+    monkeypatch.setattr(
+        person_module, "load_installed_person_configuration", lambda _environment: object()
+    )
+    monkeypatch.setattr(broker_module, "OperatorAnalyticsBroker", Broker)
+    app, calls = _product_application(native, tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.get("/api/v1/health").status_code == 200
+        assert app.state.operator_person_status == "configured"
+        assert calls == [("start", ())]
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "pilot-admin", "password": "local-test-password"},
+        )
+        assert login.status_code == 200
+        result = client.get(
+            "/api/v1/operator/cameras",
+            headers={"Authorization": "Bearer " + login.json()["session_token"]},
+        )
+        assert result.status_code == 200 and result.json()["cameras"] == []
+        # A fresh account has no camera to prepare. Preserve login/API
+        # responsiveness while keeping the sealed native broker configured.
+        assert preparing == []
+    assert view_limits == [1]
+    assert preparing == []
+    assert closed == [True]
+    assert calls == [("start", ()), ("stop", ())]
     _assert_profile_lease_available(tmp_path / "identity")
 
 
@@ -1235,3 +1331,58 @@ def test_second_product_application_cannot_start_workers_for_an_active_identity(
             probe.close()
     assert first_calls == [("start", ()), ("stop", ())]
     _assert_profile_lease_available(tmp_path / "identity")
+
+
+def test_native_person_warmup_waits_for_quiet_camera_enrollment():
+    from k5vision.operator_product_api import _NativePersonWarmupGate
+
+    calls = []
+
+    class Broker:
+        def start_preparing(self):
+            calls.append("prepare")
+
+    async def exercise():
+        gate = _NativePersonWarmupGate(Broker(), quiet_seconds=10)
+        gate.schedule()
+        first = gate._handle
+        assert first is not None and not first.cancelled()
+        gate.schedule()
+        assert gate._handle is first
+        gate.schedule(enrollment=True)
+        second = gate._handle
+        assert first.cancelled()
+        assert second is not None and second is not first and not second.cancelled()
+        assert not calls
+        gate._begin()
+        assert calls == ["prepare"]
+        gate.schedule(enrollment=True)
+        assert calls == ["prepare"]
+        gate.close()
+        assert gate._closed
+
+    asyncio.run(exercise())
+
+
+def test_native_person_warmup_cancelled_on_product_shutdown():
+    from k5vision.operator_product_api import _NativePersonWarmupGate
+
+    calls = []
+
+    class Broker:
+        def start_preparing(self):
+            calls.append("prepare")
+
+    async def exercise():
+        gate = _NativePersonWarmupGate(Broker(), quiet_seconds=10)
+        gate.schedule()
+        pending = gate._handle
+        assert pending is not None
+        gate.close()
+        assert pending.cancelled()
+        assert gate._handle is None
+        gate._begin()
+        gate.schedule(enrollment=True)
+        assert calls == []
+
+    asyncio.run(exercise())

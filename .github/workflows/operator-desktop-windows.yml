@@ -269,6 +269,8 @@ jobs:
             'product_analytics_enablement', 'analytics_bundled_native_inference',
             'analytics_gui_configuration', 'analytics_person_event_recorded',
             'analytics_event_utc_playback', 'analytics_public_fixture_only',
+            'analytics_sampled_native_boxes', 'analytics_sampled_same_frame_overlay',
+            'analytics_sampled_canvas_cleared',
             'analytics_browser_closed_detection', 'analytics_role_camera_permissions',
             'analytics_settings_events_persisted',
             'settings_admin_gui',
@@ -319,6 +321,7 @@ jobs:
             direct_rtsp_enrollment=$true
             admin_user_management=$true; role_permissions=$true; camera_access_controls=$true
             person_analytics_bundled=$true; background_person_events=$true
+            installed_person_sampled_boxes=$true
             storage_settings=$true; windows_time_administration=$true; camera_time_administration=$true
             operational_audit=$true; custom_roles=$true; mfa=$true; oidc_sso=$true
             neural_adapter_v2=$true; analytics_event_adapter=$true; shared_neural_host=$false

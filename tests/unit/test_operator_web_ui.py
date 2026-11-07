@@ -23,6 +23,38 @@ _CAMERA = "e4fd401d-ae8e-4ac2-9f92-e8287f241532"
 _OTHER = "2cad3cbb-c56a-4368-b3e6-e5032576b77a"
 
 
+def test_busy_person_sample_preserves_last_verified_canvas_until_new_active_sample():
+    """A transient native-capacity busy response has no boxes to redraw."""
+    source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    busy_branch = 'if (result.status === "busy") {'
+    assert source.count(busy_branch) == 1
+    after_busy = source.split(busy_branch, 1)[1]
+    busy_body, active_body = after_busy.split("} else {", 1)
+    assert '"person-view-canvas").hidden' in busy_body
+    assert "putImageData" not in busy_body
+    assert "canvas.width =" not in busy_body
+    assert "output.putImageData(snapshot, 0, 0);" in active_body
+    assert "output.strokeRect" in active_body
+
+
+def test_buffering_does_not_cancel_an_already_submitted_person_frame():
+    """One frozen authorized sample must finish independently of later HLS buffering."""
+    source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    buffer = source.split("function checkPersonBuffer(", 1)[1].split(
+        '$("live-video").addEventListener("waiting"', 1
+    )[0]
+    assert "if (state.personController)" in buffer
+    assert "checkPersonBuffer(epoch, video, frames)" in buffer
+    assert "stopPersonView(" in buffer
+    # Actual revocation and camera teardown must still abort pending samples.
+    stop = source.split("function stopPersonView(", 1)[1].split("function validPersonBox(", 1)[0]
+    assert "state.personController?.abort();" in stop
+
+
 def _ui_core(account):
     return {
         "id": account.get("id", "a22c22bc-4089-45b7-a370-f360bb9d33c0"),
@@ -508,6 +540,13 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
               // Playback itself is qualified by the actual media acceptance.
               // Keep the authentic media-session DTO while disabling transport.
               window.Hls = {isSupported: () => false};
+              // Capture actual production request deadlines, without clock sleeps.
+              window.__k5RequestDeadlines = [];
+              const realDeadline = AbortSignal.timeout.bind(AbortSignal);
+              AbortSignal.timeout = (ms) => {
+                window.__k5RequestDeadlines.push(ms);
+                return realDeadline(ms);
+              };
               const RealDate = Date;
               window.Date = class extends RealDate {
                 constructor(...args) { super(...(args.length ? args : [RealDate.now() + shift])); }
@@ -797,6 +836,9 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
         expect(page.locator("#sign-in")).to_be_visible()
         expect(notice).not_to_be_visible()
         assert calls == {"profiles": 2, "connect": 1}
+        # Both ONVIF profile probes use the finite 20s UI budget; the
+        # installed backend may legitimately use most of its 12s socket limit.
+        assert page.evaluate("window.__k5RequestDeadlines.filter(ms => ms === 20000).length") >= 2
         assert not script_errors
     finally:
         if context is not None:
@@ -944,7 +986,18 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
         assert baseline_sources[-1] == media_urls(_CAMERA)["live_url"]
         page.evaluate("window.__selectedHlsIndex = window.__hlsPlayers.length - 1")
         if outcome == "logout_race":
-            page.locator("#sign-out-button").click()
+            # The request event can precede route interception on Windows.
+            # Wait for the intentionally withheld logout route rather than
+            # assuming the handler has already run when click() returns.
+            with page.expect_request(
+                lambda request: urlsplit(request.url).path == "/api/v1/auth/logout",
+                timeout=10_000,
+            ):
+                page.locator("#sign-out-button").click()
+            for _ in range(100):
+                if pending:
+                    break
+                page.wait_for_timeout(50)
             assert len(pending) == 1
             page.locator("#wall-tab").click()
             page.evaluate("""async () => {

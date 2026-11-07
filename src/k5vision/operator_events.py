@@ -39,6 +39,11 @@ MAX_EVENT_ROWS = 100_000
 MAX_RECORDING_ENTRIES = 100_000
 MAX_RECORDING_BYTES = 128 * 1024 * 1024
 _NATIVE_REQUEST_SECONDS = 8.0
+# The first native person inference compiles the admitted OpenVINO CPU model.
+# The installed view broker allows 15s for this same cold preparation. Do not
+# kill the recording detector at 8s before its first inference can finish.
+# Subsequent requests retain the original tight deadline.
+_NATIVE_COLD_PERSON_REQUEST_SECONDS = 18.0
 _DATABASE = "operator-events.sqlite3"
 
 
@@ -339,6 +344,13 @@ class _RecordedNativeWorker:
         self._job = None
         self._lock = threading.RLock()
         self._closing = threading.Event()
+        self._person_ready = False
+        self._failure_phase = "native_not_started"
+
+    def _request_timeout(self) -> float:
+        if self._configuration is not None and not self._person_ready:
+            return _NATIVE_COLD_PERSON_REQUEST_SECONDS
+        return _NATIVE_REQUEST_SECONDS
 
     def _start(self) -> None:
         from k5vision.operator_native_process import _WindowsJob
@@ -352,7 +364,10 @@ class _RecordedNativeWorker:
         process = None
         try:
             process = subprocess.Popen(
-                [sys.executable, "-B", "-m", "k5vision.operator_events_decoder"],
+                # Match the exact isolated embedded-runtime child admission
+                # exercised during desktop packaging. Never load modules from
+                # the installed working directory or inherited Python paths.
+                [sys.executable, "-I", "-B", "-m", "k5vision.operator_events_decoder"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -363,6 +378,8 @@ class _RecordedNativeWorker:
             if job is not None:
                 job.assign(process)
             self._process, self._job = process, job
+            # A replacement child has not compiled its sealed person model.
+            self._person_ready = False
         except BaseException:
             if process is not None:
                 process.kill()
@@ -371,11 +388,16 @@ class _RecordedNativeWorker:
                 job.close()
             raise OperatorEventsError("Analytics worker ownership unavailable") from None
 
-    def request(self, path: Path):
+    def request(self, path: Path | None):
+        """A None path primes the bundled model without opening camera media."""
         with self._lock:
+            if path is None and self._configuration is None:
+                raise OperatorEventsError("Analytics model priming unavailable")
             if self._closing.is_set():
                 raise OperatorEventsError("Analytics worker is closed")
+            self._failure_phase = "native_launch_failed"
             self._start()
+            self._failure_phase = "native_write_failed"
             process = self._process
             if self._closing.is_set():
                 self.close()
@@ -389,30 +411,96 @@ class _RecordedNativeWorker:
                 except OSError:
                     pass
 
-            timer = threading.Timer(_NATIVE_REQUEST_SECONDS, deadline)
+            timer = threading.Timer(self._request_timeout(), deadline)
             timer.daemon = True
             timer.start()
             failed = False
             try:
                 request = {
-                    "path": str(path),
+                    "path": "" if path is None else str(path),
                     "artifact_root": None
                     if self._configuration is None
                     else str(self._configuration.artifact_root),
                 }
-                process.stdin.write(json.dumps(request).encode("utf-8") + b"\n")
-                process.stdin.flush()
-                raw = process.stdout.readline(4097)
-                if not raw.endswith(b"\n") or len(raw) > 4096:
+                payload = json.dumps(request).encode("utf-8") + b"\n"
+                try:
+                    process.stdin.write(payload)
+                    process.stdin.flush()
+                except BrokenPipeError:
+                    # The Windows child can exit before accepting its first
+                    # snapshot. Reap it before one replacement; never retry a
+                    # model, decoder, inference or response-protocol failure.
+                    # The original deadline also owns the replacement.
+                    if expired.is_set() or self._closing.is_set():
+                        raise
+                    self.close(final=False)
+                    self._start()
+                    process = self._process
+                    self._failure_phase = "native_write_failed"
+                    if expired.is_set() or self._closing.is_set():
+                        process.kill()
+                        raise TimeoutError from None
+                    process.stdin.write(payload)
+                    process.stdin.flush()
+                self._failure_phase = "native_reply_missing"
+                # A child may report only these fixed processing phases before
+                # its response. Four bounded headers (three stages + result)
+                # retain the original kill timer and refuse unbounded chatter.
+                for _ in range(4):
+                    raw = process.stdout.readline(4097)
+                    if not raw.endswith(b"\n") or len(raw) > 4096:
+                        self._failure_phase = "native_reply_missing"
+                        raise ValueError
+                    self._failure_phase = "native_header_invalid"
+                    header = json.loads(raw)
+                    if type(header) is not dict:
+                        raise ValueError
+                    if header.get("status") != "phase":
+                        break
+                    phase = header.get("phase")
+                    if set(header) != {"status", "phase"} or phase not in {
+                        "decode",
+                        "model",
+                        "inference",
+                    }:
+                        raise ValueError
+                    self._failure_phase = {
+                        "decode": "native_decoder_active",
+                        "model": "native_model_active",
+                        "inference": "native_inference_active",
+                    }[phase]
+                else:
+                    self._failure_phase = "native_header_invalid"
                     raise ValueError
-                header = json.loads(raw)
+                if header.get("status") == "primed":
+                    if path is not None or set(header) != {"status"}:
+                        raise ValueError
+                    self._person_ready = True
+                    self._failure_phase = "native_none"
+                    return None
+                if header.get("status") == "failed":
+                    failure_phases = {
+                        "protocol": "native_protocol_failed",
+                        "decode": "native_decode_failed",
+                        "model": "native_model_failed",
+                        "inference": "native_inference_failed",
+                    }
+                    phase = header.get("phase")
+                    self._failure_phase = (
+                        failure_phases.get(phase, "native_transport_failed")
+                        if type(phase) is str
+                        else "native_transport_failed"
+                    )
+                    raise ValueError
                 if header.get("status") == "empty":
                     return None
                 if header.get("status") != "ready" or header.get("bytes") != 544 * 320 * 4:
                     raise ValueError
+                self._failure_phase = "native_payload_incomplete"
                 payload = process.stdout.read(544 * 320 * 4)
                 if len(payload) != 544 * 320 * 4:
                     raise ValueError
+                self._failure_phase = "native_reply_invalid"
                 elapsed = header["elapsed"]
                 if (
                     type(elapsed) not in (int, float)
@@ -437,8 +525,14 @@ class _RecordedNativeWorker:
                             raise ValueError
                         detections.append(SimpleNamespace(category="person", confidence=confidence))
                     detections = tuple(detections)
+                    # This acknowledgement came from the owning native child.
+                    # An empty frame never admits readiness for a later request.
+                    self._person_ready = True
+                self._failure_phase = "native_none"
                 return elapsed, payload, detections
             except Exception:
+                if expired.is_set():
+                    self._failure_phase = "native_timeout"
                 failed = True
                 raise OperatorEventsError("Analytics native frame unavailable") from None
             finally:
@@ -502,8 +596,14 @@ class RecordedFrameSampler:
         self._observations: dict[UUID, dict[str, tuple[int, int, int]]] = {}
         self._recording_files = recording_files
         self._active_files: dict[UUID, tuple[str, ...]] = {}
+        # Directory names establish a cold, content-free baseline so cache
+        # lag cannot mistake retained footage for newly arriving segments.
+        self._known_names: dict[UUID, set[str]] = {}
+        self._directory_mtime: dict[UUID, int] = {}
         self._closing = threading.Event()
         self._worker_lock = threading.RLock()
+        # Finite in-memory outcome; never a path, source URI or recorded frame.
+        self._capture_outcome = "not_started"
 
     def prune(self, active: set[UUID]) -> None:
         """Forget removed camera hints without touching retained recording files."""
@@ -517,6 +617,16 @@ class RecordedFrameSampler:
             for identifier, value in self._active_files.items()
             if identifier in active
         }
+        self._known_names = {
+            identifier: value
+            for identifier, value in self._known_names.items()
+            if identifier in active
+        }
+        self._directory_mtime = {
+            identifier: value
+            for identifier, value in self._directory_mtime.items()
+            if identifier in active
+        }
 
     @staticmethod
     def _started(name: str) -> datetime:
@@ -527,14 +637,30 @@ class RecordedFrameSampler:
             match["stamp"] + match["offset"], "%Y-%m-%d_%H-%M-%S-%f_%z"
         ).astimezone(UTC)
 
+    @staticmethod
+    def _recording_names(directory: Path) -> set[str]:
+        """Bounded name-only scan; never read retained frames or infer file age."""
+        names: set[str] = set()
+        deadline = time.monotonic() + 3
+        with os.scandir(directory) as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAX_RECORDING_ENTRIES or time.monotonic() >= deadline:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
+                if _SEGMENT_NAME.fullmatch(entry.name) is not None:
+                    names.add(entry.name)
+        return names
+
     def capture(self, source) -> RecordedPersonFrame | None:
+        self._capture_outcome = "source_check"
         if self._closing.is_set():
+            self._capture_outcome = "closing"
             return None
         identity_state._same_directory(self._root, self._root_identity)
         directory = self._root / source.binding.path_name
         try:
             directory_info = directory.lstat()
         except FileNotFoundError:
+            self._capture_outcome = "recording_directory_absent"
             return None
         if not stat.S_ISDIR(directory_info.st_mode) or directory.is_symlink():
             raise OperatorEventsError("Analytics recording source refused")
@@ -542,9 +668,13 @@ class RecordedFrameSampler:
         previous = self._observations.get(source.binding.device_id)
         current = {}
         changed = []
+        # A new segment can be created at zero bytes before the recorder writes
+        # its first fragment. Keep a bounded file-identity hint for later growth.
+        pending_zero: list[str] = []
         if self._recording_files is not None:
             inventory = self._recording_files(source.binding)
             if inventory is None:
+                self._capture_outcome = "inventory_unavailable"
                 return None
             if type(inventory) is not dict or len(inventory) > MAX_RECORDING_ENTRIES:
                 raise OperatorEventsError("Analytics recording scan limit reached")
@@ -577,7 +707,13 @@ class RecordedFrameSampler:
                 # bytes become events until new byte growth is actually observed.
                 hints = sorted(inventory, key=lambda name: inventory[name][5], reverse=True)[:2]
                 self._active_files[source.binding.device_id] = tuple(hints)
+                # The maintenance cache can predate the sampler by several
+                # seconds. A cold directory scan excludes all existing names,
+                # even if they were absent from that older cache snapshot.
+                self._known_names[source.binding.device_id] = self._recording_names(directory)
+                self._directory_mtime[source.binding.device_id] = directory_info.st_mtime_ns
                 self._observations[source.binding.device_id] = current
+                self._capture_outcome = "baseline"
                 return None
             candidates.sort(key=lambda name: (name in previous, -current[name][2]))
             candidates = list(
@@ -596,6 +732,29 @@ class RecordedFrameSampler:
                 if signature != previous.get(name):
                     changed.append((path, info))
                 current[name] = signature
+            # A fresh recorder segment may exist before the slower maintenance
+            # inventory lists it. Only an actual directory change triggers the
+            # bounded name scan, and only names absent from the cold baseline
+            # can supply fresh bytes. Active files still use byte high-water.
+            identifier = source.binding.device_id
+            if self._directory_mtime.get(identifier) != directory_info.st_mtime_ns:
+                seen = self._known_names.setdefault(identifier, set())
+                names = self._recording_names(directory)
+                for name in names - seen:
+                    if name in current:
+                        continue
+                    path = directory / name
+                    try:
+                        info = identity_state._regular_file(path)
+                    except FileNotFoundError:
+                        continue
+                    current[name] = info.st_dev, info.st_ino, info.st_size
+                    if info.st_size > 0:
+                        changed.append((path, info))
+                    else:
+                        pending_zero.append(name)
+                seen.update(names)
+                self._directory_mtime[identifier] = directory_info.st_mtime_ns
         else:
             # Source-only integrations may have no recorder cache. Their fallback
             # has the same inventory ceiling as storage and a finite scan budget.
@@ -614,15 +773,24 @@ class RecordedFrameSampler:
                         changed.append((path, info))
         self._observations[source.binding.device_id] = current
         if not changed:
+            if pending_zero:
+                previous_active = self._active_files.get(source.binding.device_id, ())
+                self._active_files[source.binding.device_id] = tuple(
+                    dict.fromkeys(pending_zero[:2] + list(previous_active))
+                )[:2]
+            self._capture_outcome = "no_growth"
             return None
         # Normally one open segment grows. At a rollover, prefer the new file;
         # its bytes belong to the same scan, independent of UTC ordering.
         changed.sort(key=lambda item: (item[0].name in previous, -item[1].st_size))
-        self._active_files[source.binding.device_id] = tuple(path.name for path, _ in changed[:2])
+        self._active_files[source.binding.device_id] = tuple(
+            dict.fromkeys(pending_zero[:2] + [path.name for path, _ in changed[:2]])
+        )[:2]
         for path, info in changed[:2]:
             if not 1 <= info.st_size <= MAX_RECORDING_BYTES:
                 continue
             try:
+                self._capture_outcome = "snapshot_read"
                 with path.open("rb") as stream:
                     raw = stream.read(info.st_size)
                     after = os.fstat(stream.fileno())
@@ -635,11 +803,14 @@ class RecordedFrameSampler:
                     or after.st_size < info.st_size
                 ):
                     continue
+                self._capture_outcome = "decode_attempt"
                 result = self.decode(raw, self._started(path.name), path.name)
                 if result is not None:
+                    self._capture_outcome = "frame_ready"
                     return result
             except (OSError, ValueError):
                 continue
+        self._capture_outcome = "no_decoded_frame"
         return None
 
     def decode(
@@ -663,6 +834,7 @@ class RecordedFrameSampler:
                 if not hasattr(self, "_worker"):
                     self._worker = _RecordedNativeWorker(getattr(self, "_configuration", None))
                 worker = self._worker
+            self._capture_outcome = "native_request"
             result = worker.request(path)
             if result is None:
                 return None
@@ -678,6 +850,28 @@ class RecordedFrameSampler:
             )
         finally:
             path.unlink(missing_ok=True)
+
+    def prime(self) -> None:
+        """Compile the optional model on enable, before fresh recording is sampled."""
+        if self._closing.is_set() or getattr(self, "_configuration", None) is None:
+            return
+        with self._worker_lock:
+            if self._closing.is_set():
+                return
+            if not hasattr(self, "_worker"):
+                self._worker = _RecordedNativeWorker(self._configuration)
+            worker = self._worker
+            # A primed child may have exited since its previous response.
+            # Never treat cached readiness as valid for a dead native process.
+            process = worker._process
+            if worker._person_ready and process is not None and process.poll() is None:
+                return
+        try:
+            worker.request(None)
+        except OperatorEventsError:
+            # A failed prime is not proof the detector works. The next actual
+            # recording request still must satisfy native and event admission.
+            pass
 
     def begin_close(self) -> None:
         self._closing.set()
@@ -742,11 +936,42 @@ class OperatorEventService:
             if not self._available or self._unavailable
             else state.get("status", "starting")
         )
+        sample_phase = state.get("sample_phase", "not_started")
+        pending = self._native_pending
+        if sample_phase == "capture_pending" and pending is not None and not pending.done():
+            # Show which bounded stage owns an in-flight recording request.
+            # Never expose a file path, media bytes, source URI or native exception.
+            candidate = getattr(self._sampler, "_capture_outcome", "")
+            if candidate == "native_request":
+                # Read the bounded child phase, never its private request or
+                # source identity. This distinguishes decode from CPU inference.
+                worker = getattr(self._sampler, "_worker", None)
+                child_phase = getattr(worker, "_failure_phase", None)
+                if child_phase in {
+                    "native_decoder_active",
+                    "native_model_active",
+                    "native_inference_active",
+                }:
+                    candidate = child_phase
+            if candidate in {
+                "queued",
+                "source_check",
+                "snapshot_read",
+                "decode_attempt",
+                "native_request",
+                "native_decoder_active",
+                "native_model_active",
+                "native_inference_active",
+            }:
+                sample_phase = candidate
         return {
             **settings,
             "status": status,
             "last_sample_at": state.get("last_sample_at"),
             "processed_frames": state.get("processed_frames", 0),
+            "sample_attempts": state.get("sample_attempts", 0),
+            "sample_phase": sample_phase,
+            "last_completed_phase": state.get("last_completed_phase", "not_started"),
             **self.store.summary(camera_id),
             "sample_interval_seconds": SAMPLE_INTERVAL_SECONDS,
             "max_parallel_cameras": 1,
@@ -762,10 +987,32 @@ class OperatorEventService:
             self._configuration_generation.get(camera_id, 0) + 1
         )
         self._states.pop(camera_id, None)
+        if (
+            enabled
+            and not self._closing
+            and isinstance(self._sampler, RecordedFrameSampler)
+            and getattr(self._sampler, "_configuration", None) is not None
+            and (self._native_pending is None or self._native_pending.done())
+        ):
+            # Warm the same bounded child used for subsequent recorded frames.
+            # No camera snapshots or credentials are needed to compile a model.
+            self._native_pending = self._executor.submit(self._sampler.prime)
         return self.status(camera_id)
 
     async def start(self) -> None:
         if self._task is None:
+            if (
+                not self._unavailable
+                and isinstance(self._sampler, RecordedFrameSampler)
+                and getattr(self._sampler, "_configuration", None) is not None
+                and self._native_pending is None
+            ):
+                # Warm the sealed, camera-free native model as the service starts.
+                # Waiting until analytics is enabled spends the first portion
+                # of the 25-second installed person-event gate compiling kernels.
+                # A failed prime never admits an event or suppresses later
+                # real-frame validation.
+                self._native_pending = self._executor.submit(self._sampler.prime)
             self._task = asyncio.create_task(self._run(), name="operator-recorded-person-events")
 
     async def _sample(self, source, settings) -> None:
@@ -774,17 +1021,39 @@ class OperatorEventService:
         state = self._states.setdefault(identifier, {"processed_frames": 0})
         if not source.recording_enabled:
             state["status"] = "waiting"
+            state["sample_phase"] = "recording_paused"
             return
         if self._native_pending is not None and not self._native_pending.done():
             state["status"] = "waiting"
+            state["sample_phase"] = "native_pending"
             return
+        state["sample_attempts"] = min(2**63 - 1, state.get("sample_attempts", 0) + 1)
+        state["sample_phase"] = "capture_pending"
+        if isinstance(self._sampler, RecordedFrameSampler):
+            self._sampler._capture_outcome = "queued"
         self._native_pending = self._executor.submit(self._sampler.capture, source)
         wrapped = asyncio.wrap_future(self._native_pending)
         # Native decoder exceptions are sanitized before crossing API/UI boundaries.
         wrapped.add_done_callback(lambda future: None if future.cancelled() else future.exception())
-        sample = await asyncio.wait_for(asyncio.shield(wrapped), 12)
+        # Preserve the finite parent/child hierarchy on the first compiled
+        # person frame (18s child + 2s termination margin). The installed GUI
+        # event acceptance deadline remains the unchanged 25 seconds.
+        wait_seconds = 20 if getattr(self._sampler, "_configuration", None) is not None else 12
+        sample = await asyncio.wait_for(asyncio.shield(wrapped), wait_seconds)
         if sample is None:
             state["status"] = "waiting"
+            # Finite status vocabulary, independent of local recording identity.
+            outcome = getattr(self._sampler, "_capture_outcome", "no_frame")
+            safe_outcomes = {
+                "closing",
+                "recording_directory_absent",
+                "inventory_unavailable",
+                "baseline",
+                "no_growth",
+                "no_decoded_frame",
+            }
+            state["sample_phase"] = outcome if outcome in safe_outcomes else "no_frame"
+            state["last_completed_phase"] = state["sample_phase"]
             return
         if sample.detections is not None:
             detections = sample.detections
@@ -826,6 +1095,8 @@ class OperatorEventService:
         if emitted:
             self._last_events[identifier] = now
         state["status"] = "active"
+        state["sample_phase"] = "person_detected" if selected else "no_person"
+        state["last_completed_phase"] = state["sample_phase"]
         state["last_sample_at"] = _utc(sample.occurred_at)
         state["processed_frames"] = min(2**63 - 1, state["processed_frames"] + 1)
 
@@ -867,7 +1138,30 @@ class OperatorEventService:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self._states.setdefault(identifier, {})["status"] = "unavailable"
+                state = self._states.setdefault(identifier, {})
+                state["status"] = "unavailable"
+                failure_phase = "native_failed"
+                if isinstance(self._sampler, RecordedFrameSampler):
+                    worker = getattr(self._sampler, "_worker", None)
+                    if isinstance(worker, _RecordedNativeWorker):
+                        candidate = worker._failure_phase
+                        if candidate in {
+                            "native_launch_failed",
+                            "native_transport_failed",
+                            "native_write_failed",
+                            "native_reply_missing",
+                            "native_header_invalid",
+                            "native_payload_incomplete",
+                            "native_reply_invalid",
+                            "native_protocol_failed",
+                            "native_decode_failed",
+                            "native_model_failed",
+                            "native_inference_failed",
+                            "native_timeout",
+                        }:
+                            failure_phase = candidate
+                state["sample_phase"] = failure_phase
+                state["last_completed_phase"] = failure_phase
                 if self._provider is not None:
                     try:
                         await self._provider.aclose()
@@ -881,6 +1175,7 @@ class OperatorEventService:
 
     async def _run(self) -> None:
         while not self._closing:
+            started = self._clock()
             try:
                 await self.cycle()
             except asyncio.CancelledError:
@@ -888,7 +1183,11 @@ class OperatorEventService:
             except Exception:
                 # Private state/decoder outages never propagate to the recorder.
                 pass
-            await asyncio.sleep(SAMPLE_INTERVAL_SECONDS)
+            # Maintain a start-to-start cadence. A slow native compile/decode
+            # already consumed the sampling interval; imposing another two
+            # seconds would delay the first fresh recorder frame unnecessarily.
+            elapsed = max(0.0, self._clock() - started)
+            await asyncio.sleep(max(0.0, SAMPLE_INTERVAL_SECONDS - elapsed))
 
     async def aclose(self) -> None:
         self._closing = True
