@@ -755,6 +755,7 @@ class RecordedFrameSampler:
             if not 1 <= info.st_size <= MAX_RECORDING_BYTES:
                 continue
             try:
+                self._capture_outcome = "snapshot_read"
                 with path.open("rb") as stream:
                     raw = stream.read(info.st_size)
                     after = os.fstat(stream.fileno())
@@ -798,6 +799,7 @@ class RecordedFrameSampler:
                 if not hasattr(self, "_worker"):
                     self._worker = _RecordedNativeWorker(getattr(self, "_configuration", None))
                 worker = self._worker
+            self._capture_outcome = "native_request"
             result = worker.request(path)
             if result is None:
                 return None
@@ -877,13 +879,27 @@ class OperatorEventService:
             if not self._available or self._unavailable
             else state.get("status", "starting")
         )
+        sample_phase = state.get("sample_phase", "not_started")
+        pending = self._native_pending
+        if sample_phase == "capture_pending" and pending is not None and not pending.done():
+            # Show which bounded stage owns an in-flight recording request.
+            # Never expose a file path, media bytes, source URI or native exception.
+            candidate = getattr(self._sampler, "_capture_outcome", "")
+            if candidate in {
+                "queued",
+                "source_check",
+                "snapshot_read",
+                "decode_attempt",
+                "native_request",
+            }:
+                sample_phase = candidate
         return {
             **settings,
             "status": status,
             "last_sample_at": state.get("last_sample_at"),
             "processed_frames": state.get("processed_frames", 0),
             "sample_attempts": state.get("sample_attempts", 0),
-            "sample_phase": state.get("sample_phase", "not_started"),
+            "sample_phase": sample_phase,
             "last_completed_phase": state.get("last_completed_phase", "not_started"),
             **self.store.summary(camera_id),
             "sample_interval_seconds": SAMPLE_INTERVAL_SECONDS,
@@ -920,6 +936,8 @@ class OperatorEventService:
             return
         state["sample_attempts"] = min(2**63 - 1, state.get("sample_attempts", 0) + 1)
         state["sample_phase"] = "capture_pending"
+        if isinstance(self._sampler, RecordedFrameSampler):
+            self._sampler._capture_outcome = "queued"
         self._native_pending = self._executor.submit(self._sampler.capture, source)
         wrapped = asyncio.wrap_future(self._native_pending)
         # Native decoder exceptions are sanitized before crossing API/UI boundaries.
@@ -1064,6 +1082,7 @@ class OperatorEventService:
 
     async def _run(self) -> None:
         while not self._closing:
+            started = self._clock()
             try:
                 await self.cycle()
             except asyncio.CancelledError:
@@ -1071,7 +1090,11 @@ class OperatorEventService:
             except Exception:
                 # Private state/decoder outages never propagate to the recorder.
                 pass
-            await asyncio.sleep(SAMPLE_INTERVAL_SECONDS)
+            # Maintain a start-to-start cadence. A slow native compile/decode
+            # already consumed the sampling interval; imposing another two
+            # seconds would delay the first fresh recorder frame unnecessarily.
+            elapsed = max(0.0, self._clock() - started)
+            await asyncio.sleep(max(0.0, SAMPLE_INTERVAL_SECONDS - elapsed))
 
     async def aclose(self) -> None:
         self._closing = True
