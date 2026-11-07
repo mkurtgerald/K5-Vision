@@ -565,7 +565,9 @@ class RecordedFrameSampler:
             if identifier in active
         }
         self._known_names = {
-            identifier: value for identifier, value in self._known_names.items() if identifier in active
+            identifier: value
+            for identifier, value in self._known_names.items()
+            if identifier in active
         }
         self._directory_mtime = {
             identifier: value
