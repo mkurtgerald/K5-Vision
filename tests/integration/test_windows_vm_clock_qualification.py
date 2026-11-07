@@ -11,11 +11,13 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import secrets
 import shutil
 import time
+from contextlib import contextmanager
 from importlib.metadata import version
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -56,6 +58,177 @@ def _module(name, path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _clock_exception_kind(error):
+    name = type(error).__name__
+    return (
+        name
+        if name
+        in {
+            "AssertionError",
+            "KeyError",
+            "JSONDecodeError",
+            "RuntimeError",
+            "TimeoutError",
+            "TimeoutExpired",
+            "IncompleteRead",
+            "RemoteDisconnected",
+            "URLError",
+            "OSError",
+            "Failed",
+            "Error",
+            "ConnectionRefusedError",
+            "ConnectionResetError",
+            "ConnectionAbortedError",
+            "BrokenPipeError",
+        }
+        else "other"
+    )
+
+
+def _clock_public_route(value):
+    if type(value) is not str:
+        return "other"
+    path = value.split("?", 1)[0]
+    if path == "/api/v1/operator/status":
+        return "status"
+    if path == "/api/v1/operator/cameras":
+        return "cameras"
+    if path == "/api/v1/auth/me":
+        return "auth"
+    parts = path.split("/")
+    if (
+        len(parts) == 7
+        and parts[:5] == ["", "api", "v1", "operator", "cameras"]
+        and parts[6] == "history"
+    ):
+        return "history"
+    return "other"
+
+
+def _clock_transport_note(client):
+    value = client.transport_failure
+    if type(value) is not dict:
+        return None
+    types = {
+        "TimeoutError",
+        "ConnectionRefusedError",
+        "ConnectionResetError",
+        "ConnectionAbortedError",
+        "BrokenPipeError",
+        "RemoteDisconnected",
+        "URLError",
+        "OSError",
+        "none",
+    }
+    seconds = value.get("elapsed_seconds")
+    try:
+        elapsed = (
+            round(min(86400, max(0, seconds)), 3)
+            if type(seconds) in (int, float) and math.isfinite(seconds)
+            else None
+        )
+    except OverflowError:
+        elapsed = None
+    return {
+        "operation": value.get("operation")
+        if type(value.get("operation")) is str and value["operation"] in {"login", "other"}
+        else "other",
+        "exception_type": value.get("exception_type")
+        if type(value.get("exception_type")) is str and value["exception_type"] in types
+        else "other",
+        "reason_type": value.get("reason_type")
+        if type(value.get("reason_type")) is str and value["reason_type"] in types
+        else "other",
+        "elapsed_seconds": elapsed,
+    }
+
+
+def _clock_response_note(result, route):
+    status, body, headers = result
+    note = {
+        "response_received": True,
+        "status": status if type(status) is int and 100 <= status <= 599 else None,
+        "body_bytes": min(2**32 - 1, len(body)) if type(body) is bytes else None,
+    }
+    header = headers.get("content-type", "")
+    mime = header.split(";", 1)[0].strip().lower() if type(header) is str else ""
+    note["content_type"] = {
+        "": "missing",
+        "text/plain": "text_plain",
+        "application/json": "application_json",
+        "text/html": "text_html",
+    }.get(mime, "other")
+    if type(body) is bytes and len(body) <= 32768 and (route == "history" or status != 200):
+        try:
+            value = json.loads(body)
+        except (ValueError, UnicodeError, RecursionError):
+            note["json_shape"] = "invalid"
+        else:
+            note["json_shape"] = (
+                "object" if type(value) is dict else "array" if type(value) is list else "scalar"
+            )
+            if route == "history":
+                note["spans_present"] = type(value) is dict and "spans" in value
+                note["spans_is_list"] = type(value) is dict and type(value.get("spans")) is list
+            if status != 200:
+                detail = value.get("detail") if type(value) is dict else None
+                if type(detail) is dict:
+                    detail = detail.get("code")
+                note["api_error_code"] = (
+                    {
+                        "Operator identity unavailable": "identity_unavailable",
+                        "Camera state unavailable": "camera_state_unavailable",
+                        "roles_unavailable": "roles_unavailable",
+                        "Media unavailable": "media_unavailable",
+                        "Playback inventory unavailable": "playback_inventory_unavailable",
+                        "Playback requires an aware interval of at most 24 hours": (
+                            "invalid_history_interval"
+                        ),
+                    }.get(detail, "other")
+                    if type(detail) is str
+                    else "other"
+                )
+    elif route == "history":
+        note["json_shape"] = "oversized" if type(body) is bytes else "unavailable"
+    return note
+
+
+@contextmanager
+def _observe_clock_requests(client, diagnostic):
+    """Retain only finite facts from original calls, publishing only on failure."""
+    original = client.get
+    had_override = "get" in vars(client)
+    prior_override = vars(client).get("get")
+    last = {}
+
+    def observed(*args, **kwargs):
+        route = _clock_public_route(args[0] if args else kwargs.get("route"))
+        last.clear()
+        last.update(route=route, response_received=False, status=None)
+        try:
+            result = original(*args, **kwargs)
+        except BaseException as error:
+            last["exception_kind"] = _clock_exception_kind(error)
+            raise
+        try:
+            last.update(_clock_response_note(result, route))
+        except BaseException:
+            last.update(response_received=True, observation_failed=True)
+        return result
+
+    client.get = observed
+    try:
+        yield
+    except BaseException:
+        diagnostic["clock_last_request"] = dict(last) if last else {"observed": False}
+        raise
+    finally:
+        if had_override:
+            client.get = prior_override
+        else:
+            del client.get
 
 
 def _storage_policy(client, require):
@@ -146,7 +319,7 @@ def test_native_windows_vm_clock_qualification(record_testsuite_property):
     onvif_cameras, publishers, sources = [], [], []
     publisher_credentials = ("generated-fixture-publisher", secrets.token_urlsafe(24))
     cohort = desktop._Cohort(api)
-    playwright = browser = context = page = form = app = None
+    playwright = browser = context = page = form = app = client = None
     stage, failure, cleanup_failed = "installer", None, False
     diagnostic = {}
     readiness = {"health_http_status": 0}
@@ -382,28 +555,29 @@ def test_native_windows_vm_clock_qualification(record_testsuite_property):
         receipt.update(analytics)
         receipt["recording_enabled_before_clock"] = _clock_entry_state(client, camera_ids, require)
         stage = "actual_vm_clock_changes"
-        receipt["vm_clock"] = desktop._vm_clock_phase(
-            page=page,
-            context=context,
-            client=client,
-            profile=profile,
-            camera_id=camera_id,
-            parent=parent,
-            processes=processes,
-            source_uri=source_uri,
-            ffmpeg=ffmpeg,
-            ffprobe=ffprobe,
-            helpers=helpers,
-            browser_helpers=browser_helpers,
-            app=app,
-            cohort=cohort,
-            setup_sha256=setup_sha256,
-            diagnostic=diagnostic,
-            publisher=publishers[0],
-            camera_directory=camera_directories[0],
-            publisher_credentials=publisher_credentials,
-            analytics_event=event,
-        )
+        with _observe_clock_requests(client, diagnostic):
+            receipt["vm_clock"] = desktop._vm_clock_phase(
+                page=page,
+                context=context,
+                client=client,
+                profile=profile,
+                camera_id=camera_id,
+                parent=parent,
+                processes=processes,
+                source_uri=source_uri,
+                ffmpeg=ffmpeg,
+                ffprobe=ffprobe,
+                helpers=helpers,
+                browser_helpers=browser_helpers,
+                app=app,
+                cohort=cohort,
+                setup_sha256=setup_sha256,
+                diagnostic=diagnostic,
+                publisher=publishers[0],
+                camera_directory=camera_directories[0],
+                publisher_credentials=publisher_credentials,
+                analytics_event=event,
+            )
         record_testsuite_property(
             "vm_clock_windows_phase", json.dumps(receipt["vm_clock"], sort_keys=True)
         )
@@ -422,6 +596,12 @@ def test_native_windows_vm_clock_qualification(record_testsuite_property):
         receipt["no_console_windows"] = True
         stage = "complete"
     except BaseException as error:
+        diagnostic["failure_exception_kind"] = _clock_exception_kind(error)
+        if client is not None:
+            try:
+                diagnostic["client_transport_failure"] = _clock_transport_note(client)
+            except BaseException:
+                diagnostic["client_transport_probe_failed"] = True
         try:
             diagnostic["failure_frames"] = desktop._native_failure_frames(error)
         except BaseException:

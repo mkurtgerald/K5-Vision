@@ -36,6 +36,13 @@ The camera must be reachable from this PC and have ONVIF and H.264 enabled.
 Camera credentials may differ from your K5 account. An accepted camera account
 does not establish that video or recording has begun.
 
+Administrators can select an enrolled ONVIF camera and choose **Camera settings**
+to read and change its supported resolution, frame-rate limit, bitrate, keyframe
+interval, quality and encoding interval. **Apply video settings** writes H.264
+only and can interrupt that camera's live video and new recording.
+Available controls come from the camera; direct RTSP enrollment does not provide
+ONVIF management access. See [camera video settings](CAMERA_VIDEO_SETTINGS.md).
+
 ### Connect a direct RTSP stream
 
 For a camera or encoder with a known stream address, select **Add camera** and
@@ -81,10 +88,12 @@ without showing passwords or temporary credentials.
 
 ## Watch, review and save
 
-On **Camera wall**, choose **1 camera**, **2 × 2** or **3 × 3** and use
-**Previous** / **Next** for more cameras. A tile's **Watch** opens its single-camera
-view; **Recordings** opens its history. Paging or changing views does not stop
-the recorder.
+On **Camera wall**, choose **Auto** for one tile with one enrolled camera,
+four tiles with two through four cameras, or nine tiles with five or more.
+Authorized offline cameras still count. Choose **1 camera**, **2 × 2** or
+**3 × 3** for a manual layout, and use **Previous** / **Next** for more cameras.
+A tile's **Watch** opens its single-camera view; **Recordings** opens its history.
+Paging or changing views does not stop the recorder.
 
 Administrators can **Pause recording** or **Resume recording** for a selected
 camera. The choice persists after restart; live viewing and retained history stay
@@ -92,19 +101,36 @@ available. **Recording** means K5 has observed new recording data on disk.
 Waiting, stalled, operator-paused and storage-paused states require different
 actions; the [workspace guide](SURVEILLANCE_WORKSPACE.md) explains them.
 
+Use **Administration → Recorder settings → Storage** to manage recording quota,
+free-space reserve, retention and location. A new recording location requires a
+successful restart migration before it becomes active; see
+[storage administration](WINDOWS_STORAGE_ADMINISTRATION.md).
+
 Choose **Latest recording**, or open **History** and use **15 min**, **1 hour**,
 **24 hours** or an explicit UTC interval. Select a recorded interval or scrub the
 timeline to play it; a gap contains no video. Use **Mark clip start** and
 **Mark clip end**, or edit the start and length, then **Save MP4 clip**. Each clip
 must stay inside one available interval and be at most five minutes.
 
+The installer includes the local person detector and its model. Administrators
+can enable **Detect people on this camera**, set **Minimum confidence** and choose
+**Save detection settings**. Keep recording enabled: background detection analyzes
+recorded frames. **Recorded person events** follow the selected history range;
+choose **Play recording** to open the corresponding footage. External Neural or
+Analytics services need a separately configured
+[integration](OPERATOR_INTEGRATIONS.md).
+
 ## Time and background operation
 
 Camera time readings show a relative camera-minus-PC offset and uncertainty.
 A small offset or a camera reporting NTP mode does not verify correct UTC or
-synchronization. K5 reads clocks for authentication and diagnostics; it does not
-set Windows time, camera time or NTP settings. Configure approved time sources
-through Windows **Date & time** and the camera's own settings.
+synchronization. Ordinary sign-in, discovery and recording do not silently
+change either clock. Administrators can use **Administration → Recorder settings
+→ Time** to configure Windows Time, request resynchronization and manage an
+ONVIF camera's NTP or UTC settings. Windows changes use the normal UAC consent
+dialog and require no terminal. Review configuration, measured offset and
+verification status separately; see
+[time administration](WINDOWS_TIME_ADMINISTRATION.md).
 
 History labels are UTC, and rolling windows follow the recorder's reported time.
 Investigate clock-step warnings: recording timestamps can move when Windows time
@@ -142,5 +168,7 @@ Time administration gate verifies configuration, resynchronization and restore.
 
 Physical-camera compatibility, independent NTP/UTC accuracy, measured capacity
 and endurance still require [field qualification](WINDOWS_BETA_FIELD_TEST.md).
-This increment does not deliver a boot service, bundled AI workflow, PTZ controls,
-event search or recording-storage configuration.
+This increment does not deliver a boot service, PTZ controls, motion-triggered
+recording, inclusion/exclusion zones, custom tile layouts or adaptive main/sub
+streams. See the [camera-setup](CAMERA_SETUP_ROADMAP.md) and
+[video-wall](VIDEO_WALL_ROADMAP.md) roadmaps.

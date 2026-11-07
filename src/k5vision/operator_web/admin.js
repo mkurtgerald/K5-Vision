@@ -421,6 +421,9 @@
           authoritySuspended = false; controller = new AbortController();
           for (const node of $("admin-panel").querySelectorAll("button")) node.disabled = false;
           setBusy(false); renderUserActions(); message("admin-message");
+          // The interrupted account list belongs to the previous authority.
+          // Revalidate it before account actions become available again.
+          void loadUsers();
         }
       },
       refreshCameras() {

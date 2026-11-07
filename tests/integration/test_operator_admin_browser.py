@@ -618,6 +618,119 @@ def assert_admin_restart(page, *, private_state, camera_ids, client=None):
         _return_to_cameras(page)
 
 
+def _admin_failure_frames(error):
+    """Project actual traceback locations without messages, source text or locals."""
+    locations = {
+        Path(__file__).resolve(): (
+            "admin",
+            {
+                "_require",
+                "_api",
+                "_login",
+                "_activate",
+                "_open_admin",
+                "_set_access",
+                "_credential",
+                "_create_user",
+                "_edit_user",
+                "_return_to_cameras",
+                "_visible_live",
+                "run_admin_journey",
+                "assert_admin_restart",
+                "test_real_browser_admin_users_roles_camera_access_and_restart",
+            },
+        ),
+        Path(__file__).with_name("test_operator_beta_browser.py").resolve(): (
+            "browser",
+            {"_decoded_color", "_decoded_video", "_decoded_video_proof"},
+        ),
+    }
+    chain, pending, seen = [], [("current", 0, error)], set()
+    while pending and len(chain) < 3:
+        relation, depth, current_error = pending.pop(0)
+        if id(current_error) in seen:
+            continue
+        seen.add(id(current_error))
+        frames = []
+        current = current_error.__traceback__
+        while current is not None:
+            code = current.tb_frame.f_code
+            admitted = locations.get(Path(code.co_filename).resolve())
+            if admitted is not None and code.co_name in admitted[1]:
+                frames.append(
+                    {
+                        "file": admitted[0],
+                        "function": code.co_name,
+                        "line": min(10000, max(1, current.tb_lineno)),
+                    }
+                )
+                frames = frames[-4:]
+            current = current.tb_next
+        chain.append({"relation": relation, "depth": depth, "frames": frames})
+        for label, following in (
+            ("cause", current_error.__cause__),
+            ("context", current_error.__context__),
+        ):
+            if following is not None and id(following) not in seen:
+                pending.append((label, min(2, depth + 1), following))
+    return chain
+
+
+def _admin_failure_ui(page):
+    if page is None:
+        return {"available": False}
+    if page.is_closed():
+        return {"available": False, "page_closed": True}
+    raw = page.wait_for_function(
+        """() => {
+          const visible = node => Boolean(node && !node.hidden && node.getClientRects().length);
+          const panel = document.getElementById('admin-panel');
+          const button = document.getElementById('admin-create-user');
+          return {
+            admin_panel_present: Boolean(panel), admin_panel_visible: visible(panel),
+            admin_panel_hidden: panel ? panel.hidden : null,
+            create_user_button_present: Boolean(button),
+            create_user_button_visible: visible(button),
+            create_user_button_hidden: button ? button.hidden : null,
+            create_user_button_disabled: button ? button.disabled : null,
+            create_user_button_count: document.querySelectorAll('#admin-create-user').length,
+            user_dialog_visible: visible(document.getElementById('admin-user-dialog'))
+          };
+        }""",
+        timeout=2000,
+    ).json_value()
+    if type(raw) is not dict:
+        return {"available": False}
+    result = {"available": True}
+    for key in (
+        "admin_panel_present",
+        "admin_panel_visible",
+        "admin_panel_hidden",
+        "create_user_button_present",
+        "create_user_button_visible",
+        "create_user_button_hidden",
+        "create_user_button_disabled",
+        "user_dialog_visible",
+    ):
+        result[key] = raw.get(key) if type(raw.get(key)) is bool else None
+    count = raw.get("create_user_button_count")
+    result["create_user_button_count"] = count if type(count) is int and 0 <= count <= 256 else None
+    return result
+
+
+def _admin_failure_observation(error, page):
+    result = {}
+    try:
+        result["exception_chain"] = _admin_failure_frames(error)
+    except BaseException:
+        result["frame_probe_failed"] = True
+    try:
+        result["ui"] = _admin_failure_ui(page)
+    except BaseException:
+        result["ui_probe_failed"] = True
+    return result
+
+
 def test_real_browser_admin_users_roles_camera_access_and_restart(
     tmp_path, monkeypatch, record_testsuite_property
 ):
@@ -706,6 +819,8 @@ def test_real_browser_admin_users_roles_camera_access_and_restart(
     upstream_port, product_ports = ports[0], ports[1:]
     processes = []
     product = playwright = browser = context = None
+    page = None
+    failure_observation = {}
     stage, failure = "fixture_ready", None
     script_errors, cleanup_failures = [], []
     receipt = {
@@ -867,6 +982,10 @@ def test_real_browser_admin_users_roles_camera_access_and_restart(
         receipt["browser_script_errors"] = 0
     except BaseException as error:
         failure = browser_helpers._failure_code(error)
+        try:
+            failure_observation = _admin_failure_observation(error, page)
+        except BaseException:
+            failure_observation = {"probe_failed": True}
     finally:
         for label, resource in (("context", context), ("browser", browser)):
             if resource is not None:
@@ -900,6 +1019,8 @@ def test_real_browser_admin_users_roles_camera_access_and_restart(
             "script_error_codes": script_errors[:16],
             "cleanup_failure_codes": cleanup_failures,
         }
+        if failure is not None:
+            diagnostic["failure_observation"] = failure_observation
         record_testsuite_property("operator_admin_browser_diagnostic", json.dumps(diagnostic))
         if failure is not None or cleanup_failures:
             print("Administration browser qualification diagnostic: " + json.dumps(diagnostic))
