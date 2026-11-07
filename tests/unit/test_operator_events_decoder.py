@@ -192,7 +192,24 @@ def test_decoder_emits_only_fixed_failure_phase_without_paths(monkeypatch):
 
     monkeypatch.setattr(decoder, "decode", invalid_recording)
     assert decoder.main() == 1
-    assert output.getvalue() == b'{"status": "failed", "phase": "decode"}\n'
+    assert output.getvalue() == (
+        b'{"status":"phase","phase":"decode"}\n'
+        b'{"status": "failed", "phase": "decode"}\n'
+    )
+
+
+def test_decoder_progress_reports_only_fixed_stage_and_never_source(monkeypatch):
+    request = json.dumps({"path": "private-recording.mp4", "artifact_root": None}).encode()
+    output = io.BytesIO()
+    monkeypatch.setattr(decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n")))
+    monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
+    monkeypatch.setattr(decoder, "decode", lambda path: None)
+    assert decoder.main() == 0
+    assert output.getvalue() == (
+        b'{"status":"phase","phase":"decode"}\n'
+        b'{"status":"empty"}\n'
+    )
+    assert b"private-recording" not in output.getvalue()
 
 
 def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monkeypatch):

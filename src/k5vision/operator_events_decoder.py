@@ -133,6 +133,10 @@ def main() -> int:
                 sys.stdout.buffer.flush()
                 continue
             phase = "decode"
+            # A finite, source-free phase notice distinguishes slow decoding from
+            # model compilation without publishing any recording identity or pixels.
+            sys.stdout.buffer.write(b'{"status":"phase","phase":"decode"}\n')
+            sys.stdout.buffer.flush()
             result = decode(request["path"])
             if result is None:
                 sys.stdout.buffer.write(b'{"status":"empty"}\n')
@@ -151,8 +155,12 @@ def main() -> int:
 
                     artifact_root = request["artifact_root"]
                     phase = "model"
+                    sys.stdout.buffer.write(b'{"status":"phase","phase":"model"}\n')
+                    sys.stdout.buffer.flush()
                     detector = _PersonDetector(OperatorPersonConfiguration(Path(artifact_root)))
                 phase = "inference"
+                sys.stdout.buffer.write(b'{"status":"phase","phase":"inference"}\n')
+                sys.stdout.buffer.flush()
                 detections = [
                     {"category": item.category, "confidence": item.confidence}
                     for item in detector.infer(pixels, 544, 320, 544 * 4, int(elapsed * 1000))

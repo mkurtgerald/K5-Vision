@@ -440,13 +440,31 @@ class _RecordedNativeWorker:
                     process.stdin.write(payload)
                     process.stdin.flush()
                 self._failure_phase = "native_reply_missing"
-                raw = process.stdout.readline(4097)
-                if not raw.endswith(b"\n") or len(raw) > 4096:
-                    self._failure_phase = "native_reply_missing"
-                    raise ValueError
-                self._failure_phase = "native_header_invalid"
-                header = json.loads(raw)
-                if type(header) is not dict:
+                # A child may report only these fixed processing phases before
+                # its response. Four bounded headers (three stages + result)
+                # retain the original kill timer and refuse unbounded chatter.
+                for _ in range(4):
+                    raw = process.stdout.readline(4097)
+                    if not raw.endswith(b"\n") or len(raw) > 4096:
+                        self._failure_phase = "native_reply_missing"
+                        raise ValueError
+                    self._failure_phase = "native_header_invalid"
+                    header = json.loads(raw)
+                    if type(header) is not dict:
+                        raise ValueError
+                    if header.get("status") != "phase":
+                        break
+                    phase = header.get("phase")
+                    if set(header) != {"status", "phase"} or phase not in {
+                        "decode", "model", "inference"
+                    }:
+                        raise ValueError
+                    self._failure_phase = {
+                        "decode": "native_decoder_active",
+                        "model": "native_model_active",
+                        "inference": "native_inference_active",
+                    }[phase]
+                else:
                     raise ValueError
                 if header.get("status") == "primed":
                     if path is not None or set(header) != {"status"}:
@@ -918,12 +936,26 @@ class OperatorEventService:
             # Show which bounded stage owns an in-flight recording request.
             # Never expose a file path, media bytes, source URI or native exception.
             candidate = getattr(self._sampler, "_capture_outcome", "")
+            if candidate == "native_request":
+                # Read the bounded child phase, never its private request or
+                # source identity. This distinguishes decode from CPU inference.
+                worker = getattr(self._sampler, "_worker", None)
+                child_phase = getattr(worker, "_failure_phase", None)
+                if child_phase in {
+                    "native_decoder_active",
+                    "native_model_active",
+                    "native_inference_active",
+                }:
+                    candidate = child_phase
             if candidate in {
                 "queued",
                 "source_check",
                 "snapshot_read",
                 "decode_attempt",
                 "native_request",
+                "native_decoder_active",
+                "native_model_active",
+                "native_inference_active",
             }:
                 sample_phase = candidate
         return {
