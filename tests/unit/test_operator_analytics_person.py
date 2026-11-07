@@ -245,9 +245,7 @@ def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(
                     return openvino_stub.Type.u8
                 return openvino_stub.Type.f32
 
-            return SimpleNamespace(
-                create_infer_request=lambda: "ready", get_property=get_property
-            )
+            return SimpleNamespace(create_infer_request=lambda: "ready", get_property=get_property)
 
     admitted_model = model
 
