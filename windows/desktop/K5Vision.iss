@@ -54,12 +54,13 @@ Name: "{userprograms}\K5 Vision"; Filename: "{app}\K5Vision.exe"; WorkingDir: "{
 Name: "{userdesktop}\K5 Vision"; Filename: "{app}\K5Vision.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\K5Vision.exe"; Description: "Launch K5 Vision"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\K5Vision.exe"; Description: "Launch K5 Vision"; Flags: nowait postinstall skipifsilent; Check: InstallationVerified
 
 [Code]
 var
   InstallationMutex: THandle;
   InstallationLease: Boolean;
+  FinalPayloadVerified: Boolean;
 
 function CreateMutex(Security: Integer; InitialOwner: Integer; Name: String): THandle;
   external 'CreateMutexW@kernel32.dll stdcall';
@@ -161,18 +162,46 @@ begin
     RaiseException('K5 Vision could not verify the installed application. Your account and recordings were preserved.');
 end;
 
+function InstallationVerified(): Boolean;
+begin
+  Result := FinalPayloadVerified;
+end;
+
 procedure CurStepChanged(Step: TSetupStep);
 var
   ExitCode: Integer;
 begin
   if Step = ssPostInstall then begin
-    // Inno's uninstall bookkeeping has been finalized. Reject any remaining
-    // unlisted installed file, before the Finish page can report success.
-    if not Exec(ExpandConstant('{app}\K5Vision.exe'), '--installation-payload-check', '',
-      SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
-      RaiseException('K5 Vision could not verify the installed application. Your account and recordings were preserved.');
-    ReleaseInstallationLease();
+    // Inno 6.4.3 catches exceptions from this callback and continues. Keep
+    // failure latched before Exec, including if Exec itself raises.
+    FinalPayloadVerified := False;
+    try
+      FinalPayloadVerified := Exec(ExpandConstant('{app}\K5Vision.exe'),
+        '--installation-payload-check', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+      if FinalPayloadVerified then FinalPayloadVerified := ExitCode = 0;
+    except
+      FinalPayloadVerified := False;
+    end;
+    // Allow the normal verified launch; retain the lease on rejection.
+    if FinalPayloadVerified then ReleaseInstallationLease();
   end;
+end;
+
+procedure CurPageChanged(PageID: Integer);
+begin
+  if (PageID = wpFinished) and not FinalPayloadVerified then begin
+    // Inno writes its success labels AFTER ssPostInstall. Override them here.
+    WizardForm.FinishedHeadingLabel.Caption := 'K5 Vision installation failed';
+    WizardForm.FinishedLabel.Caption :=
+      'K5 Vision could not verify the installed application. Do not use this installation. Your account and recordings were preserved.';
+    WizardForm.RunList.Visible := False;
+  end;
+end;
+
+function GetCustomSetupExitCode(): Integer;
+begin
+  Result := 0;
+  if not FinalPayloadVerified then Result := 1;
 end;
 
 procedure DeinitializeSetup();

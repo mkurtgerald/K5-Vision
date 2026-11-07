@@ -1,0 +1,66 @@
+name: Installer Completion Boundary
+
+on:
+  pull_request:
+    paths:
+      - windows/desktop/K5Vision.iss
+      - windows/desktop/donors.json
+      - tests/integration/test_windows_installer_completion.py
+      - .github/workflows/installer-completion-windows.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-completion-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  completion:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Install isolated test dependencies
+        shell: pwsh
+        run: |
+          python -m venv "$env:RUNNER_TEMP/completion-venv"
+          & "$env:RUNNER_TEMP/completion-venv/Scripts/python.exe" -m pip install -e ".[dev]"
+          if ($LASTEXITCODE -ne 0) { throw "Completion test dependencies failed" }
+      - name: Admit pinned Inno compiler
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $identity = (Get-Content -LiteralPath windows/desktop/donors.json -Raw | ConvertFrom-Json).inno_setup
+          $compilerRoot = Join-Path $env:RUNNER_TEMP ("K5 desktop compiler " + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $compilerRoot | Out-Null
+          $archive = Join-Path $compilerRoot "innosetup-6.4.3.exe"
+          Invoke-WebRequest -Uri $identity.url -OutFile $archive -TimeoutSec 180
+          $actual = Get-Item -LiteralPath $archive
+          if ($actual.Length -ne $identity.bytes -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $identity.sha256) {
+            throw "Inno Setup compiler archive identity mismatch"
+          }
+          $install = Join-Path $compilerRoot "compiler"
+          $process = Start-Process -FilePath $archive -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', ('/DIR="' + $install + '"')) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Reviewed compiler installation failed" }
+          $iscc = Join-Path $install "ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) { throw "Reviewed compiler frontend unavailable" }
+          # ISCC's upstream frontend resource uses 0.0.0.0. The exact admitted
+          # installer pins its bytes; check the actual engine banner at compile.
+          "K5_DESKTOP_ISCC=$iscc" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          Write-Host "Native Inno Setup compiler 6.4.3 admitted by exact official archive SHA256"
+      - name: Exercise actual graphical and silent completion
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP/completion-venv/Scripts/python.exe" -m pytest tests/integration/test_windows_installer_completion.py -o addopts= --junitxml=completion-results.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          [xml]$results = Get-Content completion-results.xml
+          if ($results.testsuites.testsuite.tests -ne 4 -or $results.testsuites.testsuite.skipped -ne 0) {
+            throw "All four real installer completion cases must execute"
+          }

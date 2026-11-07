@@ -31,9 +31,16 @@ def test_native_setup_verifies_bytes_during_extraction_and_exact_tree_before_suc
     assert "Step = ssPostInstall" in post
     assert "'--installation-payload-check'" in post
     assert "ewWaitUntilTerminated" in post
-    assert "(ExitCode <> 0)" in post
-    assert "RaiseException(" in post
-    assert post.index("RaiseException(") < post.index("ReleaseInstallationLease();")
+    assert "FinalPayloadVerified := False;" in post
+    assert "FinalPayloadVerified := ExitCode = 0;" in post
+    assert "except\n      FinalPayloadVerified := False;" in post
+    assert "if FinalPayloadVerified then ReleaseInstallationLease();" in post
+    assert "PageID = wpFinished" in post
+    assert "K5 Vision installation failed" in post
+    assert "WizardForm.RunList.Visible := False;" in post
+    assert "if not FinalPayloadVerified then Result := 1;" in post
+    assert "Check: InstallationVerified" in setup
+    assert "Result := FinalPayloadVerified;" in setup
 
 
 def test_supervisor_staged_and_final_admission_remain_sealed_and_state_free():
