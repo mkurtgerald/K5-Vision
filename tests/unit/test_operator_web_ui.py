@@ -110,6 +110,27 @@ def test_buffering_does_not_cancel_an_already_submitted_person_frame():
     assert "state.personController?.abort();" in stop
 
 
+def test_transient_live_pause_preserves_only_submitted_person_frame():
+    """An HLS decoder pause may not abort a previously authorized immutable POST."""
+    source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    handler = source.split('$("live-video").addEventListener("pause", () => {', 1)[1].split(
+        'function checkPersonBuffer(', 1
+    )[0]
+    assert "if (!state.personEnabled) return;" in handler
+    assert "if (state.personController)" in handler
+    assert "state.personBufferTimer === null" in handler
+    assert "checkPersonBuffer(epoch, video, frames);" in handler
+    assert handler.index("if (state.personController)") < handler.index("stopPersonView(")
+    # A deliberate camera change, browser logout or HLS teardown must still
+    # invalidate and abort that request before resetting the live decoder.
+    teardown = source.split("function stopLive(", 1)[1].split("function stopPlayback(", 1)[0]
+    assert teardown.index("stopPersonView();") < teardown.index('resetVideo($("live-video"));')
+    stopper = source.split("function stopPersonView(", 1)[1].split("function validPersonBox(", 1)[0]
+    assert "state.personController?.abort();" in stopper
+
+
 def _ui_core(account):
     return {
         "id": account.get("id", "a22c22bc-4089-45b7-a370-f360bb9d33c0"),
