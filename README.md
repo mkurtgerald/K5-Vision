@@ -38,6 +38,14 @@ administration has a separate native configuration/restoration witness. Source
 configuration, observed offset and successful synchronization are reported
 separately; clock-step resilience alone does not certify absolute UTC accuracy.
 
+The [camera-setup roadmap](docs/CAMERA_SETUP_ROADMAP.md) tracks planned frame-rate
+and codec controls, motion-triggered recording and graphical inclusion/exclusion
+zones. These core setup controls take priority over advanced wall customization.
+
+The [video-wall roadmap](docs/VIDEO_WALL_ROADMAP.md) tracks automatic layouts,
+individual tile editing and adaptive display streams, including delivery order,
+dependencies and acceptance criteria.
+
 ## Development
 
 Requirements: Python 3.12+
