@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future
 import hashlib
 import json
 import sys
@@ -308,6 +309,28 @@ def test_model_byte_read_rejects_same_content_replaced_inode(admitted, monkeypat
     monkeypatch.setattr(module, "_local_path", changed_path)
     with pytest.raises(ValueError, match="bytes were refused"):
         module._model_bytes(config)
+
+
+def test_sealed_person_start_has_its_own_bounded_compilation_budget(monkeypatch):
+    assert lifecycle._START_TIMEOUT_SECONDS == 15.0
+    assert lifecycle._CLOSE_TIMEOUT_SECONDS == 2.0
+    assert 15.0 < module._PERSON_START_TIMEOUT_SECONDS < 24.0
+    session = object.__new__(module._PersonSession)
+    pending = Future()
+    session._pending = pending
+
+    async def run():
+        # A timed-out waiter must not cancel the native compile Future.
+        # The existing worker lifecycle still owns its capacity release.
+        with monkeypatch.context() as short:
+            short.setattr(module, "_PERSON_START_TIMEOUT_SECONDS", 0.01)
+            with pytest.raises(TimeoutError):
+                await session.start()
+        assert not pending.done()
+        pending.set_result(True)
+        await session.start()
+
+    asyncio.run(run())
 
 
 def test_independent_factory_does_not_import_or_initialize_analytics_lab(admitted, monkeypatch):
