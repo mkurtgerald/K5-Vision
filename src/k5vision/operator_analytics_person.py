@@ -8,6 +8,7 @@ neither this module nor application startup downloads models or dependencies.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -19,7 +20,7 @@ from pathlib import Path
 from platform import system
 
 from k5vision.analytics_config import _local_path, _unique_object
-from k5vision.analytics_runtime import OwnedAnalyticsProvider, _AnalyticsSession
+from k5vision.analytics_runtime import OwnedAnalyticsProvider, _AnalyticsSession, _protected_future
 
 PERSON_CONFIG_ENV = "K5_OPERATOR_PERSON_CONFIG"
 PERSON_PROVIDER = "openvino-omz-person-view-v1"
@@ -262,8 +263,21 @@ class _PersonDetector:
         return tuple(sorted(selected, key=lambda item: item.confidence, reverse=True)[:32])
 
 
+# Only sealed native model compilation receives this additional background
+# startup budget. The unchanged 2s frame inference, 24s browser transport
+# and installed same-frame box acceptance remain separate hard deadlines.
+_PERSON_START_TIMEOUT_SECONDS = 22.0
+
+
 class _PersonSession(_AnalyticsSession):
     """Reuse K5's bounded native worker lifecycle, replacing all detector logic."""
+
+    async def start(self) -> None:
+        ready = await asyncio.wait_for(
+            _protected_future(self._pending), _PERSON_START_TIMEOUT_SECONDS
+        )
+        if ready is not True:
+            raise RuntimeError("Person session initialization failed.")
 
     def _initialize(self) -> bool:
         try:
