@@ -1316,3 +1316,43 @@ def test_verified_live_recorder_prime_releases_optional_view_warmup_without_even
     finally:
         asyncio.run(service.aclose())
     assert not sampler.native_model_ready()
+
+def test_cold_recorder_prime_defers_view_without_enabled_analytics(store):
+    """The camera-free recorder model gets CPU priority before UI configuration."""
+    camera = uuid4()
+    source = SimpleNamespace(binding=SimpleNamespace(device_id=camera))
+    cameras = SimpleNamespace(list_sources=lambda: (source,))
+
+    class NativeProcess:
+        def poll(self):
+            return None
+
+    worker = SimpleNamespace(
+        _person_ready=False,
+        _process=NativeProcess(),
+        begin_close=lambda: None,
+        close=lambda: None,
+    )
+    sampler = object.__new__(RecordedFrameSampler)
+    sampler._closing = threading.Event()
+    sampler._worker_lock = threading.RLock()
+    sampler._worker = worker
+    service = OperatorEventService(
+        store=store,
+        cameras=cameras,
+        recording_root=Path("."),
+        configuration=object(),
+        sampler=sampler,
+    )
+    try:
+        assert not store.settings(camera)["enabled"]
+        assert service.awaiting_first_recorded_person_event()
+        worker._person_ready = True
+        assert not service.awaiting_first_recorded_person_event()
+        worker._person_ready = False
+        store.configure(camera, enabled=True, confidence_threshold=0.5)
+        assert service.awaiting_first_recorded_person_event()
+        service._last_events[camera] = 1.0
+        assert not service.awaiting_first_recorded_person_event()
+    finally:
+        asyncio.run(service.aclose())

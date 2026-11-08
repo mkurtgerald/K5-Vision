@@ -974,11 +974,18 @@ class OperatorEventService:
             for source in self._cameras.list_sources()
             if self.store.settings(source.binding.device_id)["enabled"]
         ]
-        if not enabled or any(camera_id in self._last_events for camera_id in enabled):
+        if enabled and any(camera_id in self._last_events for camera_id in enabled):
             return False
-        if isinstance(self._sampler, RecordedFrameSampler) and self._sampler.native_model_ready():
-            return False
-        return True
+        if isinstance(self._sampler, RecordedFrameSampler):
+            if self._sampler.native_model_ready():
+                return False
+            # Reserve the first sealed recorder prime even before any camera's
+            # person analytics is enabled. Starting a second native model while
+            # the recorder is cold can starve the first recorded-frame deadline.
+            # A real authorized view still has its independent on-demand path.
+            if getattr(self._sampler, "_configuration", None) is not None:
+                return True
+        return bool(enabled)
 
     def status(self, camera_id: UUID) -> dict:
         settings = self.store.settings(camera_id)
