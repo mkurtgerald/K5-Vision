@@ -865,7 +865,9 @@ def test_native_worker_reaps_pre_response_broken_pipe_then_retries_once(monkeypa
         worker.close()
 
 
-@pytest.mark.parametrize(("winerror", "retry"), [(109, True), (232, True), (233, True), (5, False)])
+@pytest.mark.parametrize(
+    ("winerror", "retry"), [(109, True), (232, True), (233, True), (5, False)]
+)
 def test_recorded_native_worker_retries_only_windows_closed_pipe_errors(
     monkeypatch, tmp_path, winerror, retry
 ):
@@ -881,7 +883,7 @@ def test_recorded_native_worker_retries_only_windows_closed_pipe_errors(
         def __init__(self, broken):
             self.broken = broken
             self.stdin = ClosedPipe() if broken else io.BytesIO()
-            self.stdout = io.BytesIO(b'{"status":"empty"}\\n')
+            self.stdout = io.BytesIO(b'{"status":"empty"}\n')
             self.killed = False
 
         def poll(self):
@@ -907,7 +909,7 @@ def test_recorded_native_worker_retries_only_windows_closed_pipe_errors(
         if retry:
             assert worker.request(tmp_path / "private-snapshot.mp4") is None
             assert len(starts) == 2
-            assert replacement.stdin.getvalue().endswith(b"\\n")
+            assert replacement.stdin.getvalue().endswith(b"\n")
         else:
             with pytest.raises(OperatorEventsError, match="native frame unavailable"):
                 worker.request(tmp_path / "private-snapshot.mp4")
