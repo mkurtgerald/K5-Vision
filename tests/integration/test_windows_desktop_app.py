@@ -1048,6 +1048,19 @@ def _desktop_status(api, form):
     return "unclassified"
 
 
+def _observer_reauthenticate(runtime, client, username, password, diagnostic):
+    """Retain the existing bounded transport classification before later cleanup."""
+    try:
+        runtime._login(client, username, password)
+    finally:
+        if client.transport_failure is not None:
+            diagnostic["observer_login_transport"] = {
+                **client.transport_failure,
+                "phase": "open",
+                "http_response": "not_received",
+            }
+
+
 def _failure_detail(error):
     """Only fixed classifications are admitted from our controlled assertions."""
     text = str(error)
@@ -1724,6 +1737,18 @@ def _installed_person_fixture(parent, ffmpeg):
     return video
 
 
+def _installed_person_events(client, route, diagnostic):
+    """Keep the event-poll status before any later diagnostic request replaces it."""
+    try:
+        return client.json(route)["events"]
+    finally:
+        diagnostic["analytics_events_http_status"] = client.last_http_status
+        if client.transport_failure is not None:
+            diagnostic["analytics_events_transport"] = dict(client.transport_failure)
+        else:
+            diagnostic.pop("analytics_events_transport", None)
+
+
 def _installed_analytics_journey(
     *,
     page,
@@ -1785,7 +1810,7 @@ def _installed_analytics_journey(
     detected = {}
 
     def positive_event():
-        result = client.json(route + "/events")["events"]
+        result = _installed_person_events(client, route + "/events", diagnostic)
         if not result:
             return False
         detected.update(result[0])
@@ -3223,7 +3248,8 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["logout_destroys_wall"] = True
         # The browser has signed out. A fresh observer login now authorizes
         # subsequent tray checks without replacing an active browser session.
-        runtime._login(client, username, password)
+        _enter_stage("observer_reauthentication")
+        _observer_reauthenticate(runtime, client, username, password, nvr_diagnostic)
         _enter_stage("browser_closing")
         context.close()
         context = None
