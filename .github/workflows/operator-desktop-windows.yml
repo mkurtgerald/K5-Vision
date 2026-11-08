@@ -183,7 +183,23 @@ jobs:
           $compilerRoot = Join-Path $env:RUNNER_TEMP ("K5 desktop compiler " + [guid]::NewGuid().ToString("N"))
           New-Item -ItemType Directory -Path $compilerRoot | Out-Null
           $archive = Join-Path $compilerRoot "innosetup-6.4.3.exe"
-          Invoke-WebRequest -Uri $identity.url -OutFile $archive -TimeoutSec 180
+          # GitHub's release CDN intermittently serves HTTP 500/502/504.
+          # Retry only transport outages, never an identity or hash mismatch.
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              Invoke-WebRequest -Uri $identity.url -OutFile $archive -TimeoutSec 180 -ErrorAction Stop
+              break
+            } catch {
+              $response = $_.Exception.Response
+              $status = if ($null -ne $response) { [int]$response.StatusCode } else { 0 }
+              Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+              if ($status -notin @(408, 429, 500, 502, 503, 504) -or $attempt -eq 3) {
+                throw "Reviewed Inno Setup archive transport unavailable"
+              }
+              Write-Host "Reviewed compiler transport $status; bounded retry $attempt"
+              Start-Sleep -Seconds (2 * $attempt)
+            }
+          }
           $actual = Get-Item -LiteralPath $archive
           if ($actual.Length -ne $identity.bytes -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $identity.sha256) {
             throw "Inno Setup compiler archive identity mismatch"
