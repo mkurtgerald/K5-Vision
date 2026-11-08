@@ -935,11 +935,15 @@ class OperatorEventService:
         """
         if self._closing or self._unavailable or not self._available:
             return False
-        return any(
-            self.store.settings(source.binding.device_id)["enabled"]
-            and source.binding.device_id not in self._last_events
+        # The first event from *any* enabled camera releases optional view
+        # preparation. An empty camera may never have a person event, and must
+        # not hold every other operator view cold indefinitely.
+        enabled = [
+            source.binding.device_id
             for source in self._cameras.list_sources()
-        )
+            if self.store.settings(source.binding.device_id)["enabled"]
+        ]
+        return bool(enabled) and not any(camera_id in self._last_events for camera_id in enabled)
 
     def status(self, camera_id: UUID) -> dict:
         settings = self.store.settings(camera_id)

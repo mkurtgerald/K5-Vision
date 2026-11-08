@@ -1198,3 +1198,34 @@ def test_first_recorded_person_event_has_priority_over_speculative_view_warmup(s
         assert not service.awaiting_first_recorded_person_event()
     finally:
         asyncio.run(service.aclose())
+
+def test_first_recorded_person_event_releases_warmup_with_other_cameras_empty(store):
+    first, second, unrelated = uuid4(), uuid4(), uuid4()
+    sources = tuple(
+        SimpleNamespace(binding=SimpleNamespace(device_id=camera))
+        for camera in (first, second)
+    )
+    cameras = SimpleNamespace(list_sources=lambda: sources)
+    for camera in (first, second):
+        store.configure(camera, enabled=True, confidence_threshold=0.5)
+    service = OperatorEventService(
+        store=store,
+        cameras=cameras,
+        recording_root=Path("."),
+        configuration=None,
+        sampler=SimpleNamespace(),
+        provider_factory=object(),
+    )
+    try:
+        assert service.awaiting_first_recorded_person_event()
+        service._last_events[unrelated] = 1.0
+        assert service.awaiting_first_recorded_person_event()
+        service._last_events[first] = 2.0
+        assert not service.awaiting_first_recorded_person_event()
+        service._last_events.clear()
+        store.configure(first, enabled=False, confidence_threshold=0.5)
+        assert service.awaiting_first_recorded_person_event()
+        store.configure(second, enabled=False, confidence_threshold=0.5)
+        assert not service.awaiting_first_recorded_person_event()
+    finally:
+        asyncio.run(service.aclose())
