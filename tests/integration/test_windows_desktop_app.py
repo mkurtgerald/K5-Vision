@@ -1881,9 +1881,7 @@ def _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, di
             )
             diagnostic["analytics_sample_backend_preparation"] = (
                 preparation_phase
-                if preparation_phase in {
-                    "not_requested", "preparing", "ready", "failed", "closed"
-                }
+                if preparation_phase in {"not_requested", "preparing", "ready", "failed", "closed"}
                 else "unknown"
             )
         except Exception:
@@ -2193,7 +2191,9 @@ def _installed_analytics_journey(
         abs((datetime.now(UTC) - occurred).total_seconds()) < 30,
         "Person event was not mapped to the fresh recording's UTC timestamp",
     )
-    sampled_evidence = _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, diagnostic)
+    sampled_evidence = _installed_sampled_person_boxes(
+        page, camera_id, client, browser_helpers, diagnostic
+    )
     diagnostic["analytics_stage"] = "event_recording_navigation"
     diagnostic["analytics_navigation_step"] = "history_range_click"
     page.locator("#last-24-hours").click()
