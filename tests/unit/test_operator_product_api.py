@@ -131,6 +131,10 @@ class _Analytics:
         self.submissions = []
         self.closed = []
         self.callback = None
+        self.preparation_calls = 0
+
+    def start_preparing(self):
+        self.preparation_calls += 1
 
     async def infer(self, **submission):
         self.submissions.append({**submission, "bytes": bytes(submission["frame"].payload)})
@@ -246,6 +250,9 @@ def product(tmp_path, monkeypatch, request):
         analytics_status=options.get("analytics_status", "disabled")
         if isinstance(options, dict)
         else "disabled",
+        prepare_native_person_on_camera=bool(options.get("prepare_native_person_on_camera"))
+        if isinstance(options, dict)
+        else False,
     )
     with TestClient(app, base_url=f"http://127.0.0.1:{public_port}") as client:
         yield _Harness(
@@ -1350,7 +1357,9 @@ def _person_url(device_id, *, width=2, height=2, frame_id=17):
     )
 
 
-@pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
+@pytest.mark.parametrize(
+    "product", [{"analytics": True, "prepare_native_person_on_camera": True}], indirect=True
+)
 def test_pending_person_model_preparation_returns_retryable_429_only_after_auth(product):
     device_id = product.enroll()
     route = _person_url(device_id)
@@ -1368,15 +1377,18 @@ def test_pending_person_model_preparation_returns_retryable_429_only_after_auth(
         content=body,
     )
     assert invalid.status_code == 403
+    assert product.analytics.preparation_calls == 0
     busy = product.client.post(route, headers=_person_headers(product), content=body)
     assert busy.status_code == 429
     assert "Person view preparation is busy" in busy.text
+    assert product.analytics.preparation_calls == 1
     product.analytics.preparation_pending = False
     product.analytics.infer = original
     admitted = product.client.post(route, headers=_person_headers(product), content=body)
     assert admitted.status_code == 200
     assert admitted.headers["cache-control"] == "no-store"
     assert admitted.json()["status"] == "active"
+    assert product.analytics.preparation_calls == 2
 
 
 @pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
