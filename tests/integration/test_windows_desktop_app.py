@@ -1869,27 +1869,6 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
         response = first.value
     except Exception:
         diagnostic["analytics_sample_request_traffic"] = dict(traffic)
-        # Fetch only a finite authenticated worker phase, never the native
-        # exception, credentials, submitted pixels or camera source URI.
-        try:
-            diagnostic["analytics_sample_preparation_phase"] = page.evaluate(
-                """async () => {
-                  const controller = new AbortController();
-                  const timeout = setTimeout(() => controller.abort(), 1500);
-                  try {
-                    const response = await fetch('/api/v1/operator/status', {
-                      credentials: 'same-origin', cache: 'no-store', signal: controller.signal
-                    });
-                    if (!response.ok) return 'unavailable';
-                    const phase = (await response.json()).person_preparation_phase;
-                    const phases = ['not_requested', 'preparing', 'ready', 'failed', 'closed', 'unknown'];
-                    return phases.includes(phase) ? phase : 'unavailable';
-                  } catch (_) { return 'unavailable'; }
-                  finally { clearTimeout(timeout); }
-                }"""
-            )
-        except Exception:
-            diagnostic["analytics_sample_preparation_phase"] = "unavailable"
         try:
             diagnostic["analytics_sample_request_state"] = page.evaluate(
                 """() => {
