@@ -1268,6 +1268,7 @@ def test_first_verified_recorded_person_event_starts_optional_preparation_once(s
 
     asyncio.run(run())
 
+
 def test_verified_live_recorder_prime_releases_optional_view_warmup_without_event(store):
     """A sealed primed worker may warm the view; it never admits a person event."""
     camera = uuid4()
