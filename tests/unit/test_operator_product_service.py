@@ -1387,6 +1387,7 @@ def test_native_person_warmup_cancelled_on_product_shutdown():
 
     asyncio.run(exercise())
 
+
 def test_native_view_warmup_yields_to_first_recorded_event_without_changing_view_path():
     from k5vision.operator_product_api import _NativePersonWarmupGate
 
