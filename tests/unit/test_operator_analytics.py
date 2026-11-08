@@ -132,9 +132,7 @@ def test_pending_native_preparation_returns_busy_without_waiting_for_compilation
             release.set()
         await broker._prewarm_task
         assert broker.preparation_pending is False
-        second = await broker.infer(
-            owner_id=owner, camera_id=camera, frame_id=12, frame=frame(8)
-        )
+        second = await broker.infer(owner_id=owner, camera_id=camera, frame_id=12, frame=frame(8))
         assert second.status == "active" and second.frame_id == 12
         assert len(harness.providers) == 1 and len(harness.calls) == 1
         assert harness.calls[0][1] == bytes(frame(8).payload)
