@@ -1237,6 +1237,52 @@ def test_history_registry_lock_does_not_block_other_http_requests(
     assert calls == 2 * reads_per_admission
 
 
+def test_history_waits_for_brief_native_recovery_and_rechecks_camera(product, monkeypatch):
+    identifier = product.enroll()
+    calls = []
+
+    def recovering_status():
+        calls.append(True)
+        return "unavailable" if len(calls) <= 2 else "ready"
+
+    monkeypatch.setattr(product.service, "status", recovering_status)
+    response = product.client.get(
+        f"/api/v1/operator/cameras/{identifier}/history", headers=product.headers
+    )
+    assert response.status_code == 200
+    assert response.json()["spans"][0]["duration_seconds"] == 60.0
+    assert len(calls) == 3
+
+
+def test_history_recovery_does_not_reuse_revoked_admin_authority(product, monkeypatch):
+    identifier = product.enroll()
+    replacement, _, _ = product.users.create_with_bootstrap(
+        UserCreate(
+            username="history-recovery-admin",
+            display_name="History recovery administrator",
+            role=UserRole.ADMINISTRATOR,
+        ),
+        actor="test",
+    )
+    _initialized_session(product, replacement)
+    calls = []
+
+    def revoked_during_recovery():
+        calls.append(True)
+        if len(calls) == 2:
+            product.users.update(product.admin.id, UserPatch(enabled=False), actor="test")
+            return "ready"
+        return "unavailable"
+
+    monkeypatch.setattr(product.service, "status", revoked_during_recovery)
+    response = product.client.get(
+        f"/api/v1/operator/cameras/{identifier}/history", headers=product.headers
+    )
+    assert response.status_code == 401
+    assert len(calls) == 2
+    assert not product.service.provider.history_queries
+
+
 def test_history_respects_aware_interval_and_hides_donor_errors(product):
     device_id = product.enroll()
     route = f"/api/v1/operator/cameras/{device_id}/history"
