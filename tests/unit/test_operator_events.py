@@ -1199,11 +1199,11 @@ def test_first_recorded_person_event_has_priority_over_speculative_view_warmup(s
     finally:
         asyncio.run(service.aclose())
 
+
 def test_first_recorded_person_event_releases_warmup_with_other_cameras_empty(store):
     first, second, unrelated = uuid4(), uuid4(), uuid4()
     sources = tuple(
-        SimpleNamespace(binding=SimpleNamespace(device_id=camera))
-        for camera in (first, second)
+        SimpleNamespace(binding=SimpleNamespace(device_id=camera)) for camera in (first, second)
     )
     cameras = SimpleNamespace(list_sources=lambda: sources)
     for camera in (first, second):
