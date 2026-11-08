@@ -1317,6 +1317,7 @@ def test_verified_live_recorder_prime_releases_optional_view_warmup_without_even
         asyncio.run(service.aclose())
     assert not sampler.native_model_ready()
 
+
 def test_cold_recorder_prime_defers_view_without_enabled_analytics(store):
     """The camera-free recorder model gets CPU priority before UI configuration."""
     camera = uuid4()
