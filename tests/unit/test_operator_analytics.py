@@ -105,6 +105,45 @@ def test_unowned_native_preparation_is_claimed_only_by_an_authorized_view(harnes
     asyncio.run(run())
 
 
+def test_pending_native_preparation_returns_busy_without_waiting_for_compilation(harness):
+    async def run():
+        broker = harness.make(max_views=1)
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = broker._factory
+
+        async def slow_factory():
+            entered.set()
+            await release.wait()
+            return await original()
+
+        broker._factory = slow_factory
+        broker.start_preparing()
+        await entered.wait()
+        assert broker.preparation_pending is True
+        owner, camera = uuid4(), uuid4()
+        try:
+            first = await asyncio.wait_for(
+                broker.infer(owner_id=owner, camera_id=camera, frame_id=11, frame=frame(7)),
+                timeout=1.0,
+            )
+            assert first.as_dict() == {"status": "busy", "frame_id": 11, "boxes": []}
+            assert harness.providers == [] and harness.calls == []
+        finally:
+            release.set()
+        await broker._prewarm_task
+        assert broker.preparation_pending is False
+        second = await broker.infer(
+            owner_id=owner, camera_id=camera, frame_id=12, frame=frame(8)
+        )
+        assert second.status == "active" and second.frame_id == 12
+        assert len(harness.providers) == 1 and len(harness.calls) == 1
+        assert harness.calls[0][1] == bytes(frame(8).payload)
+        await broker.aclose()
+        assert harness.providers[0].closed == 1
+
+    asyncio.run(run())
+
+
 def test_cancelled_view_does_not_cancel_media_free_model_preparation(harness):
     async def run():
         broker = harness.make(max_views=1)
