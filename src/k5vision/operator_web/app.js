@@ -59,7 +59,7 @@
     recorderTime: null, sessionExpiresAt: null, sessionExpirySteady: null,
     removeTarget: null, removing: false,
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
-    personBufferTimer: null,
+    personBufferTimer: null, personTransient503: 0,
     personFrameId: 0,
     recordingBusy: false, cameraListEpoch: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
     playbackStart: null, playbackEnd: null, playbackPosition: null, playbackEpoch: 0, selectedStatus: null,
@@ -887,6 +887,7 @@
 
   function stopPersonView(reason = "Select Start sampled view while live video is playing. Samples are processed locally and are not saved.") {
     state.personEnabled = false;
+    state.personTransient503 = 0;
     state.personEpoch += 1;
     clearTimeout(state.personTimer);
     state.personTimer = null;
@@ -943,7 +944,7 @@
       });
       if (epoch !== state.personEpoch || !state.personEnabled || cameraId !== state.selected || !canSamplePerson()) return;
       if (!result || result.frame_id !== frameId || !["active", "busy", "unavailable"].includes(result.status)
-        || !Array.isArray(result.boxes) || result.boxes.length > 32 || !result.boxes.every(validPersonBox)) throw new ApiError(503);
+        || !Array.isArray(result.boxes) || result.boxes.length > 32 || !result.boxes.every(validPersonBox)) throw new ApiError(503, "person_contract_invalid");
       if (result.status === "unavailable") {
         stopPersonView("Person detection is unavailable. Live video and recording continue. Start sampled view to retry.");
         return;
@@ -953,6 +954,9 @@
         // while another native worker owns inference capacity.
         if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
       } else {
+        // Only a genuine active response resets the bounded transient-error
+        // budget. Alternating HTTP 429/503 cannot retry without limit.
+        state.personTransient503 = 0;
         // The response belongs to this exact frozen sample, never the moving
         // live player. Publish frame and boxes together in one canvas update.
         const canvas = $("person-view-canvas");
@@ -971,8 +975,19 @@
       }
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.personEpoch || !state.token) return;
-      if (error.status === 429 && $("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
-      else stopPersonView(apiMessage(error, "Person detection is unavailable. Live video and recording continue. Start sampled view to retry."));
+      if (error.status === 429) {
+        if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
+      } else if (error.status === 503 && error.code !== "person_contract_invalid"
+        && state.personTransient503 < 2 && canSamplePerson()) {
+        // A transient local service fault must not permanently disable an
+        // otherwise healthy installed view after one request. Retry at most
+        // twice; malformed successful responses still fail closed immediately.
+        // Each request owns a fresh frame and is reauthorized server-side.
+        state.personTransient503 += 1;
+        if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is temporarily unavailable. Retrying…");
+      } else {
+        stopPersonView(apiMessage(error, "Person detection is unavailable. Live video and recording continue. Start sampled view to retry."));
+      }
     } finally {
       pixels?.fill(0);
       snapshot?.data.fill(0);
@@ -1971,6 +1986,7 @@
     if (state.personEnabled) { stopPersonView(); return; }
     if (!canSamplePerson()) return;
     state.personEnabled = true;
+    state.personTransient503 = 0;
     const epoch = ++state.personEpoch;
     renderPersonControls();
     message("person-view-message", "Processing a sampled frame…");

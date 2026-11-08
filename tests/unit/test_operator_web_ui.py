@@ -39,6 +39,25 @@ def test_busy_person_sample_preserves_last_verified_canvas_until_new_active_samp
     assert "output.strokeRect" in active_body
 
 
+def test_installed_sampled_person_recovers_from_only_two_transient_service_failures():
+    """One local HTTP 503 can retry, without masking malformed data or revocation."""
+    source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    sample = source.split("async function samplePerson(epoch)", 1)[1].split("async function startLive(", 1)[0]
+    assert 'throw new ApiError(503, "person_contract_invalid")' in sample
+    assert 'error.status === 503 && error.code !== "person_contract_invalid"' in sample
+    assert "state.personTransient503 < 2 && canSamplePerson()" in sample
+    assert "state.personTransient503 += 1;" in sample
+    assert "state.personTransient503 = 0;" in sample
+    assert "else {\\n        stopPersonView(apiMessage(error," in sample
+    assert "state.personTimer = setTimeout(() => void samplePerson(epoch)" in sample
+    stop = source.split("function stopPersonView(", 1)[1].split("function validPersonBox(", 1)[0]
+    assert "state.personTransient503 = 0;" in stop
+    assert "state.personController?.abort();" in stop
+    assert "state.personTransient503 = 0;" in source.split('$("toggle-person-view").addEventListener("click"', 1)[1].split("void samplePerson(epoch)", 1)[0]
+
+
 def test_buffering_does_not_cancel_an_already_submitted_person_frame():
     """One frozen authorized sample must finish independently of later HLS buffering."""
     source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
