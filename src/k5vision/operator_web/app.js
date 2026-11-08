@@ -1955,7 +1955,25 @@
     message("live-state", "Live video connected");
     renderPersonControls();
   });
-  $("live-video").addEventListener("pause", () => { if (state.personEnabled) stopPersonView("Sampled view stopped while live video is paused."); });
+  $("live-video").addEventListener("pause", () => {
+    if (!state.personEnabled) return;
+    if (state.personController) {
+      // Chrome/HLS can emit pause during buffering after the immutable frame
+      // was submitted. Preserve that one request: playback teardowns still
+      // call stopPersonView() themselves and abort it immediately.
+      const epoch = state.personEpoch;
+      const video = $("live-video");
+      if (state.personBufferTimer === null) {
+        const frames = video.getVideoPlaybackQuality?.().totalVideoFrames;
+        state.personBufferTimer = setTimeout(() => {
+          state.personBufferTimer = null;
+          checkPersonBuffer(epoch, video, frames);
+        }, PERSON_BUFFER_GRACE_MS);
+      }
+      return;
+    }
+    stopPersonView("Sampled view stopped while live video is paused.");
+  });
   function checkPersonBuffer(epoch, video, frames) {
     if (!state.personEnabled || state.personEpoch !== epoch) return;
     const current = video.getVideoPlaybackQuality?.().totalVideoFrames;
