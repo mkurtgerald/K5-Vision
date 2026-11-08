@@ -115,6 +115,12 @@ class OperatorAnalyticsBroker:
         self._prewarm_task: asyncio.Task[None] | None = None
         self._prewarmed_provider: OwnedAnalyticsProvider | None = None
 
+    @property
+    def preparation_pending(self) -> bool:
+        """A sealed, media-free native worker is still being prepared."""
+        task = self._prewarm_task
+        return task is not None and not task.done()
+
     def start_preparing(self) -> None:
         """Prepare one sealed native worker ahead of a first installed frame.
 
@@ -215,6 +221,12 @@ class OperatorAnalyticsBroker:
             self._views[key] = view
         if view.closed:
             return OperatorAnalyticsResult("unavailable", frame_id)
+        if view.provider is None and self.preparation_pending:
+            # Native model admission must never hold the API request open until
+            # Caddy's gateway timeout. Leave the media-free preparation intact;
+            # the authenticated browser retries without retaining this frame.
+            view.last_used = now
+            return OperatorAnalyticsResult("busy", frame_id)
         if view.operation is not None or now - view.last_submission < self._interval:
             return OperatorAnalyticsResult("busy", frame_id)
         view.last_used = view.last_submission = now
