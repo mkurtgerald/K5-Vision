@@ -26,6 +26,33 @@ def builder() -> ModuleType:
     return module
 
 
+def test_native_worker_archive_reuses_only_verified_ci_donor(builder, tmp_path, monkeypatch):
+    root = tmp_path / "CI verified donors"
+    root.mkdir()
+    raw = b"immutable pinned official worker archive"
+    source = root / "mediamtx.zip"
+    source.write_bytes(raw)
+    identity = {"bytes": len(raw), "sha256": sha256(raw).hexdigest()}
+    monkeypatch.setenv("K5_DONOR_TOOL_ROOT", str(root))
+
+    def no_redownload(*_args, **_kwargs):
+        raise AssertionError("Verified CI donor must not be fetched again")
+
+    monkeypatch.setattr(builder, "download", no_redownload)
+    destination = tmp_path / "worker-mediamtx-official.zip"
+    builder.acquire_worker_archive(identity, destination, "mediamtx")
+    assert destination.read_bytes() == raw
+
+    # A changed archive fails without falling back to the network.
+    source.write_bytes(b"tampered upstream archive")
+    refused = tmp_path / "refused.zip"
+    with pytest.raises(ValueError, match="identity mismatch"):
+        builder.acquire_worker_archive(identity, refused, "mediamtx")
+    assert not refused.exists()
+    with pytest.raises(ValueError, match="component"):
+        builder.acquire_worker_archive(identity, refused, "unknown")
+
+
 def test_exact_donor_identity_detects_size_and_content_tampering(builder, tmp_path):
     donor = tmp_path / "donor.zip"
     donor.write_bytes(b"verified native donor")
