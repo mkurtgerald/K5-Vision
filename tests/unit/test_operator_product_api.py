@@ -1198,7 +1198,8 @@ def test_history_registry_lock_does_not_block_other_http_requests(
     # Camera selection performs two device-registry reads per admission;
     # policy lookup performs one. Hit both sides of provider I/O.
     reads_per_admission = 2 if blocked_read == "device_registry" else 1
-    block_call = 1 + (reads_per_admission if block_after_provider else 0)
+    # Initial admission and post-readiness admission both precede provider I/O.
+    block_call = 1 + (2 * reads_per_admission if block_after_provider else 0)
     original = getattr(owner, method)
     entered, released = threading.Event(), threading.Event()
     counter_lock = threading.Lock()
@@ -1234,7 +1235,7 @@ def test_history_registry_lock_does_not_block_other_http_requests(
         finally:
             released.set()
         assert protected.result(timeout=5).status_code == 200
-    assert calls == 2 * reads_per_admission
+    assert calls == 3 * reads_per_admission
 
 
 def test_history_waits_for_brief_native_recovery_and_rechecks_camera(product, monkeypatch):
