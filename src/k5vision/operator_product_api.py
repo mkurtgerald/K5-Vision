@@ -347,15 +347,6 @@ class _NativePersonWarmupGate:
         self._started = True
         self._analytics.start_preparing()
 
-    def on_analytics_enabled(self) -> None:
-        """Prime sealed view inference when an admin enables recorded detection.
-
-        Recorder detection and view model compilation can now overlap. The
-        preparation owns no camera identity, credentials, media or session;
-        sampled frames still require all authorization and bounding-box checks.
-        """
-        self.on_first_recorded_person_event()
-
     def on_first_recorded_person_event(self) -> None:
         """Start sealed preparation as soon as recording admits a real person.
 
@@ -819,11 +810,6 @@ def install_operator_product_api(
         authorized_selection=authorized_selection,
         selections=selections,
         mutations=mutations,
-        on_analytics_enabled=(
-            native_person_preparation.on_analytics_enabled
-            if native_person_preparation is not None
-            else None
-        ),
     )
     install_operator_exports_api(
         app,

@@ -2592,22 +2592,3 @@ def test_first_recorded_event_bypasses_optional_native_preparation_timer_once():
         assert analytics.preparation_calls == 1
 
     asyncio.run(run())
-
-def test_authorized_analytics_preparation_cancels_quiet_timer_without_person_event():
-    analytics = _Analytics()
-    gate = _NativePersonWarmupGate(analytics, quiet_seconds=18.0, defer_preparation=lambda: True)
-
-    async def run():
-        gate.schedule(enrollment=True)
-        assert analytics.preparation_calls == 0
-        gate.on_analytics_enabled()
-        assert analytics.preparation_calls == 1
-        gate.on_analytics_enabled()
-        gate.on_first_recorded_person_event()
-        await asyncio.sleep(0)
-        assert analytics.preparation_calls == 1
-        gate.close()
-        gate.on_analytics_enabled()
-        assert analytics.preparation_calls == 1
-
-    asyncio.run(run())
