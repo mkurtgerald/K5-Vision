@@ -875,9 +875,7 @@ def test_media_auth_recovery_wait_is_finite_and_persistent_failure_denied():
         elapsed[0] += seconds
 
     with pytest.raises(HTTPException) as failure:
-        asyncio.run(
-            _await_media_ready(unavailable, now=lambda: elapsed[0], pause=advance)
-        )
+        asyncio.run(_await_media_ready(unavailable, now=lambda: elapsed[0], pause=advance))
     assert failure.value.status_code == 503
     assert elapsed[0] == pytest.approx(2.0)
     assert 2 <= len(observations) <= 22
