@@ -3,7 +3,7 @@ name: Native Windows Operator Product
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, codex/windows-mediamtx-donor]
+    branches: [main, codex/windows-mediamtx-donor, codex/camera-setup-beta-20261102]
     paths:
       - .github/workflows/operator-product-windows.yml
       - src/k5vision/operator_product*.py
