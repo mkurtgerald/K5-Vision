@@ -90,7 +90,26 @@ jobs:
             if ($Url -notmatch '^https://[^\s]+$' -or $ExpectedHash -notmatch '^[a-fA-F0-9]{64}$') {
               throw "Native tool archive identity is invalid"
             }
-            Invoke-WebRequest -Uri $Url -OutFile $Archive -TimeoutSec 180
+            # Retry bounded transient transport failures only. Archive and
+            # extracted executable SHA-256 checks remain unconditional.
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                Invoke-WebRequest -Uri $Url -OutFile $Archive -TimeoutSec 180
+                break
+              } catch {
+                $response = $_.Exception.Response
+                $status = if ($null -ne $response) { [int]$response.StatusCode } else { 0 }
+                Remove-Item -LiteralPath $Archive -Force -ErrorAction SilentlyContinue
+                if ($status -notin @(408, 429, 502, 503, 504)) {
+                  throw "Native tool archive download was refused"
+                }
+                if ($attempt -eq 3) {
+                  throw "Pinned archive transport retries exhausted (HTTP $status)"
+                }
+                Write-Host "Pinned archive transport HTTP $status; retrying bounded download"
+                Start-Sleep -Seconds (2 * $attempt)
+              }
+            }
             $actualHash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
             if (-not [string]::Equals($actualHash, $ExpectedHash, [StringComparison]::OrdinalIgnoreCase)) {
               throw "Native tool archive SHA256 mismatch"
