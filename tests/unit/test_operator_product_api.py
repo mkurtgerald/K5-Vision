@@ -809,9 +809,7 @@ def test_media_cookie_survives_host_clock_steps_but_never_extends_human_session(
     )
 
 
-def test_media_auth_survives_brief_health_dip_without_skipping_ownership(
-    product, monkeypatch
-):
+def test_media_auth_survives_brief_health_dip_without_skipping_ownership(product, monkeypatch):
     identifier = product.enroll()
     path = MediaMTXBinding(product.service.site_id, UUID(identifier)).path_name
     observed = []
