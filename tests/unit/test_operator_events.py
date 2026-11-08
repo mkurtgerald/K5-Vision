@@ -1171,3 +1171,29 @@ def test_recorded_native_model_prime_requires_matching_reply_and_reuses_child(
         "artifact_root": str(tmp_path / "sealed-person-model"),
     }
     worker.close()
+
+def test_first_recorded_person_event_has_priority_over_speculative_view_warmup(store):
+    camera = uuid4()
+    source = SimpleNamespace(binding=SimpleNamespace(device_id=camera))
+    cameras = SimpleNamespace(list_sources=lambda: (source,))
+    store.configure(camera, enabled=True, confidence_threshold=0.5)
+    assert _record(store, camera, 1)
+    service = OperatorEventService(
+        store=store,
+        cameras=cameras,
+        recording_root=Path("."),
+        configuration=None,
+        sampler=SimpleNamespace(),
+        provider_factory=object(),
+    )
+    try:
+        # Historical rows cannot prove a newly started native worker has
+        # detected a real event in this service lifetime.
+        assert service.awaiting_first_recorded_person_event()
+        service._last_events[camera] = 1.0
+        assert not service.awaiting_first_recorded_person_event()
+        service._last_events.clear()
+        store.configure(camera, enabled=False, confidence_threshold=0.5)
+        assert not service.awaiting_first_recorded_person_event()
+    finally:
+        asyncio.run(service.aclose())
