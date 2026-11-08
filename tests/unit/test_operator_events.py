@@ -1267,3 +1267,51 @@ def test_first_verified_recorded_person_event_starts_optional_preparation_once(s
             await service.aclose()
 
     asyncio.run(run())
+
+def test_verified_live_recorder_prime_releases_optional_view_warmup_without_event(store):
+    """A sealed primed worker may warm the view; it never admits a person event."""
+    camera = uuid4()
+    source = SimpleNamespace(binding=SimpleNamespace(device_id=camera))
+    cameras = SimpleNamespace(list_sources=lambda: (source,))
+    store.configure(camera, enabled=True, confidence_threshold=0.5)
+
+    class NativeProcess:
+        exit_code = None
+
+        def poll(self):
+            return self.exit_code
+
+    process = NativeProcess()
+    worker = SimpleNamespace(
+        _person_ready=False,
+        _process=process,
+        begin_close=lambda: None,
+        close=lambda: None,
+    )
+    sampler = object.__new__(RecordedFrameSampler)
+    sampler._closing = threading.Event()
+    sampler._worker_lock = threading.RLock()
+    sampler._worker = worker
+    service = OperatorEventService(
+        store=store,
+        cameras=cameras,
+        recording_root=Path("."),
+        configuration=None,
+        sampler=sampler,
+        provider_factory=object(),
+    )
+    try:
+        assert service.awaiting_first_recorded_person_event()
+        assert not sampler.native_model_ready()
+        worker._person_ready = True
+        assert sampler.native_model_ready()
+        assert not service.awaiting_first_recorded_person_event()
+        assert service._last_events == {}
+        process.exit_code = 1
+        assert not sampler.native_model_ready()
+        assert service.awaiting_first_recorded_person_event()
+        worker._process = None
+        assert not sampler.native_model_ready()
+    finally:
+        asyncio.run(service.aclose())
+    assert not sampler.native_model_ready()
