@@ -75,9 +75,7 @@ def test_inflight_person_response_survives_transient_hls_buffering():
     assert "if (!canSamplePerson())" in submitted
     # Completion remains bound to a valid camera and session without depending
     # on the transient decoder readyState after the immutable POST was sent.
-    fulfilled = submitted.split("const result = await request(", 1)[1].split(
-        "if (!result ||", 1
-    )[0]
+    fulfilled = submitted.split("const result = await request(", 1)[1].split("if (!result ||", 1)[0]
     for guard in (
         "epoch !== state.personEpoch",
         "!state.personEnabled",
