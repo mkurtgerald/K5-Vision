@@ -83,7 +83,6 @@ async def _await_media_ready(status, *, now=None, pause=None) -> bool:
     raise HTTPException(503, "Media unavailable")
 
 
-
 def _analytics_owner(token: str) -> UUID:
     return UUID(bytes=hashlib.sha256(token.encode("ascii")).digest()[:16])
 
