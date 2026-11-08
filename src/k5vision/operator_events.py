@@ -9,6 +9,7 @@ Decoded pixels stay transient; durable data contains settings and event metadata
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import math
@@ -352,6 +353,15 @@ class _RecordedNativeWorker:
             return _NATIVE_COLD_PERSON_REQUEST_SECONDS
         return _NATIVE_REQUEST_SECONDS
 
+    @staticmethod
+    def _recoverable_stdin_disconnect(error: OSError) -> bool:
+        # Windows may report a closed anonymous pipe as WinError 109, 232,
+        # or 233 without raising the BrokenPipeError subclass. Never retry
+        # unrelated native launch or write errors.
+        return isinstance(error, BrokenPipeError) or error.errno == errno.EPIPE or (
+            getattr(error, "winerror", None) in {109, 232, 233}
+        )
+
     def _start(self) -> None:
         from k5vision.operator_native_process import _WindowsJob
 
@@ -426,7 +436,9 @@ class _RecordedNativeWorker:
                 try:
                     process.stdin.write(payload)
                     process.stdin.flush()
-                except BrokenPipeError:
+                except OSError as error:
+                    if not self._recoverable_stdin_disconnect(error):
+                        raise
                     # The Windows child can exit before accepting its first
                     # snapshot. Reap it before one replacement; never retry a
                     # model, decoder, inference or response-protocol failure.
