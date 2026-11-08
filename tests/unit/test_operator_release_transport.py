@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 TOOL_STEPS = (
     ".github/actions/provision-operator-tools/action.yml",
