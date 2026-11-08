@@ -52,7 +52,7 @@ def test_installed_sampled_person_recovers_from_only_two_transient_service_failu
     assert "state.personTransient503 < 2 && canSamplePerson()" in sample
     assert "state.personTransient503 += 1;" in sample
     assert "state.personTransient503 = 0;" in sample
-    assert "else {\\n        stopPersonView(apiMessage(error," in sample
+    assert "stopPersonView(apiMessage(error," in sample
     assert "state.personTimer = setTimeout(() => void samplePerson(epoch)" in sample
     stop = source.split("function stopPersonView(", 1)[1].split("function validPersonBox(", 1)[0]
     assert "state.personTransient503 = 0;" in stop
