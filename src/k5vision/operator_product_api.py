@@ -1160,6 +1160,12 @@ def install_operator_product_api(
                 raise HTTPException(400, "Person view upload unavailable") from None
             if len(body) != expected:
                 raise HTTPException(400, "Person view length does not match geometry")
+            if prepare_native_person_on_camera:
+                # A real, authorized sampled-view request bypasses the optional
+                # enrollment quiet timer, not model admission or person-event
+                # acceptance. Preparation owns no camera pixels or source URI.
+                # The first request is retryable while native compilation runs.
+                analytics.start_preparing()
             try:
                 result = await analytics.infer(
                     owner_id=_analytics_owner(session[1]),
