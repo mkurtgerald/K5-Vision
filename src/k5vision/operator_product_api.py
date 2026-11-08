@@ -815,7 +815,17 @@ def install_operator_product_api(
     @app.get(_PREFIX + "/status", tags=["operator"])
     async def operator_status(response: Response, _session: tuple[UserAccount, str] = read_session):
         response.headers["Cache-Control"] = "no-store"
-        return {**service.diagnostics(), "analytics_status": person_status}
+        report = {**service.diagnostics(), "analytics_status": person_status}
+        if prepare_native_person_on_camera and analytics is not None:
+            # Reveal only the finite sealed-worker phase to an authenticated
+            # operator. Never expose local model paths, exceptions or pixels.
+            phase = getattr(analytics, "preparation_phase", "unknown")
+            report["person_preparation_phase"] = (
+                phase
+                if phase in {"not_requested", "preparing", "ready", "failed", "closed"}
+                else "unknown"
+            )
+        return report
 
     @app.get(_PREFIX + "/cameras", tags=["operator"])
     async def list_cameras(response: Response, session: tuple[UserAccount, str] = read_session):
@@ -1142,7 +1152,11 @@ def install_operator_product_api(
             if declared != expected:
                 raise HTTPException(400, "Person view length does not match geometry")
         if person_slots.locked():
-            raise HTTPException(429, "Person view capacity is busy")
+            raise HTTPException(
+                429,
+                "Person view capacity is busy",
+                headers={"X-K5-Person-Phase": "capacity"},
+            )
         await person_slots.acquire()
         body = bytearray()
         try:
@@ -1189,7 +1203,11 @@ def install_operator_product_api(
                 # A native compilation in progress is not a successful sampled
                 # detection. The browser retries HTTP 429 while the existing
                 # installed box deadline and camera-policy checks remain intact.
-                raise HTTPException(429, "Person view preparation is busy")
+                raise HTTPException(
+                    429,
+                    "Person view preparation is busy",
+                    headers={"X-K5-Person-Phase": "preparing"},
+                )
             response.headers["Cache-Control"] = "no-store"
             return value
         finally:

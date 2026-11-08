@@ -114,12 +114,25 @@ class OperatorAnalyticsBroker:
         self._closed = False
         self._prewarm_task: asyncio.Task[None] | None = None
         self._prewarmed_provider: OwnedAnalyticsProvider | None = None
+        self._prewarm_successful = False
 
     @property
     def preparation_pending(self) -> bool:
         """A sealed, media-free native worker is still being prepared."""
         task = self._prewarm_task
         return task is not None and not task.done()
+
+    @property
+    def preparation_phase(self) -> str:
+        """Finite native-admission state, without private worker diagnostics."""
+        if self._closed:
+            return "closed"
+        task = self._prewarm_task
+        if task is None:
+            return "not_requested"
+        if not task.done():
+            return "preparing"
+        return "ready" if self._prewarm_successful else "failed"
 
     def start_preparing(self) -> None:
         """Prepare one sealed native worker ahead of a first installed frame.
@@ -146,6 +159,7 @@ class OperatorAnalyticsBroker:
                 pass
         else:
             self._prewarmed_provider = provider
+            self._prewarm_successful = True
 
     @staticmethod
     def _validate(owner_id: UUID, camera_id: UUID, frame_id: int, frame) -> None:

@@ -108,6 +108,7 @@ def test_unowned_native_preparation_is_claimed_only_by_an_authorized_view(harnes
 def test_pending_native_preparation_returns_busy_without_waiting_for_compilation(harness):
     async def run():
         broker = harness.make(max_views=1)
+        assert broker.preparation_phase == "not_requested"
         entered, release = asyncio.Event(), asyncio.Event()
         original = broker._factory
 
@@ -120,6 +121,7 @@ def test_pending_native_preparation_returns_busy_without_waiting_for_compilation
         broker.start_preparing()
         await entered.wait()
         assert broker.preparation_pending is True
+        assert broker.preparation_phase == "preparing"
         owner, camera = uuid4(), uuid4()
         try:
             first = await asyncio.wait_for(
@@ -132,12 +134,14 @@ def test_pending_native_preparation_returns_busy_without_waiting_for_compilation
             release.set()
         await broker._prewarm_task
         assert broker.preparation_pending is False
+        assert broker.preparation_phase == "ready"
         second = await broker.infer(owner_id=owner, camera_id=camera, frame_id=12, frame=frame(8))
         assert second.status == "active" and second.frame_id == 12
         assert len(harness.providers) == 1 and len(harness.calls) == 1
         assert harness.calls[0][1] == bytes(frame(8).payload)
         await broker.aclose()
         assert harness.providers[0].closed == 1
+        assert broker.preparation_phase == "closed"
 
     asyncio.run(run())
 

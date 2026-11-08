@@ -1826,6 +1826,9 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
             # response content. Preserve unexpected 5xx classes to distinguish
             # proxy/backend faults from a native inference refusal.
             traffic["http_status"] = response.status if 100 <= response.status <= 599 else 0
+            if response.status == 429:
+                phase = response.headers.get("x-k5-person-phase")
+                traffic["busy_phase"] = phase if phase in {"capacity", "preparing"} else "other"
             if first_sent_at[0] is not None:
                 traffic["first_response_ms"] = min(
                     120000, max(0, int((time.monotonic() - first_sent_at[0]) * 1000))
@@ -1866,6 +1869,27 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
         response = first.value
     except Exception:
         diagnostic["analytics_sample_request_traffic"] = dict(traffic)
+        # Fetch only a finite authenticated worker phase, never the native
+        # exception, credentials, submitted pixels or camera source URI.
+        try:
+            diagnostic["analytics_sample_preparation_phase"] = page.evaluate(
+                """async () => {
+                  const controller = new AbortController();
+                  const timeout = setTimeout(() => controller.abort(), 1500);
+                  try {
+                    const response = await fetch('/api/v1/operator/status', {
+                      credentials: 'same-origin', cache: 'no-store', signal: controller.signal
+                    });
+                    if (!response.ok) return 'unavailable';
+                    const phase = (await response.json()).person_preparation_phase;
+                    return ['not_requested', 'preparing', 'ready', 'failed', 'closed', 'unknown'].includes(phase)
+                      ? phase : 'unavailable';
+                  } catch (_) { return 'unavailable'; }
+                  finally { clearTimeout(timeout); }
+                }"""
+            )
+        except Exception:
+            diagnostic["analytics_sample_preparation_phase"] = "unavailable"
         try:
             diagnostic["analytics_sample_request_state"] = page.evaluate(
                 """() => {

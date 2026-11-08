@@ -1384,6 +1384,8 @@ def test_pending_person_model_preparation_returns_retryable_429_only_after_auth(
     busy = product.client.post(route, headers=_person_headers(product), content=body)
     assert busy.status_code == 429
     assert "Person view preparation is busy" in busy.text
+    assert busy.headers.get("x-k5-person-phase") == "preparing"
+    assert invalid.headers.get("x-k5-person-phase") is None
     assert product.analytics.preparation_calls == 1
     product.analytics.preparation_pending = False
     product.analytics.infer = original
