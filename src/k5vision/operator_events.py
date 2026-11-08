@@ -926,6 +926,21 @@ class OperatorEventService:
         self._configuration_generation: dict[UUID, int] = {}
         self._rotation = 0
 
+    def awaiting_first_recorded_person_event(self) -> bool:
+        """Give the first real recorded-person event priority over optional view warmup.
+
+        This is an internal scheduling hint, not an event admission or UI
+        entitlement. A requested sampled view retains its normal cold path.
+        Historical events never prove that this process has sampled a frame.
+        """
+        if self._closing or self._unavailable or not self._available:
+            return False
+        return any(
+            self.store.settings(source.binding.device_id)["enabled"]
+            and source.binding.device_id not in self._last_events
+            for source in self._cameras.list_sources()
+        )
+
     def status(self, camera_id: UUID) -> dict:
         settings = self.store.settings(camera_id)
         state = self._states.get(camera_id, {})
