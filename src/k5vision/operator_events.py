@@ -533,6 +533,13 @@ class _RecordedNativeWorker:
             except Exception:
                 if expired.is_set():
                     self._failure_phase = "native_timeout"
+                elif (
+                    self._failure_phase == "native_write_failed"
+                    and process.poll() is not None
+                ):
+                    # A child exiting before stdin acceptance is not evidence
+                    # of model failure. Retain no stderr, arguments or paths.
+                    self._failure_phase = "native_child_exited_before_request"
                 failed = True
                 raise OperatorEventsError("Analytics native frame unavailable") from None
             finally:
@@ -1015,6 +1022,7 @@ class OperatorEventService:
                 in_flight = {
                     "native_launch_failed": "native_worker_starting",
                     "native_write_failed": "native_request_writing",
+                    "native_child_exited_before_request": "native_worker_exited",
                     "native_reply_missing": "native_reply_waiting",
                     "native_header_invalid": "native_header_reading",
                     "native_payload_incomplete": "native_payload_reading",
@@ -1032,6 +1040,7 @@ class OperatorEventService:
                 "native_request",
                 "native_worker_starting",
                 "native_request_writing",
+                "native_worker_exited",
                 "native_reply_waiting",
                 "native_header_reading",
                 "native_payload_reading",
@@ -1241,6 +1250,7 @@ class OperatorEventService:
                             "native_launch_failed",
                             "native_transport_failed",
                             "native_write_failed",
+                            "native_child_exited_before_request",
                             "native_reply_missing",
                             "native_header_invalid",
                             "native_payload_incomplete",
