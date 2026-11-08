@@ -347,6 +347,20 @@ class _NativePersonWarmupGate:
         self._started = True
         self._analytics.start_preparing()
 
+    def on_first_recorded_person_event(self) -> None:
+        """Start sealed preparation as soon as recording admits a real person.
+
+        Do not wait for the next timer poll. The installed browser's immutable
+        sampled-frame deadline is independent of recorder event detection.
+        """
+        if self._closed or self._started:
+            return
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+        self._started = True
+        self._analytics.start_preparing()
+
     def close(self) -> None:
         self._closed = True
         if self._handle is not None:
@@ -392,6 +406,10 @@ def install_operator_product_api(
         else None
     )
     app.state.operator_person_preparation = native_person_preparation
+    if native_person_preparation is not None:
+        register_event = getattr(recorder_events, "notify_on_first_recorded_person_event", None)
+        if callable(register_event):
+            register_event(native_person_preparation.on_first_recorded_person_event)
     seen_live: set[UUID] = set()
     connection_started: dict[UUID, float] = {}
     recording_started: dict[UUID, float] = {}

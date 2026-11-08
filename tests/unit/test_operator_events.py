@@ -1229,3 +1229,41 @@ def test_first_recorded_person_event_releases_warmup_with_other_cameras_empty(st
         assert not service.awaiting_first_recorded_person_event()
     finally:
         asyncio.run(service.aclose())
+
+
+def test_first_verified_recorded_person_event_starts_optional_preparation_once(store):
+    source = _source()
+
+    class InitiallyEmptyProvider:
+        def __init__(self):
+            self.calls = 0
+
+        async def __call__(self, _frame):
+            self.calls += 1
+            if self.calls == 1:
+                return ()
+            return (SimpleNamespace(category="person", confidence=0.9),)
+
+        async def aclose(self):
+            pass
+
+    service, _, provider = _service(store, source, provider=InitiallyEmptyProvider())
+    calls = []
+    service.notify_on_first_recorded_person_event(lambda: calls.append("first_event"))
+
+    async def run():
+        try:
+            service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
+            await service.cycle()
+            assert provider.calls == 1
+            assert calls == []
+            assert service.awaiting_first_recorded_person_event()
+            await service.cycle()
+            assert calls == ["first_event"]
+            assert not service.awaiting_first_recorded_person_event()
+            await service.cycle()
+            assert calls == ["first_event"]
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())

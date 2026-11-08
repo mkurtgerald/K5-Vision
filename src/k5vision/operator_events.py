@@ -923,8 +923,22 @@ class OperatorEventService:
         self._native_pending = None
         self._states: dict[UUID, dict] = {}
         self._last_events: dict[UUID, float] = {}
+        self._first_recorded_person_callback: Callable[[], None] | None = None
         self._configuration_generation: dict[UUID, int] = {}
         self._rotation = 0
+
+    def notify_on_first_recorded_person_event(self, callback: Callable[[], None]) -> None:
+        """Release optional, media-free view warmup after a real recorded event.
+
+        No camera, frame, identity, recording path or credential reaches the
+        callback. This is a one-shot scheduling signal, never event evidence.
+        """
+        if not callable(callback) or self._first_recorded_person_callback is not None:
+            raise ValueError("Native view warmup callback is invalid")
+        if self._last_events and not self.awaiting_first_recorded_person_event():
+            callback()
+        else:
+            self._first_recorded_person_callback = callback
 
     def awaiting_first_recorded_person_event(self) -> bool:
         """Give the first real recorded-person event priority over optional view warmup.
@@ -1133,6 +1147,17 @@ class OperatorEventService:
         )
         if emitted:
             self._last_events[identifier] = now
+            callback, self._first_recorded_person_callback = (
+                self._first_recorded_person_callback,
+                None,
+            )
+            if callback is not None:
+                try:
+                    callback()
+                except Exception:
+                    # Optional view warmup cannot invalidate recorded-person
+                    # evidence or interrupt subsequent recorded-frame sampling.
+                    pass
         state["status"] = "active"
         state["sample_phase"] = "person_detected" if selected else "no_person"
         state["last_completed_phase"] = state["sample_phase"]

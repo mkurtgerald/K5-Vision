@@ -38,7 +38,7 @@ from k5vision.media.mediamtx_provider import (
 )
 from k5vision.operator_analytics import OperatorAnalyticsResult
 from k5vision.operator_onvif import OnvifClockReading, OnvifError, OnvifProfile
-from k5vision.operator_product_api import install_operator_product_api
+from k5vision.operator_product_api import _NativePersonWarmupGate, install_operator_product_api
 from k5vision.operator_product_state import OperatorCameraStore
 from k5vision.services.device_registry import DeviceRegistry
 from k5vision.services.user_registry import UserRegistry
@@ -2572,3 +2572,23 @@ def test_slow_identity_registry_read_does_not_block_operator_event_loop(
         finally:
             released.set()
         assert protected.result(timeout=5).status_code == 200
+
+
+def test_first_recorded_event_bypasses_optional_native_preparation_timer_once():
+    analytics = _Analytics()
+    gate = _NativePersonWarmupGate(analytics, quiet_seconds=18.0, defer_preparation=lambda: True)
+
+    async def run():
+        gate.schedule(enrollment=True)
+        assert analytics.preparation_calls == 0
+        gate.on_first_recorded_person_event()
+        assert analytics.preparation_calls == 1
+        gate.schedule(enrollment=True)
+        gate.on_first_recorded_person_event()
+        await asyncio.sleep(0)
+        assert analytics.preparation_calls == 1
+        gate.close()
+        gate.on_first_recorded_person_event()
+        assert analytics.preparation_calls == 1
+
+    asyncio.run(run())
