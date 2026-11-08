@@ -865,6 +865,59 @@ def test_native_worker_reaps_pre_response_broken_pipe_then_retries_once(monkeypa
         worker.close()
 
 
+@pytest.mark.parametrize(("winerror", "retry"), [(109, True), (232, True), (233, True), (5, False)])
+def test_recorded_native_worker_retries_only_windows_closed_pipe_errors(
+    monkeypatch, tmp_path, winerror, retry
+):
+    import k5vision.operator_events as module
+
+    class ClosedPipe(io.BytesIO):
+        def write(self, _payload):
+            error = OSError("private pipe failure")
+            error.winerror = winerror
+            raise error
+
+    class Child:
+        def __init__(self, broken):
+            self.broken = broken
+            self.stdin = ClosedPipe() if broken else io.BytesIO()
+            self.stdout = io.BytesIO(b'{"status":"empty"}\\n')
+            self.killed = False
+
+        def poll(self):
+            return 1 if self.broken or self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=2):
+            return 1 if self.broken or self.killed else 0
+
+    first, replacement = Child(True), Child(False)
+    children = iter((first, replacement))
+    worker = module._RecordedNativeWorker(None)
+    starts = []
+
+    def start():
+        worker._process = next(children)
+        starts.append(True)
+
+    monkeypatch.setattr(worker, "_start", start)
+    try:
+        if retry:
+            assert worker.request(tmp_path / "private-snapshot.mp4") is None
+            assert len(starts) == 2
+            assert replacement.stdin.getvalue().endswith(b"\\n")
+        else:
+            with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+                worker.request(tmp_path / "private-snapshot.mp4")
+            assert len(starts) == 1
+            assert worker._failure_phase == "native_write_failed"
+        assert first.stdin.closed
+    finally:
+        worker.close()
+
+
 def test_native_worker_tracks_bounded_child_phases_without_source_content(monkeypatch, tmp_path):
     import k5vision.operator_events as module
 
