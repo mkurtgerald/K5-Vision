@@ -358,9 +358,9 @@ class _RecordedNativeWorker:
         # Windows may report a closed anonymous pipe as WinError 109, 232,
         # or 233 without raising the BrokenPipeError subclass. Never retry
         # unrelated native launch or write errors.
-        return isinstance(error, BrokenPipeError) or error.errno == errno.EPIPE or (
-            getattr(error, "winerror", None) in {109, 232, 233}
-        )
+        if isinstance(error, BrokenPipeError) or error.errno == errno.EPIPE:
+            return True
+        return getattr(error, "winerror", None) in {109, 232, 233}
 
     def _start(self) -> None:
         from k5vision.operator_native_process import _WindowsJob
