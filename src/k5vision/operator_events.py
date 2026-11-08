@@ -533,10 +533,7 @@ class _RecordedNativeWorker:
             except Exception:
                 if expired.is_set():
                     self._failure_phase = "native_timeout"
-                elif (
-                    self._failure_phase == "native_write_failed"
-                    and process.poll() is not None
-                ):
+                elif self._failure_phase == "native_write_failed" and process.poll() is not None:
                     # A child exiting before stdin acceptance is not evidence
                     # of model failure. Retain no stderr, arguments or paths.
                     self._failure_phase = "native_child_exited_before_request"
