@@ -873,6 +873,21 @@ class RecordedFrameSampler:
             # recording request still must satisfy native and event admission.
             pass
 
+    def native_model_ready(self) -> bool:
+        """Admit early view preparation only after a living recorder worker is primed.
+
+        This reads process readiness, never a frame, path or recording identity.
+        A stale readiness bit from a terminated native process is insufficient.
+        """
+        if self._closing.is_set():
+            return False
+        with self._worker_lock:
+            worker = getattr(self, "_worker", None)
+            if worker is None or not worker._person_ready:
+                return False
+            process = worker._process
+            return process is not None and process.poll() is None
+
     def begin_close(self) -> None:
         self._closing.set()
         with self._worker_lock:
@@ -950,14 +965,20 @@ class OperatorEventService:
         if self._closing or self._unavailable or not self._available:
             return False
         # The first event from *any* enabled camera releases optional view
-        # preparation. An empty camera may never have a person event, and must
-        # not hold every other operator view cold indefinitely.
+        # preparation. A live, verified primed recorder also permits the
+        # camera-free second model to prepare during the enrollment quiet period,
+        # rather than spending the installed sampled-frame deadline cold.
+        # Priming alone NEVER admits an analytics event or sampled frame.
         enabled = [
             source.binding.device_id
             for source in self._cameras.list_sources()
             if self.store.settings(source.binding.device_id)["enabled"]
         ]
-        return bool(enabled) and not any(camera_id in self._last_events for camera_id in enabled)
+        if not enabled or any(camera_id in self._last_events for camera_id in enabled):
+            return False
+        if isinstance(self._sampler, RecordedFrameSampler) and self._sampler.native_model_ready():
+            return False
+        return True
 
     def status(self, camera_id: UUID) -> dict:
         settings = self.store.settings(camera_id)
