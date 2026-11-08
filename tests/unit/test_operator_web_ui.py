@@ -62,6 +62,7 @@ def test_installed_sampled_person_recovers_from_only_two_transient_service_failu
     )[0]
     assert "state.personTransient503 = 0;" in start_click
 
+
 def test_buffering_does_not_cancel_an_already_submitted_person_frame():
     """One frozen authorized sample must finish independently of later HLS buffering."""
     source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
