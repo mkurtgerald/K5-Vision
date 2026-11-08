@@ -297,7 +297,9 @@ class _NativePersonWarmupGate:
 
     A busy installer may enroll several ONVIF cameras consecutively. Starting
     CPU-heavy native model compilation after camera one can contend with camera
-    two's credential/profile deadline. Only a timer is retained: no camera,
+    two's credential/profile deadline. Reset a six-second quiet interval on each
+    enrollment so sealed view compilation begins before the first recorded event
+    when a primed recorder is available. Only a timer is retained: no camera,
     frame, credential, source URI or human identity is captured.
     """
 
@@ -305,7 +307,7 @@ class _NativePersonWarmupGate:
         self,
         analytics,
         *,
-        quiet_seconds: float = 18.0,
+        quiet_seconds: float = 6.0,
         defer_preparation: Callable[[], bool] | None = None,
     ):
         if not 0 < quiet_seconds <= 30:
