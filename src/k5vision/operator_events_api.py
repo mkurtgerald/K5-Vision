@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Callable
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
@@ -47,6 +48,7 @@ def install_operator_events_api(
     authorized_selection,
     selections,
     mutations,
+    on_analytics_enabled: Callable[[], None] | None = None,
 ):
     """Reuse the product's current credential, role, origin and camera authority."""
     session_dependency = Depends(require_session)
@@ -81,13 +83,22 @@ def install_operator_events_api(
                 raise HTTPException(403, "Insufficient camera administration permission")
             authorized_selection(account, camera_id)
             try:
-                return service().configure(
+                configured = service().configure(
                     camera_id,
                     enabled=payload.enabled,
                     confidence_threshold=payload.confidence_threshold,
                 )
             except (OperatorEventsError, ValueError):
                 raise HTTPException(503, "analytics_unavailable") from None
+            if payload.enabled and on_analytics_enabled is not None:
+                try:
+                    on_analytics_enabled()
+                except Exception:
+                    # Optional media-free compilation cannot invalidate a
+                    # successful recorder configuration; the view retains
+                    # its original bounded cold-initialization path.
+                    pass
+            return configured
 
     @app.get(_PREFIX + "/{camera_id}/events", tags=["operator analytics"])
     async def person_events(

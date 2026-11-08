@@ -26,6 +26,9 @@ def event_product(monkeypatch, request):
         detector, _, _ = event_helpers._service(store, event_helpers._source())
         app.state.operator_events = detector
         events.append(detector)
+        if getattr(request, "param", None) == "native-view":
+            options["analytics"] = helpers._Analytics()
+            options["prepare_native_person_on_camera"] = True
         return original(app, cameras=cameras, service=service, **options)
 
     monkeypatch.setattr(helpers, "install_operator_product_api", compose)
@@ -178,3 +181,36 @@ def test_private_database_failure_returns_fixed_unavailable(event_product, monke
     response = product.client.get(f"{_PREFIX}/{camera}/analytics", headers=product.headers)
     assert response.status_code == 503
     assert response.json() == {"detail": "analytics_unavailable"}
+
+@pytest.mark.parametrize("event_product", ["native-view"], indirect=True)
+def test_authorized_analytics_enable_primes_native_view_before_first_recorded_event(
+    event_product, monkeypatch
+):
+    product, service = event_product
+    camera_id = product.enroll()
+    route = f"{_PREFIX}/{camera_id}/analytics"
+    enabled = {"enabled": True, "confidence_threshold": 0.5}
+    disabled = {"enabled": False, "confidence_threshold": 0.5}
+    assert product.analytics.preparation_calls == 0
+    assert product.client.get(route, headers=product.headers).status_code == 200
+    assert product.client.patch(route, json=enabled).status_code == 401
+    assert product.client.patch(route, headers=product.headers, json=disabled).status_code == 200
+    assert product.analytics.preparation_calls == 0
+
+    configure = service.configure
+
+    def refused(*_args, **_kwargs):
+        raise OperatorEventsError("synthetic private failure")
+
+    monkeypatch.setattr(service, "configure", refused)
+    response = product.client.patch(route, headers=product.headers, json=enabled)
+    assert response.status_code == 503
+    assert product.analytics.preparation_calls == 0
+    monkeypatch.setattr(service, "configure", configure)
+
+    admitted = product.client.patch(route, headers=product.headers, json=enabled)
+    assert admitted.status_code == 200 and admitted.json()["enabled"] is True
+    assert product.analytics.preparation_calls == 1
+    repeated = product.client.patch(route, headers=product.headers, json=enabled)
+    assert repeated.status_code == 200
+    assert product.analytics.preparation_calls == 1
