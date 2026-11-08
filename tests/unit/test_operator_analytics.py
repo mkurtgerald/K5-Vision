@@ -147,6 +147,11 @@ def test_pending_native_preparation_returns_busy_without_waiting_for_compilation
 def test_cancelled_view_does_not_cancel_media_free_model_preparation(harness):
     async def run():
         broker = harness.make(max_views=1)
+        owner, camera = uuid4(), uuid4()
+        first = await broker.infer(
+            owner_id=owner, camera_id=camera, frame_id=1, frame=frame(1)
+        )
+        assert first.status == "active" and len(harness.providers) == 1
         started, release = asyncio.Event(), asyncio.Event()
         original = broker._factory
 
@@ -158,23 +163,33 @@ def test_cancelled_view_does_not_cancel_media_free_model_preparation(harness):
         broker._factory = delayed_factory
         broker.start_preparing()
         await started.wait()
-        owner, camera = uuid4(), uuid4()
+        harness.now[0] = 5
+        harness.gate[0] = asyncio.Event()
         pending = asyncio.create_task(
-            broker.infer(owner_id=owner, camera_id=camera, frame_id=1, frame=frame())
+            broker.infer(owner_id=owner, camera_id=camera, frame_id=2, frame=frame(2))
         )
-        await asyncio.sleep(0)
+        for _ in range(6):
+            if len(harness.calls) == 2:
+                break
+            await asyncio.sleep(0)
+        assert len(harness.calls) == 2 and not pending.done()
         pending.cancel()
         with pytest.raises(asyncio.CancelledError):
             await pending
-        assert harness.providers == []
+        assert broker.preparation_pending
+        assert harness.providers[0].closed == 1
         release.set()
         await broker._prewarm_task
-        assert len(harness.providers) == 1 and harness.calls == []
-        result = await broker.infer(owner_id=owner, camera_id=camera, frame_id=2, frame=frame(5))
+        assert len(harness.providers) == 2
+        harness.gate[0] = None
+        harness.now[0] = 8
+        result = await broker.infer(
+            owner_id=owner, camera_id=camera, frame_id=3, frame=frame(5)
+        )
         assert result.status == "active"
-        assert harness.calls[0][0] is harness.providers[0]
+        assert harness.calls[-1][0] is harness.providers[1]
         await broker.aclose()
-        assert harness.providers[0].closed == 1
+        assert harness.providers[1].closed == 1
 
     asyncio.run(run())
 
