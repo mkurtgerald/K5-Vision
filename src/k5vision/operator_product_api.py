@@ -1166,6 +1166,7 @@ def install_operator_product_api(
                 # acceptance. Preparation owns no camera pixels or source URI.
                 # The first request is retryable while native compilation runs.
                 analytics.start_preparing()
+            preparing_at_submission = bool(getattr(analytics, "preparation_pending", False))
             try:
                 result = await analytics.infer(
                     owner_id=_analytics_owner(session[1]),
@@ -1182,7 +1183,9 @@ def install_operator_product_api(
                 raise HTTPException(503, "Person view unavailable") from None
             current, _ = await authenticate(session[1])
             await asyncio.to_thread(authorized_selection, current, device_id)
-            if result.status == "busy" and getattr(analytics, "preparation_pending", False):
+            if result.status == "busy" and (
+                preparing_at_submission or getattr(analytics, "preparation_pending", False)
+            ):
                 # A native compilation in progress is not a successful sampled
                 # detection. The browser retries HTTP 429 while the existing
                 # installed box deadline and camera-policy checks remain intact.
