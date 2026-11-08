@@ -116,7 +116,7 @@ def test_transient_live_pause_preserves_only_submitted_person_frame():
         encoding="utf-8"
     )
     handler = source.split('$("live-video").addEventListener("pause", () => {', 1)[1].split(
-        'function checkPersonBuffer(', 1
+        "function checkPersonBuffer(", 1
     )[0]
     assert "if (!state.personEnabled) return;" in handler
     assert "if (state.personController)" in handler
