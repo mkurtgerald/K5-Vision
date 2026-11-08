@@ -1351,6 +1351,35 @@ def _person_url(device_id, *, width=2, height=2, frame_id=17):
 
 
 @pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
+def test_pending_person_model_preparation_returns_retryable_429_only_after_auth(product):
+    device_id = product.enroll()
+    route = _person_url(device_id)
+    body = bytes(range(16))
+    original = product.analytics.infer
+    product.analytics.preparation_pending = True
+
+    async def pending(**submission):
+        return OperatorAnalyticsResult("busy", submission["frame_id"])
+
+    product.analytics.infer = pending
+    invalid = product.client.post(
+        route,
+        headers={**product.headers, "Content-Type": "application/octet-stream"},
+        content=body,
+    )
+    assert invalid.status_code == 403
+    busy = product.client.post(route, headers=_person_headers(product), content=body)
+    assert busy.status_code == 429
+    assert "Person view preparation is busy" in busy.text
+    product.analytics.preparation_pending = False
+    product.analytics.infer = original
+    admitted = product.client.post(route, headers=_person_headers(product), content=body)
+    assert admitted.status_code == 200
+    assert admitted.headers["cache-control"] == "no-store"
+    assert admitted.json()["status"] == "active"
+
+
+@pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
 def test_person_view_preserves_correlation_and_isolates_session_camera_identity(product):
     first = product.enroll()
     second = product.client.post(
