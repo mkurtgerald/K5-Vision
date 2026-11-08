@@ -73,14 +73,14 @@ async def _await_media_ready(status, *, now=None, pause=None) -> bool:
     persistently unavailable worker remains denied within a fixed 2s bound.
     Returns whether recovery required waiting, so permissions are rechecked.
     """
-    if status() in {"ready", "disk_full"}:
+    if await asyncio.to_thread(status) in {"ready", "disk_full"}:
         return False
     clock = monotonic if now is None else now
     sleeper = asyncio.sleep if pause is None else pause
     deadline = clock() + _MEDIA_RECOVERY_GRACE_SECONDS
     while clock() < deadline:
         await sleeper(min(_MEDIA_RECOVERY_POLL_SECONDS, deadline - clock()))
-        if status() in {"ready", "disk_full"}:
+        if await asyncio.to_thread(status) in {"ready", "disk_full"}:
             return True
     raise HTTPException(503, "Media unavailable")
 
