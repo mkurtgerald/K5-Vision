@@ -1737,6 +1737,18 @@ def _installed_person_fixture(parent, ffmpeg):
     return video
 
 
+def _installed_person_events(client, route, diagnostic):
+    """Keep the event-poll status before any later diagnostic request replaces it."""
+    try:
+        return client.json(route)["events"]
+    finally:
+        diagnostic["analytics_events_http_status"] = client.last_http_status
+        if client.transport_failure is not None:
+            diagnostic["analytics_events_transport"] = dict(client.transport_failure)
+        else:
+            diagnostic.pop("analytics_events_transport", None)
+
+
 def _installed_analytics_journey(
     *,
     page,
@@ -1798,7 +1810,7 @@ def _installed_analytics_journey(
     detected = {}
 
     def positive_event():
-        result = client.json(route + "/events")["events"]
+        result = _installed_person_events(client, route + "/events", diagnostic)
         if not result:
             return False
         detected.update(result[0])

@@ -203,3 +203,71 @@ def test_http_denial_is_not_reclassified_as_transport_failure():
         desktop._observer_reauthenticate(runtime, client, "private", "private", diagnostic)
     assert not diagnostic
     assert client.transport_failure is None
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 500, 503])
+def test_installed_events_keep_denial_status_before_following_analytics_read(status):
+    client = runtime._Client(12345)
+
+    def denied(_request, *, timeout):
+        assert timeout == 3
+        raise HTTPError("http://private", status, "private", {}, io.BytesIO(b"{}"))
+
+    client.opener = SimpleNamespace(open=denied)
+    diagnostic = {}
+    with pytest.raises(AssertionError, match="unexpected status"):
+        desktop._installed_person_events(client, "/private-camera/events", diagnostic)
+    client.last_http_status = 200  # A later status read cannot rewrite the captured failure.
+    assert diagnostic == {"analytics_events_http_status": status}
+    assert "private" not in json.dumps(diagnostic)
+
+
+def test_installed_event_transport_does_not_reuse_a_previous_http_status():
+    client = runtime._Client(12345)
+    client.last_http_status = 200
+
+    def unavailable(_request, *, timeout):
+        raise ConnectionResetError("private route and token")
+
+    client.opener = SimpleNamespace(open=unavailable)
+    diagnostic = {}
+    with pytest.raises(RuntimeError, match="Local operator request did not complete"):
+        desktop._installed_person_events(client, "/private-camera/events", diagnostic)
+    assert diagnostic["analytics_events_http_status"] is None
+    assert diagnostic["analytics_events_transport"]["exception_type"] == "ConnectionResetError"
+    assert "private" not in json.dumps(diagnostic)
+
+
+def test_installed_event_success_retains_the_original_event_contract():
+    client = runtime._Client(12345)
+    response = HTTPError("http://private", 200, "private", {}, io.BytesIO(b'{"events": []}'))
+    client.opener = SimpleNamespace(open=lambda _request, timeout: response)
+    diagnostic = {"analytics_events_transport": {"exception_type": "ConnectionResetError"}}
+    assert desktop._installed_person_events(client, "/private-camera/events", diagnostic) == []
+    assert diagnostic == {"analytics_events_http_status": 200}
+
+
+@pytest.mark.parametrize("status", [200, 401])
+def test_installed_event_http_response_clears_prior_poll_transport_failure(status):
+    client = runtime._Client(12345)
+    responses = iter(
+        [
+            ConnectionResetError("private"),
+            HTTPError("http://private", status, "private", {}, io.BytesIO(b'{"events": []}')),
+        ]
+    )
+
+    def respond(_request, *, timeout):
+        raise next(responses)
+
+    client.opener = SimpleNamespace(open=respond)
+    diagnostic = {}
+    with pytest.raises(RuntimeError):
+        desktop._installed_person_events(client, "/private-camera/events", diagnostic)
+    assert "analytics_events_transport" in diagnostic
+    if status == 200:
+        assert desktop._installed_person_events(client, "/private-camera/events", diagnostic) == []
+    else:
+        with pytest.raises(AssertionError):
+            desktop._installed_person_events(client, "/private-camera/events", diagnostic)
+    assert diagnostic == {"analytics_events_http_status": status}
