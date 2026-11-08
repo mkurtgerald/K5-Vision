@@ -43,9 +43,7 @@ def test_installed_warmup_waits_for_six_second_quiet_period_and_recorder_readine
             return handle
 
         monkeypatch.setattr(loop, "call_later", call_later)
-        gate = _NativePersonWarmupGate(
-            analytics, defer_preparation=lambda: recorder["awaiting"]
-        )
+        gate = _NativePersonWarmupGate(analytics, defer_preparation=lambda: recorder["awaiting"])
         gate.schedule(enrollment=True)
         assert calls[-1][0] == 6.0
         first = calls[-1][1]
@@ -85,9 +83,7 @@ def test_recorded_person_event_still_bypasses_quiet_timer_once(monkeypatch):
             return handle
 
         monkeypatch.setattr(loop, "call_later", call_later)
-        gate = _NativePersonWarmupGate(
-            analytics, defer_preparation=lambda: True
-        )
+        gate = _NativePersonWarmupGate(analytics, defer_preparation=lambda: True)
         gate.schedule(enrollment=True)
         gate.on_first_recorded_person_event()
         assert handles[0].cancelled
