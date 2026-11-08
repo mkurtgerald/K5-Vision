@@ -148,9 +148,7 @@ def test_cancelled_view_does_not_cancel_media_free_model_preparation(harness):
     async def run():
         broker = harness.make(max_views=1)
         owner, camera = uuid4(), uuid4()
-        first = await broker.infer(
-            owner_id=owner, camera_id=camera, frame_id=1, frame=frame(1)
-        )
+        first = await broker.infer(owner_id=owner, camera_id=camera, frame_id=1, frame=frame(1))
         assert first.status == "active" and len(harness.providers) == 1
         started, release = asyncio.Event(), asyncio.Event()
         original = broker._factory
@@ -183,9 +181,7 @@ def test_cancelled_view_does_not_cancel_media_free_model_preparation(harness):
         assert len(harness.providers) == 2
         harness.gate[0] = None
         harness.now[0] = 8
-        result = await broker.infer(
-            owner_id=owner, camera_id=camera, frame_id=3, frame=frame(5)
-        )
+        result = await broker.infer(owner_id=owner, camera_id=camera, frame_id=3, frame=frame(5))
         assert result.status == "active"
         assert harness.calls[-1][0] is harness.providers[1]
         await broker.aclose()
