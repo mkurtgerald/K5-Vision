@@ -865,9 +865,7 @@ def test_native_worker_reaps_pre_response_broken_pipe_then_retries_once(monkeypa
         worker.close()
 
 
-@pytest.mark.parametrize(
-    ("winerror", "retry"), [(109, True), (232, True), (233, True), (5, False)]
-)
+@pytest.mark.parametrize(("winerror", "retry"), [(109, True), (232, True), (233, True), (5, False)])
 def test_recorded_native_worker_retries_only_windows_closed_pipe_errors(
     monkeypatch, tmp_path, winerror, retry
 ):
@@ -887,7 +885,8 @@ def test_recorded_native_worker_retries_only_windows_closed_pipe_errors(
             self.killed = False
 
         def poll(self):
-            return 1 if self.broken or self.killed else None
+            # An unrelated access error must not be conflated with child exit.
+            return 1 if (self.broken and winerror in {109, 232, 233}) or self.killed else None
 
         def kill(self):
             self.killed = True
