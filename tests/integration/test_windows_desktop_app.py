@@ -1750,7 +1750,7 @@ def _installed_person_fixture(parent, ffmpeg):
     return video
 
 
-def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic):
+def _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, diagnostic):
     """Prove native boxes are visible on the same transient installed browser frame.
 
     No sampled pixels, camera URI, request body, screenshot or bearer token is
@@ -1869,6 +1869,25 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
         response = first.value
     except Exception:
         diagnostic["analytics_sample_request_traffic"] = dict(traffic)
+        # The API client already carries the operator's bearer authorization.
+        # Only the finite preparation phase enters evidence, never headers,
+        # credentials, server diagnostics, exception strings, or camera media.
+        try:
+            status_report = client.json("/api/v1/operator/status", max_bytes=8192)
+            preparation_phase = (
+                status_report.get("person_preparation_phase")
+                if type(status_report) is dict
+                else None
+            )
+            diagnostic["analytics_sample_backend_preparation"] = (
+                preparation_phase
+                if preparation_phase in {
+                    "not_requested", "preparing", "ready", "failed", "closed"
+                }
+                else "unknown"
+            )
+        except Exception:
+            diagnostic["analytics_sample_backend_preparation"] = "unavailable"
         try:
             diagnostic["analytics_sample_request_state"] = page.evaluate(
                 """() => {
@@ -2174,7 +2193,7 @@ def _installed_analytics_journey(
         abs((datetime.now(UTC) - occurred).total_seconds()) < 30,
         "Person event was not mapped to the fresh recording's UTC timestamp",
     )
-    sampled_evidence = _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic)
+    sampled_evidence = _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, diagnostic)
     diagnostic["analytics_stage"] = "event_recording_navigation"
     diagnostic["analytics_navigation_step"] = "history_range_click"
     page.locator("#last-24-hours").click()
