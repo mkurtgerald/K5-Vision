@@ -1048,6 +1048,19 @@ def _desktop_status(api, form):
     return "unclassified"
 
 
+def _observer_reauthenticate(runtime, client, username, password, diagnostic):
+    """Retain the existing bounded transport classification before later cleanup."""
+    try:
+        runtime._login(client, username, password)
+    finally:
+        if client.transport_failure is not None:
+            diagnostic["observer_login_transport"] = {
+                **client.transport_failure,
+                "phase": "open",
+                "http_response": "not_received",
+            }
+
+
 def _failure_detail(error):
     """Only fixed classifications are admitted from our controlled assertions."""
     text = str(error)
@@ -3223,7 +3236,8 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["logout_destroys_wall"] = True
         # The browser has signed out. A fresh observer login now authorizes
         # subsequent tray checks without replacing an active browser session.
-        runtime._login(client, username, password)
+        _enter_stage("observer_reauthentication")
+        _observer_reauthenticate(runtime, client, username, password, nvr_diagnostic)
         _enter_stage("browser_closing")
         context.close()
         context = None

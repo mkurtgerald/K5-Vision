@@ -100,6 +100,91 @@ def _transport_error_code(error):
     return "unclassified"
 
 
+class _SampleRequestDiagnostic:
+    """Bounded request lifecycle evidence; never retain bodies or endpoint identities."""
+
+    def __init__(self):
+        self.route = None
+        self.requests = 0
+        self.responses = 0
+        self.statuses = []
+        self.failures = {}
+        self.video_events = dict.fromkeys(("waiting", "playing", "pause", "ended", "error"), 0)
+        self.browser_state = {"observed": False}
+
+    def matches(self, request):
+        return (
+            self.route is not None
+            and request.method == "POST"
+            and urlsplit(request.url).path == self.route
+        )
+
+    def requested(self, request):
+        if self.matches(request):
+            self.requests = min(1000, self.requests + 1)
+
+    def responded(self, response):
+        if self.matches(response.request):
+            self.responses = min(1000, self.responses + 1)
+            status = response.status
+            if len(self.statuses) < 16:
+                self.statuses.append(status if type(status) is int and 100 <= status <= 599 else 0)
+
+    def failed(self, request):
+        if not self.matches(request):
+            return
+        detail = request.failure or ""
+        code = "other"
+        for marker, value in (
+            ("ERR_ABORTED", "aborted"),
+            ("ERR_TIMED_OUT", "timeout"),
+            ("ERR_CONNECTION_RESET", "reset"),
+            ("ERR_CONNECTION_REFUSED", "refused"),
+        ):
+            if marker in detail:
+                code = value
+                break
+        self.failures[code] = min(1000, self.failures.get(code, 0) + 1)
+
+    def video_event(self, name, paused, ready_state, enabled, disabled):
+        if name not in (*self.video_events, "initial", "control"):
+            return
+        if (
+            any(type(value) is not bool for value in (paused, enabled, disabled))
+            or type(ready_state) is not int
+            or not 0 <= ready_state <= 4
+        ):
+            return
+        if name in self.video_events:
+            self.video_events[name] = min(1000, self.video_events[name] + 1)
+        self.browser_state = {
+            "observed": True,
+            "video_paused": paused,
+            "video_ready_state": ready_state,
+            "sample_enabled": enabled,
+            "sample_disabled": disabled,
+        }
+
+    def snapshot(self):
+        return {
+            "requests": self.requests,
+            "responses": self.responses,
+            "response_statuses": list(self.statuses),
+            "failure_counts": dict(self.failures),
+            "video_events": dict(self.video_events),
+            "last_browser_event_state": dict(self.browser_state),
+        }
+
+
+def _person_state_before_cleanup(product):
+    # Never query a possibly stalled renderer on the cleanup path.
+    return {
+        "product_thread_alive": bool(product and product.thread.is_alive()),
+        "product_thread_failed": bool(product and product.failed),
+        "product_server_started": bool(product and product.server.started),
+    }
+
+
 def _recording_bytes(root):
     __tracebackhide__ = True
     return sum(path.stat().st_size for path in root.rglob("*.mp4"))
@@ -333,13 +418,14 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
     source_uri = f"rtsp://127.0.0.1:{upstream_port}/generated"
     recording_root = identity.directory / "recordings"
     processes = []
-    product = browser = context = playwright = onvif_camera = None
+    product = browser = context = playwright = onvif_camera = page = None
     stage = "product_start"
     failure = None
     transport_error = None
     person_probe_statuses = {"authorized": None, "revoked": None, "anonymous": None}
     script_errors = []
     request_failures = {}
+    sample_diagnostic = _SampleRequestDiagnostic()
     started = time.monotonic()
     baseline_threads = {thread.ident for thread in threading.enumerate()}
     receipt = {
@@ -391,8 +477,11 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         def failed_request(request):
             code = diagnostic_helpers._request_failure_code(request)
             request_failures[code] = min(1000, request_failures.get(code, 0) + 1)
+            sample_diagnostic.failed(request)
 
         page.on("requestfailed", failed_request)
+        page.on("request", sample_diagnostic.requested)
+        page.on("response", sample_diagnostic.responded)
         stage = "page_load"
         page.goto(client.origin + "/operator/", wait_until="domcontentloaded")
         stage = "ui_login"
@@ -512,6 +601,20 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         page.wait_for_function("() => !document.getElementById('toggle-person-view').disabled")
         before_bytes = _recording_bytes(recording_root)
         sample_route = route + "/person-view"
+        sample_diagnostic.route = sample_route
+        page.expose_function("__k5PersonAcceptanceVideoEvent", sample_diagnostic.video_event)
+        page.locator("#live-video").evaluate("""video => {
+          const toggle = document.getElementById('toggle-person-view');
+          const report = name => window.__k5PersonAcceptanceVideoEvent(
+            name, video.paused, video.readyState,
+            toggle.getAttribute('aria-pressed') === 'true', toggle.disabled
+          ).catch(() => {});
+          for (const name of ['waiting', 'playing', 'pause', 'ended', 'error']) {
+            video.addEventListener(name, () => report(name));
+          }
+          toggle.addEventListener('click', () => report('control'));
+          report('initial');
+        }""")
         stage = "person_sample_request"
         with page.expect_response(
             lambda response: urlsplit(response.url).path == sample_route
@@ -701,6 +804,8 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
         failure = diagnostic_helpers._failure_code(error)
         transport_error = _transport_error_code(error)
     finally:
+        sample_before_cleanup = sample_diagnostic.snapshot()
+        state_before_cleanup = _person_state_before_cleanup(product)
         cleanup_failures = []
         for label, resource in (("operator_browser", context), ("browser", browser)):
             if resource is not None:
@@ -748,6 +853,8 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
             "person_probe_statuses": person_probe_statuses,
             "script_error_codes": script_errors[:32],
             "request_failure_counts": request_failures,
+            "sample_before_cleanup": sample_before_cleanup,
+            "state_before_cleanup": state_before_cleanup,
             "cleanup_failure_codes": cleanup_failures,
             "product_thread_alive": bool(product and product.thread.is_alive()),
             "product_thread_failed": bool(product and product.failed),
