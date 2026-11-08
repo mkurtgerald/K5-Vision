@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Future
 import hashlib
 import json
 import sys
 import threading
+from concurrent.futures import Future
 from types import ModuleType, SimpleNamespace
 
 import pytest
