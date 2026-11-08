@@ -1368,6 +1368,9 @@ def test_pending_person_model_preparation_returns_retryable_429_only_after_auth(
     product.analytics.preparation_pending = True
 
     async def pending(**submission):
+        # The native worker may finish while the response is reauthorized.
+        # That completion must not mislabel this earlier busy sample as 200.
+        product.analytics.preparation_pending = False
         return OperatorAnalyticsResult("busy", submission["frame_id"])
 
     product.analytics.infer = pending
