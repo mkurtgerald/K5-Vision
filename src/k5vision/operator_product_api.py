@@ -61,6 +61,30 @@ _PERSON_PATH = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/person-view"
 )
 _SESSION_TOKEN = re.compile(r"[A-Za-z0-9_-]{32,128}")
+_MEDIA_RECOVERY_GRACE_SECONDS = 2.0
+_MEDIA_RECOVERY_POLL_SECONDS = 0.1
+
+
+async def _await_media_ready(status, *, now=None, pause=None) -> bool:
+    """Bridge a brief control-plane health dip without bypassing readiness.
+
+    The gateway may ask during a native worker health probe or clock-step
+    recovery. Only a fresh ready/disk-full reading can authorize media; a
+    persistently unavailable worker remains denied within a fixed 2s bound.
+    Returns whether recovery required waiting, so permissions are rechecked.
+    """
+    if status() in {"ready", "disk_full"}:
+        return False
+    clock = monotonic if now is None else now
+    sleeper = asyncio.sleep if pause is None else pause
+    deadline = clock() + _MEDIA_RECOVERY_GRACE_SECONDS
+    while clock() < deadline:
+        await sleeper(min(_MEDIA_RECOVERY_POLL_SECONDS, deadline - clock()))
+        if status() in {"ready", "disk_full"}:
+            return True
+    raise HTTPException(503, "Media unavailable")
+
+
 
 
 def _analytics_owner(token: str) -> UUID:
@@ -1281,6 +1305,20 @@ def install_operator_product_api(
                 from k5vision.operator_role_policy_api import require_permission
 
                 require_permission(app, current, "cameras.export")
-        if service.status() not in {"ready", "disk_full"}:
-            raise HTTPException(503, "Media unavailable")
+        recovered = await _await_media_ready(service.status)
+        if recovered:
+            # Readiness can recover after a real clock step while the human or
+            # camera grant has changed. Never reuse the earlier authorization.
+            current, _ = await authenticate(tokens[0])
+            if not any(
+                source.binding.path_name == path and permitted(current, source.binding.device_id)
+                for source in selections()
+            ):
+                raise _unauthorized()
+            if urlsplit(uris[0]).path == "/media/playback":
+                values = dict(parse_qsl(urlsplit(uris[0]).query))
+                if values.get("format", "fmp4") == "mp4":
+                    from k5vision.operator_role_policy_api import require_permission
+
+                    require_permission(app, current, "cameras.export")
         return Response(status_code=200)
