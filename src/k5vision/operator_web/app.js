@@ -942,7 +942,15 @@
       const result = await request(`/api/v1/operator/cameras/${encodeURIComponent(cameraId)}/person-view?${query}`, {
         method: "POST", rawBody: pixels, signal: controller.signal, timeout: 24000,
       });
-      if (epoch !== state.personEpoch || !state.personEnabled || cameraId !== state.selected || !canSamplePerson()) return;
+      // This immutable frame may finish during a transient HLS rebuffer.
+      // Preserve the selected camera, analytics and session validity checks;
+      // stream teardown and sign-out still abort the pending request.
+      const selectedCamera = currentCamera();
+      if (epoch !== state.personEpoch || !state.personEnabled || cameraId !== state.selected
+        || !state.token || state.signingOut || state.view !== "live"
+        || selectedCamera?.analytics_status !== "configured"
+        || statusDetails(selectedCamera).style !== "online"
+        || state.workerStatus === "unavailable") return;
       if (!result || result.frame_id !== frameId || !["active", "busy", "unavailable"].includes(result.status)
         || !Array.isArray(result.boxes) || result.boxes.length > 32 || !result.boxes.every(validPersonBox)) throw new ApiError(503, "person_contract_invalid");
       if (result.status === "unavailable") {

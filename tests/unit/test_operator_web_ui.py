@@ -63,6 +63,39 @@ def test_installed_sampled_person_recovers_from_only_two_transient_service_failu
     assert "state.personTransient503 = 0;" in start_click
 
 
+def test_inflight_person_response_survives_transient_hls_buffering():
+    """A successful immutable frame stays renderable if live video re-buffers."""
+    source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    submitted = source.split("async function samplePerson(epoch)", 1)[1].split(
+        "async function startLive(", 1
+    )[0]
+    # Submission still requires actively decoded live media.
+    assert "if (!canSamplePerson())" in submitted
+    # Completion remains bound to a valid camera and session without depending
+    # on the transient decoder readyState after the immutable POST was sent.
+    fulfilled = submitted.split("const result = await request(", 1)[1].split(
+        "if (!result ||", 1
+    )[0]
+    for guard in (
+        "epoch !== state.personEpoch",
+        "!state.personEnabled",
+        "cameraId !== state.selected",
+        "!state.token",
+        "state.signingOut",
+        'state.view !== "live"',
+        'selectedCamera?.analytics_status !== "configured"',
+        'statusDetails(selectedCamera).style !== "online"',
+        'state.workerStatus === "unavailable"',
+    ):
+        assert guard in fulfilled
+    assert "!canSamplePerson()" not in fulfilled
+    assert "video.readyState" not in fulfilled
+    assert "video.paused" not in fulfilled
+    assert "state.personController?.abort();" in source
+
+
 def test_buffering_does_not_cancel_an_already_submitted_person_frame():
     """One frozen authorized sample must finish independently of later HLS buffering."""
     source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
