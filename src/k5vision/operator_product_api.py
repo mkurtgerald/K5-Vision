@@ -7,6 +7,7 @@ import hashlib
 import ipaddress
 import math
 import re
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -300,11 +301,18 @@ class _NativePersonWarmupGate:
     frame, credential, source URI or human identity is captured.
     """
 
-    def __init__(self, analytics, *, quiet_seconds: float = 18.0):
+    def __init__(
+        self,
+        analytics,
+        *,
+        quiet_seconds: float = 18.0,
+        defer_preparation: Callable[[], bool] | None = None,
+    ):
         if not 0 < quiet_seconds <= 30:
             raise ValueError("Native preparation quiet period is invalid")
         self._analytics = analytics
         self._quiet_seconds = quiet_seconds
+        self._defer_preparation = defer_preparation
         self._handle: asyncio.TimerHandle | None = None
         self._started = False
         self._closed = False
@@ -319,10 +327,25 @@ class _NativePersonWarmupGate:
         self._handle = asyncio.get_running_loop().call_later(self._quiet_seconds, self._begin)
 
     def _begin(self) -> None:
-        self._handle = None
-        if not self._closed and not self._started:
-            self._started = True
-            self._analytics.start_preparing()
+        scheduled, self._handle = self._handle, None
+        if scheduled is not None:
+            scheduled.cancel()
+        if self._closed or self._started:
+            return
+        if self._defer_preparation is not None:
+            try:
+                waiting_for_first_event = self._defer_preparation()
+            except Exception:
+                # Optional preparation cannot consume native CPU while the
+                # recorder's authoritative event readiness is unknown.
+                waiting_for_first_event = True
+            if waiting_for_first_event:
+                # A requested view still uses its normal bounded cold path.
+                # The timer retains no camera, credentials, pixels or source.
+                self._handle = asyncio.get_running_loop().call_later(2.0, self._begin)
+                return
+        self._started = True
+        self._analytics.start_preparing()
 
     def close(self) -> None:
         self._closed = True
@@ -361,8 +384,12 @@ def install_operator_product_api(
         raise ValueError("operator accounts belong to another site")
     mutations = asyncio.Lock()
     person_slots = asyncio.Semaphore(4)
+    recorder_events = getattr(app.state, "operator_events", None)
+    defer_preparation = getattr(recorder_events, "awaiting_first_recorded_person_event", None)
     native_person_preparation = (
-        _NativePersonWarmupGate(analytics) if prepare_native_person_on_camera else None
+        _NativePersonWarmupGate(analytics, defer_preparation=defer_preparation)
+        if prepare_native_person_on_camera
+        else None
     )
     app.state.operator_person_preparation = native_person_preparation
     seen_live: set[UUID] = set()
