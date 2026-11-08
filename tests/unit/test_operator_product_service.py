@@ -1386,3 +1386,49 @@ def test_native_person_warmup_cancelled_on_product_shutdown():
         assert calls == []
 
     asyncio.run(exercise())
+
+def test_native_view_warmup_yields_to_first_recorded_event_without_changing_view_path():
+    from k5vision.operator_product_api import _NativePersonWarmupGate
+
+    calls = []
+    priority = {"pending": True, "unavailable": False}
+
+    class Broker:
+        def start_preparing(self):
+            calls.append("prepare")
+
+    def recorded_event_pending():
+        if priority["unavailable"]:
+            raise RuntimeError("Recorder readiness unavailable")
+        return priority["pending"]
+
+    async def exercise():
+        gate = _NativePersonWarmupGate(
+            Broker(), quiet_seconds=10, defer_preparation=recorded_event_pending
+        )
+        gate.schedule()
+        initial = gate._handle
+        gate._begin()
+        assert initial.cancelled()
+        assert calls == []
+        deferred = gate._handle
+        assert deferred is not None and not deferred.cancelled()
+
+        priority["unavailable"] = True
+        gate._begin()
+        assert deferred.cancelled()
+        assert calls == []
+        assert gate._handle is not None
+
+        priority["unavailable"] = False
+        priority["pending"] = False
+        pending = gate._handle
+        gate._begin()
+        assert pending.cancelled()
+        assert calls == ["prepare"]
+        assert gate._handle is None
+        gate.schedule(enrollment=True)
+        assert calls == ["prepare"]
+        gate.close()
+
+    asyncio.run(exercise())
