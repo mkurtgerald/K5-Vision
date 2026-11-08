@@ -1000,8 +1000,11 @@ def install_operator_product_api(
             raise HTTPException(
                 422, "Playback requires an aware interval of at most 24 hours"
             ) from None
-        if service.status() not in {"ready", "disk_full"}:
-            raise HTTPException(503, "Media unavailable")
+        recovered = await _await_media_ready(service.status)
+        if recovered:
+            # A restored native worker never inherits stale camera authority.
+            current, _ = await authenticate(session[1])
+            source = await asyncio.to_thread(authorized_selection, current, device_id)
         try:
             spans = await service.provider.playback_spans(source.binding, start=first, end=last)
         except MediaWorkerError:
