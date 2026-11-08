@@ -341,6 +341,7 @@ def test_pending_native_capture_reports_finite_stage_without_exposing_source(sto
     [
         ("native_launch_failed", "native_worker_starting"),
         ("native_write_failed", "native_request_writing"),
+        ("native_child_exited_before_request", "native_worker_exited"),
         ("native_reply_missing", "native_reply_waiting"),
         ("native_header_invalid", "native_header_reading"),
         ("native_payload_incomplete", "native_payload_reading"),
@@ -945,20 +946,22 @@ def test_native_worker_rejects_unbounded_or_untrusted_progress(monkeypatch, tmp_
 
 
 @pytest.mark.parametrize(
-    "reply,write_fails,expected",
+    "reply,write_fails,child_exited,expected",
     [
-        (b"", True, "native_write_failed"),
-        (b"not-json\n", False, "native_header_invalid"),
-        (b'{"status":"ready","bytes":1}\n', False, "native_header_invalid"),
+        (b"", True, True, "native_child_exited_before_request"),
+        (b"", True, False, "native_write_failed"),
+        (b"not-json\n", False, True, "native_header_invalid"),
+        (b'{"status":"ready","bytes":1}\n', False, True, "native_header_invalid"),
         (
             b'{"status":"ready","bytes":696320,"elapsed":1.0,"detections":[]}\n',
             False,
+            True,
             "native_payload_incomplete",
         ),
     ],
 )
 def test_native_worker_distinguishes_transport_failure_boundaries(
-    monkeypatch, tmp_path, reply, write_fails, expected
+    monkeypatch, tmp_path, reply, write_fails, child_exited, expected
 ):
     import k5vision.operator_events as module
 
@@ -974,7 +977,7 @@ def test_native_worker_distinguishes_transport_failure_boundaries(
             self.stdout = io.BytesIO(reply)
 
         def poll(self):
-            return 1
+            return 1 if child_exited else None
 
         def kill(self):
             pass
