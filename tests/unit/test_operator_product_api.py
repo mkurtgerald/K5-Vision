@@ -932,6 +932,18 @@ def test_media_auth_survives_brief_health_dip_without_skipping_ownership(product
 def test_media_auth_revocation_during_recovery_still_denies(product, monkeypatch):
     identifier = product.enroll()
     path = MediaMTXBinding(product.service.site_id, UUID(identifier)).path_name
+    # Keep a second credential-active administrator so revocation exercises
+    # the media-auth boundary without bypassing the last-admin invariant.
+    replacement, _, _ = product.users.create_with_bootstrap(
+        UserCreate(
+            username="recovery-admin",
+            display_name="Recovery administrator",
+            role=UserRole.ADMINISTRATOR,
+        ),
+        actor="test",
+    )
+    _initialized_session(product, replacement)
+    assert product.users.credential_status(replacement.id) == "active"
     calls = 0
 
     def recovered_after_revocation():
@@ -967,9 +979,7 @@ def test_media_auth_recovery_wait_is_finite_and_persistent_failure_denied():
         elapsed[0] += seconds
 
     with pytest.raises(HTTPException) as failure:
-        asyncio.run(
-            _await_media_ready(unavailable, now=lambda: elapsed[0], pause=advance)
-        )
+        asyncio.run(_await_media_ready(unavailable, now=lambda: elapsed[0], pause=advance))
     assert failure.value.status_code == 503
     assert elapsed[0] == pytest.approx(2.0)
     assert 2 <= len(observations) <= 22
