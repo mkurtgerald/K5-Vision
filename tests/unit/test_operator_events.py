@@ -1172,6 +1172,7 @@ def test_recorded_native_model_prime_requires_matching_reply_and_reuses_child(
     }
     worker.close()
 
+
 def test_first_recorded_person_event_has_priority_over_speculative_view_warmup(store):
     camera = uuid4()
     source = SimpleNamespace(binding=SimpleNamespace(device_id=camera))
