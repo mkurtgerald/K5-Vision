@@ -60,6 +60,28 @@ _PERSON_PATH = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/person-view"
 )
 _SESSION_TOKEN = re.compile(r"[A-Za-z0-9_-]{32,128}")
+_MEDIA_RECOVERY_GRACE_SECONDS = 2.0
+_MEDIA_RECOVERY_POLL_SECONDS = 0.1
+
+
+async def _await_media_ready(status, *, now=None, pause=None) -> bool:
+    """Allow a bounded native control-plane recovery without relaxing readiness.
+
+    The status callback can block inside a native probe and must not run on
+    the event loop. A fresh ready/disk-full reading is mandatory. True means
+    authorization must be rechecked after a non-ready observation.
+    """
+    if await asyncio.to_thread(status) in {"ready", "disk_full"}:
+        return False
+    clock = monotonic if now is None else now
+    sleeper = asyncio.sleep if pause is None else pause
+    deadline = clock() + _MEDIA_RECOVERY_GRACE_SECONDS
+    while clock() < deadline:
+        await sleeper(min(_MEDIA_RECOVERY_POLL_SECONDS, deadline - clock()))
+        if await asyncio.to_thread(status) in {"ready", "disk_full"}:
+            return True
+    raise HTTPException(503, "Media unavailable")
+
 
 
 def _analytics_owner(token: str) -> UUID:
@@ -1194,6 +1216,17 @@ def install_operator_product_api(
                 from k5vision.operator_role_policy_api import require_permission
 
                 require_permission(app, current, "cameras.export")
-        if (await asyncio.to_thread(service.status)) not in {"ready", "disk_full"}:
-            raise HTTPException(503, "Media unavailable")
+        recovered = await _await_media_ready(service.status)
+        if recovered:
+            # A clock-step recovery may outlive the human session or camera
+            # permission. Never reuse the prior authorization for media.
+            current, _ = await authenticate(tokens[0])
+            if not await asyncio.to_thread(current_media_authority):
+                raise _unauthorized()
+            if urlsplit(uris[0]).path == "/media/playback":
+                values = dict(parse_qsl(urlsplit(uris[0]).query))
+                if values.get("format", "fmp4") == "mp4":
+                    from k5vision.operator_role_policy_api import require_permission
+
+                    require_permission(app, current, "cameras.export")
         return Response(status_code=200)
