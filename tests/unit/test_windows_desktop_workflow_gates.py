@@ -15,14 +15,16 @@ def test_hash_pinned_gui_compiler_retries_only_transient_transport_faults():
     )[0]
     assert "for ($attempt = 1; $attempt -le 3; $attempt++)" in downloader
     assert "@(408, 429, 500, 502, 503, 504)" in downloader
-    assert 'Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue' in downloader
+    assert "Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue" in downloader
     assert 'throw "Reviewed Inno Setup archive transport unavailable"' in downloader
     assert downloader.index("Invoke-WebRequest -Uri $identity.url") < downloader.index(
         "Get-FileHash -LiteralPath $archive -Algorithm SHA256"
     )
     assert "(Get-FileHash -LiteralPath $archive -Algorithm SHA256)" in downloader
     assert "$actual.Length -ne $identity.bytes" in downloader
-    assert "Native Inno Setup compiler 6.4.3 admitted by exact official archive SHA256" in downloader
+    assert (
+        "Native Inno Setup compiler 6.4.3 admitted by exact official archive SHA256" in downloader
+    )
 
 
 def test_failed_gui_analytics_does_not_skip_independent_upgrade_reversal():
