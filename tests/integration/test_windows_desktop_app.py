@@ -1882,8 +1882,8 @@ def _installed_sampled_person_boxes(page, camera_id, browser_helpers, diagnostic
                     });
                     if (!response.ok) return 'unavailable';
                     const phase = (await response.json()).person_preparation_phase;
-                    return ['not_requested', 'preparing', 'ready', 'failed', 'closed', 'unknown'].includes(phase)
-                      ? phase : 'unavailable';
+                    const phases = ['not_requested', 'preparing', 'ready', 'failed', 'closed', 'unknown'];
+                    return phases.includes(phase) ? phase : 'unavailable';
                   } catch (_) { return 'unavailable'; }
                   finally { clearTimeout(timeout); }
                 }"""
