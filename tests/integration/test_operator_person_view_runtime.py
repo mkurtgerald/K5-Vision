@@ -425,6 +425,7 @@ def test_assembled_person_view_browser_native_boxes_recording_and_logout(
     person_probe_statuses = {"authorized": None, "revoked": None, "anonymous": None}
     script_errors = []
     request_failures = {}
+    sample_diagnostic = _SampleRequestDiagnostic()
     pixel_evidence = {}
     started = time.monotonic()
     baseline_threads = {thread.ident for thread in threading.enumerate()}
