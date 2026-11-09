@@ -524,8 +524,33 @@ jobs:
           if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or $env:RUNNER_OS -ne "Windows") {
             throw "Cross-revision test requires a disposable hosted Windows VM"
           }
-          python baseline-source/scripts/build_desktop_payload.py --output baseline-build --head-sha $env:K5_DESKTOP_BASELINE_HEAD_SHA --media-exe $env:K5_MEDIAMTX_DONOR_EXE --gateway-exe $env:K5_CADDY_DONOR_EXE
-          if ($LASTEXITCODE -ne 0) { throw "Previously qualified baseline payload could not be reproduced" }
+          # The pinned historical builder predates archive retry support. Only a
+          # native-worker HTTP transport refusal may retry. Historical source,
+          # hashes, accepted archives, payload admission, and upgrade tests stay exact.
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            $log = Join-Path $env:RUNNER_TEMP ("k5-baseline-build-" + [guid]::NewGuid().ToString("N") + ".txt")
+            try {
+              & python baseline-source/scripts/build_desktop_payload.py --output baseline-build --head-sha $env:K5_DESKTOP_BASELINE_HEAD_SHA --media-exe $env:K5_MEDIAMTX_DONOR_EXE --gateway-exe $env:K5_CADDY_DONOR_EXE *> $log
+              $exitCode = $LASTEXITCODE
+              $output = Get-Content -LiteralPath $log -Raw -ErrorAction Stop
+              if ($exitCode -eq 0) {
+                Write-Host "Exact historical baseline payload built with pinned donor identities"
+                break
+              }
+              # This is the historical builder's existing fixed error vocabulary;
+              # never print the captured output, source URL, or donor contents.
+              $retryable = $output -match '\{"desktop_payload_refused": true, "stage": "native_workers", "error_type": "HTTPError"\}'
+              if (-not $retryable -or $attempt -eq 3) {
+                throw "Previously qualified baseline payload could not be reproduced"
+              }
+              $output = $null
+              Remove-Item -LiteralPath baseline-build -Recurse -Force -ErrorAction Stop
+              Write-Host "Historical native-worker archive transport refused; bounded retry $attempt"
+              Start-Sleep -Seconds (2 * $attempt)
+            } finally {
+              Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
+            }
+          }
       - name: Compile exact historical graphical supervisor
         shell: pwsh
         run: |
