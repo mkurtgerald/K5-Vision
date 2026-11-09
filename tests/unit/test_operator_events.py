@@ -950,7 +950,7 @@ def test_recorded_native_worker_only_recovers_ambiguous_write_after_confirmed_ex
             self.exited = False
             self.killed = False
             self.stdin = AmbiguousPipe() if broken else io.BytesIO()
-            self.stdout = io.BytesIO(b'{"status":"empty"}\\n')
+            self.stdout = io.BytesIO(b'{"status":"empty"}\n')
 
         def poll(self):
             return 1 if self.exited or self.killed else None
@@ -980,7 +980,7 @@ def test_recorded_native_worker_only_recovers_ambiguous_write_after_confirmed_ex
         if late_exit:
             assert worker.request(tmp_path / "private-snapshot.mp4") is None
             assert len(starts) == 2
-            assert replacement.stdin.getvalue().endswith(b"\\n")
+            assert replacement.stdin.getvalue().endswith(b"\n")
         else:
             with pytest.raises(OperatorEventsError, match="native frame unavailable"):
                 worker.request(tmp_path / "private-snapshot.mp4")
