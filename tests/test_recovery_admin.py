@@ -405,7 +405,9 @@ def test_dash_prefixed_credential_value_is_rejected_without_help_or_echo(tmp_pat
     """A secret starting with -h must not turn an invalid flag into --help."""
     marker = "-hSyntheticSecretValue"
     with pytest.raises(SystemExit) as caught:
-        cli.main(["setup-admin", "--identity-dir", str(tmp_path / "identity"), "--password", marker])
+        cli.main(
+            ["setup-admin", "--identity-dir", str(tmp_path / "identity"), "--password", marker]
+        )
     assert caught.value.code == 2
     output = capsys.readouterr()
     assert marker not in output.out + output.err
