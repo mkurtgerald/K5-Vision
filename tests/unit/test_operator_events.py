@@ -1424,3 +1424,51 @@ def test_cold_recorder_prime_defers_view_without_enabled_analytics(store):
         assert not service.awaiting_first_recorded_person_event()
     finally:
         asyncio.run(service.aclose())
+
+
+@pytest.mark.parametrize(
+    ("failed_stage", "expected"),
+    [
+        ("queued", "sample_queue_failed"),
+        ("source_check", "sample_source_failed"),
+        ("snapshot_read", "snapshot_read_failed"),
+        ("decode_attempt", "snapshot_decode_failed"),
+        ("frame_ready", "event_admission_failed"),
+        ("native_request", "native_write_failed"),
+        ("untrusted-private-value", "sample_failed"),
+    ],
+)
+def test_current_recorded_sample_stage_owns_failure_attribution(
+    identity, store, monkeypatch, failed_stage, expected
+):
+    """A stale native prime failure must not conceal the actual failing stage."""
+    from k5vision.operator_events import _RecordedNativeWorker
+
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    sampler = RecordedFrameSampler(root)
+    source = _source()
+    service, _, _ = _service(store, source, sampler=sampler)
+    worker = _RecordedNativeWorker(None)
+    worker._failure_phase = "native_write_failed"
+    sampler._worker = worker
+
+    async def fail_at_stage(_source, _settings):
+        sampler._capture_outcome = failed_stage
+        raise RuntimeError("private request error must not reach operator status")
+
+    monkeypatch.setattr(service, "_sample", fail_at_stage)
+
+    async def run():
+        try:
+            service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
+            await service.cycle()
+            status = service.status(source.binding.device_id)
+            assert status["sample_phase"] == expected
+            assert status["last_completed_phase"] == expected
+            assert status["status"] == "unavailable"
+            assert "private" not in str(status)
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
