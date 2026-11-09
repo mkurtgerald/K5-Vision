@@ -1088,11 +1088,8 @@ class OperatorEventService:
             }:
                 sample_phase = candidate
         write_cause = "not_applicable"
-        if sample_phase == "native_write_failed" and isinstance(
-            self._sampler, RecordedFrameSampler
-        ):
-            worker = getattr(self._sampler, "_worker", None)
-            candidate = getattr(worker, "_native_write_cause", None)
+        if state.get("last_completed_phase") == "native_write_failed":
+            candidate = state.get("last_native_write_cause")
             # Never let arbitrary child exceptions, paths or private source
             # details enter the authenticated status response.
             write_cause = (
@@ -1339,6 +1336,15 @@ class OperatorEventService:
                             failure_phase = candidate
                 state["sample_phase"] = failure_phase
                 state["last_completed_phase"] = failure_phase
+                # Freeze the cause at the failed request. A later native prime
+                # may replace the worker's in-flight phase while this camera's
+                # last completed request remains the failed write.
+                state.pop("last_native_write_cause", None)
+                if failure_phase == "native_write_failed":
+                    worker = getattr(self._sampler, "_worker", None)
+                    state["last_native_write_cause"] = getattr(
+                        worker, "_native_write_cause", None
+                    )
                 if self._provider is not None:
                     try:
                         await self._provider.aclose()
