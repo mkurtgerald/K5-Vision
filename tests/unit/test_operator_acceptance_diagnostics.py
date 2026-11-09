@@ -310,3 +310,19 @@ def test_installed_event_http_response_clears_prior_transport_failure(status):
         assert desktop._poll_installed_person_event(client, "/private-camera", diagnostic) is None
     assert client.transport_failure is None
     assert diagnostic == {"analytics_event_poll_status": status}
+
+
+def test_installed_sample_response_evidence_distinguishes_first_and_last_reply():
+    """Multiple HTTP 429 retries must not disguise initial responsiveness."""
+    import inspect
+
+    source = inspect.getsource(desktop._installed_sampled_person_boxes)
+    reply = source.split("    def observed_response(response):", 1)[1].split(
+        "    def observed_failure(request):", 1
+    )[0]
+    assert 'traffic.setdefault("first_response_ms", elapsed_ms)' in reply
+    assert 'traffic["last_response_ms"] = elapsed_ms' in reply
+    assert 'traffic["first_response_ms"] =' not in reply
+    # Instrumentation may not make a transient HTTP 429 a passed native box.
+    assert "response.status == 200" in source
+    assert "timeout=27_000" in source
