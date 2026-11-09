@@ -180,9 +180,7 @@ def _cap_windows_native_cpu_isa() -> None:
 
 
 class _PersonDetector:
-    def __init__(
-        self, config: OperatorPersonConfiguration, *, inference_threads: int = 2
-    ) -> None:
+    def __init__(self, config: OperatorPersonConfiguration, *, inference_threads: int = 2) -> None:
         validate_person_runtime(config)
         if type(inference_threads) is not int or inference_threads not in (1, 2):
             raise ValueError("Person CPU thread setting was refused")
