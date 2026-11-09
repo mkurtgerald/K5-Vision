@@ -1088,14 +1088,17 @@ class OperatorEventService:
             }:
                 sample_phase = candidate
         write_cause = "not_applicable"
-        if sample_phase == "native_write_failed" and isinstance(self._sampler, RecordedFrameSampler):
+        if sample_phase == "native_write_failed" and isinstance(
+            self._sampler, RecordedFrameSampler
+        ):
             worker = getattr(self._sampler, "_worker", None)
             candidate = getattr(worker, "_native_write_cause", None)
             # Never let arbitrary child exceptions, paths or private source
             # details enter the authenticated status response.
             write_cause = (
                 candidate
-                if candidate in {
+                if candidate
+                in {
                     "pending",
                     "live_child_write_error",
                     "first_child_disconnected",
