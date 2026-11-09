@@ -16,6 +16,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
@@ -34,6 +35,10 @@ _ADMIN_FAILURE_CODE = None
 _ADMIN_RESTART_DIAGNOSTIC = {}
 _ADMIN_DENIAL_DIAGNOSTIC = {}
 _FAILURE_MESSAGES = {
+    "Generated account form did not pass browser validation": "create_form_invalid",
+    "Administrator could not create a user through the UI": "create_http_status",
+    "New user did not retain its selected identity and role": "create_account_identity",
+    "New account did not atomically receive its selected cameras": "create_camera_grants",
     "Restart changed a durable user identity": "restart_user_identity",
     "Restart changed the user's durable role, enabled state or access mode": "restart_role_state",
     "Restart changed the user's selected camera grants": "restart_camera_grants",
@@ -323,6 +328,24 @@ def _return_to_cameras(page):
     if page.locator("#admin-panel").is_visible():
         page.locator("#admin-return-button").click()
     page.locator("#wall-tab").click()
+
+
+def _cleanup_admin_journey(page, contexts, *, primary_failure):
+    """Close every owned context without replacing the original failed assertion."""
+    cleanup_error = None
+    for context in reversed(contexts):
+        try:
+            context.close()
+        except BaseException as error:
+            cleanup_error = cleanup_error or error
+    _ADMIN_DENIAL_DIAGNOSTIC["journey_context_cleanup_failed"] = cleanup_error is not None
+    if primary_failure:
+        # A failed create can leave a modal open. Navigation behind it would
+        # only time out and obscure the product failure; outer cleanup owns it.
+        return
+    if cleanup_error is not None:
+        raise cleanup_error
+    _return_to_cameras(page)
 
 
 def _visible_live(page, identifier, color, *, diagnostic=None):
@@ -651,9 +674,7 @@ def run_admin_journey(
         _require(not user_script_errors, "A limited-account browser raised a script error")
         return evidence, private
     finally:
-        for context in reversed(contexts):
-            context.close()
-        _return_to_cameras(page)
+        _cleanup_admin_journey(page, contexts, primary_failure=sys.exc_info()[0] is not None)
 
 
 def assert_admin_restart(page, *, private_state, camera_ids, client=None, viewer_color="red"):

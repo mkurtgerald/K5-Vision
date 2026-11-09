@@ -816,6 +816,78 @@ def test_media_cookie_survives_host_clock_steps_but_never_extends_human_session(
     )
 
 
+def test_media_auth_survives_brief_health_dip_without_skipping_ownership(product, monkeypatch):
+    identifier = product.enroll()
+    path = MediaMTXBinding(product.service.site_id, UUID(identifier)).path_name
+    observed = []
+
+    def transient_status():
+        observed.append(True)
+        return "unavailable" if len(observed) <= 2 else "ready"
+
+    monkeypatch.setattr(product.service, "status", transient_status)
+    response = product.client.get(
+        "/api/v1/operator/media-auth",
+        headers=product.media_headers(f"/media/live/{path}/index.m3u8"),
+    )
+    assert response.status_code == 200
+    assert len(observed) == 3
+
+
+def test_media_auth_revocation_during_recovery_still_denies(product, monkeypatch):
+    identifier = product.enroll()
+    path = MediaMTXBinding(product.service.site_id, UUID(identifier)).path_name
+    replacement, _, _ = product.users.create_with_bootstrap(
+        UserCreate(
+            username="recovery-admin",
+            display_name="Recovery administrator",
+            role=UserRole.ADMINISTRATOR,
+        ),
+        actor="test",
+    )
+    _initialized_session(product, replacement)
+    assert product.users.credential_status(replacement.id) == "active"
+    calls = 0
+
+    def recovered_after_revocation():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            product.users.update(product.admin.id, UserPatch(enabled=False), actor="test")
+            return "ready"
+        return "unavailable"
+
+    monkeypatch.setattr(product.service, "status", recovered_after_revocation)
+    response = product.client.get(
+        "/api/v1/operator/media-auth",
+        headers=product.media_headers(f"/media/live/{path}/index.m3u8"),
+    )
+    assert response.status_code == 401
+    assert calls == 2
+
+
+def test_media_auth_recovery_wait_is_finite_and_persistent_failure_denied():
+    from fastapi import HTTPException
+
+    from k5vision.operator_product_api import _await_media_ready
+
+    elapsed = [0.0]
+    observations = []
+
+    def unavailable():
+        observations.append(True)
+        return "unavailable"
+
+    async def advance(seconds):
+        elapsed[0] += seconds
+
+    with pytest.raises(HTTPException) as failure:
+        asyncio.run(_await_media_ready(unavailable, now=lambda: elapsed[0], pause=advance))
+    assert failure.value.status_code == 503
+    assert elapsed[0] == pytest.approx(2.0)
+    assert 2 <= len(observations) <= 22
+
+
 def test_logout_can_clear_revoked_media_cookie_but_cross_origin_cannot(product):
     device_id = product.enroll()
     issued = product.client.post(
@@ -1133,7 +1205,8 @@ def test_history_registry_lock_does_not_block_other_http_requests(
     # Camera selection performs two device-registry reads per admission;
     # policy lookup performs one. Hit both sides of provider I/O.
     reads_per_admission = 2 if blocked_read == "device_registry" else 1
-    block_call = 1 + (reads_per_admission if block_after_provider else 0)
+    # Initial admission and post-readiness admission both precede provider I/O.
+    block_call = 1 + (2 * reads_per_admission if block_after_provider else 0)
     original = getattr(owner, method)
     entered, released = threading.Event(), threading.Event()
     counter_lock = threading.Lock()
@@ -1169,7 +1242,53 @@ def test_history_registry_lock_does_not_block_other_http_requests(
         finally:
             released.set()
         assert protected.result(timeout=5).status_code == 200
-    assert calls == 2 * reads_per_admission
+    assert calls == 3 * reads_per_admission
+
+
+def test_history_waits_for_brief_native_recovery_and_rechecks_camera(product, monkeypatch):
+    identifier = product.enroll()
+    calls = []
+
+    def recovering_status():
+        calls.append(True)
+        return "unavailable" if len(calls) <= 2 else "ready"
+
+    monkeypatch.setattr(product.service, "status", recovering_status)
+    response = product.client.get(
+        f"/api/v1/operator/cameras/{identifier}/history", headers=product.headers
+    )
+    assert response.status_code == 200
+    assert response.json()["spans"][0]["duration_seconds"] == 60.0
+    assert len(calls) == 3
+
+
+def test_history_recovery_does_not_reuse_revoked_admin_authority(product, monkeypatch):
+    identifier = product.enroll()
+    replacement, _, _ = product.users.create_with_bootstrap(
+        UserCreate(
+            username="history-recovery-admin",
+            display_name="History recovery administrator",
+            role=UserRole.ADMINISTRATOR,
+        ),
+        actor="test",
+    )
+    _initialized_session(product, replacement)
+    calls = []
+
+    def revoked_during_recovery():
+        calls.append(True)
+        if len(calls) == 2:
+            product.users.update(product.admin.id, UserPatch(enabled=False), actor="test")
+            return "ready"
+        return "unavailable"
+
+    monkeypatch.setattr(product.service, "status", revoked_during_recovery)
+    response = product.client.get(
+        f"/api/v1/operator/cameras/{identifier}/history", headers=product.headers
+    )
+    assert response.status_code == 401
+    assert len(calls) == 2
+    assert not product.service.provider.history_queries
 
 
 def test_history_respects_aware_interval_and_hides_donor_errors(product):

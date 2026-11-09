@@ -61,6 +61,41 @@ _PERSON_PATH = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/person-view"
 )
 _SESSION_TOKEN = re.compile(r"[A-Za-z0-9_-]{32,128}")
+_MEDIA_RECOVERY_GRACE_SECONDS = 2.0
+_MEDIA_RECOVERY_POLL_SECONDS = 0.1
+
+
+async def _await_media_ready(status, *, now=None, pause=None) -> bool:
+    """Allow a bounded native control-plane recovery without relaxing readiness.
+
+    The fixed budget includes the initial probe and all recovery probes.
+    Timed-out native work may finish on its thread, but cannot grant access.
+    Callers must reauthorize after this await, even when the first probe is
+    ready. The return value only records whether recovery was observed.
+    """
+    clock = monotonic if now is None else now
+    sleeper = asyncio.sleep if pause is None else pause
+    deadline = clock() + _MEDIA_RECOVERY_GRACE_SECONDS
+    recovered = False
+    while clock() < deadline:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        try:
+            state = await asyncio.wait_for(asyncio.to_thread(status), timeout=remaining)
+        except TimeoutError:
+            raise HTTPException(503, "Media unavailable") from None
+        # A completed future can win the timeout race at the boundary.
+        if clock() >= deadline:
+            break
+        if state in {"ready", "disk_full"}:
+            return recovered
+        recovered = True
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        await sleeper(min(_MEDIA_RECOVERY_POLL_SECONDS, remaining))
+    raise HTTPException(503, "Media unavailable")
 
 
 def _analytics_owner(token: str) -> UUID:
@@ -1095,8 +1130,11 @@ def install_operator_product_api(
             raise HTTPException(
                 422, "Playback requires an aware interval of at most 24 hours"
             ) from None
-        if service.status() not in {"ready", "disk_full"}:
-            raise HTTPException(503, "Media unavailable")
+        await _await_media_ready(service.status)
+        # Even a first-probe ready result follows an asynchronous suspension.
+        # Never enter the provider with authority retained across that wait.
+        current, _ = await authenticate(session[1])
+        source = await asyncio.to_thread(authorized_selection, current, device_id)
         try:
             spans = await service.provider.playback_spans(source.binding, start=first, end=last)
         except MediaWorkerError:
@@ -1332,6 +1370,16 @@ def install_operator_product_api(
                 from k5vision.operator_role_policy_api import require_permission
 
                 require_permission(app, current, "cameras.export")
-        if (await asyncio.to_thread(service.status)) not in {"ready", "disk_full"}:
-            raise HTTPException(503, "Media unavailable")
+        await _await_media_ready(service.status)
+        # Every asynchronous readiness probe can outlive the human session or
+        # camera/export permission, including an immediately ready result.
+        current, _ = await authenticate(tokens[0])
+        if not await asyncio.to_thread(current_media_authority):
+            raise _unauthorized()
+        if urlsplit(uris[0]).path == "/media/playback":
+            values = dict(parse_qsl(urlsplit(uris[0]).query))
+            if values.get("format", "fmp4") == "mp4":
+                from k5vision.operator_role_policy_api import require_permission
+
+                require_permission(app, current, "cameras.export")
         return Response(status_code=200)

@@ -60,10 +60,12 @@ class _Client:
         self.opener = build_opener(ProxyHandler({}), HTTPCookieProcessor(self.cookies))
         self.token = ""
         self.transport_failure = None
+        self.last_http_status = None
 
     def get(self, route, *, method="GET", data=None, media=False, max_bytes=1_048_576):
         __tracebackhide__ = True
         self.transport_failure = None
+        self.last_http_status = None
         headers = {"Origin": self.origin}
         if self.token and not media:
             headers["Authorization"] = "Bearer " + self.token
@@ -102,6 +104,7 @@ class _Client:
             ) from None
         with response:
             status = response.code
+            self.last_http_status = status
             deadline = time.monotonic() + 15
             body = bytearray()
             while len(body) <= max_bytes:
