@@ -15,18 +15,11 @@ def test_busy_person_preparation_does_not_flood_native_worker():
     )[0]
 
     assert "let busyRetryDelayMs = null;" in sampled
-    busy = sampled.split('if (result.status === "busy") {', 1)[1].split(
-        "} else {", 1
-    )[0]
+    busy = sampled.split('if (result.status === "busy") {', 1)[1].split("} else {", 1)[0]
     assert "busyRetryDelayMs = 1500;" in busy
-    refused = sampled.split("if (error.status === 429) {", 1)[1].split(
-        "} else if", 1
-    )[0]
+    refused = sampled.split("if (error.status === 429) {", 1)[1].split("} else if", 1)[0]
     assert "busyRetryDelayMs = 1500;" in refused
-    assert (
-        "busyRetryDelayMs ?? Math.max(0, 500 - (performance.now() - began))"
-        in sampled
-    )
+    assert "busyRetryDelayMs ?? Math.max(0, 500 - (performance.now() - began))" in sampled
     assert "pixels?.fill(0);" in sampled
     assert "snapshot?.data.fill(0);" in sampled
     assert "state.personController?.abort();" in app
