@@ -437,7 +437,15 @@ class _RecordedNativeWorker:
                     process.stdin.write(payload)
                     process.stdin.flush()
                 except OSError as error:
-                    if not self._recoverable_stdin_disconnect(error):
+                    # A child already known to have exited cannot accept
+                    # another request, even if Windows reports an unfamiliar
+                    # pipe error. A live child with an unrelated write error
+                    # must never be retried. One replacement retains the
+                    # original deadline and must reap the old owned process.
+                    if not (
+                        self._recoverable_stdin_disconnect(error)
+                        or process.poll() is not None
+                    ):
                         raise
                     # The Windows child can exit before accepting its first
                     # snapshot. Reap it before one replacement; never retry a
