@@ -1843,9 +1843,7 @@ def _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, di
                 phase = response.headers.get("x-k5-person-phase")
                 traffic["busy_phase"] = phase if phase in {"capacity", "preparing"} else "other"
             if first_sent_at[0] is not None:
-                elapsed_ms = min(
-                    120000, max(0, int((time.monotonic() - first_sent_at[0]) * 1000))
-                )
+                elapsed_ms = min(120000, max(0, int((time.monotonic() - first_sent_at[0]) * 1000)))
                 # The first reply is authoritative for backend responsiveness.
                 # Do not overwrite it with the last 429/retry response.
                 traffic.setdefault("first_response_ms", elapsed_ms)
