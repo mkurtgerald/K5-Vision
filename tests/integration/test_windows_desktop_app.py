@@ -3996,16 +3996,16 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             # Capture only a finite outcome; never stdout, stderr, model paths,
             # credentials, request content, recording bytes or source URIs.
             probe = (
-                "from k5vision.operator_events import _RecordedNativeWorker\\n"
+                "from k5vision.operator_events import _RecordedNativeWorker\n"
                 "from k5vision.operator_analytics_person import "
-                "load_installed_person_configuration\\n"
-                "config = load_installed_person_configuration({})\\n"
-                "assert config is not None\\n"
-                "worker = _RecordedNativeWorker(config)\\n"
-                "try:\\n"
-                "    assert worker.request(None) is None and worker._person_ready\\n"
-                "finally:\\n"
-                "    worker.close()\\n"
+                "load_installed_person_configuration\n"
+                "config = load_installed_person_configuration({})\n"
+                "assert config is not None\n"
+                "worker = _RecordedNativeWorker(config)\n"
+                "try:\n"
+                "    assert worker.request(None) is None and worker._person_ready\n"
+                "finally:\n"
+                "    worker.close()\n"
             )
             try:
                 completed = subprocess.run(
