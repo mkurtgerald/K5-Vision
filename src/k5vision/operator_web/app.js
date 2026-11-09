@@ -910,6 +910,17 @@
   async function samplePerson(epoch) {
     if (!state.personEnabled || epoch !== state.personEpoch) return;
     if (!canSamplePerson()) {
+      const camera = currentCamera();
+      // A retry after HTTP 429 can land while HLS is briefly rebuffering.
+      // Honor the existing five-second stalled-video guard instead of ending
+      // the authenticated sampling session before that guard can decide.
+      // Do not capture pixels or submit a request without decoded live video.
+      if (state.personBufferTimer !== null && state.token && !state.signingOut
+        && state.view === "live" && camera?.analytics_status === "configured"
+        && statusDetails(camera).style === "online" && state.workerStatus !== "unavailable") {
+        state.personTimer = setTimeout(() => void samplePerson(epoch), 250);
+        return;
+      }
       stopPersonView("Sampled view stopped while live video is unavailable. Start it again when video returns.");
       return;
     }
