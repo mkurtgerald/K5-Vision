@@ -267,7 +267,9 @@ def test_installed_event_success_retains_real_event_contract():
         )
     )
     diagnostic = {}
-    assert desktop._poll_installed_person_event(client, "/private-camera", diagnostic) == valid_event
+    assert (
+        desktop._poll_installed_person_event(client, "/private-camera", diagnostic) == valid_event
+    )
     assert diagnostic == {"analytics_event_poll_status": 200}
 
 
