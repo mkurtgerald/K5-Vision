@@ -442,9 +442,17 @@ class _RecordedNativeWorker:
                     # pipe error. A live child with an unrelated write error
                     # must never be retried. One replacement retains the
                     # original deadline and must reap the old owned process.
-                    if not (
-                        self._recoverable_stdin_disconnect(error) or process.poll() is not None
-                    ):
+                    disconnected = self._recoverable_stdin_disconnect(error)
+                    if not disconnected and process.poll() is None:
+                        # A native child can close stdin before Windows reports
+                        # process termination. Wait only for this ambiguous
+                        # failure, without inspecting stderr, arguments, or media.
+                        # A still-live child with an unrelated error is refused.
+                        try:
+                            process.wait(timeout=0.1)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    if not (disconnected or process.poll() is not None):
                         raise
                     # The Windows child can exit before accepting its first
                     # snapshot. Reap it before one replacement; never retry a
