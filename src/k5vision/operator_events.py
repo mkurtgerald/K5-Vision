@@ -441,8 +441,8 @@ class _RecordedNativeWorker:
                     process.stdin.flush()
                 except (OSError, ValueError) as error:
                     # Windows buffered stdin can report a closed stream as
-                    # ValueError rather than OSError. Treat it as an ambiguous
-                    # disconnect: only a confirmed exited child may be retried.
+                    # ValueError rather than OSError. A proven closed stream or
+                    # terminated child permits only the existing single retry.
                     # A child already known to have exited cannot accept
                     # another request, even if Windows reports an unfamiliar
                     # pipe error. A live child with an unrelated write error
