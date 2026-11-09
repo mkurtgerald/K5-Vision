@@ -88,6 +88,11 @@ def test_actual_combined_embedded_smoke_script_is_valid_python(builder):
     expression = max(expressions, key=lambda node: len(ast.get_source_segment(source, node)))
     assembled = eval(compile(ast.Expression(expression), "<smoke argument>", "eval"), vars(builder))
     compile(assembled, "<actual embedded -c smoke>", "exec")
+    # The installed view path uses one native CPU thread; the recording-child
+    # smoke separately qualifies the unchanged two-thread detector. A package
+    # must not claim native view support by probing only the recording budget.
+    assert "detector=_PersonDetector(person, inference_threads=1)" in assembled
+    assert "detector.infer(bytes(544*320*4),544,320,544*4,0)==()" in assembled
 
 
 def test_embedded_decoder_child_probe_uses_real_worker_with_no_camera_media(builder):
