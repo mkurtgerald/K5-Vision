@@ -829,9 +829,7 @@ def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch
             sampler.capture(source)
 
 
-def test_recorded_native_worker_replaces_proven_closed_stdin_with_live_child(
-    monkeypatch, tmp_path
-):
+def test_recorded_native_worker_replaces_proven_closed_stdin_with_live_child(monkeypatch, tmp_path):
     import k5vision.operator_events as module
 
     class Child:
