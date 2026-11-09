@@ -457,8 +457,7 @@ class _RecordedNativeWorker:
                         and process.stdin.closed
                     )
                     disconnected = closed_input or (
-                        isinstance(error, OSError)
-                        and self._recoverable_stdin_disconnect(error)
+                        isinstance(error, OSError) and self._recoverable_stdin_disconnect(error)
                     )
                     if not disconnected and process.poll() is None:
                         # A native child can close stdin before Windows reports
