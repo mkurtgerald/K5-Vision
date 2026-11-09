@@ -7,9 +7,9 @@ from pathlib import Path
 
 
 def test_busy_person_preparation_does_not_flood_native_worker():
-    app = (
-        Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js"
-    ).read_text(encoding="utf-8")
+    app = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
     sampled = app.split("async function samplePerson(epoch)", 1)[1].split(
         "async function startLive(", 1
     )[0]
