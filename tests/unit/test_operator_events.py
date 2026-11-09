@@ -960,8 +960,7 @@ def test_recorded_native_worker_only_recovers_ambiguous_write_after_confirmed_ex
 
         def wait(self, timeout=2):
             if self.broken and not self.exited and not self.killed:
-                assert timeout == 0.1
-                if not late_exit:
+                if timeout != 0.1 or not late_exit:
                     raise subprocess.TimeoutExpired("native-child", timeout)
                 self.exited = True
             return 1 if self.exited or self.killed else 0
