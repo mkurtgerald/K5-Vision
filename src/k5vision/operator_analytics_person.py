@@ -180,8 +180,12 @@ def _cap_windows_native_cpu_isa() -> None:
 
 
 class _PersonDetector:
-    def __init__(self, config: OperatorPersonConfiguration) -> None:
+    def __init__(
+        self, config: OperatorPersonConfiguration, *, inference_threads: int = 2
+    ) -> None:
         validate_person_runtime(config)
+        if type(inference_threads) is not int or inference_threads not in (1, 2):
+            raise ValueError("Person CPU thread setting was refused")
         _cap_windows_native_cpu_isa()
         import numpy as np
         import openvino as ov
@@ -211,7 +215,7 @@ class _PersonDetector:
             processing.build(),
             "CPU",
             {
-                "INFERENCE_NUM_THREADS": 2,
+                "INFERENCE_NUM_THREADS": inference_threads,
                 "NUM_STREAMS": "1",
                 # A fixed FP32 contract refuses native BF16/AMX dispatch
                 # without changing the admitted model or confidence threshold.
@@ -281,7 +285,10 @@ class _PersonSession(_AnalyticsSession):
 
     def _initialize(self) -> bool:
         try:
-            self._backend = _PersonDetector(self._config)
+            # A transient sampled view must not consume the recorder's full
+            # two-thread native CPU budget during installed person acceptance.
+            # The recording child retains the verified two-thread default.
+            self._backend = _PersonDetector(self._config, inference_threads=1)
             return True
         except BaseException:
             # Keep native exception tracebacks/model paths out of waiter Futures.
