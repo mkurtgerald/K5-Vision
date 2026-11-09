@@ -924,6 +924,7 @@
     let snapshot = null;
     let pixels = null;
     const controller = new AbortController();
+    let busyRetryDelayMs = null;
     state.personController = controller;
     try {
       const context = capture.getContext("2d", { willReadFrequently: true });
@@ -958,6 +959,8 @@
         return;
       }
       if (result.status === "busy") {
+        // A compiling native worker should not be flooded with raw frame uploads.
+        busyRetryDelayMs = 1500;
         // Busy has no boxes. Never erase the last valid frozen-frame overlay
         // while another native worker owns inference capacity.
         if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
@@ -984,6 +987,8 @@
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.personEpoch || !state.token) return;
       if (error.status === 429) {
+        // Preserve finite polling, but give cold native compilation CPU room.
+        busyRetryDelayMs = 1500;
         if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
       } else if (error.status === 503 && error.code !== "person_contract_invalid"
         && state.personTransient503 < 2 && canSamplePerson()) {
@@ -1002,7 +1007,8 @@
       capture.width = 0; capture.height = 0;
       if (state.personController === controller) state.personController = null;
       if (state.personEnabled && epoch === state.personEpoch) {
-        state.personTimer = setTimeout(() => void samplePerson(epoch), Math.max(0, 500 - (performance.now() - began)));
+        state.personTimer = setTimeout(() => void samplePerson(epoch),
+          busyRetryDelayMs ?? Math.max(0, 500 - (performance.now() - began)));
       }
     }
   }
