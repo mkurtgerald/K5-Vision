@@ -60,6 +60,7 @@ def test_failed_gui_analytics_does_not_skip_independent_upgrade_reversal():
     # live-refusal, upgrade and manual reversal; it cannot assert beta release.
     assert "Exercise real graphical baseline, live-refusal, upgrade and reversal" in upgrade
 
+
 def test_historical_baseline_transport_retry_never_weakens_upgrade_admission():
     """Retry historical official-archive HTTP refusals, not pin or product failures."""
     workflow = _WORKFLOW.read_text(encoding="utf-8")
