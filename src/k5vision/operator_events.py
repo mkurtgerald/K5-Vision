@@ -1033,15 +1033,10 @@ class OperatorEventService:
             return False
         if isinstance(self._sampler, RecordedFrameSampler):
             if getattr(self._sampler, "_configuration", None) is not None:
-                # After camera enrollment settles, an already primed recorder
-                # may permit the independent, camera-free view worker to
-                # compile while *no camera has enabled event inference*.
-                # This creates cold-start headroom without competing with the
-                # first authoritative recorded-person inference. Once any
-                # camera enables events, retain the strict event-first gate.
-                # Do not trust cached readiness from a terminated child.
-                if not enabled and self._sampler.native_model_ready():
-                    return False
+                # Recorder readiness is not an admitted recorded-person event.
+                # Keep optional second-worker preparation deferred until a
+                # genuine recorded event; prewarming during camera enrollment
+                # can consume the first recording inference CPU budget.
                 return True
         return bool(enabled)
 
