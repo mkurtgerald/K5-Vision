@@ -439,13 +439,16 @@ class _RecordedNativeWorker:
                 try:
                     process.stdin.write(payload)
                     process.stdin.flush()
-                except OSError as error:
+                except (OSError, ValueError) as error:
+                    # Windows buffered stdin can report a closed stream as
+                    # ValueError rather than OSError. Treat it as an ambiguous
+                    # disconnect: only a confirmed exited child may be retried.
                     # A child already known to have exited cannot accept
                     # another request, even if Windows reports an unfamiliar
                     # pipe error. A live child with an unrelated write error
                     # must never be retried. One replacement retains the
                     # original deadline and must reap the old owned process.
-                    disconnected = self._recoverable_stdin_disconnect(error)
+                    disconnected = isinstance(error, OSError) and self._recoverable_stdin_disconnect(error)
                     if not disconnected and process.poll() is None:
                         # A native child can close stdin before Windows reports
                         # process termination. Wait only for this ambiguous
