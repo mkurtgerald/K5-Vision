@@ -869,8 +869,11 @@ def test_native_worker_reaps_pre_response_broken_pipe_then_retries_once(monkeypa
     ("winerror", "child_exited", "retry"),
     [
         (109, True, True),
+        (109, False, True),
         (232, True, True),
+        (232, False, True),
         (233, True, True),
+        (233, False, True),
         (5, False, False),
         (5, True, True),
     ],
