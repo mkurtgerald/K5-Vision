@@ -7,7 +7,10 @@ gate. These tests never use or retain source URIs, camera pixels or credentials.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from uuid import uuid4
 
+from k5vision.operator_events import OperatorEventService, RecordedFrameSampler
 from k5vision.operator_product_api import _NativePersonWarmupGate
 
 
@@ -94,3 +97,38 @@ def test_recorded_person_event_still_bypasses_quiet_timer_once(monkeypatch):
         assert analytics.calls == 1
 
     asyncio.run(journey())
+
+
+
+def test_early_installed_view_warmup_requires_live_recorder_and_no_active_analytics(
+    monkeypatch,
+):
+    """The optional worker may use post-enrollment quiet time, not first-event CPU."""
+    camera_id = uuid4()
+    recorder = object.__new__(RecordedFrameSampler)
+    recorder._configuration = object()
+    child = {"ready": False}
+    monkeypatch.setattr(recorder, "native_model_ready", lambda: child["ready"])
+    state = {"enabled": False}
+    service = object.__new__(OperatorEventService)
+    service._closing = False
+    service._unavailable = False
+    service._available = True
+    service._sampler = recorder
+    service._cameras = SimpleNamespace(
+        list_sources=lambda: (SimpleNamespace(binding=SimpleNamespace(device_id=camera_id)),)
+    )
+    service.store = SimpleNamespace(settings=lambda _identifier: {"enabled": state["enabled"]})
+    service._last_events = {}
+
+    # Neither prior compilation attempts nor camera enrollment alone qualify.
+    assert service.awaiting_first_recorded_person_event()
+    child["ready"] = True
+    assert not service.awaiting_first_recorded_person_event()
+
+    # Once authoritative recording analytics are enabled, avoid CPU contention
+    # until a real accepted person event. Readiness is not event admission.
+    state["enabled"] = True
+    assert service.awaiting_first_recorded_person_event()
+    service._last_events[camera_id] = 1.0
+    assert not service.awaiting_first_recorded_person_event()
