@@ -931,6 +931,66 @@ def test_recorded_native_worker_retries_windows_disconnected_or_exited_children(
         worker.close()
 
 
+
+@pytest.mark.parametrize("late_exit", [True, False])
+def test_recorded_native_worker_only_recovers_ambiguous_write_after_confirmed_exit(
+    monkeypatch, tmp_path, late_exit
+):
+    import k5vision.operator_events as module
+
+    class AmbiguousPipe(io.BytesIO):
+        def write(self, _payload):
+            error = OSError("opaque native write failure")
+            error.winerror = 5
+            raise error
+
+    class Child:
+        def __init__(self, broken):
+            self.broken = broken
+            self.exited = False
+            self.killed = False
+            self.stdin = AmbiguousPipe() if broken else io.BytesIO()
+            self.stdout = io.BytesIO(b'{"status":"empty"}\\n')
+
+        def poll(self):
+            return 1 if self.exited or self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=2):
+            if self.broken and not self.exited and not self.killed:
+                assert timeout == 0.1
+                if not late_exit:
+                    raise subprocess.TimeoutExpired("native-child", timeout)
+                self.exited = True
+            return 1 if self.exited or self.killed else 0
+
+    first, replacement = Child(True), Child(False)
+    births = iter((first, replacement))
+    worker = module._RecordedNativeWorker(None)
+    starts = []
+
+    def start():
+        worker._process = next(births)
+        starts.append(True)
+
+    monkeypatch.setattr(worker, "_start", start)
+    try:
+        if late_exit:
+            assert worker.request(tmp_path / "private-snapshot.mp4") is None
+            assert len(starts) == 2
+            assert replacement.stdin.getvalue().endswith(b"\\n")
+        else:
+            with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+                worker.request(tmp_path / "private-snapshot.mp4")
+            assert len(starts) == 1
+            assert worker._failure_phase == "native_write_failed"
+        assert first.stdin.closed
+    finally:
+        worker.close()
+
+
 def test_native_worker_tracks_bounded_child_phases_without_source_content(monkeypatch, tmp_path):
     import k5vision.operator_events as module
 
