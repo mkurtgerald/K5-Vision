@@ -448,7 +448,15 @@ class _RecordedNativeWorker:
                     # pipe error. A live child with an unrelated write error
                     # must never be retried. One replacement retains the
                     # original deadline and must reap the old owned process.
-                    disconnected = (
+                    # A demonstrably closed buffered stdin is also a
+                    # disconnect, even if the child is still alive. Replacing
+                    # that owned child is the only way to accept a new request.
+                    closed_input = (
+                        isinstance(error, ValueError)
+                        and process.stdin is not None
+                        and process.stdin.closed
+                    )
+                    disconnected = closed_input or (
                         isinstance(error, OSError)
                         and self._recoverable_stdin_disconnect(error)
                     )
