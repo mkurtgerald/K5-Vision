@@ -829,6 +829,49 @@ def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch
             sampler.capture(source)
 
 
+def test_recorded_native_worker_replaces_proven_closed_stdin_with_live_child(
+    monkeypatch, tmp_path
+):
+    import k5vision.operator_events as module
+
+    class Child:
+        def __init__(self, closed):
+            self.stdin = io.BytesIO()
+            if closed:
+                self.stdin.close()
+            self.stdout = io.BytesIO(b'{"status":"empty"}\n')
+            self.killed = False
+
+        def poll(self):
+            return 1 if self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=2):
+            if not self.killed:
+                raise subprocess.TimeoutExpired("native-child", timeout)
+            return 0
+
+    first, replacement = Child(True), Child(False)
+    births = iter((first, replacement))
+    worker = module._RecordedNativeWorker(None)
+    started = []
+
+    def start():
+        worker._process = next(births)
+        started.append(True)
+
+    monkeypatch.setattr(worker, "_start", start)
+    try:
+        assert worker.request(tmp_path / "private-snapshot.mp4") is None
+        assert len(started) == 2
+        assert first.killed and first.stdout.closed
+        assert replacement.stdin.getvalue().endswith(b"\n")
+    finally:
+        worker.close()
+
+
 @pytest.mark.parametrize("child_exited", [True, False])
 def test_recorded_native_worker_classifies_closed_stdin_without_retrying_live_child(
     monkeypatch, tmp_path, child_exited
