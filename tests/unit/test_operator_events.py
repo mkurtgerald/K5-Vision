@@ -829,6 +829,60 @@ def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch
             sampler.capture(source)
 
 
+@pytest.mark.parametrize("child_exited", [True, False])
+def test_recorded_native_worker_classifies_closed_stdin_without_retrying_live_child(
+    monkeypatch, tmp_path, child_exited
+):
+    import k5vision.operator_events as module
+
+    class ClosedInput(io.BytesIO):
+        def write(self, _payload):
+            raise ValueError("I/O operation on closed file")
+
+    class Child:
+        def __init__(self, failed):
+            self.stdin = ClosedInput() if failed else io.BytesIO()
+            self.stdout = io.BytesIO(b'{"status":"empty"}\n')
+            self.failed = failed
+            self.killed = False
+
+        def poll(self):
+            return 1 if self.killed or (self.failed and child_exited) else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=2):
+            if self.poll() is None and timeout == 0.1:
+                raise subprocess.TimeoutExpired("native-child", timeout)
+            return 0
+
+    first, replacement = Child(True), Child(False)
+    births = iter((first, replacement))
+    worker = module._RecordedNativeWorker(None)
+    started = []
+
+    def start():
+        worker._process = next(births)
+        started.append(True)
+
+    monkeypatch.setattr(worker, "_start", start)
+    try:
+        if child_exited:
+            assert worker.request(tmp_path / "private-snapshot.mp4") is None
+            assert len(started) == 2
+            assert replacement.stdin.getvalue().endswith(b"\n")
+        else:
+            with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+                worker.request(tmp_path / "private-snapshot.mp4")
+            assert len(started) == 1
+            assert worker._failure_phase == "native_write_failed"
+            assert worker._native_write_cause == "live_child_write_error"
+        assert first.stdin.closed
+    finally:
+        worker.close()
+
+
 def test_native_worker_reaps_pre_response_broken_pipe_then_retries_once(monkeypatch, tmp_path):
     import k5vision.operator_events as module
 
