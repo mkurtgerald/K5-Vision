@@ -1087,12 +1087,18 @@ class OperatorEventService:
             and not self._closing
             and isinstance(self._sampler, RecordedFrameSampler)
             and getattr(self._sampler, "_configuration", None) is not None
-            and self._native_pending is None
+            and (
+                self._native_pending is None
+                or (
+                    self._native_pending.done()
+                    and not self._sampler.native_model_ready()
+                )
+            )
         ):
-            # Prime once before sampling, rather than repeatedly prewarming on
-            # enable after startup priming has completed or failed. A second
-            # cold 18-second request would starve the first real recorded frame
-            # of the unchanged 25-second installed event-acceptance budget.
+            # A failed or prematurely exited startup prime must be retried at
+            # explicit camera activation, before the first growing recording
+            # consumes the unchanged installed person-event deadline. Never
+            # interrupt an in-flight prime or duplicate a live ready worker.
             # A failed prime does not authorize an event: the actual sample
             # still must compile, infer and pass normal evidence admission.
             self._native_pending = self._executor.submit(self._sampler.prime)
