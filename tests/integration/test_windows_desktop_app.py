@@ -3989,6 +3989,46 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 nvr_diagnostic["wall_state_at_failure"] = browser_helpers._wall_state(page)
             except BaseException:
                 nvr_diagnostic["wall_state_probe_failed"] = True
+        if failure is not None and stage == "installed_continuous_person_analytics":
+            # Reproduce a camera-free native model prime in the *installed*
+            # runtime while the failing desktop instance remains alive. The
+            # packaged-payload smoke does not exercise this installed context.
+            # Capture only a finite outcome; never stdout, stderr, model paths,
+            # credentials, request content, recording bytes or source URIs.
+            probe = (
+                "from k5vision.operator_events import _RecordedNativeWorker\\n"
+                "from k5vision.operator_analytics_person import "
+                "load_installed_person_configuration\\n"
+                "config = load_installed_person_configuration({})\\n"
+                "assert config is not None\\n"
+                "worker = _RecordedNativeWorker(config)\\n"
+                "try:\\n"
+                "    assert worker.request(None) is None and worker._person_ready\\n"
+                "finally:\\n"
+                "    worker.close()\\n"
+            )
+            try:
+                completed = subprocess.run(
+                    [str(installed / "runtime/python.exe"), "-I", "-B", "-c", probe],
+                    cwd=installed,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    timeout=22,
+                    check=False,
+                )
+                nvr_diagnostic["analytics_installed_native_child_probe"] = (
+                    "passed"
+                    if completed.returncode == 0
+                    else "refused"
+                    if completed.returncode in {1, 2}
+                    else "abnormal_exit"
+                )
+            except subprocess.TimeoutExpired:
+                nvr_diagnostic["analytics_installed_native_child_probe"] = "timed_out"
+            except (OSError, ValueError):
+                nvr_diagnostic["analytics_installed_native_child_probe"] = "unavailable"
         if failure is not None and stage.startswith("actual_wall"):
             try:
                 status, body, _ = client.get("/api/v1/operator/cameras")
