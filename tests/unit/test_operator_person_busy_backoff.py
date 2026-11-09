@@ -23,3 +23,30 @@ def test_busy_person_preparation_does_not_flood_native_worker():
     assert "pixels?.fill(0);" in sampled
     assert "snapshot?.data.fill(0);" in sampled
     assert "state.personController?.abort();" in app
+
+
+def test_busy_retry_respects_existing_stalled_video_guard_without_upload():
+    """HTTP 429 followed by transient HLS waiting must not abort before guard expiry."""
+    app = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    retry = app.split("async function samplePerson(epoch)", 1)[1].split(
+        "const began = performance.now();", 1
+    )[0]
+    assert "if (!canSamplePerson()) {" in retry
+    assert "state.personBufferTimer !== null" in retry
+    assert "state.token && !state.signingOut" in retry
+    assert 'state.view === "live"' in retry
+    assert 'camera?.analytics_status === "configured"' in retry
+    assert 'statusDetails(camera).style === "online"' in retry
+    assert 'state.workerStatus !== "unavailable"' in retry
+    assert "state.personTimer = setTimeout(() => void samplePerson(epoch), 250);" in retry
+    assert "return;" in retry
+    assert "stopPersonView(" in retry
+    assert "const PERSON_BUFFER_GRACE_MS = 5000;" in app
+    # The timer still terminates a genuinely stalled player after its guard.
+    guard = app.split("function checkPersonBuffer(epoch, video, frames)", 1)[1].split(
+        '$("live-video").addEventListener("waiting"', 1
+    )[0]
+    assert "stopPersonView(" in guard
+    assert "current <= frames" in guard
