@@ -1023,10 +1023,8 @@ class OperatorEventService:
         if self._closing or self._unavailable or not self._available:
             return False
         # The first event from *any* enabled camera releases optional view
-        # preparation. A live, verified primed recorder also permits the
-        # camera-free second model to prepare during the enrollment quiet period,
-        # rather than spending the installed sampled-frame deadline cold.
-        # Priming alone NEVER admits an analytics event or sampled frame.
+        # preparation. Recorder priming alone never admits a person event and
+        # cannot release the CPU-intensive second model during first inference.
         enabled = [
             source.binding.device_id
             for source in self._cameras.list_sources()
@@ -1035,12 +1033,12 @@ class OperatorEventService:
         if enabled and any(camera_id in self._last_events for camera_id in enabled):
             return False
         if isinstance(self._sampler, RecordedFrameSampler):
-            if self._sampler.native_model_ready():
-                return False
-            # Reserve the first sealed recorder prime even before any camera's
-            # person analytics is enabled. Starting a second native model while
-            # the recorder is cold can starve the first recorded-frame deadline.
-            # A real authorized view still has its independent on-demand path.
+            # A primed recorder is ready to *attempt* inference, but has not
+            # admitted a person event from a real growing recording. Two native
+            # CPU models competing during that first attempt can starve the
+            # installed 25-second event gate. Keep the optional view warmup
+            # deferred until a real event, even when the recorder is primed.
+            # Explicitly requested views retain their independent cold path.
             if getattr(self._sampler, "_configuration", None) is not None:
                 return True
         return bool(enabled)

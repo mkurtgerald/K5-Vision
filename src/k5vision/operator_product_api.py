@@ -333,9 +333,9 @@ class _NativePersonWarmupGate:
     A busy installer may enroll several ONVIF cameras consecutively. Starting
     CPU-heavy native model compilation after camera one can contend with camera
     two's credential/profile deadline. Reset a six-second quiet interval on each
-    enrollment so sealed view compilation begins before the first recorded event
-    when a primed recorder is available. Only a timer is retained: no camera,
-    frame, credential, source URI or human identity is captured.
+    enrollment; keep optional view compilation behind the first recorded-person
+    event so a primed recorder still owns the first real-frame inference budget.
+    Only a timer is retained, never camera data, credentials or human identity.
     """
 
     def __init__(

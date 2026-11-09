@@ -1503,8 +1503,8 @@ def test_first_verified_recorded_person_event_starts_optional_preparation_once(s
     asyncio.run(run())
 
 
-def test_verified_live_recorder_prime_releases_optional_view_warmup_without_event(store):
-    """A sealed primed worker may warm the view; it never admits a person event."""
+def test_verified_live_recorder_prime_cannot_release_view_warmup_without_event(store):
+    """A primed native child is not evidence of a recorded person event."""
     camera = uuid4()
     source = SimpleNamespace(binding=SimpleNamespace(device_id=camera))
     cameras = SimpleNamespace(list_sources=lambda: (source,))
@@ -1531,22 +1531,24 @@ def test_verified_live_recorder_prime_releases_optional_view_warmup_without_even
         store=store,
         cameras=cameras,
         recording_root=Path("."),
-        configuration=None,
+        configuration=object(),
         sampler=sampler,
-        provider_factory=object(),
     )
     try:
         assert service.awaiting_first_recorded_person_event()
         assert not sampler.native_model_ready()
         worker._person_ready = True
         assert sampler.native_model_ready()
-        assert not service.awaiting_first_recorded_person_event()
+        # A living primed worker must not trigger competing view compilation.
+        assert service.awaiting_first_recorded_person_event()
         assert service._last_events == {}
         process.exit_code = 1
         assert not sampler.native_model_ready()
         assert service.awaiting_first_recorded_person_event()
         worker._process = None
         assert not sampler.native_model_ready()
+        service._last_events[camera] = 1.0
+        assert not service.awaiting_first_recorded_person_event()
     finally:
         asyncio.run(service.aclose())
     assert not sampler.native_model_ready()
@@ -1583,7 +1585,9 @@ def test_cold_recorder_prime_defers_view_without_enabled_analytics(store):
         assert not store.settings(camera)["enabled"]
         assert service.awaiting_first_recorded_person_event()
         worker._person_ready = True
-        assert not service.awaiting_first_recorded_person_event()
+        # Until a real event is admitted, priming alone does not release the
+        # optional second OpenVINO worker, even with analytics still disabled.
+        assert service.awaiting_first_recorded_person_event()
         worker._person_ready = False
         store.configure(camera, enabled=True, confidence_threshold=0.5)
         assert service.awaiting_first_recorded_person_event()
