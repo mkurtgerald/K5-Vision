@@ -1,7 +1,7 @@
 """Deterministic scheduling contract for installed native view-model warmup.
 
-The quiet timer is camera-free and preserves the recorder's model-readiness
-gate. These tests never use or retain source URIs, camera pixels or credentials.
+The quiet timer is camera-free and preserves the recorder's first-event
+priority. These tests never use or retain source URIs, camera pixels or credentials.
 """
 
 from __future__ import annotations
@@ -99,11 +99,8 @@ def test_recorded_person_event_still_bypasses_quiet_timer_once(monkeypatch):
     asyncio.run(journey())
 
 
-
-def test_early_installed_view_warmup_requires_live_recorder_and_no_active_analytics(
-    monkeypatch,
-):
-    """The optional worker may use post-enrollment quiet time, not first-event CPU."""
+def test_installed_view_warmup_waits_for_recorded_event(monkeypatch):
+    """Recorder priming does not authorize a second worker before a real event."""
     camera_id = uuid4()
     recorder = object.__new__(RecordedFrameSampler)
     recorder._configuration = object()
@@ -116,19 +113,15 @@ def test_early_installed_view_warmup_requires_live_recorder_and_no_active_analyt
     service._available = True
     service._sampler = recorder
     service._cameras = SimpleNamespace(
-        list_sources=lambda: (
-            SimpleNamespace(binding=SimpleNamespace(device_id=camera_id)),
-        )
+        list_sources=lambda: (SimpleNamespace(binding=SimpleNamespace(device_id=camera_id)),)
     )
-    service.store = SimpleNamespace(
-        settings=lambda _identifier: {"enabled": state["enabled"]}
-    )
+    service.store = SimpleNamespace(settings=lambda _identifier: {"enabled": state["enabled"]})
     service._last_events = {}
 
     # Neither prior compilation attempts nor camera enrollment alone qualify.
     assert service.awaiting_first_recorded_person_event()
     child["ready"] = True
-    assert not service.awaiting_first_recorded_person_event()
+    assert service.awaiting_first_recorded_person_event()
 
     # Once authoritative recording analytics are enabled, avoid CPU contention
     # until a real accepted person event. Readiness is not event admission.
