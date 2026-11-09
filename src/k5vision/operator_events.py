@@ -1032,13 +1032,16 @@ class OperatorEventService:
         if enabled and any(camera_id in self._last_events for camera_id in enabled):
             return False
         if isinstance(self._sampler, RecordedFrameSampler):
-            # A primed recorder is ready to *attempt* inference, but has not
-            # admitted a person event from a real growing recording. Two native
-            # CPU models competing during that first attempt can starve the
-            # installed 25-second event gate. Keep the optional view warmup
-            # deferred until a real event, even when the recorder is primed.
-            # Explicitly requested views retain their independent cold path.
             if getattr(self._sampler, "_configuration", None) is not None:
+                # After camera enrollment settles, an already primed recorder
+                # may permit the independent, camera-free view worker to
+                # compile while *no camera has enabled event inference*.
+                # This creates cold-start headroom without competing with the
+                # first authoritative recorded-person inference. Once any
+                # camera enables events, retain the strict event-first gate.
+                # Do not trust cached readiness from a terminated child.
+                if not enabled and self._sampler.native_model_ready():
+                    return False
                 return True
         return bool(enabled)
 
