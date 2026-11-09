@@ -197,8 +197,9 @@ def test_native_model_read_uses_verified_immutable_bytes_after_admission(admitte
 
 
 @pytest.mark.parametrize("precision_status", ["fp32", "rejected", "unavailable"])
+@pytest.mark.parametrize("inference_threads", [1, 2])
 def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(
-    admitted, monkeypatch, precision_status
+    admitted, monkeypatch, precision_status, inference_threads
 ):
     """Cold native view compilation must reuse the core and admit FP32 only."""
     config, _manifest, _files = admitted
@@ -232,7 +233,7 @@ def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(
             assert value is admitted_model
             assert device == "CPU"
             assert settings == {
-                "INFERENCE_NUM_THREADS": 2,
+                "INFERENCE_NUM_THREADS": inference_threads,
                 "NUM_STREAMS": "1",
                 "INFERENCE_PRECISION_HINT": openvino_stub.Type.f32,
             }
@@ -283,12 +284,19 @@ def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(
     monkeypatch.setattr(module, "_cap_windows_native_cpu_isa", lambda: None)
 
     if precision_status == "fp32":
-        detector = module._PersonDetector(config)
+        detector = module._PersonDetector(config, inference_threads=inference_threads)
         assert detector._request == "ready"
     else:
         with pytest.raises(ValueError, match="Person CPU precision was refused"):
-            module._PersonDetector(config)
+            module._PersonDetector(config, inference_threads=inference_threads)
     assert calls == ["core", "read", "compile"]
+
+
+@pytest.mark.parametrize("threads", [0, 3, True, 1.0])
+def test_person_detector_rejects_unapproved_native_cpu_budget(admitted, threads):
+    config, _manifest, _files = admitted
+    with pytest.raises(ValueError, match="Person CPU thread setting was refused"):
+        module._PersonDetector(config, inference_threads=threads)
 
 
 def test_model_byte_read_rejects_same_content_replaced_inode(admitted, monkeypatch):
@@ -338,8 +346,9 @@ def test_independent_factory_does_not_import_or_initialize_analytics_lab(admitte
     instances = []
 
     class Detector:
-        def __init__(self, value):
+        def __init__(self, value, *, inference_threads):
             assert value == config
+            assert inference_threads == 1
             instances.append(self)
 
         def infer(self, *args):
@@ -371,8 +380,8 @@ def test_cancelled_native_person_call_reserves_capacity_until_real_completion(
     entered, release = threading.Event(), threading.Event()
 
     class Detector:
-        def __init__(self, _config):
-            pass
+        def __init__(self, _config, *, inference_threads):
+            assert inference_threads == 1
 
         def infer(self, *args):
             entered.set()
