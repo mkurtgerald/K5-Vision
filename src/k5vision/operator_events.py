@@ -1253,10 +1253,24 @@ class OperatorEventService:
             except Exception:
                 state = self._states.setdefault(identifier, {})
                 state["status"] = "unavailable"
-                failure_phase = "native_failed"
+                failure_phase = "sample_failed"
                 if isinstance(self._sampler, RecordedFrameSampler):
+                    # A failed prior prime leaves the native worker's last
+                    # phase set. It must not mislabel a later filesystem,
+                    # decoder-setup or event-store failure as a native pipe
+                    # failure. Only the current request's native stage may
+                    # attribute the exception to the owning native worker.
+                    stage = getattr(self._sampler, "_capture_outcome", "")
+                    failure_phase = {
+                        "queued": "sample_queue_failed",
+                        "source_check": "sample_source_failed",
+                        "snapshot_read": "snapshot_read_failed",
+                        "decode_attempt": "snapshot_decode_failed",
+                        "native_request": "native_failed",
+                        "frame_ready": "event_admission_failed",
+                    }.get(stage, "sample_failed")
                     worker = getattr(self._sampler, "_worker", None)
-                    if isinstance(worker, _RecordedNativeWorker):
+                    if stage == "native_request" and isinstance(worker, _RecordedNativeWorker):
                         candidate = worker._failure_phase
                         if candidate in {
                             "native_launch_failed",
