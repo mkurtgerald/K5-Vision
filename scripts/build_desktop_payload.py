@@ -835,7 +835,7 @@ def build(args: argparse.Namespace) -> None:
             "load_installed_person_configuration,_PersonDetector; "
             "person=load_installed_person_configuration({}); assert person is not None; "
             "print('embedded smoke: person_configuration', flush=True); "
-            "detector=_PersonDetector(person); "
+            "detector=_PersonDetector(person, inference_threads=1); "
             "print('embedded smoke: person_detector', flush=True); "
             "assert detector.infer(bytes(544*320*4),544,320,544*4,0)==(); "
             "print('embedded smoke: person_inference', flush=True); "
