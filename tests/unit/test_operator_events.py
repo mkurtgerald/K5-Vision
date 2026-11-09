@@ -865,9 +865,18 @@ def test_native_worker_reaps_pre_response_broken_pipe_then_retries_once(monkeypa
         worker.close()
 
 
-@pytest.mark.parametrize(("winerror", "retry"), [(109, True), (232, True), (233, True), (5, False)])
-def test_recorded_native_worker_retries_only_windows_closed_pipe_errors(
-    monkeypatch, tmp_path, winerror, retry
+@pytest.mark.parametrize(
+    ("winerror", "child_exited", "retry"),
+    [
+        (109, True, True),
+        (232, True, True),
+        (233, True, True),
+        (5, False, False),
+        (5, True, True),
+    ],
+)
+def test_recorded_native_worker_retries_windows_disconnected_or_exited_children(
+    monkeypatch, tmp_path, winerror, child_exited, retry
 ):
     import k5vision.operator_events as module
 
@@ -886,7 +895,7 @@ def test_recorded_native_worker_retries_only_windows_closed_pipe_errors(
 
         def poll(self):
             # An unrelated access error must not be conflated with child exit.
-            return 1 if (self.broken and winerror in {109, 232, 233}) or self.killed else None
+            return 1 if (self.broken and child_exited) or self.killed else None
 
         def kill(self):
             self.killed = True
