@@ -116,9 +116,13 @@ def test_early_installed_view_warmup_requires_live_recorder_and_no_active_analyt
     service._available = True
     service._sampler = recorder
     service._cameras = SimpleNamespace(
-        list_sources=lambda: (SimpleNamespace(binding=SimpleNamespace(device_id=camera_id)),)
+        list_sources=lambda: (
+            SimpleNamespace(binding=SimpleNamespace(device_id=camera_id)),
+        )
     )
-    service.store = SimpleNamespace(settings=lambda _identifier: {"enabled": state["enabled"]})
+    service.store = SimpleNamespace(
+        settings=lambda _identifier: {"enabled": state["enabled"]}
+    )
     service._last_events = {}
 
     # Neither prior compilation attempts nor camera enrollment alone qualify.
