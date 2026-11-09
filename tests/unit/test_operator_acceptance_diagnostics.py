@@ -205,8 +205,8 @@ def test_http_denial_is_not_reclassified_as_transport_failure():
     assert client.transport_failure is None
 
 
-@pytest.mark.parametrize("status", [401, 403, 404, 500, 503])
-def test_installed_events_keep_denial_status_before_following_analytics_read(status):
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500])
+def test_installed_event_denials_remain_fatal_and_cannot_be_reclassified(status):
     client = runtime._Client(12345)
 
     def denied(_request, *, timeout):
@@ -215,40 +215,76 @@ def test_installed_events_keep_denial_status_before_following_analytics_read(sta
 
     client.opener = SimpleNamespace(open=denied)
     diagnostic = {}
-    with pytest.raises(AssertionError, match="unexpected status"):
-        desktop._installed_person_events(client, "/private-camera/events", diagnostic)
-    client.last_http_status = 200  # A later status read cannot rewrite the captured failure.
-    assert diagnostic == {"analytics_events_http_status": status}
+    with pytest.raises(pytest.fail.Exception, match="refused its authenticated poll"):
+        desktop._poll_installed_person_event(client, "/private-camera", diagnostic)
+    client.last_http_status = 200
+    assert diagnostic == {"analytics_event_poll_status": status}
     assert "private" not in json.dumps(diagnostic)
 
 
-def test_installed_event_transport_does_not_reuse_a_previous_http_status():
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_installed_event_temporary_gateway_outage_does_not_admit_an_event(status):
+    client = runtime._Client(12345)
+    client.opener = SimpleNamespace(
+        open=lambda _request, timeout: HTTPError(
+            "http://private", status, "private", {}, io.BytesIO(b"{}")
+        )
+    )
+    diagnostic = {}
+    assert desktop._poll_installed_person_event(client, "/private-camera", diagnostic) is None
+    assert diagnostic == {"analytics_event_poll_status": status}
+
+
+def test_installed_event_transport_cannot_reuse_previous_http_status():
     client = runtime._Client(12345)
     client.last_http_status = 200
 
     def unavailable(_request, *, timeout):
+        assert timeout == 3
         raise ConnectionResetError("private route and token")
 
     client.opener = SimpleNamespace(open=unavailable)
     diagnostic = {}
     with pytest.raises(RuntimeError, match="Local operator request did not complete"):
-        desktop._installed_person_events(client, "/private-camera/events", diagnostic)
-    assert diagnostic["analytics_events_http_status"] is None
-    assert diagnostic["analytics_events_transport"]["exception_type"] == "ConnectionResetError"
-    assert "private" not in json.dumps(diagnostic)
+        desktop._poll_installed_person_event(client, "/private-camera", diagnostic)
+    assert client.last_http_status is None
+    assert client.transport_failure["exception_type"] == "ConnectionResetError"
+    assert diagnostic == {}
+    assert "private" not in json.dumps(client.transport_failure)
 
 
-def test_installed_event_success_retains_the_original_event_contract():
+def test_installed_event_success_retains_real_event_contract():
     client = runtime._Client(12345)
-    response = HTTPError("http://private", 200, "private", {}, io.BytesIO(b'{"events": []}'))
-    client.opener = SimpleNamespace(open=lambda _request, timeout: response)
-    diagnostic = {"analytics_events_transport": {"exception_type": "ConnectionResetError"}}
-    assert desktop._installed_person_events(client, "/private-camera/events", diagnostic) == []
-    assert diagnostic == {"analytics_events_http_status": 200}
+    valid_event = {
+        "camera_id": "synthetic-camera",
+        "person_count": 1,
+        "confidence": 0.91,
+    }
+    payload = json.dumps({"events": [valid_event]}).encode()
+    client.opener = SimpleNamespace(
+        open=lambda _request, timeout: HTTPError(
+            "http://private", 200, "private", {}, io.BytesIO(payload)
+        )
+    )
+    diagnostic = {}
+    assert desktop._poll_installed_person_event(client, "/private-camera", diagnostic) == valid_event
+    assert diagnostic == {"analytics_event_poll_status": 200}
 
 
-@pytest.mark.parametrize("status", [200, 401])
-def test_installed_event_http_response_clears_prior_poll_transport_failure(status):
+@pytest.mark.parametrize("bad_body", [b"{}", b'{"events": null}', b'{"events": [null]}'])
+def test_installed_event_invalid_envelope_fails_closed(bad_body):
+    client = runtime._Client(12345)
+    client.opener = SimpleNamespace(
+        open=lambda _request, timeout: HTTPError(
+            "http://private", 200, "private", {}, io.BytesIO(bad_body)
+        )
+    )
+    with pytest.raises(pytest.fail.Exception, match="invalid"):
+        desktop._poll_installed_person_event(client, "/private-camera", {})
+
+
+@pytest.mark.parametrize("status", [200, 401, 503])
+def test_installed_event_http_response_clears_prior_transport_failure(status):
     client = runtime._Client(12345)
     responses = iter(
         [
@@ -263,11 +299,12 @@ def test_installed_event_http_response_clears_prior_poll_transport_failure(statu
     client.opener = SimpleNamespace(open=respond)
     diagnostic = {}
     with pytest.raises(RuntimeError):
-        desktop._installed_person_events(client, "/private-camera/events", diagnostic)
-    assert "analytics_events_transport" in diagnostic
-    if status == 200:
-        assert desktop._installed_person_events(client, "/private-camera/events", diagnostic) == []
+        desktop._poll_installed_person_event(client, "/private-camera", diagnostic)
+    assert client.transport_failure is not None
+    if status == 401:
+        with pytest.raises(pytest.fail.Exception, match="refused its authenticated poll"):
+            desktop._poll_installed_person_event(client, "/private-camera", diagnostic)
     else:
-        with pytest.raises(AssertionError):
-            desktop._installed_person_events(client, "/private-camera/events", diagnostic)
-    assert diagnostic == {"analytics_events_http_status": status}
+        assert desktop._poll_installed_person_event(client, "/private-camera", diagnostic) is None
+    assert client.transport_failure is None
+    assert diagnostic == {"analytics_event_poll_status": status}

@@ -1089,10 +1089,7 @@ class OperatorEventService:
             and getattr(self._sampler, "_configuration", None) is not None
             and (
                 self._native_pending is None
-                or (
-                    self._native_pending.done()
-                    and not self._sampler.native_model_ready()
-                )
+                or (self._native_pending.done() and not self._sampler.native_model_ready())
             )
         ):
             # A failed or prematurely exited startup prime must be retried at

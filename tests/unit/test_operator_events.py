@@ -1122,11 +1122,11 @@ def test_model_priming_is_owned_and_nonblocking_when_recorded_person_is_enabled(
 
 
 @pytest.mark.parametrize("prime_fails", [False, True])
-def test_completed_startup_prime_is_not_repeated_on_analytics_enable(
+def test_startup_prime_is_reused_only_when_native_worker_is_ready(
     identity, store, monkeypatch, prime_fails
 ):
-    # A finished or failed startup prewarm must not consume another cold
-    # inference budget after the operator enables real recorded-frame analysis.
+    # Healthy native worker readiness prevents duplicate compilation; a failed
+    # or exited preparation must be retried before enabling recorded detection.
     root = identity.directory / "recordings"
     root.mkdir(mode=0o700)
     sampler = RecordedFrameSampler(root)
@@ -1139,6 +1139,7 @@ def test_completed_startup_prime_is_not_repeated_on_analytics_enable(
             raise OperatorEventsError("synthetic model preparation unavailable")
 
     monkeypatch.setattr(sampler, "prime", prime_once)
+    monkeypatch.setattr(sampler, "native_model_ready", lambda: not prime_fails)
     service = OperatorEventService(
         store=store,
         cameras=SimpleNamespace(list_sources=lambda: (source,)),
@@ -1160,8 +1161,17 @@ def test_completed_startup_prime_is_not_repeated_on_analytics_enable(
             else:
                 await asyncio.wrap_future(first)
             service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
-            assert service._native_pending is first
-            assert requests == ["prime"]
+            if prime_fails:
+                retried = service._native_pending
+                assert retried is not first
+                with pytest.raises(
+                    OperatorEventsError, match="synthetic model preparation unavailable"
+                ):
+                    await asyncio.wrap_future(retried)
+                assert requests == ["prime", "prime"]
+            else:
+                assert service._native_pending is first
+                assert requests == ["prime"]
         finally:
             await service.aclose()
 
