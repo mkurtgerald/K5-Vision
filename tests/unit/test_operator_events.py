@@ -926,6 +926,7 @@ def test_recorded_native_worker_retries_windows_disconnected_or_exited_children(
                 worker.request(tmp_path / "private-snapshot.mp4")
             assert len(starts) == 1
             assert worker._failure_phase == "native_write_failed"
+            assert worker._native_write_cause == "live_child_write_error"
         assert first.stdin.closed
     finally:
         worker.close()
@@ -979,6 +980,7 @@ def test_recorded_native_worker_only_recovers_ambiguous_write_after_confirmed_ex
             assert worker.request(tmp_path / "private-snapshot.mp4") is None
             assert len(starts) == 2
             assert replacement.stdin.getvalue().endswith(b"\n")
+            assert worker._native_write_cause == "write_accepted"
         else:
             with pytest.raises(OperatorEventsError, match="native frame unavailable"):
                 worker.request(tmp_path / "private-snapshot.mp4")
@@ -1521,6 +1523,7 @@ def test_current_recorded_sample_stage_owns_failure_attribution(
     service, _, _ = _service(store, source, sampler=sampler)
     worker = _RecordedNativeWorker(None)
     worker._failure_phase = "native_write_failed"
+    worker._native_write_cause = "live_child_write_error"
     sampler._worker = worker
 
     async def fail_at_stage(_source, _settings):
@@ -1536,6 +1539,9 @@ def test_current_recorded_sample_stage_owns_failure_attribution(
             status = service.status(source.binding.device_id)
             assert status["sample_phase"] == expected
             assert status["last_completed_phase"] == expected
+            assert status["native_write_cause"] == (
+                "live_child_write_error" if failed_stage == "native_request" else "not_applicable"
+            )
             assert status["status"] == "unavailable"
             assert "private" not in str(status)
         finally:

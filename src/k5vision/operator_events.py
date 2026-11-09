@@ -347,6 +347,8 @@ class _RecordedNativeWorker:
         self._closing = threading.Event()
         self._person_ready = False
         self._failure_phase = "native_not_started"
+        # Fixed classifications only; never retain an OS error, path or request.
+        self._native_write_cause = "not_started"
 
     def _request_timeout(self) -> float:
         if self._configuration is not None and not self._person_ready:
@@ -408,6 +410,7 @@ class _RecordedNativeWorker:
             self._failure_phase = "native_launch_failed"
             self._start()
             self._failure_phase = "native_write_failed"
+            self._native_write_cause = "pending"
             process = self._process
             if self._closing.is_set():
                 self.close()
@@ -452,8 +455,13 @@ class _RecordedNativeWorker:
                             process.wait(timeout=0.1)
                         except subprocess.TimeoutExpired:
                             pass
-                    if not (disconnected or process.poll() is not None):
+                    exited = process.poll() is not None
+                    if not (disconnected or exited):
+                        self._native_write_cause = "live_child_write_error"
                         raise
+                    self._native_write_cause = (
+                        "first_child_disconnected" if disconnected else "first_child_exited"
+                    )
                     # The Windows child can exit before accepting its first
                     # snapshot. Reap it before one replacement; never retry a
                     # model, decoder, inference or response-protocol failure.
@@ -467,8 +475,13 @@ class _RecordedNativeWorker:
                     if expired.is_set() or self._closing.is_set():
                         process.kill()
                         raise TimeoutError from None
-                    process.stdin.write(payload)
-                    process.stdin.flush()
+                    try:
+                        process.stdin.write(payload)
+                        process.stdin.flush()
+                    except (OSError, ValueError):
+                        self._native_write_cause = "replacement_write_error"
+                        raise
+                self._native_write_cause = "write_accepted"
                 self._failure_phase = "native_reply_missing"
                 # A child may report only these fixed processing phases before
                 # its response. Four bounded headers (three stages + result)
@@ -1074,9 +1087,27 @@ class OperatorEventService:
                 "native_inference_active",
             }:
                 sample_phase = candidate
+        write_cause = "not_applicable"
+        if sample_phase == "native_write_failed" and isinstance(self._sampler, RecordedFrameSampler):
+            worker = getattr(self._sampler, "_worker", None)
+            candidate = getattr(worker, "_native_write_cause", None)
+            # Never let arbitrary child exceptions, paths or private source
+            # details enter the authenticated status response.
+            write_cause = (
+                candidate
+                if candidate in {
+                    "pending",
+                    "live_child_write_error",
+                    "first_child_disconnected",
+                    "first_child_exited",
+                    "replacement_write_error",
+                }
+                else "unclassified"
+            )
         return {
             **settings,
             "status": status,
+            "native_write_cause": write_cause,
             "last_sample_at": state.get("last_sample_at"),
             "processed_frames": state.get("processed_frames", 0),
             "sample_attempts": state.get("sample_attempts", 0),
