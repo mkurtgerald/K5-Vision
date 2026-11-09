@@ -724,8 +724,8 @@ def test_decoder_failure_is_isolated_and_closes_cleanly(store):
             await asyncio.sleep(0.1)
             assert service.status(source.binding.device_id)["status"] == "unavailable"
             status = service.status(source.binding.device_id)
-            assert status["sample_phase"] == "native_failed"
-            assert status["last_completed_phase"] == "native_failed"
+            assert status["sample_phase"] == "sample_failed"
+            assert status["last_completed_phase"] == "sample_failed"
             assert store.events(source.binding.device_id)["events"] == []
         finally:
             await service.aclose()
