@@ -1342,9 +1342,7 @@ class OperatorEventService:
                 state.pop("last_native_write_cause", None)
                 if failure_phase == "native_write_failed":
                     worker = getattr(self._sampler, "_worker", None)
-                    state["last_native_write_cause"] = getattr(
-                        worker, "_native_write_cause", None
-                    )
+                    state["last_native_write_cause"] = getattr(worker, "_native_write_cause", None)
                 if self._provider is not None:
                     try:
                         await self._provider.aclose()
