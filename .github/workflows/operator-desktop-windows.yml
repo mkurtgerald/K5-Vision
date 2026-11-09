@@ -546,7 +546,23 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP ("k5-upgrade-inno-" + [guid]::NewGuid().ToString("N"))
           New-Item -ItemType Directory -Path $root | Out-Null
           $archive = Join-Path $root "innosetup-6.4.3.exe"
-          Invoke-WebRequest -Uri $pin.url -OutFile $archive -TimeoutSec 180
+          # Match the graphical installer lane's bounded CDN outage recovery.
+          # Only retry transient transport errors; the byte/SHA gate below is mandatory.
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              Invoke-WebRequest -Uri $pin.url -OutFile $archive -TimeoutSec 180 -ErrorAction Stop
+              break
+            } catch {
+              $response = $_.Exception.Response
+              $status = if ($null -ne $response) { [int]$response.StatusCode } else { 0 }
+              Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+              if ($status -notin @(408, 429, 500, 502, 503, 504) -or $attempt -eq 3) {
+                throw "Baseline Inno Setup archive transport unavailable"
+              }
+              Write-Host "Baseline compiler transport $status; bounded retry $attempt"
+              Start-Sleep -Seconds (2 * $attempt)
+            }
+          }
           if ((Get-Item -LiteralPath $archive).Length -ne $pin.bytes -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pin.sha256) {
             throw "Inno Setup baseline compiler byte identity mismatch"
           }

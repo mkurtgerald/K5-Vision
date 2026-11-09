@@ -931,7 +931,6 @@ def test_recorded_native_worker_retries_windows_disconnected_or_exited_children(
         worker.close()
 
 
-
 @pytest.mark.parametrize("late_exit", [True, False])
 def test_recorded_native_worker_only_recovers_ambiguous_write_after_confirmed_exit(
     monkeypatch, tmp_path, late_exit
