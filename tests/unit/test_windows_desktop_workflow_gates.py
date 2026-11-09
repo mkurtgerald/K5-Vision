@@ -59,3 +59,23 @@ def test_failed_gui_analytics_does_not_skip_independent_upgrade_reversal():
     # The independent upgrade test still executes real graphical install,
     # live-refusal, upgrade and manual reversal; it cannot assert beta release.
     assert "Exercise real graphical baseline, live-refusal, upgrade and reversal" in upgrade
+
+def test_historical_baseline_transport_retry_never_weakens_upgrade_admission():
+    """Retry historical official-archive HTTP refusals, not pin or product failures."""
+    workflow = _WORKFLOW.read_text(encoding="utf-8")
+    baseline = workflow.split("Build complete native baseline package from pinned source", 1)[
+        1
+    ].split("Compile exact historical graphical supervisor", 1)[0]
+    assert "ref: b21cdfb1bb5b8605c77f7dac0957cc6651bd0bd5" in workflow
+    assert "for ($attempt = 1; $attempt -le 3; $attempt++)" in baseline
+    assert "baseline-source/scripts/build_desktop_payload.py" in baseline
+    assert "--head-sha $env:K5_DESKTOP_BASELINE_HEAD_SHA" in baseline
+    assert '"stage": "native_workers", "error_type": "HTTPError"' in baseline
+    assert "if (-not $retryable -or $attempt -eq 3)" in baseline
+    assert 'throw "Previously qualified baseline payload could not be reproduced"' in baseline
+    assert "Remove-Item -LiteralPath baseline-build -Recurse -Force" in baseline
+    assert "Remove-Item -LiteralPath $log -Force" in baseline
+    assert "Get-Content -LiteralPath $log -Raw" in baseline
+    assert "Write-Host $output" not in baseline
+    assert "source_url" not in baseline
+    assert "K5_DONOR_TOOL_ROOT" not in baseline
