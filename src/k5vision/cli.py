@@ -97,10 +97,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # A credential can begin with -h; reject the unsupported inline option
     # before argparse can mistake its value for --help and exit successfully.
     # Never expose the rejected value through an exception or terminal output.
-    if any(
-        token == "--password" or token.startswith("--password=")
-        for token in candidate_argv
-    ):
+    if any(token == "--password" or token.startswith("--password=") for token in candidate_argv):
         parser.error("Inline credentials are not supported")
     args = parser.parse_args(candidate_argv)
     if args.command is None:
