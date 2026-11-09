@@ -1544,6 +1544,18 @@ def test_current_recorded_sample_stage_owns_failure_attribution(
             )
             assert status["status"] == "unavailable"
             assert "private" not in str(status)
+
+            # A later prime can begin before the status poll. Its changing
+            # worker state must not erase the last completed failure's cause.
+            worker._native_write_cause = "pending"
+            service._states[source.binding.device_id]["sample_phase"] = "native_pending"
+            pending_status = service.status(source.binding.device_id)
+            assert pending_status["sample_phase"] == "native_pending"
+            assert pending_status["last_completed_phase"] == expected
+            assert pending_status["native_write_cause"] == (
+                "live_child_write_error" if failed_stage == "native_request" else "not_applicable"
+            )
+            assert "private" not in str(pending_status)
         finally:
             await service.aclose()
 
