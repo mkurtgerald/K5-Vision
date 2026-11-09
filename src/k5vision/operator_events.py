@@ -448,7 +448,10 @@ class _RecordedNativeWorker:
                     # pipe error. A live child with an unrelated write error
                     # must never be retried. One replacement retains the
                     # original deadline and must reap the old owned process.
-                    disconnected = isinstance(error, OSError) and self._recoverable_stdin_disconnect(error)
+                    disconnected = (
+                        isinstance(error, OSError)
+                        and self._recoverable_stdin_disconnect(error)
+                    )
                     if not disconnected and process.poll() is None:
                         # A native child can close stdin before Windows reports
                         # process termination. Wait only for this ambiguous
