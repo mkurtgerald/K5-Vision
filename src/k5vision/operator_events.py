@@ -443,8 +443,7 @@ class _RecordedNativeWorker:
                     # must never be retried. One replacement retains the
                     # original deadline and must reap the old owned process.
                     if not (
-                        self._recoverable_stdin_disconnect(error)
-                        or process.poll() is not None
+                        self._recoverable_stdin_disconnect(error) or process.poll() is not None
                     ):
                         raise
                     # The Windows child can exit before accepting its first
