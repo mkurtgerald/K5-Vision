@@ -610,7 +610,7 @@ def test_native_watchdog_does_not_start_another_thread_when_request_is_active(
 
     class Process:
         stdin = io.BytesIO()
-        stdout = io.BytesIO(b'{"status":"empty"}\\n')
+        stdout = io.BytesIO(b'{"status":"empty"}\n')
 
         def poll(self):
             return None
