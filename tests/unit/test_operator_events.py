@@ -552,6 +552,45 @@ def test_native_pipe_block_reports_exact_bounded_stage(monkeypatch, tmp_path, bl
     assert results == [None]
 
 
+
+def test_failed_native_worker_reaps_before_buffered_stdin_close():
+    """A stalled Windows pipe cannot block replacement before child termination."""
+    import k5vision.operator_events as module
+
+    phases = []
+
+    class BufferedStdin:
+        def close(self):
+            # A buffered pipe close can flush and wait for an unread child.
+            # This boundary must only be reached after the owned child exits.
+            assert phases[-1] == "reaped"
+            phases.append("stdin_closed")
+
+    class Child:
+        stdin = BufferedStdin()
+        stdout = io.BytesIO()
+        killed = False
+
+        def poll(self):
+            return -9 if self.killed else None
+
+        def kill(self):
+            self.killed = True
+            phases.append("killed")
+
+        def wait(self, timeout=2):
+            assert self.killed
+            phases.append("reaped")
+            return -9
+
+    worker = module._RecordedNativeWorker(None)
+    worker._process = Child()
+    worker.close(final=False)
+    assert phases == ["killed", "reaped", "stdin_closed"]
+    assert worker._process is None
+    assert not worker._closing.is_set()
+
+
 def test_stalled_owned_native_worker_is_killed_and_reaped_before_next_launch(monkeypatch, tmp_path):
     import k5vision.operator_events as module
 
