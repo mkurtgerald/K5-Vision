@@ -104,6 +104,53 @@ def test_large_cached_history_still_samples_fresh_growth_between_storage_scans(
     assert directory_scans == 2
 
 
+
+def test_writer_missing_from_cold_inventory_is_watched_without_admitting_old_bytes(
+    recording_camera, monkeypatch
+):
+    """A pre-existing active segment can grow without changing directory mtime."""
+    root, directory, source = recording_camera
+    cached = directory / "2026-10-28_12-00-00-000000_+0000.mp4"
+    cached.write_bytes(b"old-cached-history")
+    writer = directory / "2026-10-28_12-01-00-000000_+0000.mp4"
+    writer.write_bytes(b"preexisting-writer-bytes")
+    inventory = {cached.name: _signature(directory, cached)}
+    sampler = _sampler(root, inventory, monkeypatch)
+
+    # The cold baseline sees this writer only in the private directory,
+    # not in the storage-maintenance cache. Neither initial bytes nor an
+    # unchanged file may become a detection.
+    assert sampler.capture(source) is None
+    assert writer.name in sampler._active_files[source.binding.device_id]
+    assert sampler.capture(source) is None
+    assert sampler._capture_outcome == "no_growth"
+
+    # Only actual post-baseline byte growth is eligible, even while the
+    # maintenance inventory and directory mtime remain unchanged.
+    initial_mtime = directory.stat().st_mtime_ns
+    writer.write_bytes(b"preexisting-writer-bytes-fresh-frames")
+    assert directory.stat().st_mtime_ns == initial_mtime
+    sampled = sampler.capture(source)
+    assert sampled is not None
+    assert sampled[0] == b"preexisting-writer-bytes-fresh-frames"
+    assert sampled[2] == writer.name
+    assert sampler.capture(source) is None
+
+
+def test_uncached_retained_recording_never_emits_without_new_growth(
+    recording_camera, monkeypatch
+):
+    root, directory, source = recording_camera
+    retained = directory / "2026-10-28_12-01-00-000000_+0000.mp4"
+    retained.write_bytes(b"retained")
+    sampler = _sampler(root, {}, monkeypatch)
+    assert sampler.capture(source) is None
+    assert retained.name in sampler._active_files[source.binding.device_id]
+    for _ in range(3):
+        assert sampler.capture(source) is None
+        assert sampler._capture_outcome == "no_growth"
+
+
 def test_cached_new_recording_after_clock_rollback_uses_its_explicit_utc(
     recording_camera, monkeypatch
 ):
