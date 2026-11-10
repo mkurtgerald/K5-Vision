@@ -105,6 +105,11 @@ class OperatorAnalyticsBroker:
         # native imports. No restricted Analytics Lab source is involved.
         validate_person_runtime(config)
         self._factory = PersonProviderFactory(config)
+        # The bundled single-view Windows beta must not compile OpenVINO in
+        # the ASGI server process. Preserve the four-view in-process engineering
+        # adapter; installed model admission and box requirements are identical.
+        if max_views == 1:
+            self._factory.isolated = True
         self._max_views = max_views
         self._interval = float(minimum_interval_seconds)
         self._timeout = float(inference_timeout_seconds)

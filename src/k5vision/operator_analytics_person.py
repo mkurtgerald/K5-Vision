@@ -329,12 +329,18 @@ class PersonProviderFactory:
         validate_person_runtime(config)
         self._config = config
         self._capacity = threading.BoundedSemaphore(4)
+        self.isolated = False
 
     async def __call__(self) -> OwnedAnalyticsProvider:
         if not self._capacity.acquire(blocking=False):
             raise RuntimeError("Person native capacity is unavailable.")
         try:
-            session = _PersonSession(self._config, self._capacity.release)
+            if self.isolated:
+                from k5vision.operator_person_view_process import IsolatedPersonSession
+
+                session = IsolatedPersonSession(self._config, self._capacity.release)
+            else:
+                session = _PersonSession(self._config, self._capacity.release)
         except Exception:
             self._capacity.release()
             raise RuntimeError("Person session initialization failed.") from None
