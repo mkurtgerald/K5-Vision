@@ -171,6 +171,8 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
     cohort = d._Cohort(api)
     verified = []
     cleanup_failed = False
+    phase = "baseline_setup"
+    health_statuses = set()
     try:
         d._install_gui(baseline, installed, api)
         _assert_installed(installed, old_head, old_launcher)
@@ -190,9 +192,18 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
                 api.set_text(form, d._PASSWORD, password)
                 api.set_text(form, d._CONFIRM, password)
                 api.click(api.control(form, d._CREATE))
+            health_statuses.clear()
+
+            def observed_health():
+                diagnostic = {}
+                ready = d._healthy(client, diagnostic)
+                if "health_http_status" in diagnostic:
+                    health_statuses.add(diagnostic["health_http_status"])
+                return ready
+
             d._wait(
-                lambda: d._healthy(client, {}),
-                "Cross-revision installed backend ready",
+                observed_health,
+                "Cross-revision " + phase + " installed backend ready",
                 process=app,
                 timeout=60,
             )
@@ -203,6 +214,7 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
             app = None
             return str(result)
 
+        phase = "baseline_login"
         original_site = start_and_login(first=True)
         verified.append("baseline_login")
 
@@ -221,6 +233,7 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
 
         # Prove the candidate's Inno guard refuses replacement of a live
         # product before it changes the currently installed executable.
+        phase = "live_upgrade_refusal"
         app = d._start_app(installed, profile, port, cohort)
         form = d._wait(lambda: api.form(app.pid), "Running baseline window", process=app)
         d._wait(
@@ -236,6 +249,7 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
         app = None
         verified.append("live_upgrade_refused")
 
+        phase = "candidate_install"
         d._install_gui(candidate, installed, api)
         _assert_installed(installed, new_head, new_launcher)
         assert _installed_payload_check(installed) == 0
@@ -252,18 +266,34 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
             licensed.write_bytes(original)
         assert _installed_payload_check(installed) == 0
         assert_preserved()
+        phase = "candidate_login"
         assert start_and_login(first=False) == original_site
         verified.append("new_revision_login")
 
         # A stopped user-initiated reversal is *not* automatic rollback of a
         # failed activation. It demonstrates compatibility of both installers
         # with the same persistent operator account and profile bytes.
+        phase = "reversal_install"
         d._install_gui(baseline, installed, api)
         _assert_installed(installed, old_head, old_launcher)
         assert_preserved()
+        phase = "reversal_login"
         assert start_and_login(first=False) == original_site
         verified.append("baseline_reversal_login")
     finally:
+        # Retain only finite stage and health evidence on both pass and fail.
+        record_testsuite_property(
+            "desktop_cross_revision_stage_diagnostic",
+            json.dumps(
+                {
+                    "phase": phase,
+                    "verified_steps": verified,
+                    "health_http_statuses": sorted(health_statuses),
+                    "supervisor_exit_code": app.poll() if app is not None else None,
+                },
+                sort_keys=True,
+            ),
+        )
         cohort.finish()
         for process in reversed(cohort.snapshot()):
             try:
