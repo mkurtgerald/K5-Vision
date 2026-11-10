@@ -612,8 +612,8 @@ def test_native_worker_unbuffered_request_retains_exact_stdout_reads(monkeypatch
         child = worker._process
         assert isinstance(child.stdin, io.FileIO)
         assert isinstance(child.stdout, io.BufferedReader)
-        child.stdin.write(b"READY\\n")
-        assert child.stdout.readline() == b"OK\\n"
+        child.stdin.write(b"READY\n")
+        assert child.stdout.readline() == b"OK\n"
         # The native decoder emits large single-payload responses. Preserve
         # full reads rather than accepting partial raw-pipe chunks as frames.
         assert child.stdout.read(16384) == b"Z" * 16384
