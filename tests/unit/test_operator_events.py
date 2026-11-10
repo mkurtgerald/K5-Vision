@@ -599,7 +599,6 @@ def test_native_watchdog_thread_start_refusal_kills_owned_child_before_command(
     assert writes == []
 
 
-
 def test_failed_native_worker_reaps_before_buffered_stdin_close():
     """A stalled Windows pipe cannot block replacement before child termination."""
     import k5vision.operator_events as module
