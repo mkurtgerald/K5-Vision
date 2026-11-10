@@ -91,7 +91,9 @@ def test_actual_combined_embedded_smoke_script_is_valid_python(builder):
     # The installed view path uses one native CPU thread; the recording-child
     # smoke separately qualifies the unchanged two-thread detector. A package
     # must not claim native view support by probing only the recording budget.
-    assert "detector=_PersonDetector(person, inference_threads=1, fixed_view_input=True)" in assembled
+    assert (
+        "detector=_PersonDetector(person, inference_threads=1, fixed_view_input=True)" in assembled
+    )
     assert "detector.infer(bytes(544*320*4),544,320,544*4,0)==()" in assembled
     # The same sealed worker must accept non-native aspect ratio input and
     # resize transient pixels without changing recorded-person detection.
