@@ -1911,8 +1911,10 @@ def _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, di
                   // failure evidence. Never retain DOM text, camera identifiers,
                   // source addresses, request data, credentials or sampled pixels.
                   const liveState = document.getElementById('live-state')?.textContent || '';
-                  const liveTitle = document.getElementById('live-placeholder-title')?.textContent || '';
-                  const cameraListMessage = document.getElementById('camera-list-message')?.textContent || '';
+                  const liveTitleNode = document.getElementById('live-placeholder-title');
+                  const liveTitle = liveTitleNode?.textContent || '';
+                  const cameraListNode = document.getElementById('camera-list-message');
+                  const cameraListMessage = cameraListNode?.textContent || '';
                   const liveStatusClass = liveState.startsWith('Disconnected')
                     ? 'disconnected'
                     : liveState.startsWith('Reconnecting') ? 'reconnecting'
