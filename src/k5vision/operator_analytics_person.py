@@ -180,10 +180,18 @@ def _cap_windows_native_cpu_isa() -> None:
 
 
 class _PersonDetector:
-    def __init__(self, config: OperatorPersonConfiguration, *, inference_threads: int = 2) -> None:
+    def __init__(
+        self,
+        config: OperatorPersonConfiguration,
+        *,
+        inference_threads: int = 2,
+        fixed_view_input: bool = False,
+    ) -> None:
         validate_person_runtime(config)
         if type(inference_threads) is not int or inference_threads not in (1, 2):
             raise ValueError("Person CPU thread setting was refused")
+        if type(fixed_view_input) is not bool:
+            raise ValueError("Person view input mode was refused")
         _cap_windows_native_cpu_isa()
         import numpy as np
         import openvino as ov
@@ -204,10 +212,17 @@ class _PersonDetector:
         ):
             raise ValueError("Person model interface was refused")
         processing = PrePostProcessor(model)
-        processing.input().tensor().set_element_type(ov.Type.u8).set_layout(
+        tensor = processing.input().tensor().set_element_type(ov.Type.u8).set_layout(
             ov.Layout("NHWC")
-        ).set_color_format(ColorFormat.BGR).set_spatial_dynamic_shape()
-        processing.input().preprocess().resize(ResizeAlgorithm.RESIZE_LINEAR)
+        ).set_color_format(ColorFormat.BGR)
+        if not fixed_view_input:
+            # The authoritative recording detector retains its existing
+            # dynamic OpenVINO resizing and two-thread inference contract.
+            tensor.set_spatial_dynamic_shape()
+            processing.input().preprocess().resize(ResizeAlgorithm.RESIZE_LINEAR)
+        # Optional views supply fixed 544x320 BGR input. Avoid compiling a
+        # second dynamic-resize graph under four-camera Windows contention;
+        # resize the transient sampled frame in native OpenCV before inference.
         processing.input().model().set_layout(ov.Layout("NCHW"))
         compiled = core.compile_model(
             processing.build(),
@@ -227,6 +242,7 @@ class _PersonDetector:
         if precision != ov.Type.f32:
             raise ValueError("Person CPU precision was refused")
         self._numpy = np
+        self._fixed_view_input = fixed_view_input
         self._request = compiled.create_infer_request()
 
     def infer(
@@ -236,6 +252,15 @@ class _PersonDetector:
         raw = np.frombuffer(payload, dtype=np.uint8, count=height * stride)
         bgrx = raw.reshape(height, stride)[:, : width * 4].reshape(height, width, 4)
         bgr = np.ascontiguousarray(bgrx[:, :, :3])
+        if self._fixed_view_input and (width != 544 or height != 320):
+            import cv2
+
+            # The captured aspect and the detector bounding-box geometry keep
+            # their original normalized coordinate contract. No view pixels
+            # are stored or reused across frames.
+            bgr = np.ascontiguousarray(
+                cv2.resize(bgr, (544, 320), interpolation=cv2.INTER_LINEAR)
+            )
         self._request.infer({0: bgr[np.newaxis, ...]})
         output = self._request.get_output_tensor(0).data
         if tuple(output.shape) != (1, 1, 200, 7):
@@ -286,7 +311,9 @@ class _PersonSession(_AnalyticsSession):
             # A transient sampled view must not consume the recorder's full
             # two-thread native CPU budget during installed person acceptance.
             # The recording child retains the verified two-thread default.
-            self._backend = _PersonDetector(self._config, inference_threads=1)
+            self._backend = _PersonDetector(
+                self._config, inference_threads=1, fixed_view_input=True
+            )
             return True
         except BaseException:
             # Keep native exception tracebacks/model paths out of waiter Futures.
