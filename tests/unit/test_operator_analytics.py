@@ -187,9 +187,7 @@ def test_failed_native_preparation_does_not_cold_compile_on_http_request(harness
         release.set()
         await broker._prewarm_task
         assert broker.preparation_phase == "ready"
-        accepted = await broker.infer(
-            owner_id=owner, camera_id=camera, frame_id=3, frame=frame(8)
-        )
+        accepted = await broker.infer(owner_id=owner, camera_id=camera, frame_id=3, frame=frame(8))
         assert accepted.status == "active" and accepted.frame_id == 3
         assert len(harness.calls) == 1 and len(harness.providers) == 1
         await broker.aclose()
