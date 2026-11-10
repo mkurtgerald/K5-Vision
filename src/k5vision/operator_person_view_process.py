@@ -108,7 +108,13 @@ class _ViewPersonWorker:
             or len(payload) > _MAX_FRAME
         ):
             raise RuntimeError("Native person frame refused")
-        header = {"bytes": len(payload), "width": width, "height": height, "stride": stride, "elapsed": elapsed}
+        header = {
+            "bytes": len(payload),
+            "width": width,
+            "height": height,
+            "stride": stride,
+            "elapsed": elapsed,
+        }
         _write(process.stdin, json.dumps(header).encode("utf-8") + b"\n")
         _write(process.stdin, payload)
         report = _line(process.stdout)
@@ -120,18 +126,18 @@ class _ViewPersonWorker:
         detections = []
         for index, box in enumerate(boxes):
             if type(box) is not dict or set(box) != {
-                "confidence", "x_min", "y_min", "x_max", "y_max"
+                "confidence",
+                "x_min",
+                "y_min",
+                "x_max",
+                "y_max",
             }:
                 raise RuntimeError("Native person response unavailable")
             values = tuple(box[key] for key in ("confidence", "x_min", "y_min", "x_max", "y_max"))
             if any(type(value) not in (int, float) or not math.isfinite(value) for value in values):
                 raise RuntimeError("Native person response unavailable")
             confidence, left, top, right, bottom = values
-            if not (
-                0.5 <= confidence <= 1
-                and 0 <= left < right <= 1
-                and 0 <= top < bottom <= 1
-            ):
+            if not (0.5 <= confidence <= 1 and 0 <= left < right <= 1 and 0 <= top < bottom <= 1):
                 raise RuntimeError("Native person response unavailable")
             detections.append(
                 SimpleNamespace(
@@ -242,7 +248,11 @@ def _child() -> int:
         except (ValueError, UnicodeError):
             return 1
         if type(request) is not dict or set(request) != {
-            "bytes", "width", "height", "stride", "elapsed"
+            "bytes",
+            "width",
+            "height",
+            "stride",
+            "elapsed",
         }:
             return 1
         count, width, height, stride, elapsed = (
@@ -250,9 +260,12 @@ def _child() -> int:
         )
         if (
             any(type(value) is not int for value in (count, width, height, stride, elapsed))
-            or width < 1 or height < 1 or stride != width * 4
+            or width < 1
+            or height < 1
+            or stride != width * 4
             or not 0 <= elapsed <= 2_147_483_647
-            or count != stride * height or not 0 < count <= _MAX_FRAME
+            or count != stride * height
+            or not 0 < count <= _MAX_FRAME
         ):
             return 1
         pixels = _read_exact(sys.stdin.buffer, count)

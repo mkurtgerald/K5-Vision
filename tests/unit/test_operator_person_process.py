@@ -27,9 +27,7 @@ def _worker(report):
 def test_person_worker_sends_only_geometry_and_transient_bgrx_to_private_stdin():
     report = {
         "status": "ready",
-        "boxes": [
-            {"confidence": 0.93, "x_min": 0.1, "y_min": 0.2, "x_max": 0.7, "y_max": 0.9}
-        ],
+        "boxes": [{"confidence": 0.93, "x_min": 0.1, "y_min": 0.2, "x_max": 0.7, "y_max": 0.9}],
     }
     worker = _worker(report)
     frame = bytes(range(64))
@@ -38,19 +36,20 @@ def test_person_worker_sends_only_geometry_and_transient_bgrx_to_private_stdin()
     assert boxes[0].box.x_max == 0.7
     sent = worker._process.stdin.getvalue()
     header, raw = sent.split(b"\n", 1)
-    assert json.loads(header) == {
-        "bytes": 64, "width": 4, "height": 4, "stride": 16, "elapsed": 7
-    }
+    assert json.loads(header) == {"bytes": 64, "width": 4, "height": 4, "stride": 16, "elapsed": 7}
     assert raw == frame
     assert frame not in worker._process.stdout.getvalue()
 
 
-@pytest.mark.parametrize("box", [
-    {"confidence": 0.93, "x_min": 0.8, "y_min": 0.2, "x_max": 0.7, "y_max": 0.9},
-    {"confidence": float("nan"), "x_min": 0.1, "y_min": 0.2, "x_max": 0.7, "y_max": 0.9},
-    {"confidence": 0.1, "x_min": 0.1, "y_min": 0.2, "x_max": 0.7, "y_max": 0.9},
-    {"confidence": 0.93, "x_min": 0.1, "y_min": 0.2, "x_max": 0.7, "y_max": 2},
-])
+@pytest.mark.parametrize(
+    "box",
+    [
+        {"confidence": 0.93, "x_min": 0.8, "y_min": 0.2, "x_max": 0.7, "y_max": 0.9},
+        {"confidence": float("nan"), "x_min": 0.1, "y_min": 0.2, "x_max": 0.7, "y_max": 0.9},
+        {"confidence": 0.1, "x_min": 0.1, "y_min": 0.2, "x_max": 0.7, "y_max": 0.9},
+        {"confidence": 0.93, "x_min": 0.1, "y_min": 0.2, "x_max": 0.7, "y_max": 2},
+    ],
+)
 def test_person_worker_rejects_invalid_geometry_without_acceptance_weakening(box):
     worker = _worker({"status": "ready", "boxes": [box]})
     with pytest.raises(RuntimeError, match="response unavailable"):
