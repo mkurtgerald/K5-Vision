@@ -437,9 +437,15 @@ class _RecordedNativeWorker:
                 }
                 payload = json.dumps(request).encode("utf-8") + b"\n"
                 try:
+                    # Distinguish a blocked Windows pipe write from a blocked
+                    # flush or an unresponsive child. These phases carry no
+                    # path, request bytes or native exception details.
+                    self._failure_phase = "native_pipe_write_active"
                     process.stdin.write(payload)
+                    self._failure_phase = "native_pipe_flush_active"
                     process.stdin.flush()
                 except (OSError, ValueError) as error:
+                    self._failure_phase = "native_write_failed"
                     # Windows buffered stdin can report a closed stream as
                     # ValueError rather than OSError. A proven closed stream or
                     # terminated child permits only the existing single retry.
@@ -489,9 +495,12 @@ class _RecordedNativeWorker:
                         process.kill()
                         raise TimeoutError from None
                     try:
+                        self._failure_phase = "native_pipe_write_active"
                         process.stdin.write(payload)
+                        self._failure_phase = "native_pipe_flush_active"
                         process.stdin.flush()
                     except (OSError, ValueError):
+                        self._failure_phase = "native_write_failed"
                         self._native_write_cause = "replacement_write_error"
                         raise
                 self._native_write_cause = "write_accepted"
@@ -1091,6 +1100,8 @@ class OperatorEventService:
                 in_flight = {
                     "native_launch_failed": "native_worker_starting",
                     "native_write_failed": "native_request_writing",
+                    "native_pipe_write_active": "native_pipe_write_active",
+                    "native_pipe_flush_active": "native_pipe_flush_active",
                     "native_child_exited_before_request": "native_worker_exited",
                     "native_reply_missing": "native_reply_waiting",
                     "native_header_invalid": "native_header_reading",
@@ -1109,6 +1120,8 @@ class OperatorEventService:
                 "native_request",
                 "native_worker_starting",
                 "native_request_writing",
+                "native_pipe_write_active",
+                "native_pipe_flush_active",
                 "native_worker_exited",
                 "native_reply_waiting",
                 "native_header_reading",
