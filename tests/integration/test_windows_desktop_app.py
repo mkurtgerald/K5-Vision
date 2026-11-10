@@ -4172,6 +4172,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         except BaseException:
             desktop_status = "unresponsive"
             desktop_probe = {"available": False}
+
         def record_cleanup_failure(phase, error):
             # First finite failure stage and type only: never an OS exception
             # message, local path, process command, credential or source URI.
@@ -4200,9 +4201,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 "ValueError",
             }
             nvr_diagnostic.setdefault("cleanup_failure_phase", phase)
-            nvr_diagnostic.setdefault(
-                "cleanup_failure_type", kind if kind in kinds else "other"
-            )
+            nvr_diagnostic.setdefault("cleanup_failure_type", kind if kind in kinds else "other")
             nvr_diagnostic["cleanup_failure_count"] = min(
                 9, nvr_diagnostic.get("cleanup_failure_count", 0) + 1
             )
