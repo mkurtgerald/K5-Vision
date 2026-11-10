@@ -20,6 +20,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress, StrictBool
+from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -1232,11 +1233,34 @@ def install_operator_product_api(
                 raise HTTPException(400, "Person view upload unavailable") from None
             if len(body) != expected:
                 raise HTTPException(400, "Person view length does not match geometry")
+            if (
+                prepare_native_person_on_camera
+                and getattr(analytics, "preparation_phase", None) == "not_requested"
+            ):
+                # An authenticated first sample must receive a bounded 429
+                # *before* optional native model compilation can starve the
+                # control-plane event loop. Starlette starts this media-free
+                # preparation only after sending the retryable response.
+                # Never retain the sampled pixels or start work after a
+                # revoked session or changed camera grant.
+                current, _ = await authenticate(session[1])
+                await asyncio.to_thread(authorized_selection, current, device_id)
+
+                async def prepare_after_response() -> None:
+                    analytics.start_preparing()
+
+                return JSONResponse(
+                    {"detail": "Person view preparation is busy"},
+                    status_code=429,
+                    headers={
+                        "X-K5-Person-Phase": "preparing",
+                        "Cache-Control": "no-store",
+                    },
+                    background=BackgroundTask(prepare_after_response),
+                )
             if prepare_native_person_on_camera:
-                # A real, authorized sampled-view request bypasses the optional
-                # enrollment quiet timer, not model admission or person-event
-                # acceptance. Preparation owns no camera pixels or source URI.
-                # The first request is retryable while native compilation runs.
+                # An authorized retry can recover one failed, media-free
+                # compilation without awaiting it inside the HTTP request.
                 analytics.start_preparing()
             preparing_at_submission = bool(getattr(analytics, "preparation_pending", False))
             try:

@@ -1515,6 +1515,43 @@ def test_pending_person_model_preparation_returns_retryable_429_only_after_auth(
     assert product.analytics.preparation_calls == 2
 
 
+@pytest.mark.parametrize(
+    "product", [{"analytics": True, "prepare_native_person_on_camera": True}], indirect=True
+)
+def test_first_installed_person_request_replies_before_optional_native_compile(product):
+    """A first authorized frame cannot hold HTTP while model startup begins."""
+    camera_id = product.enroll()
+    product.analytics.preparation_phase = "not_requested"
+    url = _person_url(camera_id)
+    payload = bytes(range(16))
+
+    refused = product.client.post(
+        url, headers=product.headers, content=payload
+    )
+    assert refused.status_code == 403
+    assert product.analytics.preparation_calls == 0
+    assert not product.analytics.submissions
+
+    retry = product.client.post(
+        url, headers=_person_headers(product), content=payload
+    )
+    assert retry.status_code == 429
+    assert retry.headers["x-k5-person-phase"] == "preparing"
+    assert retry.headers["cache-control"] == "no-store"
+    # The real broker's optional startup is performed after the 429 ASGI
+    # response, rather than awaited while retaining this frozen frame.
+    assert product.analytics.preparation_calls == 1
+    assert not product.analytics.submissions
+
+    product.analytics.preparation_phase = "ready"
+    accepted = product.client.post(
+        url, headers=_person_headers(product), content=payload
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "active"
+    assert accepted.json()["frame_id"] == 17
+
+
 @pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
 def test_person_view_preserves_correlation_and_isolates_session_camera_identity(product):
     first = product.enroll()
