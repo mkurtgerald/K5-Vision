@@ -1867,6 +1867,31 @@ def _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, di
     # retain URLs, query parameters, upload pixels or request/response bodies.
     traffic = {"requests": 0, "responses": 0, "failed": 0, "http_status": 0}
     first_sent_at = [None]
+    control_probe = {}
+    control_thread = [None]
+
+    def measure_control_plane():
+        # A single independent, unauthenticated loopback health request during
+        # the sampled POST distinguishes gateway/backend starvation from a
+        # slow person handler. Never retain response bodies or local addresses.
+        began = time.monotonic()
+        try:
+            time.sleep(0.75)
+            independent = client.__class__(urlsplit(client.origin).port)
+            status, body, _ = independent.get("/api/v1/health", max_bytes=1024)
+            control_probe["status"] = status if status in {200, 404, 503, 504} else 0
+            try:
+                healthy = status == 200 and json.loads(body).get("status") == "ok"
+            except (TypeError, ValueError, AttributeError):
+                healthy = False
+            control_probe["healthy"] = healthy
+        except Exception:
+            control_probe["status"] = "transport_unavailable"
+            control_probe["healthy"] = False
+        finally:
+            control_probe["elapsed_ms"] = min(
+                30_000, max(0, int((time.monotonic() - began) * 1000))
+            )
 
     def is_sample(request):
         return request.method == "POST" and urlsplit(request.url).path == route
@@ -1876,6 +1901,8 @@ def _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, di
             traffic["requests"] = min(5, traffic["requests"] + 1)
             if first_sent_at[0] is None:
                 first_sent_at[0] = time.monotonic()
+                control_thread[0] = threading.Thread(target=measure_control_plane, daemon=True)
+                control_thread[0].start()
 
     def observed_response(response):
         if is_sample(response.request):
@@ -2018,6 +2045,11 @@ def _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, di
         page.remove_listener("request", observed_request)
         page.remove_listener("response", observed_response)
         page.remove_listener("requestfailed", observed_failure)
+        if control_thread[0] is not None:
+            control_thread[0].join(timeout=0.1)
+        diagnostic["analytics_sample_concurrent_health"] = (
+            dict(control_probe) if "elapsed_ms" in control_probe else {"completed": False}
+        )
     diagnostic["analytics_sample_request_traffic"] = dict(traffic)
     diagnostic["analytics_sample_response_no_store"] = (
         response.headers.get("cache-control") == "no-store"
