@@ -235,15 +235,31 @@ def _create_user(page, username, role, identifiers, *, progress=None):
         page.locator("#admin-user-form").evaluate("form => form.checkValidity()"),
         "Generated account form did not pass browser validation",
     )
+    # Capture only finite grant counts and equivalence flags. Never publish
+    # device identities, form values, request bodies or one-time credentials.
+    checked_before = page.locator(
+        "#admin-camera-choices input[type=checkbox]:checked"
+    ).evaluate_all("items => items.map(item => item.value)")
+    mode_before = page.locator("#admin-access-mode").input_value()
+    submitted_grants = None
     request_seen = False
 
     def observe_submission(request):
-        nonlocal request_seen
+        nonlocal request_seen, submitted_grants
         if (
             request.method == "POST"
             and urlsplit(request.url).path == "/api/v1/operator/admin/users"
         ):
             request_seen = True
+            body = request.post_data_json
+            if isinstance(body, dict):
+                access = body.get("camera_access")
+                if isinstance(access, dict) and isinstance(access.get("camera_ids"), list):
+                    submitted_grants = {
+                        "mode_selected": access.get("mode") == "selected",
+                        "count": min(64, len(access["camera_ids"])),
+                        "exact_match": set(access["camera_ids"]) == set(identifiers),
+                    }
 
     page.on("request", observe_submission)
     try:
@@ -277,11 +293,26 @@ def _create_user(page, username, role, identifiers, *, progress=None):
         and account.get("enabled") is True,
         "New user did not retain its selected identity and role",
     )
-    _require(
-        account.get("camera_access", {}).get("mode") == "selected"
-        and set(account["camera_access"]["camera_ids"]) == set(identifiers),
-        "New account did not atomically receive its selected cameras",
+    received_access = account.get("camera_access", {})
+    grants_match = (
+        received_access.get("mode") == "selected"
+        and isinstance(received_access.get("camera_ids"), list)
+        and set(received_access["camera_ids"]) == set(identifiers)
     )
+    if not grants_match:
+        received_ids = received_access.get("camera_ids")
+        _ADMIN_DENIAL_DIAGNOSTIC.update(
+            create_expected_grant_count=min(64, len(set(identifiers))),
+            create_ui_mode_selected=mode_before == "selected",
+            create_ui_checked_count=min(64, len(checked_before)),
+            create_ui_grants_match=set(checked_before) == set(identifiers),
+            create_post_grants=submitted_grants,
+            create_response_mode_selected=received_access.get("mode") == "selected",
+            create_response_grant_count=(
+                min(64, len(received_ids)) if isinstance(received_ids, list) else -1
+            ),
+        )
+    _require(grants_match, "New account did not atomically receive its selected cameras")
     checkpoint("one_time_credential")
     credential = _credential(page, username)
     _require(
