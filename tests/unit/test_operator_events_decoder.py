@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 from k5vision import operator_events_decoder as decoder
@@ -235,7 +236,7 @@ def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monke
     monkeypatch.setattr(decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n")))
     monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
     assert decoder.main() == 0
-    assert initialized == [("private-model", 2, True)] and warmed == [True]
+    assert initialized == [(Path("private-model"), 2, True)] and warmed == [True]
     assert output.getvalue() == (
         b'{"status":"phase","phase":"model"}\n'
         b'{"status":"phase","phase":"inference"}\n'
@@ -263,7 +264,7 @@ def test_recorded_person_uses_the_same_fixed_graph_after_model_only_prime(monkey
             )
 
     def factory(config, *, inference_threads, fixed_view_input):
-        assert (config, inference_threads, fixed_view_input) == ("private-model", 2, True)
+        assert (config, inference_threads, fixed_view_input) == (Path("private-model"), 2, True)
         models.append(Detector())
         return models[-1]
 
