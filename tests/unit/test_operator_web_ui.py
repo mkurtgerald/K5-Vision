@@ -1501,3 +1501,126 @@ def test_direct_rtsp_enrollment_tests_privately_and_connects_only_an_opaque_prob
             assert errors == []
         finally:
             browser.close()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["verified_busy", "changed_grant", "denied", "malformed", "unverified_busy"],
+)
+def test_transient_camera_inventory_reverifies_authority_before_preserving_live(outcome):
+    """A media inventory stall cannot silently revoke or invent a live camera grant."""
+    browser_api = pytest.importorskip("playwright.sync_api")
+    channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
+    assets = Path(__file__).resolve().parents[2] / "src/k5vision/operator_web"
+    account = {"username": "fixture-admin", "role": "administrator", "display_name": "Fixture"}
+    camera = {"device_id": _CAMERA, "name": "Generated camera", "status": "live",
+              "recording": True, "analytics_status": "configured"}
+    token = "generated-inventory-revalidation-session-token-000000000"
+    armed = {"value": False, "failures": 0, "authority": 0}
+    errors = []
+    with browser_api.sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel=channel, headless=True)
+        try:
+            context = browser.new_context()
+            try:
+                context.add_init_script("""(() => {
+                  window.__hlsPlayers = [];
+                  HTMLMediaElement.prototype.play = () => Promise.reject(
+                    new DOMException("Generated video test", "NotAllowedError"));
+                  window.Hls = class {
+                    static Events = {
+                      ERROR: "error", MEDIA_ATTACHED: "attached", MANIFEST_PARSED: "parsed"
+                    };
+                    static isSupported() { return true; }
+                    constructor() { this.handlers = {}; window.__hlsPlayers.push(this); }
+                    on(name, handler) { this.handlers[name] = handler; }
+                    attachMedia() { queueMicrotask(() => this.handlers.attached?.()); }
+                    loadSource() { queueMicrotask(() => this.handlers.parsed?.()); }
+                    destroy() { this.destroyed = true; }
+                  };
+                })();""")
+                page = context.new_page()
+                page.set_default_timeout(10_000)
+                page.on("pageerror", lambda _error: errors.append("script_error"))
+
+                def intercept(route):
+                    path = urlsplit(route.request.url).path
+                    if _operator_asset(route, assets):
+                        return
+                    status, data = 200, {}
+                    if path == "/api/v1/auth/login":
+                        data = {
+                            "session_token": token, "account": account,
+                            "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                            "expires_in_seconds": 300,
+                        }
+                    elif path == "/api/v1/auth/me":
+                        data = _ui_core(account)
+                    elif path in {"/api/v1/operator/cameras", "/api/v1/operator/capabilities"}:
+                        snapshot = _ui_inventory(account, [camera], worker_status="ready")
+                        snapshot["capabilities"]["account"]["camera_access"] = {
+                            "mode": "all", "camera_ids": []
+                        }
+                        if path.endswith("/capabilities"):
+                            armed["authority"] += 1
+                            data = snapshot["capabilities"]
+                            if outcome == "changed_grant":
+                                data["account"]["camera_access"] = {
+                                    "mode": "selected", "camera_ids": []
+                                }
+                            if outcome == "unverified_busy":
+                                status = 503
+                        elif armed["value"] and armed["failures"] == 0:
+                            armed["failures"] += 1
+                            if outcome == "denied":
+                                status = 403
+                            elif outcome == "malformed":
+                                data = {"cameras": "invalid"}
+                            else:
+                                status = 503
+                        else:
+                            data = snapshot
+                    elif path == "/api/v1/operator/status":
+                        data = {
+                            "worker_status": "ready",
+                            "server_utc": datetime.now(UTC).isoformat(),
+                            "clock": {"status": "observing", "sync_verified": False},
+                        }
+                    elif path.endswith("/media-session"):
+                        data = {
+                            "live_url": f"/media/live/{_CAMERA}/index.m3u8",
+                            "playback_url": f"/media/playback?path={_CAMERA}",
+                        }
+                    else:
+                        status = 404
+                    route.fulfill(
+                        status=status, content_type="application/json", body=json.dumps(data)
+                    )
+
+                page.route("**/*", intercept)
+                page.goto("http://127.0.0.1:8000/operator/")
+                page.locator("#username").fill(account["username"])
+                page.locator("#password").fill("generated-fixture-password")
+                page.locator("#sign-in-button").click()
+                page.locator(".camera-item").first.click()
+                page.wait_for_function("window.__hlsPlayers.length >= 1")
+                browser_api.expect(page.locator("#live-panel")).to_be_visible()
+                armed["value"] = True
+                page.locator("#refresh-cameras").click()
+                if outcome == "verified_busy":
+                    browser_api.expect(page.locator("#camera-list-message")).to_contain_text(
+                        "Account access reverified"
+                    )
+                    assert armed["authority"] >= 1
+                    assert not page.evaluate("window.__hlsPlayers.at(-1).destroyed === true")
+                    browser_api.expect(page.locator("#live-panel")).to_be_visible()
+                else:
+                    page.wait_for_function("window.__hlsPlayers.at(-1).destroyed === true")
+                    assert armed["authority"] == (0 if outcome in {"denied", "malformed"} else 1)
+                    browser_api.expect(page.locator("#toggle-person-view")).to_be_disabled()
+                assert armed["failures"] == 1
+                assert not errors
+            finally:
+                context.close()
+        finally:
+            browser.close()
