@@ -621,6 +621,21 @@ def test_native_worker_unbuffered_request_retains_exact_stdout_reads(monkeypatch
         worker.close()
 
 
+def test_native_worker_short_raw_pipe_writes_do_not_truncate_request():
+    from k5vision import operator_events as module
+
+    class ShortPipe(io.BytesIO):
+        def write(self, payload):
+            return super().write(payload[:3])
+
+    worker = module._RecordedNativeWorker(None)
+    pipe = ShortPipe()
+    command = b'{"path":"","artifact_root":"sealed"}\\n'
+    worker._write_request(pipe, command)
+    assert pipe.getvalue() == command
+    assert worker._failure_phase == "native_pipe_flush_active"
+
+
 def test_stalled_owned_native_worker_is_killed_and_reaped_before_next_launch(monkeypatch, tmp_path):
     import k5vision.operator_events as module
 

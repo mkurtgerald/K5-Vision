@@ -365,6 +365,18 @@ class _RecordedNativeWorker:
             return True
         return getattr(error, "winerror", None) in {109, 232, 233}
 
+    def _write_request(self, stream, payload: bytes) -> None:
+        """Send one bounded native command, including on short raw-pipe writes."""
+        self._failure_phase = "native_pipe_write_active"
+        remaining = memoryview(payload)
+        while remaining:
+            written = stream.write(remaining)
+            if type(written) is not int or not 0 < written <= len(remaining):
+                raise OSError("Native request pipe unavailable")
+            remaining = remaining[written:]
+        self._failure_phase = "native_pipe_flush_active"
+        stream.flush()
+
     def _start(self) -> None:
         from k5vision.operator_native_process import _WindowsJob
 
@@ -449,10 +461,7 @@ class _RecordedNativeWorker:
                     # Distinguish a blocked Windows pipe write from a blocked
                     # flush or an unresponsive child. These phases carry no
                     # path, request bytes or native exception details.
-                    self._failure_phase = "native_pipe_write_active"
-                    process.stdin.write(payload)
-                    self._failure_phase = "native_pipe_flush_active"
-                    process.stdin.flush()
+                    self._write_request(process.stdin, payload)
                 except (OSError, ValueError) as error:
                     self._failure_phase = "native_write_failed"
                     # Windows buffered stdin can report a closed stream as
@@ -504,10 +513,7 @@ class _RecordedNativeWorker:
                         process.kill()
                         raise TimeoutError from None
                     try:
-                        self._failure_phase = "native_pipe_write_active"
-                        process.stdin.write(payload)
-                        self._failure_phase = "native_pipe_flush_active"
-                        process.stdin.flush()
+                        self._write_request(process.stdin, payload)
                     except (OSError, ValueError):
                         self._failure_phase = "native_write_failed"
                         self._native_write_cause = "replacement_write_error"
