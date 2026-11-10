@@ -1907,6 +1907,31 @@ def _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, di
                   const message = document.getElementById('person-view-message')?.textContent || '';
                   const video = document.getElementById('live-video');
                   const button = document.getElementById('toggle-person-view');
+                  // Only finite, locally defined categories are admitted to
+                  // failure evidence. Never retain DOM text, camera identifiers,
+                  // source addresses, request data, credentials or sampled pixels.
+                  const liveState = document.getElementById('live-state')?.textContent || '';
+                  const liveTitle = document.getElementById('live-placeholder-title')?.textContent || '';
+                  const cameraListMessage = document.getElementById('camera-list-message')?.textContent || '';
+                  const liveStatusClass = liveState.startsWith('Disconnected')
+                    ? 'disconnected'
+                    : liveState.startsWith('Reconnecting') ? 'reconnecting'
+                    : liveState.startsWith('Restoring media access') ? 'restoring_access'
+                    : liveState.startsWith('Live view unavailable') ? 'access_unavailable'
+                    : liveState.startsWith('Buffering live video') ? 'buffering'
+                    : liveState.startsWith('Unsupported video') ? 'unsupported_codec'
+                    : liveState.startsWith('Ready') ? 'ready'
+                    : liveState.startsWith('Connecting') ? 'connecting'
+                    : liveState.startsWith('Playing') ? 'playing'
+                    : 'other';
+                  const livePlaceholderClass = liveTitle.startsWith('Live view disconnected')
+                    ? 'disconnected'
+                    : liveTitle.startsWith('Reconnecting') ? 'reconnecting'
+                    : liveTitle.startsWith('Restoring media access') ? 'restoring_access'
+                    : liveTitle.startsWith('Media access unavailable') ? 'access_unavailable'
+                    : liveTitle.startsWith('Video format unavailable') ? 'unsupported_codec'
+                    : liveTitle.startsWith('Opening live view') ? 'opening'
+                    : 'other';
                   const classification = message.startsWith('Processing a sampled frame')
                     ? 'processing'
                     : message.startsWith('Person detection is busy') ? 'busy'
@@ -1920,10 +1945,18 @@ def _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, di
                     : message.startsWith('Sampled view stopped while the camera is unavailable')
                       ? 'camera_unavailable'
                     : message.startsWith('Sampled view stopped') ? 'stopped_other'
+                    : message.startsWith('Select Start sampled view') ? 'reset_default'
                     : message.includes(' in this sample') ? 'sample_received'
                     : 'other';
                   return {
                     message_class: classification,
+                    live_status_class: liveStatusClass,
+                    live_placeholder_class: livePlaceholderClass,
+                    camera_list_error: cameraListMessage.includes('Camera list unavailable'),
+                    capabilities_tab_hidden: !!document.getElementById('live-tab')?.hidden,
+                    live_panel_visible: !document.getElementById('live-panel')?.hidden,
+                    retry_visible: !document.getElementById('retry-live')?.hidden,
+                    workspace_visible: !document.getElementById('workspace')?.hidden,
                     enabled: button?.getAttribute('aria-pressed') === 'true',
                     sample_button_enabled: !!button && !button.disabled,
                     live_playing: !!video && !video.paused && video.readyState >= 2,
