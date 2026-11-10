@@ -1814,6 +1814,51 @@ def _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, di
         except Exception:
             diagnostic["analytics_sample_live_state"] = {"available": False}
         raise
+    # Native decoding and authoritative camera status can become ready in
+    # adjacent browser tasks. Require the real enabled control, not a stale
+    # instantaneous disabled-button snapshot.
+    diagnostic["analytics_sample_stage"] = "control_ready"
+    try:
+        page.wait_for_function(
+            """() => {
+              const button = document.getElementById('toggle-person-view');
+              const video = document.getElementById('live-video');
+              const panel = document.getElementById('person-view-panel');
+              return !!button && !button.disabled && !!panel && !panel.hidden
+                && !!video && !video.paused && video.readyState >= 2
+                && video.videoWidth > 0 && video.videoHeight > 0;
+            }""",
+            timeout=5_000,
+        )
+    except Exception:
+        # Enumerated control/player evidence only; no camera identifiers, URLs,
+        # browser exceptions, sampled frames, request data or response bodies.
+        try:
+            diagnostic["analytics_sample_control_state"] = page.evaluate(
+                """() => {
+                  const video = document.getElementById('live-video');
+                  const button = document.getElementById('toggle-person-view');
+                  const panel = document.getElementById('person-view-panel');
+                  const frames = video?.getVideoPlaybackQuality?.().totalVideoFrames;
+                  const ready = video?.readyState;
+                  return {
+                    control_present: !!button,
+                    control_enabled: !!button && !button.disabled,
+                    panel_visible: !!panel && !panel.hidden,
+                    camera_online_badge: !!document.getElementById('connection-badge')
+                      ?.classList.contains('online'),
+                    live_playing: !!video && !video.paused && ready >= 2,
+                    has_dimensions: !!video && video.videoWidth > 0 && video.videoHeight > 0,
+                    ready_state: Number.isInteger(ready) && ready >= 0 && ready <= 4
+                      ? ready : null,
+                    decoded_frames: Number.isSafeInteger(frames) && frames >= 0
+                      ? Math.min(frames, 1000000) : null
+                  };
+                }"""
+            )
+        except Exception:
+            diagnostic["analytics_sample_control_state"] = {"available": False}
+        raise
     button = page.locator("#toggle-person-view")
     _require(button.is_enabled(), "Installed sampled-person control was not enabled")
     route = f"/api/v1/operator/cameras/{camera_id}/person-view"
