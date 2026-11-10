@@ -552,7 +552,6 @@ def test_native_pipe_block_reports_exact_bounded_stage(monkeypatch, tmp_path, bl
     assert results == [None]
 
 
-
 def test_failed_native_worker_reaps_before_buffered_stdin_close():
     """A stalled Windows pipe cannot block replacement before child termination."""
     import k5vision.operator_events as module
