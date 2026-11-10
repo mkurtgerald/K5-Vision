@@ -11,6 +11,17 @@ from types import SimpleNamespace
 from k5vision import operator_events_decoder as decoder
 
 
+def test_recorded_person_native_cpu_budget_is_windows_single_thread(monkeypatch):
+    # Host-installed acceptance exercises four decoded cameras concurrently.
+    # This changes only CPU scheduling; both paths use the same FP32 model.
+    with monkeypatch.context() as patch:
+        patch.setattr(decoder.sys, "platform", "win32")
+        assert decoder._recorder_inference_threads() == 1
+    with monkeypatch.context() as patch:
+        patch.setattr(decoder.sys, "platform", "linux")
+        assert decoder._recorder_inference_threads() == 2
+
+
 def test_nonseekable_fragmented_recording_falls_back_to_real_timestamp(monkeypatch):
     class Pixels:
         def tobytes(self, *, order):
@@ -236,7 +247,7 @@ def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monke
     monkeypatch.setattr(decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n")))
     monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
     assert decoder.main() == 0
-    assert initialized == [(Path("private-model"), 2, True)] and warmed == [True]
+    assert initialized == [(Path("private-model"), decoder._recorder_inference_threads(), True)] and warmed == [True]
     assert output.getvalue() == (
         b'{"status":"phase","phase":"model"}\n'
         b'{"status":"phase","phase":"inference"}\n'
@@ -261,7 +272,9 @@ def test_recorded_person_uses_the_same_fixed_graph_after_model_only_prime(monkey
             return (SimpleNamespace(category="person", confidence=0.81),) if elapsed else ()
 
     def factory(config, *, inference_threads, fixed_view_input):
-        assert (config, inference_threads, fixed_view_input) == (Path("private-model"), 2, True)
+        assert (config, inference_threads, fixed_view_input) == (
+            Path("private-model"), decoder._recorder_inference_threads(), True
+        )
         models.append(Detector())
         return models[-1]
 
