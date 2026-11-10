@@ -83,9 +83,7 @@ def test_inflight_native_sample_survives_only_bounded_same_camera_hls_reconnect(
     assert "if (state.retryCount >= RETRY_DELAYS.length) {" in retry
     assert retry.index("stopLive(false);") < retry.index("stopLive(false, true);")
     assert "startLive(epoch, true)" in retry
-    launch = app.split("async function startLive(", 1)[1].split(
-        "function setView(", 1
-    )[0]
+    launch = app.split("async function startLive(", 1)[1].split("function setView(", 1)[0]
     assert "preserveInFlightPerson = false" in launch
     assert "stopLive(false, preserveInFlightPerson);" in launch
     assert "scheduleLiveRetry(epoch," in launch
@@ -94,5 +92,5 @@ def test_inflight_native_sample_survives_only_bounded_same_camera_hls_reconnect(
         "function canSamplePerson(", 1
     )[0]
     assert "stopLive(false);" in recover
-    assert 'timeout: 24000' in app
+    assert "timeout: 24000" in app
     assert "state.personController?.abort();" in app
