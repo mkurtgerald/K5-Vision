@@ -198,8 +198,9 @@ def test_native_model_read_uses_verified_immutable_bytes_after_admission(admitte
 
 @pytest.mark.parametrize("precision_status", ["fp32", "rejected", "unavailable"])
 @pytest.mark.parametrize("inference_threads", [1, 2])
+@pytest.mark.parametrize("fixed_view_input", [False, True])
 def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(
-    admitted, monkeypatch, precision_status, inference_threads
+    admitted, monkeypatch, precision_status, inference_threads, fixed_view_input
 ):
     """Cold native view compilation must reuse the core and admit FP32 only."""
     config, _manifest, _files = admitted
@@ -251,9 +252,15 @@ def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(
 
     admitted_model = model
 
+    preprocessing = []
+
     class Chain:
-        def __getattr__(self, _name):
-            return lambda *args, **kwargs: self
+        def __getattr__(self, name):
+            def record(*_args, **_kwargs):
+                preprocessing.append(name)
+                return self
+
+            return record
 
     class PrePost:
         def __init__(self, value):
@@ -284,12 +291,19 @@ def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(
     monkeypatch.setattr(module, "_cap_windows_native_cpu_isa", lambda: None)
 
     if precision_status == "fp32":
-        detector = module._PersonDetector(config, inference_threads=inference_threads)
+        detector = module._PersonDetector(
+            config, inference_threads=inference_threads, fixed_view_input=fixed_view_input
+        )
         assert detector._request == "ready"
+        assert detector._fixed_view_input is fixed_view_input
     else:
         with pytest.raises(ValueError, match="Person CPU precision was refused"):
-            module._PersonDetector(config, inference_threads=inference_threads)
+            module._PersonDetector(
+                config, inference_threads=inference_threads, fixed_view_input=fixed_view_input
+            )
     assert calls == ["core", "read", "compile"]
+    assert ("set_spatial_dynamic_shape" in preprocessing) is not fixed_view_input
+    assert ("resize" in preprocessing) is not fixed_view_input
 
 
 @pytest.mark.parametrize("threads", [0, 3, True, 1.0])
@@ -297,6 +311,13 @@ def test_person_detector_rejects_unapproved_native_cpu_budget(admitted, threads)
     config, _manifest, _files = admitted
     with pytest.raises(ValueError, match="Person CPU thread setting was refused"):
         module._PersonDetector(config, inference_threads=threads)
+
+
+@pytest.mark.parametrize("mode", [None, 0, 1, "fixed"])
+def test_person_detector_refuses_untyped_input_mode(admitted, mode):
+    config, _manifest, _files = admitted
+    with pytest.raises(ValueError, match="Person view input mode was refused"):
+        module._PersonDetector(config, fixed_view_input=mode)
 
 
 def test_model_byte_read_rejects_same_content_replaced_inode(admitted, monkeypatch):
@@ -346,9 +367,10 @@ def test_independent_factory_does_not_import_or_initialize_analytics_lab(admitte
     instances = []
 
     class Detector:
-        def __init__(self, value, *, inference_threads):
+        def __init__(self, value, *, inference_threads, fixed_view_input):
             assert value == config
             assert inference_threads == 1
+            assert fixed_view_input is True
             instances.append(self)
 
         def infer(self, *args):
@@ -380,8 +402,9 @@ def test_cancelled_native_person_call_reserves_capacity_until_real_completion(
     entered, release = threading.Event(), threading.Event()
 
     class Detector:
-        def __init__(self, _config, *, inference_threads):
+        def __init__(self, _config, *, inference_threads, fixed_view_input):
             assert inference_threads == 1
+            assert fixed_view_input is True
 
         def infer(self, *args):
             entered.set()
