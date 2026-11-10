@@ -341,6 +341,8 @@ def test_pending_native_capture_reports_finite_stage_without_exposing_source(sto
     [
         ("native_launch_failed", "native_worker_starting"),
         ("native_write_failed", "native_request_writing"),
+        ("native_pipe_write_active", "native_pipe_write_active"),
+        ("native_pipe_flush_active", "native_pipe_flush_active"),
         ("native_child_exited_before_request", "native_worker_exited"),
         ("native_reply_missing", "native_reply_waiting"),
         ("native_header_invalid", "native_header_reading"),
@@ -375,6 +377,8 @@ def test_pending_native_worker_distinguishes_bounded_inflight_stage(store, worke
     ("child_phase", "expected"),
     [
         ("native_write_failed", "native_request_writing"),
+        ("native_pipe_write_active", "native_pipe_write_active"),
+        ("native_pipe_flush_active", "native_pipe_flush_active"),
         ("native_model_active", "native_model_active"),
         ("native_reply_missing", "native_reply_waiting"),
     ],
@@ -485,6 +489,67 @@ def test_failed_native_provider_cleanup_retains_owner_and_refuses_another_launch
         assert service._provider is provider
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("blocked_stage", ["write", "flush"])
+def test_native_pipe_block_reports_exact_bounded_stage(monkeypatch, tmp_path, blocked_stage):
+    """Installed Windows failures must distinguish pipe I/O from model startup.
+
+    Only a fixed phase is observed; no recording path, payload or error text
+    enters the authenticated diagnostic. The unchanged native deadline owns it.
+    """
+    import k5vision.operator_events as module
+
+    entered, release = threading.Event(), threading.Event()
+
+    class GatedPipe(io.BytesIO):
+        def write(self, data):
+            if blocked_stage == "write":
+                entered.set()
+                assert release.wait(3)
+            return super().write(data)
+
+        def flush(self):
+            if blocked_stage == "flush":
+                entered.set()
+                assert release.wait(3)
+            return super().flush()
+
+    class Child:
+        stdin = GatedPipe()
+        stdout = io.BytesIO(b'{"status":"empty"}\\n')
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 0
+
+    worker = module._RecordedNativeWorker(None)
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", Child()))
+    results = []
+
+    def request():
+        try:
+            results.append(worker.request(tmp_path / "private-unused-snapshot.mp4"))
+        except BaseException as error:
+            results.append(type(error).__name__)
+
+    task = threading.Thread(target=request, daemon=True)
+    task.start()
+    try:
+        assert entered.wait(3)
+        assert worker._failure_phase == f"native_pipe_{blocked_stage}_active"
+        assert worker._native_write_cause == "pending"
+    finally:
+        release.set()
+        task.join(timeout=3)
+        assert not task.is_alive()
+        worker.close()
+    assert results == [None]
 
 
 def test_stalled_owned_native_worker_is_killed_and_reaped_before_next_launch(monkeypatch, tmp_path):
