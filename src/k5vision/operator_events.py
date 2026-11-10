@@ -1024,21 +1024,31 @@ class OperatorEventService:
         # The first event from *any* enabled camera releases optional view
         # preparation. Recorder priming alone never admits a person event and
         # cannot release the CPU-intensive second model during first inference.
+        sources = tuple(self._cameras.list_sources())
+        if not sources:
+            # The startup quiet timer must not compile a second native model
+            # before the first camera has even enrolled.
+            return True
         enabled = [
             source.binding.device_id
-            for source in self._cameras.list_sources()
+            for source in sources
             if self.store.settings(source.binding.device_id)["enabled"]
         ]
-        if enabled and any(camera_id in self._last_events for camera_id in enabled):
+        if not enabled:
+            # Once enrollment is quiet and no camera requests recorded-person
+            # inference, an optional view may prepare in advance. Delaying it
+            # until recording analytics is enabled causes the first sampled
+            # view to miss its unchanged installed 27-second acceptance window.
+            return False
+        if any(camera_id in self._last_events for camera_id in enabled):
             return False
         if isinstance(self._sampler, RecordedFrameSampler):
             if getattr(self._sampler, "_configuration", None) is not None:
                 # Recorder readiness is not an admitted recorded-person event.
-                # Keep optional second-worker preparation deferred until a
-                # genuine recorded event; prewarming during camera enrollment
-                # can consume the first recording inference CPU budget.
+                # Keep optional second-worker preparation deferred while any
+                # camera awaits its first real recorded event.
                 return True
-        return bool(enabled)
+        return True
 
     def status(self, camera_id: UUID) -> dict:
         settings = self.store.settings(camera_id)
