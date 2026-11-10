@@ -1984,6 +1984,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
     outage_diagnostic = {}
     recording_diagnostic = {}
     switch_diagnostic = {}
+    logout_diagnostic = {"logout_check": "not_started"}
     started = time.monotonic()
     receipt = {
         "schema_version": "1",
@@ -2940,40 +2941,63 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         )
         logout_recording_before = _camera_recording_bytes(product, camera_ids)
         stage = "logout_revocation"
+        logout_diagnostic["logout_check"] = "sign_out_request"
         page.locator("#sign-out-button").click()
         page.locator("#sign-in").wait_for(state="visible")
+        logout_diagnostic["logout_check"] = "media_revocation"
+        logout_diagnostic["logout_media_checked"] = 0
         for url in (*live_urls, *playback_urls):
-            _require(
-                context.request.get(client.origin + url).status == 401,
-                "Sign-out left cached camera media authorized",
-            )
-        _require(
-            client.get("/api/v1/operator/cameras")[0] == 401,
-            "Sign-out did not revoke the browser human session",
+            # Retain only a bounded count/status, never a camera media URL.
+            status = context.request.get(client.origin + url).status
+            logout_diagnostic["logout_last_media_status"] = status if 100 <= status <= 599 else 0
+            _require(status == 401, "Sign-out left cached camera media authorized")
+            logout_diagnostic["logout_media_checked"] += 1
+        logout_diagnostic["logout_check"] = "human_revocation"
+        session_status = client.get("/api/v1/operator/cameras")[0]
+        logout_diagnostic["logout_session_status"] = (
+            session_status if 100 <= session_status <= 599 else 0
         )
         _require(
+            session_status == 401,
+            "Sign-out did not revoke the browser human session",
+        )
+        logout_diagnostic["logout_check"] = "media_teardown"
+        logout_diagnostic["logout_visible_media_cleared"] = (
             page.locator("#live-video").get_attribute("src") is None
             and page.locator("#playback-video").get_attribute("src") is None
-            and page.locator("#wall-panel video").count() == 0,
+            and page.locator("#wall-panel video").count() == 0
+        )
+        _require(
+            logout_diagnostic["logout_visible_media_cleared"],
             "Sign-out did not reset visible media",
         )
         receipt["logout_destroyed_wall_tiles"] = True
-        runtime._wait(
-            lambda: all(
+        logout_diagnostic["logout_check"] = "background_recording_growth"
+
+        def signed_out_recording_advances():
+            growth = [
                 after > before
                 for after, before in zip(
                     _camera_recording_bytes(product, camera_ids),
                     logout_recording_before,
                     strict=True,
                 )
-            ),
+            ]
+            logout_diagnostic["logout_recording_growth_flags"] = growth
+            return all(growth)
+
+        runtime._wait(
+            signed_out_recording_advances,
             label="Signing out stops wall players and preserves background recording",
             product=product,
             timeout=15,
         )
         receipt["logout_background_recording_continues"] = True
+        logout_diagnostic["logout_check"] = "browser_storage"
         _assert_no_browser_storage(page)
+        logout_diagnostic["logout_check"] = "script_errors"
         _require(not script_errors, "Operator browser raised an uncaught script error")
+        logout_diagnostic["logout_check"] = "complete"
         receipt["logout_revoked_media_and_session"] = True
         receipt["browser_script_errors"] = 0
         stage = "browser_closing"
@@ -3035,6 +3059,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             **outage_diagnostic,
             **recording_diagnostic,
             **switch_diagnostic,
+            **logout_diagnostic,
             "cleanup_failure_codes": cleanup_failures,
             "product_thread_alive": bool(product and product.thread.is_alive()),
             "product_thread_failed": bool(product and product.failed),
