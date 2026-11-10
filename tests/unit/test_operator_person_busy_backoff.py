@@ -105,9 +105,7 @@ def test_native_person_sample_isolates_bounded_background_inventory_work():
     app = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
         encoding="utf-8"
     )
-    poll = app.split("function scheduleCameraPoll()", 1)[1].split(
-        "function safeMediaUrl(", 1
-    )[0]
+    poll = app.split("function scheduleCameraPoll()", 1)[1].split("function safeMediaUrl(", 1)[0]
     assert "if (state.personController) {" in poll
     assert "scheduleCameraPoll();" in poll
     assert "const controller = new AbortController();" in poll
@@ -127,9 +125,9 @@ def test_native_person_sample_isolates_bounded_background_inventory_work():
     )[0]
     assert 'request("/api/v1/operator/status", { signal })' in diagnostics
 
-    start_sample = app.split(
-        '$("toggle-person-view").addEventListener("click", () => {', 1
-    )[1].split('$("live-video").addEventListener("error"', 1)[0]
+    start_sample = app.split('$("toggle-person-view").addEventListener("click", () => {', 1)[
+        1
+    ].split('$("live-video").addEventListener("error"', 1)[0]
     assert "state.cameraPollController?.abort();" in start_sample
     assert start_sample.index("state.cameraPollController?.abort();") < (
         start_sample.index("void samplePerson(epoch);")
