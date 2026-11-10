@@ -130,9 +130,11 @@ def test_installed_view_warmup_requires_enrollment_and_respects_recorded_event(m
     # Once at least one camera has enrolled and its six-second quiet interval
     # has elapsed, an optional model can prepare if recording analytics is off.
     state["enrolled"] = True
+    assert service.awaiting_first_recorded_person_event()
+    child["ready"] = True
     assert not service.awaiting_first_recorded_person_event()
     child["ready"] = False
-    assert not service.awaiting_first_recorded_person_event()
+    assert service.awaiting_first_recorded_person_event()
 
     # Any enabled recorded-person camera takes first-event CPU priority even
     # if its own native worker is already primed.
