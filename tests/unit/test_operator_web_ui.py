@@ -1513,8 +1513,13 @@ def test_transient_camera_inventory_reverifies_authority_before_preserving_live(
     channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
     assets = Path(__file__).resolve().parents[2] / "src/k5vision/operator_web"
     account = {"username": "fixture-admin", "role": "administrator", "display_name": "Fixture"}
-    camera = {"device_id": _CAMERA, "name": "Generated camera", "status": "live",
-              "recording": True, "analytics_status": "configured"}
+    camera = {
+        "device_id": _CAMERA,
+        "name": "Generated camera",
+        "status": "live",
+        "recording": True,
+        "analytics_status": "configured",
+    }
     token = "generated-inventory-revalidation-session-token-000000000"
     armed = {"value": False, "failures": 0, "authority": 0}
     errors = []
@@ -1550,7 +1555,8 @@ def test_transient_camera_inventory_reverifies_authority_before_preserving_live(
                     status, data = 200, {}
                     if path == "/api/v1/auth/login":
                         data = {
-                            "session_token": token, "account": account,
+                            "session_token": token,
+                            "account": account,
                             "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
                             "expires_in_seconds": 300,
                         }
@@ -1559,14 +1565,16 @@ def test_transient_camera_inventory_reverifies_authority_before_preserving_live(
                     elif path in {"/api/v1/operator/cameras", "/api/v1/operator/capabilities"}:
                         snapshot = _ui_inventory(account, [camera], worker_status="ready")
                         snapshot["capabilities"]["account"]["camera_access"] = {
-                            "mode": "all", "camera_ids": []
+                            "mode": "all",
+                            "camera_ids": [],
                         }
                         if path.endswith("/capabilities"):
                             armed["authority"] += 1
                             data = snapshot["capabilities"]
                             if outcome == "changed_grant":
                                 data["account"]["camera_access"] = {
-                                    "mode": "selected", "camera_ids": []
+                                    "mode": "selected",
+                                    "camera_ids": [],
                                 }
                             if outcome == "unverified_busy":
                                 status = 503
