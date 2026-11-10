@@ -332,6 +332,89 @@ class RecordedPersonFrame:
     detections: tuple[object, ...] | None = None
 
 
+class _NativeRequestWatchdog:
+    """One prestarted deadline thread per owned native worker.
+
+    Starting threading.Timer for each request waits synchronously for a new
+    thread to run. On a loaded Windows desktop that wait can block before the
+    request is written, with no active deadline. Arm this prestarted guard
+    through a condition instead; it never creates a thread at request time.
+    """
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._process = None
+        self._expired = None
+        self._deadline = 0.0
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run, name="k5-native-person-deadline", daemon=True
+        )
+        try:
+            self._thread.start()
+        except RuntimeError:
+            self._closed = True
+            raise OperatorEventsError("Analytics watchdog unavailable") from None
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while True:
+                    if self._closed:
+                        return
+                    if self._process is None:
+                        self._condition.wait()
+                        continue
+                    remaining = self._deadline - time.monotonic()
+                    if remaining > 0:
+                        self._condition.wait(remaining)
+                        continue
+                    process = self._process
+                    self._expired.set()
+                    self._process = None
+                    self._expired = None
+                    break
+            # Never hold the condition while killing/reaping an owned child.
+            # The caller retains the original request deadline and cleanup.
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    def arm(self, process, seconds: float) -> threading.Event:
+        with self._condition:
+            if self._closed or not self._thread.is_alive() or self._process is not None:
+                raise OperatorEventsError("Analytics watchdog unavailable")
+            expired = threading.Event()
+            self._process = process
+            self._expired = expired
+            self._deadline = time.monotonic() + seconds
+            self._condition.notify()
+            return expired
+
+    def rebind(self, process) -> None:
+        """Retain the same deadline when an exited child is replaced once."""
+        with self._condition:
+            if self._process is not None and not self._closed:
+                self._process = process
+                self._condition.notify()
+
+    def disarm(self) -> None:
+        with self._condition:
+            self._process = None
+            self._expired = None
+            self._condition.notify()
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._process = None
+            self._expired = None
+            self._condition.notify()
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=2)
+
+
 class _RecordedNativeWorker:
     """One persistent, killable decoder/detector process with bounded requests.
 
@@ -350,6 +433,8 @@ class _RecordedNativeWorker:
         self._failure_phase = "native_not_started"
         # Fixed classifications only; never retain an OS error, path or request.
         self._native_write_cause = "not_started"
+        # Initialized before child startup, usually during media-free priming.
+        self._watchdog = _NativeRequestWatchdog()
 
     def _request_timeout(self) -> float:
         if self._configuration is not None and not self._person_ready:
@@ -436,23 +521,11 @@ class _RecordedNativeWorker:
             if self._closing.is_set():
                 self.close()
                 raise OperatorEventsError("Analytics worker is closed")
-            expired = threading.Event()
-
-            def deadline():
-                expired.set()
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-
-            timer = threading.Timer(self._request_timeout(), deadline)
-            timer.daemon = True
             try:
-                # A Windows host under decoder load may refuse a new thread.
-                # Fail closed and reap the owned worker instead of leaving an
-                # unguarded native request or reporting a fictional pipe error.
-                timer.start()
-            except RuntimeError:
+                # Arming a prestarted guard never waits for Windows to schedule
+                # another Timer thread before writing the native command.
+                expired = self._watchdog.arm(process, self._request_timeout())
+            except OperatorEventsError:
                 self._failure_phase = "native_watchdog_unavailable"
                 self.close(final=False)
                 raise OperatorEventsError("Analytics native frame unavailable") from None
@@ -518,6 +591,8 @@ class _RecordedNativeWorker:
                     self.close(final=False)
                     self._start()
                     process = self._process
+                    # A replacement inherits the original watchdog deadline.
+                    self._watchdog.rebind(process)
                     self._failure_phase = "native_write_failed"
                     if expired.is_set() or self._closing.is_set():
                         process.kill()
@@ -627,8 +702,7 @@ class _RecordedNativeWorker:
                 failed = True
                 raise OperatorEventsError("Analytics native frame unavailable") from None
             finally:
-                timer.cancel()
-                timer.join()
+                self._watchdog.disarm()
                 if failed or expired.is_set():
                     self.close(final=False)
 
@@ -675,6 +749,8 @@ class _RecordedNativeWorker:
             finally:
                 if job is not None:
                     job.close()
+                if final:
+                    self._watchdog.close()
 
 
 class RecordedFrameSampler:
