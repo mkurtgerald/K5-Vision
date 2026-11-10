@@ -146,6 +146,84 @@ def test_pending_native_preparation_returns_busy_without_waiting_for_compilation
     asyncio.run(run())
 
 
+def test_failed_native_preparation_does_not_cold_compile_on_http_request(harness):
+    async def run():
+        broker = harness.make(max_views=1)
+        attempts = [0]
+        original = broker._factory
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def transient_failure():
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise RuntimeError("sealed-native-preparation-failed")
+            entered.set()
+            await release.wait()
+            return await original()
+
+        broker._factory = transient_failure
+        broker.start_preparing()
+        await broker._prewarm_task
+        assert broker.preparation_phase == "failed"
+        owner, camera = uuid4(), uuid4()
+        first = await asyncio.wait_for(
+            broker.infer(owner_id=owner, camera_id=camera, frame_id=1, frame=frame()),
+            timeout=0.2,
+        )
+        assert first.as_dict() == {"status": "unavailable", "frame_id": 1, "boxes": []}
+        assert attempts == [1]
+        assert not harness.providers and not harness.calls
+
+        # The following authorized request can trigger a second *media-free*
+        # preparation. Its frame returns busy without awaiting native startup.
+        broker.start_preparing()
+        await entered.wait()
+        pending = await asyncio.wait_for(
+            broker.infer(owner_id=owner, camera_id=camera, frame_id=2, frame=frame(7)),
+            timeout=0.2,
+        )
+        assert pending.as_dict() == {"status": "busy", "frame_id": 2, "boxes": []}
+        assert attempts == [2] and broker.preparation_phase == "preparing"
+        release.set()
+        await broker._prewarm_task
+        assert broker.preparation_phase == "ready"
+        accepted = await broker.infer(
+            owner_id=owner, camera_id=camera, frame_id=3, frame=frame(8)
+        )
+        assert accepted.status == "active" and accepted.frame_id == 3
+        assert len(harness.calls) == 1 and len(harness.providers) == 1
+        await broker.aclose()
+
+    asyncio.run(run())
+
+
+def test_failed_native_preparation_retry_limit_prevents_unbounded_compilation(harness):
+    async def run():
+        broker = harness.make(max_views=1)
+        attempts = [0]
+
+        async def always_fails():
+            attempts[0] += 1
+            raise RuntimeError("sealed-native-preparation-failed")
+
+        broker._factory = always_fails
+        for _ in range(2):
+            broker.start_preparing()
+            await broker._prewarm_task
+            assert broker.preparation_phase == "failed"
+        broker.start_preparing()
+        assert attempts == [2]
+        result = await asyncio.wait_for(
+            broker.infer(owner_id=uuid4(), camera_id=uuid4(), frame_id=4, frame=frame()),
+            timeout=0.2,
+        )
+        assert result.as_dict() == {"status": "unavailable", "frame_id": 4, "boxes": []}
+        assert attempts == [2] and not harness.providers
+        await broker.aclose()
+
+    asyncio.run(run())
+
+
 def test_cancelled_view_does_not_cancel_media_free_model_preparation(harness):
     async def run():
         broker = harness.make(max_views=1)
