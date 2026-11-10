@@ -1555,7 +1555,7 @@ def test_verified_live_recorder_prime_cannot_release_view_warmup_without_event(s
 
 
 def test_cold_recorder_prime_defers_view_without_enabled_analytics(store):
-    """The camera-free recorder model gets CPU priority before UI configuration."""
+    """The unprimed recording worker retains CPU priority even when analytics is disabled."""
     camera = uuid4()
     source = SimpleNamespace(binding=SimpleNamespace(device_id=camera))
     cameras = SimpleNamespace(list_sources=lambda: (source,))
@@ -1574,6 +1574,7 @@ def test_cold_recorder_prime_defers_view_without_enabled_analytics(store):
     sampler._closing = threading.Event()
     sampler._worker_lock = threading.RLock()
     sampler._worker = worker
+    sampler._configuration = object()
     service = OperatorEventService(
         store=store,
         cameras=cameras,
@@ -1585,11 +1586,16 @@ def test_cold_recorder_prime_defers_view_without_enabled_analytics(store):
         assert not store.settings(camera)["enabled"]
         assert service.awaiting_first_recorded_person_event()
         worker._person_ready = True
-        # Until a real event is admitted, priming alone does not release the
-        # optional second OpenVINO worker, even with analytics still disabled.
-        assert service.awaiting_first_recorded_person_event()
+        # A living, primed recorder permits optional view preparation only
+        # while recorded-person analytics is disabled and enrollment is quiet.
+        assert not service.awaiting_first_recorded_person_event()
         worker._person_ready = False
+        assert service.awaiting_first_recorded_person_event()
         store.configure(camera, enabled=True, confidence_threshold=0.5)
+        assert service.awaiting_first_recorded_person_event()
+        worker._person_ready = True
+        # Enabling recorded analytics restores first-real-event priority even
+        # when the recorder's model itself is already primed.
         assert service.awaiting_first_recorded_person_event()
         service._last_events[camera] = 1.0
         assert not service.awaiting_first_recorded_person_event()
