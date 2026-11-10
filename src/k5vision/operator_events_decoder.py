@@ -125,7 +125,11 @@ def main() -> int:
                     # Priming owns no camera media and publishes no model path.
                     sys.stdout.buffer.write(b'{"status":"phase","phase":"model"}\n')
                     sys.stdout.buffer.flush()
-                    detector = _PersonDetector(OperatorPersonConfiguration(Path(artifact_root)))
+                    detector = _PersonDetector(
+                        OperatorPersonConfiguration(Path(artifact_root)),
+                        inference_threads=2,
+                        fixed_view_input=True,
+                    )
                 # CPU kernels may finish JIT initialization only on their
                 # first inference. Exercise that boundary with synthetic zero
                 # pixels before the recording sampler enters the 25s event gate.
@@ -163,7 +167,11 @@ def main() -> int:
                     phase = "model"
                     sys.stdout.buffer.write(b'{"status":"phase","phase":"model"}\n')
                     sys.stdout.buffer.flush()
-                    detector = _PersonDetector(OperatorPersonConfiguration(Path(artifact_root)))
+                    detector = _PersonDetector(
+                        OperatorPersonConfiguration(Path(artifact_root)),
+                        inference_threads=2,
+                        fixed_view_input=True,
+                    )
                 phase = "inference"
                 sys.stdout.buffer.write(b'{"status":"phase","phase":"inference"}\n')
                 sys.stdout.buffer.flush()

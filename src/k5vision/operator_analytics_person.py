@@ -220,12 +220,12 @@ class _PersonDetector:
             .set_color_format(ColorFormat.BGR)
         )
         if not fixed_view_input:
-            # The authoritative recording detector retains its existing
-            # dynamic OpenVINO resizing and two-thread inference contract.
+            # Variable-shape callers retain OpenVINO resize admission; the
+            # fixed 544x320 recording decoder and view sampler use fixed graphs.
             tensor.set_spatial_dynamic_shape()
             processing.input().preprocess().resize(ResizeAlgorithm.RESIZE_LINEAR)
-        # Optional views supply fixed 544x320 BGR input. Avoid compiling a
-        # second dynamic-resize graph under four-camera Windows contention;
+        # Recording snapshots and optional views both supply fixed 544x320 BGR
+        # input. Avoid extra dynamic-resize graph compilation under contention;
         # resize the transient sampled frame in native OpenCV before inference.
         processing.input().model().set_layout(ov.Layout("NCHW"))
         compiled = core.compile_model(
