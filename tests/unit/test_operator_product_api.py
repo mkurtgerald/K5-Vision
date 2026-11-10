@@ -1525,16 +1525,12 @@ def test_first_installed_person_request_replies_before_optional_native_compile(p
     url = _person_url(camera_id)
     payload = bytes(range(16))
 
-    refused = product.client.post(
-        url, headers=product.headers, content=payload
-    )
+    refused = product.client.post(url, headers=product.headers, content=payload)
     assert refused.status_code == 403
     assert product.analytics.preparation_calls == 0
     assert not product.analytics.submissions
 
-    retry = product.client.post(
-        url, headers=_person_headers(product), content=payload
-    )
+    retry = product.client.post(url, headers=_person_headers(product), content=payload)
     assert retry.status_code == 429
     assert retry.headers["x-k5-person-phase"] == "preparing"
     assert retry.headers["cache-control"] == "no-store"
@@ -1544,9 +1540,7 @@ def test_first_installed_person_request_replies_before_optional_native_compile(p
     assert not product.analytics.submissions
 
     product.analytics.preparation_phase = "ready"
-    accepted = product.client.post(
-        url, headers=_person_headers(product), content=payload
-    )
+    accepted = product.client.post(url, headers=_person_headers(product), content=payload)
     assert accepted.status_code == 200
     assert accepted.json()["status"] == "active"
     assert accepted.json()["frame_id"] == 17
