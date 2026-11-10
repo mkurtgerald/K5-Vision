@@ -15,7 +15,6 @@ import os
 import subprocess
 import sys
 import threading
-from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -284,6 +283,7 @@ def _child() -> int:
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(_child())
+        exit_code = _child()
     except BaseException:
-        raise SystemExit(1) from None
+        exit_code = 1
+    raise SystemExit(exit_code)
