@@ -1289,11 +1289,12 @@ def test_model_priming_is_owned_and_nonblocking_when_recorded_person_is_enabled(
 
 
 @pytest.mark.parametrize("prime_fails", [False, True])
-def test_startup_prime_is_reused_only_when_native_worker_is_ready(
+def test_startup_prime_does_not_delay_first_recorded_frame_on_camera_enable(
     identity, store, monkeypatch, prime_fails
 ):
-    # Healthy native worker readiness prevents duplicate compilation; a failed
-    # or exited preparation must be retried before enabling recorded detection.
+    # A failed startup preparation must not be queued a second time at camera
+    # activation: the first real recorded frame owns the bounded native retry.
+    # A ready worker is reused without duplicate model compilation.
     root = identity.directory / "recordings"
     root.mkdir(mode=0o700)
     sampler = RecordedFrameSampler(root)
@@ -1328,17 +1329,17 @@ def test_startup_prime_is_reused_only_when_native_worker_is_ready(
             else:
                 await asyncio.wrap_future(first)
             service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
-            if prime_fails:
-                retried = service._native_pending
-                assert retried is not first
-                with pytest.raises(
-                    OperatorEventsError, match="synthetic model preparation unavailable"
-                ):
-                    await asyncio.wrap_future(retried)
-                assert requests == ["prime", "prime"]
-            else:
-                assert service._native_pending is first
-                assert requests == ["prime"]
+            assert service._native_pending is first
+            assert requests == ["prime"]
+
+            # Both readiness outcomes must advance directly to one real-frame
+            # attempt instead of spending the installed event deadline priming.
+            monkeypatch.setattr(
+                sampler, "capture", lambda _source: requests.append("capture") or None
+            )
+            await service.cycle()
+            assert requests == ["prime", "capture"]
+            assert service.status(source.binding.device_id)["sample_attempts"] == 1
         finally:
             await service.aclose()
 
