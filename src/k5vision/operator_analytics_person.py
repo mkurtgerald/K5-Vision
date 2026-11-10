@@ -212,9 +212,13 @@ class _PersonDetector:
         ):
             raise ValueError("Person model interface was refused")
         processing = PrePostProcessor(model)
-        tensor = processing.input().tensor().set_element_type(ov.Type.u8).set_layout(
-            ov.Layout("NHWC")
-        ).set_color_format(ColorFormat.BGR)
+        tensor = (
+            processing.input()
+            .tensor()
+            .set_element_type(ov.Type.u8)
+            .set_layout(ov.Layout("NHWC"))
+            .set_color_format(ColorFormat.BGR)
+        )
         if not fixed_view_input:
             # The authoritative recording detector retains its existing
             # dynamic OpenVINO resizing and two-thread inference contract.
@@ -258,9 +262,7 @@ class _PersonDetector:
             # The captured aspect and the detector bounding-box geometry keep
             # their original normalized coordinate contract. No view pixels
             # are stored or reused across frames.
-            bgr = np.ascontiguousarray(
-                cv2.resize(bgr, (544, 320), interpolation=cv2.INTER_LINEAR)
-            )
+            bgr = np.ascontiguousarray(cv2.resize(bgr, (544, 320), interpolation=cv2.INTER_LINEAR))
         self._request.infer({0: bgr[np.newaxis, ...]})
         output = self._request.get_output_tensor(0).data
         if tuple(output.shape) != (1, 1, 200, 7):
