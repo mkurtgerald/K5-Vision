@@ -517,7 +517,7 @@ def test_native_pipe_block_reports_exact_bounded_stage(monkeypatch, tmp_path, bl
 
     class Child:
         stdin = GatedPipe()
-        stdout = io.BytesIO(b'{"status":"empty"}\\n')
+        stdout = io.BytesIO(b'{"status":"empty"}\n')
 
         def poll(self):
             return None
