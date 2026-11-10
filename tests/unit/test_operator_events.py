@@ -552,7 +552,7 @@ def test_native_pipe_block_reports_exact_bounded_stage(monkeypatch, tmp_path, bl
     assert results == [None]
 
 
-def test_native_watchdog_thread_start_refusal_kills_owned_child_before_command(
+def test_native_watchdog_arm_refusal_kills_owned_child_before_command(
     monkeypatch, tmp_path
 ):
     """No unguarded native request or misleading pipe-write diagnosis is allowed."""
@@ -585,10 +585,10 @@ def test_native_watchdog_thread_start_refusal_kills_owned_child_before_command(
     worker = module._RecordedNativeWorker(None)
     monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", child))
 
-    def refuse_start(_timer):
-        raise RuntimeError("private watchdog thread unavailable")
+    def refuse_arm(_process, _timeout):
+        raise OperatorEventsError("private watchdog unavailable")
 
-    monkeypatch.setattr(module.threading.Timer, "start", refuse_start)
+    monkeypatch.setattr(worker._watchdog, "arm", refuse_arm)
     with pytest.raises(OperatorEventsError, match="native frame unavailable"):
         worker.request(tmp_path / "unused-private-snapshot.mp4")
     assert worker._failure_phase == "native_watchdog_unavailable"
@@ -597,6 +597,78 @@ def test_native_watchdog_thread_start_refusal_kills_owned_child_before_command(
     assert child.killed
     assert child.stdin.closed and child.stdout.closed
     assert writes == []
+    worker.close()
+
+
+def test_native_watchdog_does_not_start_another_thread_when_request_is_active(
+    monkeypatch, tmp_path
+):
+    """Four decoded streams must not block a new frame on Thread.start()."""
+    from k5vision import operator_events as module
+
+    worker = module._RecordedNativeWorker(None)
+
+    class Process:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(b'{"status":"empty"}\\n')
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 0
+
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", Process()))
+    original_start = threading.Thread.start
+
+    def no_new_thread(_thread):
+        pytest.fail("A native frame request started another watchdog thread")
+
+    monkeypatch.setattr(threading.Thread, "start", no_new_thread)
+    try:
+        assert worker.request(tmp_path / "unused.mp4") is None
+        assert worker._failure_phase == "native_none"
+    finally:
+        monkeypatch.setattr(threading.Thread, "start", original_start)
+        worker.close()
+
+
+def test_native_watchdog_rebind_kills_replacement_on_original_deadline():
+    """A disconnected first child may not gain another watchdog budget."""
+    from k5vision import operator_events as module
+
+    class Child:
+        def __init__(self):
+            self.killed = threading.Event()
+
+        def kill(self):
+            self.killed.set()
+
+    first, second = Child(), Child()
+    guard = module._NativeRequestWatchdog()
+    try:
+        expired = guard.arm(first, 0.1)
+        guard.rebind(second)
+        assert expired.wait(timeout=2)
+        assert second.killed.wait(timeout=2)
+        assert not first.killed.is_set()
+    finally:
+        guard.disarm()
+        guard.close()
+
+
+def test_native_watchdog_constructor_refuses_missing_thread_without_child(monkeypatch):
+    from k5vision import operator_events as module
+
+    def refuse_start(_thread):
+        raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(threading.Thread, "start", refuse_start)
+    with pytest.raises(OperatorEventsError, match="watchdog unavailable"):
+        module._RecordedNativeWorker(None)
 
 
 def test_failed_native_worker_reaps_before_buffered_stdin_close():
