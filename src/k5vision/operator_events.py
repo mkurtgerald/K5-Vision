@@ -430,8 +430,8 @@ class _RecordedNativeWorker:
                 raise OperatorEventsError("Analytics worker is closed")
             self._failure_phase = "native_launch_failed"
             self._start()
-            self._failure_phase = "native_write_failed"
-            self._native_write_cause = "pending"
+            self._failure_phase = "native_watchdog_starting"
+            self._native_write_cause = "not_started"
             process = self._process
             if self._closing.is_set():
                 self.close()
@@ -447,7 +447,17 @@ class _RecordedNativeWorker:
 
             timer = threading.Timer(self._request_timeout(), deadline)
             timer.daemon = True
-            timer.start()
+            try:
+                # A Windows host under decoder load may refuse a new thread.
+                # Fail closed and reap the owned worker instead of leaving an
+                # unguarded native request or reporting a fictional pipe error.
+                timer.start()
+            except RuntimeError:
+                self._failure_phase = "native_watchdog_unavailable"
+                self.close(final=False)
+                raise OperatorEventsError("Analytics native frame unavailable") from None
+            self._failure_phase = "native_write_failed"
+            self._native_write_cause = "pending"
             failed = False
             try:
                 request = {
@@ -1137,6 +1147,7 @@ class OperatorEventService:
                 # on installed Windows. The parent still owns the same timer.
                 in_flight = {
                     "native_launch_failed": "native_worker_starting",
+                    "native_watchdog_starting": "native_watchdog_starting",
                     "native_write_failed": "native_request_writing",
                     "native_pipe_write_active": "native_pipe_write_active",
                     "native_pipe_flush_active": "native_pipe_flush_active",
@@ -1157,6 +1168,7 @@ class OperatorEventService:
                 "decode_attempt",
                 "native_request",
                 "native_worker_starting",
+                "native_watchdog_starting",
                 "native_request_writing",
                 "native_pipe_write_active",
                 "native_pipe_flush_active",
@@ -1403,6 +1415,7 @@ class OperatorEventService:
                         candidate = worker._failure_phase
                         if candidate in {
                             "native_launch_failed",
+                            "native_watchdog_unavailable",
                             "native_transport_failed",
                             "native_write_failed",
                             "native_child_exited_before_request",
