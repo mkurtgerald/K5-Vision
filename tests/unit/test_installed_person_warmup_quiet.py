@@ -127,9 +127,11 @@ def test_installed_view_warmup_requires_enrollment_and_respects_recorded_event(m
     child["ready"] = True
     assert service.awaiting_first_recorded_person_event()
 
-    # Once at least one camera has enrolled and its six-second quiet interval
-    # has elapsed, an optional model can prepare if recording analytics is off.
+    # Enrollment by itself does not prove the native recorder is primed.
+    # Once the recorder is ready, optional view preparation can proceed
+    # after the independent six-second quiet period if analytics is off.
     state["enrolled"] = True
+    child["ready"] = False
     assert service.awaiting_first_recorded_person_event()
     child["ready"] = True
     assert not service.awaiting_first_recorded_person_event()
