@@ -84,17 +84,23 @@ def test_recorded_person_model_primes_on_service_start(
 @pytest.mark.parametrize(
     ("prior_prime", "enabled", "worker_ready", "expected_primes"),
     [
-        ("completed", True, False, 1),
+        ("completed", True, False, 0),
         ("completed", True, True, 0),
         ("pending", True, False, 0),
         ("none", True, False, 1),
         ("completed", False, False, 0),
+        ("none", True, True, 0),
+        ("none", False, False, 0),
     ],
 )
-def test_enabling_analytics_retries_only_completed_failed_recorder_prime(
+def test_enabling_analytics_preserves_first_real_frame_budget_after_failed_prime(
     monkeypatch, tmp_path, prior_prime, enabled, worker_ready, expected_primes
 ):
-    """A failed startup prewarm cannot force the first recording into a cold path."""
+    """A failed startup prime cannot occupy the 25s event gate with a second prime.
+
+    A fresh frame gets the normal bounded native decoder/inference request;
+    this scheduling check never claims person-event or pixel acceptance.
+    """
 
     class Sampler:
         def __init__(self):

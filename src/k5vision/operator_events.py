@@ -1159,17 +1159,17 @@ class OperatorEventService:
             and not self._closing
             and isinstance(self._sampler, RecordedFrameSampler)
             and getattr(self._sampler, "_configuration", None) is not None
-            and (
-                self._native_pending is None
-                or (self._native_pending.done() and not self._sampler.native_model_ready())
-            )
+            and self._native_pending is None
+            and not self._sampler.native_model_ready()
         ):
-            # A failed or prematurely exited startup prime must be retried at
-            # explicit camera activation, before the first growing recording
-            # consumes the unchanged installed person-event deadline. Never
-            # interrupt an in-flight prime or duplicate a live ready worker.
-            # A failed prime does not authorize an event: the actual sample
-            # still must compile, infer and pass normal evidence admission.
+            # A camera enabled before service startup still gets a model-only
+            # prime. Do not repeat a *completed but unsuccessful* startup prime
+            # at camera activation: the extra 18-second request would occupy
+            # the single recorder executor ahead of its first real frame and
+            # consume most of the unchanged 25-second event acceptance budget.
+            # That first frame must instead use the normal bounded native
+            # decode/inference path. A successful prime remains reusable; an
+            # in-flight prime retains its existing worker ownership.
             self._native_pending = self._executor.submit(self._sampler.prime)
         return self.status(camera_id)
 
