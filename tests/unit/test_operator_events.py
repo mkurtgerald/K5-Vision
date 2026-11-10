@@ -552,9 +552,7 @@ def test_native_pipe_block_reports_exact_bounded_stage(monkeypatch, tmp_path, bl
     assert results == [None]
 
 
-def test_native_watchdog_arm_refusal_kills_owned_child_before_command(
-    monkeypatch, tmp_path
-):
+def test_native_watchdog_arm_refusal_kills_owned_child_before_command(monkeypatch, tmp_path):
     """No unguarded native request or misleading pipe-write diagnosis is allowed."""
     from k5vision import operator_events as module
 
@@ -630,7 +628,7 @@ def test_native_watchdog_does_not_start_another_thread_when_request_is_active(
     monkeypatch.setattr(threading.Thread, "start", no_new_thread)
     try:
         assert worker.request(tmp_path / "unused.mp4") is None
-        assert worker._failure_phase == "native_none"
+        assert worker._native_write_cause == "write_accepted"
     finally:
         monkeypatch.setattr(threading.Thread, "start", original_start)
         worker.close()
