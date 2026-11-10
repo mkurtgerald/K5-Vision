@@ -94,3 +94,45 @@ def test_inflight_native_sample_survives_only_bounded_same_camera_hls_reconnect(
     assert "stopLive(false);" in recover
     assert "timeout: 24000" in app
     assert "state.personController?.abort();" in app
+
+
+def test_native_person_sample_isolates_bounded_background_inventory_work():
+    """A sampled POST must not be torn down by a preexisting slow UI poll.
+
+    Authority and membership are still checked on the server both before and
+    after native inference. This does not permit stale authorization bypass.
+    """
+    app = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    poll = app.split("function scheduleCameraPoll()", 1)[1].split(
+        "function safeMediaUrl(", 1
+    )[0]
+    assert "if (state.personController) {" in poll
+    assert "scheduleCameraPoll();" in poll
+    assert "const controller = new AbortController();" in poll
+    assert "state.cameraPollController = controller;" in poll
+    assert "refreshCameras(false, controller.signal)" in poll
+    assert "refreshDiagnostics(controller.signal)" in poll
+    assert "state.cameraPollController = null;" in poll
+
+    cameras = app.split("async function refreshCameras(", 1)[1].split(
+        "function scheduleCameraPoll()", 1
+    )[0]
+    assert 'request("/api/v1/operator/cameras", { signal })' in cameras
+    assert 'request("/api/v1/operator/capabilities", { timeout: 4000, signal })' in cameras
+    assert "suspendCapabilities();" in cameras
+    diagnostics = app.split("async function refreshDiagnostics(", 1)[1].split(
+        "function clearCameraSelection(", 1
+    )[0]
+    assert 'request("/api/v1/operator/status", { signal })' in diagnostics
+
+    start_sample = app.split(
+        '$("toggle-person-view").addEventListener("click", () => {', 1
+    )[1].split('$("live-video").addEventListener("error"', 1)[0]
+    assert "state.cameraPollController?.abort();" in start_sample
+    assert start_sample.index("state.cameraPollController?.abort();") < (
+        start_sample.index("void samplePerson(epoch);")
+    )
+    assert "timeout: 24000" in app
+    assert "state.personController?.abort();" in app

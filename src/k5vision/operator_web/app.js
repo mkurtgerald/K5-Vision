@@ -49,7 +49,7 @@
     view: "wall", sessionEpoch: 0, selectionEpoch: 0, requests: new Set(),
     hls: null, nativeLive: false, hlsScript: null, retryTimer: null, retryCount: 0,
     mediaAuthRefreshUsed: false,
-    pollTimer: null, expiryTimer: null, selectionController: null,
+    pollTimer: null, cameraPollController: null, expiryTimer: null, selectionController: null,
     spans: [], selectedSpan: null, historyEpoch: 0, historyLoad: null, historyRolling: true, signingOut: false,
     eventSeekEpoch: 0,
     dialogMode: "add", cameraSetupEpoch: 0, diagnostics: null, statusUnavailable: false,
@@ -697,11 +697,11 @@
     renderOverview();
   }
 
-  async function refreshDiagnostics() {
+  async function refreshDiagnostics(signal = null) {
     if (!state.token || state.securityTransition) return;
     const epoch = state.sessionEpoch;
     try {
-      const diagnostics = await request("/api/v1/operator/status");
+      const diagnostics = await request("/api/v1/operator/status", { signal });
       if (epoch !== state.sessionEpoch) return;
       if (!diagnostics || !["ready", "unavailable", "disk_full"].includes(diagnostics.worker_status)) throw new ApiError(503);
       state.diagnostics = diagnostics;
@@ -732,7 +732,7 @@
     if (state.token) setView("wall", false);
   }
 
-  async function refreshCameras(selectFirst = false) {
+  async function refreshCameras(selectFirst = false, signal = null) {
     if (!state.token || state.securityTransition) return;
     const epoch = state.sessionEpoch;
     const navigationEpoch = state.navigationEpoch;
@@ -740,7 +740,7 @@
     try {
       let data;
       try {
-        data = await request("/api/v1/operator/cameras");
+        data = await request("/api/v1/operator/cameras", { signal });
       } catch (error) {
         // A stalled inventory query is not proof of revoked account authority.
         // Only preserve an existing session when independently reauthorized;
@@ -752,7 +752,7 @@
           || state.cameraInventoryFreshAt <= 0 || inventoryAge > 30000
           || state.signingOut || state.securityTransition) throw error;
         try {
-          const verified = await request("/api/v1/operator/capabilities", { timeout: 4000 });
+          const verified = await request("/api/v1/operator/capabilities", { timeout: 4000, signal });
           if (epoch !== state.sessionEpoch || cameraListEpoch !== state.cameraListEpoch
             || !state.token || state.signingOut || state.securityTransition) return;
           const previous = state.account;
@@ -803,7 +803,26 @@
     clearTimeout(state.pollTimer);
     if (!state.token || state.securityTransition) return;
     state.pollTimer = setTimeout(async () => {
-      await Promise.all([refreshCameras(), refreshDiagnostics()]);
+      // Native cold-start inference competes with four live decoders on
+      // Windows. Do not let an unrelated inventory timeout revoke an
+      // in-flight immutable, server-reauthorized person frame. This skips
+      // only background polling until the bounded request completes; login,
+      // session expiry, explicit security changes and media authorization
+      // continue to revoke immediately.
+      if (state.personController) {
+        scheduleCameraPoll();
+        return;
+      }
+      const controller = new AbortController();
+      state.cameraPollController = controller;
+      try {
+        await Promise.all([
+          refreshCameras(false, controller.signal),
+          refreshDiagnostics(controller.signal),
+        ]);
+      } finally {
+        if (state.cameraPollController === controller) state.cameraPollController = null;
+      }
       scheduleCameraPoll();
     }, 3000);
   }
@@ -2083,6 +2102,10 @@
     const epoch = ++state.personEpoch;
     renderPersonControls();
     message("person-view-message", "Processing a sampled frame…");
+    // Cancel background inventory/status reads already awaiting the service.
+    // Their AbortError paths cannot suspend account authority; the person POST
+    // independently reauthenticates and checks camera grants before/after.
+    state.cameraPollController?.abort();
     void samplePerson(epoch);
   });
   $("live-video").addEventListener("error", () => {
