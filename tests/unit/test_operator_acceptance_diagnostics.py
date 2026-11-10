@@ -326,3 +326,27 @@ def test_installed_sample_response_evidence_distinguishes_first_and_last_reply()
     # Instrumentation may not make a transient HTTP 429 a passed native box.
     assert "response.status == 200" in source
     assert "timeout=27_000" in source
+
+
+def test_installed_person_control_readiness_cannot_skip_real_decoding_or_authority():
+    """A transient disabled control is retried; a genuinely unavailable view still fails."""
+    import inspect
+
+    source = inspect.getsource(desktop._installed_sampled_person_boxes)
+    gate = source.split('diagnostic["analytics_sample_stage"] = "control_ready"', 1)[1].split(
+        'diagnostic["analytics_sample_stage"] = "native_frame_request"', 1
+    )[0]
+    assert 'timeout=5_000' in gate
+    assert "not button.disabled" in gate
+    assert "not panel.hidden" in gate
+    assert "not video.paused" in gate
+    assert "video.readyState >= 2" in gate
+    assert "video.videoWidth > 0 && video.videoHeight > 0" in gate
+    assert 'button.is_enabled()' in gate
+    assert '"analytics_sample_control_state"' in gate
+    # Only fixed booleans and bounded numbers may leave the Windows runner.
+    assert "camera_online_badge:" in gate
+    assert "decoded_frames:" in gate
+    assert "Math.min(frames, 1000000)" in gate
+    for private in ("source_uri", "request.url", "response.body", "screenshot", "getImageData"):
+        assert private not in gate
