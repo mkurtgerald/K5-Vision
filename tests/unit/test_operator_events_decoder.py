@@ -247,7 +247,10 @@ def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monke
     monkeypatch.setattr(decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n")))
     monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
     assert decoder.main() == 0
-    assert initialized == [(Path("private-model"), decoder._recorder_inference_threads(), True)] and warmed == [True]
+    assert initialized == [
+        (Path("private-model"), decoder._recorder_inference_threads(), True)
+    ]
+    assert warmed == [True]
     assert output.getvalue() == (
         b'{"status":"phase","phase":"model"}\n'
         b'{"status":"phase","phase":"inference"}\n'
@@ -313,7 +316,8 @@ def test_model_prime_failure_reports_finite_stage_without_native_details(monkeyp
     from k5vision import operator_analytics_person as person
 
     def broken_model(_config, *, inference_threads, fixed_view_input):
-        assert inference_threads == 2 and fixed_view_input is True
+        assert inference_threads == decoder._recorder_inference_threads()
+        assert fixed_view_input is True
         raise RuntimeError("rtsp://private-source-with-credentials")
 
     monkeypatch.setattr(person, "OperatorPersonConfiguration", lambda root: root)
