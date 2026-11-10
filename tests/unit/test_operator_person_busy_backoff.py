@@ -50,3 +50,49 @@ def test_busy_retry_respects_existing_stalled_video_guard_without_upload():
     )[0]
     assert "stopPersonView(" in guard
     assert "current <= frames" in guard
+
+
+def test_inflight_native_sample_survives_only_bounded_same_camera_hls_reconnect():
+    """Transient HLS failures cannot silently abort an authenticated frozen POST.
+
+    The existing 24-second request deadline, camera/session/authentication and
+    actual rendered same-frame positive boxes remain separate acceptance gates.
+    """
+    app = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    teardown = app.split("function stopLive(", 1)[1].split("function stopPlayback(", 1)[0]
+    assert "preserveInFlightPerson = false" in teardown
+    assert "preserveInFlightPerson && state.personEnabled && state.personController" in teardown
+    for guard in (
+        "state.token",
+        "!state.signingOut",
+        "!state.securityTransition",
+        "state.capabilitiesResolved",
+        'allowed("cameras.view_live")',
+        'state.view === "live"',
+        'camera?.analytics_status === "configured"',
+        'statusDetails(camera).style === "online"',
+        'state.workerStatus !== "unavailable"',
+    ):
+        assert guard in teardown
+    assert teardown.index("stopPersonView();") < teardown.index('resetVideo($("live-video"));')
+    retry = app.split("function scheduleLiveRetry(", 1)[1].split(
+        "async function recoverMediaAccess(", 1
+    )[0]
+    assert "if (state.retryCount >= RETRY_DELAYS.length) {" in retry
+    assert retry.index("stopLive(false);") < retry.index("stopLive(false, true);")
+    assert "startLive(epoch, true)" in retry
+    launch = app.split("async function startLive(", 1)[1].split(
+        "function setView(", 1
+    )[0]
+    assert "preserveInFlightPerson = false" in launch
+    assert "stopLive(false, preserveInFlightPerson);" in launch
+    assert "scheduleLiveRetry(epoch," in launch
+    # Security/media revocation must never opt in to preserving the request.
+    recover = app.split("async function recoverMediaAccess(", 1)[1].split(
+        "function canSamplePerson(", 1
+    )[0]
+    assert "stopLive(false);" in recover
+    assert 'timeout: 24000' in app
+    assert "state.personController?.abort();" in app
