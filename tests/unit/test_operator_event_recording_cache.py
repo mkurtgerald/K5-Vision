@@ -136,9 +136,7 @@ def test_writer_missing_from_cold_inventory_is_watched_without_admitting_old_byt
     assert sampler.capture(source) is None
 
 
-def test_uncached_retained_recording_never_emits_without_new_growth(
-    recording_camera, monkeypatch
-):
+def test_uncached_retained_recording_never_emits_without_new_growth(recording_camera, monkeypatch):
     root, directory, source = recording_camera
     retained = directory / "2026-10-28_12-01-00-000000_+0000.mp4"
     retained.write_bytes(b"retained")
