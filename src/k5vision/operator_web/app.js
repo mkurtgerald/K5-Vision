@@ -61,7 +61,7 @@
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
     personBufferTimer: null, personTransient503: 0,
     personFrameId: 0,
-    recordingBusy: false, cameraListEpoch: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
+    recordingBusy: false, cameraListEpoch: 0, cameraInventoryFreshAt: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
     playbackStart: null, playbackEnd: null, playbackPosition: null, playbackEpoch: 0, selectedStatus: null,
     playbackPrefetch: null, playbackObjectUrl: null, playbackRate: 1,
     exportEpoch: 0, exportController: null, exportJob: null, exportDownloadAllowed: false,
@@ -428,6 +428,7 @@
     cameraAnalytics?.clear();
     cancelExport();
     resetActivation();
+    state.cameraInventoryFreshAt = 0;
     state.sessionEpoch += 1;
     state.selectionEpoch += 1;
     state.historyEpoch += 1;
@@ -737,7 +738,41 @@
     const navigationEpoch = state.navigationEpoch;
     const cameraListEpoch = ++state.cameraListEpoch;
     try {
-      const data = await request("/api/v1/operator/cameras");
+      let data;
+      try {
+        data = await request("/api/v1/operator/cameras");
+      } catch (error) {
+        // A stalled inventory query is not proof of revoked account authority.
+        // Only preserve an existing session when independently reauthorized;
+        // explicit denials, changed grants and malformed data still fail closed.
+        const temporary = [429, 502, 503, 504].includes(error.status)
+          || error.name === "TimeoutError" || error instanceof TypeError;
+        const inventoryAge = performance.now() - state.cameraInventoryFreshAt;
+        if (!temporary || !state.capabilitiesResolved || !state.account
+          || state.cameraInventoryFreshAt <= 0 || inventoryAge > 30000
+          || state.signingOut || state.securityTransition) throw error;
+        try {
+          const verified = await request("/api/v1/operator/capabilities", { timeout: 4000 });
+          if (epoch !== state.sessionEpoch || cameraListEpoch !== state.cameraListEpoch
+            || !state.token || state.signingOut || state.securityTransition) return;
+          const previous = state.account;
+          const sameCameraGrant = JSON.stringify(verified?.account?.camera_access ?? null)
+            === JSON.stringify(previous.camera_access ?? null);
+          const sameRolePolicy = (verified?.account?.role_profile_id ?? null)
+            === (previous.role_profile_id ?? null);
+          const samePermissions = Array.isArray(verified?.effective_permissions)
+            && JSON.stringify([...verified.effective_permissions].sort())
+              === JSON.stringify([...(previous.effective_permissions || [])].sort());
+          if (!sameCameraGrant || !sameRolePolicy || !samePermissions) throw new ApiError(403);
+          resolveCapabilities(verified);
+          $("camera-list-message").textContent =
+            "Camera list unavailable. Account access reverified; retrying inventory.";
+          return false;
+        } catch (_) {
+          // Do not use stale grants if independent account proof fails.
+          throw error;
+        }
+      }
       if (epoch !== state.sessionEpoch || cameraListEpoch !== state.cameraListEpoch) return;
       if (!Array.isArray(data.cameras)) throw new ApiError(503);
       const restoreWall = !state.capabilitiesResolved;
@@ -745,6 +780,7 @@
       state.workerStatus = ["ready", "unavailable", "disk_full"].includes(data.worker_status) ? data.worker_status : "ready";
       renderWorkerStatus();
       state.cameras = data.cameras.filter((camera) => camera && typeof camera.device_id === "string" && typeof camera.name === "string");
+      state.cameraInventoryFreshAt = performance.now();
       administration?.refreshCameras();
       settings?.refreshCameras();
       renderCameras();
