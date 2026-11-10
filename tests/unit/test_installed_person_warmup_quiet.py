@@ -99,33 +99,46 @@ def test_recorded_person_event_still_bypasses_quiet_timer_once(monkeypatch):
     asyncio.run(journey())
 
 
-def test_installed_view_warmup_waits_for_recorded_event(monkeypatch):
-    """Recorder priming does not authorize a second worker before a real event."""
+def test_installed_view_warmup_requires_enrollment_and_respects_recorded_event(monkeypatch):
+    """Quiet, enrolled, disabled analytics may prepare without competing with a recorder."""
     camera_id = uuid4()
     recorder = object.__new__(RecordedFrameSampler)
     recorder._configuration = object()
     child = {"ready": False}
     monkeypatch.setattr(recorder, "native_model_ready", lambda: child["ready"])
-    state = {"enabled": False}
+    state = {"enrolled": False, "enabled": False}
     service = object.__new__(OperatorEventService)
     service._closing = False
     service._unavailable = False
     service._available = True
     service._sampler = recorder
     service._cameras = SimpleNamespace(
-        list_sources=lambda: (SimpleNamespace(binding=SimpleNamespace(device_id=camera_id)),)
+        list_sources=lambda: (
+            (SimpleNamespace(binding=SimpleNamespace(device_id=camera_id)),)
+            if state["enrolled"]
+            else ()
+        )
     )
     service.store = SimpleNamespace(settings=lambda _identifier: {"enabled": state["enabled"]})
     service._last_events = {}
 
-    # Neither prior compilation attempts nor camera enrollment alone qualify.
+    # A startup timer with zero enrolled cameras may not contend with ONVIF.
     assert service.awaiting_first_recorded_person_event()
     child["ready"] = True
     assert service.awaiting_first_recorded_person_event()
 
-    # Once authoritative recording analytics are enabled, avoid CPU contention
-    # until a real accepted person event. Readiness is not event admission.
+    # Once at least one camera has enrolled and its six-second quiet interval
+    # has elapsed, an optional model can prepare if recording analytics is off.
+    state["enrolled"] = True
+    assert not service.awaiting_first_recorded_person_event()
+    child["ready"] = False
+    assert not service.awaiting_first_recorded_person_event()
+
+    # Any enabled recorded-person camera takes first-event CPU priority even
+    # if its own native worker is already primed.
     state["enabled"] = True
+    assert service.awaiting_first_recorded_person_event()
+    child["ready"] = True
     assert service.awaiting_first_recorded_person_event()
     service._last_events[camera_id] = 1.0
     assert not service.awaiting_first_recorded_person_event()
