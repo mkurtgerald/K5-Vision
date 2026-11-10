@@ -624,16 +624,27 @@ class _RecordedNativeWorker:
             job, self._job = self._job, None
             try:
                 if process is not None:
-                    if process.stdin is not None:
+                    # Never flush buffered stdin while the owned native child
+                    # may still be blocked compiling or decoding. On Windows,
+                    # closing a buffered writer first can block forever on its
+                    # pending pipe bytes, preventing the failed worker from
+                    # being reaped or replaced. Kill and reap before closing
+                    # either pipe, retaining the existing two-second bound.
+                    if process.poll() is None:
                         try:
-                            process.stdin.close()
-                        except (BrokenPipeError, OSError):
+                            process.kill()
+                        except OSError:
                             pass
                     try:
                         process.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=2)
+                    if process.stdin is not None:
+                        try:
+                            process.stdin.close()
+                        except (BrokenPipeError, OSError):
+                            pass
                     if process.stdout is not None:
                         process.stdout.close()
             finally:
