@@ -1035,10 +1035,17 @@ class OperatorEventService:
             if self.store.settings(source.binding.device_id)["enabled"]
         ]
         if not enabled:
-            # Once enrollment is quiet and no camera requests recorded-person
-            # inference, an optional view may prepare in advance. Delaying it
-            # until recording analytics is enabled causes the first sampled
-            # view to miss its unchanged installed 27-second acceptance window.
+            # Even without enabled recording analytics, the recorder may be
+            # compiling its first sealed model. A second OpenVINO compilation
+            # at that moment competes with the installed first-recording gate.
+            # Wait for the living recorder worker, then permit the optional
+            # sampled-view warmup after the separate enrollment quiet timer.
+            if (
+                isinstance(self._sampler, RecordedFrameSampler)
+                and getattr(self._sampler, "_configuration", None) is not None
+                and not self._sampler.native_model_ready()
+            ):
+                return True
             return False
         if any(camera_id in self._last_events for camera_id in enabled):
             return False
