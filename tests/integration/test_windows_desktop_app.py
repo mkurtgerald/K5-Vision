@@ -4172,27 +4172,69 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         except BaseException:
             desktop_status = "unresponsive"
             desktop_probe = {"available": False}
+        def record_cleanup_failure(phase, error):
+            # First finite failure stage and type only: never an OS exception
+            # message, local path, process command, credential or source URI.
+            stages = {
+                "admin_executor",
+                "permissions_executor",
+                "browser_context",
+                "browser",
+                "playwright",
+                "cohort_process",
+                "publisher_process",
+                "onvif_fixture",
+                "temporary_files",
+            }
+            if phase not in stages:
+                phase = "other"
+            kind = type(error).__name__
+            kinds = {
+                "OSError",
+                "PermissionError",
+                "FileNotFoundError",
+                "TimeoutExpired",
+                "RuntimeError",
+                "AccessDenied",
+                "Error",
+                "ValueError",
+            }
+            nvr_diagnostic.setdefault("cleanup_failure_phase", phase)
+            nvr_diagnostic.setdefault(
+                "cleanup_failure_type", kind if kind in kinds else "other"
+            )
+            nvr_diagnostic["cleanup_failure_count"] = min(
+                9, nvr_diagnostic.get("cleanup_failure_count", 0) + 1
+            )
+
         if admin_executor is not None:
             try:
                 admin_executor.shutdown(wait=True, cancel_futures=True)
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("admin_executor", error)
         if permissions_executor is not None:
             try:
                 permissions_executor.shutdown(wait=True, cancel_futures=True)
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("permissions_executor", error)
         process_counts = _cohort_diagnostic(cohort)
         app_exit_code = app.poll() if app else None
         form_alive = bool(form and api.api.IsWindow(form))
         form_visible = bool(form and api.api.IsWindowVisible(form))
         cohort.finish()
-        for resource in (context, browser, playwright):
+        for name, resource in (
+            ("browser_context", context),
+            ("browser", browser),
+            ("playwright", playwright),
+        ):
             if resource is not None:
                 try:
-                    resource.stop() if resource is playwright else resource.close()
-                except Exception:
+                    resource.stop() if name == "playwright" else resource.close()
+                except Exception as error:
                     cleanup_failed = True
+                    record_cleanup_failure(name, error)
         for process in reversed(cohort.snapshot()):
             try:
                 if process.is_running():
@@ -4200,25 +4242,29 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                     process.wait(timeout=10)
             except psutil.NoSuchProcess:
                 pass
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("cohort_process", error)
         for process in reversed(processes):
             try:
                 helpers._stop_owned(process)
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("publisher_process", error)
         for camera_fixture in onvif_cameras:
             try:
                 camera_fixture.close()
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("onvif_fixture", error)
         for listener in reservations:
             listener.close()
         if parent.exists():
             try:
                 shutil.rmtree(parent)
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("temporary_files", error)
         stage_durations.append(("cleanup", round(time.monotonic() - cleanup_started, 2)))
         diagnostic = {
             "stage": stage,
