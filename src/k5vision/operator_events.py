@@ -1069,8 +1069,14 @@ class OperatorEventService:
         )
         sample_phase = state.get("sample_phase", "not_started")
         pending = self._native_pending
-        if sample_phase == "capture_pending" and pending is not None and not pending.done():
-            # Show which bounded stage owns an in-flight recording request.
+        if (
+            sample_phase in {"capture_pending", "native_pending"}
+            and pending is not None
+            and not pending.done()
+            and (sample_phase == "capture_pending" or state.get("sample_attempts", 0) > 0)
+        ):
+            # Report the current stage even after the outer sample wait expires
+            # while the native future still runs. A prime is not a frame attempt.
             # Never expose a file path, media bytes, source URI or native exception.
             candidate = getattr(self._sampler, "_capture_outcome", "")
             if candidate == "native_request":

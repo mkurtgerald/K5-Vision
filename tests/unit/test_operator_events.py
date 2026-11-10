@@ -371,6 +371,46 @@ def test_pending_native_worker_distinguishes_bounded_inflight_stage(store, worke
         asyncio.run(service.aclose())
 
 
+@pytest.mark.parametrize(
+    ("child_phase", "expected"),
+    [
+        ("native_write_failed", "native_request_writing"),
+        ("native_model_active", "native_model_active"),
+        ("native_reply_missing", "native_reply_waiting"),
+    ],
+)
+def test_timed_out_capture_exposes_current_native_stage_without_changing_last_failure(
+    store, child_phase, expected
+):
+    source = _source()
+    service, sampler, _ = _service(store, source)
+    camera_id = source.binding.device_id
+    service.configure(camera_id, enabled=True, confidence_threshold=0.5)
+    service._states[camera_id] = {
+        "sample_phase": "native_pending",
+        "sample_attempts": 2,
+        "last_completed_phase": "native_write_failed",
+        "last_native_write_cause": "pending",
+    }
+    pending = Future()
+    service._native_pending = pending
+    sampler._capture_outcome = "native_request"
+    sampler._worker = SimpleNamespace(_failure_phase=child_phase)
+    try:
+        state = service.status(camera_id)
+        assert state["sample_phase"] == expected
+        assert state["last_completed_phase"] == "native_write_failed"
+        assert state["native_write_cause"] == "pending"
+        assert state["sample_attempts"] == 2
+        sampler._capture_outcome = "rtsp://private-source-with-credentials"
+        assert service.status(camera_id)["sample_phase"] == "native_pending"
+        service._states[camera_id]["sample_attempts"] = 0
+        assert service.status(camera_id)["sample_phase"] == "native_pending"
+    finally:
+        pending.set_result(None)
+        asyncio.run(service.aclose())
+
+
 def test_reconfigure_during_inference_discards_result(store):
     source = _source()
     service, _sampler, provider = _service(store, source)
