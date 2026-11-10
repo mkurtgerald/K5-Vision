@@ -229,7 +229,7 @@ def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monke
         "_PersonDetector",
         lambda config, *, inference_threads, fixed_view_input: (
             initialized.append((config, inference_threads, fixed_view_input)) or Detector()
-        )
+        ),
     )
     request = json.dumps({"path": "", "artifact_root": "private-model"}).encode()
     output = io.BytesIO()
@@ -258,10 +258,7 @@ def test_recorded_person_uses_the_same_fixed_graph_after_model_only_prime(monkey
             assert raw == pixels
             assert (width, height, stride) == (544, 320, 544 * 4)
             calls.append(elapsed)
-            return (
-                (SimpleNamespace(category="person", confidence=0.81),)
-                if elapsed else ()
-            )
+            return (SimpleNamespace(category="person", confidence=0.81),) if elapsed else ()
 
     def factory(config, *, inference_threads, fixed_view_input):
         assert (config, inference_threads, fixed_view_input) == (Path("private-model"), 2, True)
