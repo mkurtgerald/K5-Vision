@@ -115,6 +115,9 @@ class OperatorAnalyticsBroker:
         self._prewarm_task: asyncio.Task[None] | None = None
         self._prewarmed_provider: OwnedAnalyticsProvider | None = None
         self._prewarm_successful = False
+        # Bound recovery from one failed native compile without starting a
+        # cold compile inside an authenticated HTTP request.
+        self._prewarm_attempts = 0
 
     @property
     def preparation_pending(self) -> bool:
@@ -140,7 +143,12 @@ class OperatorAnalyticsBroker:
         This owns no camera, human session, frame or source URI. The worker is
         handed to exactly one authenticated view on its first actual request.
         """
-        if not self._closed and self._prewarm_task is None:
+        if self._closed or self._prewarm_attempts >= 2:
+            return
+        if self._prewarm_task is None or (
+            self._prewarm_task.done() and not self._prewarm_successful
+        ):
+            self._prewarm_attempts += 1
             self._prewarm_task = asyncio.create_task(
                 self._prepare(), name="operator-native-person-preparation"
             )
@@ -241,6 +249,17 @@ class OperatorAnalyticsBroker:
             # the authenticated browser retries without retaining this frame.
             view.last_used = now
             return OperatorAnalyticsResult("busy", frame_id)
+        if (
+            view.provider is None
+            and self._prewarm_task is not None
+            and self._prewarm_task.done()
+            and not self._prewarm_successful
+        ):
+            # A failed native compile must not synchronously start a second
+            # 22-second compile from the ASGI request. A bounded retry is
+            # scheduled separately by start_preparing(), without any pixels.
+            view.last_used = now
+            return OperatorAnalyticsResult("unavailable", frame_id)
         if view.operation is not None or now - view.last_submission < self._interval:
             return OperatorAnalyticsResult("busy", frame_id)
         view.last_used = view.last_submission = now
