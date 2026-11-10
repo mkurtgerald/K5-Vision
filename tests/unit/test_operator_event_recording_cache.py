@@ -104,7 +104,6 @@ def test_large_cached_history_still_samples_fresh_growth_between_storage_scans(
     assert directory_scans == 2
 
 
-
 def test_writer_missing_from_cold_inventory_is_watched_without_admitting_old_bytes(
     recording_camera, monkeypatch
 ):
