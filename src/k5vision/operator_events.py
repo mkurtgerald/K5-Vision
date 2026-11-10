@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import hashlib
+import io
 import json
 import math
 import os
@@ -382,6 +383,10 @@ class _RecordedNativeWorker:
                 [sys.executable, "-I", "-B", "-m", "k5vision.operator_events_decoder"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
+                # The native request is one bounded JSON line. Buffered stdin
+                # can leave a second flush blocking on Windows under load.
+                # Keep the input pipe unbuffered; do not change response framing.
+                bufsize=0,
                 stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 start_new_session=os.name != "nt",
@@ -389,6 +394,10 @@ class _RecordedNativeWorker:
             )
             if job is not None:
                 job.assign(process)
+            # Unbuffered stdout can return a partial native pixel payload.
+            # Retain exact-length frame reads and bounded line parsing with
+            # an explicit buffered reader; the input pipe alone is unbuffered.
+            process.stdout = io.BufferedReader(process.stdout, buffer_size=65536)
             self._process, self._job = process, job
             # A replacement child has not compiled its sealed person model.
             self._person_ready = False

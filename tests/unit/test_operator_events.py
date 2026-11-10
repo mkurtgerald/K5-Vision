@@ -590,6 +590,37 @@ def test_failed_native_worker_reaps_before_buffered_stdin_close():
     assert not worker._closing.is_set()
 
 
+def test_native_worker_unbuffered_request_retains_exact_stdout_reads(monkeypatch):
+    from k5vision import operator_events as module
+
+    actual_popen = subprocess.Popen
+    script = (
+        "import sys;"
+        "sys.stdin.buffer.readline();"
+        "sys.stdout.buffer.write(b'OK\\n' + b'Z' * 16384);"
+        "sys.stdout.buffer.flush()"
+    )
+
+    def launch(_argv, **kwargs):
+        assert kwargs["bufsize"] == 0
+        return actual_popen([sys.executable, "-I", "-c", script], **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    worker = module._RecordedNativeWorker(None)
+    try:
+        worker._start()
+        child = worker._process
+        assert isinstance(child.stdin, io.FileIO)
+        assert isinstance(child.stdout, io.BufferedReader)
+        child.stdin.write(b"READY\\n")
+        assert child.stdout.readline() == b"OK\\n"
+        # The native decoder emits large single-payload responses. Preserve
+        # full reads rather than accepting partial raw-pipe chunks as frames.
+        assert child.stdout.read(16384) == b"Z" * 16384
+    finally:
+        worker.close()
+
+
 def test_stalled_owned_native_worker_is_killed_and_reaped_before_next_launch(monkeypatch, tmp_path):
     import k5vision.operator_events as module
 
