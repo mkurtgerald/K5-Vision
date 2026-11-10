@@ -8,6 +8,15 @@ import sys
 import time
 
 
+def _recorder_inference_threads() -> int:
+    """Avoid competing with four live camera decoders on hosted Windows CPUs.
+
+    This is only a native CPU scheduling budget. It does not change the
+    admitted FP32 model, frame bytes, detections or acceptance threshold.
+    """
+    return 1 if sys.platform == "win32" else 2
+
+
 def decode(path: str):
     import cv2
 
@@ -127,7 +136,7 @@ def main() -> int:
                     sys.stdout.buffer.flush()
                     detector = _PersonDetector(
                         OperatorPersonConfiguration(Path(artifact_root)),
-                        inference_threads=2,
+                        inference_threads=_recorder_inference_threads(),
                         fixed_view_input=True,
                     )
                 # CPU kernels may finish JIT initialization only on their
@@ -169,7 +178,7 @@ def main() -> int:
                     sys.stdout.buffer.flush()
                     detector = _PersonDetector(
                         OperatorPersonConfiguration(Path(artifact_root)),
-                        inference_threads=2,
+                        inference_threads=_recorder_inference_threads(),
                         fixed_view_input=True,
                     )
                 phase = "inference"
