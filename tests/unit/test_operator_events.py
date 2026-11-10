@@ -552,6 +552,54 @@ def test_native_pipe_block_reports_exact_bounded_stage(monkeypatch, tmp_path, bl
     assert results == [None]
 
 
+def test_native_watchdog_thread_start_refusal_kills_owned_child_before_command(
+    monkeypatch, tmp_path
+):
+    """No unguarded native request or misleading pipe-write diagnosis is allowed."""
+    from k5vision import operator_events as module
+
+    writes = []
+
+    class Pipe(io.BytesIO):
+        def write(self, payload):
+            writes.append(bytes(payload))
+            return super().write(payload)
+
+    class Child:
+        def __init__(self):
+            self.stdin = Pipe()
+            self.stdout = io.BytesIO()
+            self.killed = False
+
+        def poll(self):
+            return 1 if self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=2):
+            assert self.killed
+            return 1
+
+    child = Child()
+    worker = module._RecordedNativeWorker(None)
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", child))
+
+    def refuse_start(_timer):
+        raise RuntimeError("private watchdog thread unavailable")
+
+    monkeypatch.setattr(module.threading.Timer, "start", refuse_start)
+    with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+        worker.request(tmp_path / "unused-private-snapshot.mp4")
+    assert worker._failure_phase == "native_watchdog_unavailable"
+    assert worker._native_write_cause == "not_started"
+    assert worker._process is None
+    assert child.killed
+    assert child.stdin.closed and child.stdout.closed
+    assert writes == []
+
+
+
 def test_failed_native_worker_reaps_before_buffered_stdin_close():
     """A stalled Windows pipe cannot block replacement before child termination."""
     import k5vision.operator_events as module
