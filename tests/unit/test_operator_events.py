@@ -630,7 +630,7 @@ def test_native_worker_short_raw_pipe_writes_do_not_truncate_request():
 
     worker = module._RecordedNativeWorker(None)
     pipe = ShortPipe()
-    command = b'{"path":"","artifact_root":"sealed"}\\n'
+    command = b'{"path":"","artifact_root":"sealed"}\n'
     worker._write_request(pipe, command)
     assert pipe.getvalue() == command
     assert worker._failure_phase == "native_pipe_flush_active"
