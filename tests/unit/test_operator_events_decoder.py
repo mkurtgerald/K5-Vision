@@ -247,9 +247,7 @@ def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monke
     monkeypatch.setattr(decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request + b"\n")))
     monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
     assert decoder.main() == 0
-    assert initialized == [
-        (Path("private-model"), decoder._recorder_inference_threads(), True)
-    ]
+    assert initialized == [(Path("private-model"), decoder._recorder_inference_threads(), True)]
     assert warmed == [True]
     assert output.getvalue() == (
         b'{"status":"phase","phase":"model"}\n'
@@ -276,7 +274,9 @@ def test_recorded_person_uses_the_same_fixed_graph_after_model_only_prime(monkey
 
     def factory(config, *, inference_threads, fixed_view_input):
         assert (config, inference_threads, fixed_view_input) == (
-            Path("private-model"), decoder._recorder_inference_threads(), True
+            Path("private-model"),
+            decoder._recorder_inference_threads(),
+            True,
         )
         models.append(Detector())
         return models[-1]
