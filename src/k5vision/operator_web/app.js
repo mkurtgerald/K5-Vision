@@ -371,8 +371,19 @@
     video.load();
   }
 
-  function stopLive(resetRetries = true) {
-    stopPersonView();
+  function stopLive(resetRetries = true, preserveInFlightPerson = false) {
+    const camera = currentCamera();
+    // A same-camera HLS decoder restart cannot revoke an already authorized,
+    // immutable sampled-frame POST. Preserve only an in-flight request during
+    // a bounded automatic reconnect; deliberate teardown and loss of camera,
+    // session, permission or worker authority still abort immediately.
+    if (!(preserveInFlightPerson && state.personEnabled && state.personController
+      && state.token && !state.signingOut && !state.securityTransition
+      && state.capabilitiesResolved && allowed("cameras.view_live")
+      && state.view === "live" && camera?.analytics_status === "configured"
+      && statusDetails(camera).style === "online" && state.workerStatus !== "unavailable")) {
+      stopPersonView();
+    }
     clearTimeout(state.retryTimer);
     state.retryTimer = null;
     state.nativeLive = false;
@@ -826,16 +837,19 @@
 
   function scheduleLiveRetry(epoch, reason) {
     if (epoch !== state.selectionEpoch || !state.token || state.view !== "live") return;
-    stopLive(false);
     if (state.retryCount >= RETRY_DELAYS.length) {
+      // Exhausted retries are a real stop, not transient buffering. Revoke the
+      // frozen frame, clear its overlay and refuse another in-flight request.
+      stopLive(false);
       livePlaceholder("Live view disconnected", "The connection could not be restored. Recording history may still be available.", true);
       message("live-state", "Disconnected · Select reconnect to try again");
       return;
     }
+    stopLive(false, true);
     const delay = RETRY_DELAYS[state.retryCount++];
     livePlaceholder("Reconnecting", reason);
     message("live-state", `Reconnecting · Attempt ${state.retryCount} of ${RETRY_DELAYS.length}`);
-    state.retryTimer = setTimeout(() => void startLive(epoch), delay);
+    state.retryTimer = setTimeout(() => void startLive(epoch, true), delay);
   }
 
   async function recoverMediaAccess(epoch) {
@@ -1024,13 +1038,13 @@
     }
   }
 
-  async function startLive(epoch = state.selectionEpoch) {
+  async function startLive(epoch = state.selectionEpoch, preserveInFlightPerson = false) {
     if (!state.media || state.view !== "live" || !state.token) return;
     const url = state.media.live_url;
     try {
       await ensureHls();
       if (epoch !== state.selectionEpoch || state.view !== "live" || !state.token || state.signingOut) return;
-      stopLive(false);
+      stopLive(false, preserveInFlightPerson);
       livePlaceholder("Opening live view", "Waiting for camera video…");
       const video = $("live-video");
       video.muted = true;
