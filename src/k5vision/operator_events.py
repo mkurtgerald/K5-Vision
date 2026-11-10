@@ -798,11 +798,23 @@ class RecordedFrameSampler:
                 # Timestamp ordering supplies cold-start hints only. No retained
                 # bytes become events until new byte growth is actually observed.
                 hints = sorted(inventory, key=lambda name: inventory[name][5], reverse=True)[:2]
-                self._active_files[source.binding.device_id] = tuple(hints)
-                # The maintenance cache can predate the sampler by several
-                # seconds. A cold directory scan excludes all existing names,
-                # even if they were absent from that older cache snapshot.
-                self._known_names[source.binding.device_id] = self._recording_names(directory)
+                # An active writer may already exist before the maintenance
+                # inventory catches up. A cold name-only scan must baseline
+                # those uncached files too: directory mtime does not change
+                # when a pre-existing recording merely grows. Never infer a
+                # person from the bytes present at this cold observation.
+                known = self._recording_names(directory)
+                uncached = sorted(known - current.keys(), reverse=True)[:2]
+                for name in uncached:
+                    try:
+                        info = identity_state._regular_file(directory / name)
+                    except FileNotFoundError:
+                        continue
+                    current[name] = info.st_dev, info.st_ino, info.st_size
+                self._active_files[source.binding.device_id] = tuple(
+                    dict.fromkeys(uncached + hints)
+                )[:2]
+                self._known_names[source.binding.device_id] = known
                 self._directory_mtime[source.binding.device_id] = directory_info.st_mtime_ns
                 self._observations[source.binding.device_id] = current
                 self._capture_outcome = "baseline"
