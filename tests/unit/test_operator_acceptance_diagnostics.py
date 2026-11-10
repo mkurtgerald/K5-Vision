@@ -336,13 +336,13 @@ def test_installed_person_control_readiness_cannot_skip_real_decoding_or_authori
     gate = source.split('diagnostic["analytics_sample_stage"] = "control_ready"', 1)[1].split(
         'diagnostic["analytics_sample_stage"] = "native_frame_request"', 1
     )[0]
-    assert 'timeout=5_000' in gate
-    assert "not button.disabled" in gate
-    assert "not panel.hidden" in gate
-    assert "not video.paused" in gate
+    assert "timeout=5_000" in gate
+    assert "!button.disabled" in gate
+    assert "!panel.hidden" in gate
+    assert "!video.paused" in gate
     assert "video.readyState >= 2" in gate
     assert "video.videoWidth > 0 && video.videoHeight > 0" in gate
-    assert 'button.is_enabled()' in gate
+    assert "button.is_enabled()" in gate
     assert '"analytics_sample_control_state"' in gate
     # Only fixed booleans and bounded numbers may leave the Windows runner.
     assert "camera_online_badge:" in gate
