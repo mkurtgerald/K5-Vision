@@ -2880,11 +2880,28 @@ def _vm_clock_phase(
     diagnostic["vm_clock_stage"] = "restored_history_query"
     try:
         restored_history = client.json(route + "/history" + history_query)["spans"]
-    finally:
-        # The local client reports transport failures as RuntimeError. Retain
-        # only its bounded, route-free exception class and elapsed time.
+    except RuntimeError:
+        # Preserve the failed history request and its three-second deadline.
+        # After UTC restoration, probe health once, without retrying history.
+        # Only retain finite status/error types, never routes or camera data.
         if client.transport_failure is not None:
             diagnostic["vm_clock_history_transport"] = dict(client.transport_failure)
+        try:
+            observed = {}
+            ready = _healthy(client, observed)
+            diagnostic["vm_clock_postfailure_health"] = {
+                "reachable": True,
+                "ready": ready,
+                "status": observed.get("health_http_status", 0),
+            }
+        except RuntimeError:
+            failure = client.transport_failure or {}
+            diagnostic["vm_clock_postfailure_health"] = {
+                "reachable": False,
+                "exception_type": failure.get("exception_type", "other"),
+                "elapsed_seconds": failure.get("elapsed_seconds"),
+            }
+        raise
     diagnostic["vm_clock_stage"] = "restored_history_unchanged"
     _require(
         all(span in restored_history for span in before_history),

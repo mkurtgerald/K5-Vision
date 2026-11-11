@@ -173,13 +173,15 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
     cleanup_failed = False
     phase = "baseline_setup"
     health_statuses = set()
+    readiness_attempts = 0
+    last_health_transport = None
     try:
         d._install_gui(baseline, installed, api)
         _assert_installed(installed, old_head, old_launcher)
         client = runtime._Client(port)
 
         def start_and_login(*, first: bool) -> str:
-            nonlocal app
+            nonlocal app, readiness_attempts, last_health_transport
             app = d._start_app(installed, profile, port, cohort)
             form = d._wait(lambda: api.form(app.pid), "Installed upgrade window", process=app)
             if first:
@@ -193,10 +195,21 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
                 api.set_text(form, d._CONFIRM, password)
                 api.click(api.control(form, d._CREATE))
             health_statuses.clear()
+            readiness_attempts = 0
+            last_health_transport = None
 
             def observed_health():
+                nonlocal readiness_attempts, last_health_transport
+                readiness_attempts += 1
                 diagnostic = {}
-                ready = d._healthy(client, diagnostic)
+                try:
+                    ready = d._healthy(client, diagnostic)
+                except RuntimeError:
+                    # Store only the transport helper's bounded type and timing,
+                    # never a route, payload, account or local profile path.
+                    if client.transport_failure is not None:
+                        last_health_transport = dict(client.transport_failure)
+                    raise
                 if "health_http_status" in diagnostic:
                     health_statuses.add(diagnostic["health_http_status"])
                 return ready
@@ -281,6 +294,16 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
         assert start_and_login(first=False) == original_site
         verified.append("baseline_reversal_login")
     finally:
+        # Distinguish an alive-but-unready supervisor from a UI refusal.
+        # Classify known message prefixes; never retain actual window text.
+        desktop_phase = "unavailable"
+        try:
+            if app is not None and app.poll() is None:
+                last_form = api.form(app.pid)
+                if last_form is not None:
+                    desktop_phase = d._desktop_status(api, last_form)
+        except (OSError, RuntimeError):
+            pass
         # Retain only finite stage and health evidence on both pass and fail.
         record_testsuite_property(
             "desktop_cross_revision_stage_diagnostic",
@@ -289,6 +312,9 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
                     "phase": phase,
                     "verified_steps": verified,
                     "health_http_statuses": sorted(health_statuses),
+                    "readiness_attempts": readiness_attempts,
+                    "last_health_transport": last_health_transport,
+                    "desktop_phase": desktop_phase,
                     "supervisor_exit_code": app.poll() if app is not None else None,
                 },
                 sort_keys=True,
