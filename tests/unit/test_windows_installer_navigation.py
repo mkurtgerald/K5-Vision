@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -102,3 +103,44 @@ def test_installed_person_poll_requires_a_valid_envelope_and_positive_event():
         _DESKTOP._poll_installed_person_event(
             _EventPollClient(200, {"events": "malformed"}), route, diagnostic
         )
+
+
+class _ProcessActivityFixture:
+    def __init__(self, *, pid, user, system, children=()):
+        self.pid = pid
+        self._user = user
+        self._system = system
+        self._children = children
+
+    def children(self, *, recursive):
+        assert recursive
+        return list(self._children)
+
+    def cpu_times(self):
+        return SimpleNamespace(user=self._user, system=self._system)
+
+    def is_running(self):
+        return True
+
+
+def test_installer_timeout_activity_reports_only_bounded_process_metrics(monkeypatch):
+    child = _ProcessActivityFixture(pid=92, user=2.5, system=0.5)
+    root = _ProcessActivityFixture(pid=91, user=3.0, system=1.25, children=(child,))
+    monkeypatch.setattr(_DESKTOP.psutil, "Process", lambda pid: root)
+    witness = _DESKTOP._installer_timeout_activity(SimpleNamespace(pid=91))
+    assert witness == {
+        "observed_processes": 2,
+        "processes_capped": False,
+        "aggregate_cpu_seconds": 7.25,
+        "root_running": True,
+    }
+
+
+def test_installer_timeout_activity_refuses_unavailable_process_metadata(monkeypatch):
+    def missing(_pid):
+        raise _DESKTOP.psutil.NoSuchProcess(91)
+
+    monkeypatch.setattr(_DESKTOP.psutil, "Process", missing)
+    assert _DESKTOP._installer_timeout_activity(SimpleNamespace(pid=91)) == {
+        "observation": "unavailable"
+    }
