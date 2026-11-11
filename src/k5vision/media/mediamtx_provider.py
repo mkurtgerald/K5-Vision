@@ -340,6 +340,7 @@ class MediaMTXProvider:
         self._requester = requester
         self._requests: set[asyncio.Task] = set()
         self._version_admitted = False
+        self._info_task: asyncio.Task[MediaWorkerInfo] | None = None
         self._snapshots: dict[tuple[MediaMTXBinding, ...], asyncio.Task] = {}
         self._closed = False
         self._close_task: asyncio.Task | None = None
@@ -406,8 +407,13 @@ class MediaMTXProvider:
             raise MediaWorkerError(result)
         return result
 
-    async def info(self) -> MediaWorkerInfo:
-        self._version_admitted = False
+    def _info_completed(self, task: asyncio.Task) -> None:
+        if self._info_task is task:
+            self._info_task = None
+        if not task.cancelled():
+            task.exception()
+
+    async def _check_info(self) -> MediaWorkerInfo:
         result = await self._get(self._api_origin, "/v3/info")
         if not isinstance(result, dict):
             raise MediaWorkerError(MediaWorkerErrorCode.INVALID_RESPONSE)
@@ -422,6 +428,20 @@ class MediaMTXProvider:
             raise MediaWorkerError(MediaWorkerErrorCode.INVALID_RESPONSE)
         self._version_admitted = True
         return MediaWorkerInfo(MEDIAMTX_VERSION, started)
+
+    async def info(self) -> MediaWorkerInfo:
+        # Health polling and first authenticated playback must share the same
+        # pending fixed-version check, not contend for extra native API slots.
+        # Only an in-flight check is shared; a later explicit check revalidates.
+        if self._closed:
+            raise MediaWorkerError(MediaWorkerErrorCode.UNAVAILABLE)
+        task = self._info_task
+        if task is None or task.done():
+            self._version_admitted = False
+            task = asyncio.create_task(self._check_info())
+            self._info_task = task
+            task.add_done_callback(self._info_completed)
+        return await asyncio.shield(task)
 
     async def _admit(self) -> None:
         if self._closed:
@@ -523,6 +543,11 @@ class MediaMTXProvider:
             task.cancel()
         if snapshots:
             await asyncio.gather(*snapshots, return_exceptions=True)
+        # A cancelled caller cannot abandon the shared version check. Join
+        # its owner before releasing the native worker or its API listener.
+        info = self._info_task
+        if info is not None and not info.done():
+            await asyncio.gather(asyncio.shield(info), return_exceptions=True)
         # Cancelling to_thread tasks would free their tracked slots before the
         # native readers exit. Only coroutine owners are cancelled; actual reads
         # remain joined until the underlying request returns.
