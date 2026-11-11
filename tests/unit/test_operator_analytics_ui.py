@@ -329,7 +329,6 @@ def test_unchanged_provider_poll_preserves_focused_playback_button(analytics_pag
     assert not errors
 
 
-
 def test_provider_event_seek_survives_range_change_while_refresh_is_pending(analytics_page):
     page, errors = analytics_page
     page.evaluate(
