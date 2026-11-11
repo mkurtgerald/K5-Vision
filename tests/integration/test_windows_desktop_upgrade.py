@@ -222,6 +222,7 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
     cleanup_failed = False
     phase = "baseline_setup"
     installer_diagnostic = {}
+    uninstall_clone_observed = False
     health_statuses = set()
     readiness_attempts = 0
     last_health_transport = None
@@ -342,11 +343,12 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
         phase = "reversal_uninstall"
         uninstaller = installed / "unins000.exe"
         assert uninstaller.is_file(), "Candidate uninstaller is missing"
-        uninstall_exit, clone_observed = _uninstall_through_clone_completion(uninstaller)
+        uninstall_exit, uninstall_clone_observed = _uninstall_through_clone_completion(
+            uninstaller
+        )
         assert uninstall_exit == 0, "Candidate manual reversal uninstall failed"
         # Inno can terminate its original uninstaller before the TEMP clone
         # finishes. The next real installer must not race that cleanup.
-        installer_diagnostic["uninstall_clone_observed"] = clone_observed
         assert not (installed / "K5Vision.exe").exists(), "Candidate executable survived uninstall"
         assert_preserved()
         verified.append("candidate_uninstall_preserved_profile")
@@ -377,6 +379,7 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
                 {
                     "phase": phase,
                     "verified_steps": verified,
+                    "uninstall_clone_observed": uninstall_clone_observed,
                     "installer": {
                         "action": installer_diagnostic.get("installer_action"),
                         "install_posted": bool(
