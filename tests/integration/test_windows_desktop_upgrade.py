@@ -140,6 +140,61 @@ def _assert_running_upgrade_refused(setup: Path, installed: Path, api) -> None:
                     pass
 
 
+def _uninstall_through_clone_completion(uninstaller: Path) -> tuple[int, bool]:
+    """Wait for the actual Inno uninstall clone, not just its original EXE.
+
+    Inno's TEMP clone may still be completing its deletion after the original
+    uninstaller returns success. Keep the same 45-second total deadline for
+    both processes, and never inspect or persist their paths or arguments.
+    """
+    import time
+
+    import psutil
+
+    process = subprocess.Popen(
+        [str(uninstaller), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 45
+    children: dict[int, psutil.Process] = {}
+    try:
+        while process.poll() is None:
+            try:
+                for child in psutil.Process(process.pid).children(recursive=True)[:32]:
+                    children[child.pid] = child
+            except psutil.Error:
+                pass
+            if time.monotonic() >= deadline:
+                pytest.fail("Candidate uninstaller exceeded its 45-second deadline", pytrace=False)
+            time.sleep(0.05)
+
+        # A successful return code alone does not mean Inno's clone has exited.
+        # Do not retry, terminate early, or skip a still-running clone.
+        if process.returncode == 0:
+            for child in children.values():
+                while child.is_running():
+                    if time.monotonic() >= deadline:
+                        pytest.fail(
+                            "Candidate uninstall clone exceeded its 45-second deadline",
+                            pytrace=False,
+                        )
+                    time.sleep(0.05)
+        return process.returncode, bool(children)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        for child in children.values():
+            try:
+                if child.is_running():
+                    child.kill()
+                    child.wait(timeout=5)
+            except psutil.Error:
+                pass
+
+
 def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_property):
     assert all(os.environ.get(name) for name in _INPUTS), "Missing exact upgrade test input"
     d = _desktop_helpers()
@@ -293,15 +348,11 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
         phase = "reversal_uninstall"
         uninstaller = installed / "unins000.exe"
         assert uninstaller.is_file(), "Candidate uninstaller is missing"
-        removed = subprocess.run(
-            [str(uninstaller), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=45,
-            check=False,
-        )
-        assert removed.returncode == 0, "Candidate manual reversal uninstall failed"
+        uninstall_exit, clone_observed = _uninstall_through_clone_completion(uninstaller)
+        assert uninstall_exit == 0, "Candidate manual reversal uninstall failed"
+        # Inno can terminate its original uninstaller before the TEMP clone
+        # finishes. The next real installer must not race that cleanup.
+        installer_diagnostic["uninstall_clone_observed"] = clone_observed
         assert not (installed / "K5Vision.exe").exists(), "Candidate executable survived uninstall"
         assert_preserved()
         verified.append("candidate_uninstall_preserved_profile")
