@@ -193,16 +193,29 @@
     }
 
     function renderCameraChoices(ids = []) {
-      const chosen = new Set(ids), fragment = document.createDocumentFragment();
-      const cameras = cameraChoices(ids);
+      const chosen = new Set(ids), cameras = cameraChoices(ids);
+      const container = $("admin-camera-choices");
+      // Preserve existing checkbox nodes while an open permission editor
+      // receives a changed camera inventory. Replacing the entire list can
+      // retarget an in-flight click or Playwright action by position.
+      const existing = new Map(Array.from(container.querySelectorAll("label.admin-checkbox"),
+        (label) => [label.querySelector("input").value, label]));
+      const present = new Set();
       for (const camera of cameras) {
-        const label = document.createElement("label"); label.className = "admin-checkbox";
-        const input = document.createElement("input"); input.type = "checkbox"; input.value = camera.device_id;
-        input.checked = chosen.has(camera.device_id);
-        const name = document.createElement("span"); name.textContent = camera.name;
-        label.append(input, name); fragment.append(label);
+        if (present.has(camera.device_id)) continue;
+        present.add(camera.device_id);
+        let label = existing.get(camera.device_id);
+        if (!label) {
+          label = document.createElement("label"); label.className = "admin-checkbox";
+          const input = document.createElement("input"); input.type = "checkbox"; input.value = camera.device_id;
+          const name = document.createElement("span");
+          label.append(input, name);
+          container.append(label);
+        }
+        label.querySelector("input").checked = chosen.has(camera.device_id);
+        label.querySelector("span").textContent = camera.name;
       }
-      $("admin-camera-choices").replaceChildren(fragment);
+      for (const [id, label] of existing) if (!present.has(id)) label.remove();
       renderedCameraChoices = cameraChoicesKey(cameras);
       renderAccess();
     }
