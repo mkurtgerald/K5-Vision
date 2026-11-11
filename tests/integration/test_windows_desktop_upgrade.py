@@ -283,9 +283,27 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
         assert start_and_login(first=False) == original_site
         verified.append("new_revision_login")
 
-        # A stopped user-initiated reversal is *not* automatic rollback of a
-        # failed activation. It demonstrates compatibility of both installers
-        # with the same persistent operator account and profile bytes.
+        # An older baseline cannot trust unlisted files left by a newer
+        # revision. A safe *manual* reversal must first remove the stopped
+        # candidate with its real, identity-admitted Windows uninstaller,
+        # then install the baseline. This is not automatic failed-activation
+        # rollback or a claim of in-place downgrade compatibility.
+        phase = "reversal_uninstall"
+        uninstaller = installed / "unins000.exe"
+        assert uninstaller.is_file(), "Candidate uninstaller is missing"
+        removed = subprocess.run(
+            [str(uninstaller), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=45,
+            check=False,
+        )
+        assert removed.returncode == 0, "Candidate manual reversal uninstall failed"
+        assert not (installed / "K5Vision.exe").exists(), "Candidate executable survived uninstall"
+        assert_preserved()
+        verified.append("candidate_uninstall_preserved_profile")
+
         phase = "reversal_install"
         d._install_gui(baseline, installed, api)
         _assert_installed(installed, old_head, old_launcher)
@@ -339,6 +357,7 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
         "baseline_login",
         "live_upgrade_refused",
         "new_revision_login",
+        "candidate_uninstall_preserved_profile",
         "baseline_reversal_login",
     ]
     record_testsuite_property(
@@ -352,6 +371,8 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
                 "live_upgrade_refused": True,
                 "account_and_profile_retained": True,
                 "stopped_manual_reversal": True,
+                "candidate_uninstall_preserved_profile": True,
+                "manual_reversal_requires_candidate_uninstall": True,
                 "automatic_failed_activation_rollback": False,
                 "media_compatibility_qualified": False,
                 "synthetic_input_only": True,
