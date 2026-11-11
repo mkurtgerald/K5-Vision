@@ -477,9 +477,7 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
     try:
         while process.poll() is None:
             if time.monotonic() >= deadline:
-                diagnostic["installer_timeout_activity"] = _installer_timeout_activity(
-                    process
-                )
+                diagnostic["installer_timeout_activity"] = _installer_timeout_activity(process)
                 pytest.fail("Actual installer wizard exceeded its deadline", pytrace=False)
             root = psutil.Process(process.pid)
             pids = {root.pid, *(child.pid for child in root.children(recursive=True))}
