@@ -16,9 +16,11 @@ import secrets
 import shutil
 import socket
 import subprocess
+import time
 from pathlib import Path
 from uuid import uuid4
 
+import psutil
 import pytest
 
 from k5vision import identity_state
@@ -84,10 +86,6 @@ def _free_local_port() -> int:
 def _assert_running_upgrade_refused(setup: Path, installed: Path, api) -> None:
     """Exercise a real double-click-style refusal, not a hidden modal installer."""
     import subprocess
-    import time
-
-    import psutil
-
     process = subprocess.Popen(
         [str(setup), "/SP-", "/NORESTART", "/DIR=" + str(installed)],
         stdin=subprocess.DEVNULL,
@@ -147,10 +145,6 @@ def _uninstall_through_clone_completion(uninstaller: Path) -> tuple[int, bool]:
     uninstaller returns success. Keep the same 45-second total deadline for
     both processes, and never inspect or persist their paths or arguments.
     """
-    import time
-
-    import psutil
-
     process = subprocess.Popen(
         [str(uninstaller), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
         stdin=subprocess.DEVNULL,
