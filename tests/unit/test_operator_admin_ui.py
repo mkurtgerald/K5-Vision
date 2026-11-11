@@ -91,6 +91,7 @@ def workspace():
             }
         ]
         state = {
+            "cameras": cameras,
             "users": [account.copy()],
             "requests": [],
             "bootstrap_status": 204,
@@ -477,4 +478,68 @@ def test_unchanged_camera_refresh_does_not_replace_active_permissions_controls(
             "camera_ids": [_CAMERA],
         }
         page.locator("#admin-credential-dialog").wait_for(state="visible")
+        assert not errors
+
+
+def test_changed_camera_inventory_keeps_grant_controls_attached_and_scoped(workspace):
+    """A newly discovered camera must not retarget an existing checkbox click."""
+    with workspace() as (page, state, _account, errors):
+        _login(page)
+        page.locator("#admin-tab").click()
+        page.locator("#admin-users-list tr").wait_for()
+        page.locator("#admin-create-user").click()
+        selection = page.locator(f'#admin-camera-choices input[value="{_CAMERA}"]')
+        selection.check()
+        original_node = selection.element_handle()
+        assert original_node is not None
+
+        new_id = "da5b6910-09a9-4d9b-a6df-10a8083da6a1"
+        state["cameras"].insert(
+            0,
+            {
+                "device_id": new_id,
+                "name": "Generated new camera",
+                "host": "127.0.0.1",
+                "status": "live",
+                "recording": False,
+                "recording_enabled": False,
+                "recording_state": "stopped",
+                "analytics_status": "disabled",
+            },
+        )
+        state["cameras"][1]["name"] = "Renamed generated entrance camera"
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "GET"
+                and urlsplit(response.url).path == "/api/v1/operator/cameras"
+            )
+        ) as refreshed:
+            page.evaluate("document.getElementById('refresh-cameras').click()")
+        assert refreshed.value.status == 200
+        page.locator('#admin-camera-choices input[value="' + new_id + '"]').wait_for()
+        page.locator("#admin-camera-choices").filter(
+            has_text="Renamed generated entrance camera"
+        ).wait_for()
+        assert original_node.evaluate("(input) => input.isConnected")
+        assert original_node.evaluate("(input) => input.checked")
+        assert selection.is_checked()
+        assert not page.locator(f'#admin-camera-choices input[value="{new_id}"]').is_checked()
+
+        # Selecting by position during an inventory update previously changed
+        # the wrong grant when renderCameraChoices replaced all input nodes.
+        page.locator("#admin-username").fill("inventory-stable-viewer")
+        page.locator("#admin-display-name").fill("Inventory stable viewer")
+        page.locator("#admin-role").select_option("viewer")
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST"
+                and urlsplit(response.url).path == "/api/v1/operator/admin/users"
+            )
+        ) as created:
+            page.locator("#admin-save-user").click()
+        assert created.value.status == 201
+        assert created.value.json()["account"]["camera_access"] == {
+            "mode": "selected",
+            "camera_ids": [_CAMERA],
+        }
         assert not errors
