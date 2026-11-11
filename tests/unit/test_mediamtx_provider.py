@@ -260,7 +260,6 @@ def test_concurrent_health_and_history_share_one_native_version_probe() -> None:
         release.set()
 
 
-
 def test_native_read_admission_survives_unrelated_default_executor_saturation() -> None:
     """History may not queue behind unrelated camera/storage thread-pool jobs."""
     from concurrent.futures import ThreadPoolExecutor
@@ -287,7 +286,10 @@ def test_native_read_admission_survives_unrelated_default_executor_saturation() 
         blocker = loop.run_in_executor(None, hold_default_executor)
         provider = _provider(request, timeout_seconds=2.0)
         try:
-            await asyncio.sleep(0.03)
+            for _ in range(100):
+                if occupied.is_set():
+                    break
+                await asyncio.sleep(0.01)
             assert occupied.is_set()
             assert await asyncio.wait_for(provider.playback_spans(_BINDING), 1.5) == ()
             assert routes == ["/v3/info", "/list"]
@@ -298,7 +300,6 @@ def test_native_read_admission_survives_unrelated_default_executor_saturation() 
             pool.shutdown(wait=True)
 
     asyncio.run(scenario())
-
 
 
 def test_cancelled_version_waiter_and_shutdown_join_native_probe() -> None:
