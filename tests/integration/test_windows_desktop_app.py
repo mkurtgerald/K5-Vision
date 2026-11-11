@@ -419,6 +419,36 @@ def _installer_page_signature(api, controls):
     )
 
 
+def _installer_timeout_activity(process):
+    """Bounded process-only witness for a graphical Setup deadline failure.
+
+    Never inspect command lines, filenames, handles, environment or output:
+    these may expose an owner's install location or other private material.
+    CPU time distinguishes an extraction-heavy pre-wizard stall from a process
+    that spent the same interval without doing measurable work.
+    """
+    try:
+        root = psutil.Process(process.pid)
+        processes = [root, *root.children(recursive=True)]
+        seconds = 0.0
+        observed = 0
+        for item in processes[:64]:
+            try:
+                usage = item.cpu_times()
+                seconds += usage.user + usage.system
+                observed += 1
+            except (psutil.Error, OSError):
+                continue
+        return {
+            "observed_processes": observed,
+            "processes_capped": len(processes) > 64,
+            "aggregate_cpu_seconds": round(min(seconds, 3600.0), 2),
+            "root_running": root.is_running(),
+        }
+    except (psutil.Error, OSError):
+        return {"observation": "unavailable"}
+
+
 def _install_gui(setup, installed, api, *, diagnostic=None):
     """Drive the actual Inno wizard without suppressing its user interface."""
     __tracebackhide__ = True
@@ -446,7 +476,9 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
     last_next_page = None
     try:
         while process.poll() is None:
-            _require(time.monotonic() < deadline, "Actual installer wizard exceeded its deadline")
+            if time.monotonic() >= deadline:
+                diagnostic["installer_timeout_activity"] = _installer_timeout_activity(process)
+                pytest.fail("Actual installer wizard exceeded its deadline", pytrace=False)
             root = psutil.Process(process.pid)
             pids = {root.pid, *(child.pid for child in root.children(recursive=True))}
             forms = [window for window in api.windows() if api.pid(window) in pids]
