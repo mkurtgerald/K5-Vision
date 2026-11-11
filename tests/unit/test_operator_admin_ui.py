@@ -523,7 +523,8 @@ def test_changed_camera_inventory_keeps_grant_controls_attached_and_scoped(works
         assert original_node.evaluate("(input) => input.isConnected")
         assert original_node.evaluate("(input) => input.checked")
         assert selection.is_checked()
-        assert not page.locator(f'#admin-camera-choices input[value="{new_id}"]').is_checked()
+        new_choice = page.locator(f'#admin-camera-choices input[value="{new_id}"]')
+        assert not new_choice.is_checked()
 
         # Selecting by position during an inventory update previously changed
         # the wrong grant when renderCameraChoices replaced all input nodes.
