@@ -520,9 +520,7 @@ def test_assembled_operator_product_login_live_recording_logout_and_restart(
             # request, response body, credentials, paths or source addresses.
             health_class = "unreachable"
             try:
-                health_status, _body, _headers = _Client(product_ports[0]).get(
-                    "/api/v1/health"
-                )
+                health_status, _body, _headers = _Client(product_ports[0]).get("/api/v1/health")
                 health_class = "healthy" if health_status == 200 else "non_200"
             except RuntimeError:
                 pass
