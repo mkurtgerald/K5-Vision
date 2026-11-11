@@ -15,6 +15,8 @@ import json
 import math
 import re
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -338,6 +340,12 @@ class MediaMTXProvider:
         self._max_bytes = max_response_bytes
         self._max_active = max_active_requests
         self._requester = requester
+        # The generic asyncio pool also runs camera, inventory and storage
+        # operations; prevent its saturation from delaying native history reads.
+        # The existing admission bound remains the only request concurrency cap.
+        self._native_read_executor = ThreadPoolExecutor(
+            max_workers=max_active_requests, thread_name_prefix="k5-native-read"
+        )
         self._requests: set[asyncio.Task] = set()
         self._version_admitted = False
         self._info_task: asyncio.Task[MediaWorkerInfo] | None = None
@@ -391,7 +399,12 @@ class MediaMTXProvider:
             raise MediaWorkerError(MediaWorkerErrorCode.UNAVAILABLE)
         if len(self._requests) >= self._max_active:
             raise MediaWorkerError(MediaWorkerErrorCode.BUSY)
-        task = asyncio.create_task(asyncio.to_thread(self._read, origin, route))
+        async def native_read():
+            return await asyncio.get_running_loop().run_in_executor(
+                self._native_read_executor, copy_context().run, self._read, origin, route
+            )
+
+        task = asyncio.create_task(native_read())
         self._requests.add(task)
         task.add_done_callback(self._completed)
         timed_out = False
@@ -556,6 +569,9 @@ class MediaMTXProvider:
             await asyncio.gather(
                 *(asyncio.shield(task) for task in requests), return_exceptions=True
             )
+        # Every credential-bearing request has returned before worker teardown.
+        # Do not cancel queued reads or release an in-flight native API lease.
+        self._native_read_executor.shutdown(wait=True, cancel_futures=False)
 
     async def aclose(self) -> None:
         """Close admission and join every real native read before releasing ownership."""
