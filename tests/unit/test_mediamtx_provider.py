@@ -216,6 +216,89 @@ def test_failed_explicit_version_check_revokes_previous_admission() -> None:
     asyncio.run(scenario())
 
 
+
+def test_concurrent_health_and_history_share_one_native_version_probe() -> None:
+    started, release = threading.Event(), threading.Event()
+    routes = []
+
+    def request(native, *_):
+        path = urlsplit(native.full_url).path
+        routes.append(path)
+        if path == "/v3/info":
+            started.set()
+            assert release.wait(2)
+            return _info()
+        if path == "/list":
+            return b"[]"
+        raise AssertionError("Unexpected native media request")
+
+    async def scenario():
+        provider = _provider(request)
+        health = asyncio.create_task(provider.info())
+        await asyncio.wait_for(asyncio.to_thread(started.wait), 1)
+        parallel_health = asyncio.create_task(provider.info())
+        history = asyncio.create_task(provider.playback_spans(_BINDING))
+        await asyncio.sleep(0.03)
+        assert routes == ["/v3/info"]
+        assert not any(task.done() for task in (health, parallel_health, history))
+        assert provider._version_admitted is False
+        release.set()
+        first, second, spans = await asyncio.wait_for(
+            asyncio.gather(health, parallel_health, history), 2
+        )
+        assert first.version == second.version == MEDIAMTX_VERSION
+        assert spans == ()
+        assert routes == ["/v3/info", "/list"]
+        # A later explicit health check is not cached: it verifies the
+        # running native worker's version again after the shared probe.
+        await provider.info()
+        assert routes == ["/v3/info", "/list", "/v3/info"]
+        await provider.aclose()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+
+
+def test_cancelled_version_waiter_and_shutdown_join_native_probe() -> None:
+    started, release = threading.Event(), threading.Event()
+
+    def request(native, *_):
+        assert urlsplit(native.full_url).path == "/v3/info"
+        started.set()
+        assert release.wait(2)
+        return _info()
+
+    async def scenario():
+        provider = _provider(request)
+        first = asyncio.create_task(provider.info())
+        await asyncio.wait_for(asyncio.to_thread(started.wait), 1)
+        cancelled = asyncio.create_task(provider.info())
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        assert not first.done()
+        shutdown = asyncio.create_task(provider.aclose())
+        await asyncio.sleep(0.03)
+        assert not shutdown.done()
+        release.set()
+        with pytest.raises(MediaWorkerError) as raised:
+            await first
+        assert raised.value.code is MediaWorkerErrorCode.UNAVAILABLE
+        await asyncio.wait_for(shutdown, 2)
+        assert not provider._requests
+        with pytest.raises(MediaWorkerError) as closed:
+            await provider.info()
+        assert closed.value.code is MediaWorkerErrorCode.UNAVAILABLE
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+
+
 @pytest.mark.parametrize("field", ["tracks2", "readers"])
 @pytest.mark.parametrize("malformed", [False, 0, {}, ""])
 def test_malformed_empty_path_collections_are_not_coerced_to_lists(field, malformed) -> None:
