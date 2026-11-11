@@ -148,9 +148,7 @@ class UserSessionManager:
             self._user_tokens[account.id] = digest
         return token, expires_at
 
-    async def resolve(
-        self, token: str, *, executor: Executor | None = None
-    ) -> UserAccount | None:
+    async def resolve(self, token: str, *, executor: Executor | None = None) -> UserAccount | None:
         """Resolve current authority without blocking the HTTP event loop."""
         if not self._token_is_valid(token):
             return None
