@@ -216,7 +216,6 @@ def test_failed_explicit_version_check_revokes_previous_admission() -> None:
     asyncio.run(scenario())
 
 
-
 def test_concurrent_health_and_history_share_one_native_version_probe() -> None:
     started, release = threading.Event(), threading.Event()
     routes = []
