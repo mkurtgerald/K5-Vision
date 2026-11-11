@@ -218,9 +218,7 @@ def install_operator_integrations_api(
                 machine_token(request),
                 payload.supported_versions,
             )
-            await run_in_threadpool(
-                audit, "integration.handshake", connection_id, connection_id
-            )
+            await run_in_threadpool(audit, "integration.handshake", connection_id, connection_id)
             return result
         except (OperatorIntegrationError, IntegrationContractError) as error:
             raise refuse(error) from None
@@ -257,9 +255,7 @@ def install_operator_integrations_api(
                 payload,
                 known_camera=known,
             )
-            await run_in_threadpool(
-                audit, "integration.response", connection_id, connection_id
-            )
+            await run_in_threadpool(audit, "integration.response", connection_id, connection_id)
             return result
         except (OperatorIntegrationError, IntegrationContractError) as error:
             raise refuse(error) from None
@@ -277,9 +273,7 @@ def install_operator_integrations_api(
                 payload,
                 known_camera=known,
             )
-            await run_in_threadpool(
-                audit, "integration.event", connection_id, connection_id
-            )
+            await run_in_threadpool(audit, "integration.event", connection_id, connection_id)
             return result
         except (OperatorIntegrationError, IntegrationContractError) as error:
             if str(error) == "integration_source_clock_ahead":
