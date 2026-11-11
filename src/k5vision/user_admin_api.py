@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from functools import partial
 from hmac import compare_digest
 from math import ceil
@@ -311,7 +312,7 @@ def install_user_admin_api(
 
     async def login_worker(operation, *args, **kwargs):
         return await asyncio.get_running_loop().run_in_executor(
-            login_executor, partial(operation, *args, **kwargs)
+            login_executor, copy_context().run, partial(operation, *args, **kwargs)
         )
     application.add_middleware(_BoundedUserRequestBody, max_bytes=max_request_bytes)
     application.state.user_registry = registry

@@ -7,6 +7,7 @@ import hashlib
 import secrets
 from collections.abc import Callable
 from concurrent.futures import Executor
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from time import monotonic
@@ -179,7 +180,11 @@ class UserSessionManager:
                 )
             else:
                 worker = asyncio.get_running_loop().run_in_executor(
-                    executor, self._resolve_account, record.account, record.credential_version
+                    executor,
+                    copy_context().run,
+                    self._resolve_account,
+                    record.account,
+                    record.credential_version,
                 )
             try:
                 current = await asyncio.shield(worker)
