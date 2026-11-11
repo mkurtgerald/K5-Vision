@@ -172,11 +172,12 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
     verified = []
     cleanup_failed = False
     phase = "baseline_setup"
+    installer_diagnostic = {}
     health_statuses = set()
     readiness_attempts = 0
     last_health_transport = None
     try:
-        d._install_gui(baseline, installed, api)
+        d._install_gui(baseline, installed, api, diagnostic=installer_diagnostic)
         _assert_installed(installed, old_head, old_launcher)
         client = runtime._Client(port)
 
@@ -263,7 +264,8 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
         verified.append("live_upgrade_refused")
 
         phase = "candidate_install"
-        d._install_gui(candidate, installed, api)
+        installer_diagnostic.clear()
+        d._install_gui(candidate, installed, api, diagnostic=installer_diagnostic)
         _assert_installed(installed, new_head, new_launcher)
         assert _installed_payload_check(installed) == 0
         # A changed installed licensing byte must fail the same admission used
@@ -305,7 +307,8 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
         verified.append("candidate_uninstall_preserved_profile")
 
         phase = "reversal_install"
-        d._install_gui(baseline, installed, api)
+        installer_diagnostic.clear()
+        d._install_gui(baseline, installed, api, diagnostic=installer_diagnostic)
         _assert_installed(installed, old_head, old_launcher)
         assert_preserved()
         phase = "reversal_login"
@@ -329,6 +332,24 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
                 {
                     "phase": phase,
                     "verified_steps": verified,
+                    "installer": {
+                        "action": installer_diagnostic.get("installer_action"),
+                        "install_posted": bool(
+                            installer_diagnostic.get("installer_install_posted", False)
+                        ),
+                        "next_clicks": installer_diagnostic.get("installer_next_clicks", 0),
+                        "modal_visible": bool(
+                            installer_diagnostic.get("installer_modal_visible", False)
+                        ),
+                        "modal_class": installer_diagnostic.get(
+                            "installer_modal_classification", "none"
+                        ),
+                        "seal_class": installer_diagnostic.get(
+                            "installer_seal_refusal_category", "none"
+                        ),
+                        "steps_seen": installer_diagnostic.get("installer_steps_seen", []),
+                        "exit_code": installer_diagnostic.get("installer_exit_code"),
+                    },
                     "health_http_statuses": sorted(health_statuses),
                     "readiness_attempts": readiness_attempts,
                     "last_health_transport": last_health_transport,
