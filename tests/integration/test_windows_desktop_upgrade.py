@@ -349,6 +349,9 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
                         ),
                         "steps_seen": installer_diagnostic.get("installer_steps_seen", []),
                         "exit_code": installer_diagnostic.get("installer_exit_code"),
+                        "timeout_activity": installer_diagnostic.get(
+                            "installer_timeout_activity", {"observation": "not_applicable"}
+                        ),
                     },
                     "health_http_statuses": sorted(health_statuses),
                     "readiness_attempts": readiness_attempts,
