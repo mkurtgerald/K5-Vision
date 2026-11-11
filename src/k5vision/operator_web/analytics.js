@@ -176,10 +176,10 @@
     function renderEvents() {
       // Five-second polling must not detach an unchanged event while the
       // operator is targeting its Play recording button.
-      const signature = JSON.stringify(events.map((event) => [
+      const signature = JSON.stringify([version, events.map((event) => [
         event.id, event.camera_id, event.occurred_at, event.playback_at,
         event.confidence, event.person_count,
-      ]));
+      ])]);
       if (signature === renderedEventSignature) {
         eventCount.textContent = String(events.length);
         olderButton.hidden = !before || events.length >= MAX_EVENTS;
@@ -382,14 +382,19 @@
       if (next?.start === range?.start && next?.end === range?.end) return;
       stopRequests(); range = next; events = []; before = null; loadedOlder = false;
       eventRange.textContent = range ? `${utcLabel(range.start)} → ${utcLabel(range.end)}` : "Events follow the recording history time range. All times UTC.";
-      renderEvents(); message(eventMessage, "Choose a recording time range to see person events.");
+      renderEvents(); renderProviderEvents();
+      message(eventMessage, "Choose a recording time range to see person events.");
+      // Preserve the visible event navigation while the new range's network
+      // refresh is pending; those callbacks must bind the new request epoch.
       if (visible && camera) void refresh();
     }
 
     function setVisible(value) {
       if (destroyed || visible === Boolean(value)) return;
       stopRequests(); visible = Boolean(value); container.hidden = !visible || !camera;
-      controls();
+      // Rebinding on visibility restoration prevents a prior epoch from
+      // silently discarding a click before the next events request completes.
+      renderEvents(); renderProviderEvents(); controls();
       if (visible && camera) void refresh();
     }
 
