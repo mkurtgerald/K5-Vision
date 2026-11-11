@@ -9,6 +9,8 @@
   const DAY = 86400000;
   const TIME_SAMPLE_MAX_AGE = 30000;
   const RETRY_DELAYS = [1000, 2000, 4000, 8000, 10000];
+  const PERSON_BUFFER_GRACE_MS = 5000;
+  const CAMERA_PROFILE_REQUEST_MS = 20000;
   const ROLE_PERMISSIONS = Object.freeze({
     viewer: ["cameras.view_live", "cameras.playback"],
     operator: ["cameras.view_live", "cameras.playback", "cameras.export"],
@@ -47,7 +49,7 @@
     view: "wall", sessionEpoch: 0, selectionEpoch: 0, requests: new Set(),
     hls: null, nativeLive: false, hlsScript: null, retryTimer: null, retryCount: 0,
     mediaAuthRefreshUsed: false,
-    pollTimer: null, expiryTimer: null, selectionController: null,
+    pollTimer: null, cameraPollController: null, expiryTimer: null, selectionController: null,
     spans: [], selectedSpan: null, historyEpoch: 0, historyLoad: null, historyRolling: true, signingOut: false,
     eventSeekEpoch: 0,
     dialogMode: "add", cameraSetupEpoch: 0, diagnostics: null, statusUnavailable: false,
@@ -57,8 +59,9 @@
     recorderTime: null, sessionExpiresAt: null, sessionExpirySteady: null,
     removeTarget: null, removing: false,
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
+    personBufferTimer: null, personTransient503: 0,
     personFrameId: 0,
-    recordingBusy: false, cameraListEpoch: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
+    recordingBusy: false, cameraListEpoch: 0, cameraInventoryFreshAt: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
     playbackStart: null, playbackEnd: null, playbackPosition: null, playbackEpoch: 0, selectedStatus: null,
     playbackPrefetch: null, playbackObjectUrl: null, playbackRate: 1,
     exportEpoch: 0, exportController: null, exportJob: null, exportDownloadAllowed: false,
@@ -368,8 +371,19 @@
     video.load();
   }
 
-  function stopLive(resetRetries = true) {
-    stopPersonView();
+  function stopLive(resetRetries = true, preserveInFlightPerson = false) {
+    const camera = currentCamera();
+    // A same-camera HLS decoder restart cannot revoke an already authorized,
+    // immutable sampled-frame POST. Preserve only an in-flight request during
+    // a bounded automatic reconnect; deliberate teardown and loss of camera,
+    // session, permission or worker authority still abort immediately.
+    if (!(preserveInFlightPerson && state.personEnabled && state.personController
+      && state.token && !state.signingOut && !state.securityTransition
+      && state.capabilitiesResolved && allowed("cameras.view_live")
+      && state.view === "live" && camera?.analytics_status === "configured"
+      && statusDetails(camera).style === "online" && state.workerStatus !== "unavailable")) {
+      stopPersonView();
+    }
     clearTimeout(state.retryTimer);
     state.retryTimer = null;
     state.nativeLive = false;
@@ -414,6 +428,7 @@
     cameraAnalytics?.clear();
     cancelExport();
     resetActivation();
+    state.cameraInventoryFreshAt = 0;
     state.sessionEpoch += 1;
     state.selectionEpoch += 1;
     state.historyEpoch += 1;
@@ -682,11 +697,11 @@
     renderOverview();
   }
 
-  async function refreshDiagnostics() {
+  async function refreshDiagnostics(signal = null) {
     if (!state.token || state.securityTransition) return;
     const epoch = state.sessionEpoch;
     try {
-      const diagnostics = await request("/api/v1/operator/status");
+      const diagnostics = await request("/api/v1/operator/status", { signal });
       if (epoch !== state.sessionEpoch) return;
       if (!diagnostics || !["ready", "unavailable", "disk_full"].includes(diagnostics.worker_status)) throw new ApiError(503);
       state.diagnostics = diagnostics;
@@ -717,13 +732,47 @@
     if (state.token) setView("wall", false);
   }
 
-  async function refreshCameras(selectFirst = false) {
+  async function refreshCameras(selectFirst = false, signal = null) {
     if (!state.token || state.securityTransition) return;
     const epoch = state.sessionEpoch;
     const navigationEpoch = state.navigationEpoch;
     const cameraListEpoch = ++state.cameraListEpoch;
     try {
-      const data = await request("/api/v1/operator/cameras");
+      let data;
+      try {
+        data = await request("/api/v1/operator/cameras", { signal });
+      } catch (error) {
+        // A stalled inventory query is not proof of revoked account authority.
+        // Only preserve an existing session when independently reauthorized;
+        // explicit denials, changed grants and malformed data still fail closed.
+        const temporary = [429, 502, 503, 504].includes(error.status)
+          || error.name === "TimeoutError" || error instanceof TypeError;
+        const inventoryAge = performance.now() - state.cameraInventoryFreshAt;
+        if (!temporary || !state.capabilitiesResolved || !state.account
+          || state.cameraInventoryFreshAt <= 0 || inventoryAge > 30000
+          || state.signingOut || state.securityTransition) throw error;
+        try {
+          const verified = await request("/api/v1/operator/capabilities", { timeout: 4000, signal });
+          if (epoch !== state.sessionEpoch || cameraListEpoch !== state.cameraListEpoch
+            || !state.token || state.signingOut || state.securityTransition) return;
+          const previous = state.account;
+          const sameCameraGrant = JSON.stringify(verified?.account?.camera_access ?? null)
+            === JSON.stringify(previous.camera_access ?? null);
+          const sameRolePolicy = (verified?.account?.role_profile_id ?? null)
+            === (previous.role_profile_id ?? null);
+          const samePermissions = Array.isArray(verified?.effective_permissions)
+            && JSON.stringify([...verified.effective_permissions].sort())
+              === JSON.stringify([...(previous.effective_permissions || [])].sort());
+          if (!sameCameraGrant || !sameRolePolicy || !samePermissions) throw new ApiError(403);
+          resolveCapabilities(verified);
+          $("camera-list-message").textContent =
+            "Camera list unavailable. Account access reverified; retrying inventory.";
+          return false;
+        } catch (_) {
+          // Do not use stale grants if independent account proof fails.
+          throw error;
+        }
+      }
       if (epoch !== state.sessionEpoch || cameraListEpoch !== state.cameraListEpoch) return;
       if (!Array.isArray(data.cameras)) throw new ApiError(503);
       const restoreWall = !state.capabilitiesResolved;
@@ -731,6 +780,7 @@
       state.workerStatus = ["ready", "unavailable", "disk_full"].includes(data.worker_status) ? data.worker_status : "ready";
       renderWorkerStatus();
       state.cameras = data.cameras.filter((camera) => camera && typeof camera.device_id === "string" && typeof camera.name === "string");
+      state.cameraInventoryFreshAt = performance.now();
       administration?.refreshCameras();
       settings?.refreshCameras();
       renderCameras();
@@ -753,7 +803,26 @@
     clearTimeout(state.pollTimer);
     if (!state.token || state.securityTransition) return;
     state.pollTimer = setTimeout(async () => {
-      await Promise.all([refreshCameras(), refreshDiagnostics()]);
+      // Native cold-start inference competes with four live decoders on
+      // Windows. Do not let an unrelated inventory timeout revoke an
+      // in-flight immutable, server-reauthorized person frame. This skips
+      // only background polling until the bounded request completes; login,
+      // session expiry, explicit security changes and media authorization
+      // continue to revoke immediately.
+      if (state.personController) {
+        scheduleCameraPoll();
+        return;
+      }
+      const controller = new AbortController();
+      state.cameraPollController = controller;
+      try {
+        await Promise.all([
+          refreshCameras(false, controller.signal),
+          refreshDiagnostics(controller.signal),
+        ]);
+      } finally {
+        if (state.cameraPollController === controller) state.cameraPollController = null;
+      }
       scheduleCameraPoll();
     }, 3000);
   }
@@ -823,16 +892,19 @@
 
   function scheduleLiveRetry(epoch, reason) {
     if (epoch !== state.selectionEpoch || !state.token || state.view !== "live") return;
-    stopLive(false);
     if (state.retryCount >= RETRY_DELAYS.length) {
+      // Exhausted retries are a real stop, not transient buffering. Revoke the
+      // frozen frame, clear its overlay and refuse another in-flight request.
+      stopLive(false);
       livePlaceholder("Live view disconnected", "The connection could not be restored. Recording history may still be available.", true);
       message("live-state", "Disconnected · Select reconnect to try again");
       return;
     }
+    stopLive(false, true);
     const delay = RETRY_DELAYS[state.retryCount++];
     livePlaceholder("Reconnecting", reason);
     message("live-state", `Reconnecting · Attempt ${state.retryCount} of ${RETRY_DELAYS.length}`);
-    state.retryTimer = setTimeout(() => void startLive(epoch), delay);
+    state.retryTimer = setTimeout(() => void startLive(epoch, true), delay);
   }
 
   async function recoverMediaAccess(epoch) {
@@ -884,9 +956,12 @@
 
   function stopPersonView(reason = "Select Start sampled view while live video is playing. Samples are processed locally and are not saved.") {
     state.personEnabled = false;
+    state.personTransient503 = 0;
     state.personEpoch += 1;
     clearTimeout(state.personTimer);
     state.personTimer = null;
+    clearTimeout(state.personBufferTimer);
+    state.personBufferTimer = null;
     state.personController?.abort();
     state.personController = null;
     const canvas = $("person-view-canvas");
@@ -904,6 +979,17 @@
   async function samplePerson(epoch) {
     if (!state.personEnabled || epoch !== state.personEpoch) return;
     if (!canSamplePerson()) {
+      const camera = currentCamera();
+      // A retry after HTTP 429 can land while HLS is briefly rebuffering.
+      // Honor the existing five-second stalled-video guard instead of ending
+      // the authenticated sampling session before that guard can decide.
+      // Do not capture pixels or submit a request without decoded live video.
+      if (state.personBufferTimer !== null && state.token && !state.signingOut
+        && state.view === "live" && camera?.analytics_status === "configured"
+        && statusDetails(camera).style === "online" && state.workerStatus !== "unavailable") {
+        state.personTimer = setTimeout(() => void samplePerson(epoch), 250);
+        return;
+      }
       stopPersonView("Sampled view stopped while live video is unavailable. Start it again when video returns.");
       return;
     }
@@ -918,6 +1004,7 @@
     let snapshot = null;
     let pixels = null;
     const controller = new AbortController();
+    let busyRetryDelayMs = null;
     state.personController = controller;
     try {
       const context = capture.getContext("2d", { willReadFrequently: true });
@@ -934,17 +1021,33 @@
       const frameId = state.personFrameId = (state.personFrameId + 1) % 2147483648;
       const query = new URLSearchParams({ width: String(width), height: String(height), frame_id: String(frameId) });
       const result = await request(`/api/v1/operator/cameras/${encodeURIComponent(cameraId)}/person-view?${query}`, {
-        method: "POST", rawBody: pixels, signal: controller.signal,
+        method: "POST", rawBody: pixels, signal: controller.signal, timeout: 24000,
       });
-      if (epoch !== state.personEpoch || !state.personEnabled || cameraId !== state.selected || !canSamplePerson()) return;
+      // This immutable frame may finish during a transient HLS rebuffer.
+      // Preserve the selected camera, analytics and session validity checks;
+      // stream teardown and sign-out still abort the pending request.
+      const selectedCamera = currentCamera();
+      if (epoch !== state.personEpoch || !state.personEnabled || cameraId !== state.selected
+        || !state.token || state.signingOut || state.view !== "live"
+        || selectedCamera?.analytics_status !== "configured"
+        || statusDetails(selectedCamera).style !== "online"
+        || state.workerStatus === "unavailable") return;
       if (!result || result.frame_id !== frameId || !["active", "busy", "unavailable"].includes(result.status)
-        || !Array.isArray(result.boxes) || result.boxes.length > 32 || !result.boxes.every(validPersonBox)) throw new ApiError(503);
+        || !Array.isArray(result.boxes) || result.boxes.length > 32 || !result.boxes.every(validPersonBox)) throw new ApiError(503, "person_contract_invalid");
       if (result.status === "unavailable") {
         stopPersonView("Person detection is unavailable. Live video and recording continue. Start sampled view to retry.");
         return;
       }
-      if (result.status === "busy") message("person-view-message", "Person detection is busy. Waiting for the next sample…");
-      else {
+      if (result.status === "busy") {
+        // A compiling native worker should not be flooded with raw frame uploads.
+        busyRetryDelayMs = 1500;
+        // Busy has no boxes. Never erase the last valid frozen-frame overlay
+        // while another native worker owns inference capacity.
+        if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
+      } else {
+        // Only a genuine active response resets the bounded transient-error
+        // budget. Alternating HTTP 429/503 cannot retry without limit.
+        state.personTransient503 = 0;
         // The response belongs to this exact frozen sample, never the moving
         // live player. Publish frame and boxes together in one canvas update.
         const canvas = $("person-view-canvas");
@@ -963,26 +1066,40 @@
       }
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.personEpoch || !state.token) return;
-      if (error.status === 429) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
-      else stopPersonView(apiMessage(error, "Person detection is unavailable. Live video and recording continue. Start sampled view to retry."));
+      if (error.status === 429) {
+        // Preserve finite polling, but give cold native compilation CPU room.
+        busyRetryDelayMs = 1500;
+        if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
+      } else if (error.status === 503 && error.code !== "person_contract_invalid"
+        && state.personTransient503 < 2 && canSamplePerson()) {
+        // A transient local service fault must not permanently disable an
+        // otherwise healthy installed view after one request. Retry at most
+        // twice; malformed successful responses still fail closed immediately.
+        // Each request owns a fresh frame and is reauthorized server-side.
+        state.personTransient503 += 1;
+        if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is temporarily unavailable. Retrying…");
+      } else {
+        stopPersonView(apiMessage(error, "Person detection is unavailable. Live video and recording continue. Start sampled view to retry."));
+      }
     } finally {
       pixels?.fill(0);
       snapshot?.data.fill(0);
       capture.width = 0; capture.height = 0;
       if (state.personController === controller) state.personController = null;
       if (state.personEnabled && epoch === state.personEpoch) {
-        state.personTimer = setTimeout(() => void samplePerson(epoch), Math.max(0, 500 - (performance.now() - began)));
+        state.personTimer = setTimeout(() => void samplePerson(epoch),
+          busyRetryDelayMs ?? Math.max(0, 500 - (performance.now() - began)));
       }
     }
   }
 
-  async function startLive(epoch = state.selectionEpoch) {
+  async function startLive(epoch = state.selectionEpoch, preserveInFlightPerson = false) {
     if (!state.media || state.view !== "live" || !state.token) return;
     const url = state.media.live_url;
     try {
       await ensureHls();
       if (epoch !== state.selectionEpoch || state.view !== "live" || !state.token || state.signingOut) return;
-      stopLive(false);
+      stopLive(false, preserveInFlightPerson);
       livePlaceholder("Opening live view", "Waiting for camera video…");
       const video = $("live-video");
       video.muted = true;
@@ -1917,13 +2034,61 @@
   $("play-live").addEventListener("click", () => void $("live-video").play().catch(() => message("live-state", "Unable to play live video. Try reconnecting.")));
   $("live-video").addEventListener("playing", () => {
     if (!state.token || state.view !== "live") return;
+    // A transient HLS rebuffer must not abort an immutable person-frame POST.
+    clearTimeout(state.personBufferTimer);
+    state.personBufferTimer = null;
     $("live-placeholder").hidden = true; $("live-video-label").hidden = false; $("play-live").hidden = true;
     message("live-state", "Live video connected");
     renderPersonControls();
   });
-  $("live-video").addEventListener("pause", () => { if (state.personEnabled) stopPersonView("Sampled view stopped while live video is paused."); });
+  $("live-video").addEventListener("pause", () => {
+    if (!state.personEnabled) return;
+    if (state.personController) {
+      // Chrome/HLS can emit pause during buffering after the immutable frame
+      // was submitted. Preserve that one request: playback teardowns still
+      // call stopPersonView() themselves and abort it immediately.
+      const epoch = state.personEpoch;
+      const video = $("live-video");
+      if (state.personBufferTimer === null) {
+        const frames = video.getVideoPlaybackQuality?.().totalVideoFrames;
+        state.personBufferTimer = setTimeout(() => {
+          state.personBufferTimer = null;
+          checkPersonBuffer(epoch, video, frames);
+        }, PERSON_BUFFER_GRACE_MS);
+      }
+      return;
+    }
+    stopPersonView("Sampled view stopped while live video is paused.");
+  });
+  function checkPersonBuffer(epoch, video, frames) {
+    if (!state.personEnabled || state.personEpoch !== epoch) return;
+    const current = video.getVideoPlaybackQuality?.().totalVideoFrames;
+    if (video.paused || video.readyState < 2 || !Number.isFinite(frames)
+      || !Number.isFinite(current) || current <= frames) {
+      if (state.personController) {
+        // An immutable sample is already in flight. Buffering the subsequent
+        // live frames must not abort its authenticated, bounded inference.
+        // Session revocation, camera changes and actual stream teardown still
+        // call stopPersonView() and abort it immediately.
+        state.personBufferTimer = setTimeout(() => {
+          state.personBufferTimer = null;
+          checkPersonBuffer(epoch, video, frames);
+        }, 1000);
+      } else {
+        stopPersonView("Sampled view stopped while live video is buffering. Start it again when video returns.");
+      }
+    }
+  }
   $("live-video").addEventListener("waiting", () => {
-    if (state.personEnabled) stopPersonView("Sampled view stopped while live video is buffering. Start it again when video returns.");
+    if (state.personEnabled && state.personBufferTimer === null) {
+      const epoch = state.personEpoch;
+      const video = $("live-video");
+      const frames = video.getVideoPlaybackQuality?.().totalVideoFrames;
+      state.personBufferTimer = setTimeout(() => {
+        state.personBufferTimer = null;
+        checkPersonBuffer(epoch, video, frames);
+      }, PERSON_BUFFER_GRACE_MS);
+    }
     if (state.token && state.view === "live") {
       $("live-video-label").hidden = true;
       message("live-state", "Buffering live video…");
@@ -1933,9 +2098,14 @@
     if (state.personEnabled) { stopPersonView(); return; }
     if (!canSamplePerson()) return;
     state.personEnabled = true;
+    state.personTransient503 = 0;
     const epoch = ++state.personEpoch;
     renderPersonControls();
     message("person-view-message", "Processing a sampled frame…");
+    // Cancel background inventory/status reads already awaiting the service.
+    // Their AbortError paths cannot suspend account authority; the person POST
+    // independently reauthenticates and checks camera grants before/after.
+    state.cameraPollController?.abort();
     void samplePerson(epoch);
   });
   $("live-video").addEventListener("error", () => {
@@ -2318,6 +2488,9 @@
     try {
       const tested = await request(direct ? "/api/v1/operator/camera-stream-probe" : "/api/v1/operator/camera-profiles", {
         method: "POST", body: credentials, signal: controller.signal,
+        // Allow the bounded native ONVIF probe and 18-second proxy budget to finish.
+        // RTSP probe and all other API requests retain the normal 15-second limit.
+        ...(direct ? {} : { timeout: CAMERA_PROFILE_REQUEST_MS }),
       });
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       if (typeof tested.probe_id !== "string" || !tested.probe_id || tested.probe_id.length > 256 || tested.probe_id.includes("://") ||

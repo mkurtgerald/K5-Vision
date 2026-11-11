@@ -7,6 +7,7 @@ import hashlib
 import ipaddress
 import math
 import re
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress, StrictBool
+from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -326,6 +328,84 @@ def _media_selection(uri: str) -> str:
     return path
 
 
+class _NativePersonWarmupGate:
+    """Compile the optional sealed model only after camera setup has been quiet.
+
+    A busy installer may enroll several ONVIF cameras consecutively. Starting
+    CPU-heavy native model compilation after camera one can contend with camera
+    two's credential/profile deadline. Reset a six-second quiet interval on each
+    enrollment; keep optional view compilation behind the first recorded-person
+    event so a primed recorder still owns the first real-frame inference budget.
+    Only a timer is retained, never camera data, credentials or human identity.
+    """
+
+    def __init__(
+        self,
+        analytics,
+        *,
+        quiet_seconds: float = 6.0,
+        defer_preparation: Callable[[], bool] | None = None,
+    ):
+        if not 0 < quiet_seconds <= 30:
+            raise ValueError("Native preparation quiet period is invalid")
+        self._analytics = analytics
+        self._quiet_seconds = quiet_seconds
+        self._defer_preparation = defer_preparation
+        self._handle: asyncio.TimerHandle | None = None
+        self._started = False
+        self._closed = False
+
+    def schedule(self, *, enrollment: bool = False) -> None:
+        if self._closed or self._started:
+            return
+        if self._handle is not None:
+            if not enrollment:
+                return
+            self._handle.cancel()
+        self._handle = asyncio.get_running_loop().call_later(self._quiet_seconds, self._begin)
+
+    def _begin(self) -> None:
+        scheduled, self._handle = self._handle, None
+        if scheduled is not None:
+            scheduled.cancel()
+        if self._closed or self._started:
+            return
+        if self._defer_preparation is not None:
+            try:
+                waiting_for_first_event = self._defer_preparation()
+            except Exception:
+                # Optional preparation cannot consume native CPU while the
+                # recorder's authoritative event readiness is unknown.
+                waiting_for_first_event = True
+            if waiting_for_first_event:
+                # A requested view still uses its normal bounded cold path.
+                # The timer retains no camera, credentials, pixels or source.
+                self._handle = asyncio.get_running_loop().call_later(2.0, self._begin)
+                return
+        self._started = True
+        self._analytics.start_preparing()
+
+    def on_first_recorded_person_event(self) -> None:
+        """Start sealed preparation as soon as recording admits a real person.
+
+        Do not wait for the next timer poll. The installed browser's immutable
+        sampled-frame deadline is independent of recorder event detection.
+        """
+        if self._closed or self._started:
+            return
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+        self._started = True
+        self._analytics.start_preparing()
+
+    def close(self) -> None:
+        self._closed = True
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+
+
 def install_operator_product_api(
     app: FastAPI,
     *,
@@ -334,6 +414,7 @@ def install_operator_product_api(
     public_port: int,
     analytics=None,
     analytics_status: str = "disabled",
+    prepare_native_person_on_camera: bool = False,
     state_root: Path | None = None,
 ) -> None:
     """Install the local product contract without exposing execution credentials."""
@@ -341,6 +422,10 @@ def install_operator_product_api(
         raise ValueError("operator public port is invalid")
     if analytics_status not in {"disabled", "configured", "unavailable"}:
         raise ValueError("operator person view status is invalid")
+    if type(prepare_native_person_on_camera) is not bool or (
+        prepare_native_person_on_camera and analytics is None
+    ):
+        raise ValueError("operator person preparation configuration is invalid")
     person_status = "configured" if analytics is not None else analytics_status
     registry = app.state.device_registry
     users = app.state.user_registry
@@ -351,6 +436,18 @@ def install_operator_product_api(
         raise ValueError("operator accounts belong to another site")
     mutations = asyncio.Lock()
     person_slots = asyncio.Semaphore(4)
+    recorder_events = getattr(app.state, "operator_events", None)
+    defer_preparation = getattr(recorder_events, "awaiting_first_recorded_person_event", None)
+    native_person_preparation = (
+        _NativePersonWarmupGate(analytics, defer_preparation=defer_preparation)
+        if prepare_native_person_on_camera
+        else None
+    )
+    app.state.operator_person_preparation = native_person_preparation
+    if native_person_preparation is not None:
+        register_event = getattr(recorder_events, "notify_on_first_recorded_person_event", None)
+        if callable(register_event):
+            register_event(native_person_preparation.on_first_recorded_person_event)
     seen_live: set[UUID] = set()
     connection_started: dict[UUID, float] = {}
     recording_started: dict[UUID, float] = {}
@@ -774,7 +871,17 @@ def install_operator_product_api(
     @app.get(_PREFIX + "/status", tags=["operator"])
     async def operator_status(response: Response, _session: tuple[UserAccount, str] = read_session):
         response.headers["Cache-Control"] = "no-store"
-        return {**service.diagnostics(), "analytics_status": person_status}
+        report = {**service.diagnostics(), "analytics_status": person_status}
+        if prepare_native_person_on_camera and analytics is not None:
+            # Reveal only the finite sealed-worker phase to an authenticated
+            # operator. Never expose local model paths, exceptions or pixels.
+            phase = getattr(analytics, "preparation_phase", "unknown")
+            report["person_preparation_phase"] = (
+                phase
+                if phase in {"not_requested", "preparing", "ready", "failed", "closed"}
+                else "unknown"
+            )
+        return report
 
     @app.get(_PREFIX + "/cameras", tags=["operator"])
     async def list_cameras(response: Response, session: tuple[UserAccount, str] = read_session):
@@ -792,7 +899,7 @@ def install_operator_product_api(
         current, _ = await authenticate(session[1])
         selected = await asyncio.to_thread(permitted_selections, current)
 
-        return {
+        result = {
             "cameras": [
                 await camera_view(
                     source,
@@ -803,6 +910,11 @@ def install_operator_product_api(
             "worker_status": service.status(),
             "capabilities": await asyncio.to_thread(capabilities, current),
         }
+        # Do not compete with consecutive ONVIF credential/profile probes.
+        # The optional sealed model starts after a quiet camera setup interval.
+        if selected and native_person_preparation is not None:
+            native_person_preparation.schedule()
+        return result
 
     async def enroll_camera_source(
         *,
@@ -909,7 +1021,12 @@ def install_operator_product_api(
                 raise HTTPException(409, "Camera capacity reached") from None
             except (DeviceRegistryStorageError, RuntimeError, OSError, ValueError):
                 raise HTTPException(503, "Camera configuration unavailable") from None
-        return await camera_view(source)
+        result = await camera_view(source)
+        # A later enrollment resets the quiet period so native CPU model
+        # compilation cannot collide with the next camera's ONVIF probe.
+        if native_person_preparation is not None:
+            native_person_preparation.schedule(enrollment=True)
+        return result
 
     @app.post(_PREFIX + "/cameras", status_code=201, tags=["operator"])
     async def enroll_camera(
@@ -1094,7 +1211,11 @@ def install_operator_product_api(
             if declared != expected:
                 raise HTTPException(400, "Person view length does not match geometry")
         if person_slots.locked():
-            raise HTTPException(429, "Person view capacity is busy")
+            raise HTTPException(
+                429,
+                "Person view capacity is busy",
+                headers={"X-K5-Person-Phase": "capacity"},
+            )
         await person_slots.acquire()
         body = bytearray()
         try:
@@ -1112,6 +1233,36 @@ def install_operator_product_api(
                 raise HTTPException(400, "Person view upload unavailable") from None
             if len(body) != expected:
                 raise HTTPException(400, "Person view length does not match geometry")
+            if (
+                prepare_native_person_on_camera
+                and getattr(analytics, "preparation_phase", None) == "not_requested"
+            ):
+                # An authenticated first sample must receive a bounded 429
+                # *before* optional native model compilation can starve the
+                # control-plane event loop. Starlette starts this media-free
+                # preparation only after sending the retryable response.
+                # Never retain the sampled pixels or start work after a
+                # revoked session or changed camera grant.
+                current, _ = await authenticate(session[1])
+                await asyncio.to_thread(authorized_selection, current, device_id)
+
+                async def prepare_after_response() -> None:
+                    analytics.start_preparing()
+
+                return JSONResponse(
+                    {"detail": "Person view preparation is busy"},
+                    status_code=429,
+                    headers={
+                        "X-K5-Person-Phase": "preparing",
+                        "Cache-Control": "no-store",
+                    },
+                    background=BackgroundTask(prepare_after_response),
+                )
+            if prepare_native_person_on_camera:
+                # An authorized retry can recover one failed, media-free
+                # compilation without awaiting it inside the HTTP request.
+                analytics.start_preparing()
+            preparing_at_submission = bool(getattr(analytics, "preparation_pending", False))
             try:
                 result = await analytics.infer(
                     owner_id=_analytics_owner(session[1]),
@@ -1128,6 +1279,17 @@ def install_operator_product_api(
                 raise HTTPException(503, "Person view unavailable") from None
             current, _ = await authenticate(session[1])
             await asyncio.to_thread(authorized_selection, current, device_id)
+            if result.status == "busy" and (
+                preparing_at_submission or getattr(analytics, "preparation_pending", False)
+            ):
+                # A native compilation in progress is not a successful sampled
+                # detection. The browser retries HTTP 429 while the existing
+                # installed box deadline and camera-policy checks remain intact.
+                raise HTTPException(
+                    429,
+                    "Person view preparation is busy",
+                    headers={"X-K5-Person-Phase": "preparing"},
+                )
             response.headers["Cache-Control"] = "no-store"
             return value
         finally:

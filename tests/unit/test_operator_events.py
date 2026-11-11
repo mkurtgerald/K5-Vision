@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import os
 import sqlite3
 import subprocess
 import sys
 import threading
+from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -265,6 +267,7 @@ def test_background_sampling_persists_events_without_browser_and_cooldown_is_mon
             service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.7)
             await service.cycle()
             assert service.status(source.binding.device_id)["status"] == "active"
+            assert service.status(source.binding.device_id)["sample_phase"] == "person_detected"
             assert store.summary(source.binding.device_id)["event_count"] == 1
             clock[0] += 5
             sampler.when -= timedelta(hours=48)
@@ -276,11 +279,140 @@ def test_background_sampling_persists_events_without_browser_and_cooldown_is_mon
             assert len(rows) == 2 and rows[0]["occurred_at"] == "2026-10-26T12:00:00.000Z"
             assert rows[0]["person_count"] == 1
             assert service.status(source.binding.device_id)["processed_frames"] == 3
+            assert service.status(source.binding.device_id)["sample_attempts"] == 3
         finally:
             await service.aclose()
 
     asyncio.run(run())
     assert provider.closed
+
+
+@pytest.mark.parametrize(("cycle_seconds", "expected_sleep"), [(0.5, 1.5), (5.0, 0.0)])
+def test_recorded_person_sampler_does_not_wait_again_after_slow_native_cycle(
+    store, monkeypatch, cycle_seconds, expected_sleep
+):
+    # Synthetic elapsed time tests the production start-to-start cadence
+    # without sleeping or depending on hosted runner CPU timing.
+    import k5vision.operator_events as module
+
+    clock = [100.0]
+    service, _, _ = _service(store, _source(), clock=clock)
+    sleeps = []
+
+    async def simulated_cycle():
+        clock[0] += cycle_seconds
+        service._closing = True
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(service, "cycle", simulated_cycle)
+    monkeypatch.setattr(module.asyncio, "sleep", record_sleep)
+
+    async def run():
+        try:
+            await service._run()
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+    assert sleeps == [expected_sleep]
+
+
+def test_pending_native_capture_reports_finite_stage_without_exposing_source(store):
+    source = _source()
+    service, sampler, _ = _service(store, source)
+    camera_id = source.binding.device_id
+    service.configure(camera_id, enabled=True, confidence_threshold=0.5)
+    service._states[camera_id] = {"sample_phase": "capture_pending"}
+    service._native_pending = Future()
+    sampler._capture_outcome = "native_request"
+    assert service.status(camera_id)["sample_phase"] == "native_request"
+    assert service.status(camera_id)["last_completed_phase"] == "not_started"
+    sampler._capture_outcome = "private-sensitive-media-path"
+    assert service.status(camera_id)["sample_phase"] == "capture_pending"
+    service._native_pending.set_result(None)
+    assert service.status(camera_id)["sample_phase"] == "capture_pending"
+    asyncio.run(service.aclose())
+
+
+@pytest.mark.parametrize(
+    ("worker_phase", "expected"),
+    [
+        ("native_launch_failed", "native_worker_starting"),
+        ("native_write_failed", "native_request_writing"),
+        ("native_pipe_write_active", "native_pipe_write_active"),
+        ("native_pipe_flush_active", "native_pipe_flush_active"),
+        ("native_child_exited_before_request", "native_worker_exited"),
+        ("native_reply_missing", "native_reply_waiting"),
+        ("native_header_invalid", "native_header_reading"),
+        ("native_payload_incomplete", "native_payload_reading"),
+        ("native_reply_invalid", "native_reply_validating"),
+        ("native_decoder_active", "native_decoder_active"),
+        ("native_model_active", "native_model_active"),
+        ("native_inference_active", "native_inference_active"),
+        ("private-rtsp-uri-or-other-untrusted-phase", "native_request"),
+    ],
+)
+def test_pending_native_worker_distinguishes_bounded_inflight_stage(store, worker_phase, expected):
+    source = _source()
+    service, sampler, _ = _service(store, source)
+    camera_id = source.binding.device_id
+    service.configure(camera_id, enabled=True, confidence_threshold=0.5)
+    service._states[camera_id] = {"sample_phase": "capture_pending"}
+    service._native_pending = Future()
+    sampler._capture_outcome = "native_request"
+    sampler._worker = SimpleNamespace(_failure_phase=worker_phase)
+    try:
+        state = service.status(camera_id)
+        assert state["sample_phase"] == expected
+        assert state["last_completed_phase"] == "not_started"
+        assert "private" not in state["sample_phase"]
+    finally:
+        service._native_pending.set_result(None)
+        asyncio.run(service.aclose())
+
+
+@pytest.mark.parametrize(
+    ("child_phase", "expected"),
+    [
+        ("native_write_failed", "native_request_writing"),
+        ("native_pipe_write_active", "native_pipe_write_active"),
+        ("native_pipe_flush_active", "native_pipe_flush_active"),
+        ("native_model_active", "native_model_active"),
+        ("native_reply_missing", "native_reply_waiting"),
+    ],
+)
+def test_timed_out_capture_exposes_current_native_stage_without_changing_last_failure(
+    store, child_phase, expected
+):
+    source = _source()
+    service, sampler, _ = _service(store, source)
+    camera_id = source.binding.device_id
+    service.configure(camera_id, enabled=True, confidence_threshold=0.5)
+    service._states[camera_id] = {
+        "sample_phase": "native_pending",
+        "sample_attempts": 2,
+        "last_completed_phase": "native_write_failed",
+        "last_native_write_cause": "pending",
+    }
+    pending = Future()
+    service._native_pending = pending
+    sampler._capture_outcome = "native_request"
+    sampler._worker = SimpleNamespace(_failure_phase=child_phase)
+    try:
+        state = service.status(camera_id)
+        assert state["sample_phase"] == expected
+        assert state["last_completed_phase"] == "native_write_failed"
+        assert state["native_write_cause"] == "pending"
+        assert state["sample_attempts"] == 2
+        sampler._capture_outcome = "rtsp://private-source-with-credentials"
+        assert service.status(camera_id)["sample_phase"] == "native_pending"
+        service._states[camera_id]["sample_attempts"] = 0
+        assert service.status(camera_id)["sample_phase"] == "native_pending"
+    finally:
+        pending.set_result(None)
+        asyncio.run(service.aclose())
 
 
 def test_reconfigure_during_inference_discards_result(store):
@@ -359,6 +491,268 @@ def test_failed_native_provider_cleanup_retains_owner_and_refuses_another_launch
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("blocked_stage", ["write", "flush"])
+def test_native_pipe_block_reports_exact_bounded_stage(monkeypatch, tmp_path, blocked_stage):
+    """Installed Windows failures must distinguish pipe I/O from model startup.
+
+    Only a fixed phase is observed; no recording path, payload or error text
+    enters the authenticated diagnostic. The unchanged native deadline owns it.
+    """
+    import k5vision.operator_events as module
+
+    entered, release = threading.Event(), threading.Event()
+
+    class GatedPipe(io.BytesIO):
+        def write(self, data):
+            if blocked_stage == "write":
+                entered.set()
+                assert release.wait(3)
+            return super().write(data)
+
+        def flush(self):
+            if blocked_stage == "flush":
+                entered.set()
+                assert release.wait(3)
+            return super().flush()
+
+    class Child:
+        stdin = GatedPipe()
+        stdout = io.BytesIO(b'{"status":"empty"}\n')
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 0
+
+    worker = module._RecordedNativeWorker(None)
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", Child()))
+    results = []
+
+    def request():
+        try:
+            results.append(worker.request(tmp_path / "private-unused-snapshot.mp4"))
+        except BaseException as error:
+            results.append(type(error).__name__)
+
+    task = threading.Thread(target=request, daemon=True)
+    task.start()
+    try:
+        assert entered.wait(3)
+        assert worker._failure_phase == f"native_pipe_{blocked_stage}_active"
+        assert worker._native_write_cause == "pending"
+    finally:
+        release.set()
+        task.join(timeout=3)
+        assert not task.is_alive()
+        worker.close()
+    assert results == [None]
+
+
+def test_native_watchdog_arm_refusal_kills_owned_child_before_command(monkeypatch, tmp_path):
+    """No unguarded native request or misleading pipe-write diagnosis is allowed."""
+    from k5vision import operator_events as module
+
+    writes = []
+
+    class Pipe(io.BytesIO):
+        def write(self, payload):
+            writes.append(bytes(payload))
+            return super().write(payload)
+
+    class Child:
+        def __init__(self):
+            self.stdin = Pipe()
+            self.stdout = io.BytesIO()
+            self.killed = False
+
+        def poll(self):
+            return 1 if self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=2):
+            assert self.killed
+            return 1
+
+    child = Child()
+    worker = module._RecordedNativeWorker(None)
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", child))
+
+    def refuse_arm(_process, _timeout):
+        raise OperatorEventsError("private watchdog unavailable")
+
+    monkeypatch.setattr(worker._watchdog, "arm", refuse_arm)
+    with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+        worker.request(tmp_path / "unused-private-snapshot.mp4")
+    assert worker._failure_phase == "native_watchdog_unavailable"
+    assert worker._native_write_cause == "not_started"
+    assert worker._process is None
+    assert child.killed
+    assert child.stdin.closed and child.stdout.closed
+    assert writes == []
+    worker.close()
+
+
+def test_native_watchdog_does_not_start_another_thread_when_request_is_active(
+    monkeypatch, tmp_path
+):
+    """Four decoded streams must not block a new frame on Thread.start()."""
+    from k5vision import operator_events as module
+
+    worker = module._RecordedNativeWorker(None)
+
+    class Process:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(b'{"status":"empty"}\n')
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 0
+
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", Process()))
+    original_start = threading.Thread.start
+
+    def no_new_thread(_thread):
+        pytest.fail("A native frame request started another watchdog thread")
+
+    monkeypatch.setattr(threading.Thread, "start", no_new_thread)
+    try:
+        assert worker.request(tmp_path / "unused.mp4") is None
+        assert worker._native_write_cause == "write_accepted"
+    finally:
+        monkeypatch.setattr(threading.Thread, "start", original_start)
+        worker.close()
+
+
+def test_native_watchdog_rebind_kills_replacement_on_original_deadline():
+    """A disconnected first child may not gain another watchdog budget."""
+    from k5vision import operator_events as module
+
+    class Child:
+        def __init__(self):
+            self.killed = threading.Event()
+
+        def kill(self):
+            self.killed.set()
+
+    first, second = Child(), Child()
+    guard = module._NativeRequestWatchdog()
+    try:
+        expired = guard.arm(first, 0.1)
+        guard.rebind(second)
+        assert expired.wait(timeout=2)
+        assert second.killed.wait(timeout=2)
+        assert not first.killed.is_set()
+    finally:
+        guard.disarm()
+        guard.close()
+
+
+def test_native_watchdog_constructor_refuses_missing_thread_without_child(monkeypatch):
+    from k5vision import operator_events as module
+
+    def refuse_start(_thread):
+        raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(threading.Thread, "start", refuse_start)
+    with pytest.raises(OperatorEventsError, match="watchdog unavailable"):
+        module._RecordedNativeWorker(None)
+
+
+def test_failed_native_worker_reaps_before_buffered_stdin_close():
+    """A stalled Windows pipe cannot block replacement before child termination."""
+    import k5vision.operator_events as module
+
+    phases = []
+
+    class BufferedStdin:
+        def close(self):
+            # A buffered pipe close can flush and wait for an unread child.
+            # This boundary must only be reached after the owned child exits.
+            assert phases[-1] == "reaped"
+            phases.append("stdin_closed")
+
+    class Child:
+        stdin = BufferedStdin()
+        stdout = io.BytesIO()
+        killed = False
+
+        def poll(self):
+            return -9 if self.killed else None
+
+        def kill(self):
+            self.killed = True
+            phases.append("killed")
+
+        def wait(self, timeout=2):
+            assert self.killed
+            phases.append("reaped")
+            return -9
+
+    worker = module._RecordedNativeWorker(None)
+    worker._process = Child()
+    worker.close(final=False)
+    assert phases == ["killed", "reaped", "stdin_closed"]
+    assert worker._process is None
+    assert not worker._closing.is_set()
+
+
+def test_native_worker_unbuffered_request_retains_exact_stdout_reads(monkeypatch):
+    from k5vision import operator_events as module
+
+    actual_popen = subprocess.Popen
+    script = (
+        "import sys;"
+        "sys.stdin.buffer.readline();"
+        "sys.stdout.buffer.write(b'OK\\n' + b'Z' * 16384);"
+        "sys.stdout.buffer.flush()"
+    )
+
+    def launch(_argv, **kwargs):
+        assert kwargs["bufsize"] == 0
+        return actual_popen([sys.executable, "-I", "-c", script], **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    worker = module._RecordedNativeWorker(None)
+    try:
+        worker._start()
+        child = worker._process
+        assert isinstance(child.stdin, io.FileIO)
+        assert isinstance(child.stdout, io.BufferedReader)
+        child.stdin.write(b"READY\n")
+        assert child.stdout.readline() == b"OK\n"
+        # The native decoder emits large single-payload responses. Preserve
+        # full reads rather than accepting partial raw-pipe chunks as frames.
+        assert child.stdout.read(16384) == b"Z" * 16384
+    finally:
+        worker.close()
+
+
+def test_native_worker_short_raw_pipe_writes_do_not_truncate_request():
+    from k5vision import operator_events as module
+
+    class ShortPipe(io.BytesIO):
+        def write(self, payload):
+            return super().write(payload[:3])
+
+    worker = module._RecordedNativeWorker(None)
+    pipe = ShortPipe()
+    command = b'{"path":"","artifact_root":"sealed"}\n'
+    worker._write_request(pipe, command)
+    assert pipe.getvalue() == command
+    assert worker._failure_phase == "native_pipe_flush_active"
+
+
 def test_stalled_owned_native_worker_is_killed_and_reaped_before_next_launch(monkeypatch, tmp_path):
     import k5vision.operator_events as module
 
@@ -382,6 +776,90 @@ def test_stalled_owned_native_worker_is_killed_and_reaped_before_next_launch(mon
     assert worker._process is None
     assert processes[0].poll() is not None
     worker.close()
+
+
+def test_recorded_person_native_cold_budget_becomes_steady_only_after_valid_ack(
+    monkeypatch, tmp_path
+):
+    import io
+    import json
+
+    import k5vision.operator_events as module
+
+    worker = module._RecordedNativeWorker(SimpleNamespace(artifact_root=tmp_path / "private-model"))
+    assert worker._request_timeout() == 18.0
+    assert module._NATIVE_REQUEST_SECONDS == 8.0
+    assert module._NATIVE_COLD_PERSON_REQUEST_SECONDS < 20
+
+    # A complete real-shaped native response, including zero detections, proves
+    # that the owned child reached native model inference. No camera media is used.
+    pixels = bytes(544 * 320 * 4)
+    header = (
+        json.dumps(
+            {"status": "ready", "elapsed": 1.5, "bytes": len(pixels), "detections": []}
+        ).encode("ascii")
+        + b"\n"
+    )
+
+    class Process:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(header + pixels)
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 0
+
+    process = Process()
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", process))
+    elapsed, output, detections = worker.request(tmp_path / "private-snapshot.mp4")
+    assert (elapsed, len(output), detections) == (1.5, len(pixels), ())
+    assert worker._request_timeout() == module._NATIVE_REQUEST_SECONDS
+    worker.close()
+
+    # Source-only decoding has no model-compilation exception.
+    assert module._RecordedNativeWorker(None)._request_timeout() == 8.0
+
+
+def test_owned_native_child_launch_uses_isolated_embedded_python(monkeypatch):
+    import k5vision.operator_events as module
+    import k5vision.operator_native_process as native_process
+
+    captured = []
+
+    class Child:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO()
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 0
+
+    monkeypatch.setattr(
+        native_process,
+        "_WindowsJob",
+        lambda: SimpleNamespace(assign=lambda child: None, close=lambda: None),
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        lambda arguments, **options: captured.append(arguments) or Child(),
+    )
+    worker = module._RecordedNativeWorker(None)
+    try:
+        worker._start()
+        assert captured == [[sys.executable, "-I", "-B", "-m", "k5vision.operator_events_decoder"]]
+    finally:
+        worker.close()
 
 
 def test_closed_native_worker_permanently_refuses_another_birth(monkeypatch, tmp_path):
@@ -446,7 +924,92 @@ def test_paused_recording_and_disabled_detector_do_not_start_native_work(store):
             await service.cycle()
             assert sampler.index == 0
             assert service.status(source.binding.device_id)["status"] == "waiting"
+            assert service.status(source.binding.device_id)["sample_phase"] == "recording_paused"
+            assert service.status(source.binding.device_id)["sample_attempts"] == 0
         finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_empty_native_sample_reports_only_bounded_source_free_reason(store):
+    class EmptySampler:
+        # A malicious or broken donor must not turn a diagnostic into a
+        # path, camera URI or arbitrary upstream payload echo.
+        _capture_outcome = "untrusted-private-string"
+
+        def capture(self, _source):
+            return None
+
+    source = _source()
+    service, _sampler, _provider = _service(store, source, sampler=EmptySampler())
+
+    async def run():
+        try:
+            service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
+            await service.cycle()
+            status = service.status(source.binding.device_id)
+            assert status["status"] == "waiting"
+            assert status["sample_phase"] == "no_frame"
+            assert status["last_completed_phase"] == "no_frame"
+            assert status["sample_attempts"] == 1
+            assert status["processed_frames"] == 0
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_last_completed_sample_phase_survives_an_inflight_capture(store):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class TwoPhaseSampler:
+        def __init__(self):
+            self.calls = 0
+            self._capture_outcome = "not_started"
+
+        def capture(self, _source):
+            self.calls += 1
+            if self.calls == 1:
+                self._capture_outcome = "no_growth"
+                return None
+            entered.set()
+            if not release.wait(timeout=2):
+                raise AssertionError("Timed out releasing test capture")
+            self._capture_outcome = "no_decoded_frame"
+            return None
+
+    source = _source()
+    service, sampler, _provider = _service(store, source, sampler=TwoPhaseSampler())
+
+    async def run():
+        try:
+            service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
+            await service.cycle()
+            initial = service.status(source.binding.device_id)
+            assert initial["sample_phase"] == "no_growth"
+            assert initial["last_completed_phase"] == "no_growth"
+
+            pending_cycle = asyncio.create_task(service.cycle())
+            for _ in range(50):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.02)
+            assert entered.is_set()
+            pending = service.status(source.binding.device_id)
+            assert pending["sample_phase"] == "capture_pending"
+            assert pending["last_completed_phase"] == "no_growth"
+
+            release.set()
+            await pending_cycle
+            completed = service.status(source.binding.device_id)
+            assert completed["sample_phase"] == "no_decoded_frame"
+            assert completed["last_completed_phase"] == "no_decoded_frame"
+            assert completed["sample_attempts"] == 2
+            assert sampler.calls == 2
+        finally:
+            release.set()
             await service.aclose()
 
     asyncio.run(run())
@@ -466,6 +1029,9 @@ def test_decoder_failure_is_isolated_and_closes_cleanly(store):
             await service.start()
             await asyncio.sleep(0.1)
             assert service.status(source.binding.device_id)["status"] == "unavailable"
+            status = service.status(source.binding.device_id)
+            assert status["sample_phase"] == "sample_failed"
+            assert status["last_completed_phase"] == "sample_failed"
             assert store.events(source.binding.device_id)["events"] == []
         finally:
             await service.aclose()
@@ -500,6 +1066,52 @@ def test_recorder_growth_after_utc_rollback_selects_new_file_not_future_filename
     assert sampler.capture(source) is None
 
 
+def test_cached_inventory_detects_new_recorder_file_without_replaying_older_media(
+    identity, monkeypatch
+):
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    source = _source()
+    directory = root / source.binding.path_name
+    directory.mkdir(mode=0o700)
+    retained = directory / "2026-10-28_12-00-00-000000_+0000.mp4"
+    retained.write_bytes(b"retained-before-first-sample")
+
+    # A valid cached storage scan may precede the sampler's first observation.
+    # Its empty result must not authorize replay of already-retained files.
+    sampler = RecordedFrameSampler(root, recording_files=lambda _binding: {})
+    decoded = []
+
+    def decode(raw, when, key):
+        decoded.append((raw, when, key))
+        return _sample(index=len(decoded), when=when)
+
+    monkeypatch.setattr(sampler, "decode", decode)
+    assert sampler.capture(source) is None
+    assert sampler._capture_outcome == "baseline"
+    assert sampler.capture(source) is None
+    assert decoded == []
+
+    # The active recorder rolls a new file before the 6-second maintenance
+    # inventory refresh. Directory creation, not UTC filename ordering or an
+    # old cached high-water, makes this source eligible for a real read.
+    fresh = directory / "2026-10-27_12-00-00-000000_+0000.mp4"
+    fresh.write_bytes(b"new-native-segment")
+    sample = sampler.capture(source)
+    assert sample is not None
+    assert decoded == [(b"new-native-segment", datetime(2026, 10, 27, 12, tzinfo=UTC), fresh.name)]
+    assert sampler.capture(source) is None
+    assert len(decoded) == 1
+
+    # An existing active segment continues from actual byte growth even when
+    # the background storage inventory has not yet caught up.
+    with fresh.open("ab") as output:
+        output.write(b"-next-fragment")
+    assert sampler.capture(source) is not None
+    assert decoded[-1][0] == b"new-native-segment-next-fragment"
+    assert len(decoded) == 2
+
+
 def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch):
     import k5vision.operator_events as module
 
@@ -521,3 +1133,842 @@ def test_sampler_rejects_linked_source_and_oversized_scans(identity, monkeypatch
         directory.symlink_to(identity.directory, target_is_directory=True)
         with pytest.raises(OperatorEventsError, match="source refused"):
             sampler.capture(source)
+
+
+def test_recorded_native_worker_replaces_proven_closed_stdin_with_live_child(monkeypatch, tmp_path):
+    import k5vision.operator_events as module
+
+    class Child:
+        def __init__(self, closed):
+            self.stdin = io.BytesIO()
+            if closed:
+                self.stdin.close()
+            self.stdout = io.BytesIO(b'{"status":"empty"}\n')
+            self.killed = False
+
+        def poll(self):
+            return 1 if self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=2):
+            if not self.killed:
+                raise subprocess.TimeoutExpired("native-child", timeout)
+            return 0
+
+    first, replacement = Child(True), Child(False)
+    births = iter((first, replacement))
+    worker = module._RecordedNativeWorker(None)
+    started = []
+
+    def start():
+        worker._process = next(births)
+        started.append(True)
+
+    monkeypatch.setattr(worker, "_start", start)
+    try:
+        assert worker.request(tmp_path / "private-snapshot.mp4") is None
+        assert len(started) == 2
+        assert first.killed and first.stdout.closed
+        assert replacement.stdin.getvalue().endswith(b"\n")
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("child_exited", [True, False])
+def test_recorded_native_worker_classifies_closed_stdin_without_retrying_live_child(
+    monkeypatch, tmp_path, child_exited
+):
+    import k5vision.operator_events as module
+
+    class ClosedInput(io.BytesIO):
+        def write(self, _payload):
+            raise ValueError("I/O operation on closed file")
+
+    class Child:
+        def __init__(self, failed):
+            self.stdin = ClosedInput() if failed else io.BytesIO()
+            self.stdout = io.BytesIO(b'{"status":"empty"}\n')
+            self.failed = failed
+            self.killed = False
+
+        def poll(self):
+            return 1 if self.killed or (self.failed and child_exited) else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=2):
+            if self.poll() is None and timeout == 0.1:
+                raise subprocess.TimeoutExpired("native-child", timeout)
+            return 0
+
+    first, replacement = Child(True), Child(False)
+    births = iter((first, replacement))
+    worker = module._RecordedNativeWorker(None)
+    started = []
+
+    def start():
+        worker._process = next(births)
+        started.append(True)
+
+    monkeypatch.setattr(worker, "_start", start)
+    try:
+        if child_exited:
+            assert worker.request(tmp_path / "private-snapshot.mp4") is None
+            assert len(started) == 2
+            assert replacement.stdin.getvalue().endswith(b"\n")
+        else:
+            with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+                worker.request(tmp_path / "private-snapshot.mp4")
+            assert len(started) == 1
+            assert worker._failure_phase == "native_write_failed"
+            assert worker._native_write_cause == "live_child_write_error"
+        assert first.stdin.closed
+    finally:
+        worker.close()
+
+
+def test_native_worker_reaps_pre_response_broken_pipe_then_retries_once(monkeypatch, tmp_path):
+    import k5vision.operator_events as module
+
+    class BrokenInput(io.BytesIO):
+        def write(self, _payload):
+            raise BrokenPipeError
+
+    class Child:
+        def __init__(self, broken):
+            self.broken = broken
+            self.stdin = BrokenInput() if broken else io.BytesIO()
+            self.stdout = io.BytesIO(b'{"status":"empty"}\n')
+            self.killed = False
+
+        def poll(self):
+            return 1 if self.broken or self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=2):
+            return 1 if self.broken or self.killed else 0
+
+    first, replacement = Child(True), Child(False)
+    births = iter((first, replacement))
+    worker = module._RecordedNativeWorker(None)
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", next(births)))
+    try:
+        assert worker.request(tmp_path / "private-snapshot.mp4") is None
+        assert first.stdin.closed and first.stdout.closed
+        assert replacement.stdin.getvalue().endswith(b"\n")
+        assert worker._process is replacement
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize(
+    ("winerror", "child_exited", "retry"),
+    [
+        (109, True, True),
+        (109, False, True),
+        (232, True, True),
+        (232, False, True),
+        (233, True, True),
+        (233, False, True),
+        (5, False, False),
+        (5, True, True),
+    ],
+)
+def test_recorded_native_worker_retries_windows_disconnected_or_exited_children(
+    monkeypatch, tmp_path, winerror, child_exited, retry
+):
+    import k5vision.operator_events as module
+
+    class ClosedPipe(io.BytesIO):
+        def write(self, _payload):
+            error = OSError("private pipe failure")
+            error.winerror = winerror
+            raise error
+
+    class Child:
+        def __init__(self, broken):
+            self.broken = broken
+            self.stdin = ClosedPipe() if broken else io.BytesIO()
+            self.stdout = io.BytesIO(b'{"status":"empty"}\n')
+            self.killed = False
+
+        def poll(self):
+            # An unrelated access error must not be conflated with child exit.
+            return 1 if (self.broken and child_exited) or self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=2):
+            return 1 if self.broken or self.killed else 0
+
+    first, replacement = Child(True), Child(False)
+    children = iter((first, replacement))
+    worker = module._RecordedNativeWorker(None)
+    starts = []
+
+    def start():
+        worker._process = next(children)
+        starts.append(True)
+
+    monkeypatch.setattr(worker, "_start", start)
+    try:
+        if retry:
+            assert worker.request(tmp_path / "private-snapshot.mp4") is None
+            assert len(starts) == 2
+            assert replacement.stdin.getvalue().endswith(b"\n")
+        else:
+            with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+                worker.request(tmp_path / "private-snapshot.mp4")
+            assert len(starts) == 1
+            assert worker._failure_phase == "native_write_failed"
+            assert worker._native_write_cause == "live_child_write_error"
+        assert first.stdin.closed
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("late_exit", [True, False])
+def test_recorded_native_worker_only_recovers_ambiguous_write_after_confirmed_exit(
+    monkeypatch, tmp_path, late_exit
+):
+    import k5vision.operator_events as module
+
+    class AmbiguousPipe(io.BytesIO):
+        def write(self, _payload):
+            error = OSError("opaque native write failure")
+            error.winerror = 5
+            raise error
+
+    class Child:
+        def __init__(self, broken):
+            self.broken = broken
+            self.exited = False
+            self.killed = False
+            self.stdin = AmbiguousPipe() if broken else io.BytesIO()
+            self.stdout = io.BytesIO(b'{"status":"empty"}\n')
+
+        def poll(self):
+            return 1 if self.exited or self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=2):
+            if self.broken and not self.exited and not self.killed:
+                if timeout != 0.1 or not late_exit:
+                    raise subprocess.TimeoutExpired("native-child", timeout)
+                self.exited = True
+            return 1 if self.exited or self.killed else 0
+
+    first, replacement = Child(True), Child(False)
+    births = iter((first, replacement))
+    worker = module._RecordedNativeWorker(None)
+    starts = []
+
+    def start():
+        worker._process = next(births)
+        starts.append(True)
+
+    monkeypatch.setattr(worker, "_start", start)
+    try:
+        if late_exit:
+            assert worker.request(tmp_path / "private-snapshot.mp4") is None
+            assert len(starts) == 2
+            assert replacement.stdin.getvalue().endswith(b"\n")
+            assert worker._native_write_cause == "write_accepted"
+        else:
+            with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+                worker.request(tmp_path / "private-snapshot.mp4")
+            assert len(starts) == 1
+            assert worker._failure_phase == "native_write_failed"
+        assert first.stdin.closed
+    finally:
+        worker.close()
+
+
+def test_native_worker_tracks_bounded_child_phases_without_source_content(monkeypatch, tmp_path):
+    import k5vision.operator_events as module
+
+    worker = module._RecordedNativeWorker(None)
+    expected = [
+        ("native_reply_missing", b'{"status":"phase","phase":"decode"}\n'),
+        ("native_decoder_active", b'{"status":"phase","phase":"model"}\n'),
+        ("native_model_active", b'{"status":"phase","phase":"inference"}\n'),
+        ("native_inference_active", b'{"status":"empty"}\n'),
+    ]
+    observed = []
+
+    class Output:
+        def readline(self, _limit):
+            phase, response = expected[len(observed)]
+            observed.append(worker._failure_phase)
+            assert worker._failure_phase == phase
+            return response
+
+        def close(self):
+            pass
+
+    class Child:
+        stdin = io.BytesIO()
+        stdout = Output()
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 0
+
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", Child()))
+    try:
+        assert worker.request(tmp_path / "private-snapshot.mp4") is None
+        assert observed == [item[0] for item in expected]
+        assert len(observed) == 4
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize(
+    "replies",
+    [
+        b'{"status":"phase","phase":"rtsp://private"}\n',
+        b'{"status":"phase","phase":"decode"}\n' * 4,
+    ],
+)
+def test_native_worker_rejects_unbounded_or_untrusted_progress(monkeypatch, tmp_path, replies):
+    import k5vision.operator_events as module
+
+    worker = module._RecordedNativeWorker(None)
+
+    class Child:
+        stdin = io.BytesIO()
+
+        def __init__(self):
+            self.stdout = io.BytesIO(replies)
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 0
+
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", Child()))
+    try:
+        with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+            worker.request(tmp_path / "private-snapshot.mp4")
+        assert worker._failure_phase == "native_header_invalid"
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize(
+    "reply,write_fails,child_exited,expected",
+    [
+        (b"", True, True, "native_child_exited_before_request"),
+        (b"", True, False, "native_write_failed"),
+        (b"not-json\n", False, True, "native_header_invalid"),
+        (b'{"status":"ready","bytes":1}\n', False, True, "native_header_invalid"),
+        (
+            b'{"status":"ready","bytes":696320,"elapsed":1.0,"detections":[]}\n',
+            False,
+            True,
+            "native_payload_incomplete",
+        ),
+    ],
+)
+def test_native_worker_distinguishes_transport_failure_boundaries(
+    monkeypatch, tmp_path, reply, write_fails, child_exited, expected
+):
+    import k5vision.operator_events as module
+
+    class PrivateStdin(io.BytesIO):
+        def write(self, payload):
+            if write_fails:
+                raise BrokenPipeError
+            return super().write(payload)
+
+    class Process:
+        def __init__(self):
+            self.stdin = PrivateStdin()
+            self.stdout = io.BytesIO(reply)
+
+        def poll(self):
+            return 1 if child_exited else None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 1
+
+    worker = module._RecordedNativeWorker(None)
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", Process()))
+    with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+        worker.request(tmp_path / "private-snapshot.mp4")
+    assert worker._failure_phase == expected
+    assert worker._process is None
+    worker.close()
+
+
+@pytest.mark.parametrize(
+    "child_phase,expected",
+    [
+        ("model", "native_model_failed"),
+        ("decode", "native_decode_failed"),
+        ("inference", "native_inference_failed"),
+        ("rtsp://private-source", "native_transport_failed"),
+    ],
+)
+def test_native_worker_failure_phase_is_finite_and_source_free(
+    monkeypatch, tmp_path, child_phase, expected
+):
+    import json
+
+    import k5vision.operator_events as module
+
+    worker = module._RecordedNativeWorker(None)
+
+    class Process:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(
+            (json.dumps({"status": "failed", "phase": child_phase}) + "\n").encode()
+        )
+
+        def poll(self):
+            return 1
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 1
+
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", Process()))
+    with pytest.raises(OperatorEventsError, match="native frame unavailable"):
+        worker.request(tmp_path / "private-snapshot.mp4")
+    assert worker._failure_phase == expected
+    assert worker._process is None
+    worker.close()
+
+
+def test_model_priming_is_owned_and_nonblocking_when_recorded_person_is_enabled(
+    identity, store, monkeypatch
+):
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    sampler = RecordedFrameSampler(root)
+    source = _source()
+    entered, release = threading.Event(), threading.Event()
+
+    def prime_without_media():
+        entered.set()
+        assert release.wait(3)
+
+    monkeypatch.setattr(sampler, "prime", prime_without_media)
+    service = OperatorEventService(
+        store=store,
+        cameras=SimpleNamespace(list_sources=lambda: (source,)),
+        recording_root=root,
+        configuration=SimpleNamespace(artifact_root=identity.directory / "model"),
+        sampler=sampler,
+    )
+    try:
+        service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
+        assert entered.wait(2)
+        assert service._native_pending is not None
+        assert not service._native_pending.done()
+        assert sampler._observations == {}
+    finally:
+        release.set()
+        asyncio.run(service.aclose())
+
+
+@pytest.mark.parametrize("prime_fails", [False, True])
+def test_startup_prime_does_not_delay_first_recorded_frame_on_camera_enable(
+    identity, store, monkeypatch, prime_fails
+):
+    # A failed startup preparation must not be queued a second time at camera
+    # activation: the first real recorded frame owns the bounded native retry.
+    # A ready worker is reused without duplicate model compilation.
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    sampler = RecordedFrameSampler(root)
+    source = _source()
+    requests = []
+
+    def prime_once():
+        requests.append("prime")
+        if prime_fails:
+            raise OperatorEventsError("synthetic model preparation unavailable")
+
+    monkeypatch.setattr(sampler, "prime", prime_once)
+    monkeypatch.setattr(sampler, "native_model_ready", lambda: not prime_fails)
+    service = OperatorEventService(
+        store=store,
+        cameras=SimpleNamespace(list_sources=lambda: (source,)),
+        recording_root=root,
+        configuration=SimpleNamespace(artifact_root=identity.directory / "model"),
+        sampler=sampler,
+    )
+
+    async def run():
+        try:
+            await service.start()
+            first = service._native_pending
+            assert first is not None
+            if prime_fails:
+                with pytest.raises(
+                    OperatorEventsError, match="synthetic model preparation unavailable"
+                ):
+                    await asyncio.wrap_future(first)
+            else:
+                await asyncio.wrap_future(first)
+            service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
+            assert service._native_pending is first
+            assert requests == ["prime"]
+
+            # Both readiness outcomes must advance directly to one real-frame
+            # attempt instead of spending the installed event deadline priming.
+            monkeypatch.setattr(
+                sampler, "capture", lambda _source: requests.append("capture") or None
+            )
+            await service.cycle()
+            assert requests == ["prime", "capture"]
+            assert service.status(source.binding.device_id)["sample_attempts"] == 1
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("child_status", "expected_requests"), [(None, 0), (1, 1)])
+def test_model_prime_rechecks_child_liveness_before_trusting_cached_readiness(
+    identity, monkeypatch, child_status, expected_requests
+):
+    import k5vision.operator_events as module
+
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    sampler = RecordedFrameSampler(root)
+    sampler._configuration = SimpleNamespace(artifact_root=identity.directory / "model")
+    worker = module._RecordedNativeWorker(sampler._configuration)
+    worker._person_ready = True
+
+    class Child:
+        def poll(self):
+            return child_status
+
+    worker._process = Child()
+    requests = []
+    monkeypatch.setattr(worker, "request", lambda path: requests.append(path))
+    sampler._worker = worker
+    sampler.prime()
+    assert requests == [None] * expected_requests
+
+
+def test_recorded_native_model_prime_requires_matching_reply_and_reuses_child(
+    monkeypatch, tmp_path
+):
+    import json
+
+    import k5vision.operator_events as module
+
+    worker = module._RecordedNativeWorker(
+        SimpleNamespace(artifact_root=tmp_path / "sealed-person-model")
+    )
+    assert worker._request_timeout() == 18.0
+
+    class Process:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(b'{"status":"primed"}\n')
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=2):
+            return 0
+
+    process = Process()
+    monkeypatch.setattr(worker, "_start", lambda: setattr(worker, "_process", process))
+    assert worker.request(None) is None
+    assert worker._person_ready
+    assert worker._request_timeout() == module._NATIVE_REQUEST_SECONDS
+    assert json.loads(process.stdin.getvalue()) == {
+        "path": "",
+        "artifact_root": str(tmp_path / "sealed-person-model"),
+    }
+    worker.close()
+
+
+def test_first_recorded_person_event_has_priority_over_speculative_view_warmup(store):
+    camera = uuid4()
+    source = SimpleNamespace(binding=SimpleNamespace(device_id=camera))
+    cameras = SimpleNamespace(list_sources=lambda: (source,))
+    store.configure(camera, enabled=True, confidence_threshold=0.5)
+    assert _record(store, camera, 1)
+    service = OperatorEventService(
+        store=store,
+        cameras=cameras,
+        recording_root=Path("."),
+        configuration=None,
+        sampler=SimpleNamespace(),
+        provider_factory=object(),
+    )
+    try:
+        # Historical rows cannot prove a newly started native worker has
+        # detected a real event in this service lifetime.
+        assert service.awaiting_first_recorded_person_event()
+        service._last_events[camera] = 1.0
+        assert not service.awaiting_first_recorded_person_event()
+        service._last_events.clear()
+        store.configure(camera, enabled=False, confidence_threshold=0.5)
+        assert not service.awaiting_first_recorded_person_event()
+    finally:
+        asyncio.run(service.aclose())
+
+
+def test_first_recorded_person_event_releases_warmup_with_other_cameras_empty(store):
+    first, second, unrelated = uuid4(), uuid4(), uuid4()
+    sources = tuple(
+        SimpleNamespace(binding=SimpleNamespace(device_id=camera)) for camera in (first, second)
+    )
+    cameras = SimpleNamespace(list_sources=lambda: sources)
+    for camera in (first, second):
+        store.configure(camera, enabled=True, confidence_threshold=0.5)
+    service = OperatorEventService(
+        store=store,
+        cameras=cameras,
+        recording_root=Path("."),
+        configuration=None,
+        sampler=SimpleNamespace(),
+        provider_factory=object(),
+    )
+    try:
+        assert service.awaiting_first_recorded_person_event()
+        service._last_events[unrelated] = 1.0
+        assert service.awaiting_first_recorded_person_event()
+        service._last_events[first] = 2.0
+        assert not service.awaiting_first_recorded_person_event()
+        service._last_events.clear()
+        store.configure(first, enabled=False, confidence_threshold=0.5)
+        assert service.awaiting_first_recorded_person_event()
+        store.configure(second, enabled=False, confidence_threshold=0.5)
+        assert not service.awaiting_first_recorded_person_event()
+    finally:
+        asyncio.run(service.aclose())
+
+
+def test_first_verified_recorded_person_event_starts_optional_preparation_once(store):
+    source = _source()
+
+    class InitiallyEmptyProvider:
+        def __init__(self):
+            self.calls = 0
+
+        async def __call__(self, _frame):
+            self.calls += 1
+            if self.calls == 1:
+                return ()
+            return (SimpleNamespace(category="person", confidence=0.9),)
+
+        async def aclose(self):
+            pass
+
+    service, _, provider = _service(store, source, provider=InitiallyEmptyProvider())
+    calls = []
+    service.notify_on_first_recorded_person_event(lambda: calls.append("first_event"))
+
+    async def run():
+        try:
+            service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
+            await service.cycle()
+            assert provider.calls == 1
+            assert calls == []
+            assert service.awaiting_first_recorded_person_event()
+            await service.cycle()
+            assert calls == ["first_event"]
+            assert not service.awaiting_first_recorded_person_event()
+            await service.cycle()
+            assert calls == ["first_event"]
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_verified_live_recorder_prime_cannot_release_view_warmup_without_event(store):
+    """A primed native child is not evidence of a recorded person event."""
+    camera = uuid4()
+    source = SimpleNamespace(binding=SimpleNamespace(device_id=camera))
+    cameras = SimpleNamespace(list_sources=lambda: (source,))
+    store.configure(camera, enabled=True, confidence_threshold=0.5)
+
+    class NativeProcess:
+        exit_code = None
+
+        def poll(self):
+            return self.exit_code
+
+    process = NativeProcess()
+    worker = SimpleNamespace(
+        _person_ready=False,
+        _process=process,
+        begin_close=lambda: None,
+        close=lambda: None,
+    )
+    sampler = object.__new__(RecordedFrameSampler)
+    sampler._closing = threading.Event()
+    sampler._worker_lock = threading.RLock()
+    sampler._worker = worker
+    service = OperatorEventService(
+        store=store,
+        cameras=cameras,
+        recording_root=Path("."),
+        configuration=object(),
+        sampler=sampler,
+    )
+    try:
+        assert service.awaiting_first_recorded_person_event()
+        assert not sampler.native_model_ready()
+        worker._person_ready = True
+        assert sampler.native_model_ready()
+        # A living primed worker must not trigger competing view compilation.
+        assert service.awaiting_first_recorded_person_event()
+        assert service._last_events == {}
+        process.exit_code = 1
+        assert not sampler.native_model_ready()
+        assert service.awaiting_first_recorded_person_event()
+        worker._process = None
+        assert not sampler.native_model_ready()
+        service._last_events[camera] = 1.0
+        assert not service.awaiting_first_recorded_person_event()
+    finally:
+        asyncio.run(service.aclose())
+    assert not sampler.native_model_ready()
+
+
+def test_cold_recorder_prime_defers_view_without_enabled_analytics(store):
+    """The unprimed recording worker retains CPU priority even when analytics is disabled."""
+    camera = uuid4()
+    source = SimpleNamespace(binding=SimpleNamespace(device_id=camera))
+    cameras = SimpleNamespace(list_sources=lambda: (source,))
+
+    class NativeProcess:
+        def poll(self):
+            return None
+
+    worker = SimpleNamespace(
+        _person_ready=False,
+        _process=NativeProcess(),
+        begin_close=lambda: None,
+        close=lambda: None,
+    )
+    sampler = object.__new__(RecordedFrameSampler)
+    sampler._closing = threading.Event()
+    sampler._worker_lock = threading.RLock()
+    sampler._worker = worker
+    sampler._configuration = object()
+    service = OperatorEventService(
+        store=store,
+        cameras=cameras,
+        recording_root=Path("."),
+        configuration=object(),
+        sampler=sampler,
+    )
+    try:
+        assert not store.settings(camera)["enabled"]
+        assert service.awaiting_first_recorded_person_event()
+        worker._person_ready = True
+        # A living, primed recorder permits optional view preparation only
+        # while recorded-person analytics is disabled and enrollment is quiet.
+        assert not service.awaiting_first_recorded_person_event()
+        worker._person_ready = False
+        assert service.awaiting_first_recorded_person_event()
+        store.configure(camera, enabled=True, confidence_threshold=0.5)
+        assert service.awaiting_first_recorded_person_event()
+        worker._person_ready = True
+        # Enabling recorded analytics restores first-real-event priority even
+        # when the recorder's model itself is already primed.
+        assert service.awaiting_first_recorded_person_event()
+        service._last_events[camera] = 1.0
+        assert not service.awaiting_first_recorded_person_event()
+    finally:
+        asyncio.run(service.aclose())
+
+
+@pytest.mark.parametrize(
+    ("failed_stage", "expected"),
+    [
+        ("queued", "sample_queue_failed"),
+        ("source_check", "sample_source_failed"),
+        ("snapshot_read", "snapshot_read_failed"),
+        ("decode_attempt", "snapshot_decode_failed"),
+        ("frame_ready", "event_admission_failed"),
+        ("native_request", "native_write_failed"),
+        ("untrusted-private-value", "sample_failed"),
+    ],
+)
+def test_current_recorded_sample_stage_owns_failure_attribution(
+    identity, store, monkeypatch, failed_stage, expected
+):
+    """A stale native prime failure must not conceal the actual failing stage."""
+    from k5vision.operator_events import _RecordedNativeWorker
+
+    root = identity.directory / "recordings"
+    root.mkdir(mode=0o700)
+    sampler = RecordedFrameSampler(root)
+    source = _source()
+    service, _, _ = _service(store, source, sampler=sampler)
+    worker = _RecordedNativeWorker(None)
+    worker._failure_phase = "native_write_failed"
+    worker._native_write_cause = "live_child_write_error"
+    sampler._worker = worker
+
+    async def fail_at_stage(_source, _settings):
+        sampler._capture_outcome = failed_stage
+        raise RuntimeError("private request error must not reach operator status")
+
+    monkeypatch.setattr(service, "_sample", fail_at_stage)
+
+    async def run():
+        try:
+            service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
+            await service.cycle()
+            status = service.status(source.binding.device_id)
+            assert status["sample_phase"] == expected
+            assert status["last_completed_phase"] == expected
+            assert status["native_write_cause"] == (
+                "live_child_write_error" if failed_stage == "native_request" else "not_applicable"
+            )
+            assert status["status"] == "unavailable"
+            assert "private" not in str(status)
+
+            # A later prime can begin before the status poll. Its changing
+            # worker state must not erase the last completed failure's cause.
+            worker._native_write_cause = "pending"
+            service._states[source.binding.device_id]["sample_phase"] = "native_pending"
+            pending_status = service.status(source.binding.device_id)
+            assert pending_status["sample_phase"] == "native_pending"
+            assert pending_status["last_completed_phase"] == expected
+            assert pending_status["native_write_cause"] == (
+                "live_child_write_error" if failed_stage == "native_request" else "not_applicable"
+            )
+            assert "private" not in str(pending_status)
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())

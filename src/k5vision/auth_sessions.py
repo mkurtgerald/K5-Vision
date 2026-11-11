@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import secrets
 from collections.abc import Callable
+from concurrent.futures import Executor
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from time import monotonic
@@ -146,7 +148,7 @@ class UserSessionManager:
             self._user_tokens[account.id] = digest
         return token, expires_at
 
-    async def resolve(self, token: str) -> UserAccount | None:
+    async def resolve(self, token: str, *, executor: Executor | None = None) -> UserAccount | None:
         """Resolve current authority without blocking the HTTP event loop."""
         if not self._token_is_valid(token):
             return None
@@ -168,9 +170,20 @@ class UserSessionManager:
         # The bounded slots prevent simultaneous reads from flooding a private
         # SQLite registry when many authenticated browser requests arrive.
         async with self._resolve_slots:
-            worker = asyncio.create_task(
-                asyncio.to_thread(self._resolve_account, record.account, record.credential_version)
-            )
+            if executor is None:
+                worker = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._resolve_account, record.account, record.credential_version
+                    )
+                )
+            else:
+                worker = asyncio.get_running_loop().run_in_executor(
+                    executor,
+                    copy_context().run,
+                    self._resolve_account,
+                    record.account,
+                    record.credential_version,
+                )
             try:
                 current = await asyncio.shield(worker)
             except asyncio.CancelledError:

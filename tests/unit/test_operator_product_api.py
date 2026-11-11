@@ -38,7 +38,7 @@ from k5vision.media.mediamtx_provider import (
 )
 from k5vision.operator_analytics import OperatorAnalyticsResult
 from k5vision.operator_onvif import OnvifClockReading, OnvifError, OnvifProfile
-from k5vision.operator_product_api import install_operator_product_api
+from k5vision.operator_product_api import _NativePersonWarmupGate, install_operator_product_api
 from k5vision.operator_product_state import OperatorCameraStore
 from k5vision.services.device_registry import DeviceRegistry
 from k5vision.services.user_registry import UserRegistry
@@ -131,6 +131,10 @@ class _Analytics:
         self.submissions = []
         self.closed = []
         self.callback = None
+        self.preparation_calls = 0
+
+    def start_preparing(self):
+        self.preparation_calls += 1
 
     async def infer(self, **submission):
         self.submissions.append({**submission, "bytes": bytes(submission["frame"].payload)})
@@ -246,6 +250,9 @@ def product(tmp_path, monkeypatch, request):
         analytics_status=options.get("analytics_status", "disabled")
         if isinstance(options, dict)
         else "disabled",
+        prepare_native_person_on_camera=bool(options.get("prepare_native_person_on_camera"))
+        if isinstance(options, dict)
+        else False,
     )
     with TestClient(app, base_url=f"http://127.0.0.1:{public_port}") as client:
         yield _Harness(
@@ -1469,6 +1476,76 @@ def _person_url(device_id, *, width=2, height=2, frame_id=17):
     )
 
 
+@pytest.mark.parametrize(
+    "product", [{"analytics": True, "prepare_native_person_on_camera": True}], indirect=True
+)
+def test_pending_person_model_preparation_returns_retryable_429_only_after_auth(product):
+    device_id = product.enroll()
+    route = _person_url(device_id)
+    body = bytes(range(16))
+    original = product.analytics.infer
+    product.analytics.preparation_pending = True
+
+    async def pending(**submission):
+        # The native worker may finish while the response is reauthorized.
+        # That completion must not mislabel this earlier busy sample as 200.
+        product.analytics.preparation_pending = False
+        return OperatorAnalyticsResult("busy", submission["frame_id"])
+
+    product.analytics.infer = pending
+    invalid = product.client.post(
+        route,
+        headers={**product.headers, "Content-Type": "application/octet-stream"},
+        content=body,
+    )
+    assert invalid.status_code == 403
+    assert product.analytics.preparation_calls == 0
+    busy = product.client.post(route, headers=_person_headers(product), content=body)
+    assert busy.status_code == 429
+    assert "Person view preparation is busy" in busy.text
+    assert busy.headers.get("x-k5-person-phase") == "preparing"
+    assert invalid.headers.get("x-k5-person-phase") is None
+    assert product.analytics.preparation_calls == 1
+    product.analytics.preparation_pending = False
+    product.analytics.infer = original
+    admitted = product.client.post(route, headers=_person_headers(product), content=body)
+    assert admitted.status_code == 200
+    assert admitted.headers["cache-control"] == "no-store"
+    assert admitted.json()["status"] == "active"
+    assert product.analytics.preparation_calls == 2
+
+
+@pytest.mark.parametrize(
+    "product", [{"analytics": True, "prepare_native_person_on_camera": True}], indirect=True
+)
+def test_first_installed_person_request_replies_before_optional_native_compile(product):
+    """A first authorized frame cannot hold HTTP while model startup begins."""
+    camera_id = product.enroll()
+    product.analytics.preparation_phase = "not_requested"
+    url = _person_url(camera_id)
+    payload = bytes(range(16))
+
+    refused = product.client.post(url, headers=product.headers, content=payload)
+    assert refused.status_code == 403
+    assert product.analytics.preparation_calls == 0
+    assert not product.analytics.submissions
+
+    retry = product.client.post(url, headers=_person_headers(product), content=payload)
+    assert retry.status_code == 429
+    assert retry.headers["x-k5-person-phase"] == "preparing"
+    assert retry.headers["cache-control"] == "no-store"
+    # The real broker's optional startup is performed after the 429 ASGI
+    # response, rather than awaited while retaining this frozen frame.
+    assert product.analytics.preparation_calls == 1
+    assert not product.analytics.submissions
+
+    product.analytics.preparation_phase = "ready"
+    accepted = product.client.post(url, headers=_person_headers(product), content=payload)
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "active"
+    assert accepted.json()["frame_id"] == 17
+
+
 @pytest.mark.parametrize("product", [{"analytics": True}], indirect=True)
 def test_person_view_preserves_correlation_and_isolates_session_camera_identity(product):
     first = product.enroll()
@@ -2645,3 +2722,23 @@ def test_slow_identity_registry_read_does_not_block_operator_event_loop(
         finally:
             released.set()
         assert protected.result(timeout=5).status_code == 200
+
+
+def test_first_recorded_event_bypasses_optional_native_preparation_timer_once():
+    analytics = _Analytics()
+    gate = _NativePersonWarmupGate(analytics, quiet_seconds=18.0, defer_preparation=lambda: True)
+
+    async def run():
+        gate.schedule(enrollment=True)
+        assert analytics.preparation_calls == 0
+        gate.on_first_recorded_person_event()
+        assert analytics.preparation_calls == 1
+        gate.schedule(enrollment=True)
+        gate.on_first_recorded_person_event()
+        await asyncio.sleep(0)
+        assert analytics.preparation_calls == 1
+        gate.close()
+        gate.on_first_recorded_person_event()
+        assert analytics.preparation_calls == 1
+
+    asyncio.run(run())

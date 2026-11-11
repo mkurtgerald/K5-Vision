@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sys
 import threading
+from concurrent.futures import Future
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -193,6 +196,130 @@ def test_native_model_read_uses_verified_immutable_bytes_after_admission(admitte
         module._model_bytes(config)
 
 
+@pytest.mark.parametrize("precision_status", ["fp32", "rejected", "unavailable"])
+@pytest.mark.parametrize("inference_threads", [1, 2])
+@pytest.mark.parametrize("fixed_view_input", [False, True])
+def test_person_detector_reads_and_compiles_with_one_admitted_openvino_core(
+    admitted, monkeypatch, precision_status, inference_threads, fixed_view_input
+):
+    """Cold native view compilation must reuse the core and admit FP32 only."""
+    config, _manifest, _files = admitted
+    calls = []
+
+    class Model:
+        inputs = (object(),)
+        outputs = (object(),)
+
+        def input(self, name):
+            assert name == "data"
+            return SimpleNamespace(shape=(1, 3, 320, 544))
+
+        def output(self, index):
+            assert index == 0
+            return SimpleNamespace(shape=(1, 1, 200, 7))
+
+    model = Model()
+
+    class Core:
+        def __init__(self):
+            calls.append("core")
+
+        def read_model(self, *, model: str, weights):
+            assert model == "reviewed-xml"
+            assert weights == b"reviewed-weights"
+            calls.append("read")
+            return admitted_model
+
+        def compile_model(self, value, device, settings):
+            assert value is admitted_model
+            assert device == "CPU"
+            assert settings == {
+                "INFERENCE_NUM_THREADS": inference_threads,
+                "NUM_STREAMS": "1",
+                "INFERENCE_PRECISION_HINT": openvino_stub.Type.f32,
+            }
+            calls.append("compile")
+
+            def get_property(name):
+                assert name == "INFERENCE_PRECISION_HINT"
+                if precision_status == "unavailable":
+                    raise RuntimeError("Native details must remain private")
+                if precision_status == "rejected":
+                    return openvino_stub.Type.u8
+                return openvino_stub.Type.f32
+
+            return SimpleNamespace(create_infer_request=lambda: "ready", get_property=get_property)
+
+    admitted_model = model
+
+    preprocessing = []
+
+    class Chain:
+        def __getattr__(self, name):
+            def record(*_args, **_kwargs):
+                preprocessing.append(name)
+                return self
+
+            return record
+
+    class PrePost:
+        def __init__(self, value):
+            assert value is admitted_model
+
+        def input(self):
+            return Chain()
+
+        def build(self):
+            return admitted_model
+
+    numpy_stub = ModuleType("numpy")
+    numpy_stub.uint8 = object()
+    numpy_stub.frombuffer = lambda raw, dtype: raw
+    openvino_stub = ModuleType("openvino")
+    openvino_stub.__path__ = []
+    openvino_stub.Core = Core
+    openvino_stub.Tensor = lambda data: data
+    openvino_stub.Type = SimpleNamespace(u8=object(), f32=object())
+    openvino_stub.Layout = lambda text: text
+    preprocess_stub = ModuleType("openvino.preprocess")
+    preprocess_stub.ColorFormat = SimpleNamespace(BGR="BGR")
+    preprocess_stub.ResizeAlgorithm = SimpleNamespace(RESIZE_LINEAR="linear")
+    preprocess_stub.PrePostProcessor = PrePost
+    monkeypatch.setitem(sys.modules, "numpy", numpy_stub)
+    monkeypatch.setitem(sys.modules, "openvino", openvino_stub)
+    monkeypatch.setitem(sys.modules, "openvino.preprocess", preprocess_stub)
+    monkeypatch.setattr(module, "_cap_windows_native_cpu_isa", lambda: None)
+
+    if precision_status == "fp32":
+        detector = module._PersonDetector(
+            config, inference_threads=inference_threads, fixed_view_input=fixed_view_input
+        )
+        assert detector._request == "ready"
+        assert detector._fixed_view_input is fixed_view_input
+    else:
+        with pytest.raises(ValueError, match="Person CPU precision was refused"):
+            module._PersonDetector(
+                config, inference_threads=inference_threads, fixed_view_input=fixed_view_input
+            )
+    assert calls == ["core", "read", "compile"]
+    assert ("set_spatial_dynamic_shape" in preprocessing) is not fixed_view_input
+    assert ("resize" in preprocessing) is not fixed_view_input
+
+
+@pytest.mark.parametrize("threads", [0, 3, True, 1.0])
+def test_person_detector_rejects_unapproved_native_cpu_budget(admitted, threads):
+    config, _manifest, _files = admitted
+    with pytest.raises(ValueError, match="Person CPU thread setting was refused"):
+        module._PersonDetector(config, inference_threads=threads)
+
+
+@pytest.mark.parametrize("mode", [None, 0, 1, "fixed"])
+def test_person_detector_refuses_untyped_input_mode(admitted, mode):
+    config, _manifest, _files = admitted
+    with pytest.raises(ValueError, match="Person view input mode was refused"):
+        module._PersonDetector(config, fixed_view_input=mode)
+
+
 def test_model_byte_read_rejects_same_content_replaced_inode(admitted, monkeypatch):
     config, _manifest, _files = admitted
     original = module._local_path
@@ -213,13 +340,37 @@ def test_model_byte_read_rejects_same_content_replaced_inode(admitted, monkeypat
         module._model_bytes(config)
 
 
+def test_sealed_person_start_has_its_own_bounded_compilation_budget(monkeypatch):
+    assert lifecycle._START_TIMEOUT_SECONDS == 15.0
+    assert lifecycle._CLOSE_TIMEOUT_SECONDS == 2.0
+    assert 15.0 < module._PERSON_START_TIMEOUT_SECONDS < 24.0
+    session = object.__new__(module._PersonSession)
+    pending = Future()
+    session._pending = pending
+
+    async def run():
+        # A timed-out waiter must not cancel the native compile Future.
+        # The existing worker lifecycle still owns its capacity release.
+        with monkeypatch.context() as short:
+            short.setattr(module, "_PERSON_START_TIMEOUT_SECONDS", 0.01)
+            with pytest.raises(TimeoutError):
+                await session.start()
+        assert not pending.done()
+        pending.set_result(True)
+        await session.start()
+
+    asyncio.run(run())
+
+
 def test_independent_factory_does_not_import_or_initialize_analytics_lab(admitted, monkeypatch):
     config, _manifest, _files = admitted
     instances = []
 
     class Detector:
-        def __init__(self, value):
+        def __init__(self, value, *, inference_threads, fixed_view_input):
             assert value == config
+            assert inference_threads == 1
+            assert fixed_view_input is True
             instances.append(self)
 
         def infer(self, *args):
@@ -251,8 +402,9 @@ def test_cancelled_native_person_call_reserves_capacity_until_real_completion(
     entered, release = threading.Event(), threading.Event()
 
     class Detector:
-        def __init__(self, _config):
-            pass
+        def __init__(self, _config, *, inference_threads, fixed_view_input):
+            assert inference_threads == 1
+            assert fixed_view_input is True
 
         def infer(self, *args):
             entered.set()

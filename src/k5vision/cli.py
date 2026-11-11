@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from collections.abc import Sequence
 from contextlib import nullcontext
 from pathlib import Path
@@ -92,7 +93,13 @@ def _analytics_preflight() -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the installed command without enabling any device action by itself."""
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    candidate_argv = sys.argv[1:] if argv is None else argv
+    # A credential can begin with -h; reject the unsupported inline option
+    # before argparse can mistake its value for --help and exit successfully.
+    # Never expose the rejected value through an exception or terminal output.
+    if any(token == "--password" or token.startswith("--password=") for token in candidate_argv):
+        parser.error("Inline credentials are not supported")
+    args = parser.parse_args(candidate_argv)
     if args.command is None:
         parser.print_help()
         return 0

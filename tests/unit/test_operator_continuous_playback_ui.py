@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -280,6 +281,12 @@ def test_event_click_waits_for_initial_history_and_latest_click_wins(held_phase,
     with _history_page(export_handler=delayed_inventory, wait_for_history=False) as (page, expect):
         buttons = page.locator("#analytics-provider-events button")
         expect(buttons).to_have_count(2)
+        # Event rendering can finish before Playwright dispatches the pending
+        # inventory request on a busy hosted browser. Pump browser callbacks
+        # within a test-only bound; keep the required held request unchanged.
+        pending_deadline = time.monotonic() + 5.0
+        while not pending and time.monotonic() < pending_deadline:
+            page.wait_for_timeout(50)
         assert len(pending) == 1
         buttons.nth(0).click()
         buttons.nth(1).click()

@@ -7,6 +7,7 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+from starlette.concurrency import run_in_threadpool
 
 from k5vision.operator_integration_contracts import IntegrationContractError
 from k5vision.operator_integrations import OperatorIntegrationError
@@ -208,10 +209,16 @@ def install_operator_integrations_api(
     ):
         response.headers["Cache-Control"] = "no-store"
         try:
-            result = service().handshake(
-                connection_id, machine_token(request), payload.supported_versions
+            # The identity-bound store performs synchronous SQLite and seal
+            # admission. Never hold the ASGI event loop during its disk wait:
+            # a delayed provider handshake must not starve camera or health APIs.
+            result = await run_in_threadpool(
+                service().handshake,
+                connection_id,
+                machine_token(request),
+                payload.supported_versions,
             )
-            audit("integration.handshake", connection_id, connection_id)
+            await run_in_threadpool(audit, "integration.handshake", connection_id, connection_id)
             return result
         except (OperatorIntegrationError, IntegrationContractError) as error:
             raise refuse(error) from None
@@ -225,8 +232,12 @@ def install_operator_integrations_api(
     ):
         response.headers["Cache-Control"] = "no-store"
         try:
-            return service().pull(
-                connection_id, machine_token(request), known_camera=known, limit=limit
+            return await run_in_threadpool(
+                service().pull,
+                connection_id,
+                machine_token(request),
+                known_camera=known,
+                limit=limit,
             )
         except (OperatorIntegrationError, IntegrationContractError) as error:
             raise refuse(error) from None
@@ -237,10 +248,14 @@ def install_operator_integrations_api(
     ):
         response.headers["Cache-Control"] = "no-store"
         try:
-            result = service().respond(
-                connection_id, machine_token(request), payload, known_camera=known
+            result = await run_in_threadpool(
+                service().respond,
+                connection_id,
+                machine_token(request),
+                payload,
+                known_camera=known,
             )
-            audit("integration.response", connection_id, connection_id)
+            await run_in_threadpool(audit, "integration.response", connection_id, connection_id)
             return result
         except (OperatorIntegrationError, IntegrationContractError) as error:
             raise refuse(error) from None
@@ -251,14 +266,19 @@ def install_operator_integrations_api(
     ):
         response.headers["Cache-Control"] = "no-store"
         try:
-            result = service().ingest(
-                connection_id, machine_token(request), payload, known_camera=known
+            result = await run_in_threadpool(
+                service().ingest,
+                connection_id,
+                machine_token(request),
+                payload,
+                known_camera=known,
             )
-            audit("integration.event", connection_id, connection_id)
+            await run_in_threadpool(audit, "integration.event", connection_id, connection_id)
             return result
         except (OperatorIntegrationError, IntegrationContractError) as error:
             if str(error) == "integration_source_clock_ahead":
-                audit(
+                await run_in_threadpool(
+                    audit,
                     "integration.event",
                     connection_id,
                     connection_id,
@@ -281,6 +301,8 @@ def install_operator_integrations_api(
         account, _ = await authenticate(session[1])
         authorized_selection(account, camera_id)
         try:
-            return service().events(camera_id=camera_id, before=before, limit=limit)
+            return await run_in_threadpool(
+                service().events, camera_id=camera_id, before=before, limit=limit
+            )
         except (OperatorIntegrationError, IntegrationContractError) as error:
             raise refuse(error) from None
