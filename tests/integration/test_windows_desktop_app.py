@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import http.client
 import importlib.util
 import json
 import os
@@ -447,6 +448,58 @@ def _installer_timeout_activity(process):
         }
     except (psutil.Error, OSError):
         return {"observation": "unavailable"}
+
+
+def _clock_live_gateway_probe(live_url, token, *, dial=None):
+    """Classify one failed clock-step live request without retaining any media.
+
+    Runs only *after* the original five-second browser request has failed.
+    The sole target is the same local media gateway and the same authorized
+    opaque session; the response body is never read, copied or logged.
+    This must not retry the acceptance request or replace its result.
+    """
+    try:
+        target = urlsplit(live_url)
+        port = target.port
+        valid = (
+            target.scheme == "http"
+            and target.hostname == "127.0.0.1"
+            and port is not None
+            and not target.username
+            and not target.password
+            and not target.query
+            and not target.fragment
+            and re.fullmatch(r"/media/live/k5_[0-9a-f]{64}/index\\.m3u8", target.path)
+            and isinstance(token, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token)
+        )
+    except (AttributeError, ValueError):
+        valid = False
+    if not valid:
+        return {"classification": "refused"}
+    connection = None
+    started = time.monotonic()
+    try:
+        connector = http.client.HTTPConnection if dial is None else dial
+        connection = connector("127.0.0.1", port, timeout=2.0)
+        connection.request(
+            "GET",
+            target.path,
+            headers={"Cookie": "k5_operator_media=" + token},
+        )
+        response = connection.getresponse()
+        return {
+            "classification": "response",
+            "http_status": int(response.status),
+            "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000)),
+        }
+    except TimeoutError:
+        return {"classification": "timeout", "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000))}
+    except (OSError, http.client.HTTPException):
+        return {"classification": "transport_error", "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000))}
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def _install_gui(setup, installed, api, *, diagnostic=None):
@@ -2769,7 +2822,16 @@ def _vm_clock_phase(
                 mark_clock_phase(direction + "_two_maintenance_cycles")
                 diagnostic["vm_clock_stage"] = direction + "_live"
                 diagnostic["vm_clock_stage"] = direction + "_live_media"
-                live_status = context.request.get(live_url, timeout=5000).status
+                try:
+                    live_status = context.request.get(live_url, timeout=5000).status
+                except Exception:
+                    # Classify the local gateway independently after the
+                    # original browser request has failed. Never count this as
+                    # accepted media or grant another browser attempt.
+                    diagnostic["vm_clock_live_gateway_probe"] = _clock_live_gateway_probe(
+                        live_url, original_token
+                    )
+                    raise
                 diagnostic["vm_clock_media_http_status"] = live_status
                 _require(live_status == 200, "VM clock step expired authenticated live media")
                 _require(
