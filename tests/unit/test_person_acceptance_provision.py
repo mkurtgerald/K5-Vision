@@ -14,7 +14,9 @@ import pytest
 # This script is a development-only entry point, not a distributable package.
 # pytest's console-script invocation does not necessarily add the checkout
 # root to sys.path; load the exact checked-out script without changing sys.path.
-_script = Path(__file__).resolve().parents[2] / "scripts" / "provision_operator_person_acceptance.py"
+_script = (
+    Path(__file__).resolve().parents[2] / "scripts" / "provision_operator_person_acceptance.py"
+)
 _spec = importlib.util.spec_from_file_location("provision_operator_person_acceptance", _script)
 assert _spec is not None and _spec.loader is not None
 provision = importlib.util.module_from_spec(_spec)
