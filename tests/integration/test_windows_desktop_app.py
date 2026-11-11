@@ -469,7 +469,7 @@ def _clock_live_gateway_probe(live_url, token, *, dial=None):
             and not target.password
             and not target.query
             and not target.fragment
-            and re.fullmatch(r"/media/live/k5_[0-9a-f]{64}/index\\.m3u8", target.path)
+            and re.fullmatch(r"/media/live/k5_[0-9a-f]{64}/index\.m3u8", target.path)
             and isinstance(token, str)
             and re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token)
         )
@@ -494,9 +494,15 @@ def _clock_live_gateway_probe(live_url, token, *, dial=None):
             "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000)),
         }
     except TimeoutError:
-        return {"classification": "timeout", "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000))}
+        return {
+            "classification": "timeout",
+            "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000)),
+        }
     except (OSError, http.client.HTTPException):
-        return {"classification": "transport_error", "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000))}
+        return {
+            "classification": "transport_error",
+            "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000)),
+        }
     finally:
         if connection is not None:
             connection.close()
