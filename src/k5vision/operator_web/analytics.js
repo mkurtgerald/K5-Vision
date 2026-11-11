@@ -176,7 +176,7 @@
     function renderEvents() {
       // Five-second polling must not detach an unchanged event while the
       // operator is targeting its Play recording button.
-      const signature = JSON.stringify([version, events.map((event) => [
+      const signature = JSON.stringify([epoch, events.map((event) => [
         event.id, event.camera_id, event.occurred_at, event.playback_at,
         event.confidence, event.person_count,
       ])]);
