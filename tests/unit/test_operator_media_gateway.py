@@ -129,6 +129,8 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
         "/api/v1/operator/admin/*",
         "/api/v1/operator/cameras/*/time",
         "/api/v1/operator/cameras/*/time/*",
+        "/api/v1/operator/cameras/*/video-settings",
+        "/api/v1/operator/cameras/*/video-settings/*",
         "/api/v1/auth/oidc/*",
         "/api/v1/operator/cameras/*/person-view",
         "/api/v1/operator/camera-profiles",

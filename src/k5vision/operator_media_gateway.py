@@ -206,6 +206,8 @@ def generate_operator_gateway_configuration(
                         "/api/v1/operator/admin/*",
                         "/api/v1/operator/cameras/*/time",
                         "/api/v1/operator/cameras/*/time/*",
+                        "/api/v1/operator/cameras/*/video-settings",
+                        "/api/v1/operator/cameras/*/video-settings/*",
                         "/api/v1/auth/oidc/*",
                     ]
                 }

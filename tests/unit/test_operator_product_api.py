@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 
 from k5vision.auth_sessions import UserSessionManager
 from k5vision.domain.devices import DeviceCreate, DeviceProtocol
+from k5vision.domain.streams import VideoCodec
 from k5vision.domain.users import UserAccount, UserCreate, UserPatch, UserRole
 from k5vision.identity_state import initialize_identity_state
 from k5vision.media.mediamtx_provider import (
@@ -295,10 +296,169 @@ def test_enrollment_persists_private_source_and_public_rows_hide_execution_mater
         },
         "connection_error": None,
         "analytics_status": "disabled",
+        "source_revision": row["source_revision"],
     }
+    assert len(row["source_revision"]) == 64
     assert "private-test-value" not in response.text
     assert "rtsp://" not in response.text
     assert product.cameras.get(UUID(device_id)).binding == sources[0].binding
+
+
+@pytest.fixture
+def video_composition(monkeypatch):
+    import k5vision.operator_camera_settings_api as camera_api
+
+    installed = camera_api.install_operator_camera_settings_api
+    callbacks = {}
+
+    def capture(app, **kwargs):
+        callbacks.update(kwargs)
+        return installed(app, **kwargs)
+
+    monkeypatch.setattr(camera_api, "install_operator_camera_settings_api", capture)
+    return callbacks
+
+
+@pytest.fixture
+def video_product(video_composition, product, monkeypatch):
+    refreshes = []
+
+    async def refresh(previous, replacement, *, persist):
+        refreshes.append((previous, replacement))
+        assert product.cameras.get(previous.device.id) == previous
+        await persist()
+
+    original_state = product.service.provider.path_state
+    inbound_bytes = {}
+
+    async def h264_state(binding):
+        inbound_bytes[binding] = inbound_bytes.get(binding, 0) + 1024
+        return replace(
+            await original_state(binding),
+            video_codecs=(VideoCodec.H264,),
+            inbound_bytes=inbound_bytes[binding],
+        )
+
+    monkeypatch.setattr(product.service.provider, "path_state", h264_state)
+    product.service.video_observed_bytes = inbound_bytes
+    product.service.refresh_camera_source = refresh
+    product.service.camera_source_refresh_status = lambda binding: "ready"
+    return product, video_composition, refreshes
+
+
+def test_video_settings_reconcile_only_target_and_keep_recording_identity(video_product):
+    product, callbacks, refreshes = video_product
+    identifier = UUID(product.enroll())
+    previous = product.cameras.get(identifier)
+    initial = product.client.get("/api/v1/operator/cameras", headers=product.headers).json()
+    assert initial["cameras"][0]["source_revision"]
+    initial_bytes = product.service.video_observed_bytes[previous.binding]
+    result = SimpleNamespace(source_uri="rtsp://camera:private-test-value@127.0.0.1/new-profile")
+    verification = product.client.portal.call(callbacks["commit_settings"], previous, None, result)
+    assert verification == {
+        "stream_verified": True,
+        "stream_status": "live",
+        "recording_state": "recording",
+        "reconnect_requested": True,
+        "verification_pending": False,
+    }
+    replacement = product.cameras.get(identifier)
+    assert replacement.binding == previous.binding
+    assert replacement.recording_enabled is True
+    assert replacement.source_uri == result.source_uri
+    assert refreshes == [(previous, replacement)]
+    assert product.service.video_observed_bytes[previous.binding] >= initial_bytes + 2048
+    assert product.service.applied == [(previous,)]
+    final = product.client.get("/api/v1/operator/cameras", headers=product.headers).json()
+    assert final["cameras"][0]["source_revision"] != initial["cameras"][0]["source_revision"]
+    assert "private-test-value" not in str(final)
+
+
+def test_video_settings_same_uri_still_reconnects_and_preserves_paused_recording(video_product):
+    product, callbacks, refreshes = video_product
+    identifier = UUID(product.enroll())
+    previous = product.cameras.set_recording_enabled(identifier, False)
+    result = SimpleNamespace(source_uri=previous.source_uri)
+    verification = product.client.portal.call(callbacks["commit_settings"], previous, None, result)
+    assert refreshes == [(previous, previous)]
+    assert product.cameras.get(identifier).recording_enabled is False
+    assert verification["stream_verified"] is True
+    assert verification["recording_state"] == "paused"
+
+
+def test_video_settings_refuses_unavailable_recorder_before_camera_write(video_product):
+    product, callbacks, refreshes = video_product
+    identifier = UUID(product.enroll())
+    previous = product.cameras.get(identifier)
+    product.service.worker_status = "unavailable"
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as failure:
+        callbacks["before_apply"](previous)
+    assert failure.value.status_code == 409
+    assert failure.value.detail == "video_recorder_unavailable"
+    assert refreshes == []
+
+
+def test_video_settings_refuses_changed_source_before_reconciliation(video_product):
+    product, callbacks, refreshes = video_product
+    identifier = UUID(product.enroll())
+    previous = product.cameras.get(identifier)
+    updated = product.cameras.upsert(previous.device, "rtsp://127.0.0.1/re-enrolled")
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as failure:
+        product.client.portal.call(
+            callbacks["commit_settings"],
+            previous,
+            None,
+            SimpleNamespace(source_uri=previous.source_uri),
+        )
+    assert failure.value.status_code == 409
+    assert failure.value.detail == "video_source_changed"
+    assert product.cameras.get(identifier) == updated
+    assert refreshes == []
+
+
+def test_uncertain_video_write_reacquires_saved_target_without_changing_uri(video_product):
+    product, callbacks, refreshes = video_product
+    identifier = UUID(product.enroll())
+    previous = product.cameras.get(identifier)
+    product.client.portal.call(callbacks["reconcile_failed_write"], previous, None)
+    assert refreshes == [(previous, previous)]
+    assert product.cameras.get(identifier) == previous
+    assert product.service.applied == [(previous,)]
+
+
+def test_media_session_clear_releases_temporary_camera_management_credentials(product):
+    identifier = UUID(product.enroll())
+    source = product.cameras.get(identifier)
+    vault = product.app.state.operator_camera_settings_vault
+    handle, lease = vault.reserve((product.admin, product.token), identifier, source)
+    cleared = []
+    lease.inspection = SimpleNamespace(clear=lambda: cleared.append(True))
+    lease.phase = "idle"
+    response = product.client.delete("/api/v1/operator/media-session", headers=product.headers)
+    assert response.status_code == 204
+    assert cleared == [True]
+    assert handle not in vault._leases
+
+
+@pytest.mark.parametrize("scope", ["token", "user"])
+def test_session_revocation_releases_temporary_camera_management_credentials(product, scope):
+    identifier = UUID(product.enroll())
+    source = product.cameras.get(identifier)
+    vault = product.app.state.operator_camera_settings_vault
+    handle, lease = vault.reserve((product.admin, product.token), identifier, source)
+    cleared = []
+    lease.inspection = SimpleNamespace(clear=lambda: cleared.append(True))
+    lease.phase = "idle"
+    if scope == "token":
+        product.client.portal.call(product.sessions.revoke, product.token)
+    else:
+        product.client.portal.call(product.sessions.revoke_user, product.admin.id)
+    assert cleared == [True]
+    assert handle not in vault._leases
 
 
 def test_recording_pause_resume_preserves_live_source_history_and_persistent_choice(product):

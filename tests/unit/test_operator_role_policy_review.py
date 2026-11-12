@@ -71,6 +71,35 @@ def _limited_admin(product, permissions):
 
 
 @pytest.mark.parametrize("product", [{"roles": True}], indirect=True)
+def test_video_settings_requires_current_camera_administration_permission(product):
+    camera = product.enroll()
+    _, narrow = _limited_admin(product, ["users.manage"])
+    path = f"/api/v1/operator/cameras/{camera}/video-settings"
+    for method, target, payload in (
+        ("GET", path, None),
+        ("POST", path + "/read", {"username": "private-manager", "password": "private-secret"}),
+        ("PATCH", path, {"settings_handle": "a" * 43, "frame_rate": 15}),
+    ):
+        response = product.client.request(method, target, headers=narrow, json=payload)
+        assert response.status_code == 403
+        assert "private-" not in response.text
+
+
+@pytest.mark.parametrize("product", [{"roles": True}], indirect=True)
+def test_camera_management_only_admin_can_inspect_without_live_permission(product):
+    camera = product.enroll()
+    _, headers = _limited_admin(product, ["cameras.manage"])
+    path = f"/api/v1/operator/cameras/{camera}/video-settings"
+    response = product.client.get(path, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["writable"] is False
+    assert response.json()["status"] == "unavailable"
+    assert response.json()["writable_reason"] == "video_unsupported"
+    token = headers["Authorization"].removeprefix("Bearer ")
+    assert admin_helpers._media(product, token, camera).status_code == 403
+
+
+@pytest.mark.parametrize("product", [{"roles": True}], indirect=True)
 def test_playback_only_operator_cannot_bypass_export_policy_with_direct_donor_mp4(product):
     camera = product.enroll()
     issue = admin_helpers._create(product, role="operator", camera_ids=[camera])

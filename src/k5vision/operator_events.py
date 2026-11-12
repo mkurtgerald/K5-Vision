@@ -777,7 +777,7 @@ class RecordedFrameSampler:
         # Directory names establish a cold, content-free baseline so cache
         # lag cannot mistake retained footage for newly arriving segments.
         self._known_names: dict[UUID, set[str]] = {}
-        self._directory_mtime: dict[UUID, int] = {}
+        self._directory_versions: dict[UUID, tuple[int, int, int, int]] = {}
         self._closing = threading.Event()
         self._worker_lock = threading.RLock()
         # Finite in-memory outcome; never a path, source URI or recorded frame.
@@ -800,11 +800,17 @@ class RecordedFrameSampler:
             for identifier, value in self._known_names.items()
             if identifier in active
         }
-        self._directory_mtime = {
+        self._directory_versions = {
             identifier: value
-            for identifier, value in self._directory_mtime.items()
+            for identifier, value in self._directory_versions.items()
             if identifier in active
         }
+
+    @staticmethod
+    def _directory_version(info) -> tuple[int, int, int, int]:
+        # Metadata only invalidates a filename inventory. It never orders media
+        # or supplies an event timestamp; changes in either direction invalidate.
+        return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns
 
     @staticmethod
     def _started(name: str) -> datetime:
@@ -816,16 +822,19 @@ class RecordedFrameSampler:
         ).astimezone(UTC)
 
     @staticmethod
-    def _recording_names(directory: Path) -> set[str]:
+    def _recording_names(directory: Path, *, deadline: float | None = None) -> set[str]:
         """Bounded name-only scan; never read retained frames or infer file age."""
         names: set[str] = set()
-        deadline = time.monotonic() + 3
+        if deadline is None:
+            deadline = time.monotonic() + 3
         with os.scandir(directory) as entries:
             for index, entry in enumerate(entries):
                 if index >= MAX_RECORDING_ENTRIES or time.monotonic() >= deadline:
                     raise OperatorEventsError("Analytics recording scan limit reached")
                 if _SEGMENT_NAME.fullmatch(entry.name) is not None:
                     names.add(entry.name)
+        if time.monotonic() >= deadline:
+            raise OperatorEventsError("Analytics recording scan limit reached")
         return names
 
     def capture(self, source) -> RecordedPersonFrame | None:
@@ -844,6 +853,7 @@ class RecordedFrameSampler:
             raise OperatorEventsError("Analytics recording source refused")
         identity_state._windows_admission(directory, private=True, directory=True)
         previous = self._observations.get(source.binding.device_id)
+        directory_version = self._directory_version(directory_info)
         current = {}
         changed = []
         # A new segment can be created at zero bytes before the recorder writes
@@ -889,19 +899,29 @@ class RecordedFrameSampler:
                 # those uncached files too: directory mtime does not change
                 # when a pre-existing recording merely grows. Never infer a
                 # person from the bytes present at this cold observation.
-                known = self._recording_names(directory)
+                deadline = time.monotonic() + 3
+                identity_state._same_directory(directory, directory_info)
+                known = self._recording_names(directory, deadline=deadline)
+                identity_state._same_directory(directory, directory_info)
+                if len(set(inventory) | set(current) | known) > MAX_RECORDING_ENTRIES:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
                 uncached = sorted(known - current.keys(), reverse=True)[:2]
                 for name in uncached:
+                    if time.monotonic() >= deadline:
+                        raise OperatorEventsError("Analytics recording scan limit reached")
                     try:
                         info = identity_state._regular_file(directory / name)
                     except FileNotFoundError:
                         continue
                     current[name] = info.st_dev, info.st_ino, info.st_size
+                identity_state._same_directory(directory, directory_info)
+                if time.monotonic() >= deadline:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
                 self._active_files[source.binding.device_id] = tuple(
                     dict.fromkeys(uncached + hints)
                 )[:2]
                 self._known_names[source.binding.device_id] = known
-                self._directory_mtime[source.binding.device_id] = directory_info.st_mtime_ns
+                self._directory_versions[source.binding.device_id] = directory_version
                 self._observations[source.binding.device_id] = current
                 self._capture_outcome = "baseline"
                 return None
@@ -927,10 +947,19 @@ class RecordedFrameSampler:
             # bounded name scan, and only names absent from the cold baseline
             # can supply fresh bytes. Active files still use byte high-water.
             identifier = source.binding.device_id
-            if self._directory_mtime.get(identifier) != directory_info.st_mtime_ns:
+            if self._directory_versions.get(identifier) != directory_version:
                 seen = self._known_names.setdefault(identifier, set())
-                names = self._recording_names(directory)
+                deadline = time.monotonic() + 3
+                identity_state._same_directory(directory, directory_info)
+                names = self._recording_names(directory, deadline=deadline)
+                identity_state._same_directory(directory, directory_info)
+                # A stale cache entry still consumes this scan's inventory
+                # budget even if its file disappeared during candidate checks.
+                if len(set(inventory) | set(current) | names) > MAX_RECORDING_ENTRIES:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
                 for name in names - seen:
+                    if time.monotonic() >= deadline:
+                        raise OperatorEventsError("Analytics recording scan limit reached")
                     if name in current:
                         continue
                     path = directory / name
@@ -943,8 +972,13 @@ class RecordedFrameSampler:
                         changed.append((path, info))
                     else:
                         pending_zero.append(name)
+                identity_state._same_directory(directory, directory_info)
+                if time.monotonic() >= deadline:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
                 seen.update(names)
-                self._directory_mtime[identifier] = directory_info.st_mtime_ns
+                # Retain the BEFORE-scan version so arrivals during enumeration
+                # invalidate this inventory on the next capture.
+                self._directory_versions[identifier] = directory_version
         else:
             # Source-only integrations may have no recorder cache. Their fallback
             # has the same inventory ceiling as storage and a finite scan budget.

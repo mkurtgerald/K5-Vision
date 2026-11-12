@@ -218,6 +218,447 @@ def _fake_mutations(native, monkeypatch, *, fail_once=None):
     return attempts
 
 
+@pytest.mark.parametrize("same_uri", [False, True])
+@pytest.mark.parametrize("recording_enabled", [False, True])
+def test_source_refresh_restarts_only_selected_camera_and_preserves_workers(
+    native, monkeypatch, same_uri, recording_enabled
+):
+    attempts = _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first = replace(_source(1), recording_enabled=recording_enabled)
+        second = _source(2)
+        replacement = first if same_uri else replace(first, source_uri="rtsp://192.0.2.1/new")
+        await service.start((first, second))
+        workers = service._media, service._gateway
+        generation = service.media_generation
+        before = json.loads(service._media_file.read_bytes())
+        commits = []
+
+        async def persist():
+            saved = json.loads(service._media_file.read_bytes())
+            assert saved["paths"][first.binding.path_name]["source"] == replacement.source_uri
+            commits.append(replacement)
+
+        try:
+            await service.refresh_camera_source(first, replacement, persist=persist)
+            assert attempts == [("POST", f"/v3/config/paths/replace/{first.binding.path_name}")] * (
+                2 if same_uri else 1
+            )
+            assert service._sources == (replacement, second)
+            assert commits == [replacement]
+            assert (service._media, service._gateway) == workers
+            assert service.media_generation == generation and len(native.processes) == 2
+            assert all(process.stopped == 0 for process in workers)
+            saved = json.loads(service._media_file.read_bytes())
+            assert saved["paths"] == service._media.paths
+            assert (
+                saved["paths"][second.binding.path_name]
+                == before["paths"][second.binding.path_name]
+            )
+            assert saved["paths"][first.binding.path_name]["record"] is recording_enabled
+            assert saved["paths"][first.binding.path_name]["sourceOnDemand"] is False
+            assert service.status() == "ready" and not service._needs_reconcile
+            assert service.camera_source_refresh_status(first.binding) == "ready"
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "failure", ["remote_before", "remote_after", "timeout", "config", "persist"]
+)
+def test_source_refresh_compensates_target_without_disturbing_other_camera(
+    native, monkeypatch, failure
+):
+    attempts = _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first, second = _source(1), _source(2)
+        replacement = replace(first, source_uri="rtsp://user:private@192.0.2.1/changed")
+        await service.start((first, second))
+        workers = service._media, service._gateway
+        original = service._media_file.read_bytes()
+        original_paths = json.loads(original)["paths"]
+        original_mutation, original_write = service._mutation, service._write_media
+        calls = 0
+        committed = []
+
+        def mutation(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            assert kwargs.get("timeout", 3) == 3
+            if calls == 1 and failure in {"remote_before", "timeout"}:
+                if failure == "timeout":
+                    raise TimeoutError("private native URL")
+                raise RuntimeError("private native URL")
+            original_mutation(*args, **kwargs)
+            if calls == 1 and failure == "remote_after":
+                raise RuntimeError("private native URL")
+
+        writes = 0
+
+        def write():
+            nonlocal writes
+            writes += 1
+            original_write()
+            if writes == 1 and failure == "config":
+                raise OSError("private configuration path")
+
+        async def persist():
+            if failure == "persist":
+                raise RuntimeError("private database path")
+            committed.append(True)
+
+        monkeypatch.setattr(service, "_mutation", mutation)
+        monkeypatch.setattr(service, "_write_media", write)
+        try:
+            with pytest.raises(OperatorProductError) as error:
+                await service.refresh_camera_source(first, replacement, persist=persist)
+            assert "private" not in str(error.value)
+            assert not committed
+            assert service._sources == (first, second)
+            assert service._media_file.read_bytes() == original
+            assert service._media.paths == original_paths
+            assert all(route.endswith(first.binding.path_name) for _, route in attempts)
+            assert all(method == "POST" for method, _ in attempts)
+            assert (service._media, service._gateway) == workers
+            assert len(native.processes) == 2 and all(p.stopped == 0 for p in workers)
+            assert service.status() == "ready" and not service._needs_reconcile
+            assert service.camera_source_refresh_status(first.binding) == "ready"
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_uncertain_source_rollback_reports_target_recovery_then_repairs_without_restart(
+    native, monkeypatch
+):
+    _fake_mutations(native, monkeypatch)
+    _fast_maintenance(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first, second = _source(1), _source(2)
+        await service.start((first, second))
+        workers = service._media, service._gateway
+        original = service._media_file.read_bytes()
+        original_mutation = service._mutation
+        calls = []
+
+        def ambiguous(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 2:
+                raise TimeoutError("rollback did not acknowledge")
+            original_mutation(*args, **kwargs)
+            if len(calls) == 1:
+                raise TimeoutError("update applied without acknowledgement")
+
+        monkeypatch.setattr(service, "_mutation", ambiguous)
+
+        async def persist():
+            pytest.fail("Failed native update must not commit")
+
+        try:
+            with pytest.raises(OperatorProductError):
+                await service.refresh_camera_source(
+                    first, replace(first, source_uri="rtsp://192.0.2.1/new"), persist=persist
+                )
+            assert service.camera_source_refresh_status(first.binding) == "recovery_required"
+            assert service.camera_source_refresh_status(second.binding) == "ready"
+            assert service.status() == "ready" and not service._needs_reconcile
+            assert service._sources == (first, second)
+            await _until(lambda: service.camera_source_refresh_status(first.binding) == "ready")
+            assert len(calls) == 3
+            assert all(args[1].endswith(first.binding.path_name) for args in calls)
+            assert service._media_file.read_bytes() == original
+            assert service._media.paths == json.loads(original)["paths"]
+            assert (service._media, service._gateway) == workers and len(native.processes) == 2
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["remote", "config"])
+@pytest.mark.parametrize("same_uri", [False, True])
+def test_cancelled_source_refresh_joins_late_mutation_before_target_compensation(
+    native, monkeypatch, stage, same_uri
+):
+    attempts = _fake_mutations(native, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+
+    async def scenario():
+        service = native.service
+        first, second = _source(1), _source(2)
+        await service.start((first, second))
+        workers = service._media, service._gateway
+        saved = service._media_file.read_bytes()
+        original = service._mutation if stage == "remote" else service._write_media
+        calls = 0
+
+        def held(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                assert release.wait(3)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(service, "_mutation" if stage == "remote" else "_write_media", held)
+
+        async def persist():
+            pytest.fail("Cancelled request must not reach persistence")
+
+        try:
+            replacement = first if same_uri else replace(first, source_uri="rtsp://192.0.2.1/new")
+            refresh = asyncio.create_task(
+                service.refresh_camera_source(first, replacement, persist=persist)
+            )
+            await _until(entered.is_set)
+            refresh.cancel()
+            await asyncio.sleep(0.02)
+            refresh.cancel()
+            assert not refresh.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await refresh
+            assert service._sources == (first, second)
+            assert service._media_file.read_bytes() == saved
+            assert service._media.paths == json.loads(saved)["paths"]
+            assert all(route.endswith(first.binding.path_name) for _, route in attempts)
+            assert (service._media, service._gateway) == workers
+            assert all(p.stopped == 0 for p in workers)
+            assert service.status() == "ready" and not service._needs_reconcile
+        finally:
+            release.set()
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mismatch", ["previous", "binding", "device", "recording", "private_uri"])
+def test_source_refresh_refuses_stale_or_different_camera_identity(native, monkeypatch, mismatch):
+    attempts = _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first, second = _source(1), _source(2)
+        await service.start((first, second))
+        saved = service._media_file.read_bytes()
+        previous, replacement = first, replace(first, source_uri="rtsp://192.0.2.1/new")
+        if mismatch == "previous":
+            previous = replace(first, source_uri="rtsp://192.0.2.1/stale")
+        elif mismatch == "binding":
+            replacement = second
+        elif mismatch == "device":
+            replacement = replace(
+                replacement, device=first.device.model_copy(update={"name": "Other"})
+            )
+        elif mismatch == "recording":
+            replacement = replace(replacement, recording_enabled=False)
+        else:
+            object.__setattr__(replacement, "source_uri", "http://192.0.2.1/invalid")
+
+        async def persist():
+            pytest.fail("Unadmitted source must not commit")
+
+        try:
+            with pytest.raises(OperatorProductError, match="selection changed"):
+                await service.refresh_camera_source(previous, replacement, persist=persist)
+            assert attempts == []
+            assert service._sources == (first, second)
+            assert service._media_file.read_bytes() == saved
+            assert service._media.paths == json.loads(saved)["paths"]
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("same_uri", [False, True])
+def test_stop_joins_cancelled_source_compensation_before_releasing_native_processes(
+    native, monkeypatch, same_uri
+):
+    attempts = _fake_mutations(native, monkeypatch)
+    update_entered, update_release = threading.Event(), threading.Event()
+    rollback_entered, rollback_release = threading.Event(), threading.Event()
+
+    async def scenario():
+        service = native.service
+        first, second = _source(1), _source(2)
+        await service.start((first, second))
+        workers = service._media, service._gateway
+        saved = service._media_file.read_bytes()
+        mutation = service._mutation
+        calls = 0
+
+        def held(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                update_entered.set()
+                assert update_release.wait(3)
+            elif calls == 2:
+                rollback_entered.set()
+                assert rollback_release.wait(3)
+            mutation(*args, **kwargs)
+
+        monkeypatch.setattr(service, "_mutation", held)
+
+        async def persist():
+            pytest.fail("Cancelled update must not persist")
+
+        replacement = first if same_uri else replace(first, source_uri="rtsp://192.0.2.1/new")
+        refresh = asyncio.create_task(
+            service.refresh_camera_source(first, replacement, persist=persist)
+        )
+        cleanup = None
+        try:
+            await _until(update_entered.is_set)
+            refresh.cancel()
+            update_release.set()
+            await _until(rollback_entered.is_set)
+            refresh.cancel()
+            cleanup = asyncio.create_task(service.stop())
+            await asyncio.sleep(0.02)
+            assert not cleanup.done() and not refresh.done()
+            assert all(process.stopped == 0 for process in workers)
+            assert service._sources == (first, second)
+            rollback_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await refresh
+            await cleanup
+            assert service._media_file.read_bytes() == saved
+            assert all(process.stopped == 1 for process in workers)
+            replaces = [route for method, route in attempts if method == "POST"]
+            assert replaces == [f"/v3/config/paths/replace/{first.binding.path_name}"] * 2
+            assert not service._source_refreshes
+        finally:
+            update_release.set()
+            rollback_release.set()
+            await asyncio.gather(refresh, *([cleanup] if cleanup else []), return_exceptions=True)
+            if service._media is not None:
+                await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_stale_source_recovery_never_overwrites_a_newer_committed_source(native, monkeypatch):
+    attempts = _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first, second = _source(1), _source(2)
+        replacement = replace(first, source_uri="rtsp://192.0.2.1/new")
+        await service.start((first, second))
+
+        async def persist():
+            return None
+
+        try:
+            await service.refresh_camera_source(first, replacement, persist=persist)
+            saved = service._media_file.read_bytes()
+            # Model an old queued recovery after a later successful intent.
+            service._source_recovery[first.binding.path_name] = (first, 0)
+            async with service._lock:
+                await service._retry_camera_source()
+            assert len(attempts) == 1
+            assert service._sources == (replacement, second)
+            assert service._media_file.read_bytes() == saved
+            assert service._media.paths[first.binding.path_name]["source"] == replacement.source_uri
+            assert not service._source_recovery
+            assert service.camera_source_refresh_status(first.binding) == "ready"
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_source_refresh_respects_disk_pause_and_rejects_unavailable_worker(native, monkeypatch):
+    attempts = _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first, second = _source(1), _source(2)
+        _Storage.allowed = False
+        await service.start((first, second))
+        commits = []
+
+        async def persist():
+            commits.append(True)
+
+        try:
+            await service.refresh_camera_source(first, first, persist=persist)
+            assert service.status() == "disk_full"
+            assert not any(path["record"] for path in service._media.paths.values())
+            assert len(attempts) == 2 and commits == [True]
+            assert service._media.paths[first.binding.path_name]["sourceOnDemand"] is False
+            saved = service._media_file.read_bytes()
+            service._ready = False
+            with pytest.raises(OperatorProductError, match="unavailable"):
+                await service.refresh_camera_source(first, first, persist=persist)
+            assert len(attempts) == 2 and commits == [True]
+            assert service._media_file.read_bytes() == saved
+            assert service.camera_source_refresh_status(first.binding) == "unavailable"
+            with pytest.raises(ValueError):
+                service.camera_source_refresh_status(MediaMTXBinding("other-site", first.device.id))
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failed_call", [1, 2])
+@pytest.mark.parametrize("applied_before_failure", [False, True])
+def test_unchanged_uri_refresh_restores_continuous_acquisition_after_either_post_fails(
+    native, monkeypatch, failed_call, applied_before_failure
+):
+    attempts = _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        first, second = _source(1), _source(2)
+        await service.start((first, second))
+        saved = service._media_file.read_bytes()
+        workers = service._media, service._gateway
+        mutation = service._mutation
+        calls = 0
+
+        def ambiguous(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == failed_call and not applied_before_failure:
+                raise TimeoutError("private native timeout")
+            mutation(*args, **kwargs)
+            if calls == failed_call:
+                raise TimeoutError("private native timeout")
+
+        monkeypatch.setattr(service, "_mutation", ambiguous)
+
+        async def persist():
+            pytest.fail("Partial refresh must not persist")
+
+        try:
+            with pytest.raises(OperatorProductError):
+                await service.refresh_camera_source(first, first, persist=persist)
+            assert service._sources == (first, second)
+            assert service._media_file.read_bytes() == saved
+            assert service._media.paths == json.loads(saved)["paths"]
+            assert service._media.paths[first.binding.path_name]["sourceOnDemand"] is False
+            assert all(route.endswith(first.binding.path_name) for _, route in attempts)
+            assert (service._media, service._gateway) == workers
+            assert service.status() == "ready" and not service._needs_reconcile
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
 def test_stop_closes_each_active_writer_before_workers_without_rewriting_saved_config(
     native, monkeypatch
 ):
@@ -1433,3 +1874,184 @@ def test_native_view_warmup_yields_to_first_recorded_event_without_changing_view
         gate.close()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("previous_failures", [0, 1])
+def test_local_provider_capacity_does_not_change_prior_worker_health(
+    native, monkeypatch, previous_failures
+):
+    from k5vision.media.mediamtx_provider import (
+        MEDIAMTX_VERSION,
+        MediaMTXCredentials,
+        MediaMTXProvider,
+        MediaWorkerError,
+        MediaWorkerErrorCode,
+    )
+
+    entered, release = threading.Event(), threading.Event()
+    count = 0
+    lock = threading.Lock()
+    observations = []
+
+    def worker(request, timeout, _limit):
+        nonlocal count
+        assert timeout == 3
+        if request.full_url.endswith("/v3/info"):
+            return json.dumps(
+                {"version": MEDIAMTX_VERSION, "started": "2026-11-08T01:00:00Z"}
+            ).encode()
+        with lock:
+            count += 1
+            if count == 4:
+                entered.set()
+        assert release.wait(5), "Controlled worker reads were not released"
+        return b"[]"
+
+    class ObservedProvider(MediaMTXProvider):
+        async def info(self):
+            try:
+                return await super().info()
+            except MediaWorkerError as error:
+                observations.append(error.code)
+                raise
+
+    async def scenario():
+        service = native.service
+        held = []
+        original_sleep = asyncio.sleep
+        ticks = asyncio.Queue()
+
+        async def tick_sleep(delay):
+            if delay == 2:
+                await ticks.get()
+            else:
+                await original_sleep(delay)
+
+        try:
+            await service.start(())
+            service._task.cancel()
+            await asyncio.gather(service._task, return_exceptions=True)
+            service._task = None
+            provider = ObservedProvider(
+                site_id=service.site_id,
+                api_origin="http://127.0.0.1:18082",
+                playback_origin="http://127.0.0.1:18083",
+                credentials=MediaMTXCredentials("worker", "x" * 43),
+                requester=worker,
+            )
+            service.provider = provider
+            await provider.info()
+            service._health_failures["media"] = previous_failures
+            service._ready = previous_failures == 0
+            held = [
+                asyncio.create_task(provider.playback_spans(_source(1).binding)) for _ in range(4)
+            ]
+            await _until(entered.is_set)
+            monkeypatch.setattr(native.module.asyncio, "sleep", tick_sleep)
+            service._task = asyncio.create_task(service._maintain())
+            ticks.put_nowait(None)
+            await _until(lambda: bool(observations))
+            # Wait until the observed health result has finished its iteration.
+            await _until(lambda: service._lock.locked() is False)
+            assert observations == [MediaWorkerErrorCode.BUSY]
+            assert service._health_failures["media"] == previous_failures
+            assert service.status() == ("ready" if previous_failures == 0 else "unavailable")
+            assert provider._version_admitted
+            assert all(
+                process.poll() is None and not process.stopped for process in native.processes
+            )
+            release.set()
+            assert await asyncio.gather(*held) == [(), (), (), ()]
+            if previous_failures:
+                ticks.put_nowait(None)
+                await _until(lambda: service.status() == "ready")
+                assert service._health_failures["media"] == 0
+        finally:
+            release.set()
+            await asyncio.gather(*held, return_exceptions=True)
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "failure", ["timeout", "unavailable", "unauthorized", "version", "gateway_busy"]
+)
+def test_worker_observation_failures_still_block_media_until_success(native, monkeypatch, failure):
+    from urllib.error import HTTPError
+
+    from k5vision.media.mediamtx_provider import (
+        MEDIAMTX_VERSION,
+        MediaMTXCredentials,
+        MediaMTXProvider,
+        MediaWorkerError,
+        MediaWorkerErrorCode,
+    )
+
+    counts = {"info": 0, "gateway": 0}
+
+    def worker(_request, timeout, _limit):
+        assert timeout == 3
+        counts["info"] += 1
+        version = MEDIAMTX_VERSION
+        if counts["info"] == 2:
+            if failure == "timeout":
+                raise TimeoutError
+            if failure == "unavailable":
+                raise OSError
+            if failure == "unauthorized":
+                raise HTTPError("http://127.0.0.1/info", 401, "", None, None)
+            if failure == "version":
+                version = "v9"
+        return json.dumps({"version": version, "started": "2026-11-08T01:00:00Z"}).encode()
+
+    def gateway():
+        counts["gateway"] += 1
+        if failure == "gateway_busy" and counts["gateway"] == 1:
+            raise MediaWorkerError(MediaWorkerErrorCode.BUSY)
+
+    async def scenario():
+        service = native.service
+        original_sleep = asyncio.sleep
+        ticks = asyncio.Queue()
+
+        async def tick_sleep(delay):
+            if delay == 2:
+                await ticks.get()
+            else:
+                await original_sleep(delay)
+
+        try:
+            await service.start(())
+            service._task.cancel()
+            await asyncio.gather(service._task, return_exceptions=True)
+            service._task = None
+            service.provider = MediaMTXProvider(
+                site_id=service.site_id,
+                api_origin="http://127.0.0.1:18082",
+                playback_origin="http://127.0.0.1:18083",
+                credentials=MediaMTXCredentials("worker", "x" * 43),
+                requester=worker,
+            )
+            await service.provider.info()
+            monkeypatch.setattr(service, "_check_gateway", gateway)
+            monkeypatch.setattr(native.module.asyncio, "sleep", tick_sleep)
+            workers = service._media, service._gateway
+            service._task = asyncio.create_task(service._maintain())
+            ticks.put_nowait(None)
+            component = "gateway" if failure == "gateway_busy" else "media"
+            await _until(lambda: service._health_failures[component] == 1)
+            await _until(lambda: not service._lock.locked())
+            assert service.status() == "unavailable"
+            assert service.provider._version_admitted is (failure == "gateway_busy")
+            assert (service._media, service._gateway) == workers
+            assert all(not process.stopped for process in workers)
+            ticks.put_nowait(None)
+            await _until(lambda: service.status() == "ready")
+            assert service._health_failures[component] == 0
+            assert service.provider._version_admitted
+            assert (service._media, service._gateway) == workers
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())

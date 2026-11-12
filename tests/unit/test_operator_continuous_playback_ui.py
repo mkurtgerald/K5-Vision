@@ -634,3 +634,310 @@ def test_ready_export_downloads_and_a_later_expired_file_is_rechecked():
         expect(page.locator("#export-message")).to_contain_text("no longer available")
         assert len(download_response["requests"]) == 1
         assert page.locator("#download-recording").get_attribute("href") == "#"
+
+
+_LATE_EVENT = _BEGIN + timedelta(minutes=200)
+_LATE_EXPECTED = _LATE_EVENT.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _late_event_spans(fresh=False):
+    spans = [
+        {
+            "recording_id": f"generated-{i}",
+            "started_at": (_BEGIN + timedelta(minutes=i * 10 + (10 if i >= 12 else 0))).isoformat(),
+            "duration_seconds": 600,
+        }
+        for i in range(18)
+    ]
+    if fresh:
+        spans.append(
+            {
+                "recording_id": "newly-indexed",
+                "started_at": (_BEGIN + timedelta(minutes=195)).isoformat(),
+                "duration_seconds": 600,
+            }
+        )
+    return spans
+
+
+def _wait_for_history_route(page, predicate):
+    deadline = time.monotonic() + 5
+    while not predicate() and time.monotonic() < deadline:
+        page.wait_for_timeout(10)
+    assert predicate(), "expected actual route callback within bounded 5s"
+
+
+def _late_event_route(route, moments):
+    if not urlsplit(route.request.url).path.endswith("/events"):
+        return False
+    route.fulfill(
+        content_type="application/json",
+        body=json.dumps(
+            {
+                "events": [
+                    {
+                        "id": i + 1,
+                        "camera_id": _CAMERA,
+                        "occurred_at": at.isoformat(),
+                        "playback_at": at.isoformat(),
+                        "confidence": 0.9,
+                        "person_count": 1,
+                    }
+                    for i, at in enumerate(moments)
+                ],
+                "has_more": False,
+                "next_before": None,
+            }
+        ),
+    )
+    return True
+
+
+@pytest.mark.parametrize("outcome", ["covered", "gap", "error", "rollback"])
+def test_inside_range_event_rechecks_missing_cached_coverage(outcome):
+    history, status_requests = [], []
+    clock = {"rolled_back": False}
+
+    def intercept(route):
+        path = urlsplit(route.request.url).path
+        if _late_event_route(route, [_LATE_EVENT]):
+            return True
+        if path == "/api/v1/operator/status":
+            status_requests.append(route.request.url)
+            now = _NOW - timedelta(days=2) if clock["rolled_back"] else _NOW
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "worker_status": "ready",
+                        "server_utc": now.isoformat().replace("+00:00", "Z"),
+                    }
+                ),
+            )
+            return True
+        if path.endswith("/history"):
+            history.append(route.request.url)
+            fresh = len(history) > 1
+            route.fulfill(
+                status=503 if fresh and outcome == "error" else 200,
+                content_type="application/json",
+                body=json.dumps(
+                    {"detail": "Recording inventory temporarily unavailable"}
+                    if fresh and outcome == "error"
+                    else {"spans": _late_event_spans(fresh and outcome in {"covered", "rollback"})}
+                ),
+            )
+            return True
+        return False
+
+    with _history_page(export_handler=intercept) as (page, expect):
+        button = page.locator('#analytics-events button[data-event-id="1"]')
+        expect(button).to_be_visible()
+        bounds = [
+            page.locator("#history-start").input_value(),
+            page.locator("#history-end").input_value(),
+        ]
+        assert len(history) == 1
+        if outcome == "rollback":
+            clock["rolled_back"] = True
+            previous = len(status_requests)
+            page.locator("#refresh-cameras").click()
+            _wait_for_history_route(page, lambda: len(status_requests) > previous)
+            page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame(() => "
+                "requestAnimationFrame(resolve)))"
+            )
+            assert [
+                page.locator("#history-start").input_value(),
+                page.locator("#history-end").input_value(),
+            ] == bounds
+        button.click()
+        _wait_for_history_route(page, lambda: len(history) == 2)
+        query = parse_qs(urlsplit(history[-1]).query)
+        assert datetime.fromisoformat(query["start"][0]) == datetime.fromisoformat(bounds[0] + "Z")
+        assert datetime.fromisoformat(query["end"][0]) == datetime.fromisoformat(bounds[1] + "Z")
+        video = page.locator("#playback-video")
+        if outcome in {"covered", "rollback"}:
+            expect(video).to_have_attribute("data-utc-start", _LATE_EXPECTED)
+            expect(page.locator("#history-count")).to_have_text("19")
+            assert "No playable recording" not in page.locator("#playback-message").inner_text()
+        elif outcome == "gap":
+            expect(page.locator("#playback-message")).to_contain_text("No playable recording")
+            assert video.get_attribute("src") is None
+            expect(page.locator("#history-count")).to_have_text("18")
+        else:
+            expect(page.locator("#history-message")).to_contain_text("unavailable")
+            assert video.get_attribute("src") is None
+            assert "No playable recording" not in page.locator("#playback-message").inner_text()
+        assert len(history) == 2
+
+
+@pytest.mark.parametrize("last_action", ["latest_event", "leave"])
+def test_missing_coverage_refresh_preserves_later_operator_action(last_action):
+    history, held = [], []
+    moments = [_LATE_EVENT, _BEGIN + timedelta(minutes=65)]
+
+    def intercept(route):
+        path = urlsplit(route.request.url).path
+        if path.endswith("/integration-events"):
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "events": [
+                            {
+                                "sequence": i + 1,
+                                "source_id": _CAMERA,
+                                "event_id": f"event-{i}",
+                                "event_type": "analytics.person",
+                                "status": "confirmed",
+                                "confidence": 0.9,
+                                "observed_at": at.isoformat(),
+                                "playback_at": at.isoformat(),
+                            }
+                            for i, at in enumerate(moments)
+                        ],
+                        "has_more": False,
+                        "next_before": None,
+                    }
+                ),
+            )
+            return True
+        if path.endswith("/history"):
+            history.append(route.request.url)
+            if len(history) > 1:
+                held.append(route)
+            else:
+                route.fulfill(
+                    content_type="application/json", body=json.dumps({"spans": _late_event_spans()})
+                )
+            return True
+        return False
+
+    with _history_page(export_handler=intercept) as (page, expect):
+        buttons = page.locator("#analytics-provider-events button")
+        expect(buttons).to_have_count(2)
+        buttons.nth(0).click()
+        _wait_for_history_route(page, lambda: len(held) == 1)
+        if last_action == "latest_event":
+            buttons.nth(1).click()
+        else:
+            page.locator("#wall-tab").click()
+        assert page.locator("#playback-video").get_attribute("src") is None
+        held[0].fulfill(
+            content_type="application/json", body=json.dumps({"spans": _late_event_spans(True)})
+        )
+        if last_action == "latest_event":
+            expected = moments[-1].isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            expect(page.locator("#playback-video")).to_have_attribute("data-utc-start", expected)
+        else:
+            page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame(() => "
+                "requestAnimationFrame(resolve)))"
+            )
+            expect(page.locator("#wall-panel")).to_be_visible()
+            assert page.locator("#playback-video").get_attribute("src") is None
+            assert page.locator("#playback-video").get_attribute("data-utc-start") is None
+        assert len(history) == 2
+
+
+_PRECISE_NOW = _NOW + timedelta(milliseconds=750)
+_FRESH_EVENT = _NOW + timedelta(milliseconds=500)
+
+
+def _precise_event_range_interceptor(observed):
+    def intercept(route):
+        path = urlsplit(route.request.url).path
+        if path == "/api/v1/operator/status":
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "worker_status": "ready",
+                        "server_utc": _PRECISE_NOW.isoformat().replace("+00:00", "Z"),
+                    }
+                ),
+            )
+            return True
+        if path.endswith("/history"):
+            observed["history"].append(parse_qs(urlsplit(route.request.url).query))
+        if path.endswith("/events"):
+            query = parse_qs(urlsplit(route.request.url).query)
+            observed["events"].append(query)
+            start, end = (datetime.fromisoformat(query[k][0]) for k in ("start", "end"))
+            # Match the real store's occurred_at>=start and occurred_at<end predicate.
+            events = [
+                {
+                    "id": 1,
+                    "camera_id": _CAMERA,
+                    "occurred_at": _FRESH_EVENT.isoformat(),
+                    "playback_at": _FRESH_EVENT.isoformat(),
+                    "confidence": 0.9,
+                    "person_count": 1,
+                }
+            ]
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "events": events if start <= _FRESH_EVENT < end else [],
+                        "has_more": False,
+                        "next_before": None,
+                    }
+                ),
+            )
+            return True
+        return False
+
+    return intercept
+
+
+def test_default_history_includes_existing_event_in_current_recorder_fraction():
+    observed = {"history": [], "events": []}
+    assert _FRESH_EVENT < _PRECISE_NOW
+    assert _FRESH_EVENT.replace(microsecond=0) == _PRECISE_NOW.replace(microsecond=0)
+    with _history_page(export_handler=_precise_event_range_interceptor(observed)) as (page, expect):
+        _wait_for_history_route(page, lambda: bool(observed["events"]))
+        expect(page.locator('#analytics-events button[data-event-id="1"]')).to_be_visible(
+            timeout=2000
+        )
+        bounds = observed["history"][-1]
+        start, end = (datetime.fromisoformat(bounds[k][0]) for k in ("start", "end"))
+        assert start <= _FRESH_EVENT < end
+        assert end >= _PRECISE_NOW
+        assert end - start == timedelta(days=1)
+        assert page.locator("#history-form").evaluate("form => form.checkValidity()")
+        assert not page.locator("#history-start").evaluate("input => input.validity.stepMismatch")
+        assert not page.locator("#history-end").evaluate("input => input.validity.stepMismatch")
+        # A normal submit must admit the fractional defaults, without changing their UTC bounds.
+        previous = len(observed["history"])
+        page.locator("#history-form").evaluate("form => form.requestSubmit()")
+        _wait_for_history_route(page, lambda: len(observed["history"]) > previous)
+        submitted = observed["history"][-1]
+        submitted_start, submitted_end = (
+            datetime.fromisoformat(submitted[k][0]) for k in ("start", "end")
+        )
+        assert submitted_start <= _FRESH_EVENT < submitted_end
+        assert submitted_end >= _PRECISE_NOW
+        assert submitted_end - submitted_start == timedelta(days=1)
+
+
+@pytest.mark.parametrize(
+    "start,end",
+    [
+        ("2026-11-01T08:00", "2026-11-01T12:00"),
+        ("2026-11-01T08:00:00.125", "2026-11-01T12:00:00.625"),
+    ],
+)
+def test_manual_history_bounds_are_submitted_exactly(start, end):
+    observed = {"history": [], "events": []}
+    with _history_page(export_handler=_precise_event_range_interceptor(observed)) as (page, expect):
+        page.locator("#history-start").fill(start)
+        page.locator("#history-end").fill(end)
+        assert page.locator("#history-form").evaluate("form => form.checkValidity()")
+        previous = len(observed["history"])
+        page.locator("#history-form").evaluate("form => form.requestSubmit()")
+        _wait_for_history_route(page, lambda: len(observed["history"]) > previous)
+        query = observed["history"][-1]
+        assert datetime.fromisoformat(query["start"][0]) == datetime.fromisoformat(start + "Z")
+        assert datetime.fromisoformat(query["end"][0]) == datetime.fromisoformat(end + "Z")

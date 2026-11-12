@@ -441,3 +441,215 @@ def test_cancelled_native_person_call_reserves_capacity_until_real_completion(
         await next_provider.aclose()
 
     asyncio.run(run())
+
+
+@pytest.fixture
+def person_cpu_native(admitted, monkeypatch):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    config, _manifest, files = admitted
+    events = []
+    options = []
+
+    class ElementType:
+        def __init__(self, name):
+            self.name = name
+
+        def __eq__(self, other):
+            return isinstance(other, ElementType) and self.name == other.name
+
+    types = SimpleNamespace(u8=ElementType("u8"), f32=ElementType("f32"))
+    scenario = SimpleNamespace(precision=ElementType("f32"), getter_error=None, compile_error=None)
+    request = object()
+    model = SimpleNamespace(
+        inputs=(object(),),
+        outputs=(object(),),
+        input=lambda name: SimpleNamespace(shape=[1, 3, 320, 544]),
+        output=lambda index: SimpleNamespace(shape=[1, 1, 200, 7]),
+    )
+
+    class Compiled:
+        def get_property(self, name):
+            events.append(("read_precision", name))
+            if scenario.getter_error is not None:
+                raise scenario.getter_error
+            return scenario.precision
+
+        def create_infer_request(self):
+            events.append(("create_request",))
+            return request
+
+    class Core:
+        def read_model(self, *, model: str, weights):
+            assert model == files["person.xml"].decode("utf-8")
+            assert weights == files["person.bin"]
+            events.append(("read_admitted_model",))
+            return native.model
+
+        def compile_model(self, supplied, device, configuration):
+            assert supplied is native.model and device == "CPU"
+            events.append(("compile",))
+            options.append(dict(configuration))
+            if scenario.compile_error is not None:
+                raise scenario.compile_error
+            return Compiled()
+
+    class Processing:
+        def __init__(self, supplied):
+            assert supplied is model
+
+        def input(self):
+            return self
+
+        def tensor(self):
+            return self
+
+        def set_element_type(self, element_type):
+            assert element_type == types.u8
+            events.append(("input_u8",))
+            return self
+
+        def set_layout(self, layout):
+            events.append(("layout", layout))
+            return self
+
+        def set_color_format(self, color):
+            assert color == "BGR"
+            events.append(("color_bgr",))
+            return self
+
+        def set_spatial_dynamic_shape(self):
+            events.append(("dynamic_spatial",))
+            return self
+
+        def preprocess(self):
+            return self
+
+        def resize(self, algorithm):
+            assert algorithm == "linear"
+            events.append(("resize_linear",))
+            return self
+
+        def model(self):
+            return self
+
+        def build(self):
+            return model
+
+    numpy = ModuleType("numpy")
+    numpy.uint8 = "uint8"
+
+    def frombuffer(raw, *, dtype):
+        assert dtype == "uint8"
+        return raw
+
+    numpy.frombuffer = frombuffer
+    openvino = ModuleType("openvino")
+    openvino.__path__ = []
+    openvino.Core = Core
+    openvino.Type = types
+    openvino.Tensor = lambda value: value
+    openvino.Layout = lambda value: value
+    preprocessing = ModuleType("openvino.preprocess")
+    preprocessing.PrePostProcessor = Processing
+    preprocessing.ColorFormat = SimpleNamespace(BGR="BGR")
+    preprocessing.ResizeAlgorithm = SimpleNamespace(RESIZE_LINEAR="linear")
+    monkeypatch.setitem(sys.modules, "numpy", numpy)
+    monkeypatch.setitem(sys.modules, "openvino", openvino)
+    monkeypatch.setitem(sys.modules, "openvino.preprocess", preprocessing)
+    native = SimpleNamespace(
+        config=config,
+        events=events,
+        options=options,
+        scenario=scenario,
+        types=types,
+        element_type=ElementType,
+        request=request,
+        model=model,
+    )
+    return native
+
+
+def test_native_person_requires_verified_fp32_before_creating_inference_request(person_cpu_native):
+    native = person_cpu_native
+    assert native.scenario.precision == native.types.f32
+    assert native.scenario.precision is not native.types.f32
+    detector = module._PersonDetector(native.config)
+    assert detector._request is native.request
+    assert native.options == [
+        {
+            "INFERENCE_NUM_THREADS": 2,
+            "NUM_STREAMS": "1",
+            "INFERENCE_PRECISION_HINT": native.types.f32,
+        }
+    ]
+    compile_at = native.events.index(("compile",))
+    read_at = native.events.index(("read_precision", "INFERENCE_PRECISION_HINT"))
+    request_at = native.events.index(("create_request",))
+    assert compile_at < read_at < request_at
+    assert ("layout", "NHWC") in native.events
+    assert ("layout", "NCHW") in native.events
+    assert ("input_u8",) in native.events and ("color_bgr",) in native.events
+    assert ("dynamic_spatial",) in native.events and ("resize_linear",) in native.events
+
+
+@pytest.mark.parametrize("precision", ["bf16", "f16", "string", "missing"])
+def test_native_person_rejects_unverified_cpu_precision_without_request(
+    person_cpu_native, precision
+):
+    native = person_cpu_native
+    native.scenario.precision = (
+        "f32"
+        if precision == "string"
+        else None
+        if precision == "missing"
+        else native.element_type(precision)
+    )
+    with pytest.raises(ValueError, match="Person CPU precision was refused"):
+        module._PersonDetector(native.config)
+    assert ("read_precision", "INFERENCE_PRECISION_HINT") in native.events
+    assert ("create_request",) not in native.events
+
+
+def test_native_person_missing_precision_property_is_fixed_failure_without_request(
+    person_cpu_native,
+):
+    native = person_cpu_native
+    native.scenario.getter_error = RuntimeError("private-model-path unsupported property")
+    with pytest.raises(ValueError) as failure:
+        module._PersonDetector(native.config)
+    assert str(failure.value) == "Person CPU precision was refused"
+    assert "private" not in str(failure.value)
+    assert ("create_request",) not in native.events
+
+
+@pytest.mark.parametrize("failure_kind", ["compile", "getter", "mismatch"])
+def test_native_person_precision_failure_preserves_capacity_and_sanitizes_error(
+    person_cpu_native, failure_kind
+):
+    native = person_cpu_native
+    if failure_kind == "compile":
+        native.scenario.compile_error = RuntimeError("private-model-path compile failure")
+    elif failure_kind == "getter":
+        native.scenario.getter_error = RuntimeError("private-model-path unknown precision")
+    else:
+        native.scenario.precision = native.element_type("bf16")
+
+    async def run():
+        factory = module.PersonProviderFactory(native.config)
+        factory._capacity = threading.BoundedSemaphore(1)
+        with pytest.raises(RuntimeError) as failure:
+            await factory()
+        assert str(failure.value) == "Person session initialization failed."
+        assert "private" not in str(failure.value)
+        assert ("create_request",) not in native.events
+        if failure_kind == "compile":
+            assert ("read_precision", "INFERENCE_PRECISION_HINT") not in native.events
+        native.scenario.compile_error = native.scenario.getter_error = None
+        native.scenario.precision = native.element_type("f32")
+        provider = await factory()
+        assert native.events.count(("create_request",)) == 1
+        await provider.aclose()
+
+    asyncio.run(run())

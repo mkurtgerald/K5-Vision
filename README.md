@@ -38,13 +38,20 @@ administration has a separate native configuration/restoration witness. Source
 configuration, observed offset and successful synchronization are reported
 separately; clock-step resilience alone does not certify absolute UTC accuracy.
 
-The [camera-setup roadmap](docs/CAMERA_SETUP_ROADMAP.md) tracks planned frame-rate
-and codec controls, motion-triggered recording and graphical inclusion/exclusion
-zones. These core setup controls take priority over advanced wall customization.
+This source adds [ONVIF video settings](docs/CAMERA_VIDEO_SETTINGS.md): supported
+frame-rate, resolution, bitrate and encoder controls, verified configuration
+readback and reconnection of only the affected camera. H.264 is the writable
+product codec. The wall also offers automatic 1/4/9 layout selection, with
+manual overrides. Matching installed-Windows evidence is required before these
+source changes are advertised in a download.
 
-The [video-wall roadmap](docs/VIDEO_WALL_ROADMAP.md) tracks automatic layouts,
-individual tile editing and adaptive display streams, including delivery order,
-dependencies and acceptance criteria.
+The [camera-setup roadmap](docs/CAMERA_SETUP_ROADMAP.md) tracks the remaining
+motion-triggered recording and graphical inclusion/exclusion zones. These core
+setup controls take priority over advanced wall customization.
+
+The [video-wall roadmap](docs/VIDEO_WALL_ROADMAP.md) tracks individual tile editing
+and adaptive display streams, including delivery order, dependencies and
+acceptance criteria.
 
 ## Development
 

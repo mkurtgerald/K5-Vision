@@ -86,6 +86,7 @@ def _free_local_port() -> int:
 def _assert_running_upgrade_refused(setup: Path, installed: Path, api) -> None:
     """Exercise a real double-click-style refusal, not a hidden modal installer."""
     import subprocess
+
     process = subprocess.Popen(
         [str(setup), "/SP-", "/NORESTART", "/DIR=" + str(installed)],
         stdin=subprocess.DEVNULL,
@@ -343,9 +344,7 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
         phase = "reversal_uninstall"
         uninstaller = installed / "unins000.exe"
         assert uninstaller.is_file(), "Candidate uninstaller is missing"
-        uninstall_exit, uninstall_clone_observed = _uninstall_through_clone_completion(
-            uninstaller
-        )
+        uninstall_exit, uninstall_clone_observed = _uninstall_through_clone_completion(uninstaller)
         assert uninstall_exit == 0, "Candidate manual reversal uninstall failed"
         # Inno can terminate its original uninstaller before the TEMP clone
         # finishes. The next real installer must not race that cleanup.

@@ -3,7 +3,7 @@ name: Native Windows Desktop Installer
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta, codex/windows-onvif-onboarding, codex/windows-surveillance-workspace]
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta, codex/windows-onvif-onboarding, codex/windows-surveillance-workspace, codex/video-wall-roadmap-20261101, codex/camera-setup-beta-20261102]
     paths:
       - .github/workflows/operator-desktop-windows.yml
       - .github/actions/provision-operator-tools/**
@@ -13,13 +13,20 @@ on:
       - src/k5vision/**
       - tests/integration/test_windows_desktop_app.py
       - tests/integration/test_windows_desktop_upgrade.py
+      - tests/integration/test_windows_camera_video_settings.py
+      - tests/integration/onvif_video_camera_fixture.py
+      - scripts/verify_windows_camera_video_settings_receipt.py
+      - tests/unit/test_windows_camera_video_settings_receipt.py
       - tests/integration/windows_vm_clock.py
+      - tests/integration/test_windows_vm_clock_qualification.py
       - tests/integration/windows_time_configuration.py
       - tests/integration/test_windows_time_administration.py
       - tests/unit/test_operator_time*.py
       - tests/unit/test_windows_time*.py
       - scripts/verify_windows_time_administration_receipt.py
       - tests/unit/test_windows_vm_clock*.py
+      - tests/unit/test_windows_desktop_analytics_diagnostic.py
+      - tests/unit/test_windows_clock_media_gateway_probe.py
       - scripts/verify_windows_vm_clock_receipt.py
       - tests/integration/test_operator_beta_browser.py
       - tests/integration/recorded_history_fixture.py
@@ -88,17 +95,21 @@ jobs:
         if: matrix.lane == 'onvif'
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_rtsp.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_admin_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py tests/unit/test_operator_analytics_ui.py tests/unit/test_operator_continuous_playback_ui.py tests/unit/test_operator_settings_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          python -m pytest tests/unit/test_operator_onvif.py tests/unit/test_operator_camera_settings.py tests/unit/test_operator_onvif_discovery.py tests/unit/test_operator_rtsp.py tests/unit/test_operator_web_ui.py tests/unit/test_operator_camera_video_ui.py tests/unit/test_operator_admin_ui.py tests/unit/test_operator_camera_wall.py tests/unit/test_operator_recording_timeline_ui.py tests/unit/test_operator_analytics_ui.py tests/unit/test_operator_continuous_playback_ui.py tests/unit/test_operator_settings_ui.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify camera administration and atomic reconnect on Windows
         if: matrix.lane == 'cameras'
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_admin_api.py tests/unit/test_operator_product_state.py tests/unit/test_operator_events.py tests/unit/test_operator_events_api.py tests/unit/test_operator_exports.py tests/unit/test_operator_export_audit.py tests/unit/test_operator_audit.py tests/unit/test_operator_audit_api.py tests/unit/test_operator_role_policy.py tests/unit/test_operator_role_policy_review.py tests/unit/test_operator_integrations.py tests/unit/test_operator_storage_settings.py tests/unit/test_operator_storage_settings_api.py tests/test_device_registry.py tests/test_user_registry.py tests/test_user_admin_api.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
+          python -m pytest tests/unit/test_operator_product_api.py tests/unit/test_operator_product_route_boundary.py tests/unit/test_operator_camera_settings_api.py tests/unit/test_operator_admin_api.py tests/unit/test_operator_product_state.py tests/unit/test_operator_events.py tests/unit/test_operator_events_api.py tests/unit/test_operator_exports.py tests/unit/test_operator_export_audit.py tests/unit/test_operator_audit.py tests/unit/test_operator_audit_api.py tests/unit/test_operator_role_policy.py tests/unit/test_operator_role_policy_review.py tests/unit/test_operator_integrations.py tests/unit/test_operator_storage_settings.py tests/unit/test_operator_storage_settings_api.py tests/test_device_registry.py tests/test_user_registry.py tests/test_user_admin_api.py tests/test_session_resolve_concurrency.py tests/unit/test_operator_login_audit_isolation.py -o addopts= --no-cov -o faulthandler_timeout=90 --durations=5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   native-desktop:
     name: Build and exercise actual graphical Windows installation
+    outputs:
+      setup_artifact_id: ${{ steps.qualified_desktop_setup.outputs.artifact-id }}
+      primary_witness_artifact_id: ${{ steps.primary_desktop_witness.outputs.artifact-id }}
+      primary_run_attempt: ${{ github.run_attempt }}
     runs-on: windows-2025
     timeout-minutes: 30
     env:
@@ -272,7 +283,7 @@ jobs:
         timeout-minutes: 12
         shell: pwsh
         run: |
-          python -m pytest tests/integration/test_windows_desktop_app.py -o addopts= --no-cov -s -o faulthandler_timeout=180 --junitxml=desktop-build/desktop-windows.xml
+          python -m pytest tests/integration/test_windows_desktop_app.py -o addopts= --no-cov -s -o faulthandler_timeout=400 --junitxml=desktop-build/desktop-windows.xml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/verify_desktop_receipt.py desktop-build/desktop-windows.xml desktop-build/desktop-windows-receipt.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -369,6 +380,8 @@ jobs:
             workers_bundled=$true; first_launch_internet_required=$false; disconnected_network_qualified=$false
             onvif_camera_onboarding=$true; manual_stream_uri_required=$false
             direct_rtsp_enrollment=$true
+            camera_video_settings=$true; automatic_wall_layout=$true
+            motion_recording=$false; camera_trigger_zones=$false; writable_video_codecs=@('H264')
             admin_user_management=$true; role_permissions=$true; camera_access_controls=$true
             person_analytics_bundled=$true; background_person_events=$true
             installed_person_sampled_boxes=$true
@@ -379,6 +392,7 @@ jobs:
           }
           $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $release "desktop-package.json") -Encoding utf8
       - name: Upload qualified graphical Windows installer
+        id: qualified_desktop_setup
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: k5-vision-windows-setup-${{ github.event.pull_request.head.sha || github.sha }}
@@ -386,6 +400,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Preserve finite graphical acceptance evidence on failure
+        id: primary_desktop_witness
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -396,16 +411,98 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  vm-clock:
-    name: Exercise real clock corrections on a second disposable Windows VM
-    needs: [native-desktop, focused-windows]
+  camera-video:
+    name: Exercise installed ONVIF video settings and automatic camera wall
+    needs: [native-desktop]
     runs-on: windows-2025
     timeout-minutes: 15
     env:
       K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
       K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_NATIVE_CAMERA_VIDEO_ACCEPTANCE: "1"
+    steps:
+      - name: Checkout the tested installer revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up development Python for the separate camera gate
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install acceptance dependencies in development Python
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Camera acceptance dependency install failed" }
+      - name: Provision immutable generated-media tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Download the exact installer exercised by the first VM
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: k5-vision-windows-setup-${{ github.event.pull_request.head.sha || github.sha }}
+          path: camera-video-input
+      - name: Bind camera qualification to the exact tested installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Get-Content -LiteralPath camera-video-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath camera-video-input/payload-manifest.json -Raw | ConvertFrom-Json
+          $setup = Get-Item -LiteralPath camera-video-input/K5VisionSetup.exe
+          $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
+              $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath camera-video-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
+              $package.camera_video_settings -ne $true -or $package.automatic_wall_layout -ne $true -or
+              $package.motion_recording -ne $false -or $package.camera_trigger_zones -ne $false -or
+              @($package.writable_video_codecs).Count -ne 1 -or $package.writable_video_codecs[0] -ne 'H264') {
+            throw "Camera qualification source, installer or feature identity mismatch"
+          }
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_SETUP_SHA256=$sha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Verify strict camera evidence admission
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_windows_camera_video_settings_receipt.py -o addopts= --no-cov --tb=short
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exercise real installed camera controls and bounded automatic players
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_camera_video_settings.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=400 --junitxml=camera-video-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_windows_camera_video_settings_receipt.py camera-video-windows.xml camera-video-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve the separate finite camera-video witness
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: camera-video-windows-witness-${{ github.run_id }}
+          path: |
+            camera-video-windows.xml
+            camera-video-windows-receipt.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  vm-clock:
+    name: Exercise real clock corrections on a second disposable Windows VM
+    needs: [native-desktop, focused-windows]
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
       K5_VM_CLOCK_ACCEPTANCE: "1"
+      K5_VM_CLOCK_SETUP_ARTIFACT_ID: ${{ needs.native-desktop.outputs.setup_artifact_id }}
+      K5_VM_CLOCK_PRIMARY_ARTIFACT_ID: ${{ needs.native-desktop.outputs.primary_witness_artifact_id }}
+      K5_VM_CLOCK_PRIMARY_RUN_ID: ${{ github.run_id }}
+      K5_VM_CLOCK_PRIMARY_RUN_ATTEMPT: ${{ needs.native-desktop.outputs.primary_run_attempt }}
     steps:
       - name: Checkout the tested installer revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -429,43 +526,99 @@ jobs:
         run: |
           python scripts/provision_operator_person_acceptance.py
           if ($LASTEXITCODE -ne 0) { throw "Installed analytics fixture admission failed" }
-      - name: Download the installer exercised by the first VM
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
-        with:
-          name: k5-vision-windows-setup-${{ github.event.pull_request.head.sha || github.sha }}
-          path: vm-clock-input
-      - name: Bind downloaded Setup and manifest to the exact tested revision
+      - name: Bind both immutable producer artifacts to this source and run
         shell: pwsh
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
           if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or $env:RUNNER_OS -ne "Windows") {
             throw "Real clock tests require a disposable GitHub-hosted Windows VM"
           }
+          if ($env:K5_VM_CLOCK_SETUP_ARTIFACT_ID -notmatch '^[1-9][0-9]*$' -or
+              $env:K5_VM_CLOCK_PRIMARY_ARTIFACT_ID -notmatch '^[1-9][0-9]*$' -or
+              $env:K5_VM_CLOCK_PRIMARY_RUN_ATTEMPT -notmatch '^[1-9][0-9]*$' -or
+              $env:K5_VM_CLOCK_PRIMARY_RUN_ID -ne $env:GITHUB_RUN_ID -or
+              $env:K5_VM_CLOCK_PRIMARY_RUN_ATTEMPT -ne $env:GITHUB_RUN_ATTEMPT) {
+            throw "Clock evidence producer identity is unavailable"
+          }
+          $headers = @{
+            Authorization="Bearer $env:GH_READ_TOKEN"
+            Accept="application/vnd.github+json"
+            "X-GitHub-Api-Version"="2022-11-28"
+          }
+          $artifacts = @(
+            @{Id=$env:K5_VM_CLOCK_SETUP_ARTIFACT_ID; Name="k5-vision-windows-setup-$env:K5_DESKTOP_HEAD_SHA"},
+            @{Id=$env:K5_VM_CLOCK_PRIMARY_ARTIFACT_ID; Name="desktop-windows-witness-$env:GITHUB_RUN_ID"}
+          )
+          foreach ($expected in $artifacts) {
+            $observed = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$($expected.Id)" -Headers $headers -TimeoutSec 30
+            if ([string]$observed.id -ne $expected.Id -or $observed.name -ne $expected.Name -or
+                [string]$observed.workflow_run.id -ne $env:GITHUB_RUN_ID -or
+                $observed.workflow_run.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $observed.expired -ne $false) {
+              throw "Clock evidence artifact belongs to another source or run"
+            }
+          }
+      - name: Download the exact installer from the successful primary job
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          artifact-ids: ${{ needs.native-desktop.outputs.setup_artifact_id }}
+          merge-multiple: true
+          path: vm-clock-input
+      - name: Download the exact raw primary GUI evidence from the same run
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          artifact-ids: ${{ needs.native-desktop.outputs.primary_witness_artifact_id }}
+          merge-multiple: true
+          path: vm-clock-primary
+      - name: Admit the exact Setup and unchanged primary GUI witness before bootstrap
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
           $package = Get-Content -LiteralPath vm-clock-input/desktop-package.json -Raw | ConvertFrom-Json
-          $manifest = Get-Content -LiteralPath vm-clock-input/payload-manifest.json -Raw | ConvertFrom-Json
+          $manifestPath = "vm-clock-input/payload-manifest.json"
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
           $setup = Get-Item -LiteralPath vm-clock-input/K5VisionSetup.exe
           $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
               $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
-              $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath vm-clock-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant()) {
+              $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()) {
             throw "VM test installer source or content identity mismatch"
+          }
+          python scripts/verify_desktop_receipt.py vm-clock-primary/desktop-windows.xml vm-clock-primary-reverified.json
+          if ($LASTEXITCODE -ne 0) { throw "The unchanged primary desktop verifier rejected GUI evidence" }
+          $primaryPath = "vm-clock-primary/desktop-windows-receipt.json"
+          $primary = Get-Content -LiteralPath $primaryPath -Raw | ConvertFrom-Json
+          $primarySha = (Get-FileHash -LiteralPath $primaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($primary.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $primary.lane -ne "desktop" -or
+              $primarySha -ne (Get-FileHash -LiteralPath vm-clock-primary-reverified.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
+              $primarySha -ne (Get-FileHash -LiteralPath vm-clock-input/desktop-windows-receipt.json -Algorithm SHA256).Hash.ToLowerInvariant()) {
+            throw "Raw primary XML, JSON and Setup-package evidence disagree"
           }
           "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           "K5_DESKTOP_SETUP_SHA256=$sha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_VM_CLOCK_PRIMARY_XML=$((Resolve-Path -LiteralPath vm-clock-primary/desktop-windows.xml).Path)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_VM_CLOCK_PRIMARY_RECEIPT=$((Resolve-Path -LiteralPath $primaryPath).Path)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
       - name: Test restoration guard and strict VM evidence admission
         shell: pwsh
         env:
           K5_VM_CLOCK_ACCEPTANCE: "0"
         run: |
-          python -m pytest tests/unit/test_windows_vm_clock.py tests/unit/test_windows_vm_clock_receipt.py -o addopts= --no-cov --tb=short
+          python -m pytest tests/unit/test_windows_vm_clock.py tests/unit/test_windows_vm_clock_receipt.py tests/unit/test_windows_vm_clock_scoped_receipt.py tests/unit/test_windows_vm_clock_request_observation.py tests/unit/test_windows_desktop_analytics_diagnostic.py tests/unit/test_windows_clock_media_gateway_probe.py -o addopts= --no-cov --tb=short
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Exercise installed GUI, real UTC steps and restoration
+      - name: Exercise the dedicated installed clock journey and restoration
         timeout-minutes: 10
         shell: pwsh
         run: |
-          python -m pytest tests/integration/test_windows_desktop_app.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=180 --junitxml=vm-clock-windows.xml
+          python -m pytest tests/integration/test_windows_vm_clock_qualification.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=400 --junitxml=vm-clock-windows.xml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/verify_windows_vm_clock_receipt.py vm-clock-windows.xml vm-clock-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256
+          python scripts/verify_windows_vm_clock_receipt.py vm-clock-windows.xml vm-clock-windows-receipt.json --scope vm-clock-dedicated --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256 --primary-report $env:K5_VM_CLOCK_PRIMARY_XML --primary-receipt $env:K5_VM_CLOCK_PRIMARY_RECEIPT --package vm-clock-input/desktop-package.json --expected-run-id $env:K5_VM_CLOCK_PRIMARY_RUN_ID --expected-run-attempt $env:K5_VM_CLOCK_PRIMARY_RUN_ATTEMPT --expected-primary-artifact-id $env:K5_VM_CLOCK_PRIMARY_ARTIFACT_ID --expected-setup-artifact-id $env:K5_VM_CLOCK_SETUP_ARTIFACT_ID
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve finite VM clock evidence after UTC restoration
         if: always()

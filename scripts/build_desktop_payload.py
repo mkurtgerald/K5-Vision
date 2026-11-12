@@ -346,7 +346,6 @@ def worker_download(source: Path, name: str) -> dict[str, object]:
     }
 
 
-
 def bundle_worker(payload: Path, source: Path, name: str) -> dict[str, object]:
     """Seal exact official worker bytes and their original license at build time.
 
@@ -366,6 +365,7 @@ def bundle_worker(payload: Path, source: Path, name: str) -> dict[str, object]:
     root.mkdir(exist_ok=True)
 
     with ZipFile(archive) as zipped:
+
         def copy_member(member: str, destination: Path, maximum: int, sha: str) -> dict:
             matches = [entry for entry in zipped.infolist() if entry.filename == member]
             if len(matches) != 1:
@@ -401,9 +401,7 @@ def bundle_worker(payload: Path, source: Path, name: str) -> dict[str, object]:
         license_entries = [entry for entry in zipped.infolist() if entry.filename == "LICENSE"]
         if len(license_entries) != 1:
             raise ValueError("Worker upstream license missing")
-        license_info = copy_member(
-            "LICENSE", license_path, 65536, identity["license_sha256"]
-        )
+        license_info = copy_member("LICENSE", license_path, 65536, identity["license_sha256"])
     admit(binary, pin)
     return {
         **identity,
@@ -778,6 +776,11 @@ def build(args: argparse.Namespace) -> None:
                 "admin_user_management": True,
                 "role_permissions": True,
                 "camera_access_controls": True,
+                "camera_video_settings": True,
+                "automatic_wall_layout": True,
+                "motion_recording": False,
+                "camera_trigger_zones": False,
+                "writable_video_codecs": ["H264"],
                 "person_analytics_bundled": True,
                 "background_person_events": True,
                 "storage_settings": True,

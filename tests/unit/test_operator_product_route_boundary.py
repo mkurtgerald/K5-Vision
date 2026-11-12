@@ -195,3 +195,31 @@ def test_product_does_not_inherit_future_generic_routes(tmp_path, monkeypatch):
     assert [(route.path, route.methods) for route in app.routes] == [
         ("/api/v1/auth/login", {"POST"})
     ]
+
+
+def test_product_drains_camera_writes_before_stopping_recorder(tmp_path, monkeypatch):
+    identity = initialize_identity_state(
+        tmp_path / "video-lifecycle", username="full-admin", password=_PASSWORD
+    )
+    order = []
+
+    async def start(_sources):
+        order.append("started")
+
+    async def stop():
+        order.append("recorder-stopped")
+
+    service = SimpleNamespace(site_id=identity.site_id, public_port=8080, start=start, stop=stop)
+    app = create_operator_product_app(identity_directory=identity.directory, service=service)
+    vault = app.state.operator_camera_settings_vault
+    original_close = vault.aclose
+
+    async def close():
+        order.append("video-drained")
+        await original_close()
+
+    monkeypatch.setattr(vault, "aclose", close)
+    with TestClient(app, base_url="http://127.0.0.1:8080") as client:
+        assert client.get("/api/v1/health").status_code == 200
+    assert order[0] == "started"
+    assert order.index("video-drained") < order.index("recorder-stopped")

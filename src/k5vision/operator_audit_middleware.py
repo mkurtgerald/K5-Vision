@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+from contextvars import copy_context
+from functools import partial
 from uuid import UUID, uuid4
 
 from starlette.responses import JSONResponse
@@ -34,6 +36,24 @@ _RULES = (
     ("POST", _PREFIX + r"/camera-stream-probe", "camera.probe", "camera"),
     ("POST", _PREFIX + r"/cameras(?:/connect|/stream-connect)?", "camera.enroll", "camera"),
     ("POST", _PREFIX + "/cameras/" + _ID + r"/reconnect", "camera.reconnect", "camera"),
+    (
+        "GET",
+        _PREFIX + "/cameras/" + _ID + r"/video-settings",
+        "camera.video.read",
+        "camera",
+    ),
+    (
+        "POST",
+        _PREFIX + "/cameras/" + _ID + r"/video-settings/read",
+        "camera.video.read",
+        "camera",
+    ),
+    (
+        "PATCH",
+        _PREFIX + "/cameras/" + _ID + r"/video-settings",
+        "camera.video.configure",
+        "camera",
+    ),
     ("DELETE", _PREFIX + "/cameras/" + _ID, "camera.remove", "camera"),
     ("PUT", _PREFIX + "/cameras/" + _ID + r"/recording", "recording.configure", "camera"),
     ("PATCH", _PREFIX + "/cameras/" + _ID + r"/analytics", "analytics.configure", "camera"),
@@ -111,6 +131,34 @@ class OperatorAuditMiddleware:
     def __init__(self, app, *, store):
         self.app, self.store = app, store
 
+    async def _record(self, scope, action, **options):
+        # Login's mandatory audit writes must share its owned, bounded worker
+        # lane; otherwise a saturated media pool blocks before authentication.
+        # Other operations keep their existing worker admission.
+        state = getattr(scope.get("app"), "state", None)
+        executor = getattr(state, "user_login_executor", None) if action == "auth.login" else None
+        worker = asyncio.get_running_loop().run_in_executor(
+            executor, copy_context().run, partial(self.store.record, action, **options)
+        )
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                if worker.cancelled():
+                    raise
+                # SQLite work cannot be cancelled once running. Drain even a
+                # repeatedly cancelled request before its store can be closed.
+                cancelled = True
+            except Exception:
+                if cancelled:
+                    raise asyncio.CancelledError from None
+                raise
+            else:
+                if cancelled:
+                    raise asyncio.CancelledError
+                return result
+
     async def __call__(self, scope, receive, send):
         path = scope.get("path", "")
         classification = _classify(scope.get("method"), path) if scope["type"] == "http" else None
@@ -139,8 +187,8 @@ class OperatorAuditMiddleware:
         try:
             if attempt:
                 try:
-                    await asyncio.to_thread(
-                        self.store.record,
+                    await self._record(
+                        scope,
                         action,
                         outcome="started",
                         target_kind=kind,
@@ -180,17 +228,15 @@ class OperatorAuditMiddleware:
                 )
                 if attempt or status is not None and status >= 400:
                     try:
-                        await asyncio.shield(
-                            asyncio.to_thread(
-                                self.store.record,
-                                action,
-                                outcome=outcome,
-                                actor=context["actor_id"],
-                                target_kind=kind,
-                                target_id=target,
-                                request_id=context["request_id"],
-                                status_code=status,
-                            )
+                        await self._record(
+                            scope,
+                            action,
+                            outcome=outcome,
+                            actor=context["actor_id"],
+                            target_kind=kind,
+                            target_id=target,
+                            request_id=context["request_id"],
+                            status_code=status,
                         )
                     except (OperatorAuditError, ValueError):
                         # The durable attempt remains visible; store latches failed

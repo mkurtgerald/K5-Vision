@@ -25,6 +25,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from k5vision.domain.devices import Device, DeviceCreate, DeviceProtocol
+from k5vision.domain.streams import VideoCodec
 from k5vision.domain.users import UserAccount, UserRole
 from k5vision.media.mediamtx_config import MediaMTXSource
 from k5vision.media.mediamtx_provider import (
@@ -452,6 +453,7 @@ def install_operator_product_api(
     connection_started: dict[UUID, float] = {}
     recording_started: dict[UUID, float] = {}
     recording_changed: dict[UUID, float] = {}
+    video_settings_vault = None
     media_generation = getattr(service, "media_generation", 0)
     app.add_middleware(_BoundedProductBody)
     app.add_middleware(_ProductRoutesOnly)
@@ -654,6 +656,9 @@ def install_operator_product_api(
             },
             "connection_error": None,
             "analytics_status": person_status,
+            "source_revision": None
+            if video_settings_vault is None
+            else video_settings_vault.source_revision(source),
         }
         if service.status() not in {"ready", "disk_full"}:
             if not source.recording_enabled:
@@ -1050,6 +1055,108 @@ def install_operator_product_api(
         app, require_admin=require_admin, authenticate=authenticate, enroll=enroll_camera_source
     )
 
+    def video_settings_ready(source: MediaMTXSource) -> None:
+        # Check again at the protocol's immediate pre-write gate. An offline
+        # recorder must not let a camera change outlive its ability to reconcile.
+        if selection(source.binding.device_id) != source:
+            raise HTTPException(409, "video_source_changed")
+        refresh = getattr(service, "refresh_camera_source", None)
+        refresh_status = getattr(service, "camera_source_refresh_status", None)
+        if (
+            not callable(refresh)
+            or not callable(refresh_status)
+            or service.status() not in {"ready", "disk_full"}
+            or refresh_status(source.binding) != "ready"
+        ):
+            raise HTTPException(409, "video_recorder_unavailable")
+
+    async def reconcile_video_source(previous, source_uri):
+        # The API retains the mutation lock and joins this reconciliation even
+        # if the initiating request disappears after an authorized camera write.
+        video_settings_ready(previous)
+        replacement = cameras._validated_source(
+            previous.device, source_uri, previous.recording_enabled
+        )
+        if replacement.binding != previous.binding:
+            raise HTTPException(409, "video_source_changed")
+
+        async def persist():
+            # This callback must not yield or perform fallible work after the
+            # synchronous atomic store commit: the worker owns compensation.
+            cameras.upsert(previous.device, replacement.source_uri)
+
+        await service.refresh_camera_source(previous, replacement, persist=persist)
+        identifier = previous.binding.device_id
+        seen_live.discard(identifier)
+        connection_started[identifier] = monotonic()
+        recording_started.pop(identifier, None)
+        recording_changed[identifier] = monotonic()
+        snapshot = MediaWorkerErrorCode.NOT_FOUND
+        verified = False
+        previous_bytes = None
+        try:
+            async with asyncio.timeout(8):
+                while True:
+                    values = await service.provider.path_snapshot((replacement.binding,))
+                    snapshot = values.get(replacement.binding, MediaWorkerErrorCode.NOT_FOUND)
+                    if not isinstance(snapshot, MediaWorkerErrorCode):
+                        state, _ = snapshot
+                        receiving = (
+                            state.online
+                            and state.available
+                            and VideoCodec.H264 in state.video_codecs
+                            and state.inbound_bytes > 0
+                        )
+                        # A positive cumulative counter alone may be stalled.
+                        # Require new bytes across separate post-restart reads.
+                        verified = (
+                            receiving
+                            and previous_bytes is not None
+                            and state.inbound_bytes > previous_bytes
+                        )
+                        previous_bytes = state.inbound_bytes if receiving else None
+                        if verified:
+                            break
+                    else:
+                        previous_bytes = None
+                    await asyncio.sleep(0.25)
+        except (TimeoutError, MediaWorkerError):
+            pass
+        view = await camera_view(replacement, worker_snapshot=snapshot)
+        return {
+            "stream_verified": verified,
+            "stream_status": view["status"]
+            if view["status"] in {"live", "connecting"}
+            else "unavailable",
+            "recording_state": view["recording_state"],
+            "reconnect_requested": True,
+            "verification_pending": not verified,
+        }
+
+    async def commit_video_settings(previous, inspection, result):
+        return await reconcile_video_source(previous, result.source_uri)
+
+    async def reconcile_failed_video_write(previous, inspection):
+        # A lost Set reply/readback cannot establish what the camera accepted.
+        # Reacquire the saved target, without retrying or reverting camera writes.
+        await reconcile_video_source(previous, previous.source_uri)
+
+    from k5vision.operator_camera_settings_api import install_operator_camera_settings_api
+
+    video_settings_vault = install_operator_camera_settings_api(
+        app,
+        require_admin=require_admin,
+        authenticate=authenticate,
+        selection=authorized_selection,
+        mutations=mutations,
+        before_apply=video_settings_ready,
+        commit_settings=commit_video_settings,
+        reconcile_failed_write=reconcile_failed_video_write,
+    )
+    app.state.operator_camera_settings_revocation_cleanup = sessions.add_revocation_listener(
+        video_settings_vault.clear_user
+    )
+
     @app.put(_PREFIX + "/cameras/{device_id}/recording", tags=["operator"])
     async def recording_preference(
         device_id: UUID,
@@ -1332,6 +1439,7 @@ def install_operator_product_api(
         if separator and scheme.lower() == "bearer" and _SESSION_TOKEN.fullmatch(token) is not None:
             onvif_probes.clear_token(token)
             rtsp_probes.clear_token(token)
+            video_settings_vault.clear_token(token)
         if (
             analytics is not None
             and separator

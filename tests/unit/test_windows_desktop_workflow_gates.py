@@ -30,7 +30,7 @@ def test_hash_pinned_gui_compiler_retries_only_transient_transport_faults():
 def test_failed_gui_analytics_does_not_skip_independent_upgrade_reversal():
     workflow = _WORKFLOW.read_text(encoding="utf-8")
     native, upgrade = workflow.split("  cross-revision-upgrade:\n", 1)
-    desktop = native.split("  native-desktop:\n", 1)[1].split("  vm-clock:\n", 1)[0]
+    desktop = native.split("  native-desktop:\n", 1)[1].split("  camera-video:\n", 1)[0]
     candidate = (
         "k5-vision-windows-upgrade-candidate-"
         "${{ github.event.pull_request.head.sha || github.sha }}"

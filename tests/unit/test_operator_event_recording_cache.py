@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+import k5vision.operator_events as event_module
 from k5vision import identity_state
 from k5vision.operator_events import OperatorEventsError, RecordedFrameSampler
 
@@ -222,3 +223,294 @@ def test_cached_paths_never_authorize_a_linked_recording(recording_camera, monke
     active.symlink_to(root.parent / "users.sqlite3")
     with pytest.raises(identity_state.IdentityStateError, match="linked identity paths"):
         sampler.capture(source)
+
+
+def _invalidation_baseline(recording_camera, monkeypatch):
+    root, directory, source = recording_camera
+    old = directory / "2026-11-02_12-00-00-000000_+0000.mp4"
+    old.write_bytes(b"old-baseline")
+    old.chmod(0o600)
+    inventory = {old.name: _signature(directory, old)}
+    sampler = _sampler(root, inventory, monkeypatch)
+    assert sampler.capture(source) is None
+    return directory, source, sampler, inventory
+
+
+def _new_segment(directory, name="2026-10-31_12-00-00-000000_+0000.mp4"):
+    path = directory / name
+    path.write_bytes(b"fresh-bytes")
+    path.chmod(0o600)
+    return path
+
+
+def test_discovered_active_file_grows_again_without_inventory_refresh_or_rescan(
+    recording_camera, monkeypatch
+):
+    directory, source, sampler, inventory = _invalidation_baseline(recording_camera, monkeypatch)
+    fresh = _new_segment(directory)
+    assert fresh.name not in inventory
+    assert sampler.capture(source)[0] == b"fresh-bytes"
+    original = os.scandir
+
+    def forbid(path):
+        assert Path(path) != directory, "Unchanged directory was unnecessarily rescanned"
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", forbid)
+    with fresh.open("ab") as stream:
+        stream.write(b"-more")
+    assert sampler.capture(source)[0] == b"fresh-bytes-more"
+    assert sampler.capture(source) is None
+    assert fresh.name in sampler._observations[source.binding.device_id]
+
+
+def test_directory_time_rollback_only_invalidates_and_filename_supplies_utc(
+    recording_camera, monkeypatch
+):
+    directory, source, sampler, _ = _invalidation_baseline(recording_camera, monkeypatch)
+    before = directory.stat().st_mtime_ns
+    fresh = _new_segment(directory)
+    os.utime(directory, ns=(before - 10**12, before - 10**12))
+    sample = sampler.capture(source)
+    assert sample[2] == fresh.name
+    assert sample[1] == datetime(2026, 10, 31, 12, tzinfo=UTC)
+
+
+def test_new_name_created_during_enumeration_is_retried_next_capture(recording_camera, monkeypatch):
+    directory, source, sampler, _ = _invalidation_baseline(recording_camera, monkeypatch)
+    first = _new_segment(directory)
+    original = os.scandir
+    later = directory / "2026-10-30_12-00-00-000000_+0000.mp4"
+
+    class Entries:
+        def __enter__(self):
+            with original(directory) as entries:
+                return iter(list(entries))
+
+        def __exit__(self, *_):
+            _new_segment(directory, later.name)
+
+    monkeypatch.setattr(
+        os, "scandir", lambda path: Entries() if Path(path) == directory else original(path)
+    )
+    assert sampler.capture(source)[2] == first.name
+    monkeypatch.setattr(os, "scandir", original)
+    assert sampler.capture(source)[2] == later.name
+
+
+def test_discovery_refuses_linked__new_segment(recording_camera, monkeypatch):
+    if os.name != "posix":
+        pytest.skip("POSIX link admission case")
+    directory, source, sampler, _ = _invalidation_baseline(recording_camera, monkeypatch)
+    version = dict(sampler._directory_versions)
+    target = directory / "2026-10-31_12-00-00-000000_+0000.mp4"
+    target.symlink_to(next(directory.iterdir()))
+    with pytest.raises(identity_state.IdentityStateError):
+        sampler.capture(source)
+    assert sampler._directory_versions == version
+
+
+def test_discovery_refuses_directory_replacement_during_enumeration(recording_camera, monkeypatch):
+    directory, source, sampler, _ = _invalidation_baseline(recording_camera, monkeypatch)
+    _new_segment(directory)
+    version = dict(sampler._directory_versions)
+    original = os.scandir
+
+    class Entries:
+        def __enter__(self):
+            return iter(())
+
+        def __exit__(self, *_):
+            directory.rename(directory.with_name("retained-private-directory"))
+            directory.mkdir(mode=0o700)
+
+    monkeypatch.setattr(
+        os, "scandir", lambda path: Entries() if Path(path) == directory else original(path)
+    )
+    with pytest.raises(identity_state.IdentityStateError, match="directory changed"):
+        sampler.capture(source)
+    assert sampler._directory_versions == version
+
+
+def test_entry_budget_counts_nonsegment_names_and_does_not_ack_partial_scan(
+    recording_camera, monkeypatch
+):
+    directory, source, sampler, _ = _invalidation_baseline(recording_camera, monkeypatch)
+    fresh = _new_segment(directory)
+    (directory / "ignored-nonsegment").write_bytes(b"ignored")
+    version = dict(sampler._directory_versions)
+    monkeypatch.setattr(event_module, "MAX_RECORDING_ENTRIES", 2)
+    with pytest.raises(OperatorEventsError, match="scan limit"):
+        sampler.capture(source)
+    assert sampler._directory_versions == version
+    monkeypatch.setattr(event_module, "MAX_RECORDING_ENTRIES", 100_000)
+    assert sampler.capture(source)[2] == fresh.name
+
+
+def test_discovery_deadline_keeps_previous_version_for_retry(recording_camera, monkeypatch):
+    directory, source, sampler, _ = _invalidation_baseline(recording_camera, monkeypatch)
+    fresh = _new_segment(directory)
+    version = dict(sampler._directory_versions)
+    real_time = event_module.time
+    ticks = iter((0, 4))
+    monkeypatch.setattr(event_module, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    with pytest.raises(OperatorEventsError, match="scan limit"):
+        sampler.capture(source)
+    assert sampler._directory_versions == version
+    monkeypatch.setattr(event_module, "time", real_time)
+    assert sampler.capture(source)[2] == fresh.name
+
+
+def test_stale_cache_and_discovered_name_union_has_one_inventory_ceiling(
+    recording_camera, monkeypatch
+):
+    root, directory, source = recording_camera
+    first = _new_segment(directory, "2026-11-02_12-00-00-000000_+0000.mp4")
+    second = _new_segment(directory, "2026-11-02_12-01-00-000000_+0000.mp4")
+    inventory = {path.name: _signature(directory, path) for path in (first, second)}
+    sampler = _sampler(root, inventory, monkeypatch)
+    assert sampler.capture(source) is None
+    second.unlink()
+    _new_segment(directory)
+    version = dict(sampler._directory_versions)
+    monkeypatch.setattr(event_module, "MAX_RECORDING_ENTRIES", 2)
+    with pytest.raises(OperatorEventsError, match="scan limit"):
+        sampler.capture(source)
+    assert sampler._directory_versions == version
+
+
+def test_final_entry_deadline_overrun_does_not_commit_inventory_version(
+    recording_camera, monkeypatch
+):
+    directory, source, sampler, _ = _invalidation_baseline(recording_camera, monkeypatch)
+    fresh = _new_segment(directory)
+    version = dict(sampler._directory_versions)
+    real_time = event_module.time
+    ticks = iter((0, 1, 2, 4))
+    monkeypatch.setattr(event_module, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    with pytest.raises(OperatorEventsError, match="scan limit"):
+        sampler.capture(source)
+    assert sampler._directory_versions == version
+    monkeypatch.setattr(event_module, "time", real_time)
+    assert sampler.capture(source)[2] == fresh.name
+
+
+def test_discovered_file_stat_uses_the_name_scan_deadline_and_retries(
+    recording_camera, monkeypatch
+):
+    directory, source, sampler, _ = _invalidation_baseline(recording_camera, monkeypatch)
+    fresh = _new_segment(directory)
+    version = dict(sampler._directory_versions)
+    known = {key: set(names) for key, names in sampler._known_names.items()}
+    original = identity_state._regular_file
+    real_time = event_module.time
+    clock = {"now": 0.0}
+
+    def slow_regular_file(path):
+        value = original(path)
+        if path == fresh:
+            # Enumeration spent two seconds; the final file stat crosses the
+            # original three-second deadline, not a separate stat allowance.
+            clock["now"] += 2.0
+        return value
+
+    original_names = sampler._recording_names
+
+    def slow_names(path, *, deadline=None):
+        names = original_names(path, deadline=deadline)
+        clock["now"] += 2.0
+        return names
+
+    monkeypatch.setattr(event_module, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+    monkeypatch.setattr(sampler, "_recording_names", slow_names)
+    monkeypatch.setattr(identity_state, "_regular_file", slow_regular_file)
+    with pytest.raises(OperatorEventsError, match="scan limit"):
+        sampler.capture(source)
+    assert sampler._directory_versions == version
+    assert sampler._known_names == known
+
+    monkeypatch.setattr(event_module, "time", real_time)
+    monkeypatch.setattr(sampler, "_recording_names", original_names)
+    monkeypatch.setattr(identity_state, "_regular_file", original)
+    assert sampler.capture(source)[2] == fresh.name
+    assert sampler.capture(source) is None
+
+
+def test_directory_replacement_during_discovered_file_stat_cannot_ack_inventory(
+    recording_camera, monkeypatch
+):
+    directory, source, sampler, _ = _invalidation_baseline(recording_camera, monkeypatch)
+    fresh = _new_segment(directory)
+    retained = directory.with_name("retained-during-stat")
+    version = dict(sampler._directory_versions)
+    known = {key: set(names) for key, names in sampler._known_names.items()}
+    original = identity_state._regular_file
+
+    def replaced_regular_file(path):
+        value = original(path)
+        if path == fresh:
+            directory.rename(retained)
+            directory.mkdir(mode=0o700)
+        return value
+
+    monkeypatch.setattr(identity_state, "_regular_file", replaced_regular_file)
+    with pytest.raises(identity_state.IdentityStateError, match="directory changed"):
+        sampler.capture(source)
+    assert sampler._directory_versions == version
+    assert sampler._known_names == known
+
+    monkeypatch.setattr(identity_state, "_regular_file", original)
+    directory.rmdir()
+    retained.rename(directory)
+    assert sampler.capture(source)[2] == fresh.name
+
+
+def test_prune_forgets_directory_invalidation_versions(recording_camera, monkeypatch):
+    _, source, sampler, _ = _invalidation_baseline(recording_camera, monkeypatch)
+    assert source.binding.device_id in sampler._directory_versions
+    sampler.prune(set())
+    assert sampler._directory_versions == {}
+    assert sampler._observations == {}
+    assert sampler._active_files == {}
+
+
+def test_new_reconnected_segment_is_sampled_before_cached_history_refresh(
+    recording_camera, monkeypatch
+):
+    root, directory, source = recording_camera
+    first = datetime(2026, 11, 2, 12, tzinfo=UTC)
+    inventory = {}
+    for index in range(18):
+        stamp = first + timedelta(minutes=10 * index)
+        path = directory / (stamp.strftime("%Y-%m-%d_%H-%M-%S-%f_%z") + ".mp4")
+        path.write_bytes(b"retained-history" + bytes(128))
+        inventory[path.name] = _signature(directory, path)
+    sampler = _sampler(root, inventory, monkeypatch)
+    assert sampler.capture(source) is None
+    fresh = _new_segment(directory)
+    with fresh.open("ab") as stream:
+        stream.write(b"-fresh-growth")
+    assert fresh.name not in inventory and len(inventory) == 18
+    sample = sampler.capture(source)
+    assert sample[0] == b"fresh-bytes-fresh-growth"
+    assert sample[1] == datetime(2026, 10, 31, 12, tzinfo=UTC)
+    assert sample[2] == fresh.name
+
+
+def test_cache_refresh_and_discovery_preserve_two_distinct_new_file_candidates(
+    recording_camera, monkeypatch
+):
+    directory, source, sampler, inventory = _invalidation_baseline(recording_camera, monkeypatch)
+    first = _new_segment(directory)
+    first.write_bytes(b"incomplete-first" + bytes(128))
+    second = _new_segment(directory, "2026-10-30_12-00-00-000000_+0000.mp4")
+    inventory.update({path.name: _signature(directory, path) for path in (first, second)})
+    decoded = []
+
+    def decode(raw, stamp, key):
+        decoded.append(key)
+        return (raw, stamp, key) if key == second.name else None
+
+    monkeypatch.setattr(sampler, "decode", decode)
+    assert sampler.capture(source)[2] == second.name
+    assert decoded == [first.name, second.name]

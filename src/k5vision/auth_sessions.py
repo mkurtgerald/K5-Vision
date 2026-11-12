@@ -84,6 +84,10 @@ class UserSessionManager:
         self._user_tokens: dict[UUID, bytes] = {}
         self._lock = asyncio.Lock()
         self._resolve_slots = asyncio.Semaphore(4)
+        # Login already owns a two-worker executor. Its durable post-issue
+        # authority read must not wait behind ordinary reads queued in the
+        # shared worker pool; keep its admission bounded independently.
+        self._isolated_resolve_slots = asyncio.Semaphore(2)
         self._revocation_listeners: set[Callable[[UUID], None]] = set()
 
     def add_revocation_listener(self, callback: Callable[[UUID], None]) -> Callable[[], None]:
@@ -169,7 +173,8 @@ class UserSessionManager:
         # inside the event loop or hold the session lock while it is in flight.
         # The bounded slots prevent simultaneous reads from flooding a private
         # SQLite registry when many authenticated browser requests arrive.
-        async with self._resolve_slots:
+        slots = self._resolve_slots if executor is None else self._isolated_resolve_slots
+        async with slots:
             if executor is None:
                 worker = asyncio.create_task(
                     asyncio.to_thread(

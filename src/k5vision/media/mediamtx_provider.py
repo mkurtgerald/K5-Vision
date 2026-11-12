@@ -348,6 +348,7 @@ class MediaMTXProvider:
         )
         self._requests: set[asyncio.Task] = set()
         self._version_admitted = False
+        self._admission_revision = 0
         self._info_task: asyncio.Task[MediaWorkerInfo] | None = None
         self._snapshots: dict[tuple[MediaMTXBinding, ...], asyncio.Task] = {}
         self._closed = False
@@ -422,24 +423,37 @@ class MediaMTXProvider:
         return result
 
     def _info_completed(self, task: asyncio.Task) -> None:
-        if self._info_task is task:
-            self._info_task = None
+        # Retain the latest owner for cancellation identity checks. Completed
+        # observations are never reused: info() starts a fresh check below.
         if not task.cancelled():
             task.exception()
 
-    async def _check_info(self) -> MediaWorkerInfo:
-        result = await self._get(self._api_origin, "/v3/info")
-        if not isinstance(result, dict):
-            raise MediaWorkerError(MediaWorkerErrorCode.INVALID_RESPONSE)
-        if result.get("version") != MEDIAMTX_VERSION:
-            raise MediaWorkerError(MediaWorkerErrorCode.VERSION_MISMATCH)
-        invalid = False
+    async def _check_info(self, revision: int) -> MediaWorkerInfo:
         try:
-            started = _timestamp(result.get("started"))
-        except ValueError:
-            invalid = True
-        if invalid:
-            raise MediaWorkerError(MediaWorkerErrorCode.INVALID_RESPONSE)
+            result = await self._get(self._api_origin, "/v3/info")
+            if not isinstance(result, dict):
+                raise MediaWorkerError(MediaWorkerErrorCode.INVALID_RESPONSE)
+            if result.get("version") != MEDIAMTX_VERSION:
+                raise MediaWorkerError(MediaWorkerErrorCode.VERSION_MISMATCH)
+            invalid = False
+            try:
+                started = _timestamp(result.get("started"))
+            except ValueError:
+                invalid = True
+            if invalid:
+                raise MediaWorkerError(MediaWorkerErrorCode.INVALID_RESPONSE)
+        except BaseException as error:
+            # Local capacity rejection dispatches no worker observation. Keep
+            # existing admission; cold providers remain unverified.
+            if revision == self._admission_revision and (
+                not isinstance(error, MediaWorkerError)
+                or error.code is not MediaWorkerErrorCode.BUSY
+            ):
+                self._admission_revision += 1
+                self._version_admitted = False
+            raise
+        if self._closed or revision != self._admission_revision:
+            raise MediaWorkerError(MediaWorkerErrorCode.UNAVAILABLE)
         self._version_admitted = True
         return MediaWorkerInfo(MEDIAMTX_VERSION, started)
 
@@ -451,11 +465,19 @@ class MediaMTXProvider:
             raise MediaWorkerError(MediaWorkerErrorCode.UNAVAILABLE)
         task = self._info_task
         if task is None or task.done():
-            self._version_admitted = False
-            task = asyncio.create_task(self._check_info())
+            # A pending refresh does not revoke a verified running worker.
+            task = asyncio.create_task(self._check_info(self._admission_revision))
             self._info_task = task
             task.add_done_callback(self._info_completed)
-        return await asyncio.shield(task)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if self._info_task is task:
+                self._admission_revision += 1
+                self._version_admitted = False
+            # Keep the shared owner and its native slot joined; its late
+            # success cannot undo cancellation or a newer admission.
+            raise
 
     async def _admit(self) -> None:
         if self._closed:
@@ -577,6 +599,7 @@ class MediaMTXProvider:
     async def aclose(self) -> None:
         """Close admission and join every real native read before releasing ownership."""
         self._closed = True
+        self._admission_revision += 1
         self._version_admitted = False
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close_requests())

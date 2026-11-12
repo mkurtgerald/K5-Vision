@@ -21,6 +21,8 @@ def test_media_ready_probe_does_not_block_the_api_event_loop():
         try:
             started = await asyncio.wait_for(asyncio.to_thread(entered.wait, 2), timeout=2.5)
             assert started is True
+            # The control loop must be able to observe the probe while it is
+            # still executing, without granting media access prematurely.
             assert not operation.done()
             released.set()
             assert await asyncio.wait_for(operation, timeout=2) is False
