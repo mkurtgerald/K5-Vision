@@ -487,10 +487,14 @@ jobs:
           retention-days: 14
 
   vm-clock:
-    name: Exercise real clock corrections on a second disposable Windows VM
+    name: Exercise real clock corrections on disposable Windows VM (${{ matrix.clock_run }}/2)
     needs: [native-desktop, focused-windows]
     runs-on: windows-2025
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        clock_run: [1, 2]
     permissions:
       contents: read
       actions: read
@@ -624,7 +628,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: vm-clock-windows-witness-${{ github.run_id }}
+          name: ${{ matrix.clock_run == 1 && format('vm-clock-windows-witness-{0}', github.run_id) || format('vm-clock-repeat-{0}-windows-witness-{1}', matrix.clock_run, github.run_id) }}
           path: |
             vm-clock-windows.xml
             vm-clock-windows-receipt.json

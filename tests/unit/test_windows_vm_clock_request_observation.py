@@ -116,7 +116,7 @@ def test_only_finite_public_route_labels(observer, route, label):
         (b"PRIVATE_BODY", "invalid", None, None),
         (b"\xffPRIVATE_BODY", "invalid", None, None),
         (b"", "invalid", None, None),
-        (b" " * 32769, "oversized", None, None),
+        pytest.param(b" " * 32769, "oversized", None, None, id="oversized-body"),
     ],
 )
 def test_history_shape_without_private_body_data(observer, body, shape, present, is_list):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -366,6 +367,13 @@ def test_windows_actual_start_bad_config_owned_observation(tmp_path, monkeypatch
     try:
         run_reproduction(tmp_path, monkeypatch, record, resources)
     except BaseException as error:
+        if isinstance(error, alpha.AlphaWitnessError):
+            try:
+                alpha.emit_alpha_diagnostic(error.alpha_diagnostic)
+            except BaseException:
+                # Observation cannot expose unvalidated output or replace the
+                # original rejection, including when cleanup later fails.
+                print("K5_ALPHA_LAUNCHER_DIAGNOSTIC_INVALID")
         failure = str(error) if isinstance(error, ObservationFailure) else "fixture_admission"
         if record["error"] == "none":
             record["error"] = failure
@@ -989,6 +997,50 @@ def expected_refusal_error():
     return alpha.AlphaWitnessError(
         alpha.alpha_diagnostic("invalid_config", "invalid_job_total", observations=observations)
     )
+
+
+@pytest.mark.parametrize("projection", ["valid", "invalid", "emitter_failure"])
+def test_hosted_failure_keeps_bounded_original_diagnostic(
+    tmp_path, monkeypatch, capsys, projection
+):
+    private = "generated-private-source-path-and-token"
+    error = alpha.AlphaWitnessError(
+        alpha.alpha_diagnostic(
+            "invalid_config",
+            "child_process",
+            failure_code="child_timeout",
+            observations={"timed_out": True, "gate_state": "started"},
+        )
+    )
+    error.args = (private,)
+    if projection == "invalid":
+        error.alpha_diagnostic["source_uri"] = private
+    if projection == "emitter_failure":
+
+        def refuse(_value):
+            raise RuntimeError(private)
+
+        monkeypatch.setattr(alpha, "emit_alpha_diagnostic", refuse)
+
+    def reproduce(*_args):
+        raise error
+
+    monkeypatch.setattr(sys.modules[__name__], "run_reproduction", reproduce)
+    with pytest.raises(pytest.fail.Exception, match="fixture_admission"):
+        test_windows_actual_start_bad_config_owned_observation(tmp_path, monkeypatch)
+    output = capsys.readouterr().out
+    assert private not in output
+    records = [
+        line.removeprefix("K5_ALPHA_LAUNCHER_DIAGNOSTIC=")
+        for line in output.splitlines()
+        if line.startswith("K5_ALPHA_LAUNCHER_DIAGNOSTIC=")
+    ]
+    if projection == "valid":
+        assert len(records) == 1
+        assert json.loads(records[0]) == error.alpha_diagnostic
+    else:
+        assert records == []
+        assert "K5_ALPHA_LAUNCHER_DIAGNOSTIC_INVALID" in output
 
 
 @pytest.mark.parametrize(

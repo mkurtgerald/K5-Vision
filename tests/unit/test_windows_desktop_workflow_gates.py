@@ -80,3 +80,50 @@ def test_historical_baseline_transport_retry_never_weakens_upgrade_admission():
     assert "Write-Host $output" not in baseline
     assert "source_url" not in baseline
     assert "K5_DONOR_TOOL_ROOT" not in baseline
+
+
+def test_two_clock_vms_run_independently_with_the_same_qualified_producer_inputs():
+    workflow = _WORKFLOW.read_text(encoding="utf-8")
+    clock = workflow.split("  vm-clock:\n", 1)[1].split("  cross-revision-upgrade:\n", 1)[0]
+    assert (
+        "name: Exercise real clock corrections on disposable Windows VM (${{ matrix.clock_run }}/2)"
+        in clock
+    )
+    assert "needs: [native-desktop, focused-windows]" in clock
+    assert "runs-on: windows-2025" in clock
+    assert "strategy:\n      fail-fast: false\n      matrix:\n        clock_run: [1, 2]" in clock
+    assert "max-parallel:" not in clock
+    assert "continue-on-error:" not in clock
+    assert (
+        "K5_VM_CLOCK_SETUP_ARTIFACT_ID: ${{ needs.native-desktop.outputs.setup_artifact_id }}"
+        in clock
+    )
+    assert (
+        "K5_VM_CLOCK_PRIMARY_ARTIFACT_ID: "
+        "${{ needs.native-desktop.outputs.primary_witness_artifact_id }}" in clock
+    )
+    assert "K5_VM_CLOCK_PRIMARY_RUN_ID: ${{ github.run_id }}" in clock
+    assert (
+        "K5_VM_CLOCK_PRIMARY_RUN_ATTEMPT: ${{ needs.native-desktop.outputs.primary_run_attempt }}"
+        in clock
+    )
+    assert "artifact-ids: ${{ needs.native-desktop.outputs.setup_artifact_id }}" in clock
+    assert "artifact-ids: ${{ needs.native-desktop.outputs.primary_witness_artifact_id }}" in clock
+    assert "--expected-primary-artifact-id $env:K5_VM_CLOCK_PRIMARY_ARTIFACT_ID" in clock
+    assert "--expected-setup-artifact-id $env:K5_VM_CLOCK_SETUP_ARTIFACT_ID" in clock
+
+
+def test_clock_matrix_retains_original_witness_name_and_distinct_repeat_artifact():
+    workflow = _WORKFLOW.read_text(encoding="utf-8")
+    clock = workflow.split("  vm-clock:\n", 1)[1].split("  cross-revision-upgrade:\n", 1)[0]
+    evidence = clock.split("Preserve finite VM clock evidence after UTC restoration", 1)[1]
+    assert "if: always()" in evidence
+    assert (
+        "name: ${{ matrix.clock_run == 1 && "
+        "format('vm-clock-windows-witness-{0}', github.run_id) || "
+        "format('vm-clock-repeat-{0}-windows-witness-{1}', matrix.clock_run, github.run_id) }}"
+        in evidence
+    )
+    assert "vm-clock-windows.xml" in evidence
+    assert "vm-clock-windows-receipt.json" in evidence
+    assert "vm-clock-input/desktop-package.json" in evidence
