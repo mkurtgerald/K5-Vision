@@ -1283,7 +1283,8 @@
     $("history-start").value = utcInput(new Date(end.getTime() - state.historyRangeMs), true);
     $("history-end").value = utcInput(end, true);
     $("history-day").value = "";
-    $("history-day").max = end.toISOString().slice(0, 10);
+    // Retained recording dates can be ahead of corrected recorder UTC.
+    // The recording inventory, rather than the clock, determines availability.
     state.historyRolling = true;
     return true;
   }

@@ -1726,10 +1726,29 @@ def _desktop_nvr_journey(
         > before_live,
         "Pausing recording interrupted installed live video",
     )
-    _require(
-        bool(client.json(f"/api/v1/operator/cameras/{camera_ids[0]}/history")["spans"]),
-        "Pausing recording removed installed recording history",
-    )
+    history_entered_utc, history_started = datetime.now(UTC), time.monotonic()
+    paused_history = client.json(f"/api/v1/operator/cameras/{camera_ids[0]}/history")
+    history_completed_utc = datetime.now(UTC)
+    history_elapsed = time.monotonic() - history_started
+    try:
+        _require(
+            bool(paused_history["spans"]),
+            "Pausing recording removed installed recording history",
+        )
+    except BaseException:
+        try:
+            diagnostic["paused_history"] = _helpers("installed_history_diagnostic").observe_failure(
+                client=client,
+                profile=profile,
+                directory=camera_directories[0],
+                entered_utc=history_entered_utc,
+                completed_utc=history_completed_utc,
+                elapsed=history_elapsed,
+                response=paused_history,
+            )
+        except BaseException:  # noqa: BLE001 - preserve the original assertion and cleanup.
+            diagnostic["paused_history"] = {"probe_failed": True}
+        raise
     browser_helpers._recording_control_diagnostic(None, True, diagnostic)
     with page.expect_response(
         lambda response: response.request.method == "PUT" and response.url.endswith(recording_route)

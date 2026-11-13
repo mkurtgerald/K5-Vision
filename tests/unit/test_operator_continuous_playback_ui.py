@@ -407,6 +407,67 @@ def test_rolling_history_keeps_events_from_the_current_recorder_second():
             page.locator("#load-history").click()
 
 
+@pytest.mark.parametrize("clock_step_hours", [-48, 48])
+def test_calendar_keeps_retained_utc_days_selectable_after_recorder_clock_correction(
+    clock_step_hours,
+):
+    """Recorder time cannot establish the latest retained recording date."""
+    clock, queries = {"now": _NOW}, []
+
+    def corrected_clock(route):
+        path = urlsplit(route.request.url).path
+        if path == "/api/v1/operator/status":
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "worker_status": "ready",
+                        "server_utc": clock["now"].isoformat().replace("+00:00", "Z"),
+                    }
+                ),
+            )
+            return True
+        if path.endswith("/history"):
+            queries.append(parse_qs(urlsplit(route.request.url).query))
+        return False
+
+    with _history_page(export_handler=corrected_clock) as (page, expect):
+        day = page.locator("#history-day")
+
+        def choose_utc_day(at, expected_intervals):
+            with page.expect_response(
+                lambda response: urlsplit(response.url).path.endswith("/history")
+            ):
+                day.fill(at.date().isoformat())
+            # fill() can set a date disabled by the native calendar. Its actual
+            # validity must also allow a person to select this retained day.
+            assert day.evaluate("input => input.validity.valid")
+            expect(page.locator("#history-count")).to_have_text(str(expected_intervals))
+            start, end = (datetime.fromisoformat(queries[-1][key][0]) for key in ("start", "end"))
+            midnight = at.replace(hour=0, minute=0, second=0, microsecond=0)
+            assert start == midnight
+            assert end == midnight + timedelta(days=1)
+
+        choose_utc_day(_NOW, 18)
+        clock["now"] += timedelta(hours=clock_step_hours)
+        with page.expect_response(
+            lambda response: urlsplit(response.url).path.endswith("/history")
+        ):
+            page.locator("#last-24-hours").click()
+        # Rolling history follows corrected recorder UTC and must not claim
+        # that the retained fixture has footage in the newly selected range.
+        expect(page.locator("#history-count")).to_have_text("0")
+        rolling_end = datetime.fromisoformat(queries[-1]["end"][0])
+        assert rolling_end.date() == clock["now"].date()
+
+        choose_utc_day(_NOW, 18)
+        # Permitting a calendar query does not manufacture future recordings.
+        choose_utc_day(_NOW + timedelta(days=5), 0)
+        expect(page.locator("#history-message")).to_have_text(
+            "No recorded video is available in this interval."
+        )
+
+
 def test_old_recorder_time_response_cannot_reset_a_newer_history_and_event_seek():
     pending, history_requests = [], []
     status_count = 0
