@@ -1,0 +1,169 @@
+name: Validate repaired media transport on 8 Windows VMs 4a146e1
+
+on:
+  pull_request:
+    types: [opened]
+    branches: [codex/beta-integration-20261112]
+    paths: [.github/workflows/diagnose-combined-transport-4a146e1-8vm.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  observe:
+    name: Observe combined media transport on VM ${{ matrix.probe }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        probe: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: "false"
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_BETA_HEAD_SHA: 4a146e1a6108c5d876b8bf17dd007f88b441a721
+      K5_DESKTOP_HEAD_SHA: 4a146e1a6108c5d876b8bf17dd007f88b441a721
+      K5_VM_CLOCK_ACCEPTANCE: "0"
+      K5_TRANSPORT_DIAGNOSTIC_PROBE: ${{ matrix.probe }}
+      K5_DIAGNOSTIC_DISPATCHER_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Checkout the exact repaired product candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 4a146e1a6108c5d876b8bf17dd007f88b441a721
+          persist-credentials: false
+      - name: Checkout the separately pinned diagnostic dispatcher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: .transport-diagnostic-dispatcher
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Set up the original development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Admit frozen source, dispatcher and exact unqualified candidate producer
+        shell: python
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+        run: |
+          import hashlib,json,os,platform,subprocess,urllib.request
+          from pathlib import Path
+          assert __debug__ and platform.system() == 'Windows'
+          assert os.environ['GITHUB_REPOSITORY'] == 'mkurtgerald/K5-Vision'
+          assert os.environ['GITHUB_EVENT_NAME'] == 'pull_request'
+          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
+          assert os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted'
+          assert os.environ['RUNNER_OS'] == 'Windows'
+          source='4a146e1a6108c5d876b8bf17dd007f88b441a721'
+          tree='e4433cfc11ab77aa63a640ffd737ccc988160a49'
+          dispatcher=Path('.transport-diagnostic-dispatcher').resolve()
+          def git(root,*args):
+              return subprocess.check_output(['git',*args],cwd=root,text=True).strip()
+          assert git('.', 'rev-parse','HEAD') == source
+          assert git('.', 'rev-parse','HEAD^{tree}') == tree
+          assert not git('.', 'status','--porcelain','--untracked-files=no')
+          observed=git(dispatcher,'rev-parse','HEAD')
+          assert observed == os.environ['K5_DIAGNOSTIC_DISPATCHER_SHA']
+          assert git(dispatcher,'rev-list','--parents','-n','1','HEAD').split() == [observed,source]
+          allowed=['.github/workflows/diagnose-combined-transport-4a146e1-8vm.yml','scripts/observe_combined_transport_4a146e1.py']
+          assert git(dispatcher,'diff','--name-status',source,'HEAD').splitlines() == ['A\t'+p for p in allowed]
+          helper=dispatcher/'scripts/observe_combined_transport_4a146e1.py'
+          assert hashlib.sha256(helper.read_bytes()).hexdigest() == '84ca7e0f511bb7f8d931863d2c4082328c454cd14bde52ba6df8caf73cd552b4'
+          for name,expected in {'tests/integration/test_windows_desktop_app.py': '1b976af55ca908bfc397f06e895f9546a7d4f60fd37e05f4b65fa6f62cd6677f', 'tests/integration/test_operator_product_runtime.py': 'd7c7eaa38fe36843a937e57d60b696a93bca66599b3883e51d84cd1f37345106', 'tests/integration/test_operator_beta_browser.py': '67eea5d12df2cfe6e19603fe459405eac05c93e6db8d59c068a23f69a573f771', 'tests/integration/installed_settings_acceptance.py': '3fcda240480194282712ee1e18fb820a327b9e0b840987775a358900c22bf165', '.github/actions/provision-operator-tools/action.yml': 'e50c55c29830ed793c0500e52628d145580d23209f49c9369a2c218e722c0c00', 'scripts/provision_operator_person_acceptance.py': '3dc414b2aa0ba92cae73ab02b81ffdca43386e5e0e1274c02dc0c52110d3c896'}.items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == expected
+          subprocess.run(['python',str(helper),'--source','.', '--preflight-only'],check=True)
+          headers={'Authorization':'Bearer '+os.environ['GH_READ_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'K5-combined-transport-diagnostic'}
+          def document(route):
+              request=urllib.request.Request('https://api.github.com/repos/mkurtgerald/K5-Vision'+route,headers=headers)
+              with urllib.request.urlopen(request,timeout=30) as response:
+                  raw=response.read(4194305)
+              assert len(raw)<=4194304
+              return json.loads(raw)
+          run=document('/actions/runs/43357366067')
+          assert run['id']==43357366067 and run['head_sha']==source and run['run_attempt']==1
+          assert run['path']=='.github/workflows/operator-desktop-windows.yml'
+          assert run['status'] in {'in_progress','completed'} and run['conclusion'] in {None,'success','failure'}
+          jobs=document('/actions/runs/43357366067/attempts/1/jobs?per_page=100')['jobs']
+          producer=[row for row in jobs if row['id']==131662490774]
+          assert len(producer)==1 and producer[0]['head_sha']==source
+          assert producer[0]['name']=='Build and exercise actual graphical Windows installation'
+          assert producer[0]['status'] in {'in_progress','completed'} and producer[0]['conclusion'] in {None,'success','failure'}
+          upload=[row for row in producer[0]['steps'] if row['name']=='Upload non-release candidate for independent upgrade and reversal qualification']
+          assert len(upload)==1 and upload[0]['status']=='completed' and upload[0]['conclusion']=='success'
+          artifact=document('/actions/artifacts/14007056163')
+          assert artifact['id']==14007056163 and artifact['name']=='k5-vision-windows-upgrade-candidate-'+source
+          assert artifact['size_in_bytes']==298600127 and artifact['expired'] is False
+          assert artifact['digest']=='sha256:35209d82979736c3d49a77475ca429a30da5d4fea6eb56027c4049f1ff427a61'
+          assert artifact['workflow_run']['id']==43357366067 and artifact['workflow_run']['head_sha']==source
+          identity={'scope':'post-repair-combined-media-transport-diagnostic-only','qualification':False,'source_head':source,'source_tree':tree,'dispatcher_head':observed,'helper_sha256':'84ca7e0f511bb7f8d931863d2c4082328c454cd14bde52ba6df8caf73cd552b4','run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':1,'probe':os.environ['K5_TRANSPORT_DIAGNOSTIC_PROBE'],'input_native_run':43357366067,'input_producer':131662490774,'input_producer_status':producer[0]['status'],'input_producer_conclusion':producer[0]['conclusion'],'input_workflow_status':run['status'],'input_workflow_conclusion':run['conclusion'],'candidate_artifact':14007056163,'candidate_is_unqualified':True,'product_test_files_changed':False,'original_assertions_and_deadlines_changed':False,'request_retries_added':0}
+          Path('combined-transport-4a146e1-identity.json').write_text(json.dumps(identity,indent=2)+'\n',encoding='utf-8')
+      - name: Download exact unqualified repaired candidate for diagnostics only
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          artifact-ids: "14007056163"
+          run-id: "43357366067"
+          github-token: ${{ github.token }}
+          path: transport-candidate-input
+          merge-multiple: true
+      - name: Bind exact source, unqualified candidate, manifest and package bytes
+        shell: python
+        run: |
+          import hashlib,json,os
+          from pathlib import Path
+          root=Path('transport-candidate-input')
+          assert sorted(p.name for p in root.iterdir())==['K5VisionSetup.exe','desktop-package.json','payload-manifest.json']
+          package=root/'desktop-package.json'
+          manifest=root/'payload-manifest.json'
+          setup=root/'K5VisionSetup.exe'
+          assert hashlib.sha256(package.read_bytes()).hexdigest()=='f12cf41e3999aa664da98bf0bd08668c6b21576403f23d29fb620d999574486e'
+          assert hashlib.sha256(manifest.read_bytes()).hexdigest()=='51b5864e692a818c1d966012f2cc61e654aaf1387537527c8e6e03d85d16dcb0'
+          data=json.loads(package.read_bytes())
+          assert data['qualification_status']=='unqualified' and data['schema_version']==1
+          assert data['head_sha']==json.loads(manifest.read_bytes())['head_sha']=='4a146e1a6108c5d876b8bf17dd007f88b441a721'
+          assert data['payload_manifest_sha256']=='51b5864e692a818c1d966012f2cc61e654aaf1387537527c8e6e03d85d16dcb0'
+          assert data['launcher_sha256']=='59586686d8094e3672911f9f36157fec1b4c2443d23b37c3964dd2d03444c2b6'
+          assert setup.stat().st_size==data['setup_bytes']==300005130
+          with setup.open('rb') as stream:
+              actual=hashlib.file_digest(stream,'sha256').hexdigest()
+          assert actual==data['setup_sha256']=='ad6d196b0e52b989502dba2f3ece635f164ecd3fe63bcac80c24f09c3e6ccaef'
+          with Path(os.environ['GITHUB_ENV']).open('a',encoding='utf-8') as stream:
+              stream.write('K5_DESKTOP_SETUP='+str(setup.resolve())+'\n')
+              stream.write('K5_DESKTOP_SETUP_SHA256='+actual+'\n')
+          print('Exact unqualified post-repair source, installer, package and manifest admitted for transport diagnostics only')
+      - name: Install original acceptance dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Original diagnostic dependency install failed" }
+      - name: Provision original immutable native acceptance tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Provision original admitted public person fixture
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Original public person fixture admission failed" }
+      - name: Run unchanged installed GUI tests with passive transport observations
+        timeout-minutes: 12
+        shell: pwsh
+        run: |
+          python .transport-diagnostic-dispatcher/scripts/observe_combined_transport_4a146e1.py --source .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve diagnostic identity and finite original outcome
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: combined-transport-4a146e1-probe-${{ matrix.probe }}-${{ github.run_id }}
+          path: |
+            combined-transport-4a146e1-identity.json
+            combined-transport-4a146e1-original.xml
+            combined-transport-4a146e1-observation.json
+          if-no-files-found: error
+          retention-days: 7
