@@ -9,7 +9,9 @@ Decoded pixels stay transient; durable data contains settings and event metadata
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
+import io
 import json
 import math
 import os
@@ -39,6 +41,11 @@ MAX_EVENT_ROWS = 100_000
 MAX_RECORDING_ENTRIES = 100_000
 MAX_RECORDING_BYTES = 128 * 1024 * 1024
 _NATIVE_REQUEST_SECONDS = 8.0
+# The first native person inference compiles the admitted OpenVINO CPU model.
+# The installed view broker allows 15s for this same cold preparation. Do not
+# kill the recording detector at 8s before its first inference can finish.
+# Subsequent requests retain the original tight deadline.
+_NATIVE_COLD_PERSON_REQUEST_SECONDS = 18.0
 _DATABASE = "operator-events.sqlite3"
 
 
@@ -204,6 +211,7 @@ class OperatorEventStore:
         confidence: float,
         person_count: int,
         emit: bool,
+        admit: Callable[[], bool] | None = None,
     ) -> bool:
         if (
             not isinstance(camera_id, UUID)
@@ -226,7 +234,10 @@ class OperatorEventStore:
                 "SELECT enabled,last_frame_key FROM camera_analytics WHERE camera_id=?",
                 (str(camera_id),),
             ).fetchone()
-            if row is None or not row[0] or row[1] == frame_key:
+            if row is None or not row[0] or (admit is not None and not admit()):
+                connection.execute("COMMIT")
+                return False
+            if row[1] == frame_key:
                 connection.execute("COMMIT")
                 return False
             connection.execute(
@@ -325,6 +336,89 @@ class RecordedPersonFrame:
     detections: tuple[object, ...] | None = None
 
 
+class _NativeRequestWatchdog:
+    """One prestarted deadline thread per owned native worker.
+
+    Starting threading.Timer for each request waits synchronously for a new
+    thread to run. On a loaded Windows desktop that wait can block before the
+    request is written, with no active deadline. Arm this prestarted guard
+    through a condition instead; it never creates a thread at request time.
+    """
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._process = None
+        self._expired = None
+        self._deadline = 0.0
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run, name="k5-native-person-deadline", daemon=True
+        )
+        try:
+            self._thread.start()
+        except RuntimeError:
+            self._closed = True
+            raise OperatorEventsError("Analytics watchdog unavailable") from None
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while True:
+                    if self._closed:
+                        return
+                    if self._process is None:
+                        self._condition.wait()
+                        continue
+                    remaining = self._deadline - time.monotonic()
+                    if remaining > 0:
+                        self._condition.wait(remaining)
+                        continue
+                    process = self._process
+                    self._expired.set()
+                    self._process = None
+                    self._expired = None
+                    break
+            # Never hold the condition while killing/reaping an owned child.
+            # The caller retains the original request deadline and cleanup.
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    def arm(self, process, seconds: float) -> threading.Event:
+        with self._condition:
+            if self._closed or not self._thread.is_alive() or self._process is not None:
+                raise OperatorEventsError("Analytics watchdog unavailable")
+            expired = threading.Event()
+            self._process = process
+            self._expired = expired
+            self._deadline = time.monotonic() + seconds
+            self._condition.notify()
+            return expired
+
+    def rebind(self, process) -> None:
+        """Retain the same deadline when an exited child is replaced once."""
+        with self._condition:
+            if self._process is not None and not self._closed:
+                self._process = process
+                self._condition.notify()
+
+    def disarm(self) -> None:
+        with self._condition:
+            self._process = None
+            self._expired = None
+            self._condition.notify()
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._process = None
+            self._expired = None
+            self._condition.notify()
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=2)
+
+
 class _RecordedNativeWorker:
     """One persistent, killable decoder/detector process with bounded requests.
 
@@ -339,6 +433,38 @@ class _RecordedNativeWorker:
         self._job = None
         self._lock = threading.RLock()
         self._closing = threading.Event()
+        self._person_ready = False
+        self._failure_phase = "native_not_started"
+        # Fixed classifications only; never retain an OS error, path or request.
+        self._native_write_cause = "not_started"
+        # Initialized before child startup, usually during media-free priming.
+        self._watchdog = _NativeRequestWatchdog()
+
+    def _request_timeout(self) -> float:
+        if self._configuration is not None and not self._person_ready:
+            return _NATIVE_COLD_PERSON_REQUEST_SECONDS
+        return _NATIVE_REQUEST_SECONDS
+
+    @staticmethod
+    def _recoverable_stdin_disconnect(error: OSError) -> bool:
+        # Windows may report a closed anonymous pipe as WinError 109, 232,
+        # or 233 without raising the BrokenPipeError subclass. Never retry
+        # unrelated native launch or write errors.
+        if isinstance(error, BrokenPipeError) or error.errno == errno.EPIPE:
+            return True
+        return getattr(error, "winerror", None) in {109, 232, 233}
+
+    def _write_request(self, stream, payload: bytes) -> None:
+        """Send one bounded native command, including on short raw-pipe writes."""
+        self._failure_phase = "native_pipe_write_active"
+        remaining = memoryview(payload)
+        while remaining:
+            written = stream.write(remaining)
+            if type(written) is not int or not 0 < written <= len(remaining):
+                raise OSError("Native request pipe unavailable")
+            remaining = remaining[written:]
+        self._failure_phase = "native_pipe_flush_active"
+        stream.flush()
 
     def _start(self) -> None:
         from k5vision.operator_native_process import _WindowsJob
@@ -352,9 +478,16 @@ class _RecordedNativeWorker:
         process = None
         try:
             process = subprocess.Popen(
-                [sys.executable, "-B", "-m", "k5vision.operator_events_decoder"],
+                # Match the exact isolated embedded-runtime child admission
+                # exercised during desktop packaging. Never load modules from
+                # the installed working directory or inherited Python paths.
+                [sys.executable, "-I", "-B", "-m", "k5vision.operator_events_decoder"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
+                # The native request is one bounded JSON line. Buffered stdin
+                # can leave a second flush blocking on Windows under load.
+                # Keep the input pipe unbuffered; do not change response framing.
+                bufsize=0,
                 stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 start_new_session=os.name != "nt",
@@ -362,7 +495,13 @@ class _RecordedNativeWorker:
             )
             if job is not None:
                 job.assign(process)
+            # Unbuffered stdout can return a partial native pixel payload.
+            # Retain exact-length frame reads and bounded line parsing with
+            # an explicit buffered reader; the input pipe alone is unbuffered.
+            process.stdout = io.BufferedReader(process.stdout, buffer_size=65536)
             self._process, self._job = process, job
+            # A replacement child has not compiled its sealed person model.
+            self._person_ready = False
         except BaseException:
             if process is not None:
                 process.kill()
@@ -371,48 +510,163 @@ class _RecordedNativeWorker:
                 job.close()
             raise OperatorEventsError("Analytics worker ownership unavailable") from None
 
-    def request(self, path: Path):
+    def request(self, path: Path | None):
+        """A None path primes the bundled model without opening camera media."""
         with self._lock:
+            if path is None and self._configuration is None:
+                raise OperatorEventsError("Analytics model priming unavailable")
             if self._closing.is_set():
                 raise OperatorEventsError("Analytics worker is closed")
+            self._failure_phase = "native_launch_failed"
             self._start()
+            self._failure_phase = "native_watchdog_starting"
+            self._native_write_cause = "not_started"
             process = self._process
             if self._closing.is_set():
                 self.close()
                 raise OperatorEventsError("Analytics worker is closed")
-            expired = threading.Event()
-
-            def deadline():
-                expired.set()
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-
-            timer = threading.Timer(_NATIVE_REQUEST_SECONDS, deadline)
-            timer.daemon = True
-            timer.start()
+            try:
+                # Arming a prestarted guard never waits for Windows to schedule
+                # another Timer thread before writing the native command.
+                expired = self._watchdog.arm(process, self._request_timeout())
+            except OperatorEventsError:
+                self._failure_phase = "native_watchdog_unavailable"
+                self.close(final=False)
+                raise OperatorEventsError("Analytics native frame unavailable") from None
+            self._failure_phase = "native_write_failed"
+            self._native_write_cause = "pending"
             failed = False
             try:
                 request = {
-                    "path": str(path),
+                    "path": "" if path is None else str(path),
                     "artifact_root": None
                     if self._configuration is None
                     else str(self._configuration.artifact_root),
                 }
-                process.stdin.write(json.dumps(request).encode("utf-8") + b"\n")
-                process.stdin.flush()
-                raw = process.stdout.readline(4097)
-                if not raw.endswith(b"\n") or len(raw) > 4096:
+                payload = json.dumps(request).encode("utf-8") + b"\n"
+                try:
+                    # Distinguish a blocked Windows pipe write from a blocked
+                    # flush or an unresponsive child. These phases carry no
+                    # path, request bytes or native exception details.
+                    self._write_request(process.stdin, payload)
+                except (OSError, ValueError) as error:
+                    self._failure_phase = "native_write_failed"
+                    # Windows buffered stdin can report a closed stream as
+                    # ValueError rather than OSError. A proven closed stream or
+                    # terminated child permits only the existing single retry.
+                    # A child already known to have exited cannot accept
+                    # another request, even if Windows reports an unfamiliar
+                    # pipe error. A live child with an unrelated write error
+                    # must never be retried. One replacement retains the
+                    # original deadline and must reap the old owned process.
+                    # A demonstrably closed buffered stdin is also a
+                    # disconnect, even if the child is still alive. Replacing
+                    # that owned child is the only way to accept a new request.
+                    closed_input = (
+                        isinstance(error, ValueError)
+                        and process.stdin is not None
+                        and process.stdin.closed
+                    )
+                    disconnected = closed_input or (
+                        isinstance(error, OSError) and self._recoverable_stdin_disconnect(error)
+                    )
+                    if not disconnected and process.poll() is None:
+                        # A native child can close stdin before Windows reports
+                        # process termination. Wait only for this ambiguous
+                        # failure, without inspecting stderr, arguments, or media.
+                        # A still-live child with an unrelated error is refused.
+                        try:
+                            process.wait(timeout=0.1)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    exited = process.poll() is not None
+                    if not (disconnected or exited):
+                        self._native_write_cause = "live_child_write_error"
+                        raise
+                    self._native_write_cause = (
+                        "first_child_disconnected" if disconnected else "first_child_exited"
+                    )
+                    # The Windows child can exit before accepting its first
+                    # snapshot. Reap it before one replacement; never retry a
+                    # model, decoder, inference or response-protocol failure.
+                    # The original deadline also owns the replacement.
+                    if expired.is_set() or self._closing.is_set():
+                        raise
+                    self.close(final=False)
+                    self._start()
+                    process = self._process
+                    # A replacement inherits the original watchdog deadline.
+                    self._watchdog.rebind(process)
+                    self._failure_phase = "native_write_failed"
+                    if expired.is_set() or self._closing.is_set():
+                        process.kill()
+                        raise TimeoutError from None
+                    try:
+                        self._write_request(process.stdin, payload)
+                    except (OSError, ValueError):
+                        self._failure_phase = "native_write_failed"
+                        self._native_write_cause = "replacement_write_error"
+                        raise
+                self._native_write_cause = "write_accepted"
+                self._failure_phase = "native_reply_missing"
+                # A child may report only these fixed processing phases before
+                # its response. Four bounded headers (three stages + result)
+                # retain the original kill timer and refuse unbounded chatter.
+                for _ in range(4):
+                    raw = process.stdout.readline(4097)
+                    if not raw.endswith(b"\n") or len(raw) > 4096:
+                        self._failure_phase = "native_reply_missing"
+                        raise ValueError
+                    self._failure_phase = "native_header_invalid"
+                    header = json.loads(raw)
+                    if type(header) is not dict:
+                        raise ValueError
+                    if header.get("status") != "phase":
+                        break
+                    phase = header.get("phase")
+                    if set(header) != {"status", "phase"} or phase not in {
+                        "decode",
+                        "model",
+                        "inference",
+                    }:
+                        raise ValueError
+                    self._failure_phase = {
+                        "decode": "native_decoder_active",
+                        "model": "native_model_active",
+                        "inference": "native_inference_active",
+                    }[phase]
+                else:
+                    self._failure_phase = "native_header_invalid"
                     raise ValueError
-                header = json.loads(raw)
+                if header.get("status") == "primed":
+                    if path is not None or set(header) != {"status"}:
+                        raise ValueError
+                    self._person_ready = True
+                    self._failure_phase = "native_none"
+                    return None
+                if header.get("status") == "failed":
+                    failure_phases = {
+                        "protocol": "native_protocol_failed",
+                        "decode": "native_decode_failed",
+                        "model": "native_model_failed",
+                        "inference": "native_inference_failed",
+                    }
+                    phase = header.get("phase")
+                    self._failure_phase = (
+                        failure_phases.get(phase, "native_transport_failed")
+                        if type(phase) is str
+                        else "native_transport_failed"
+                    )
+                    raise ValueError
                 if header.get("status") == "empty":
                     return None
                 if header.get("status") != "ready" or header.get("bytes") != 544 * 320 * 4:
                     raise ValueError
+                self._failure_phase = "native_payload_incomplete"
                 payload = process.stdout.read(544 * 320 * 4)
                 if len(payload) != 544 * 320 * 4:
                     raise ValueError
+                self._failure_phase = "native_reply_invalid"
                 elapsed = header["elapsed"]
                 if (
                     type(elapsed) not in (int, float)
@@ -437,13 +691,22 @@ class _RecordedNativeWorker:
                             raise ValueError
                         detections.append(SimpleNamespace(category="person", confidence=confidence))
                     detections = tuple(detections)
+                    # This acknowledgement came from the owning native child.
+                    # An empty frame never admits readiness for a later request.
+                    self._person_ready = True
+                self._failure_phase = "native_none"
                 return elapsed, payload, detections
             except Exception:
+                if expired.is_set():
+                    self._failure_phase = "native_timeout"
+                elif self._failure_phase == "native_write_failed" and process.poll() is not None:
+                    # A child exiting before stdin acceptance is not evidence
+                    # of model failure. Retain no stderr, arguments or paths.
+                    self._failure_phase = "native_child_exited_before_request"
                 failed = True
                 raise OperatorEventsError("Analytics native frame unavailable") from None
             finally:
-                timer.cancel()
-                timer.join()
+                self._watchdog.disarm()
                 if failed or expired.is_set():
                     self.close(final=False)
 
@@ -464,21 +727,34 @@ class _RecordedNativeWorker:
             job, self._job = self._job, None
             try:
                 if process is not None:
-                    if process.stdin is not None:
+                    # Never flush buffered stdin while the owned native child
+                    # may still be blocked compiling or decoding. On Windows,
+                    # closing a buffered writer first can block forever on its
+                    # pending pipe bytes, preventing the failed worker from
+                    # being reaped or replaced. Kill and reap before closing
+                    # either pipe, retaining the existing two-second bound.
+                    if process.poll() is None:
                         try:
-                            process.stdin.close()
-                        except (BrokenPipeError, OSError):
+                            process.kill()
+                        except OSError:
                             pass
                     try:
                         process.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=2)
+                    if process.stdin is not None:
+                        try:
+                            process.stdin.close()
+                        except (BrokenPipeError, OSError):
+                            pass
                     if process.stdout is not None:
                         process.stdout.close()
             finally:
                 if job is not None:
                     job.close()
+                if final:
+                    self._watchdog.close()
 
 
 class RecordedFrameSampler:
@@ -502,8 +778,14 @@ class RecordedFrameSampler:
         self._observations: dict[UUID, dict[str, tuple[int, int, int]]] = {}
         self._recording_files = recording_files
         self._active_files: dict[UUID, tuple[str, ...]] = {}
+        # Directory names establish a cold, content-free baseline so cache
+        # lag cannot mistake retained footage for newly arriving segments.
+        self._known_names: dict[UUID, set[str]] = {}
+        self._directory_versions: dict[UUID, tuple[int, int, int, int]] = {}
         self._closing = threading.Event()
         self._worker_lock = threading.RLock()
+        # Finite in-memory outcome; never a path, source URI or recorded frame.
+        self._capture_outcome = "not_started"
 
     def prune(self, active: set[UUID]) -> None:
         """Forget removed camera hints without touching retained recording files."""
@@ -517,6 +799,22 @@ class RecordedFrameSampler:
             for identifier, value in self._active_files.items()
             if identifier in active
         }
+        self._known_names = {
+            identifier: value
+            for identifier, value in self._known_names.items()
+            if identifier in active
+        }
+        self._directory_versions = {
+            identifier: value
+            for identifier, value in self._directory_versions.items()
+            if identifier in active
+        }
+
+    @staticmethod
+    def _directory_version(info) -> tuple[int, int, int, int]:
+        # Metadata only invalidates a filename inventory. It never orders media
+        # or supplies an event timestamp; changes in either direction invalidate.
+        return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns
 
     @staticmethod
     def _started(name: str) -> datetime:
@@ -527,24 +825,48 @@ class RecordedFrameSampler:
             match["stamp"] + match["offset"], "%Y-%m-%d_%H-%M-%S-%f_%z"
         ).astimezone(UTC)
 
+    @staticmethod
+    def _recording_names(directory: Path, *, deadline: float | None = None) -> set[str]:
+        """Bounded name-only scan; never read retained frames or infer file age."""
+        names: set[str] = set()
+        if deadline is None:
+            deadline = time.monotonic() + 3
+        with os.scandir(directory) as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAX_RECORDING_ENTRIES or time.monotonic() >= deadline:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
+                if _SEGMENT_NAME.fullmatch(entry.name) is not None:
+                    names.add(entry.name)
+        if time.monotonic() >= deadline:
+            raise OperatorEventsError("Analytics recording scan limit reached")
+        return names
+
     def capture(self, source) -> RecordedPersonFrame | None:
+        self._capture_outcome = "source_check"
         if self._closing.is_set():
+            self._capture_outcome = "closing"
             return None
         identity_state._same_directory(self._root, self._root_identity)
         directory = self._root / source.binding.path_name
         try:
             directory_info = directory.lstat()
         except FileNotFoundError:
+            self._capture_outcome = "recording_directory_absent"
             return None
         if not stat.S_ISDIR(directory_info.st_mode) or directory.is_symlink():
             raise OperatorEventsError("Analytics recording source refused")
         identity_state._windows_admission(directory, private=True, directory=True)
         previous = self._observations.get(source.binding.device_id)
+        directory_version = self._directory_version(directory_info)
         current = {}
         changed = []
+        # A new segment can be created at zero bytes before the recorder writes
+        # its first fragment. Keep a bounded file-identity hint for later growth.
+        pending_zero: list[str] = []
         if self._recording_files is not None:
             inventory = self._recording_files(source.binding)
             if inventory is None:
+                self._capture_outcome = "inventory_unavailable"
                 return None
             if type(inventory) is not dict or len(inventory) > MAX_RECORDING_ENTRIES:
                 raise OperatorEventsError("Analytics recording scan limit reached")
@@ -576,8 +898,36 @@ class RecordedFrameSampler:
                 # Timestamp ordering supplies cold-start hints only. No retained
                 # bytes become events until new byte growth is actually observed.
                 hints = sorted(inventory, key=lambda name: inventory[name][5], reverse=True)[:2]
-                self._active_files[source.binding.device_id] = tuple(hints)
+                # An active writer may already exist before the maintenance
+                # inventory catches up. A cold name-only scan must baseline
+                # those uncached files too: directory mtime does not change
+                # when a pre-existing recording merely grows. Never infer a
+                # person from the bytes present at this cold observation.
+                deadline = time.monotonic() + 3
+                identity_state._same_directory(directory, directory_info)
+                known = self._recording_names(directory, deadline=deadline)
+                identity_state._same_directory(directory, directory_info)
+                if len(set(inventory) | set(current) | known) > MAX_RECORDING_ENTRIES:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
+                uncached = sorted(known - current.keys(), reverse=True)[:2]
+                for name in uncached:
+                    if time.monotonic() >= deadline:
+                        raise OperatorEventsError("Analytics recording scan limit reached")
+                    try:
+                        info = identity_state._regular_file(directory / name)
+                    except FileNotFoundError:
+                        continue
+                    current[name] = info.st_dev, info.st_ino, info.st_size
+                identity_state._same_directory(directory, directory_info)
+                if time.monotonic() >= deadline:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
+                self._active_files[source.binding.device_id] = tuple(
+                    dict.fromkeys(uncached + hints)
+                )[:2]
+                self._known_names[source.binding.device_id] = known
+                self._directory_versions[source.binding.device_id] = directory_version
                 self._observations[source.binding.device_id] = current
+                self._capture_outcome = "baseline"
                 return None
             candidates.sort(key=lambda name: (name in previous, -current[name][2]))
             candidates = list(
@@ -596,6 +946,43 @@ class RecordedFrameSampler:
                 if signature != previous.get(name):
                     changed.append((path, info))
                 current[name] = signature
+            # A fresh recorder segment may exist before the slower maintenance
+            # inventory lists it. Only an actual directory change triggers the
+            # bounded name scan, and only names absent from the cold baseline
+            # can supply fresh bytes. Active files still use byte high-water.
+            identifier = source.binding.device_id
+            if self._directory_versions.get(identifier) != directory_version:
+                seen = self._known_names.setdefault(identifier, set())
+                deadline = time.monotonic() + 3
+                identity_state._same_directory(directory, directory_info)
+                names = self._recording_names(directory, deadline=deadline)
+                identity_state._same_directory(directory, directory_info)
+                # A stale cache entry still consumes this scan's inventory
+                # budget even if its file disappeared during candidate checks.
+                if len(set(inventory) | set(current) | names) > MAX_RECORDING_ENTRIES:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
+                for name in names - seen:
+                    if time.monotonic() >= deadline:
+                        raise OperatorEventsError("Analytics recording scan limit reached")
+                    if name in current:
+                        continue
+                    path = directory / name
+                    try:
+                        info = identity_state._regular_file(path)
+                    except FileNotFoundError:
+                        continue
+                    current[name] = info.st_dev, info.st_ino, info.st_size
+                    if info.st_size > 0:
+                        changed.append((path, info))
+                    else:
+                        pending_zero.append(name)
+                identity_state._same_directory(directory, directory_info)
+                if time.monotonic() >= deadline:
+                    raise OperatorEventsError("Analytics recording scan limit reached")
+                seen.update(names)
+                # Retain the BEFORE-scan version so arrivals during enumeration
+                # invalidate this inventory on the next capture.
+                self._directory_versions[identifier] = directory_version
         else:
             # Source-only integrations may have no recorder cache. Their fallback
             # has the same inventory ceiling as storage and a finite scan budget.
@@ -614,15 +1001,24 @@ class RecordedFrameSampler:
                         changed.append((path, info))
         self._observations[source.binding.device_id] = current
         if not changed:
+            if pending_zero:
+                previous_active = self._active_files.get(source.binding.device_id, ())
+                self._active_files[source.binding.device_id] = tuple(
+                    dict.fromkeys(pending_zero[:2] + list(previous_active))
+                )[:2]
+            self._capture_outcome = "no_growth"
             return None
         # Normally one open segment grows. At a rollover, prefer the new file;
         # its bytes belong to the same scan, independent of UTC ordering.
         changed.sort(key=lambda item: (item[0].name in previous, -item[1].st_size))
-        self._active_files[source.binding.device_id] = tuple(path.name for path, _ in changed[:2])
+        self._active_files[source.binding.device_id] = tuple(
+            dict.fromkeys(pending_zero[:2] + [path.name for path, _ in changed[:2]])
+        )[:2]
         for path, info in changed[:2]:
             if not 1 <= info.st_size <= MAX_RECORDING_BYTES:
                 continue
             try:
+                self._capture_outcome = "snapshot_read"
                 with path.open("rb") as stream:
                     raw = stream.read(info.st_size)
                     after = os.fstat(stream.fileno())
@@ -635,11 +1031,14 @@ class RecordedFrameSampler:
                     or after.st_size < info.st_size
                 ):
                     continue
+                self._capture_outcome = "decode_attempt"
                 result = self.decode(raw, self._started(path.name), path.name)
                 if result is not None:
+                    self._capture_outcome = "frame_ready"
                     return result
             except (OSError, ValueError):
                 continue
+        self._capture_outcome = "no_decoded_frame"
         return None
 
     def decode(
@@ -663,6 +1062,7 @@ class RecordedFrameSampler:
                 if not hasattr(self, "_worker"):
                     self._worker = _RecordedNativeWorker(getattr(self, "_configuration", None))
                 worker = self._worker
+            self._capture_outcome = "native_request"
             result = worker.request(path)
             if result is None:
                 return None
@@ -678,6 +1078,43 @@ class RecordedFrameSampler:
             )
         finally:
             path.unlink(missing_ok=True)
+
+    def prime(self) -> None:
+        """Compile the optional model on enable, before fresh recording is sampled."""
+        if self._closing.is_set() or getattr(self, "_configuration", None) is None:
+            return
+        with self._worker_lock:
+            if self._closing.is_set():
+                return
+            if not hasattr(self, "_worker"):
+                self._worker = _RecordedNativeWorker(self._configuration)
+            worker = self._worker
+            # A primed child may have exited since its previous response.
+            # Never treat cached readiness as valid for a dead native process.
+            process = worker._process
+            if worker._person_ready and process is not None and process.poll() is None:
+                return
+        try:
+            worker.request(None)
+        except OperatorEventsError:
+            # A failed prime is not proof the detector works. The next actual
+            # recording request still must satisfy native and event admission.
+            pass
+
+    def native_model_ready(self) -> bool:
+        """Admit early view preparation only after a living recorder worker is primed.
+
+        This reads process readiness, never a frame, path or recording identity.
+        A stale readiness bit from a terminated native process is insufficient.
+        """
+        if self._closing.is_set():
+            return False
+        with self._worker_lock:
+            worker = getattr(self, "_worker", None)
+            if worker is None or not worker._person_ready:
+                return False
+            process = worker._process
+            return process is not None and process.poll() is None
 
     def begin_close(self) -> None:
         self._closing.set()
@@ -727,10 +1164,173 @@ class OperatorEventService:
         self._provider_failed = False
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="k5-recorded-person")
         self._native_pending = None
+        # Durable admission/SQLite work must never occupy the ASGI loop or
+        # queue behind native decode/inference. Submit at most one owned call.
+        self._state_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="k5-event-state"
+        )
+        self._state_pending = None
+        self._state_closed = False
+        self._close_task = None
+        self._state_admission = asyncio.Lock()
+        self._mutations = asyncio.Lock()
+        self._mutations_bound = False
+        self._warmup_deferred = True
+        self._warmup_generation = 0
+        self._configuration_faulted = False
         self._states: dict[UUID, dict] = {}
         self._last_events: dict[UUID, float] = {}
+        self._first_recorded_person_callback: Callable[[], None] | None = None
         self._configuration_generation: dict[UUID, int] = {}
         self._rotation = 0
+
+    def bind_mutations(self, mutations: asyncio.Lock) -> None:
+        """Share camera/configuration ordering with the installed operator API."""
+        if self._mutations_bound and self._mutations is not mutations:
+            raise ValueError("Analytics mutation owner changed")
+        self._mutations = mutations
+        self._mutations_bound = True
+
+    def defer_view_preparation(self) -> bool:
+        """A conservative memory-only scheduling hint; never event authority."""
+        if self._closing:
+            return False
+        if self._configuration_faulted:
+            return True
+        if self._unavailable or not self._available:
+            return False
+        return self._warmup_deferred
+
+    def mark_configuration_unavailable(self) -> None:
+        """Latch an unadmitted compensation without performing loop I/O."""
+        self._configuration_faulted = True
+        self._unavailable = True
+        self._warmup_deferred = True
+        self._warmup_generation += 1
+        for identifier in set(self._states) | set(self._configuration_generation):
+            self._configuration_generation[identifier] = (
+                self._configuration_generation.get(identifier, 0) + 1
+            )
+
+    async def _durable(self, callback, *args, _closing=False, _completed=None, **kwargs):
+        """Own one worker through completion, including cancelled callers.
+
+        Cancelling an asyncio waiter cannot stop SQLite or filesystem work.
+        Keep its admission until the actual operation is drained, so shutdown
+        cannot close the store beneath a surviving callback.
+        """
+        async with self._state_admission:
+            if self._closing and not _closing:
+                raise OperatorEventsError("Analytics service is closed")
+            from functools import partial
+
+            pending = self._state_executor.submit(partial(callback, *args, **kwargs))
+            self._state_pending = pending
+            wrapped = asyncio.wrap_future(pending)
+            cancellation = None
+            try:
+                while True:
+                    try:
+                        result = await asyncio.shield(wrapped)
+                    except asyncio.CancelledError as error:
+                        if wrapped.cancelled():
+                            raise
+                        cancellation = cancellation or error
+                    except Exception:
+                        if cancellation is not None:
+                            raise cancellation from None
+                        raise
+                    else:
+                        if _completed is not None:
+                            _completed(result)
+                        if cancellation is not None:
+                            raise cancellation
+                        return result
+            finally:
+                if pending.done() and self._state_pending is pending:
+                    self._state_pending = None
+
+    async def configure_async(self, camera_id: UUID, *, enabled: bool, confidence_threshold: float):
+        # Only durable work crosses threads. Native admission and generation
+        # publication stay on the ASGI owner, including a cancelled write.
+        def persist():
+            if enabled and (not self._available or self._unavailable):
+                raise OperatorEventsError("Analytics runtime unavailable")
+            self.store.configure(
+                camera_id, enabled=enabled, confidence_threshold=confidence_threshold
+            )
+            return (
+                self._sampler.native_model_ready()
+                if isinstance(self._sampler, RecordedFrameSampler)
+                and getattr(self._sampler, "_configuration", None) is not None
+                else False
+            )
+
+        await self._durable(
+            persist,
+            _completed=lambda ready: self._configured(
+                camera_id, enabled=enabled, native_ready=ready
+            ),
+        )
+        return await self._durable(self.status, camera_id)
+
+    def notify_on_first_recorded_person_event(self, callback: Callable[[], None]) -> None:
+        """Release optional, media-free view warmup after a real recorded event.
+
+        No camera, frame, identity, recording path or credential reaches the
+        callback. This is a one-shot scheduling signal, never event evidence.
+        """
+        if not callable(callback) or self._first_recorded_person_callback is not None:
+            raise ValueError("Native view warmup callback is invalid")
+        if self._last_events and not self.defer_view_preparation():
+            callback()
+        else:
+            self._first_recorded_person_callback = callback
+
+    def awaiting_first_recorded_person_event(self) -> bool:
+        """Give the first real recorded-person event priority over optional view warmup.
+
+        This is an internal scheduling hint, not an event admission or UI
+        entitlement. A requested sampled view retains its normal cold path.
+        Historical events never prove that this process has sampled a frame.
+        """
+        if self._closing or self._unavailable or not self._available:
+            return False
+        # The first event from *any* enabled camera releases optional view
+        # preparation. Recorder priming alone never admits a person event and
+        # cannot release the CPU-intensive second model during first inference.
+        sources = tuple(self._cameras.list_sources())
+        if not sources:
+            # The startup quiet timer must not compile a second native model
+            # before the first camera has even enrolled.
+            return True
+        enabled = [
+            source.binding.device_id
+            for source in sources
+            if self.store.settings(source.binding.device_id)["enabled"]
+        ]
+        if not enabled:
+            # Even without enabled recording analytics, the recorder may be
+            # compiling its first sealed model. A second OpenVINO compilation
+            # at that moment competes with the installed first-recording gate.
+            # Wait for the living recorder worker, then permit the optional
+            # sampled-view warmup after the separate enrollment quiet timer.
+            if (
+                isinstance(self._sampler, RecordedFrameSampler)
+                and getattr(self._sampler, "_configuration", None) is not None
+                and not self._sampler.native_model_ready()
+            ):
+                return True
+            return False
+        if any(camera_id in self._last_events for camera_id in enabled):
+            return False
+        if isinstance(self._sampler, RecordedFrameSampler):
+            if getattr(self._sampler, "_configuration", None) is not None:
+                # Recorder readiness is not an admitted recorded-person event.
+                # Keep optional second-worker preparation deferred while any
+                # camera awaits its first real recorded event.
+                return True
+        return True
 
     def status(self, camera_id: UUID) -> dict:
         settings = self.store.settings(camera_id)
@@ -742,11 +1342,90 @@ class OperatorEventService:
             if not self._available or self._unavailable
             else state.get("status", "starting")
         )
+        sample_phase = state.get("sample_phase", "not_started")
+        pending = self._native_pending
+        if (
+            sample_phase in {"capture_pending", "native_pending"}
+            and pending is not None
+            and not pending.done()
+            and (sample_phase == "capture_pending" or state.get("sample_attempts", 0) > 0)
+        ):
+            # Report the current stage even after the outer sample wait expires
+            # while the native future still runs. A prime is not a frame attempt.
+            # Never expose a file path, media bytes, source URI or native exception.
+            candidate = getattr(self._sampler, "_capture_outcome", "")
+            if candidate == "native_request":
+                # Read the bounded child phase, never its private request or
+                # source identity. This distinguishes decode from CPU inference.
+                worker = getattr(self._sampler, "_worker", None)
+                child_phase = getattr(worker, "_failure_phase", None)
+                # These are finite *in-flight* stages, not native error
+                # details. A child that has not yet emitted its first phase
+                # must be distinguishable from decoding/model/inference stalls
+                # on installed Windows. The parent still owns the same timer.
+                in_flight = {
+                    "native_launch_failed": "native_worker_starting",
+                    "native_watchdog_starting": "native_watchdog_starting",
+                    "native_write_failed": "native_request_writing",
+                    "native_pipe_write_active": "native_pipe_write_active",
+                    "native_pipe_flush_active": "native_pipe_flush_active",
+                    "native_child_exited_before_request": "native_worker_exited",
+                    "native_reply_missing": "native_reply_waiting",
+                    "native_header_invalid": "native_header_reading",
+                    "native_payload_incomplete": "native_payload_reading",
+                    "native_reply_invalid": "native_reply_validating",
+                    "native_decoder_active": "native_decoder_active",
+                    "native_model_active": "native_model_active",
+                    "native_inference_active": "native_inference_active",
+                }
+                candidate = in_flight.get(child_phase, "native_request")
+            if candidate in {
+                "queued",
+                "source_check",
+                "snapshot_read",
+                "decode_attempt",
+                "native_request",
+                "native_worker_starting",
+                "native_watchdog_starting",
+                "native_request_writing",
+                "native_pipe_write_active",
+                "native_pipe_flush_active",
+                "native_worker_exited",
+                "native_reply_waiting",
+                "native_header_reading",
+                "native_payload_reading",
+                "native_reply_validating",
+                "native_decoder_active",
+                "native_model_active",
+                "native_inference_active",
+            }:
+                sample_phase = candidate
+        write_cause = "not_applicable"
+        if state.get("last_completed_phase") == "native_write_failed":
+            candidate = state.get("last_native_write_cause")
+            # Never let arbitrary child exceptions, paths or private source
+            # details enter the authenticated status response.
+            write_cause = (
+                candidate
+                if candidate
+                in {
+                    "pending",
+                    "live_child_write_error",
+                    "first_child_disconnected",
+                    "first_child_exited",
+                    "replacement_write_error",
+                }
+                else "unclassified"
+            )
         return {
             **settings,
             "status": status,
+            "native_write_cause": write_cause,
             "last_sample_at": state.get("last_sample_at"),
             "processed_frames": state.get("processed_frames", 0),
+            "sample_attempts": state.get("sample_attempts", 0),
+            "sample_phase": sample_phase,
+            "last_completed_phase": state.get("last_completed_phase", "not_started"),
             **self.store.summary(camera_id),
             "sample_interval_seconds": SAMPLE_INTERVAL_SECONDS,
             "max_parallel_cameras": 1,
@@ -758,33 +1437,91 @@ class OperatorEventService:
         if enabled and (not self._available or self._unavailable):
             raise OperatorEventsError("Analytics runtime unavailable")
         self.store.configure(camera_id, enabled=enabled, confidence_threshold=confidence_threshold)
+        ready = (
+            self._sampler.native_model_ready()
+            if isinstance(self._sampler, RecordedFrameSampler)
+            and getattr(self._sampler, "_configuration", None) is not None
+            else False
+        )
+        self._configured(camera_id, enabled=enabled, native_ready=ready)
+        return self.status(camera_id)
+
+    def _configured(self, camera_id: UUID, *, enabled: bool, native_ready: bool) -> None:
         self._configuration_generation[camera_id] = (
             self._configuration_generation.get(camera_id, 0) + 1
         )
+        self._warmup_generation += 1
+        self._warmup_deferred = True
         self._states.pop(camera_id, None)
-        return self.status(camera_id)
+        if (
+            enabled
+            and not self._closing
+            and isinstance(self._sampler, RecordedFrameSampler)
+            and getattr(self._sampler, "_configuration", None) is not None
+            and self._native_pending is None
+            and not native_ready
+        ):
+            # A completed startup prime is never repeated at camera activation.
+            # Native admission stays on the loop alongside real-frame submits.
+            self._native_pending = self._executor.submit(self._sampler.prime)
 
     async def start(self) -> None:
         if self._task is None:
+            if (
+                not self._unavailable
+                and isinstance(self._sampler, RecordedFrameSampler)
+                and getattr(self._sampler, "_configuration", None) is not None
+                and self._native_pending is None
+            ):
+                # Warm the sealed, camera-free native model as the service starts.
+                # Waiting until analytics is enabled spends the first portion
+                # of the 25-second installed person-event gate compiling kernels.
+                # A failed prime never admits an event or suppresses later
+                # real-frame validation.
+                self._native_pending = self._executor.submit(self._sampler.prime)
             self._task = asyncio.create_task(self._run(), name="operator-recorded-person-events")
 
     async def _sample(self, source, settings) -> None:
+        if self._closing or self._unavailable:
+            return
         identifier = source.binding.device_id
         generation = self._configuration_generation.get(identifier, 0)
         state = self._states.setdefault(identifier, {"processed_frames": 0})
         if not source.recording_enabled:
             state["status"] = "waiting"
+            state["sample_phase"] = "recording_paused"
             return
         if self._native_pending is not None and not self._native_pending.done():
             state["status"] = "waiting"
+            state["sample_phase"] = "native_pending"
             return
+        state["sample_attempts"] = min(2**63 - 1, state.get("sample_attempts", 0) + 1)
+        state["sample_phase"] = "capture_pending"
+        if isinstance(self._sampler, RecordedFrameSampler):
+            self._sampler._capture_outcome = "queued"
         self._native_pending = self._executor.submit(self._sampler.capture, source)
         wrapped = asyncio.wrap_future(self._native_pending)
         # Native decoder exceptions are sanitized before crossing API/UI boundaries.
         wrapped.add_done_callback(lambda future: None if future.cancelled() else future.exception())
-        sample = await asyncio.wait_for(asyncio.shield(wrapped), 12)
+        # Preserve the finite parent/child hierarchy on the first compiled
+        # person frame (18s child + 2s termination margin). The installed GUI
+        # event acceptance deadline remains the unchanged 25 seconds.
+        wait_seconds = 20 if getattr(self._sampler, "_configuration", None) is not None else 12
+        sample = await asyncio.wait_for(asyncio.shield(wrapped), wait_seconds)
         if sample is None:
             state["status"] = "waiting"
+            # Finite status vocabulary, independent of local recording identity.
+            outcome = getattr(self._sampler, "_capture_outcome", "no_frame")
+            safe_outcomes = {
+                "closing",
+                "recording_directory_absent",
+                "inventory_unavailable",
+                "baseline",
+                "no_growth",
+                "no_decoded_frame",
+            }
+            state["sample_phase"] = outcome if outcome in safe_outcomes else "no_frame"
+            state["last_completed_phase"] = state["sample_phase"]
             return
         if sample.detections is not None:
             detections = sample.detections
@@ -794,45 +1531,102 @@ class OperatorEventService:
             if self._provider is None:
                 self._provider = await self._factory()
             detections = await asyncio.wait_for(self._provider(sample.frame), 5)
-        current = self.store.settings(identifier)
-        selected_sources = tuple(self._cameras.list_sources())
-        live_source = next(
-            (item for item in selected_sources if item.binding == source.binding), None
-        )
-        if (
-            self._closing
-            or not current["enabled"]
-            or current != settings
-            or self._configuration_generation.get(identifier, 0) != generation
-            or live_source is None
-            or not live_source.recording_enabled
-            or getattr(live_source, "source_uri", None) != getattr(source, "source_uri", None)
-        ):
-            return
-        selected = [
-            item
-            for item in detections
-            if item.category == "person" and item.confidence >= current["confidence_threshold"]
-        ]
-        now = self._clock()
-        emitted = self.store.record(
-            identifier,
-            frame_key=sample.frame_key,
-            occurred_at=sample.occurred_at,
-            confidence=max((item.confidence for item in selected), default=0.0),
-            person_count=min(32, len(selected)),
-            emit=now - self._last_events.get(identifier, -math.inf) >= EVENT_INTERVAL_SECONDS,
-        )
-        if emitted:
-            self._last_events[identifier] = now
-        state["status"] = "active"
-        state["last_sample_at"] = _utc(sample.occurred_at)
-        state["processed_frames"] = min(2**63 - 1, state["processed_frames"] + 1)
+        # Mutations of camera membership, source identity and analytics settings
+        # share this async owner. They can wait without blocking unrelated HTTP.
+        async with self._mutations:
+
+            def persist():
+                current = self.store.settings(identifier)
+                if (
+                    self._closing
+                    or self._unavailable
+                    or not current["enabled"]
+                    or current != settings
+                    or self._configuration_generation.get(identifier, 0) != generation
+                ):
+                    return None
+                selected = [
+                    item
+                    for item in detections
+                    if item.category == "person"
+                    and item.confidence >= current["confidence_threshold"]
+                ]
+                admitted = False
+
+                def admit():
+                    nonlocal admitted
+                    # This check runs inside the actual SQLite write, after its
+                    # private-file admission, before even the frame-key update.
+                    live_source = next(
+                        (
+                            item
+                            for item in self._cameras.list_sources()
+                            if item.binding == source.binding
+                        ),
+                        None,
+                    )
+                    admitted = (
+                        not self._closing
+                        and not self._unavailable
+                        and self._configuration_generation.get(identifier, 0) == generation
+                        and live_source is not None
+                        and live_source.recording_enabled
+                        and getattr(live_source, "source_uri", None)
+                        == getattr(source, "source_uri", None)
+                    )
+                    return admitted
+
+                now = self._clock()
+                emitted = self.store.record(
+                    identifier,
+                    frame_key=sample.frame_key,
+                    occurred_at=sample.occurred_at,
+                    confidence=max((item.confidence for item in selected), default=0.0),
+                    person_count=min(32, len(selected)),
+                    emit=now - self._last_events.get(identifier, -math.inf)
+                    >= EVENT_INTERVAL_SECONDS,
+                    admit=admit,
+                )
+                return admitted, selected, emitted, now
+
+            committed = await self._durable(persist)
+            if committed is None:
+                return
+            admitted, selected, emitted, now = committed
+            if emitted:
+                self._last_events[identifier] = now
+            if (
+                not admitted
+                or self._closing
+                or self._configuration_generation.get(identifier, 0) != generation
+            ):
+                return
+            if emitted:
+                self._warmup_deferred = False
+                callback, self._first_recorded_person_callback = (
+                    self._first_recorded_person_callback,
+                    None,
+                )
+                if callback is not None:
+                    try:
+                        callback()
+                    except Exception:
+                        # Optional view warmup never changes event admission.
+                        pass
+            state["status"] = "active"
+            state["sample_phase"] = "person_detected" if selected else "no_person"
+            state["last_completed_phase"] = state["sample_phase"]
+            state["last_sample_at"] = _utc(sample.occurred_at)
+            state["processed_frames"] = min(2**63 - 1, state["processed_frames"] + 1)
 
     async def cycle(self) -> None:
         if not self._available or self._unavailable or self._closing or self._provider_failed:
             return
-        sources = tuple(self._cameras.list_sources())
+        self._warmup_deferred = True
+        warmup_generation = self._warmup_generation
+        sources = await self._durable(lambda: tuple(self._cameras.list_sources()))
+        if self._closing:
+            return
         if len(sources) > 64:
             raise OperatorEventsError("Analytics camera capacity unavailable")
         if not sources:
@@ -855,19 +1649,69 @@ class OperatorEventService:
         self._configuration_generation = {
             key: value for key, value in self._configuration_generation.items() if key in active
         }
+        enabled = set()
         for source in ordered:
             if self._closing:
                 return
             identifier = source.binding.device_id
-            settings = self.store.settings(identifier)
+            settings = await self._durable(self.store.settings, identifier)
+            if self._closing:
+                return
             if not settings["enabled"]:
                 continue
+            enabled.add(identifier)
             try:
                 await self._sample(source, settings)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self._states.setdefault(identifier, {})["status"] = "unavailable"
+                state = self._states.setdefault(identifier, {})
+                state["status"] = "unavailable"
+                failure_phase = "sample_failed"
+                if isinstance(self._sampler, RecordedFrameSampler):
+                    # A failed prior prime leaves the native worker's last
+                    # phase set. It must not mislabel a later filesystem,
+                    # decoder-setup or event-store failure as a native pipe
+                    # failure. Only the current request's native stage may
+                    # attribute the exception to the owning native worker.
+                    stage = getattr(self._sampler, "_capture_outcome", "")
+                    failure_phase = {
+                        "queued": "sample_queue_failed",
+                        "source_check": "sample_source_failed",
+                        "snapshot_read": "snapshot_read_failed",
+                        "decode_attempt": "snapshot_decode_failed",
+                        "native_request": "native_failed",
+                        "frame_ready": "event_admission_failed",
+                    }.get(stage, "sample_failed")
+                    worker = getattr(self._sampler, "_worker", None)
+                    if stage == "native_request" and isinstance(worker, _RecordedNativeWorker):
+                        candidate = worker._failure_phase
+                        if candidate in {
+                            "native_launch_failed",
+                            "native_watchdog_unavailable",
+                            "native_transport_failed",
+                            "native_write_failed",
+                            "native_child_exited_before_request",
+                            "native_reply_missing",
+                            "native_header_invalid",
+                            "native_payload_incomplete",
+                            "native_reply_invalid",
+                            "native_protocol_failed",
+                            "native_decode_failed",
+                            "native_model_failed",
+                            "native_inference_failed",
+                            "native_timeout",
+                        }:
+                            failure_phase = candidate
+                state["sample_phase"] = failure_phase
+                state["last_completed_phase"] = failure_phase
+                # Freeze the cause at the failed request. A later native prime
+                # may replace the worker's in-flight phase while this camera's
+                # last completed request remains the failed write.
+                state.pop("last_native_write_cause", None)
+                if failure_phase == "native_write_failed":
+                    worker = getattr(self._sampler, "_worker", None)
+                    state["last_native_write_cause"] = getattr(worker, "_native_write_cause", None)
                 if self._provider is not None:
                     try:
                         await self._provider.aclose()
@@ -879,8 +1723,23 @@ class OperatorEventService:
                     else:
                         self._provider = None
 
+        if not self._closing and self._warmup_generation == warmup_generation:
+            ready = True
+            if (
+                not enabled
+                and isinstance(self._sampler, RecordedFrameSampler)
+                and getattr(self._sampler, "_configuration", None) is not None
+            ):
+                ready = await self._durable(self._sampler.native_model_ready)
+            if not self._closing and self._warmup_generation == warmup_generation:
+                self._warmup_deferred = not (
+                    (not enabled and ready)
+                    or any(identifier in self._last_events for identifier in enabled)
+                )
+
     async def _run(self) -> None:
         while not self._closing:
+            started = self._clock()
             try:
                 await self.cycle()
             except asyncio.CancelledError:
@@ -888,12 +1747,42 @@ class OperatorEventService:
             except Exception:
                 # Private state/decoder outages never propagate to the recorder.
                 pass
-            await asyncio.sleep(SAMPLE_INTERVAL_SECONDS)
+            # Maintain a start-to-start cadence. A slow native compile/decode
+            # already consumed the sampling interval; imposing another two
+            # seconds would delay the first fresh recorder frame unnecessarily.
+            elapsed = max(0.0, self._clock() - started)
+            await asyncio.sleep(max(0.0, SAMPLE_INTERVAL_SECONDS - elapsed))
 
     async def aclose(self) -> None:
-        self._closing = True
-        if hasattr(self._sampler, "begin_close"):
-            self._sampler.begin_close()
+        # All callers share one owned shutdown. Cancellation cannot release
+        # ownership while a durable callback or native cleanup still survives.
+        task = self._close_task
+        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+            # Seal native and durable admission in this very turn, before a
+            # previously queued capture gets another opportunity to launch.
+            self._closing = True
+            if hasattr(self._sampler, "begin_close"):
+                self._sampler.begin_close()
+            task = asyncio.create_task(self._close_owned(), name="operator-event-close")
+            self._close_task = task
+        cancellation = None
+        while True:
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                if task.cancelled():
+                    raise
+                cancellation = cancellation or error
+            except Exception:
+                if cancellation is not None:
+                    raise cancellation from None
+                raise
+            else:
+                if cancellation is not None:
+                    raise cancellation
+                return
+
+    async def _close_owned(self) -> None:
         incomplete = False
         if self._task is not None:
             self._task.cancel()
@@ -927,6 +1816,9 @@ class OperatorEventService:
         except Exception:
             incomplete = True
         self._executor.shutdown(wait=finished, cancel_futures=True)
-        self.store.close()
+        if not self._state_closed:
+            await self._durable(self.store.close, _closing=True)
+            self._state_closed = True
+            self._state_executor.shutdown(wait=True, cancel_futures=True)
         if incomplete:
             raise OperatorEventsError("Analytics native cleanup is incomplete")

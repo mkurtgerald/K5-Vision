@@ -6,6 +6,7 @@ import os
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -391,6 +392,41 @@ def test_http_separate_machine_auth_grants_and_human_event_access(store):
         ).status_code
         == 401
     )
+
+
+def test_machine_handshake_durable_wait_does_not_starve_unrelated_http(store, monkeypatch):
+    """A slow integration SQLite operation cannot block the shared ASGI loop."""
+    camera = uuid4()
+    identifier, token = _connection(store, camera)
+    entered, released = threading.Event(), threading.Event()
+    original_handshake = store.handshake
+
+    def held_handshake(*args, **kwargs):
+        entered.set()
+        assert released.wait(timeout=6), "Controlled handshake was not released"
+        return original_handshake(*args, **kwargs)
+
+    monkeypatch.setattr(store, "handshake", held_handshake)
+    with TestClient(_app(store, camera)) as client:
+        path = f"/api/v1/operator/integrations/{identifier}/handshake"
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            try:
+                pending = executor.submit(
+                    client.post,
+                    path,
+                    headers={"X-Integration-Token": token},
+                    json={"supported_versions": ["2"]},
+                )
+                assert entered.wait(timeout=3), "Handshake never entered durable storage"
+                liveness = executor.submit(client.get, "/openapi.json")
+                assert liveness.result(timeout=1.5).status_code == 200
+                assert not pending.done(), "Handshake returned before storage was released"
+            finally:
+                released.set()
+            completed = pending.result(timeout=5)
+    assert completed.status_code == 200
+    assert completed.headers["cache-control"] == "no-store"
+    assert completed.json()["selected_version"] == "2"
 
 
 def test_real_native_http_bridge_with_actual_v2_and_analytics_contracts(identity, store):

@@ -6,6 +6,14 @@ on:
       - "Install-K5VisionAlpha.ps1"
       - "scripts/windows-alpha/**"
       - "src/k5vision/operator_runtime.py"
+      - "src/k5vision/operator_product*.py"
+      - "src/k5vision/operator_camera_settings*.py"
+      - "src/k5vision/operator_web/**"
+      - "tests/unit/test_operator_camera*.py"
+      - "tests/integration/test_windows_vm_clock_qualification.py"
+      - "scripts/verify_windows_vm_clock_receipt.py"
+      - "tests/unit/test_windows_vm_clock*.py"
+      - ".github/workflows/operator-desktop-windows.yml"
       - "src/k5vision/main.py"
       - "src/k5vision/stage_one_app.py"
       - "tests/test_app_resource_lifetime.py"
@@ -40,6 +48,14 @@ on:
     paths:
       - "scripts/windows-alpha/**"
       - "src/k5vision/operator_runtime.py"
+      - "src/k5vision/operator_product*.py"
+      - "src/k5vision/operator_camera_settings*.py"
+      - "src/k5vision/operator_web/**"
+      - "tests/unit/test_operator_camera*.py"
+      - "tests/integration/test_windows_vm_clock_qualification.py"
+      - "scripts/verify_windows_vm_clock_receipt.py"
+      - "tests/unit/test_windows_vm_clock*.py"
+      - ".github/workflows/operator-desktop-windows.yml"
       - "src/k5vision/main.py"
       - "src/k5vision/stage_one_app.py"
       - "tests/test_app_resource_lifetime.py"
@@ -123,12 +139,18 @@ jobs:
           $ErrorActionPreference = "Stop"
           $probe = Join-Path $env:RUNNER_TEMP "k5-alpha-runtime-probe"
           python -m venv $probe
+          if ($LASTEXITCODE -ne 0) { throw "Clean Alpha runtime creation failed." }
           $probePython = Join-Path $probe "Scripts\python.exe"
           & $probePython -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "Clean Alpha runtime pip preparation failed." }
           & $probePython -m pip install --requirement scripts\windows-alpha\runtime-requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "Reviewed Alpha runtime dependencies failed." }
           & $probePython -m pip install --no-deps .
+          if ($LASTEXITCODE -ne 0) { throw "Exact Alpha runtime installation failed." }
           & $probePython -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "Clean Alpha runtime dependency verification failed." }
           & $probePython -m k5vision.cli --version
+          if ($LASTEXITCODE -ne 0) { throw "Clean Alpha runtime version verification failed." }
 
       - name: Run Windows alpha boundary regressions
         shell: powershell

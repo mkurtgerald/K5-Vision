@@ -12,6 +12,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -70,6 +71,22 @@ _SOURCE_PHASES = {
     "aomedia/aom": "decoder_source_libaom",
 }
 
+
+NATIVE_DECODER_CHILD_SMOKE = (
+    "from pathlib import Path\n"
+    "from k5vision.operator_events import _RecordedNativeWorker\n"
+    "from k5vision.operator_analytics_person import load_installed_person_configuration\n"
+    "person = load_installed_person_configuration({})\n"
+    "assert person is not None\n"
+    "worker = _RecordedNativeWorker(person)\n"
+    "try:\n"
+    "    assert worker.request(None) is None\n"
+    "    assert worker._person_ready\n"
+    "    assert worker.request(Path.cwd() / '__k5_missing_native_probe__.mp4') is None\n"
+    "finally:\n"
+    "    worker.close()\n"
+    "print('embedded smoke: native_detector_child', flush=True)\n"
+)
 
 IDENTITY_CRYPTO_SMOKE = (
     "import jwt,cffi,cryptography,base64; "
@@ -153,6 +170,26 @@ def download(identity: dict[str, object], destination: Path) -> None:
                 raise ValueError("Donor size exceeded")
             stream.write(block)
     admit(destination, identity)
+
+
+def acquire_worker_archive(identity: dict[str, object], archive: Path, name: str) -> None:
+    """Reuse the same hash-admitted CI donor without an unnecessary second download.
+
+    The independent official archive remains mandatory for upstream license
+    admission. A supplied cache with mismatched bytes fails closed; there is
+    no fallback to a different binary, version or unverified source.
+    """
+    if name not in {"mediamtx", "caddy"}:
+        raise ValueError("Worker cache component is not admitted")
+    tool_root = os.environ.get("K5_DONOR_TOOL_ROOT")
+    if tool_root:
+        source = Path(tool_root) / f"{name}.zip"
+        admit(source, identity)
+        with source.open("rb") as existing, archive.open("xb") as target:
+            shutil.copyfileobj(existing, target, length=1024 * 1024)
+        admit(archive, identity)
+    else:
+        download(identity, archive)
 
 
 def extract_python(archive: Path, runtime: Path) -> None:
@@ -309,7 +346,6 @@ def worker_download(source: Path, name: str) -> dict[str, object]:
     }
 
 
-
 def bundle_worker(payload: Path, source: Path, name: str) -> dict[str, object]:
     """Seal exact official worker bytes and their original license at build time.
 
@@ -324,11 +360,12 @@ def bundle_worker(payload: Path, source: Path, name: str) -> dict[str, object]:
     pin = {"bytes": identity["executable_bytes"], "sha256": identity["executable_sha256"]}
     admit(source, pin)
     archive = payload.parent / ("worker-" + name + "-official.zip")
-    download(identity, archive)
+    acquire_worker_archive(identity, archive, name)
     root = payload / "workers"
     root.mkdir(exist_ok=True)
 
     with ZipFile(archive) as zipped:
+
         def copy_member(member: str, destination: Path, maximum: int, sha: str) -> dict:
             matches = [entry for entry in zipped.infolist() if entry.filename == member]
             if len(matches) != 1:
@@ -364,9 +401,7 @@ def bundle_worker(payload: Path, source: Path, name: str) -> dict[str, object]:
         license_entries = [entry for entry in zipped.infolist() if entry.filename == "LICENSE"]
         if len(license_entries) != 1:
             raise ValueError("Worker upstream license missing")
-        license_info = copy_member(
-            "LICENSE", license_path, 65536, identity["license_sha256"]
-        )
+        license_info = copy_member("LICENSE", license_path, 65536, identity["license_sha256"])
     admit(binary, pin)
     return {
         **identity,
@@ -741,6 +776,11 @@ def build(args: argparse.Namespace) -> None:
                 "admin_user_management": True,
                 "role_permissions": True,
                 "camera_access_controls": True,
+                "camera_video_settings": True,
+                "automatic_wall_layout": True,
+                "motion_recording": False,
+                "camera_trigger_zones": False,
+                "writable_video_codecs": ["H264"],
                 "person_analytics_bundled": True,
                 "background_person_events": True,
                 "storage_settings": True,
@@ -798,9 +838,10 @@ def build(args: argparse.Namespace) -> None:
             "load_installed_person_configuration,_PersonDetector; "
             "person=load_installed_person_configuration({}); assert person is not None; "
             "print('embedded smoke: person_configuration', flush=True); "
-            "detector=_PersonDetector(person); "
+            "detector=_PersonDetector(person, inference_threads=1, fixed_view_input=True); "
             "print('embedded smoke: person_detector', flush=True); "
             "assert detector.infer(bytes(544*320*4),544,320,544*4,0)==(); "
+            "assert detector.infer(bytes(544*306*4),544,306,544*4,0)==(); "
             "print('embedded smoke: person_inference', flush=True); "
             r"assert re.search(r'FFMPEG:\s+YES',cv2.getBuildInformation()); "
             "import importlib.util; "
@@ -810,6 +851,12 @@ def build(args: argparse.Namespace) -> None:
             "assert importlib.util.find_spec('pip') is None",
         ]
     )
+    # Package admission must exercise the sealed model and a subsequent decode
+    # through the real child and Windows Job Object, not just the parent import.
+    # The child primes on synthetic zero pixels; the only path it reads for
+    # decoding is intentionally nonexistent. No camera media is involved.
+    phase("embedded_runtime_execution")
+    run([str(runtime / "python.exe"), "-I", "-B", "-c", NATIVE_DECODER_CHILD_SMOKE])
     generated = output / "PayloadIdentity.generated.cs"
     phase("payload_manifest")
     manifest_sha = write_manifest(payload, args.head_sha, generated)

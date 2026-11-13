@@ -90,6 +90,10 @@ class OperatorRolePolicy:
     def __init__(self, root: Path, site_id: str):
         self._lock = threading.RLock()
         self._closed = False
+        # Invalidate in-flight reads before a local mutation can touch disk.
+        # This is an observation generation, never cached positive authority.
+        self._mutation_generation = 0
+        self._completed_generation = 0
         state = identity_state.load_identity_state(root)
         if state.site_id != site_id:
             raise RolePolicyError("roles_unavailable")
@@ -187,6 +191,7 @@ class OperatorRolePolicy:
         return value
 
     def _write(self, value):
+        self._mutation_generation += 1
         identity_state._same_directory(self._root, self._root_identity)
         if self._identity is not None:
             self._admit()
@@ -209,6 +214,9 @@ class OperatorRolePolicy:
             self._admit()
         finally:
             temporary.unlink(missing_ok=True)
+        # An interrupted or refused write still invalidates an earlier read,
+        # but must never be mistaken for a completed settings update to retry.
+        self._completed_generation = self._mutation_generation
 
     @staticmethod
     def _permissions(account, state):
@@ -219,6 +227,21 @@ class OperatorRolePolicy:
     def permissions(self, account):
         with self._lock:
             return self._permissions(account, self._read())
+
+    def permission_snapshot(self, account):
+        """Read durable authority and its local mutation generation together."""
+        with self._lock:
+            return self._permissions(account, self._read()), self._mutation_generation
+
+    @property
+    def permission_generation(self):
+        """Inspect a completed read without waiting on a writer's disk lock."""
+        return None if self._closed else self._mutation_generation
+
+    @property
+    def completed_permission_generation(self):
+        """Identify only completed local writes; this contains no authority."""
+        return None if self._closed else self._completed_generation
 
     def account_fields(self, account):
         with self._lock:
@@ -347,4 +370,5 @@ class OperatorRolePolicy:
 
     def close(self):
         with self._lock:
+            self._mutation_generation += 1
             self._closed = True

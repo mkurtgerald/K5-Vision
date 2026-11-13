@@ -1,8 +1,9 @@
 # Camera-setup roadmap
 
-Status: **Planned**, requested by the owner on 2026-11-01. This is the next core
-camera-setup workstream, ahead of advanced video-wall customization. It does not
-establish support in the current installer.
+Status: **Video controls implemented in the candidate source; Windows installer
+qualification pending. Motion recording and zones remain planned.** Requested by
+the owner on 2026-11-01. Camera setup takes priority over advanced video-wall
+customization. Source changes do not establish support in a released installer.
 
 Provide **Camera settings** for each enrolled camera, with Video, Recording and
 Zones sections. Keep ONVIF the brand-neutral management interface and retain the
@@ -11,7 +12,7 @@ work can proceed independently where their contracts permit.
 
 | Item | Tracking | Release boundary |
 | --- | --- | --- |
-| Frame rate, codec and supported encoder parameters | [#351](https://github.com/mkurtgerald/K5-Vision/issues/351) | Device-supported options, verified readback and actual delivered video; target-camera-only reconnection. |
+| Frame rate, codec and supported encoder parameters | [#351](https://github.com/mkurtgerald/K5-Vision/issues/351) | Candidate Video controls implemented with H.264-only writes; native and representative physical-camera qualification remain release/field gates. See the [control guide](CAMERA_VIDEO_SETTINGS.md). |
 | Motion-recording on/off and continuous mode | [#352](https://github.com/mkurtgerald/K5-Vision/issues/352) | Independent trigger source, real capture behavior and honest recorder states. |
 | Graphical inclusion/exclusion zones | [#353](https://github.com/mkurtgerald/K5-Vision/issues/353) | Correct image coordinates and demonstrated effects in the actual trigger/detection path. |
 
@@ -20,7 +21,8 @@ work can proceed independently where their contracts permit.
 - Read the selected ONVIF channel/profile, current codec, resolution and frame
   rate. Offer camera-reported options/ranges, including bitrate/keyframe controls
   where supported; distinguish unavailable controls and management permissions.
-- Retain private profile, video-source and encoder-configuration identities.
+- Bind each short-lived private inspection to its exact profile, video-source
+  and encoder-configuration identities; re-read before writing.
   Never select a channel from profile names, resolution or list position alone.
 - Account for Media1 encoding interval and Media2 fractional/discrete rates.
   Distinguish a requested/configured limit from measured delivered FPS.

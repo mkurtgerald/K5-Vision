@@ -59,6 +59,9 @@ def audit_api(audit_store):  # noqa: F811
     @app.get("/api/v1/auth/oidc/callback")
     @app.post("/api/v1/operator/security/mfa/enroll")
     @app.put("/api/v1/operator/admin/sso/provider")
+    @app.get("/api/v1/operator/cameras/{camera_id}/video-settings")
+    @app.post("/api/v1/operator/cameras/{camera_id}/video-settings/read")
+    @app.patch("/api/v1/operator/cameras/{camera_id}/video-settings")
     async def denied_security_operation():
         return JSONResponse({"detail": "Unauthorized"}, status_code=403)
 
@@ -195,6 +198,21 @@ def test_failed_audit_preflight_prevents_camera_side_effect(audit_api, monkeypat
         ("GET", "/api/v1/auth/oidc/callback", "auth.sso"),
         ("POST", "/api/v1/operator/security/mfa/enroll", "security.mfa.configure"),
         ("PUT", "/api/v1/operator/admin/sso/provider", "security.sso.configure"),
+        (
+            "GET",
+            "/api/v1/operator/cameras/00000000-0000-0000-0000-000000000001/video-settings",
+            "camera.video.read",
+        ),
+        (
+            "POST",
+            "/api/v1/operator/cameras/00000000-0000-0000-0000-000000000001/video-settings/read",
+            "camera.video.read",
+        ),
+        (
+            "PATCH",
+            "/api/v1/operator/cameras/00000000-0000-0000-0000-000000000001/video-settings",
+            "camera.video.configure",
+        ),
     ],
 )
 def test_security_denials_are_recorded_on_real_identity_route_shapes(

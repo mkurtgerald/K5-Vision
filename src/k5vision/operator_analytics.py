@@ -105,6 +105,11 @@ class OperatorAnalyticsBroker:
         # native imports. No restricted Analytics Lab source is involved.
         validate_person_runtime(config)
         self._factory = PersonProviderFactory(config)
+        # The bundled single-view Windows beta must not compile OpenVINO in
+        # the ASGI server process. Preserve the four-view in-process engineering
+        # adapter; installed model admission and box requirements are identical.
+        if max_views == 1:
+            self._factory.isolated = True
         self._max_views = max_views
         self._interval = float(minimum_interval_seconds)
         self._timeout = float(inference_timeout_seconds)
@@ -112,6 +117,62 @@ class OperatorAnalyticsBroker:
         self._clock: Callable[[], float] = time.monotonic
         self._views: dict[tuple[UUID, UUID], _View] = {}
         self._closed = False
+        self._prewarm_task: asyncio.Task[None] | None = None
+        self._prewarmed_provider: OwnedAnalyticsProvider | None = None
+        self._prewarm_successful = False
+        # Bound recovery from one failed native compile without starting a
+        # cold compile inside an authenticated HTTP request.
+        self._prewarm_attempts = 0
+
+    @property
+    def preparation_pending(self) -> bool:
+        """A sealed, media-free native worker is still being prepared."""
+        task = self._prewarm_task
+        return task is not None and not task.done()
+
+    @property
+    def preparation_phase(self) -> str:
+        """Finite native-admission state, without private worker diagnostics."""
+        if self._closed:
+            return "closed"
+        task = self._prewarm_task
+        if task is None:
+            return "not_requested"
+        if not task.done():
+            return "preparing"
+        return "ready" if self._prewarm_successful else "failed"
+
+    def start_preparing(self) -> None:
+        """Prepare one sealed native worker ahead of a first installed frame.
+
+        This owns no camera, human session, frame or source URI. The worker is
+        handed to exactly one authenticated view on its first actual request.
+        """
+        if self._closed or self._prewarm_attempts >= 2:
+            return
+        if self._prewarm_task is None or (
+            self._prewarm_task.done() and not self._prewarm_successful
+        ):
+            self._prewarm_attempts += 1
+            self._prewarm_task = asyncio.create_task(
+                self._prepare(), name="operator-native-person-preparation"
+            )
+
+    async def _prepare(self) -> None:
+        try:
+            provider = await self._factory()
+        except Exception:
+            # A failed optional warmup never prevents recording or startup.
+            # The first real frame may still attempt the normal cold path.
+            return
+        if self._closed:
+            try:
+                await provider.aclose()
+            except Exception:
+                pass
+        else:
+            self._prewarmed_provider = provider
+            self._prewarm_successful = True
 
     @staticmethod
     def _validate(owner_id: UUID, camera_id: UUID, frame_id: int, frame) -> None:
@@ -187,13 +248,43 @@ class OperatorAnalyticsBroker:
             self._views[key] = view
         if view.closed:
             return OperatorAnalyticsResult("unavailable", frame_id)
+        if view.provider is None and self.preparation_pending:
+            # Native model admission must never hold the API request open until
+            # Caddy's gateway timeout. Leave the media-free preparation intact;
+            # the authenticated browser retries without retaining this frame.
+            view.last_used = now
+            return OperatorAnalyticsResult("busy", frame_id)
+        if (
+            view.provider is None
+            and self._prewarm_task is not None
+            and self._prewarm_task.done()
+            and not self._prewarm_successful
+        ):
+            # A failed native compile must not synchronously start a second
+            # 22-second compile from the ASGI request. A bounded retry is
+            # scheduled separately by start_preparing(), without any pixels.
+            view.last_used = now
+            return OperatorAnalyticsResult("unavailable", frame_id)
         if view.operation is not None or now - view.last_submission < self._interval:
             return OperatorAnalyticsResult("busy", frame_id)
         view.last_used = view.last_submission = now
 
         async def run() -> OperatorAnalyticsResult:
             if view.provider is None:
-                view.provider = await self._factory()
+                if self._prewarm_task is not None:
+                    # A canceled request cannot cancel the shared, media-free
+                    # native initialization. Only the first view claims it.
+                    await asyncio.shield(self._prewarm_task)
+                    if view.closed or self._closed:
+                        return OperatorAnalyticsResult("unavailable", frame_id)
+                    view.provider, self._prewarmed_provider = (
+                        self._prewarmed_provider,
+                        None,
+                    )
+                if view.closed or self._closed:
+                    return OperatorAnalyticsResult("unavailable", frame_id)
+                if view.provider is None:
+                    view.provider = await self._factory()
             if view.closed or self._closed:
                 return OperatorAnalyticsResult("unavailable", frame_id)
             # Caller timing is a view correlation hint, never tracker authority.
@@ -253,6 +344,19 @@ class OperatorAnalyticsBroker:
 
     async def aclose(self) -> None:
         self._closed = True
+        preparation, self._prewarm_task = self._prewarm_task, None
+        if preparation is not None:
+            preparation.cancel()
+            try:
+                await preparation
+            except (Exception, asyncio.CancelledError):
+                pass
+        prepared, self._prewarmed_provider = self._prewarmed_provider, None
+        if prepared is not None:
+            try:
+                await prepared.aclose()
+            except Exception:
+                pass
         selected = tuple(self._views.values())
         self._views.clear()
         for view in selected:

@@ -50,6 +50,8 @@ def install_operator_events_api(
     mutations,
 ):
     """Reuse the product's current credential, role, origin and camera authority."""
+    if events is not None:
+        events.bind_mutations(mutations)
     session_dependency = Depends(require_session)
     admin_dependency = Depends(require_admin)
 
@@ -86,6 +88,12 @@ def install_operator_events_api(
         await current_selection(session[1], camera_id)
         return snapshot
 
+    async def current_administrator(token):
+        account, _ = await authenticate(token)
+        if account.role is not UserRole.ADMINISTRATOR:
+            raise HTTPException(403, "Insufficient camera administration permission")
+        return account
+
     @app.patch(_PREFIX + "/{camera_id}/analytics", tags=["operator analytics"])
     async def configure_analytics(
         camera_id: UUID,
@@ -95,18 +103,84 @@ def install_operator_events_api(
     ):
         response.headers["Cache-Control"] = "no-store"
         async with mutations:
-            account, _ = await authenticate(session[1])
-            if account.role is not UserRole.ADMINISTRATOR:
-                raise HTTPException(403, "Insufficient camera administration permission")
-            authorized_selection(account, camera_id)
+            events_service = service()
+            account = await current_administrator(session[1])
+            await asyncio.to_thread(authorized_selection, account, camera_id)
             try:
-                return service().configure(
-                    camera_id,
-                    enabled=payload.enabled,
-                    confidence_threshold=payload.confidence_threshold,
-                )
+                previous = await events_service._durable(events_service.store.settings, camera_id)
             except (OperatorEventsError, ValueError):
-                raise HTTPException(503, "analytics_unavailable") from None
+                raise HTTPException(
+                    503, "analytics_unavailable", headers={"Cache-Control": "no-store"}
+                ) from None
+            # Selection and private-state reads both yield. Their old principal
+            # cannot authorize a later write after logout or permission change.
+            await current_administrator(session[1])
+            requested = {
+                "enabled": payload.enabled,
+                "confidence_threshold": payload.confidence_threshold,
+            }
+            started = False
+            try:
+                started = True
+                snapshot = await events_service.configure_async(camera_id, **requested)
+                account = await current_administrator(session[1])
+                await asyncio.to_thread(authorized_selection, account, camera_id)
+                await current_administrator(session[1])
+                return snapshot
+            except BaseException as error:
+                cancellation = error if isinstance(error, asyncio.CancelledError) else None
+                rollback_failed = False
+                if started:
+
+                    async def restore():
+                        current = await events_service._durable(
+                            events_service.store.settings, camera_id
+                        )
+                        if current == previous:
+                            return
+                        if current != requested:
+                            # Never overwrite a third state whose ownership
+                            # cannot be established, even under this lock.
+                            raise OperatorEventsError("Analytics compensation unavailable")
+                        await events_service.configure_async(camera_id, **previous)
+                        readback = await events_service._durable(
+                            events_service.store.settings, camera_id
+                        )
+                        if readback != previous:
+                            raise OperatorEventsError("Analytics compensation unavailable")
+
+                    rollback = asyncio.create_task(restore(), name="operator-analytics-restore")
+                    # Keep both the mutation lock and the actual write owner
+                    # until compensation finishes, despite repeated cancellation.
+                    while True:
+                        try:
+                            await asyncio.shield(rollback)
+                        except asyncio.CancelledError as cancelled:
+                            if rollback.cancelled():
+                                rollback_failed = True
+                                break
+                            if cancellation is None:
+                                cancellation = cancelled
+                        except Exception:
+                            rollback_failed = True
+                            break
+                        else:
+                            break
+                if rollback_failed:
+                    events_service.mark_configuration_unavailable()
+                if cancellation is not None:
+                    raise cancellation from None
+                if rollback_failed or isinstance(error, (OperatorEventsError, ValueError)):
+                    raise HTTPException(
+                        503, "analytics_unavailable", headers={"Cache-Control": "no-store"}
+                    ) from None
+                if isinstance(error, HTTPException):
+                    raise HTTPException(
+                        error.status_code,
+                        error.detail,
+                        headers={**(error.headers or {}), "Cache-Control": "no-store"},
+                    ) from None
+                raise
 
     @app.get(_PREFIX + "/{camera_id}/events", tags=["operator analytics"])
     async def person_events(

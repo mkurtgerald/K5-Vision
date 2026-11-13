@@ -9,6 +9,8 @@
   const DAY = 86400000;
   const TIME_SAMPLE_MAX_AGE = 30000;
   const RETRY_DELAYS = [1000, 2000, 4000, 8000, 10000];
+  const PERSON_BUFFER_GRACE_MS = 5000;
+  const CAMERA_PROFILE_REQUEST_MS = 20000;
   const ROLE_PERMISSIONS = Object.freeze({
     viewer: ["cameras.view_live", "cameras.playback"],
     operator: ["cameras.view_live", "cameras.playback", "cameras.export"],
@@ -25,6 +27,30 @@
     "admin_last_administrator", "admin_username_exists", "admin_capacity",
     "admin_invalid_request", "admin_user_not_found", "admin_unavailable",
   ]);
+  const VIDEO_ERRORS = Object.freeze({
+    video_unsupported: "This source does not provide supported ONVIF encoder controls.",
+    video_auth_failed: "The camera management account was not accepted. Read with a management account below.",
+    video_unreachable: "The camera did not respond. Read fresh settings when it is reachable.",
+    video_invalid_response: "The camera did not return safe, supported encoder settings.",
+    video_settings_expired: "This one-time authorization expired or was consumed. Read fresh settings before applying.",
+    video_source_changed: "This camera connection changed. Read fresh settings before applying.",
+    video_configuration_conflict: "Camera settings changed after this read. Refresh before applying again.",
+    video_shared_configuration: "Acknowledge the shared encoder configuration, then read fresh settings before applying.",
+    video_apply_in_progress: "Another encoder change is running. Wait, then read fresh settings.",
+    video_busy: "Camera settings are busy. Wait, then read fresh settings.",
+    video_outcome_unverified: "The camera may have changed, but the outcome could not be verified. Read fresh settings before another change.",
+    video_readback_mismatch: "Camera readback did not match the requested settings. Read fresh values before trying again.",
+    video_closed: "Camera settings are unavailable. Read again when the service is ready.",
+    video_recorder_unavailable: "The recorder cannot reconcile this camera change. Check recorder health and read fresh settings before trying again.",
+    video_codec_unsupported: "This codec cannot be safely changed by K5. Select a supported H.264 configuration.",
+    video_options_unavailable: "The camera did not advertise safe encoder options. Its current values remain read-only.",
+    video_profile_ambiguous: "K5 could not identify one encoder profile for this enrolled stream. Reconnect using an unambiguous ONVIF profile.",
+    video_profile_unidentified: "The enrolled stream could not be matched to an ONVIF encoder profile.",
+    video_unsafe_extension: "This encoder uses options K5 cannot safely preserve. Its settings remain read-only.",
+    video_inspection_expired: "The camera inspection expired. Read fresh settings before applying.",
+    video_invalid_request: "Choose values within the device-advertised options and read fresh settings before retrying.",
+    video_apply_cancelled: "This change was cancelled. Read fresh settings to verify the camera before another change.",
+  });
   const EXPORT_ERRORS = Object.freeze({
     export_too_large: "This clip exceeds 256 MB. Select a shorter clip.",
     export_recording_gap: "The clip crosses a recording gap or unavailable footage. Adjust its start or duration.",
@@ -47,7 +73,7 @@
     view: "wall", sessionEpoch: 0, selectionEpoch: 0, requests: new Set(),
     hls: null, nativeLive: false, hlsScript: null, retryTimer: null, retryCount: 0,
     mediaAuthRefreshUsed: false,
-    pollTimer: null, expiryTimer: null, selectionController: null,
+    pollTimer: null, cameraPollController: null, expiryTimer: null, selectionController: null,
     spans: [], selectedSpan: null, historyEpoch: 0, historyLoad: null, historyRolling: true, signingOut: false,
     eventSeekEpoch: 0,
     dialogMode: "add", cameraSetupEpoch: 0, diagnostics: null, statusUnavailable: false,
@@ -57,14 +83,15 @@
     recorderTime: null, sessionExpiresAt: null, sessionExpirySteady: null,
     removeTarget: null, removing: false,
     personEnabled: false, personEpoch: 0, personTimer: null, personController: null,
+    personBufferTimer: null, personTransient503: 0,
     personFrameId: 0,
-    recordingBusy: false, cameraListEpoch: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
+    recordingBusy: false, cameraListEpoch: 0, cameraInventoryFreshAt: 0, navigationEpoch: 0, historyRangeMs: DAY, historyFetchedSteady: 0,
     playbackStart: null, playbackEnd: null, playbackPosition: null, playbackEpoch: 0, selectedStatus: null,
     playbackPrefetch: null, playbackObjectUrl: null, playbackRate: 1,
     exportEpoch: 0, exportController: null, exportJob: null, exportDownloadAllowed: false,
     securityTransition: false, capabilitiesResolved: false,
   };
-  let wall = null, timeline = null, administration = null, cameraAnalytics = null, settings = null;
+  let wall = null, timeline = null, administration = null, cameraAnalytics = null, settings = null, cameraVideoSettings = null;
   const PLAYBACK_CHUNK_SECONDS = 120;
   const MAX_PREFETCH_BYTES = 32 * 1024 * 1024;
   let wallLayoutPending = false;
@@ -198,7 +225,7 @@
     $("admin-tab").hidden = account?.role !== "administrator" || !ADMIN_PERMISSIONS.some(allowed);
     $("security-tab").hidden = !account || !state.capabilitiesResolved || !window.K5Settings?.create;
     $("add-camera-button").hidden = !allowed("cameras.manage");
-    for (const node of $("camera-list").querySelectorAll(".camera-item")) node.disabled = !allowed("cameras.view_live") && !allowed("cameras.playback");
+    for (const node of $("camera-list").querySelectorAll(".camera-item")) node.disabled = !allowed("cameras.view_live") && !allowed("cameras.playback") && !allowed("cameras.manage");
     $("admin-tab").textContent = allowed("users.manage") ? "Administration" : "Recorder settings";
     $("admin-settings-tab").hidden = !ADMIN_PERMISSIONS.some(allowed);
     $("account-role").title = account?.role === "administrator" ? "Manage users, cameras and recordings"
@@ -208,6 +235,7 @@
     $("clip-mark-out").hidden = !canExport();
     $("clip-selection-label").hidden = !canExport();
     $("export-panel").hidden = !canExport();
+    cameraVideoSettings?.authority();
   }
 
   class ApiError extends Error {
@@ -292,6 +320,7 @@
           try {
             const detail = (await response.json()).detail;
             const candidate = typeof detail === "string" ? detail : detail?.code;
+            if (Object.hasOwn(VIDEO_ERRORS, candidate)) code = candidate;
             if (CAMERA_ERROR_CODES.has(candidate)) {
               code = candidate;
               clock = cameraClockReport(detail?.clock);
@@ -368,8 +397,19 @@
     video.load();
   }
 
-  function stopLive(resetRetries = true) {
-    stopPersonView();
+  function stopLive(resetRetries = true, preserveInFlightPerson = false) {
+    const camera = currentCamera();
+    // A same-camera HLS decoder restart cannot revoke an already authorized,
+    // immutable sampled-frame POST. Preserve only an in-flight request during
+    // a bounded automatic reconnect; deliberate teardown and loss of camera,
+    // session, permission or worker authority still abort immediately.
+    if (!(preserveInFlightPerson && state.personEnabled && state.personController
+      && state.token && !state.signingOut && !state.securityTransition
+      && state.capabilitiesResolved && allowed("cameras.view_live")
+      && state.view === "live" && camera?.analytics_status === "configured"
+      && statusDetails(camera).style === "online" && state.workerStatus !== "unavailable")) {
+      stopPersonView();
+    }
     clearTimeout(state.retryTimer);
     state.retryTimer = null;
     state.nativeLive = false;
@@ -410,10 +450,12 @@
   function clearWorkspace(reason = "") {
     administration?.hide();
     settings?.hide();
+    cameraVideoSettings?.close();
     state.securityTransition = false;
     cameraAnalytics?.clear();
     cancelExport();
     resetActivation();
+    state.cameraInventoryFreshAt = 0;
     state.sessionEpoch += 1;
     state.selectionEpoch += 1;
     state.historyEpoch += 1;
@@ -535,7 +577,7 @@
       const button = document.createElement("button");
       button.type = "button";
       button.className = "camera-item";
-      button.disabled = !allowed("cameras.view_live") && !allowed("cameras.playback");
+      button.disabled = !allowed("cameras.view_live") && !allowed("cameras.playback") && !allowed("cameras.manage");
       button.classList.toggle("selected", camera.device_id === state.selected);
       button.setAttribute("aria-pressed", String(camera.device_id === state.selected));
       const heading = document.createElement("span");
@@ -577,6 +619,7 @@
       : camera ? String(camera.host || "Enrolled camera") : "Select a camera from the wall or camera list.";
     $("connection-badge").hidden = !focused;
     $("recording-badge").hidden = !focused;
+    $("camera-video-button").hidden = !focused || !allowed("cameras.manage");
     $("update-source-button").hidden = !focused || !allowed("cameras.manage");
     $("remove-camera-button").hidden = !focused || !allowed("cameras.manage");
     $("toggle-recording").hidden = !focused || !allowed("recording.manage");
@@ -682,11 +725,11 @@
     renderOverview();
   }
 
-  async function refreshDiagnostics() {
+  async function refreshDiagnostics(signal = null) {
     if (!state.token || state.securityTransition) return;
     const epoch = state.sessionEpoch;
     try {
-      const diagnostics = await request("/api/v1/operator/status");
+      const diagnostics = await request("/api/v1/operator/status", { signal });
       if (epoch !== state.sessionEpoch) return;
       if (!diagnostics || !["ready", "unavailable", "disk_full"].includes(diagnostics.worker_status)) throw new ApiError(503);
       state.diagnostics = diagnostics;
@@ -717,13 +760,47 @@
     if (state.token) setView("wall", false);
   }
 
-  async function refreshCameras(selectFirst = false) {
+  async function refreshCameras(selectFirst = false, signal = null) {
     if (!state.token || state.securityTransition) return;
     const epoch = state.sessionEpoch;
     const navigationEpoch = state.navigationEpoch;
     const cameraListEpoch = ++state.cameraListEpoch;
     try {
-      const data = await request("/api/v1/operator/cameras");
+      let data;
+      try {
+        data = await request("/api/v1/operator/cameras", { signal });
+      } catch (error) {
+        // A stalled inventory query is not proof of revoked account authority.
+        // Only preserve an existing session when independently reauthorized;
+        // explicit denials, changed grants and malformed data still fail closed.
+        const temporary = [429, 502, 503, 504].includes(error.status)
+          || error.name === "TimeoutError" || error instanceof TypeError;
+        const inventoryAge = performance.now() - state.cameraInventoryFreshAt;
+        if (!temporary || !state.capabilitiesResolved || !state.account
+          || state.cameraInventoryFreshAt <= 0 || inventoryAge > 30000
+          || state.signingOut || state.securityTransition) throw error;
+        try {
+          const verified = await request("/api/v1/operator/capabilities", { timeout: 4000, signal });
+          if (epoch !== state.sessionEpoch || cameraListEpoch !== state.cameraListEpoch
+            || !state.token || state.signingOut || state.securityTransition) return;
+          const previous = state.account;
+          const sameCameraGrant = JSON.stringify(verified?.account?.camera_access ?? null)
+            === JSON.stringify(previous.camera_access ?? null);
+          const sameRolePolicy = (verified?.account?.role_profile_id ?? null)
+            === (previous.role_profile_id ?? null);
+          const samePermissions = Array.isArray(verified?.effective_permissions)
+            && JSON.stringify([...verified.effective_permissions].sort())
+              === JSON.stringify([...(previous.effective_permissions || [])].sort());
+          if (!sameCameraGrant || !sameRolePolicy || !samePermissions) throw new ApiError(403);
+          resolveCapabilities(verified);
+          $("camera-list-message").textContent =
+            "Camera list unavailable. Account access reverified; retrying inventory.";
+          return false;
+        } catch (_) {
+          // Do not use stale grants if independent account proof fails.
+          throw error;
+        }
+      }
       if (epoch !== state.sessionEpoch || cameraListEpoch !== state.cameraListEpoch) return;
       if (!Array.isArray(data.cameras)) throw new ApiError(503);
       const restoreWall = !state.capabilitiesResolved;
@@ -731,8 +808,10 @@
       state.workerStatus = ["ready", "unavailable", "disk_full"].includes(data.worker_status) ? data.worker_status : "ready";
       renderWorkerStatus();
       state.cameras = data.cameras.filter((camera) => camera && typeof camera.device_id === "string" && typeof camera.name === "string");
+      state.cameraInventoryFreshAt = performance.now();
       administration?.refreshCameras();
       settings?.refreshCameras();
+      cameraVideoSettings?.inventory();
       renderCameras();
       if (restoreWall && state.view === "wall" && allowed("cameras.view_live")) cameraWall().show(state.cameras);
       if (state.selected && !currentCamera() && !["admin", "settings"].includes(state.view)) {
@@ -753,7 +832,26 @@
     clearTimeout(state.pollTimer);
     if (!state.token || state.securityTransition) return;
     state.pollTimer = setTimeout(async () => {
-      await Promise.all([refreshCameras(), refreshDiagnostics()]);
+      // Native cold-start inference competes with four live decoders on
+      // Windows. Do not let an unrelated inventory timeout revoke an
+      // in-flight immutable, server-reauthorized person frame. This skips
+      // only background polling until the bounded request completes; login,
+      // session expiry, explicit security changes and media authorization
+      // continue to revoke immediately.
+      if (state.personController) {
+        scheduleCameraPoll();
+        return;
+      }
+      const controller = new AbortController();
+      state.cameraPollController = controller;
+      try {
+        await Promise.all([
+          refreshCameras(false, controller.signal),
+          refreshDiagnostics(controller.signal),
+        ]);
+      } finally {
+        if (state.cameraPollController === controller) state.cameraPollController = null;
+      }
       scheduleCameraPoll();
     }, 3000);
   }
@@ -766,7 +864,15 @@
   }
 
   async function selectCamera(deviceId) {
-    if (!state.token || state.signingOut || !allowed("cameras.view_live") && !allowed("cameras.playback")) return;
+    if (!state.token || state.signingOut) return;
+    if (!allowed("cameras.view_live") && !allowed("cameras.playback")) {
+      const camera = state.cameras.find((item) => item.device_id === deviceId);
+      if (camera && canManageCameras()) {
+        cameraVideoSettings?.selection(deviceId); state.selected = deviceId; renderCameras(); cameraVideoWorkspace().open(camera);
+      }
+      return;
+    }
+    cameraVideoSettings?.selection(deviceId);
     state.navigationEpoch += 1;
     if (["wall", "admin"].includes(state.view)) setView(allowed("cameras.view_live") ? "live" : "history", false);
     state.selectionController?.abort();
@@ -823,16 +929,19 @@
 
   function scheduleLiveRetry(epoch, reason) {
     if (epoch !== state.selectionEpoch || !state.token || state.view !== "live") return;
-    stopLive(false);
     if (state.retryCount >= RETRY_DELAYS.length) {
+      // Exhausted retries are a real stop, not transient buffering. Revoke the
+      // frozen frame, clear its overlay and refuse another in-flight request.
+      stopLive(false);
       livePlaceholder("Live view disconnected", "The connection could not be restored. Recording history may still be available.", true);
       message("live-state", "Disconnected · Select reconnect to try again");
       return;
     }
+    stopLive(false, true);
     const delay = RETRY_DELAYS[state.retryCount++];
     livePlaceholder("Reconnecting", reason);
     message("live-state", `Reconnecting · Attempt ${state.retryCount} of ${RETRY_DELAYS.length}`);
-    state.retryTimer = setTimeout(() => void startLive(epoch), delay);
+    state.retryTimer = setTimeout(() => void startLive(epoch, true), delay);
   }
 
   async function recoverMediaAccess(epoch) {
@@ -884,9 +993,12 @@
 
   function stopPersonView(reason = "Select Start sampled view while live video is playing. Samples are processed locally and are not saved.") {
     state.personEnabled = false;
+    state.personTransient503 = 0;
     state.personEpoch += 1;
     clearTimeout(state.personTimer);
     state.personTimer = null;
+    clearTimeout(state.personBufferTimer);
+    state.personBufferTimer = null;
     state.personController?.abort();
     state.personController = null;
     const canvas = $("person-view-canvas");
@@ -904,6 +1016,17 @@
   async function samplePerson(epoch) {
     if (!state.personEnabled || epoch !== state.personEpoch) return;
     if (!canSamplePerson()) {
+      const camera = currentCamera();
+      // A retry after HTTP 429 can land while HLS is briefly rebuffering.
+      // Honor the existing five-second stalled-video guard instead of ending
+      // the authenticated sampling session before that guard can decide.
+      // Do not capture pixels or submit a request without decoded live video.
+      if (state.personBufferTimer !== null && state.token && !state.signingOut
+        && state.view === "live" && camera?.analytics_status === "configured"
+        && statusDetails(camera).style === "online" && state.workerStatus !== "unavailable") {
+        state.personTimer = setTimeout(() => void samplePerson(epoch), 250);
+        return;
+      }
       stopPersonView("Sampled view stopped while live video is unavailable. Start it again when video returns.");
       return;
     }
@@ -918,6 +1041,7 @@
     let snapshot = null;
     let pixels = null;
     const controller = new AbortController();
+    let busyRetryDelayMs = null;
     state.personController = controller;
     try {
       const context = capture.getContext("2d", { willReadFrequently: true });
@@ -934,17 +1058,33 @@
       const frameId = state.personFrameId = (state.personFrameId + 1) % 2147483648;
       const query = new URLSearchParams({ width: String(width), height: String(height), frame_id: String(frameId) });
       const result = await request(`/api/v1/operator/cameras/${encodeURIComponent(cameraId)}/person-view?${query}`, {
-        method: "POST", rawBody: pixels, signal: controller.signal,
+        method: "POST", rawBody: pixels, signal: controller.signal, timeout: 24000,
       });
-      if (epoch !== state.personEpoch || !state.personEnabled || cameraId !== state.selected || !canSamplePerson()) return;
+      // This immutable frame may finish during a transient HLS rebuffer.
+      // Preserve the selected camera, analytics and session validity checks;
+      // stream teardown and sign-out still abort the pending request.
+      const selectedCamera = currentCamera();
+      if (epoch !== state.personEpoch || !state.personEnabled || cameraId !== state.selected
+        || !state.token || state.signingOut || state.view !== "live"
+        || selectedCamera?.analytics_status !== "configured"
+        || statusDetails(selectedCamera).style !== "online"
+        || state.workerStatus === "unavailable") return;
       if (!result || result.frame_id !== frameId || !["active", "busy", "unavailable"].includes(result.status)
-        || !Array.isArray(result.boxes) || result.boxes.length > 32 || !result.boxes.every(validPersonBox)) throw new ApiError(503);
+        || !Array.isArray(result.boxes) || result.boxes.length > 32 || !result.boxes.every(validPersonBox)) throw new ApiError(503, "person_contract_invalid");
       if (result.status === "unavailable") {
         stopPersonView("Person detection is unavailable. Live video and recording continue. Start sampled view to retry.");
         return;
       }
-      if (result.status === "busy") message("person-view-message", "Person detection is busy. Waiting for the next sample…");
-      else {
+      if (result.status === "busy") {
+        // A compiling native worker should not be flooded with raw frame uploads.
+        busyRetryDelayMs = 1500;
+        // Busy has no boxes. Never erase the last valid frozen-frame overlay
+        // while another native worker owns inference capacity.
+        if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
+      } else {
+        // Only a genuine active response resets the bounded transient-error
+        // budget. Alternating HTTP 429/503 cannot retry without limit.
+        state.personTransient503 = 0;
         // The response belongs to this exact frozen sample, never the moving
         // live player. Publish frame and boxes together in one canvas update.
         const canvas = $("person-view-canvas");
@@ -963,26 +1103,40 @@
       }
     } catch (error) {
       if (error.name === "AbortError" || epoch !== state.personEpoch || !state.token) return;
-      if (error.status === 429) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
-      else stopPersonView(apiMessage(error, "Person detection is unavailable. Live video and recording continue. Start sampled view to retry."));
+      if (error.status === 429) {
+        // Preserve finite polling, but give cold native compilation CPU room.
+        busyRetryDelayMs = 1500;
+        if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is busy. Waiting for the next sample…");
+      } else if (error.status === 503 && error.code !== "person_contract_invalid"
+        && state.personTransient503 < 2 && canSamplePerson()) {
+        // A transient local service fault must not permanently disable an
+        // otherwise healthy installed view after one request. Retry at most
+        // twice; malformed successful responses still fail closed immediately.
+        // Each request owns a fresh frame and is reauthorized server-side.
+        state.personTransient503 += 1;
+        if ($("person-view-canvas").hidden) message("person-view-message", "Person detection is temporarily unavailable. Retrying…");
+      } else {
+        stopPersonView(apiMessage(error, "Person detection is unavailable. Live video and recording continue. Start sampled view to retry."));
+      }
     } finally {
       pixels?.fill(0);
       snapshot?.data.fill(0);
       capture.width = 0; capture.height = 0;
       if (state.personController === controller) state.personController = null;
       if (state.personEnabled && epoch === state.personEpoch) {
-        state.personTimer = setTimeout(() => void samplePerson(epoch), Math.max(0, 500 - (performance.now() - began)));
+        state.personTimer = setTimeout(() => void samplePerson(epoch),
+          busyRetryDelayMs ?? Math.max(0, 500 - (performance.now() - began)));
       }
     }
   }
 
-  async function startLive(epoch = state.selectionEpoch) {
+  async function startLive(epoch = state.selectionEpoch, preserveInFlightPerson = false) {
     if (!state.media || state.view !== "live" || !state.token) return;
     const url = state.media.live_url;
     try {
       await ensureHls();
       if (epoch !== state.selectionEpoch || state.view !== "live" || !state.token || state.signingOut) return;
-      stopLive(false);
+      stopLive(false, preserveInFlightPerson);
       livePlaceholder("Opening live view", "Waiting for camera video…");
       const video = $("live-video");
       video.muted = true;
@@ -1129,7 +1283,8 @@
     $("history-start").value = utcInput(new Date(end.getTime() - state.historyRangeMs), true);
     $("history-end").value = utcInput(end, true);
     $("history-day").value = "";
-    $("history-day").max = end.toISOString().slice(0, 10);
+    // Retained recording dates can be ahead of corrected recorder UTC.
+    // The recording inventory, rather than the clock, determines availability.
     state.historyRolling = true;
     return true;
   }
@@ -1510,17 +1665,16 @@
       if (!await pending.task || !active()) return;
     }
     const first = parseUtc($("history-start").value).getTime(), last = parseUtc($("history-end").value).getTime();
-    if (!Number.isFinite(first) || at < first || at >= last) {
+    const outsideRange = !Number.isFinite(first) || at < first || at >= last;
+    if (outsideRange) {
       const dayStart = new Date(at); dayStart.setUTCHours(0, 0, 0, 0);
       $("history-start").value = utcInput(dayStart, true);
       $("history-end").value = utcInput(new Date(dayStart.getTime() + DAY), true);
-      state.historyRolling = false;
-      if (!await loadHistory()) return;
     }
-    // A detector event can arrive after the latest recorder history snapshot.
-    // Re-query once before concluding the event is in a recording gap.
-    // Never let a superseded navigation or changed session apply its result.
-    if (active() && !state.spans.some((span) => span.start <= at && at < span.end)) {
+    if (outsideRange || !state.spans.some((span) => span.start <= at && at < span.end)) {
+      // An event can arrive before a new recording appears in the cached history.
+      // Keep this UTC interval stable while checking current recorder coverage.
+      state.historyRolling = false;
       if (!await loadHistory() || !active()) return;
     }
     if (active()) seekRecording(at);
@@ -1917,13 +2071,61 @@
   $("play-live").addEventListener("click", () => void $("live-video").play().catch(() => message("live-state", "Unable to play live video. Try reconnecting.")));
   $("live-video").addEventListener("playing", () => {
     if (!state.token || state.view !== "live") return;
+    // A transient HLS rebuffer must not abort an immutable person-frame POST.
+    clearTimeout(state.personBufferTimer);
+    state.personBufferTimer = null;
     $("live-placeholder").hidden = true; $("live-video-label").hidden = false; $("play-live").hidden = true;
     message("live-state", "Live video connected");
     renderPersonControls();
   });
-  $("live-video").addEventListener("pause", () => { if (state.personEnabled) stopPersonView("Sampled view stopped while live video is paused."); });
+  $("live-video").addEventListener("pause", () => {
+    if (!state.personEnabled) return;
+    if (state.personController) {
+      // Chrome/HLS can emit pause during buffering after the immutable frame
+      // was submitted. Preserve that one request: playback teardowns still
+      // call stopPersonView() themselves and abort it immediately.
+      const epoch = state.personEpoch;
+      const video = $("live-video");
+      if (state.personBufferTimer === null) {
+        const frames = video.getVideoPlaybackQuality?.().totalVideoFrames;
+        state.personBufferTimer = setTimeout(() => {
+          state.personBufferTimer = null;
+          checkPersonBuffer(epoch, video, frames);
+        }, PERSON_BUFFER_GRACE_MS);
+      }
+      return;
+    }
+    stopPersonView("Sampled view stopped while live video is paused.");
+  });
+  function checkPersonBuffer(epoch, video, frames) {
+    if (!state.personEnabled || state.personEpoch !== epoch) return;
+    const current = video.getVideoPlaybackQuality?.().totalVideoFrames;
+    if (video.paused || video.readyState < 2 || !Number.isFinite(frames)
+      || !Number.isFinite(current) || current <= frames) {
+      if (state.personController) {
+        // An immutable sample is already in flight. Buffering the subsequent
+        // live frames must not abort its authenticated, bounded inference.
+        // Session revocation, camera changes and actual stream teardown still
+        // call stopPersonView() and abort it immediately.
+        state.personBufferTimer = setTimeout(() => {
+          state.personBufferTimer = null;
+          checkPersonBuffer(epoch, video, frames);
+        }, 1000);
+      } else {
+        stopPersonView("Sampled view stopped while live video is buffering. Start it again when video returns.");
+      }
+    }
+  }
   $("live-video").addEventListener("waiting", () => {
-    if (state.personEnabled) stopPersonView("Sampled view stopped while live video is buffering. Start it again when video returns.");
+    if (state.personEnabled && state.personBufferTimer === null) {
+      const epoch = state.personEpoch;
+      const video = $("live-video");
+      const frames = video.getVideoPlaybackQuality?.().totalVideoFrames;
+      state.personBufferTimer = setTimeout(() => {
+        state.personBufferTimer = null;
+        checkPersonBuffer(epoch, video, frames);
+      }, PERSON_BUFFER_GRACE_MS);
+    }
     if (state.token && state.view === "live") {
       $("live-video-label").hidden = true;
       message("live-state", "Buffering live video…");
@@ -1933,9 +2135,14 @@
     if (state.personEnabled) { stopPersonView(); return; }
     if (!canSamplePerson()) return;
     state.personEnabled = true;
+    state.personTransient503 = 0;
     const epoch = ++state.personEpoch;
     renderPersonControls();
     message("person-view-message", "Processing a sampled frame…");
+    // Cancel background inventory/status reads already awaiting the service.
+    // Their AbortError paths cannot suspend account authority; the person POST
+    // independently reauthenticates and checks camera grants before/after.
+    state.cameraPollController?.abort();
     void samplePerson(epoch);
   });
   $("live-video").addEventListener("error", () => {
@@ -2016,6 +2223,250 @@
   function canManageCameras() {
     return allowed("cameras.manage") && Boolean(state.token) && !state.signingOut;
   }
+
+  function cameraVideoWorkspace() {
+    if (cameraVideoSettings) return cameraVideoSettings;
+    const dialog = $("camera-video-dialog"), form = $("camera-video-form");
+    const keys = ["codec", "resolution", "frame_rate", "bitrate_kbps", "gop", "quality", "encoding_interval"];
+    const numberKeys = keys.filter((key) => !["codec", "resolution"].includes(key));
+    const id = (key) => "video-" + key.replaceAll("_", "-");
+    let target = null, epoch = 0, controller = null, busy = false, applying = false, data = null;
+    let handle = "", deadline = 0, timer = null;
+    const numeric = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1e9;
+    const size = (value) => value && Number.isInteger(value.width) && value.width > 0 && value.width <= 16384
+      && Number.isInteger(value.height) && value.height > 0 && value.height <= 16384;
+    const resolution = (value) => String(value.width) + "x" + String(value.height);
+    const range = (value) => value === null || value && numeric(value.min) && numeric(value.max) && value.min <= value.max;
+    function valid(value) {
+      if (!value || value.camera_id !== target.id || typeof value.source_revision !== "string" || value.source_revision.length < 16 || value.source_revision.length > 256
+        || typeof value.writable !== "boolean" || typeof value.shared_configuration !== "boolean"
+        || !Number.isInteger(value.shared_profile_count) || value.shared_profile_count < 0 || value.shared_profile_count > 64
+        || typeof value.configuration_readback_verified !== "boolean" || typeof value.stream_verified !== "boolean"
+        || !(value.observed_fps === null || numeric(value.observed_fps))) return false;
+      if (value.status === "unavailable") return value.writable === false && value.current === null && value.options === null;
+      const c = value.current, o = value.options;
+      return value.status === "available" && ["media1", "media2"].includes(value.protocol)
+        && c && typeof c.codec === "string" && /^[A-Z0-9]{1,12}$/.test(c.codec) && size(c.resolution)
+        && numberKeys.every((key) => c[key] === null || numeric(c[key]))
+        && o && Array.isArray(o.codecs) && o.codecs.length <= 16
+        && o.codecs.every((item) => item && typeof item.codec === "string" && /^[A-Z0-9]{1,12}$/.test(item.codec)
+          && item.device_supported === true && typeof item.product_supported === "boolean")
+        && (!value.writable || o.codecs.some((item) => item.codec === "H264" && item.product_supported))
+        && (!value.shared_configuration || value.shared_profile_count >= 2)
+        && Array.isArray(o.resolutions) && o.resolutions.length <= 128 && o.resolutions.every(size)
+        && numberKeys.every((key) => range(o[key]))
+        && (o.frame_rate === null || typeof o.frame_rate.integer_only === "boolean"
+          && Array.isArray(o.frame_rate.values) && o.frame_rate.values.length <= 1024 && o.frame_rate.values.every(numeric))
+        && Array.isArray(o.writable_fields) && o.writable_fields.length <= keys.length
+        && new Set(o.writable_fields).size === o.writable_fields.length && o.writable_fields.every((key) => keys.includes(key));
+    }
+    function clearCredentials() {
+      $("camera-video-username").value = ""; $("camera-video-password").value = "";
+      $("camera-video-use-account").checked = false; $("camera-video-account").hidden = true;
+    }
+    function clearHandle() { handle = ""; deadline = 0; clearTimeout(timer); timer = null; }
+    function current(version) {
+      return dialog.open && target && target.session === state.sessionEpoch && target.id === state.selected
+        && version === epoch && canManageCameras() && state.cameras.some((camera) => camera.device_id === target.id);
+    }
+    function editable(key) {
+      return data?.status === "available" && data.writable && data.options.writable_fields.includes(key)
+        && (key === "codec" ? data.options.codecs.some((item) => item.codec === "H264" && item.product_supported)
+          : $("video-codec").value === "H264" && (key === "resolution" ? data.options.resolutions.length > 0 : data.options[key] !== null));
+    }
+    function readField(key) {
+      const node = $(id(key));
+      if (key === "codec") return node.value;
+      if (key === "resolution") {
+        const chosen = data.options.resolutions.find((item) => resolution(item) === node.value);
+        return chosen || null;
+      }
+      const value = node.value === "" ? NaN : Number(node.value), limits = data.options[key];
+      if (!numeric(value) || !limits || value < limits.min || value > limits.max) return null;
+      if ((["bitrate_kbps", "gop", "encoding_interval"].includes(key) || key === "frame_rate" && limits.integer_only) && !Number.isInteger(value)) return null;
+      if (key === "frame_rate" && limits.values.length && !limits.values.includes(value)) return null;
+      return value;
+    }
+    function changes() {
+      if (!data || data.status !== "available" || $("video-codec").value !== "H264") return null;
+      const body = {};
+      for (const key of keys) {
+        if (!editable(key)) continue;
+        const value = readField(key);
+        if (value === null || key === "codec" && value !== "H264") return null;
+        if (JSON.stringify(value) !== JSON.stringify(data.current[key])) body[key] = value;
+      }
+      return body;
+    }
+    function controls() {
+      const active = dialog.open && target && canManageCameras();
+      const ready = active && !busy && handle && performance.now() < deadline && data?.writable === true;
+      form.setAttribute("aria-busy", String(busy));
+      $("camera-video-values").disabled = !ready;
+      for (const key of keys) $(id(key)).disabled = !ready || !editable(key);
+      $("camera-video-use-account").disabled = !active || busy;
+      $("camera-video-username").disabled = !active || busy; $("camera-video-password").disabled = !active || busy;
+      $("camera-video-read").disabled = !active || busy;
+      $("camera-video-refresh").disabled = !active || busy;
+      $("video-shared-ack").disabled = !ready;
+      const modified = changes();
+      $("camera-video-apply").disabled = !ready || !modified || !Object.keys(modified).length
+        || data.shared_configuration && !$("video-shared-ack").checked;
+      $("camera-video-apply").textContent = busy ? "Working…" : "Apply video settings";
+    }
+    function option(value, label, disabled = false) {
+      const node = document.createElement("option"); node.value = value; node.textContent = label; node.disabled = disabled; return node;
+    }
+    function render(value) {
+      data = value; $("video-shared-ack").checked = false;
+      $("camera-video-values").hidden = value?.status !== "available";
+      $("camera-video-shared").hidden = value?.shared_configuration !== true;
+      if (!value || value.status !== "available") {
+        $("camera-video-verification").textContent = ""; controls(); return;
+      }
+      const c = value.current, o = value.options;
+      $("video-codec").replaceChildren(...o.codecs.map((item) => option(item.codec,
+        item.codec + (item.codec === "H264" && item.product_supported ? "" : " · unavailable for K5 changes"), item.codec !== "H264" || !item.product_supported)));
+      if (!o.codecs.some((item) => item.codec === c.codec)) $("video-codec").append(option(c.codec, c.codec + " · current, read-only", true));
+      $("video-codec").value = c.codec;
+      $("video-codec-help").textContent = "K5 currently supports changing to H.264. Other reported codecs are read-only.";
+      $("video-resolution").replaceChildren(...o.resolutions.map((item) => option(resolution(item), String(item.width) + " × " + String(item.height))));
+      if (!o.resolutions.some((item) => resolution(item) === resolution(c.resolution))) $("video-resolution").append(option(resolution(c.resolution), resolution(c.resolution) + " · current, read-only", true));
+      $("video-resolution").value = resolution(c.resolution);
+      $("video-resolution-help").textContent = o.writable_fields.includes("resolution") ? "Choose a device-advertised H.264 resolution." : "The device did not advertise a safe writable resolution list.";
+      for (const key of numberKeys) {
+        const limits = o[key], old = $(id(key)), discrete = key === "frame_rate" && limits?.values.length;
+        const node = document.createElement(discrete ? "select" : "input"); node.id = id(key); node.dataset.videoField = key;
+        if (discrete) {
+          node.append(...limits.values.map((n) => option(String(n), String(n))));
+          if (c[key] !== null && !limits.values.includes(c[key])) node.append(option(String(c[key]), String(c[key]) + " · current, read-only", true));
+        } else {
+          node.type = "number"; node.step = ["quality", "frame_rate"].includes(key) && !(key === "frame_rate" && limits?.integer_only) ? "any" : "1";
+          if (limits) { node.min = String(limits.min); node.max = String(limits.max); node.required = o.writable_fields.includes(key); }
+        }
+        node.value = c[key] === null ? "" : String(c[key]); old.replaceWith(node);
+        $(id(key) + "-field").hidden = c[key] === null && limits === null;
+        $(id(key) + "-help").textContent = limits && o.writable_fields.includes(key)
+          ? discrete ? "Select one of the camera’s supported frame rates." : "Device range: " + limits.min + "–" + limits.max + (key === "frame_rate" && limits.integer_only ? " · whole fps" : "")
+          : "Read-only: no safe writable range was advertised.";
+      }
+      $("camera-video-shared-notice").textContent = "This encoder configuration is shared by " + value.shared_profile_count + " camera profiles. Applying changes affects those profiles too.";
+      const verified = typeof value.verification?.stream_verified === "boolean" ? value.verification.stream_verified : value.stream_verified === true;
+      $("camera-video-verification").textContent = (value.configuration_readback_verified ? "Camera configuration readback verified." : "Current camera configuration loaded; no change has been applied.")
+        + "\n" + (verified ? "Live stream verification passed." : "Live stream is not verified by this result.")
+        + "\nObserved FPS: " + (value.observed_fps === null ? "not measured." : String(value.observed_fps));
+      controls();
+    }
+    function accept(value, applying = false) {
+      if (!valid(value)) throw new ApiError(502, "video_invalid_response");
+      const camera = state.cameras.find((item) => item.device_id === target.id);
+      if (!applying && typeof camera?.source_revision === "string" && camera.source_revision !== value.source_revision) throw new ApiError(409, "video_source_changed");
+      if (applying) {
+        // The authorized transaction may renew the private stream URI. Its
+        // response is newer than a poll issued before the transaction committed.
+        state.cameraListEpoch += 1;
+        if (camera) camera.source_revision = value.source_revision;
+      }
+      target.source = value.source_revision;
+      if (!applying && value.writable && value.status === "available") {
+        if (typeof value.settings_handle !== "string" || !/^[A-Za-z0-9_-]{24,256}$/.test(value.settings_handle)
+          || !Number.isInteger(value.expires_in_seconds) || value.expires_in_seconds < 1 || value.expires_in_seconds > 120) throw new ApiError(502, "video_invalid_response");
+        handle = value.settings_handle; deadline = performance.now() + value.expires_in_seconds * 1000;
+        timer = setTimeout(() => { if (dialog.open && !busy) { clearHandle(); controls(); message("camera-video-message", "This read authorization expired. Read fresh settings before applying.", true); } }, value.expires_in_seconds * 1000);
+      }
+      const display = { ...value }; delete display.settings_handle; delete display.expires_in_seconds;
+      render(display);
+      if (value.status !== "available" || !value.writable) message("camera-video-message", VIDEO_ERRORS[value.writable_reason] || "The camera did not provide safe writable ONVIF encoder options.", true);
+      else if (applying) message("camera-video-message", value.configuration_readback_verified
+        ? "Camera configuration readback verified. Read fresh settings before another change."
+        : "The camera change was not verified. Read fresh settings before trying again.", !value.configuration_readback_verified);
+      else message("camera-video-message", "Review the camera’s supported values, then apply your changes.");
+    }
+    function errorText(error) {
+      if (VIDEO_ERRORS[error.code]) return VIDEO_ERRORS[error.code];
+      if (error.status === 404) return "Video settings are unavailable in this running build.";
+      if (error.status === 422) return "The camera did not accept these values. Read fresh settings and choose supported values.";
+      return apiMessage(error, "Camera settings could not be verified. Read fresh values before another change.");
+    }
+    async function read(withAccount = false) {
+      if (!target || !canManageCameras() || busy) return;
+      const version = ++epoch, cameraId = target.id;
+      controller?.abort(); controller = new AbortController(); clearHandle();
+      const body = withAccount ? { username: $("camera-video-username").value, password: $("camera-video-password").value } : undefined;
+      clearCredentials(); applying = false; busy = true; render(null); message("camera-video-message", "Reading camera settings…");
+      try {
+        const value = await request("/api/v1/operator/cameras/" + encodeURIComponent(cameraId) + "/video-settings" + (withAccount ? "/read" : ""), {
+          method: withAccount ? "POST" : "GET", ...(withAccount ? { body } : {}), signal: controller.signal, timeout: 30000,
+        });
+        if (current(version)) accept(value);
+      } catch (error) { if (current(version) && error.name !== "AbortError") message("camera-video-message", errorText(error), true); }
+      finally { if (body) { body.username = ""; body.password = ""; } if (current(version)) { busy = false; controls(); } }
+    }
+    function close() {
+      epoch += 1; controller?.abort(); controller = null; busy = false; applying = false; clearCredentials(); clearHandle();
+      data = null; target = null; if (dialog.open) dialog.close(); form.reset(); $("camera-video-verification").textContent = ""; message("camera-video-message", "");
+    }
+    function invalidate(text) {
+      epoch += 1; controller?.abort(); controller = null; busy = false; applying = false; clearCredentials(); clearHandle(); controls(); message("camera-video-message", text, true);
+    }
+    form.addEventListener("input", controls); form.addEventListener("change", controls);
+    $("camera-video-use-account").addEventListener("change", () => { $("camera-video-account").hidden = !$("camera-video-use-account").checked; if (!$("camera-video-use-account").checked) clearCredentials(); });
+    $("camera-video-read").addEventListener("click", () => { if ($("camera-video-use-account").checked) void read(true); });
+    $("camera-video-refresh").addEventListener("click", () => void read());
+    $("camera-video-close").addEventListener("click", close); $("camera-video-cancel").addEventListener("click", close);
+    dialog.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
+    dialog.addEventListener("close", () => { if (target) close(); });
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault(); controls();
+      if (!target || !canManageCameras() || busy || $("camera-video-apply").disabled) return;
+      const requested = changes(); if (!requested || !Object.keys(requested).length) return;
+      const body = { settings_handle: handle, ...requested, shared_config_ack: $("video-shared-ack").checked };
+      const version = ++epoch, cameraId = target.id;
+      controller?.abort(); controller = new AbortController(); clearCredentials(); clearHandle(); busy = true; applying = true; controls();
+      message("camera-video-message", "Applying camera settings and reading back the result…");
+      try {
+        const value = await request("/api/v1/operator/cameras/" + encodeURIComponent(cameraId) + "/video-settings", { method: "PATCH", body, signal: controller.signal, timeout: 45000 });
+        if (current(version)) accept(value, true);
+      } catch (error) { if (current(version) && error.name !== "AbortError") message("camera-video-message", errorText(error), true); }
+      finally {
+        body.settings_handle = "";
+        if (current(version)) {
+          applying = false; busy = false;
+          const camera = state.cameras.find((item) => item.device_id === target.id);
+          if (typeof camera?.source_revision === "string") target.source = camera.source_revision;
+          controls();
+        }
+      }
+    });
+    cameraVideoSettings = {
+      close,
+      open(camera) {
+        close(); target = { id: camera.device_id, session: state.sessionEpoch, source: camera.source_revision || "" };
+        $("camera-video-target").textContent = camera.name + " · " + camera.host;
+        $("camera-video-values").hidden = true; $("camera-video-shared").hidden = true;
+        dialog.showModal(); controls(); void read();
+      },
+      authority() {
+        if (!dialog.open) return;
+        if (canManageCameras()) { controls(); return; }
+        if (!state.capabilitiesResolved) invalidate("Current permissions could not be verified. Read fresh settings after access is restored.");
+        else close();
+      },
+      selection(cameraId) { if (target && target.id !== cameraId) close(); },
+      inventory() {
+        if (!target) return;
+        const camera = state.cameras.find((item) => item.device_id === target.id);
+        if (!camera || !canManageCameras()) { close(); return; }
+        if (!applying && target.source && typeof camera.source_revision === "string" && camera.source_revision !== target.source) {
+          target.source = camera.source_revision; invalidate("This camera connection changed. Read fresh settings before applying.");
+        }
+      },
+    };
+    return cameraVideoSettings;
+  }
+  $("camera-video-button").addEventListener("click", () => {
+    const camera = currentCamera(); if (camera && canManageCameras()) cameraVideoWorkspace().open(camera);
+  });
 
   function cameraSetupType() {
     return $("camera-connection-type").value === "rtsp" ? "rtsp" : "onvif";
@@ -2318,6 +2769,9 @@
     try {
       const tested = await request(direct ? "/api/v1/operator/camera-stream-probe" : "/api/v1/operator/camera-profiles", {
         method: "POST", body: credentials, signal: controller.signal,
+        // Allow the bounded native ONVIF probe and 18-second proxy budget to finish.
+        // RTSP probe and all other API requests retain the normal 15-second limit.
+        ...(direct ? {} : { timeout: CAMERA_PROFILE_REQUEST_MS }),
       });
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
       if (typeof tested.probe_id !== "string" || !tested.probe_id || tested.probe_id.length > 256 || tested.probe_id.includes("://") ||
@@ -2415,11 +2869,30 @@
         method: "POST", body: camera, signal: controller.signal,
       });
       if (epoch !== state.sessionEpoch || setupEpoch !== state.cameraSetupEpoch) return;
+      clearCameraProbe();
+      // The connection reply is newer than any outstanding inventory read.
+      state.cameraListEpoch += 1;
+      const deviceId = created?.device_id || created?.camera?.device_id;
+      const cameraStatus = created?.camera || created;
+      if (!cameraStatus || typeof deviceId !== "string" || !deviceId || cameraStatus.device_id !== deviceId
+        || typeof cameraStatus.name !== "string" || !cameraStatus.name || typeof cameraStatus.host !== "string"
+        || updating && deviceId !== state.cameraSetupTarget
+        || cameraStatus.source_revision != null && (typeof cameraStatus.source_revision !== "string"
+          || cameraStatus.source_revision.length < 16 || cameraStatus.source_revision.length > 256)) {
+        suspendCapabilities();
+        message("add-camera-message", "The connection was updated, but the camera details could not be verified. Refresh the camera list before making another change.", true);
+        return;
+      }
+      // Replace the whole row so a legacy reply cannot retain an old revision.
+      cameraVideoSettings?.close();
+      const connected = { ...cameraStatus };
+      state.cameras = state.cameras.some((item) => item.device_id === deviceId)
+        ? state.cameras.map((item) => item.device_id === deviceId ? connected : item)
+        : [...state.cameras, connected];
+      renderCameras();
       closeAddCamera();
       const completedEpoch = state.cameraSetupEpoch;
       const navigationEpoch = state.navigationEpoch;
-      const deviceId = created.device_id || created.camera?.device_id;
-      const cameraStatus = created.camera || created;
       state.cameraConnectionNotice = deviceId || null;
       const connection = cameraConnectionStatus(cameraStatus, state.workerStatus);
       notice(connection.text, connection.error, "camera_connection");

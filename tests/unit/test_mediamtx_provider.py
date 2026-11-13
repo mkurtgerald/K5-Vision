@@ -216,6 +216,130 @@ def test_failed_explicit_version_check_revokes_previous_admission() -> None:
     asyncio.run(scenario())
 
 
+def test_concurrent_health_and_history_share_one_native_version_probe() -> None:
+    started, release = threading.Event(), threading.Event()
+    routes = []
+
+    def request(native, *_):
+        path = urlsplit(native.full_url).path
+        routes.append(path)
+        if path == "/v3/info":
+            started.set()
+            assert release.wait(2)
+            return _info()
+        if path == "/list":
+            return b"[]"
+        raise AssertionError("Unexpected native media request")
+
+    async def scenario():
+        provider = _provider(request)
+        health = asyncio.create_task(provider.info())
+        await asyncio.wait_for(asyncio.to_thread(started.wait), 1)
+        parallel_health = asyncio.create_task(provider.info())
+        history = asyncio.create_task(provider.playback_spans(_BINDING))
+        await asyncio.sleep(0.03)
+        assert routes == ["/v3/info"]
+        assert not any(task.done() for task in (health, parallel_health, history))
+        assert provider._version_admitted is False
+        release.set()
+        first, second, spans = await asyncio.wait_for(
+            asyncio.gather(health, parallel_health, history), 2
+        )
+        assert first.version == second.version == MEDIAMTX_VERSION
+        assert spans == ()
+        assert routes == ["/v3/info", "/list"]
+        # A later explicit health check is not cached: it verifies the
+        # running native worker's version again after the shared probe.
+        await provider.info()
+        assert routes == ["/v3/info", "/list", "/v3/info"]
+        await provider.aclose()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+
+
+def test_native_read_admission_survives_unrelated_default_executor_saturation() -> None:
+    """History may not queue behind unrelated camera/storage thread-pool jobs."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    occupied, release = threading.Event(), threading.Event()
+    routes = []
+
+    def hold_default_executor():
+        occupied.set()
+        assert release.wait(10)
+
+    def request(native, *_):
+        path = urlsplit(native.full_url).path
+        routes.append(path)
+        if path == "/v3/info":
+            return _info()
+        assert path == "/list"
+        return b"[]"
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        pool = ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(pool)
+        blocker = loop.run_in_executor(None, hold_default_executor)
+        provider = _provider(request, timeout_seconds=2.0)
+        try:
+            for _ in range(100):
+                if occupied.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert occupied.is_set()
+            assert await asyncio.wait_for(provider.playback_spans(_BINDING), 1.5) == ()
+            assert routes == ["/v3/info", "/list"]
+        finally:
+            release.set()
+            await blocker
+            await provider.aclose()
+            pool.shutdown(wait=True)
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_version_waiter_and_shutdown_join_native_probe() -> None:
+    started, release = threading.Event(), threading.Event()
+
+    def request(native, *_):
+        assert urlsplit(native.full_url).path == "/v3/info"
+        started.set()
+        assert release.wait(2)
+        return _info()
+
+    async def scenario():
+        provider = _provider(request)
+        first = asyncio.create_task(provider.info())
+        await asyncio.wait_for(asyncio.to_thread(started.wait), 1)
+        cancelled = asyncio.create_task(provider.info())
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        assert not first.done()
+        shutdown = asyncio.create_task(provider.aclose())
+        await asyncio.sleep(0.03)
+        assert not shutdown.done()
+        release.set()
+        with pytest.raises(MediaWorkerError) as raised:
+            await first
+        assert raised.value.code is MediaWorkerErrorCode.UNAVAILABLE
+        await asyncio.wait_for(shutdown, 2)
+        assert not provider._requests
+        with pytest.raises(MediaWorkerError) as closed:
+            await provider.info()
+        assert closed.value.code is MediaWorkerErrorCode.UNAVAILABLE
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+
+
 @pytest.mark.parametrize("field", ["tracks2", "readers"])
 @pytest.mark.parametrize("malformed", [False, 0, {}, ""])
 def test_malformed_empty_path_collections_are_not_coerced_to_lists(field, malformed) -> None:
@@ -303,6 +427,9 @@ def test_timeout_keeps_worker_slot_until_real_read_completes() -> None:
         # completion before asserting the capacity slot is reusable on Windows.
         await asyncio.wait_for(asyncio.shield(pending[0]), timeout=2)
         assert not provider._requests
+        # The 20ms deadline above forces a timeout; it is not a Windows thread
+        # scheduling guarantee for the subsequent healthy capacity-reuse check.
+        provider._timeout_seconds = 1
         assert (await provider.info()).version == MEDIAMTX_VERSION
 
     asyncio.run(scenario())
@@ -346,8 +473,18 @@ def _source(uri="rtsp://user:private@127.0.0.1/live") -> MediaMTXSource:
     return MediaMTXSource(_BINDING, device, uri)
 
 
-def test_configuration_is_enrolled_only_private_and_windows_compatible() -> None:
-    source = _source()
+@pytest.mark.parametrize("protocol", [DeviceProtocol.ONVIF, DeviceProtocol.RTSP])
+@pytest.mark.parametrize("recording_enabled", [False, True])
+def test_configuration_is_enrolled_only_private_and_windows_compatible(
+    protocol, recording_enabled
+) -> None:
+    original = _source()
+    source = MediaMTXSource(
+        original.binding,
+        original.device.model_copy(update={"protocols": {protocol}}),
+        original.source_uri,
+        recording_enabled=recording_enabled,
+    )
     config = json.loads(
         generate_mediamtx_configuration(
             site_id="poc-site",
@@ -359,7 +496,9 @@ def test_configuration_is_enrolled_only_private_and_windows_compatible() -> None
     assert list(config["paths"]) == [_BINDING.path_name]
     path = config["paths"][_BINDING.path_name]
     assert path["source"] == source.source_uri
-    assert path["record"] and not path["sourceOnDemand"]
+    assert path["record"] is recording_enabled
+    assert path["sourceOnDemand"] is False
+    assert config["hlsAlwaysRemux"] is True
     assert path["recordFormat"] == "fmp4" and path["recordDeleteAfter"] == "0s"
     assert path["useAbsoluteTimestamp"] is False
     assert path["recordPath"].startswith(r"C:\Users\Owner\K5Recordings/%path/")
@@ -753,5 +892,282 @@ def test_close_joins_native_read_after_sole_snapshot_waiter_cancels_without_late
         await provider.aclose()
         assert not provider._requests and not provider._snapshots
         assert routes == ["/v3/info", "/v3/paths/list"]
+
+    asyncio.run(scenario())
+
+
+class _RefreshWorker:
+    def __init__(self, *, blocked=(2,), replies=None):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+        self.blocked = blocked
+        self.replies = replies or {}
+        self.info_calls = 0
+        self.list_calls = 0
+
+    def __call__(self, request, *_):
+        if not request.full_url.endswith("/v3/info"):
+            with self.lock:
+                self.list_calls += 1
+            return b"[]"
+        with self.lock:
+            self.info_calls += 1
+            index = self.info_calls
+        if index in self.blocked:
+            self.entered.set()
+            assert self.release.wait(5), "Controlled health request was not released"
+        reply = self.replies.get(index, _info())
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+
+async def _refresh_entered(worker):
+    deadline = asyncio.get_running_loop().time() + 2
+    while not worker.entered.is_set() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.001)
+    assert worker.entered.is_set()
+
+
+def test_warm_history_uses_verified_worker_while_healthy_refresh_is_pending():
+    async def scenario():
+        worker = _RefreshWorker(blocked=(2, 3))
+        provider = _provider(worker)
+        await provider.info()
+        health = asyncio.create_task(provider.info())
+        try:
+            await _refresh_entered(worker)
+            # A second admission would block on the same healthy fixture gate.
+            spans = await asyncio.wait_for(provider.playback_spans(_BINDING), 0.5)
+            assert spans == ()
+            assert worker.info_calls == 2 and worker.list_calls == 1
+            assert provider._version_admitted
+        finally:
+            worker.release.set()
+            await asyncio.gather(health, return_exceptions=True)
+            await provider.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "body,code",
+    [
+        (b"[]", MediaWorkerErrorCode.INVALID_RESPONSE),
+        (
+            b'{"version":"v9","started":"2026-10-11T12:00:00Z"}',
+            MediaWorkerErrorCode.VERSION_MISMATCH,
+        ),
+        (b'{"version":"v1.21.2","started":"naive"}', MediaWorkerErrorCode.INVALID_RESPONSE),
+        (TimeoutError(), MediaWorkerErrorCode.TIMEOUT),
+        (OSError(), MediaWorkerErrorCode.UNAVAILABLE),
+    ],
+)
+def test_failed_warm_refresh_revokes_admission_before_any_later_history(body, code):
+    async def scenario():
+        worker = _RefreshWorker(blocked=(), replies={2: body, 3: body})
+        provider = _provider(worker)
+        await provider.info()
+        try:
+            with pytest.raises(MediaWorkerError) as observed:
+                await provider.info()
+            assert observed.value.code is code
+            assert not provider._version_admitted
+            with pytest.raises(MediaWorkerError) as later:
+                await provider.playback_spans(_BINDING)
+            assert later.value.code is code
+            assert worker.info_calls == 3 and worker.list_calls == 0
+        finally:
+            await provider.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_warm_refresh_revokes_cache_and_keeps_native_read_owned_until_close():
+    async def scenario():
+        worker = _RefreshWorker()
+        provider = _provider(worker)
+        await provider.info()
+        health = asyncio.create_task(provider.info())
+        closing = None
+        try:
+            await _refresh_entered(worker)
+            health.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await health
+            assert not provider._version_admitted
+            assert len(provider._requests) == 1
+            closing = asyncio.create_task(provider.aclose())
+            await asyncio.sleep(0.01)
+            assert not closing.done()
+            worker.release.set()
+            await closing
+            assert not provider._version_admitted and not provider._requests
+            with pytest.raises(MediaWorkerError) as closed:
+                await provider.info()
+            assert closed.value.code is MediaWorkerErrorCode.UNAVAILABLE
+            assert worker.info_calls == 2
+        finally:
+            worker.release.set()
+            await asyncio.gather(health, return_exceptions=True)
+            if closing is not None:
+                await asyncio.gather(closing, return_exceptions=True)
+            await provider.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_close_during_warm_refresh_prevents_its_late_success_from_readmitting():
+    async def scenario():
+        worker = _RefreshWorker()
+        provider = _provider(worker)
+        await provider.info()
+        health = asyncio.create_task(provider.info())
+        closing = None
+        try:
+            await _refresh_entered(worker)
+            closing = asyncio.create_task(provider.aclose())
+            await asyncio.sleep(0.01)
+            assert not closing.done()
+            worker.release.set()
+            with pytest.raises(MediaWorkerError) as stopped:
+                await health
+            assert stopped.value.code is MediaWorkerErrorCode.UNAVAILABLE
+            await closing
+            assert not provider._version_admitted and not provider._requests
+        finally:
+            worker.release.set()
+            await asyncio.gather(health, return_exceptions=True)
+            if closing is not None:
+                await asyncio.gather(closing, return_exceptions=True)
+            await provider.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("verified", [False, True])
+def test_local_busy_refresh_keeps_current_admission_and_failure_revision(verified):
+    async def scenario():
+        entered, release = threading.Event(), threading.Event()
+        count = 0
+        lock = threading.Lock()
+
+        def worker(request, *_):
+            nonlocal count
+            if request.full_url.endswith("/v3/info"):
+                return _info()
+            with lock:
+                count += 1
+                if count == 4:
+                    entered.set()
+            assert release.wait(5), "Controlled worker reads were not released"
+            return b"[]"
+
+        provider = _provider(worker)
+        held = []
+        try:
+            if verified:
+                await provider.info()
+            revision = getattr(provider, "_admission_revision", 0)
+            held = [
+                asyncio.create_task(provider._get(provider._playback_origin, "/list?path=test"))
+                for _ in range(4)
+            ]
+            deadline = asyncio.get_running_loop().time() + 2
+            while not entered.is_set() and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.001)
+            assert entered.is_set() and len(provider._requests) == 4
+            with pytest.raises(MediaWorkerError) as busy:
+                await provider.info()
+            assert busy.value.code is MediaWorkerErrorCode.BUSY
+            assert provider._version_admitted is verified
+            assert getattr(provider, "_admission_revision", 0) == revision
+            release.set()
+            assert await asyncio.gather(*held) == [[], [], [], []]
+        finally:
+            release.set()
+            await asyncio.gather(*held, return_exceptions=True)
+            await provider.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_warm_waiter_invalidates_shared_probe_without_abandoning_native_read():
+    async def scenario():
+        worker = _RefreshWorker()
+        provider = _provider(worker)
+        await provider.info()
+        health = asyncio.create_task(provider.info())
+        peer = None
+        try:
+            await _refresh_entered(worker)
+            peer = asyncio.create_task(provider.info())
+            await asyncio.sleep(0)
+            health.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await health
+            assert not provider._version_admitted
+            assert not peer.done() and len(provider._requests) == 1
+            assert worker.info_calls == 2
+            worker.release.set()
+            with pytest.raises(MediaWorkerError) as stale:
+                await peer
+            assert stale.value.code is MediaWorkerErrorCode.UNAVAILABLE
+            assert not provider._version_admitted
+            await provider.info()
+            assert provider._version_admitted and worker.info_calls == 3
+            assert await provider.playback_spans(_BINDING) == ()
+        finally:
+            worker.release.set()
+            await asyncio.gather(health, *(() if peer is None else (peer,)), return_exceptions=True)
+            await provider.aclose()
+            assert not provider._requests
+
+    asyncio.run(scenario())
+
+
+def test_old_completed_waiter_cancellation_cannot_revoke_newer_verified_observation(monkeypatch):
+    async def scenario():
+        worker = _RefreshWorker(blocked=())
+        provider = _provider(worker)
+        await provider.info()
+        original_shield = asyncio.shield
+        result_ready = asyncio.Event()
+        finish_waiter = asyncio.Event()
+        delayed_owner = None
+
+        async def delayed_shield(awaitable):
+            nonlocal delayed_owner
+            if (
+                delayed_owner is None
+                and isinstance(awaitable, asyncio.Task)
+                and awaitable.get_coro().__name__ == "_check_info"
+            ):
+                delayed_owner = awaitable
+            result = await original_shield(awaitable)
+            if awaitable is delayed_owner:
+                result_ready.set()
+                await finish_waiter.wait()
+            return result
+
+        monkeypatch.setattr(mediamtx_provider.asyncio, "shield", delayed_shield)
+        old = asyncio.create_task(provider.info())
+        try:
+            await asyncio.wait_for(result_ready.wait(), 2)
+            # The worker response completed, but its caller has not resumed.
+            await provider.info()
+            revision = provider._admission_revision
+            assert worker.info_calls == 3 and provider._version_admitted
+            old.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await old
+            assert provider._version_admitted and provider._admission_revision == revision
+            assert await provider.playback_spans(_BINDING) == ()
+        finally:
+            finish_waiter.set()
+            await asyncio.gather(old, return_exceptions=True)
+            await provider.aclose()
+            assert not provider._requests
 
     asyncio.run(scenario())

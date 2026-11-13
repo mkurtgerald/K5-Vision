@@ -1,8 +1,11 @@
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 ROOT = Path(__file__).resolve().parents[1]
 ALPHA = ROOT / "scripts" / "windows-alpha"
@@ -222,6 +225,43 @@ def test_windows_alpha_installer_installs_reviewed_runtime_dependencies() -> Non
     assert "-m pip install --force-reinstall --no-deps $packageUri" in text
     assert "-m pip check" in text
     assert "K5 Vision Alpha runtime dependency verification PASS." in text
+
+
+def test_reviewed_alpha_runtime_covers_project_dependency_versions() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    pins = {}
+    for line in (ALPHA / "runtime-requirements.txt").read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith("#"):
+            dependency = Requirement(line)
+            pins[canonicalize_name(dependency.name)] = next(iter(dependency.specifier)).version
+    for declared in project["project"]["dependencies"]:
+        dependency = Requirement(declared)
+        installed = pins.get(canonicalize_name(dependency.name))
+        assert installed is not None, (
+            f"Missing reviewed Alpha runtime dependency: {dependency.name}"
+        )
+        assert installed in dependency.specifier
+
+
+def test_alpha_runtime_probe_stops_after_each_failed_native_command() -> None:
+    workflow = (ROOT / ".github/workflows/windows-alpha-script-smoke.yml").read_text(
+        encoding="utf-8"
+    )
+    setup = workflow.split("Verify clean Windows alpha runtime dependency install", 1)[1].split(
+        "Run Windows alpha boundary regressions", 1
+    )[0]
+    commands = (
+        "python -m venv $probe",
+        "& $probePython -m pip install --upgrade pip",
+        "& $probePython -m pip install --requirement "
+        "scripts\\windows-alpha\\runtime-requirements.txt",
+        "& $probePython -m pip install --no-deps .",
+        "& $probePython -m pip check",
+        "& $probePython -m k5vision.cli --version",
+    )
+    for command in commands:
+        following = setup.split(command, 1)[1].lstrip().splitlines()[0]
+        assert following.startswith('if ($LASTEXITCODE -ne 0) { throw "')
 
 
 def test_synthetic_source_owns_partial_startup_until_successful_return() -> None:

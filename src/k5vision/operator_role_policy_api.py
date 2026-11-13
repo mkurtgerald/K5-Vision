@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
+from dataclasses import dataclass
 from uuid import UUID
 
 from fastapi import Depends, HTTPException, Query, Response
@@ -46,6 +47,79 @@ def require_current_permission(app, account):
     permission = _REQUEST_PERMISSION.get()
     if permission is not None:
         require_permission(app, account, permission)
+
+
+def current_request_permission():
+    """Return the finite route classification without reading durable state."""
+    return _REQUEST_PERMISSION.get()
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentPermissionSnapshot:
+    account_id: UUID
+    role: UserRole
+    required: str
+    permissions: frozenset[str]
+    policy: object | None
+    generation: int | None
+
+
+class PermissionSnapshotChanged(HTTPException):
+    """Only a completed local policy update invalidated this positive read."""
+
+    def __init__(self):
+        super().__init__(503, "roles_unavailable")
+
+
+def current_permission_snapshot(app, account):
+    """Read a single request's durable role authority on its owned worker."""
+    required = _REQUEST_PERMISSION.get()
+    if required is None:
+        return None
+    policy = getattr(app.state, "operator_roles", None)
+    try:
+        permissions, generation = (
+            (BASE_PERMISSIONS[account.role], None)
+            if policy is None
+            else policy.permission_snapshot(account)
+        )
+    except RolePolicyError:
+        raise HTTPException(503, "roles_unavailable") from None
+    return CurrentPermissionSnapshot(
+        account.id, account.role, required, frozenset(permissions), policy, generation
+    )
+
+
+def validate_current_permission_snapshot(app, account, snapshot):
+    """Check one completed read after awaits, without file I/O or lock waits."""
+    required = _REQUEST_PERMISSION.get()
+    if required is None:
+        if snapshot is not None:
+            raise HTTPException(503, "roles_unavailable")
+        return
+    policy = getattr(app.state, "operator_roles", None)
+    if (
+        not isinstance(snapshot, CurrentPermissionSnapshot)
+        or snapshot.account_id != account.id
+        or snapshot.role is not account.role
+        or snapshot.required != required
+        or snapshot.policy is not policy
+    ):
+        raise HTTPException(503, "roles_unavailable")
+    if policy is not None:
+        generation = policy.permission_generation
+        if snapshot.generation != generation:
+            if (
+                type(snapshot.generation) is int
+                and type(generation) is int
+                and snapshot.generation < generation
+                and generation == policy.completed_permission_generation
+                and required in snapshot.permissions
+            ):
+                raise PermissionSnapshotChanged()
+            raise HTTPException(503, "roles_unavailable")
+    if required not in snapshot.permissions:
+        raise HTTPException(403, "Insufficient operator permission")
 
 
 class _Role(BaseModel):
@@ -130,6 +204,8 @@ def request_permission(path: str, method: str):
                 return "recording.manage"
             if operation == "time":
                 return "time.manage"
+            if operation == "video-settings":
+                return "cameras.manage"
             if operation == "analytics" and method not in {"GET", "HEAD"}:
                 return "analytics.manage"
         if method not in {"GET", "HEAD"} and (len(parts) == 1 or parts[-1] != "media-session"):

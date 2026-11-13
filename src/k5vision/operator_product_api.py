@@ -7,6 +7,7 @@ import hashlib
 import ipaddress
 import math
 import re
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,10 +20,12 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress, StrictBool
+from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from k5vision.domain.devices import Device, DeviceCreate, DeviceProtocol
+from k5vision.domain.streams import VideoCodec
 from k5vision.domain.users import UserAccount, UserRole
 from k5vision.media.mediamtx_config import MediaMTXSource
 from k5vision.media.mediamtx_provider import (
@@ -326,6 +329,84 @@ def _media_selection(uri: str) -> str:
     return path
 
 
+class _NativePersonWarmupGate:
+    """Compile the optional sealed model only after camera setup has been quiet.
+
+    A busy installer may enroll several ONVIF cameras consecutively. Starting
+    CPU-heavy native model compilation after camera one can contend with camera
+    two's credential/profile deadline. Reset a six-second quiet interval on each
+    enrollment; keep optional view compilation behind the first recorded-person
+    event so a primed recorder still owns the first real-frame inference budget.
+    Only a timer is retained, never camera data, credentials or human identity.
+    """
+
+    def __init__(
+        self,
+        analytics,
+        *,
+        quiet_seconds: float = 6.0,
+        defer_preparation: Callable[[], bool] | None = None,
+    ):
+        if not 0 < quiet_seconds <= 30:
+            raise ValueError("Native preparation quiet period is invalid")
+        self._analytics = analytics
+        self._quiet_seconds = quiet_seconds
+        self._defer_preparation = defer_preparation
+        self._handle: asyncio.TimerHandle | None = None
+        self._started = False
+        self._closed = False
+
+    def schedule(self, *, enrollment: bool = False) -> None:
+        if self._closed or self._started:
+            return
+        if self._handle is not None:
+            if not enrollment:
+                return
+            self._handle.cancel()
+        self._handle = asyncio.get_running_loop().call_later(self._quiet_seconds, self._begin)
+
+    def _begin(self) -> None:
+        scheduled, self._handle = self._handle, None
+        if scheduled is not None:
+            scheduled.cancel()
+        if self._closed or self._started:
+            return
+        if self._defer_preparation is not None:
+            try:
+                waiting_for_first_event = self._defer_preparation()
+            except Exception:
+                # Optional preparation cannot consume native CPU while the
+                # recorder's authoritative event readiness is unknown.
+                waiting_for_first_event = True
+            if waiting_for_first_event:
+                # A requested view still uses its normal bounded cold path.
+                # The timer retains no camera, credentials, pixels or source.
+                self._handle = asyncio.get_running_loop().call_later(2.0, self._begin)
+                return
+        self._started = True
+        self._analytics.start_preparing()
+
+    def on_first_recorded_person_event(self) -> None:
+        """Start sealed preparation as soon as recording admits a real person.
+
+        Do not wait for the next timer poll. The installed browser's immutable
+        sampled-frame deadline is independent of recorder event detection.
+        """
+        if self._closed or self._started:
+            return
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+        self._started = True
+        self._analytics.start_preparing()
+
+    def close(self) -> None:
+        self._closed = True
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+
+
 def install_operator_product_api(
     app: FastAPI,
     *,
@@ -334,6 +415,7 @@ def install_operator_product_api(
     public_port: int,
     analytics=None,
     analytics_status: str = "disabled",
+    prepare_native_person_on_camera: bool = False,
     state_root: Path | None = None,
 ) -> None:
     """Install the local product contract without exposing execution credentials."""
@@ -341,6 +423,10 @@ def install_operator_product_api(
         raise ValueError("operator public port is invalid")
     if analytics_status not in {"disabled", "configured", "unavailable"}:
         raise ValueError("operator person view status is invalid")
+    if type(prepare_native_person_on_camera) is not bool or (
+        prepare_native_person_on_camera and analytics is None
+    ):
+        raise ValueError("operator person preparation configuration is invalid")
     person_status = "configured" if analytics is not None else analytics_status
     registry = app.state.device_registry
     users = app.state.user_registry
@@ -351,18 +437,34 @@ def install_operator_product_api(
         raise ValueError("operator accounts belong to another site")
     mutations = asyncio.Lock()
     person_slots = asyncio.Semaphore(4)
+    recorder_events = getattr(app.state, "operator_events", None)
+    defer_preparation = getattr(recorder_events, "defer_view_preparation", None)
+    native_person_preparation = (
+        _NativePersonWarmupGate(analytics, defer_preparation=defer_preparation)
+        if prepare_native_person_on_camera
+        else None
+    )
+    app.state.operator_person_preparation = native_person_preparation
+    if native_person_preparation is not None:
+        register_event = getattr(recorder_events, "notify_on_first_recorded_person_event", None)
+        if callable(register_event):
+            register_event(native_person_preparation.on_first_recorded_person_event)
     seen_live: set[UUID] = set()
     connection_started: dict[UUID, float] = {}
     recording_started: dict[UUID, float] = {}
     recording_changed: dict[UUID, float] = {}
+    video_settings_vault = None
     media_generation = getattr(service, "media_generation", 0)
     app.add_middleware(_BoundedProductBody)
     app.add_middleware(_ProductRoutesOnly)
     from k5vision.operator_role_policy_api import (
         OperatorPermissionContext,
+        PermissionSnapshotChanged,
+        current_permission_snapshot,
+        current_request_permission,
         effective_permissions,
         install_operator_role_api,
-        require_current_permission,
+        validate_current_permission_snapshot,
     )
 
     app.add_middleware(OperatorPermissionContext)
@@ -381,7 +483,32 @@ def install_operator_product_api(
             return JSONResponse({"detail": detail}, status_code=422)
         return await previous_validation_handler(request, exc)
 
-    async def authenticate(token: str) -> tuple[UserAccount, str]:
+    authority_read_slots = asyncio.Semaphore(4)
+
+    async def authority_read(operation):
+        # Durable policy admission can wait on a filesystem/registry lock.
+        # Keep it off the ASGI loop, retain a bounded slot until the actual
+        # thread completes, and drain even repeatedly cancelled requests.
+        async with authority_read_slots:
+            worker = asyncio.create_task(asyncio.to_thread(operation))
+            cancelled = False
+            while True:
+                try:
+                    result = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    if worker.cancelled():
+                        raise
+                    cancelled = True
+                except Exception:
+                    if cancelled:
+                        raise asyncio.CancelledError from None
+                    raise
+                else:
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    return result
+
+    async def authenticate_once(token: str) -> tuple[UserAccount, str]:
         principal = await sessions.resolve(token)
         if principal is None:
             raise _unauthorized()
@@ -389,15 +516,40 @@ def install_operator_product_api(
         # The registry shares a bounded SQLite connection with administration.
         # Its synchronous lock and busy timeout must never block the ASGI loop
         # while recording, history, and live requests are being served.
-        def current_authority() -> tuple[UserAccount | None, bool]:
+        def current_authority():
             current = users.get(principal.id)
             credential_active = (
                 current is not None and users.credential_status(current.id) == "active"
             )
-            return current, credential_active
+            permission = None
+            permission_error = None
+            if (
+                current is not None
+                and current.enabled
+                and current.role in _READ_ROLES
+                and current.role is principal.role
+                and credential_active
+            ):
+                try:
+                    permission = current_permission_snapshot(app, current)
+                except HTTPException as error:
+                    permission_error = error
+                if current_request_permission() is not None:
+                    # A durable role read can outlive an account change.
+                    # Account and credential status must follow that read too.
+                    current = users.get(principal.id)
+                    credential_active = (
+                        current is not None and users.credential_status(current.id) == "active"
+                    )
+            return current, credential_active, permission, permission_error
 
         try:
-            current, credential_active = await asyncio.to_thread(current_authority)
+            result = (
+                await asyncio.to_thread(current_authority)
+                if current_request_permission() is None
+                else await authority_read(current_authority)
+            )
+            current, credential_active, permission, permission_error = result
         except UserRegistryStorageError:
             raise HTTPException(503, "Operator identity unavailable") from None
         if (
@@ -411,8 +563,40 @@ def install_operator_product_api(
         from k5vision.operator_audit import set_audit_actor
 
         set_audit_actor(current)
-        require_current_permission(app, current)
+        if permission_error is not None:
+            raise permission_error
+        validate_current_permission_snapshot(app, current, permission)
+        if permission is not None:
+            # A logout, replacement login, password/role change or disable may
+            # have completed while the policy read was in flight. Resolution
+            # checks both durable credential identity and the issued record.
+            final = await sessions.resolve(token)
+            if (
+                final is None
+                or not final.enabled
+                or final.id != current.id
+                or final.role is not current.role
+            ):
+                raise _unauthorized()
+            # The role may have changed while that final resolution awaited
+            # its own registry read. No positive policy cache survives here.
+            validate_current_permission_snapshot(app, final, permission)
         return current, token
+
+    async def authenticate(token: str) -> tuple[UserAccount, str]:
+        # A separate role edit can land between this request's durable policy
+        # read and final session resolution. Re-admit from current durable
+        # account, credential, session and policy state instead of feeding a
+        # transient 503 to an otherwise authorized media decoder. Two fresh
+        # attempts cover updates at either validation boundary; continued
+        # changes remain unavailable rather than extending work indefinitely.
+        for attempt in range(3):
+            try:
+                return await authenticate_once(token)
+            except PermissionSnapshotChanged:
+                if attempt == 2:
+                    raise HTTPException(503, "roles_unavailable") from None
+        raise HTTPException(503, "roles_unavailable")
 
     async def require_session(request: Request) -> tuple[UserAccount, str]:
         values = request.headers.getlist("authorization")
@@ -557,6 +741,9 @@ def install_operator_product_api(
             },
             "connection_error": None,
             "analytics_status": person_status,
+            "source_revision": None
+            if video_settings_vault is None
+            else video_settings_vault.source_revision(source),
         }
         if service.status() not in {"ready", "disk_full"}:
             if not source.recording_enabled:
@@ -774,7 +961,17 @@ def install_operator_product_api(
     @app.get(_PREFIX + "/status", tags=["operator"])
     async def operator_status(response: Response, _session: tuple[UserAccount, str] = read_session):
         response.headers["Cache-Control"] = "no-store"
-        return {**service.diagnostics(), "analytics_status": person_status}
+        report = {**service.diagnostics(), "analytics_status": person_status}
+        if prepare_native_person_on_camera and analytics is not None:
+            # Reveal only the finite sealed-worker phase to an authenticated
+            # operator. Never expose local model paths, exceptions or pixels.
+            phase = getattr(analytics, "preparation_phase", "unknown")
+            report["person_preparation_phase"] = (
+                phase
+                if phase in {"not_requested", "preparing", "ready", "failed", "closed"}
+                else "unknown"
+            )
+        return report
 
     @app.get(_PREFIX + "/cameras", tags=["operator"])
     async def list_cameras(response: Response, session: tuple[UserAccount, str] = read_session):
@@ -792,7 +989,7 @@ def install_operator_product_api(
         current, _ = await authenticate(session[1])
         selected = await asyncio.to_thread(permitted_selections, current)
 
-        return {
+        result = {
             "cameras": [
                 await camera_view(
                     source,
@@ -803,6 +1000,11 @@ def install_operator_product_api(
             "worker_status": service.status(),
             "capabilities": await asyncio.to_thread(capabilities, current),
         }
+        # Do not compete with consecutive ONVIF credential/profile probes.
+        # The optional sealed model starts after a quiet camera setup interval.
+        if selected and native_person_preparation is not None:
+            native_person_preparation.schedule()
+        return result
 
     async def enroll_camera_source(
         *,
@@ -909,7 +1111,12 @@ def install_operator_product_api(
                 raise HTTPException(409, "Camera capacity reached") from None
             except (DeviceRegistryStorageError, RuntimeError, OSError, ValueError):
                 raise HTTPException(503, "Camera configuration unavailable") from None
-        return await camera_view(source)
+        result = await camera_view(source)
+        # A later enrollment resets the quiet period so native CPU model
+        # compilation cannot collide with the next camera's ONVIF probe.
+        if native_person_preparation is not None:
+            native_person_preparation.schedule(enrollment=True)
+        return result
 
     @app.post(_PREFIX + "/cameras", status_code=201, tags=["operator"])
     async def enroll_camera(
@@ -931,6 +1138,108 @@ def install_operator_product_api(
 
     rtsp_probes = install_operator_rtsp_api(
         app, require_admin=require_admin, authenticate=authenticate, enroll=enroll_camera_source
+    )
+
+    def video_settings_ready(source: MediaMTXSource) -> None:
+        # Check again at the protocol's immediate pre-write gate. An offline
+        # recorder must not let a camera change outlive its ability to reconcile.
+        if selection(source.binding.device_id) != source:
+            raise HTTPException(409, "video_source_changed")
+        refresh = getattr(service, "refresh_camera_source", None)
+        refresh_status = getattr(service, "camera_source_refresh_status", None)
+        if (
+            not callable(refresh)
+            or not callable(refresh_status)
+            or service.status() not in {"ready", "disk_full"}
+            or refresh_status(source.binding) != "ready"
+        ):
+            raise HTTPException(409, "video_recorder_unavailable")
+
+    async def reconcile_video_source(previous, source_uri):
+        # The API retains the mutation lock and joins this reconciliation even
+        # if the initiating request disappears after an authorized camera write.
+        video_settings_ready(previous)
+        replacement = cameras._validated_source(
+            previous.device, source_uri, previous.recording_enabled
+        )
+        if replacement.binding != previous.binding:
+            raise HTTPException(409, "video_source_changed")
+
+        async def persist():
+            # This callback must not yield or perform fallible work after the
+            # synchronous atomic store commit: the worker owns compensation.
+            cameras.upsert(previous.device, replacement.source_uri)
+
+        await service.refresh_camera_source(previous, replacement, persist=persist)
+        identifier = previous.binding.device_id
+        seen_live.discard(identifier)
+        connection_started[identifier] = monotonic()
+        recording_started.pop(identifier, None)
+        recording_changed[identifier] = monotonic()
+        snapshot = MediaWorkerErrorCode.NOT_FOUND
+        verified = False
+        previous_bytes = None
+        try:
+            async with asyncio.timeout(8):
+                while True:
+                    values = await service.provider.path_snapshot((replacement.binding,))
+                    snapshot = values.get(replacement.binding, MediaWorkerErrorCode.NOT_FOUND)
+                    if not isinstance(snapshot, MediaWorkerErrorCode):
+                        state, _ = snapshot
+                        receiving = (
+                            state.online
+                            and state.available
+                            and VideoCodec.H264 in state.video_codecs
+                            and state.inbound_bytes > 0
+                        )
+                        # A positive cumulative counter alone may be stalled.
+                        # Require new bytes across separate post-restart reads.
+                        verified = (
+                            receiving
+                            and previous_bytes is not None
+                            and state.inbound_bytes > previous_bytes
+                        )
+                        previous_bytes = state.inbound_bytes if receiving else None
+                        if verified:
+                            break
+                    else:
+                        previous_bytes = None
+                    await asyncio.sleep(0.25)
+        except (TimeoutError, MediaWorkerError):
+            pass
+        view = await camera_view(replacement, worker_snapshot=snapshot)
+        return {
+            "stream_verified": verified,
+            "stream_status": view["status"]
+            if view["status"] in {"live", "connecting"}
+            else "unavailable",
+            "recording_state": view["recording_state"],
+            "reconnect_requested": True,
+            "verification_pending": not verified,
+        }
+
+    async def commit_video_settings(previous, inspection, result):
+        return await reconcile_video_source(previous, result.source_uri)
+
+    async def reconcile_failed_video_write(previous, inspection):
+        # A lost Set reply/readback cannot establish what the camera accepted.
+        # Reacquire the saved target, without retrying or reverting camera writes.
+        await reconcile_video_source(previous, previous.source_uri)
+
+    from k5vision.operator_camera_settings_api import install_operator_camera_settings_api
+
+    video_settings_vault = install_operator_camera_settings_api(
+        app,
+        require_admin=require_admin,
+        authenticate=authenticate,
+        selection=authorized_selection,
+        mutations=mutations,
+        before_apply=video_settings_ready,
+        commit_settings=commit_video_settings,
+        reconcile_failed_write=reconcile_failed_video_write,
+    )
+    app.state.operator_camera_settings_revocation_cleanup = sessions.add_revocation_listener(
+        video_settings_vault.clear_user
     )
 
     @app.put(_PREFIX + "/cameras/{device_id}/recording", tags=["operator"])
@@ -1094,7 +1403,11 @@ def install_operator_product_api(
             if declared != expected:
                 raise HTTPException(400, "Person view length does not match geometry")
         if person_slots.locked():
-            raise HTTPException(429, "Person view capacity is busy")
+            raise HTTPException(
+                429,
+                "Person view capacity is busy",
+                headers={"X-K5-Person-Phase": "capacity"},
+            )
         await person_slots.acquire()
         body = bytearray()
         try:
@@ -1112,6 +1425,36 @@ def install_operator_product_api(
                 raise HTTPException(400, "Person view upload unavailable") from None
             if len(body) != expected:
                 raise HTTPException(400, "Person view length does not match geometry")
+            if (
+                prepare_native_person_on_camera
+                and getattr(analytics, "preparation_phase", None) == "not_requested"
+            ):
+                # An authenticated first sample must receive a bounded 429
+                # *before* optional native model compilation can starve the
+                # control-plane event loop. Starlette starts this media-free
+                # preparation only after sending the retryable response.
+                # Never retain the sampled pixels or start work after a
+                # revoked session or changed camera grant.
+                current, _ = await authenticate(session[1])
+                await asyncio.to_thread(authorized_selection, current, device_id)
+
+                async def prepare_after_response() -> None:
+                    analytics.start_preparing()
+
+                return JSONResponse(
+                    {"detail": "Person view preparation is busy"},
+                    status_code=429,
+                    headers={
+                        "X-K5-Person-Phase": "preparing",
+                        "Cache-Control": "no-store",
+                    },
+                    background=BackgroundTask(prepare_after_response),
+                )
+            if prepare_native_person_on_camera:
+                # An authorized retry can recover one failed, media-free
+                # compilation without awaiting it inside the HTTP request.
+                analytics.start_preparing()
+            preparing_at_submission = bool(getattr(analytics, "preparation_pending", False))
             try:
                 result = await analytics.infer(
                     owner_id=_analytics_owner(session[1]),
@@ -1128,6 +1471,17 @@ def install_operator_product_api(
                 raise HTTPException(503, "Person view unavailable") from None
             current, _ = await authenticate(session[1])
             await asyncio.to_thread(authorized_selection, current, device_id)
+            if result.status == "busy" and (
+                preparing_at_submission or getattr(analytics, "preparation_pending", False)
+            ):
+                # A native compilation in progress is not a successful sampled
+                # detection. The browser retries HTTP 429 while the existing
+                # installed box deadline and camera-policy checks remain intact.
+                raise HTTPException(
+                    429,
+                    "Person view preparation is busy",
+                    headers={"X-K5-Person-Phase": "preparing"},
+                )
             response.headers["Cache-Control"] = "no-store"
             return value
         finally:
@@ -1170,6 +1524,7 @@ def install_operator_product_api(
         if separator and scheme.lower() == "bearer" and _SESSION_TOKEN.fullmatch(token) is not None:
             onvif_probes.clear_token(token)
             rtsp_probes.clear_token(token)
+            video_settings_vault.clear_token(token)
         if (
             analytics is not None
             and separator

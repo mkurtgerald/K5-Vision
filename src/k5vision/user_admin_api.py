@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from functools import partial
 from hmac import compare_digest
 from math import ceil
 from os import environ
@@ -301,6 +304,17 @@ def install_user_admin_api(
     # cannot stall recording control, health checks or other browser requests.
     # Bound in-flight verifications as well as the existing login rate.
     login_verification_slots = asyncio.Semaphore(2)
+    # Keep password hashing and post-issue authority checks off the shared
+    # asyncio worker pool used by cameras, history, audits and integrations.
+    # Retain the existing two-verification admission limit and scrypt settings.
+    login_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="k5-login")
+    application.state.user_login_executor = login_executor
+
+    async def login_worker(operation, *args, **kwargs):
+        return await asyncio.get_running_loop().run_in_executor(
+            login_executor, copy_context().run, partial(operation, *args, **kwargs)
+        )
+
     application.add_middleware(_BoundedUserRequestBody, max_bytes=max_request_bytes)
     application.state.user_registry = registry
     application.state.user_session_manager = session_manager
@@ -541,13 +555,11 @@ def install_user_admin_api(
     async def login(payload: UserLogin, response: Response) -> UserSessionIssue:
         response.headers["Cache-Control"] = "no-store"
         security = getattr(application.state, "operator_identity_security", None)
-        started_epoch = (
-            None if security is None else await asyncio.to_thread(security.primary_started)
-        )
+        started_epoch = None if security is None else await login_worker(security.primary_started)
         try:
             registry = require_registry()
             async with login_verification_slots:
-                verified = await asyncio.to_thread(
+                verified = await login_worker(
                     registry.verify_password_snapshot,
                     username=payload.username,
                     password=payload.password,
@@ -574,7 +586,7 @@ def install_user_admin_api(
             )
 
             try:
-                primary_epoch = await asyncio.to_thread(
+                primary_epoch = await login_worker(
                     security.password_authenticated,
                     account,
                     credential_version,
@@ -593,7 +605,7 @@ def install_user_admin_api(
         session_token, expires_at = await session_manager.issue(
             account, credential_version=credential_version
         )
-        current = await session_manager.resolve(session_token)
+        current = await session_manager.resolve(session_token, executor=login_executor)
         if security is not None:
             try:
                 # Durable authority and MFA-state reads may block on the user
@@ -603,7 +615,7 @@ def install_user_admin_api(
                     security.validate_primary_proof(account, credential_version, primary_epoch)
                     return security.store.status(account.id)["mfa_enabled"]
 
-                factor_enabled = await asyncio.to_thread(verify_issued_session)
+                factor_enabled = await login_worker(verify_issued_session)
             except AccountSecurityUnavailable:
                 await session_manager.revoke(session_token)
                 raise HTTPException(503, "Account security unavailable") from None

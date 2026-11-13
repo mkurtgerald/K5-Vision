@@ -32,9 +32,12 @@ RestartApplications=no
 UninstallDisplayIcon={app}\K5Vision.exe
 OutputDir={#OutputRoot}
 OutputBaseFilename=K5VisionSetup
-; Favor fast, low-memory extraction for the offline Windows setup; all installed payload hashes remain verified.
+; The native guard is extracted by InitializeSetup *before* the first wizard page.
+; Independent ZIP blocks avoid inflating the entire 200+ MB payload just to
+; reach that guard during an upgrade/reversal. The same sealed-file SHA/ACL
+; admission still runs before install success; no integrity check is skipped.
 Compression=zip/7
-SolidCompression=yes
+SolidCompression=no
 LicenseFile={#PayloadRoot}\licenses\INSTALLATION-LICENSE.txt
 
 [Tasks]
