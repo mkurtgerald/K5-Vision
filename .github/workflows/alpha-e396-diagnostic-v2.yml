@@ -1,0 +1,122 @@
+name: Supplemental frozen Alpha diagnosis e396793 v2
+
+on:
+  pull_request:
+    types: [opened]
+    branches: [codex/beta-integration-20261112]
+    paths: [.github/workflows/alpha-e396-diagnostic-v2.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-frozen-alpha:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact frozen candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: e39679357a943174dd29a0c8c5594bcc134146d3
+          path: candidate
+          persist-credentials: false
+
+      - name: Checkout separate diagnostic harness identity
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: harness
+          persist-credentials: false
+
+      - name: Admit frozen candidate revision
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $revision = git -C candidate rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $revision.Trim() -cne "e39679357a943174dd29a0c8c5594bcc134146d3") {
+              throw "Frozen candidate identity refused."
+          }
+          $harness = git -C harness rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $harness.Trim() -cne "${{ github.event.pull_request.head.sha }}" -or $harness.Trim() -ceq $revision.Trim()) {
+              throw "Separate diagnostic harness identity refused."
+          }
+
+      - name: Set up original native development Python
+        id: runtime_python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: candidate/pyproject.toml
+
+      - name: Install the original targeted test dependencies
+        working-directory: candidate
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "Development pip preparation failed." }
+          python -m pip install -e ".[dev]"
+          if ($LASTEXITCODE -ne 0) { throw "Original test dependency preparation failed." }
+
+      - name: Prepare the original clean Alpha runtime probe
+        working-directory: candidate
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $probe = Join-Path $env:RUNNER_TEMP "k5-alpha-runtime-probe"
+          python -m venv $probe
+          if ($LASTEXITCODE -ne 0) { throw "Clean runtime creation failed." }
+          $probePython = Join-Path $probe "Scripts\python.exe"
+          & $probePython -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "Clean runtime pip preparation failed." }
+          & $probePython -m pip install --requirement scripts\windows-alpha\runtime-requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "Original runtime dependencies failed." }
+          & $probePython -m pip install .
+          if ($LASTEXITCODE -ne 0) { throw "Frozen runtime installation failed." }
+          & $probePython -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "Frozen runtime dependency check failed." }
+          & $probePython -m k5vision.cli --version
+          if ($LASTEXITCODE -ne 0) { throw "Frozen runtime version check failed." }
+
+      - name: Diagnose the one unchanged owned Start test exactly once
+        working-directory: candidate
+        shell: powershell
+        env:
+          K5_SETUP_PYTHON: ${{ steps.runtime_python.outputs.python-path }}
+          K5_ALPHA_DIAGNOSTIC_HARNESS_COMMIT: ${{ github.event.pull_request.head.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:K5_WITNESS_BASE_PYTHON = $env:K5_SETUP_PYTHON
+          $env:K5_WITNESS_BASE_PYTHON_SHA256 = (Get-FileHash -LiteralPath $env:K5_WITNESS_BASE_PYTHON -Algorithm SHA256).Hash.ToLowerInvariant()
+          $env:K5_PREFLIGHT_PROBE_PYTHON = Join-Path $env:RUNNER_TEMP "k5-alpha-runtime-probe\Scripts\python.exe"
+          $env:K5_ALPHA_DIAGNOSTIC_SOURCE_ROOT = (Get-Location).Path
+          $env:PYTHONPATH = Join-Path $env:GITHUB_WORKSPACE "harness\diagnostics\alpha-e396"
+          $evidence = Join-Path $env:RUNNER_TEMP "k5-alpha-e396-supplemental-v2"
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $identity = [ordered]@{
+              schema_version = "frozen-alpha-supplemental-context-v1"
+              candidate_commit = "e39679357a943174dd29a0c8c5594bcc134146d3"
+              harness_commit = $env:K5_ALPHA_DIAGNOSTIC_HARNESS_COMMIT
+              run_id = "${{ github.run_id }}"
+              run_attempt = "${{ github.run_attempt }}"
+              scope = "supplemental-diagnosis-only-v2-runtime-dependencies-corrected"
+              original_failed_alpha_run = "43324439307"
+              original_failed_alpha_attempt = 1
+          }
+          $identity | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $evidence "context.json") -Encoding UTF8
+          $junit = Join-Path $evidence "junit.xml"
+          python -m pytest tests/test_windows_alpha_preflight_boundary.py::test_windows_actual_start_bad_config_owned_observation -o "addopts=" --no-cov -q -s -p k5_alpha_frozen_diagnostic --junitxml $junit
+          $result = $LASTEXITCODE
+          if ($result -ne 0) { throw "Frozen Alpha supplemental diagnostic retained a failing result." }
+
+      - name: Preserve finite supplemental context
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v7
+        with:
+          name: alpha-e396-supplemental-v2-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/k5-alpha-e396-supplemental-v2/context.json
+            ${{ runner.temp }}/k5-alpha-e396-supplemental-v2/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
