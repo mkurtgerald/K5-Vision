@@ -1,0 +1,399 @@
+name: Diagnostic-only clock repair 8bddc21
+
+on:
+  pull_request:
+    types: [opened]
+    paths:
+      - .github/workflows/diagnose-clock-repair-8bddc21.yml
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: clock-repair-8bddc21-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  clock-repair-probe:
+    name: Diagnostic-only repaired clock on VM ${{ matrix.probe }}
+    runs-on: windows-2025
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        probe: [1, 2]
+    env:
+      K5_DESKTOP_HEAD_SHA: 8bddc213ef7372a2fbc153e2895cebfe5b0f63b0
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_VM_CLOCK_ACCEPTANCE: "0"
+      K5_VM_CLOCK_SETUP_ARTIFACT_ID: "13998014656"
+      K5_VM_CLOCK_PRIMARY_ARTIFACT_ID: "13999681183"
+      K5_VM_CLOCK_PRIMARY_RUN_ID: "43339745259"
+      K5_VM_CLOCK_PRIMARY_RUN_ATTEMPT: "1"
+      K5_RESTORED_HISTORY_DIAGNOSTIC_PROBE: ${{ matrix.probe }}
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: "false"
+    steps:
+      - name: Checkout exact repaired source and unchanged committed clock test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 8bddc213ef7372a2fbc153e2895cebfe5b0f63b0
+          persist-credentials: false
+      - name: Set up native development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Admit immutable successful GUI Setup and separate diagnostic owner
+        shell: python {0}
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+        run: |
+          """Diagnostic-only preflight; admitted product, test and original gates stay untouched."""
+
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+          import uuid
+          import zipfile
+          from pathlib import Path
+
+          PINS = json.loads(r"""{"artifacts":{"primary":{"bytes":7055,"id":13999681183,"name":"desktop-windows-witness-43339745259","sha256":"f054105338319122345cd7bd97a5e3e52b4f5c74f9305cd43a88999d8329f17d"},"setup":{"bytes":298611386,"id":13998014656,"name":"k5-vision-windows-setup-8bddc213ef7372a2fbc153e2895cebfe5b0f63b0","sha256":"267718656fafd8e07f64acca1b2c928ac740e2be3a1d1da9b576bd6dbb9ab41b"}},"manifest_sha256":"bd9ade2584bc39d6f6f55ef7fd241041310e8a255727ef157a2a55f12d1c23d7","original_clock_phase_ast_sha256":"e04a89b227362740c3bcb38e868a9034a5293a05ae6a06a404f06be872b45da3","original_failed_onvif_job":131604777791,"original_skipped_clock_job":131609669865,"package_sha256":"333b4a17c7cb0a44ab01bca99c0d131ee5adaa70d3b864c9131b913d01463eee","primary_receipt_sha256":"41383e7a98f810422a8de1f3df3b685d2a75a18f1d64748956e1b7798747bcc8","primary_report_sha256":"a5737bb4b57587d0723f714e0a80a13627db6fa90a54814678e2165a066f824c","primary_run_attempt":1,"primary_run_id":43339745259,"producer_job_id":131604777316,"qualification_runs":[{"attempt":1,"id":43339745163,"name":"CI","path":".github/workflows/ci.yml"},{"attempt":1,"id":43339745113,"name":"Windows Alpha Script Smoke","path":".github/workflows/windows-alpha-script-smoke.yml"},{"attempt":1,"id":43339745112,"name":"Native Windows Beta Sprint","path":".github/workflows/operator-beta-windows.yml"},{"attempt":1,"id":43339745259,"name":"Native Windows Desktop Installer","path":".github/workflows/operator-desktop-windows.yml"}],"setup_bytes":300004610,"setup_sha256":"b29179347bb369db51fed2c5272fee1af64618cac14b8270316737da83beb439","source_files":{".github/actions/provision-operator-tools/action.yml":"e50c55c29830ed793c0500e52628d145580d23209f49c9369a2c218e722c0c00",".github/workflows/operator-desktop-windows.yml":"aeffd418958b5c5b4713a871be8e4247c18223e8fbca28a155380fd5aae43aa8","scripts/provision_operator_person_acceptance.py":"3dc414b2aa0ba92cae73ab02b81ffdca43386e5e0e1274c02dc0c52110d3c896","scripts/verify_desktop_receipt.py":"1dacff23c919e09c64ff7723f8ec64d80e7660739d327dc9ebb770207f1495ca","scripts/verify_windows_vm_clock_receipt.py":"b391e01b2276bd95e955263e50300507044239f75c1fd4978a5550e0c5a5be11","tests/integration/test_operator_beta_browser.py":"67eea5d12df2cfe6e19603fe459405eac05c93e6db8d59c068a23f69a573f771","tests/integration/test_operator_product_runtime.py":"d7c7eaa38fe36843a937e57d60b696a93bca66599b3883e51d84cd1f37345106","tests/integration/test_windows_desktop_app.py":"d08831a743c13b27a125c3272e24fde407d7fedd7f469b41f279c284634902e6","tests/integration/test_windows_vm_clock_qualification.py":"cbd66d5cdf2b13a17c4f05e4e2c6fd10a7d50b77add65b8549a2d4d27721dcb8","tests/integration/windows_vm_clock.py":"a43fb41cc3ad80ea84040c22691d20703906f884d6b586b6ccd3c86110ea10a5"},"source_head":"8bddc213ef7372a2fbc153e2895cebfe5b0f63b0","source_tree":"cdbe56a130246dbc653f22edba23b5a242caed4f"}""")
+          SOURCE = "8bddc213ef7372a2fbc153e2895cebfe5b0f63b0"
+          REPOSITORY = "mkurtgerald/K5-Vision"
+          WORKFLOW = ".github/workflows/diagnose-clock-repair-8bddc21.yml"
+          API = "https://api.github.com/repos/" + REPOSITORY
+          if not __debug__:
+              raise RuntimeError("Controlled diagnostic requires assertions enabled")
+
+
+          def require(value):
+              if not value:
+                  raise RuntimeError("Controlled instrumented clock diagnostic admission rejected")
+
+
+          def digest(raw):
+              return hashlib.sha256(raw).hexdigest()
+
+
+          require(PINS["source_head"] == SOURCE)
+          require(os.name == "nt" and os.environ["GITHUB_ACTIONS"] == "true")
+          require(os.environ["RUNNER_ENVIRONMENT"] == "github-hosted")
+          require(os.environ["RUNNER_OS"] == "Windows")
+          require(os.environ["GITHUB_REPOSITORY"] == REPOSITORY)
+          require(os.environ["GITHUB_EVENT_NAME"] == "pull_request")
+          require(os.environ["GITHUB_RUN_ATTEMPT"] == "1")
+          probe = os.environ["K5_RESTORED_HISTORY_DIAGNOSTIC_PROBE"]
+          require(probe in {"1", "2"})
+          require(subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == SOURCE)
+          require(
+              subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
+              == PINS["source_tree"]
+          )
+          require(
+              not subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"], text=True)
+          )
+          for name, expected in PINS["source_files"].items():
+              committed = subprocess.check_output(["git", "show", SOURCE + ":" + name])
+              require(digest(committed) == expected)
+              require(digest(Path(name).read_bytes()) == expected)
+
+
+          class RedirectWithoutCredential(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  from urllib.parse import urlsplit
+
+                  require(urlsplit(newurl).scheme == "https")
+                  result = super().redirect_request(req, fp, code, msg, headers, newurl)
+                  if result is not None:
+                      result.remove_header("Authorization")
+                  return result
+
+
+          opener = urllib.request.build_opener(RedirectWithoutCredential())
+
+
+          def request(route):
+              require(route.startswith("/") and "\n" not in route)
+              return urllib.request.Request(
+                  API + route,
+                  headers={
+                      "Authorization": "Bearer " + os.environ["GH_READ_TOKEN"],
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "K5-controlled-instrumented-clock-diagnostic",
+                  },
+              )
+
+
+          def document(route):
+              with opener.open(request(route), timeout=30) as response:
+                  raw = response.read(4 * 1024**2 + 1)
+              require(len(raw) <= 4 * 1024**2)
+              return json.loads(raw)
+
+
+          run_id = int(os.environ["GITHUB_RUN_ID"])
+          event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+          dispatch_head = event["pull_request"]["head"]["sha"]
+          require(re.fullmatch("[a-f0-9]{40}", dispatch_head) is not None and dispatch_head != SOURCE)
+          self_run = document("/actions/runs/" + str(run_id))
+          require(self_run["id"] == run_id and self_run["run_attempt"] == 1)
+          require(self_run["path"] == WORKFLOW and self_run["event"] == "pull_request")
+          require(self_run["head_sha"] == dispatch_head and self_run["head_sha"] != SOURCE)
+          dispatch = document("/git/commits/" + dispatch_head)
+          require(len(dispatch["parents"]) == 1 and dispatch["parents"][0]["sha"] == SOURCE)
+          comparison = document("/compare/" + SOURCE + "..." + dispatch_head)
+          require(comparison["ahead_by"] == 1 and comparison["behind_by"] == 0)
+          require(len(comparison["files"]) == 1)
+          require({row["filename"] for row in comparison["files"]} == {WORKFLOW})
+          require(all(row["status"] == "added" for row in comparison["files"]))
+          qualification = []
+          for pin in PINS["qualification_runs"]:
+              observed = document("/actions/runs/" + str(pin["id"]))
+              require(observed["id"] == pin["id"] and observed["run_attempt"] == pin["attempt"])
+              require(observed["name"] == pin["name"] and observed["path"] == pin["path"])
+              require(observed["head_sha"] == SOURCE)
+              if pin["name"] == "Native Windows Desktop Installer":
+                  require((observed["status"] == "in_progress" and observed["conclusion"] is None)
+                          or (observed["status"] == "completed" and observed["conclusion"] == "failure"))
+              else:
+                  require(observed["status"] == "completed" and observed["conclusion"] == "success")
+              qualification.append(
+                  {
+                      key: observed[key]
+                      for key in ("id", "name", "path", "head_sha", "run_attempt", "status", "conclusion")
+                  }
+              )
+          require(len(qualification) == 4)
+          primary = next(row for row in qualification if row["name"] == "Native Windows Desktop Installer")
+          require(primary["id"] == PINS["primary_run_id"])
+          require(primary["run_attempt"] == PINS["primary_run_attempt"])
+          require(primary["id"] != run_id)
+
+          jobs = document("/actions/runs/" + str(PINS["primary_run_id"]) + "/attempts/1/jobs?per_page=100")
+          require(jobs["total_count"] == len(jobs["jobs"]) == 7)
+          producer = [job for job in jobs["jobs"] if job["id"] == PINS["producer_job_id"]]
+          require(len(producer) == 1 and producer[0]["head_sha"] == SOURCE)
+          require(producer[0]["run_attempt"] == 1 and producer[0]["status"] == "completed" and producer[0]["conclusion"] == "success")
+          failed = [job for job in jobs["jobs"] if job["id"] == PINS["original_failed_onvif_job"]]
+          require(len(failed) == 1 and failed[0]["head_sha"] == SOURCE and failed[0]["run_attempt"] == 1 and failed[0]["conclusion"] == "failure")
+          skipped = [job for job in jobs["jobs"] if job["id"] == PINS["original_skipped_clock_job"]]
+          require(len(skipped) == 1 and skipped[0]["head_sha"] == SOURCE and skipped[0]["run_attempt"] == 1 and skipped[0]["conclusion"] == "skipped")
+
+
+          root = Path(os.environ["RUNNER_TEMP"]) / ("K5 supplemental input " + uuid.uuid4().hex)
+          root.mkdir(mode=0o700)
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as stream:
+              stream.write("K5_SUPPLEMENTAL_INPUT_ROOT=" + str(root) + "\n")
+          observed_artifacts = []
+          for label, expected_names in (
+              (
+                  "setup",
+                  {
+                      "K5VisionSetup.exe",
+                      "desktop-package.json",
+                      "payload-manifest.json",
+                      "dependency-inventory.json",
+                      "desktop-windows-receipt.json",
+                  },
+              ),
+              ("primary", {"desktop-windows.xml", "desktop-windows-receipt.json"}),
+          ):
+              pin = PINS["artifacts"][label]
+              observed = document("/actions/artifacts/" + str(pin["id"]))
+              require(observed["id"] == pin["id"] and observed["name"] == pin["name"])
+              require(observed["workflow_run"]["id"] == PINS["primary_run_id"])
+              require(observed["workflow_run"]["head_sha"] == SOURCE)
+              require(observed["expired"] is False and observed["size_in_bytes"] == pin["bytes"])
+              require(observed["digest"] == "sha256:" + pin["sha256"])
+              observed_artifacts.append(
+                  {
+                      "kind": label,
+                      "id": observed["id"],
+                      "name": observed["name"],
+                      "producer_run_id": observed["workflow_run"]["id"],
+                      "producer_run_attempt": PINS["primary_run_attempt"],
+                      "producer_head_sha": observed["workflow_run"]["head_sha"],
+                      "bytes": observed["size_in_bytes"],
+                      "sha256": pin["sha256"],
+                      "expired": observed["expired"],
+                  }
+              )
+              archive = root / (label + ".zip")
+              checksum, count = hashlib.sha256(), 0
+              with (
+                  opener.open(
+                      request("/actions/artifacts/" + str(pin["id"]) + "/zip"), timeout=180
+                  ) as response,
+                  archive.open("xb") as stream,
+              ):
+                  while block := response.read(1024 * 1024):
+                      count += len(block)
+                      require(count <= pin["bytes"])
+                      checksum.update(block)
+                      stream.write(block)
+              require(count == pin["bytes"] and checksum.hexdigest() == pin["sha256"])
+              target = Path("vm-clock-input" if label == "setup" else "vm-clock-primary")
+              require(not target.exists())
+              target.mkdir(mode=0o700)
+              with zipfile.ZipFile(archive) as bundle:
+                  entries = bundle.infolist()
+                  require(len(entries) == len(expected_names))
+                  require({entry.filename for entry in entries} == expected_names)
+                  for entry in entries:
+                      maximum = 512 * 1024**2 if entry.filename == "K5VisionSetup.exe" else 16 * 1024**2
+                      require(not entry.is_dir() and not entry.flag_bits & 1)
+                      require(0 < entry.file_size <= maximum)
+                      with bundle.open(entry) as source, (target / entry.filename).open("xb") as output:
+                          remaining = entry.file_size
+                          while block := source.read(min(1024 * 1024, remaining + 1)):
+                              remaining -= len(block)
+                              require(remaining >= 0)
+                              output.write(block)
+                          require(remaining == 0)
+
+          setup = Path("vm-clock-input/K5VisionSetup.exe").resolve(strict=True)
+          require(setup.stat().st_size == PINS["setup_bytes"])
+          with setup.open("rb") as stream:
+              require(hashlib.file_digest(stream, "sha256").hexdigest() == PINS["setup_sha256"])
+          file_paths = {
+              "primary_report_sha256": Path("vm-clock-primary/desktop-windows.xml"),
+              "primary_receipt_sha256": Path("vm-clock-primary/desktop-windows-receipt.json"),
+              "package_sha256": Path("vm-clock-input/desktop-package.json"),
+              "manifest_sha256": Path("vm-clock-input/payload-manifest.json"),
+          }
+          for key, path in file_paths.items():
+              require(digest(path.read_bytes()) == PINS[key])
+          require(
+              Path("vm-clock-input/desktop-windows-receipt.json").read_bytes()
+              == Path("vm-clock-primary/desktop-windows-receipt.json").read_bytes()
+          )
+          env = {
+              "K5_DESKTOP_SETUP": str(setup),
+              "K5_DESKTOP_SETUP_SHA256": PINS["setup_sha256"],
+              "K5_VM_CLOCK_PRIMARY_XML": str(file_paths["primary_report_sha256"].resolve(strict=True)),
+              "K5_VM_CLOCK_PRIMARY_RECEIPT": str(file_paths["primary_receipt_sha256"].resolve(strict=True)),
+              "K5_SUPPLEMENTAL_INPUT_ROOT": str(root),
+              "K5_RESTORED_HISTORY_DIAGNOSTIC_DISPATCH_HEAD": dispatch_head,
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as stream:
+              for name, value in env.items():
+                  require("\n" not in value and "\r" not in value)
+                  stream.write(name + "=" + value + "\n")
+          provenance = {
+              "schema_version": 1,
+              "scope": "clock-repair-diagnostic-only",
+              "candidate_source_head": SOURCE,
+              "candidate_source_tree": PINS["source_tree"],
+              "qualification_runs": qualification,
+              "original_producer_artifacts": observed_artifacts,
+              "frozen_inputs": PINS,
+              "diagnostic_owner": {
+                  "repository": os.environ["GITHUB_REPOSITORY"],
+                  "event_name": os.environ["GITHUB_EVENT_NAME"],
+                  "github_sha": os.environ["GITHUB_SHA"],
+                  "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"],
+                  "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+                  "dispatcher_head_sha": dispatch_head,
+                  "dispatcher_tree_sha": dispatch["tree"]["sha"],
+                  "run_id": run_id,
+                  "run_attempt": 1,
+                  "job": os.environ["GITHUB_JOB"],
+                  "matrix_probe": int(probe),
+                  "artifact_id_binding": "external-post-upload-API-required",
+              },
+              "source_checkout": {"head_sha": SOURCE, "source_files": PINS["source_files"]},
+              "qualification_asserted_by_sidecar": False,
+              "original_unit_guard_batch_retained": True,
+              "original_test_run_through_pytest": True,
+              "additional_http_requests_during_original": 0,
+              "publication_artifact_substitution_allowed": False,
+              "clock_test_started": False,
+              "qualified": False,
+          }
+          Path("clock-repair-preflight.json").write_text(
+              json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
+          )
+          print("Exact repaired source and immutable Setup admitted for diagnostic-only clock execution.")
+      - name: Install original test automation before any clock change
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "VM test dependency install failed" }
+      - name: Provision committed pinned recording tools before any clock change
+        uses: ./.github/actions/provision-operator-tools
+      - name: Provision the committed admitted person fixture before any clock change
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Installed analytics fixture admission failed" }
+      - name: Revalidate raw full GUI evidence with the unchanged normal verifier
+        shell: pwsh
+        run: |
+          python scripts/verify_desktop_receipt.py vm-clock-primary/desktop-windows.xml primary-reverified.json
+          if ($LASTEXITCODE -ne 0) { throw "The normal GUI verifier rejected original evidence" }
+          $actual = (Get-FileHash -LiteralPath primary-reverified.json -Algorithm SHA256).Hash
+          $original = (Get-FileHash -LiteralPath vm-clock-primary/desktop-windows-receipt.json -Algorithm SHA256).Hash
+          if ($actual -ne $original) { throw "Reverified GUI bytes differ from immutable original" }
+      - name: Test unchanged restoration guard and strict scoped evidence admission
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_windows_vm_clock.py tests/unit/test_windows_vm_clock_receipt.py tests/unit/test_windows_vm_clock_scoped_receipt.py tests/unit/test_windows_vm_clock_request_observation.py tests/unit/test_windows_desktop_analytics_diagnostic.py tests/unit/test_windows_clock_media_gateway_probe.py -o addopts= --no-cov --tb=short
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Execute unchanged original dedicated clock test and restoration
+
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          K5_VM_CLOCK_ACCEPTANCE: "1"
+        run: |
+          python -m pytest tests/integration/test_windows_vm_clock_qualification.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=400 --junitxml=vm-clock-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_windows_vm_clock_receipt.py vm-clock-windows.xml vm-clock-windows-receipt.json --scope vm-clock-dedicated --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256 --primary-report $env:K5_VM_CLOCK_PRIMARY_XML --primary-receipt $env:K5_VM_CLOCK_PRIMARY_RECEIPT --package vm-clock-input/desktop-package.json --expected-run-id $env:K5_VM_CLOCK_PRIMARY_RUN_ID --expected-run-attempt $env:K5_VM_CLOCK_PRIMARY_RUN_ATTEMPT --expected-primary-artifact-id $env:K5_VM_CLOCK_PRIMARY_ARTIFACT_ID --expected-setup-artifact-id $env:K5_VM_CLOCK_SETUP_ARTIFACT_ID
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload only separate diagnostic evidence after the original restoration path
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-clock-repair-8bddc21-${{ github.run_id }}-attempt-${{ github.run_attempt }}-probe-${{ matrix.probe }}
+          path: |
+            vm-clock-windows.xml
+            vm-clock-windows-receipt.json
+            clock-repair-preflight.json
+            vm-clock-input/desktop-package.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Remove only owned supplemental input and tool directories
+        if: always()
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $expectedParent = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar)
+          $owned = @(
+            @{Value=$env:K5_SUPPLEMENTAL_INPUT_ROOT; Pattern='^K5 supplemental input [a-f0-9]{32}$'},
+            @{Value=$env:K5_DONOR_TOOL_ROOT; Pattern='^K5 donor development tools [a-f0-9]{32}$'}
+          )
+          foreach ($item in $owned) {
+            if ([string]::IsNullOrEmpty($item.Value)) { continue }
+            $path = [IO.Path]::GetFullPath($item.Value)
+            if (-not [string]::Equals([IO.Directory]::GetParent($path).FullName, $expectedParent, [StringComparison]::OrdinalIgnoreCase) -or
+                [IO.Path]::GetFileName($path) -notmatch $item.Pattern) {
+              throw "Supplemental cleanup ownership refused"
+            }
+            if (Test-Path -LiteralPath $path) {
+              $directory = Get-Item -LiteralPath $path
+              if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Supplemental cleanup refused a redirected directory"
+              }
+              Remove-Item -LiteralPath $path -Recurse -Force
+            }
+          }
