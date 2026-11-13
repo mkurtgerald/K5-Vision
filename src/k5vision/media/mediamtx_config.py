@@ -187,6 +187,9 @@ def generate_mediamtx_configuration(
         "rtspAddress": f"127.0.0.1:{rtsp_port}",
         "rtspTransports": ["tcp"],
         "hls": True,
+        # Keep buffers on already-pulled sources when a CDN session is replaced.
+        # Automatic muxers avoid the donor's wall-clock-based idle expiry.
+        "hlsAlwaysRemux": True,
         "hlsAddress": f"127.0.0.1:{hls_port}",
         "hlsAllowOrigins": [],
         "webrtc": False,

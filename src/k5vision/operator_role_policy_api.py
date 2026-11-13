@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
+from dataclasses import dataclass
 from uuid import UUID
 
 from fastapi import Depends, HTTPException, Query, Response
@@ -46,6 +47,61 @@ def require_current_permission(app, account):
     permission = _REQUEST_PERMISSION.get()
     if permission is not None:
         require_permission(app, account, permission)
+
+
+def current_request_permission():
+    """Return the finite route classification without reading durable state."""
+    return _REQUEST_PERMISSION.get()
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentPermissionSnapshot:
+    account_id: UUID
+    role: UserRole
+    required: str
+    permissions: frozenset[str]
+    policy: object | None
+    generation: int | None
+
+
+def current_permission_snapshot(app, account):
+    """Read a single request's durable role authority on its owned worker."""
+    required = _REQUEST_PERMISSION.get()
+    if required is None:
+        return None
+    policy = getattr(app.state, "operator_roles", None)
+    try:
+        permissions, generation = (
+            (BASE_PERMISSIONS[account.role], None)
+            if policy is None
+            else policy.permission_snapshot(account)
+        )
+    except RolePolicyError:
+        raise HTTPException(503, "roles_unavailable") from None
+    return CurrentPermissionSnapshot(
+        account.id, account.role, required, frozenset(permissions), policy, generation
+    )
+
+
+def validate_current_permission_snapshot(app, account, snapshot):
+    """Check one completed read after awaits, without file I/O or lock waits."""
+    required = _REQUEST_PERMISSION.get()
+    if required is None:
+        if snapshot is not None:
+            raise HTTPException(503, "roles_unavailable")
+        return
+    policy = getattr(app.state, "operator_roles", None)
+    if (
+        not isinstance(snapshot, CurrentPermissionSnapshot)
+        or snapshot.account_id != account.id
+        or snapshot.role is not account.role
+        or snapshot.required != required
+        or snapshot.policy is not policy
+        or (policy is not None and snapshot.generation != policy.permission_generation)
+    ):
+        raise HTTPException(503, "roles_unavailable")
+    if required not in snapshot.permissions:
+        raise HTTPException(403, "Insufficient operator permission")
 
 
 class _Role(BaseModel):

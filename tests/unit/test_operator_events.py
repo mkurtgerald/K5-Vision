@@ -1634,6 +1634,11 @@ def test_startup_prime_does_not_delay_first_recorded_frame_on_camera_enable(
                     await asyncio.wrap_future(first)
             else:
                 await asyncio.wrap_future(first)
+            # Exercise one explicit first-frame cycle, independently of the
+            # already scheduled background loop's new metadata awaits.
+            service._task.cancel()
+            await asyncio.gather(service._task, return_exceptions=True)
+            service._task = None
             service.configure(source.binding.device_id, enabled=True, confidence_threshold=0.5)
             assert service._native_pending is first
             assert requests == ["prime"]

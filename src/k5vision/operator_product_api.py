@@ -438,7 +438,7 @@ def install_operator_product_api(
     mutations = asyncio.Lock()
     person_slots = asyncio.Semaphore(4)
     recorder_events = getattr(app.state, "operator_events", None)
-    defer_preparation = getattr(recorder_events, "awaiting_first_recorded_person_event", None)
+    defer_preparation = getattr(recorder_events, "defer_view_preparation", None)
     native_person_preparation = (
         _NativePersonWarmupGate(analytics, defer_preparation=defer_preparation)
         if prepare_native_person_on_camera
@@ -459,9 +459,11 @@ def install_operator_product_api(
     app.add_middleware(_ProductRoutesOnly)
     from k5vision.operator_role_policy_api import (
         OperatorPermissionContext,
+        current_permission_snapshot,
+        current_request_permission,
         effective_permissions,
         install_operator_role_api,
-        require_current_permission,
+        validate_current_permission_snapshot,
     )
 
     app.add_middleware(OperatorPermissionContext)
@@ -480,6 +482,31 @@ def install_operator_product_api(
             return JSONResponse({"detail": detail}, status_code=422)
         return await previous_validation_handler(request, exc)
 
+    authority_read_slots = asyncio.Semaphore(4)
+
+    async def authority_read(operation):
+        # Durable policy admission can wait on a filesystem/registry lock.
+        # Keep it off the ASGI loop, retain a bounded slot until the actual
+        # thread completes, and drain even repeatedly cancelled requests.
+        async with authority_read_slots:
+            worker = asyncio.create_task(asyncio.to_thread(operation))
+            cancelled = False
+            while True:
+                try:
+                    result = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    if worker.cancelled():
+                        raise
+                    cancelled = True
+                except Exception:
+                    if cancelled:
+                        raise asyncio.CancelledError from None
+                    raise
+                else:
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    return result
+
     async def authenticate(token: str) -> tuple[UserAccount, str]:
         principal = await sessions.resolve(token)
         if principal is None:
@@ -488,15 +515,40 @@ def install_operator_product_api(
         # The registry shares a bounded SQLite connection with administration.
         # Its synchronous lock and busy timeout must never block the ASGI loop
         # while recording, history, and live requests are being served.
-        def current_authority() -> tuple[UserAccount | None, bool]:
+        def current_authority():
             current = users.get(principal.id)
             credential_active = (
                 current is not None and users.credential_status(current.id) == "active"
             )
-            return current, credential_active
+            permission = None
+            permission_error = None
+            if (
+                current is not None
+                and current.enabled
+                and current.role in _READ_ROLES
+                and current.role is principal.role
+                and credential_active
+            ):
+                try:
+                    permission = current_permission_snapshot(app, current)
+                except HTTPException as error:
+                    permission_error = error
+                if current_request_permission() is not None:
+                    # A durable role read can outlive an account change.
+                    # Account and credential status must follow that read too.
+                    current = users.get(principal.id)
+                    credential_active = (
+                        current is not None and users.credential_status(current.id) == "active"
+                    )
+            return current, credential_active, permission, permission_error
 
         try:
-            current, credential_active = await asyncio.to_thread(current_authority)
+            result = (
+                await asyncio.to_thread(current_authority)
+                if current_request_permission() is None
+                else await authority_read(current_authority)
+            )
+            current, credential_active, permission, permission_error = result
         except UserRegistryStorageError:
             raise HTTPException(503, "Operator identity unavailable") from None
         if (
@@ -510,7 +562,24 @@ def install_operator_product_api(
         from k5vision.operator_audit import set_audit_actor
 
         set_audit_actor(current)
-        require_current_permission(app, current)
+        if permission_error is not None:
+            raise permission_error
+        validate_current_permission_snapshot(app, current, permission)
+        if permission is not None:
+            # A logout, replacement login, password/role change or disable may
+            # have completed while the policy read was in flight. Resolution
+            # checks both durable credential identity and the issued record.
+            final = await sessions.resolve(token)
+            if (
+                final is None
+                or not final.enabled
+                or final.id != current.id
+                or final.role is not current.role
+            ):
+                raise _unauthorized()
+            # The role may have changed while that final resolution awaited
+            # its own registry read. No positive policy cache survives here.
+            validate_current_permission_snapshot(app, final, permission)
         return current, token
 
     async def require_session(request: Request) -> tuple[UserAccount, str]:

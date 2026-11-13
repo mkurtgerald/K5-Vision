@@ -211,6 +211,7 @@ class OperatorEventStore:
         confidence: float,
         person_count: int,
         emit: bool,
+        admit: Callable[[], bool] | None = None,
     ) -> bool:
         if (
             not isinstance(camera_id, UUID)
@@ -233,7 +234,10 @@ class OperatorEventStore:
                 "SELECT enabled,last_frame_key FROM camera_analytics WHERE camera_id=?",
                 (str(camera_id),),
             ).fetchone()
-            if row is None or not row[0] or row[1] == frame_key:
+            if row is None or not row[0] or (admit is not None and not admit()):
+                connection.execute("COMMIT")
+                return False
+            if row[1] == frame_key:
                 connection.execute("COMMIT")
                 return False
             connection.execute(
@@ -1160,11 +1164,115 @@ class OperatorEventService:
         self._provider_failed = False
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="k5-recorded-person")
         self._native_pending = None
+        # Durable admission/SQLite work must never occupy the ASGI loop or
+        # queue behind native decode/inference. Submit at most one owned call.
+        self._state_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="k5-event-state"
+        )
+        self._state_pending = None
+        self._state_closed = False
+        self._close_task = None
+        self._state_admission = asyncio.Lock()
+        self._mutations = asyncio.Lock()
+        self._mutations_bound = False
+        self._warmup_deferred = True
+        self._warmup_generation = 0
+        self._configuration_faulted = False
         self._states: dict[UUID, dict] = {}
         self._last_events: dict[UUID, float] = {}
         self._first_recorded_person_callback: Callable[[], None] | None = None
         self._configuration_generation: dict[UUID, int] = {}
         self._rotation = 0
+
+    def bind_mutations(self, mutations: asyncio.Lock) -> None:
+        """Share camera/configuration ordering with the installed operator API."""
+        if self._mutations_bound and self._mutations is not mutations:
+            raise ValueError("Analytics mutation owner changed")
+        self._mutations = mutations
+        self._mutations_bound = True
+
+    def defer_view_preparation(self) -> bool:
+        """A conservative memory-only scheduling hint; never event authority."""
+        if self._closing:
+            return False
+        if self._configuration_faulted:
+            return True
+        if self._unavailable or not self._available:
+            return False
+        return self._warmup_deferred
+
+    def mark_configuration_unavailable(self) -> None:
+        """Latch an unadmitted compensation without performing loop I/O."""
+        self._configuration_faulted = True
+        self._unavailable = True
+        self._warmup_deferred = True
+        self._warmup_generation += 1
+        for identifier in set(self._states) | set(self._configuration_generation):
+            self._configuration_generation[identifier] = (
+                self._configuration_generation.get(identifier, 0) + 1
+            )
+
+    async def _durable(self, callback, *args, _closing=False, _completed=None, **kwargs):
+        """Own one worker through completion, including cancelled callers.
+
+        Cancelling an asyncio waiter cannot stop SQLite or filesystem work.
+        Keep its admission until the actual operation is drained, so shutdown
+        cannot close the store beneath a surviving callback.
+        """
+        async with self._state_admission:
+            if self._closing and not _closing:
+                raise OperatorEventsError("Analytics service is closed")
+            from functools import partial
+
+            pending = self._state_executor.submit(partial(callback, *args, **kwargs))
+            self._state_pending = pending
+            wrapped = asyncio.wrap_future(pending)
+            cancellation = None
+            try:
+                while True:
+                    try:
+                        result = await asyncio.shield(wrapped)
+                    except asyncio.CancelledError as error:
+                        if wrapped.cancelled():
+                            raise
+                        cancellation = cancellation or error
+                    except Exception:
+                        if cancellation is not None:
+                            raise cancellation from None
+                        raise
+                    else:
+                        if _completed is not None:
+                            _completed(result)
+                        if cancellation is not None:
+                            raise cancellation
+                        return result
+            finally:
+                if pending.done() and self._state_pending is pending:
+                    self._state_pending = None
+
+    async def configure_async(self, camera_id: UUID, *, enabled: bool, confidence_threshold: float):
+        # Only durable work crosses threads. Native admission and generation
+        # publication stay on the ASGI owner, including a cancelled write.
+        def persist():
+            if enabled and (not self._available or self._unavailable):
+                raise OperatorEventsError("Analytics runtime unavailable")
+            self.store.configure(
+                camera_id, enabled=enabled, confidence_threshold=confidence_threshold
+            )
+            return (
+                self._sampler.native_model_ready()
+                if isinstance(self._sampler, RecordedFrameSampler)
+                and getattr(self._sampler, "_configuration", None) is not None
+                else False
+            )
+
+        await self._durable(
+            persist,
+            _completed=lambda ready: self._configured(
+                camera_id, enabled=enabled, native_ready=ready
+            ),
+        )
+        return await self._durable(self.status, camera_id)
 
     def notify_on_first_recorded_person_event(self, callback: Callable[[], None]) -> None:
         """Release optional, media-free view warmup after a real recorded event.
@@ -1174,7 +1282,7 @@ class OperatorEventService:
         """
         if not callable(callback) or self._first_recorded_person_callback is not None:
             raise ValueError("Native view warmup callback is invalid")
-        if self._last_events and not self.awaiting_first_recorded_person_event():
+        if self._last_events and not self.defer_view_preparation():
             callback()
         else:
             self._first_recorded_person_callback = callback
@@ -1329,9 +1437,21 @@ class OperatorEventService:
         if enabled and (not self._available or self._unavailable):
             raise OperatorEventsError("Analytics runtime unavailable")
         self.store.configure(camera_id, enabled=enabled, confidence_threshold=confidence_threshold)
+        ready = (
+            self._sampler.native_model_ready()
+            if isinstance(self._sampler, RecordedFrameSampler)
+            and getattr(self._sampler, "_configuration", None) is not None
+            else False
+        )
+        self._configured(camera_id, enabled=enabled, native_ready=ready)
+        return self.status(camera_id)
+
+    def _configured(self, camera_id: UUID, *, enabled: bool, native_ready: bool) -> None:
         self._configuration_generation[camera_id] = (
             self._configuration_generation.get(camera_id, 0) + 1
         )
+        self._warmup_generation += 1
+        self._warmup_deferred = True
         self._states.pop(camera_id, None)
         if (
             enabled
@@ -1339,18 +1459,11 @@ class OperatorEventService:
             and isinstance(self._sampler, RecordedFrameSampler)
             and getattr(self._sampler, "_configuration", None) is not None
             and self._native_pending is None
-            and not self._sampler.native_model_ready()
+            and not native_ready
         ):
-            # A camera enabled before service startup still gets a model-only
-            # prime. Do not repeat a *completed but unsuccessful* startup prime
-            # at camera activation: the extra 18-second request would occupy
-            # the single recorder executor ahead of its first real frame and
-            # consume most of the unchanged 25-second event acceptance budget.
-            # That first frame must instead use the normal bounded native
-            # decode/inference path. A successful prime remains reusable; an
-            # in-flight prime retains its existing worker ownership.
+            # A completed startup prime is never repeated at camera activation.
+            # Native admission stays on the loop alongside real-frame submits.
             self._native_pending = self._executor.submit(self._sampler.prime)
-        return self.status(camera_id)
 
     async def start(self) -> None:
         if self._task is None:
@@ -1369,6 +1482,8 @@ class OperatorEventService:
             self._task = asyncio.create_task(self._run(), name="operator-recorded-person-events")
 
     async def _sample(self, source, settings) -> None:
+        if self._closing or self._unavailable:
+            return
         identifier = source.binding.device_id
         generation = self._configuration_generation.get(identifier, 0)
         state = self._states.setdefault(identifier, {"processed_frames": 0})
@@ -1416,58 +1531,102 @@ class OperatorEventService:
             if self._provider is None:
                 self._provider = await self._factory()
             detections = await asyncio.wait_for(self._provider(sample.frame), 5)
-        current = self.store.settings(identifier)
-        selected_sources = tuple(self._cameras.list_sources())
-        live_source = next(
-            (item for item in selected_sources if item.binding == source.binding), None
-        )
-        if (
-            self._closing
-            or not current["enabled"]
-            or current != settings
-            or self._configuration_generation.get(identifier, 0) != generation
-            or live_source is None
-            or not live_source.recording_enabled
-            or getattr(live_source, "source_uri", None) != getattr(source, "source_uri", None)
-        ):
-            return
-        selected = [
-            item
-            for item in detections
-            if item.category == "person" and item.confidence >= current["confidence_threshold"]
-        ]
-        now = self._clock()
-        emitted = self.store.record(
-            identifier,
-            frame_key=sample.frame_key,
-            occurred_at=sample.occurred_at,
-            confidence=max((item.confidence for item in selected), default=0.0),
-            person_count=min(32, len(selected)),
-            emit=now - self._last_events.get(identifier, -math.inf) >= EVENT_INTERVAL_SECONDS,
-        )
-        if emitted:
-            self._last_events[identifier] = now
-            callback, self._first_recorded_person_callback = (
-                self._first_recorded_person_callback,
-                None,
-            )
-            if callback is not None:
-                try:
-                    callback()
-                except Exception:
-                    # Optional view warmup cannot invalidate recorded-person
-                    # evidence or interrupt subsequent recorded-frame sampling.
-                    pass
-        state["status"] = "active"
-        state["sample_phase"] = "person_detected" if selected else "no_person"
-        state["last_completed_phase"] = state["sample_phase"]
-        state["last_sample_at"] = _utc(sample.occurred_at)
-        state["processed_frames"] = min(2**63 - 1, state["processed_frames"] + 1)
+        # Mutations of camera membership, source identity and analytics settings
+        # share this async owner. They can wait without blocking unrelated HTTP.
+        async with self._mutations:
+
+            def persist():
+                current = self.store.settings(identifier)
+                if (
+                    self._closing
+                    or self._unavailable
+                    or not current["enabled"]
+                    or current != settings
+                    or self._configuration_generation.get(identifier, 0) != generation
+                ):
+                    return None
+                selected = [
+                    item
+                    for item in detections
+                    if item.category == "person"
+                    and item.confidence >= current["confidence_threshold"]
+                ]
+                admitted = False
+
+                def admit():
+                    nonlocal admitted
+                    # This check runs inside the actual SQLite write, after its
+                    # private-file admission, before even the frame-key update.
+                    live_source = next(
+                        (
+                            item
+                            for item in self._cameras.list_sources()
+                            if item.binding == source.binding
+                        ),
+                        None,
+                    )
+                    admitted = (
+                        not self._closing
+                        and not self._unavailable
+                        and self._configuration_generation.get(identifier, 0) == generation
+                        and live_source is not None
+                        and live_source.recording_enabled
+                        and getattr(live_source, "source_uri", None)
+                        == getattr(source, "source_uri", None)
+                    )
+                    return admitted
+
+                now = self._clock()
+                emitted = self.store.record(
+                    identifier,
+                    frame_key=sample.frame_key,
+                    occurred_at=sample.occurred_at,
+                    confidence=max((item.confidence for item in selected), default=0.0),
+                    person_count=min(32, len(selected)),
+                    emit=now - self._last_events.get(identifier, -math.inf)
+                    >= EVENT_INTERVAL_SECONDS,
+                    admit=admit,
+                )
+                return admitted, selected, emitted, now
+
+            committed = await self._durable(persist)
+            if committed is None:
+                return
+            admitted, selected, emitted, now = committed
+            if emitted:
+                self._last_events[identifier] = now
+            if (
+                not admitted
+                or self._closing
+                or self._configuration_generation.get(identifier, 0) != generation
+            ):
+                return
+            if emitted:
+                self._warmup_deferred = False
+                callback, self._first_recorded_person_callback = (
+                    self._first_recorded_person_callback,
+                    None,
+                )
+                if callback is not None:
+                    try:
+                        callback()
+                    except Exception:
+                        # Optional view warmup never changes event admission.
+                        pass
+            state["status"] = "active"
+            state["sample_phase"] = "person_detected" if selected else "no_person"
+            state["last_completed_phase"] = state["sample_phase"]
+            state["last_sample_at"] = _utc(sample.occurred_at)
+            state["processed_frames"] = min(2**63 - 1, state["processed_frames"] + 1)
 
     async def cycle(self) -> None:
         if not self._available or self._unavailable or self._closing or self._provider_failed:
             return
-        sources = tuple(self._cameras.list_sources())
+        self._warmup_deferred = True
+        warmup_generation = self._warmup_generation
+        sources = await self._durable(lambda: tuple(self._cameras.list_sources()))
+        if self._closing:
+            return
         if len(sources) > 64:
             raise OperatorEventsError("Analytics camera capacity unavailable")
         if not sources:
@@ -1490,13 +1649,17 @@ class OperatorEventService:
         self._configuration_generation = {
             key: value for key, value in self._configuration_generation.items() if key in active
         }
+        enabled = set()
         for source in ordered:
             if self._closing:
                 return
             identifier = source.binding.device_id
-            settings = self.store.settings(identifier)
+            settings = await self._durable(self.store.settings, identifier)
+            if self._closing:
+                return
             if not settings["enabled"]:
                 continue
+            enabled.add(identifier)
             try:
                 await self._sample(source, settings)
             except asyncio.CancelledError:
@@ -1560,6 +1723,20 @@ class OperatorEventService:
                     else:
                         self._provider = None
 
+        if not self._closing and self._warmup_generation == warmup_generation:
+            ready = True
+            if (
+                not enabled
+                and isinstance(self._sampler, RecordedFrameSampler)
+                and getattr(self._sampler, "_configuration", None) is not None
+            ):
+                ready = await self._durable(self._sampler.native_model_ready)
+            if not self._closing and self._warmup_generation == warmup_generation:
+                self._warmup_deferred = not (
+                    (not enabled and ready)
+                    or any(identifier in self._last_events for identifier in enabled)
+                )
+
     async def _run(self) -> None:
         while not self._closing:
             started = self._clock()
@@ -1577,9 +1754,35 @@ class OperatorEventService:
             await asyncio.sleep(max(0.0, SAMPLE_INTERVAL_SECONDS - elapsed))
 
     async def aclose(self) -> None:
-        self._closing = True
-        if hasattr(self._sampler, "begin_close"):
-            self._sampler.begin_close()
+        # All callers share one owned shutdown. Cancellation cannot release
+        # ownership while a durable callback or native cleanup still survives.
+        task = self._close_task
+        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+            # Seal native and durable admission in this very turn, before a
+            # previously queued capture gets another opportunity to launch.
+            self._closing = True
+            if hasattr(self._sampler, "begin_close"):
+                self._sampler.begin_close()
+            task = asyncio.create_task(self._close_owned(), name="operator-event-close")
+            self._close_task = task
+        cancellation = None
+        while True:
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                if task.cancelled():
+                    raise
+                cancellation = cancellation or error
+            except Exception:
+                if cancellation is not None:
+                    raise cancellation from None
+                raise
+            else:
+                if cancellation is not None:
+                    raise cancellation
+                return
+
+    async def _close_owned(self) -> None:
         incomplete = False
         if self._task is not None:
             self._task.cancel()
@@ -1613,6 +1816,9 @@ class OperatorEventService:
         except Exception:
             incomplete = True
         self._executor.shutdown(wait=finished, cancel_futures=True)
-        self.store.close()
+        if not self._state_closed:
+            await self._durable(self.store.close, _closing=True)
+            self._state_closed = True
+            self._state_executor.shutdown(wait=True, cancel_futures=True)
         if incomplete:
             raise OperatorEventsError("Analytics native cleanup is incomplete")

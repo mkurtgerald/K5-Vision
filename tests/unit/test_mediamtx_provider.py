@@ -473,8 +473,18 @@ def _source(uri="rtsp://user:private@127.0.0.1/live") -> MediaMTXSource:
     return MediaMTXSource(_BINDING, device, uri)
 
 
-def test_configuration_is_enrolled_only_private_and_windows_compatible() -> None:
-    source = _source()
+@pytest.mark.parametrize("protocol", [DeviceProtocol.ONVIF, DeviceProtocol.RTSP])
+@pytest.mark.parametrize("recording_enabled", [False, True])
+def test_configuration_is_enrolled_only_private_and_windows_compatible(
+    protocol, recording_enabled
+) -> None:
+    original = _source()
+    source = MediaMTXSource(
+        original.binding,
+        original.device.model_copy(update={"protocols": {protocol}}),
+        original.source_uri,
+        recording_enabled=recording_enabled,
+    )
     config = json.loads(
         generate_mediamtx_configuration(
             site_id="poc-site",
@@ -486,7 +496,9 @@ def test_configuration_is_enrolled_only_private_and_windows_compatible() -> None
     assert list(config["paths"]) == [_BINDING.path_name]
     path = config["paths"][_BINDING.path_name]
     assert path["source"] == source.source_uri
-    assert path["record"] and not path["sourceOnDemand"]
+    assert path["record"] is recording_enabled
+    assert path["sourceOnDemand"] is False
+    assert config["hlsAlwaysRemux"] is True
     assert path["recordFormat"] == "fmp4" and path["recordDeleteAfter"] == "0s"
     assert path["useAbsoluteTimestamp"] is False
     assert path["recordPath"].startswith(r"C:\Users\Owner\K5Recordings/%path/")
