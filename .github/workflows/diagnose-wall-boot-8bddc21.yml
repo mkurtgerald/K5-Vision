@@ -1,0 +1,101 @@
+name: Diagnose original 8bddc21 wall boot failure
+
+on:
+  pull_request:
+    types: [opened]
+    branches: [codex/beta-integration-20261112]
+    paths: [.github/workflows/diagnose-wall-boot-8bddc21.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    name: Observe original wall boot (${{ matrix.scope }})
+    runs-on: windows-2025
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [isolated, full-batch]
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: "false"
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_BETA_HEAD_SHA: 8bddc213ef7372a2fbc153e2895cebfe5b0f63b0
+      K5_DESKTOP_HEAD_SHA: 8bddc213ef7372a2fbc153e2895cebfe5b0f63b0
+      K5_DIAGNOSTIC_SCOPE: ${{ matrix.scope }}
+      K5_DIAGNOSTIC_DISPATCHER_SHA: ${{ github.event.pull_request.head.sha }}
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - name: Checkout the exact failed product candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 8bddc213ef7372a2fbc153e2895cebfe5b0f63b0
+          path: source
+          persist-credentials: false
+      - name: Checkout the separately identified diagnostic dispatcher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: diagnostic-dispatcher
+          persist-credentials: false
+      - name: Set up the original development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: source/pyproject.toml
+      - name: Admit immutable source and bounded dispatcher
+        shell: python
+        run: |
+          import hashlib,json,os,platform,subprocess
+          from pathlib import Path
+          assert __debug__ and platform.system() == 'Windows'
+          assert os.environ['GITHUB_REPOSITORY'] == 'mkurtgerald/K5-Vision'
+          source = '8bddc213ef7372a2fbc153e2895cebfe5b0f63b0'
+          tree = 'cdbe56a130246dbc653f22edba23b5a242caed4f'
+          dispatcher = Path('../diagnostic-dispatcher').resolve()
+          def git(root,*args):
+              return subprocess.check_output(['git',*args],cwd=root,text=True).strip()
+          assert git('.', 'rev-parse','HEAD') == source
+          assert git('.', 'rev-parse','HEAD^{tree}') == tree
+          observed_dispatcher = git(dispatcher,'rev-parse','HEAD')
+          assert observed_dispatcher == os.environ['K5_DIAGNOSTIC_DISPATCHER_SHA']
+          assert git(dispatcher,'rev-list','--parents','-n','1','HEAD').split() == [observed_dispatcher,source]
+          allowed = ['.github/workflows/diagnose-wall-boot-8bddc21.yml','scripts/observe_wall_boot_8bddc21.py']
+          assert git(dispatcher,'diff','--name-only',source,'HEAD').splitlines() == allowed
+          assert git(dispatcher,'diff','--name-status',source,'HEAD').splitlines() == ['A\t'+p for p in allowed]
+          helper = dispatcher/'scripts/observe_wall_boot_8bddc21.py'
+          helper_sha = hashlib.sha256(helper.read_bytes()).hexdigest()
+          assert helper_sha == 'fdc4e610dcf538064457c8c8b8d5391a73affd784ddd4e83be4fadc621ddb6c6'
+          subprocess.run(['python',str(helper),'--source','.', '--preflight-only'],check=True)
+          identity = {'scope':'wall-boot-diagnostic-only','qualification':False,'product_source':source,'product_tree':tree,'dispatcher':observed_dispatcher,'helper_sha256':helper_sha,'run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':os.environ['GITHUB_RUN_ATTEMPT'],'comparison_scope':os.environ['K5_DIAGNOSTIC_SCOPE'],'assertion_deadline_changed':False,'requests_retried':0}
+          Path('wall-boot-8bddc21-identity.json').write_text(json.dumps(identity,indent=2)+'\n',encoding='utf-8')
+      - name: Install the original acceptance dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Original diagnostic dependency install failed" }
+      - name: Exercise the unchanged assertion with failure-only observations
+        shell: pwsh
+        run: |
+          $arguments = @('../diagnostic-dispatcher/scripts/observe_wall_boot_8bddc21.py','--source','.')
+          if ($env:K5_DIAGNOSTIC_SCOPE -eq 'isolated') { $arguments += '--isolated-target' }
+          python @arguments
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve diagnostic identity and original test outcome
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: wall-boot-8bddc21-${{ matrix.scope }}-${{ github.run_id }}
+          path: |
+            source/wall-boot-8bddc21-identity.json
+            source/wall-boot-8bddc21-diagnostic.xml
+            source/wall-boot-8bddc21-diagnostic.json
+          if-no-files-found: error
+          retention-days: 7
