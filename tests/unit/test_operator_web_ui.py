@@ -277,12 +277,26 @@ def test_focused_camera_switch_observes_its_own_grant_without_wall_response_ambi
     phase = {"mode": "normal", "target": _CAMERA}
     grants, pending, errors = [], [], []
     playwright = browser = context = None
+    boot = None
     try:
         playwright = browser_api.sync_playwright().start()
         browser = playwright.chromium.launch(channel=channel, headless=True)
         context = browser.new_context(viewport={"width": 1440, "height": 900})
         context.add_init_script("window.Hls = {isSupported: () => false};")
         page = context.new_page()
+        try:
+            helper_path = (
+                Path(__file__).resolve().parents[1] / "integration/installed_boot_diagnostic.py"
+            )
+            spec = importlib.util.spec_from_file_location(
+                "k5_installed_boot_diagnostic", helper_path
+            )
+            helper = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(helper)
+            boot = helper.WallBootObserver(page)
+        except BaseException:
+            # Diagnostics cannot prevent the original browser test from running.
+            boot = None
         page.set_default_timeout(10_000)
         page.on("pageerror", lambda _error: errors.append("uncaught_script_error"))
 
@@ -341,13 +355,33 @@ def test_focused_camera_switch_observes_its_own_grant_without_wall_response_ambi
                 f"/api/v1/operator/cameras/{phase['target']}/media-session"
             )
 
-        page.route("**/*", intercept)
+        page.route("**/*", boot.intercept(intercept) if boot else intercept)
+        if boot:
+            boot.mark("goto_start")
         page.goto("http://127.0.0.1:8000/operator/")
+        if boot:
+            boot.mark("goto_done")
         page.locator("#username").fill("fixture-admin")
         page.locator("#password").fill("generated-human-account-password")
+        if boot:
+            boot.mark("sign_in_click_start")
         page.locator("#sign-in-button").click()
+        if boot:
+            boot.mark("sign_in_click_done")
         expect = browser_api.expect
-        expect(page.locator("#wall-panel video")).to_have_count(4)
+        if boot:
+            boot.mark("wall_assert_start")
+        try:
+            expect(page.locator("#wall-panel video")).to_have_count(4)
+        except BaseException as error:
+            if boot:
+                try:
+                    boot.annotate(error)
+                except BaseException:
+                    pass  # The original assertion and cleanup remain authoritative.
+            raise
+        if boot:
+            boot.mark("wall_assert_done")
         page.locator(".camera-item").filter(has_text=cameras[1]["name"]).click()
         expect(page.locator("#live-panel")).to_be_visible()
         phase.update(mode="wall_then_watch", target=_CAMERA)
@@ -398,6 +432,8 @@ def test_focused_camera_switch_observes_its_own_grant_without_wall_response_ambi
         expect(page.locator("#live-panel")).to_be_visible()
         assert not errors
     finally:
+        if boot:
+            boot.close()
         if context is not None:
             context.close()
         if browser is not None:

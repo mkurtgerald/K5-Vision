@@ -75,6 +75,26 @@ def _require(condition, message):
         pytest.fail(message, pytrace=False)
 
 
+def _remove_owned_temporary_tree(parent):
+    """Remove the proof tree even if an exiting child removes a descendant.
+
+    Python 3.12 can raise when a child disappears between rmtree's directory
+    scan and unlink. Only that already-completed descendant removal is benign;
+    failures at the owned root and all other errors remain qualification failures.
+    """
+
+    def removed_descendant(_operation, path, error):
+        if isinstance(error, FileNotFoundError):
+            descendant = Path(path)
+            if descendant != parent and descendant.is_relative_to(parent):
+                return
+        raise error
+
+    shutil.rmtree(parent, onexc=removed_descendant)
+    if parent.exists():
+        raise OSError("Owned temporary proof directory remains after removal")
+
+
 def _helpers(name):
     spec = importlib.util.spec_from_file_location(
         "k5_desktop_" + name, Path(__file__).with_name(name + ".py")
@@ -1727,28 +1747,65 @@ def _desktop_nvr_journey(
         "Pausing recording interrupted installed live video",
     )
     history_entered_utc, history_started = datetime.now(UTC), time.monotonic()
-    paused_history = client.json(f"/api/v1/operator/cameras/{camera_ids[0]}/history")
-    history_completed_utc = datetime.now(UTC)
-    history_elapsed = time.monotonic() - history_started
+    history_route = f"/api/v1/operator/cameras/{camera_ids[0]}/history"
+    history_original_get = client.get
+    history_original_response = None
+    history_response_metadata = {}
+    paused_history = None
+
+    def observed_history_get(route, *args, **kwargs):
+        nonlocal history_original_response
+        try:
+            result = history_original_get(route, *args, **kwargs)
+        except BaseException:
+            if route == history_route:
+                history_response_metadata["get_failed"] = True
+            raise
+        if route == history_route:
+            history_response_metadata["get_completed"] = True
+            history_original_response = result
+        return result
+
     try:
+        try:
+            client.get = observed_history_get
+        except BaseException:  # noqa: BLE001 - observation cannot prevent the original request.
+            history_response_metadata["projection_failed"] = True
+        paused_history = client.json(f"/api/v1/operator/cameras/{camera_ids[0]}/history")
         _require(
             bool(paused_history["spans"]),
             "Pausing recording removed installed recording history",
         )
-    except BaseException:
+    except BaseException as history_error:
         try:
-            diagnostic["paused_history"] = _helpers("installed_history_diagnostic").observe_failure(
+            history_helper = _helpers("installed_history_diagnostic")
+            if history_original_response is not None:
+                try:
+                    history_response_metadata.update(
+                        history_helper.response_metadata(history_original_response)
+                    )
+                except BaseException:  # noqa: BLE001 - preserve the original GET/status failure.
+                    history_response_metadata["projection_failed"] = True
+            diagnostic["paused_history"] = history_helper.observe_failure(
                 client=client,
                 profile=profile,
                 directory=camera_directories[0],
                 entered_utc=history_entered_utc,
-                completed_utc=history_completed_utc,
-                elapsed=history_elapsed,
+                completed_utc=datetime.now(UTC),
+                elapsed=time.monotonic() - history_started,
                 response=paused_history,
+                original_response=history_response_metadata,
+                error=history_error,
             )
         except BaseException:  # noqa: BLE001 - preserve the original assertion and cleanup.
             diagnostic["paused_history"] = {"probe_failed": True}
         raise
+    finally:
+        try:
+            client.get = history_original_get
+        except BaseException:  # noqa: BLE001 - diagnostic restoration cannot replace a failure.
+            pass  # noqa: S110 - preserve the original request/assertion result.
+        history_original_response = None
     browser_helpers._recording_control_diagnostic(None, True, diagnostic)
     with page.expect_response(
         lambda response: response.request.method == "PUT" and response.url.endswith(recording_route)
@@ -4925,7 +4982,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             listener.close()
         if parent.exists():
             try:
-                shutil.rmtree(parent)
+                _remove_owned_temporary_tree(parent)
             except Exception as error:
                 cleanup_failed = True
                 record_cleanup_failure("temporary_files", error)

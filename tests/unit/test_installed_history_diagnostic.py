@@ -18,11 +18,18 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 _HELPER = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_HELPER)
+_RUNTIME_SPEC = importlib.util.spec_from_file_location(
+    "history_runtime_failure_unit", _ROOT / "tests/integration/test_operator_product_runtime.py"
+)
+_RUNTIME = importlib.util.module_from_spec(_RUNTIME_SPEC)
+_RUNTIME_SPEC.loader.exec_module(_RUNTIME)
 _PRIVATE = "PRIVATE-user-path-rtsp://account:password@camera.invalid/recording"
 _REFERENCE = datetime(2026, 11, 13, 1, tzinfo=UTC)
 
 
 def _actual_gate(client, require, observe, diagnostic):
+    if not hasattr(client, "get"):
+        client.get = lambda *args, **kwargs: pytest.fail("Unexpected original GET")
     module = ast.parse(_DESKTOP.read_text(encoding="utf-8"))
     journey = next(
         node
@@ -43,7 +50,7 @@ def _actual_gate(client, require, observe, diagnostic):
 
     def helpers(name):
         imports.append(name)
-        return SimpleNamespace(observe_failure=observe)
+        return SimpleNamespace(observe_failure=observe, response_metadata=_HELPER.response_metadata)
 
     namespace = {
         "datetime": datetime,
@@ -57,15 +64,17 @@ def _actual_gate(client, require, observe, diagnostic):
         "_require": require,
         "_helpers": helpers,
     }
+    exercise = ast.parse("def _exercise():\n    pass\n").body[0]
+    exercise.body = journey.body[start : finish + 1] + ast.parse("return locals()\n").body
     exec(
         compile(
-            ast.Module(body=journey.body[start : finish + 1], type_ignores=[]),
+            ast.fix_missing_locations(ast.Module(body=[exercise], type_ignores=[])),
             str(_DESKTOP),
             "exec",
         ),
         namespace,
     )
-    return namespace, imports
+    return namespace["_exercise"](), imports
 
 
 def test_success_preserves_original_call_truth_and_result_without_loading_observer():
@@ -120,7 +129,7 @@ def test_original_assertion_identity_and_truth_survive_failed_observation(observ
     assert _PRIVATE not in json.dumps(diagnostic)
 
 
-def test_original_request_exception_is_not_retried_observed_or_replaced():
+def test_original_request_exception_is_observed_once_without_retry_or_replacement():
     original, calls, observations = RuntimeError(_PRIVATE), [], []
 
     def request(*args, **kwargs):
@@ -134,7 +143,259 @@ def test_original_request_exception_is_not_retried_observed_or_replaced():
             lambda **kwargs: observations.append(kwargs),
             {},
         )
-    assert caught.value is original and len(calls) == 1 and observations == []
+    assert caught.value is original and len(calls) == len(observations) == 1
+    assert observations[0]["response"] is None and observations[0]["error"] is original
+
+
+def _native_client(response=None, *, failure=None):
+    """Use the actual status assertion and JSON parser with a controlled GET."""
+    client = _RUNTIME._Client(1234)
+    calls, returned = [], []
+
+    def original_get(*args, **kwargs):
+        calls.append((args, kwargs))
+        if failure is not None:
+            raise failure
+        return response
+
+    client.get = original_get
+    original_json = client.json
+
+    def check_returned_tuple(*args, **kwargs):
+        observed_get = client.get
+
+        def identical_result(*get_args, **get_kwargs):
+            value = observed_get(*get_args, **get_kwargs)
+            returned.append(value)
+            assert value is response
+            return value
+
+        client.get = identical_result
+        try:
+            return original_json(*args, **kwargs)
+        finally:
+            client.get = observed_get
+
+    client.json = check_returned_tuple
+    return client, original_get, calls, returned
+
+
+def test_successful_original_get_tuple_is_identical_and_runs_no_failure_probe():
+    response = (200, json.dumps({"spans": [{"private": _PRIVATE}]}).encode(), {_PRIVATE: _PRIVATE})
+    client, original, calls, returned = _native_client(response)
+    observations, truths, diagnostic = [], [], {}
+    namespace, imports = _actual_gate(
+        client,
+        lambda value, message: truths.append(value),
+        lambda **kwargs: observations.append(kwargs),
+        diagnostic,
+    )
+    assert calls == [(("/api/v1/operator/cameras/generated-id/history",), {})]
+    assert returned == [response] and returned[0] is response
+    assert client.get is original and truths == [True] and observations == [] and diagnostic == {}
+    assert namespace["history_response_metadata"] == {"get_completed": True}
+    assert namespace["history_original_response"] is None and imports == []
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (503, b'{"detail":"roles_unavailable"}', "roles_unavailable"),
+        (503, b'{"detail":"Operator identity unavailable"}', "identity_unavailable"),
+        (503, b'{"detail":"Playback inventory unavailable"}', "playback_inventory_unavailable"),
+        (401, b'{"detail":"Unauthorized"}', "unauthorized"),
+        (403, b'{"detail":"Insufficient operator permission"}', "insufficient_permission"),
+        (503, json.dumps({"detail": _PRIVATE, "private": _PRIVATE}).encode(), "other"),
+        (503, _PRIVATE.encode(), "other"),
+        (503, b"x" * 16_385, "other"),
+    ],
+)
+def test_original_non200_status_assertion_is_preserved_with_safe_metadata(status, body, expected):
+    response = (status, body, {_PRIVATE: _PRIVATE})
+    client, original, calls, returned = _native_client(response)
+    observations, diagnostic = [], {}
+
+    def observe(**kwargs):
+        observations.append(kwargs)
+        return kwargs["original_response"]
+
+    with pytest.raises(
+        AssertionError, match="Operator API returned an unexpected status"
+    ) as caught:
+        _actual_gate(
+            client,
+            lambda *args: pytest.fail("HTTP status assertion must fail before the span assertion"),
+            observe,
+            diagnostic,
+        )
+    assert len(calls) == len(returned) == len(observations) == 1
+    assert returned[0] is response and client.get is original
+    assert caught.value is observations[0]["error"]
+    assert observations[0]["response"] is None
+    assert diagnostic["paused_history"]["http_status"] == status
+    assert diagnostic["paused_history"]["error_detail"] == expected
+    assert _PRIVATE not in json.dumps(diagnostic, allow_nan=False)
+
+
+@pytest.mark.parametrize("failure", [TimeoutError(_PRIVATE), RuntimeError(_PRIVATE)])
+def test_original_transport_failure_has_no_extra_get_and_restores_original_method(failure):
+    client, original, calls, returned = _native_client(failure=failure)
+    observations, diagnostic = [], {}
+
+    def observe(**kwargs):
+        observations.append(kwargs)
+        return kwargs["original_response"]
+
+    with pytest.raises(type(failure)) as caught:
+        _actual_gate(client, lambda *args: pytest.fail("Request failed"), observe, diagnostic)
+    assert caught.value is failure and observations[0]["error"] is failure
+    assert len(calls) == 1 and returned == [] and client.get is original
+    assert diagnostic["paused_history"] == {"get_failed": True}
+    assert _PRIVATE not in json.dumps(diagnostic)
+
+
+def test_original_json_parse_failure_is_observed_without_replaying_the_get():
+    response = (200, _PRIVATE.encode(), {})
+    client, original, calls, returned = _native_client(response)
+    observed = []
+    with pytest.raises(json.JSONDecodeError) as caught:
+        _actual_gate(
+            client,
+            lambda *args: pytest.fail("JSON parser must fail first"),
+            lambda **kwargs: observed.append(kwargs) or kwargs["original_response"],
+            {},
+        )
+    assert len(calls) == len(returned) == len(observed) == 1 and client.get is original
+    assert observed[0]["error"] is caught.value and observed[0]["response"] is None
+    assert observed[0]["original_response"]["http_status"] == 200
+
+
+@pytest.mark.parametrize("failure", [ValueError(_PRIVATE), KeyboardInterrupt(_PRIVATE)])
+def test_projection_fault_cannot_replace_original_tuple_or_success(monkeypatch, failure):
+    response = (200, b'{"spans":[{}]}', {})
+    client, original, calls, returned = _native_client(response)
+
+    def broken(*args):
+        raise failure
+
+    monkeypatch.setattr(_HELPER, "response_metadata", broken)
+    namespace, imports = _actual_gate(
+        client,
+        lambda value, _: value or pytest.fail("Original span"),
+        lambda **kwargs: pytest.fail("No failure probe on success"),
+        {},
+    )
+    assert len(calls) == len(returned) == 1 and returned[0] is response and client.get is original
+    assert namespace["history_response_metadata"] == {"get_completed": True}
+    assert imports == []
+
+
+def test_non200_original_exception_survives_a_failure_probe_exception():
+    response = (503, b'{"detail":"roles_unavailable"}', {})
+    client, original, calls, _ = _native_client(response)
+    observed, diagnostic = [], {}
+
+    def broken(**kwargs):
+        observed.append(kwargs["error"])
+        raise RuntimeError(_PRIVATE)
+
+    with pytest.raises(AssertionError) as caught:
+        _actual_gate(client, lambda *args: pytest.fail("Original status"), broken, diagnostic)
+    assert caught.value is observed[0] and client.get is original and len(calls) == 1
+    assert diagnostic == {"paused_history": {"probe_failed": True}}
+
+
+def test_original_non200_assertion_survives_a_deferred_projection_exception(monkeypatch):
+    response = (503, b'{"detail":"roles_unavailable"}', {})
+    client, original, calls, _ = _native_client(response)
+    observed, diagnostic = [], {}
+
+    def broken_projection(*args):
+        raise RuntimeError(_PRIVATE)
+
+    def observe(**kwargs):
+        observed.append(kwargs)
+        return kwargs["original_response"]
+
+    monkeypatch.setattr(_HELPER, "response_metadata", broken_projection)
+    with pytest.raises(AssertionError) as caught:
+        _actual_gate(client, lambda *args: pytest.fail("Original status"), observe, diagnostic)
+    assert caught.value is observed[0]["error"] and client.get is original and len(calls) == 1
+    assert diagnostic == {"paused_history": {"get_completed": True, "projection_failed": True}}
+
+
+def test_nontarget_get_keeps_its_original_arguments_tuple_and_no_projection(monkeypatch):
+    response = (200, b'{"spans":[{}]}', {})
+    client, original, calls, _ = _native_client(response)
+    original_json, projections = client.json, []
+    original_project = _HELPER.response_metadata
+
+    def project(value):
+        projections.append(value)
+        return original_project(value)
+
+    def with_other_request(route, **kwargs):
+        assert client.get("/unrelated", method="HEAD", max_bytes=17) is response
+        return original_json(route, **kwargs)
+
+    monkeypatch.setattr(_HELPER, "response_metadata", project)
+    client.json = with_other_request
+    _actual_gate(
+        client,
+        lambda value, _: value or pytest.fail("Original span"),
+        lambda **kwargs: pytest.fail("No failure probe"),
+        {},
+    )
+    assert calls == [
+        (("/unrelated",), {"method": "HEAD", "max_bytes": 17}),
+        (("/api/v1/operator/cameras/generated-id/history",), {}),
+    ]
+    assert projections == [] and client.get is original
+
+
+def test_malformed_nested_error_json_retains_original_status_without_private_body():
+    body = b'{"detail":' + b"[" * 1100 + json.dumps(_PRIVATE).encode() + b"]" * 1100 + b"}"
+    result = _HELPER.response_metadata((503, body, {_PRIVATE: _PRIVATE}))
+    assert result["http_status"] == 503 and result["error_detail"] == "other"
+    assert _PRIVATE not in json.dumps(result)
+
+
+def test_original_failed_request_is_never_reported_as_empty_spans(tmp_path):
+    arguments = _arguments(tmp_path)
+    arguments.update(
+        response=None,
+        original_response={
+            "http_status": 503,
+            "error_detail": "roles_unavailable",
+            "get_completed": True,
+        },
+        error=AssertionError(_PRIVATE),
+    )
+    result = _HELPER.observe_failure(**arguments)
+    assert result["history_request"]["http_status"] == 503
+    assert result["history_request"]["error_detail"] == "roles_unavailable"
+    assert result["history_request"]["span_count"] is None
+    assert result["original_error_type"] == "AssertionError"
+    assert _PRIVATE not in json.dumps(result, allow_nan=False)
+
+
+def test_malformed_captured_metadata_is_projected_again_before_output(tmp_path):
+    arguments = _arguments(tmp_path)
+    arguments.update(
+        response=None,
+        original_response={
+            "http_status": _PRIVATE,
+            "error_detail": _PRIVATE,
+            "get_completed": _PRIVATE,
+            "private": _PRIVATE,
+        },
+        error=RuntimeError(_PRIVATE),
+    )
+    result = _HELPER.observe_failure(**arguments)
+    assert result["history_request"]["http_status"] is None
+    assert result["history_request"]["error_detail"] == "other"
+    assert result["history_request"]["get_completed"] is False
+    assert _PRIVATE not in json.dumps(result, allow_nan=False)
 
 
 def test_file_inventory_emits_only_bounded_metadata_without_reading_contents(tmp_path, monkeypatch):

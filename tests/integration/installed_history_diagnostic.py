@@ -24,6 +24,40 @@ _BYTE_LIMIT = 2**63 - 1
 _POLICY_BYTE_LIMIT = 4096 * 1024**3
 _FILENAME = re.compile(r"(\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d-\d{6}_(?:Z|[+-]\d{4}))\.mp4")
 _PATH = re.compile(r"k5_[0-9a-f]{64}")
+_ERROR_DETAILS = {
+    "roles_unavailable": "roles_unavailable",
+    "Operator identity unavailable": "identity_unavailable",
+    "Playback inventory unavailable": "playback_inventory_unavailable",
+    "Unauthorized": "unauthorized",
+    "Insufficient operator permission": "insufficient_permission",
+}
+
+
+def response_metadata(response):
+    """Project an original GET tuple without retaining its body or headers."""
+    result = {"http_status": None, "error_detail": "other"}
+    if type(response) is not tuple or len(response) != 3:
+        return result
+    status, body, _ = response
+    if type(status) is not int or not 100 <= status <= 599:
+        return result
+    result["http_status"] = status
+    if status == 200:
+        result["error_detail"] = None
+        return result
+    if type(body) is not bytes or len(body) > 16_384:
+        result["error_body_unavailable"] = True
+        return result
+    try:
+        value = json.loads(body)
+        detail = value.get("detail") if type(value) is dict else None
+        if type(detail) is dict:
+            detail = detail.get("code")
+        if type(detail) is str:
+            result["error_detail"] = _ERROR_DETAILS.get(detail, "other")
+    except (ValueError, UnicodeError, RecursionError):
+        result["invalid_error_json"] = True
+    return result
 
 
 def _integer(value, maximum=_BYTE_LIMIT):
@@ -202,12 +236,26 @@ def _policy_snapshot(value):
     }
 
 
-def observe_failure(*, client, profile, directory, entered_utc, completed_utc, elapsed, response):
+def observe_failure(
+    *,
+    client,
+    profile,
+    directory,
+    entered_utc,
+    completed_utc,
+    elapsed,
+    response,
+    original_response=None,
+    error=None,
+):
     """Call only after the unchanged assertion failed; never serialize private data."""
     began = time.monotonic()
     deadline = began + _BUDGET_SECONDS
     reference = entered_utc if _iso(entered_utc) is not None else datetime.now(UTC)
     spans = response.get("spans") if type(response) is dict else None
+    original_response = original_response if type(original_response) is dict else {}
+    status = original_response.get("http_status")
+    status = status if type(status) is int and 100 <= status <= 599 else None
     result = {
         "scope": "failed-paused-history-metadata",
         "request_retries_added": 0,
@@ -216,7 +264,25 @@ def observe_failure(*, client, profile, directory, entered_utc, completed_utc, e
             "completed_utc": _iso(completed_utc),
             "seconds": _number(elapsed, maximum=60),
             "span_count": _integer(len(spans), 1024) if type(spans) is list else None,
+            "http_status": status,
+            "error_detail": None
+            if status == 200
+            else _choice(original_response.get("error_detail"), set(_ERROR_DETAILS.values())),
+            "get_completed": original_response.get("get_completed") is True,
+            "get_failed": original_response.get("get_failed") is True,
+            "projection_failed": original_response.get("projection_failed") is True,
         },
+        "original_error_type": _choice(
+            type(error).__name__,
+            {
+                "AssertionError",
+                "RuntimeError",
+                "TimeoutError",
+                "JSONDecodeError",
+                "KeyError",
+                "Failed",
+            },
+        ),
         "observation_utc": _iso(datetime.now(UTC)),
         "recording_files": _file_inventory(directory, deadline, reference),
     }

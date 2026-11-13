@@ -64,6 +64,13 @@ class CurrentPermissionSnapshot:
     generation: int | None
 
 
+class PermissionSnapshotChanged(HTTPException):
+    """Only a completed local policy update invalidated this positive read."""
+
+    def __init__(self):
+        super().__init__(503, "roles_unavailable")
+
+
 def current_permission_snapshot(app, account):
     """Read a single request's durable role authority on its owned worker."""
     required = _REQUEST_PERMISSION.get()
@@ -97,9 +104,20 @@ def validate_current_permission_snapshot(app, account, snapshot):
         or snapshot.role is not account.role
         or snapshot.required != required
         or snapshot.policy is not policy
-        or (policy is not None and snapshot.generation != policy.permission_generation)
     ):
         raise HTTPException(503, "roles_unavailable")
+    if policy is not None:
+        generation = policy.permission_generation
+        if snapshot.generation != generation:
+            if (
+                type(snapshot.generation) is int
+                and type(generation) is int
+                and snapshot.generation < generation
+                and generation == policy.completed_permission_generation
+                and required in snapshot.permissions
+            ):
+                raise PermissionSnapshotChanged()
+            raise HTTPException(503, "roles_unavailable")
     if required not in snapshot.permissions:
         raise HTTPException(403, "Insufficient operator permission")
 

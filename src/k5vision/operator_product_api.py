@@ -459,6 +459,7 @@ def install_operator_product_api(
     app.add_middleware(_ProductRoutesOnly)
     from k5vision.operator_role_policy_api import (
         OperatorPermissionContext,
+        PermissionSnapshotChanged,
         current_permission_snapshot,
         current_request_permission,
         effective_permissions,
@@ -507,7 +508,7 @@ def install_operator_product_api(
                         raise asyncio.CancelledError
                     return result
 
-    async def authenticate(token: str) -> tuple[UserAccount, str]:
+    async def authenticate_once(token: str) -> tuple[UserAccount, str]:
         principal = await sessions.resolve(token)
         if principal is None:
             raise _unauthorized()
@@ -581,6 +582,21 @@ def install_operator_product_api(
             # its own registry read. No positive policy cache survives here.
             validate_current_permission_snapshot(app, final, permission)
         return current, token
+
+    async def authenticate(token: str) -> tuple[UserAccount, str]:
+        # A separate role edit can land between this request's durable policy
+        # read and final session resolution. Re-admit from current durable
+        # account, credential, session and policy state instead of feeding a
+        # transient 503 to an otherwise authorized media decoder. Two fresh
+        # attempts cover updates at either validation boundary; continued
+        # changes remain unavailable rather than extending work indefinitely.
+        for attempt in range(3):
+            try:
+                return await authenticate_once(token)
+            except PermissionSnapshotChanged:
+                if attempt == 2:
+                    raise HTTPException(503, "roles_unavailable") from None
+        raise HTTPException(503, "roles_unavailable")
 
     async def require_session(request: Request) -> tuple[UserAccount, str]:
         values = request.headers.getlist("authorization")
