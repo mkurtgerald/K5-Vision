@@ -1,0 +1,163 @@
+name: Diagnose paused history on 16 Windows VMs 11efea1
+
+on:
+  pull_request:
+    types: [opened]
+    branches: [codex/beta-integration-20261112]
+    paths: [.github/workflows/diagnose-paused-history-11efea1-16vm.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  observe:
+    name: Observe actual paused history on VM ${{ matrix.probe }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix:
+        probe: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: "false"
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_BETA_HEAD_SHA: 11efea1bd5d33533148c2aa3d53c445017d102f5
+      K5_DESKTOP_HEAD_SHA: 11efea1bd5d33533148c2aa3d53c445017d102f5
+      K5_VM_CLOCK_ACCEPTANCE: "0"
+      K5_HISTORY_DIAGNOSTIC_PROBE: ${{ matrix.probe }}
+      K5_DIAGNOSTIC_DISPATCHER_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Checkout the exact failed product candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 11efea1bd5d33533148c2aa3d53c445017d102f5
+          persist-credentials: false
+      - name: Checkout the separately pinned diagnostic dispatcher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: .history-diagnostic-dispatcher
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Set up the original development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Admit frozen source, dispatcher, and original failed candidate producer
+        shell: python
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+        run: |
+          import hashlib,json,os,platform,subprocess,urllib.request
+          from pathlib import Path
+          assert __debug__ and platform.system() == 'Windows'
+          assert os.environ['GITHUB_REPOSITORY'] == 'mkurtgerald/K5-Vision'
+          assert os.environ['GITHUB_EVENT_NAME'] == 'pull_request'
+          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
+          assert os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted'
+          assert os.environ['RUNNER_OS'] == 'Windows'
+          source='11efea1bd5d33533148c2aa3d53c445017d102f5'
+          tree='f05040b021eb429aa85d155b1635b4718f4a6cc6'
+          dispatcher=Path('.history-diagnostic-dispatcher').resolve()
+          def git(root,*args):
+              return subprocess.check_output(['git',*args],cwd=root,text=True).strip()
+          assert git('.', 'rev-parse','HEAD') == source
+          assert git('.', 'rev-parse','HEAD^{tree}') == tree
+          assert not git('.', 'status','--porcelain','--untracked-files=no')
+          observed=git(dispatcher,'rev-parse','HEAD')
+          assert observed == os.environ['K5_DIAGNOSTIC_DISPATCHER_SHA']
+          assert git(dispatcher,'rev-list','--parents','-n','1','HEAD').split() == [observed,source]
+          allowed=['.github/workflows/diagnose-paused-history-11efea1-16vm.yml','scripts/observe_paused_history_11efea1.py']
+          assert git(dispatcher,'diff','--name-status',source,'HEAD').splitlines() == ['A\t'+p for p in allowed]
+          helper=dispatcher/'scripts/observe_paused_history_11efea1.py'
+          assert hashlib.sha256(helper.read_bytes()).hexdigest() == '1030f5a1ef265727e60d965e581bc34dd15c67070ae2f60049fe763b400beeeb'
+          for name,expected in {'tests/integration/test_windows_desktop_app.py': 'd08831a743c13b27a125c3272e24fde407d7fedd7f469b41f279c284634902e6', 'tests/integration/test_operator_product_runtime.py': 'd7c7eaa38fe36843a937e57d60b696a93bca66599b3883e51d84cd1f37345106', 'tests/integration/test_operator_beta_browser.py': '67eea5d12df2cfe6e19603fe459405eac05c93e6db8d59c068a23f69a573f771', 'tests/integration/installed_settings_acceptance.py': '3fcda240480194282712ee1e18fb820a327b9e0b840987775a358900c22bf165', '.github/actions/provision-operator-tools/action.yml': 'e50c55c29830ed793c0500e52628d145580d23209f49c9369a2c218e722c0c00', 'scripts/provision_operator_person_acceptance.py': '3dc414b2aa0ba92cae73ab02b81ffdca43386e5e0e1274c02dc0c52110d3c896'}.items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == expected
+          subprocess.run(['python',str(helper),'--source','.', '--preflight-only'],check=True)
+          headers={'Authorization':'Bearer '+os.environ['GH_READ_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'K5-history-diagnostic'}
+          def document(route):
+              request=urllib.request.Request('https://api.github.com/repos/mkurtgerald/K5-Vision'+route,headers=headers)
+              with urllib.request.urlopen(request,timeout=30) as response:
+                  raw=response.read(4194305)
+              assert len(raw)<=4194304
+              return json.loads(raw)
+          run=document('/actions/runs/43343305341')
+          assert run['id']==43343305341 and run['head_sha']==source and run['run_attempt']==1
+          assert run['path']=='.github/workflows/operator-desktop-windows.yml'
+          assert run['status']=='completed' and run['conclusion']=='failure'
+          jobs=document('/actions/runs/43343305341/attempts/1/jobs?per_page=100')['jobs']
+          producer=[row for row in jobs if row['id']==131616567279]
+          assert len(producer)==1 and producer[0]['conclusion']=='failure' and producer[0]['head_sha']==source
+          artifact=document('/actions/artifacts/14001165254')
+          assert artifact['id']==14001165254 and artifact['size_in_bytes']==298599623 and artifact['expired'] is False
+          assert artifact['name']=='k5-vision-windows-upgrade-candidate-'+source
+          assert artifact['digest']=='sha256:139112d19fb882d9492882b9dfb82772126f4914670f553a314352fbe58c57e2'
+          assert artifact['workflow_run']['id']==43343305341 and artifact['workflow_run']['head_sha']==source
+          identity={'scope':'paused-history-diagnostic-only','qualification':False,'source_head':source,'source_tree':tree,'dispatcher_head':observed,'helper_sha256':'1030f5a1ef265727e60d965e581bc34dd15c67070ae2f60049fe763b400beeeb','run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':1,'probe':os.environ['K5_HISTORY_DIAGNOSTIC_PROBE'],'original_failed_run':43343305341,'original_failed_job':131616567279,'candidate_artifact':14001165254,'candidate_is_unqualified':True,'product_test_files_changed':False,'original_assertions_and_deadlines_changed':False,'request_retries_added':0}
+          Path('paused-history-11efea1-identity.json').write_text(json.dumps(identity,indent=2)+'\n',encoding='utf-8')
+      - name: Download the original unqualified installer for diagnostics only
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          artifact-ids: "14001165254"
+          run-id: "43343305341"
+          github-token: ${{ github.token }}
+          path: history-diagnostic-input
+          merge-multiple: true
+      - name: Verify original candidate installer, package and manifest bytes
+        shell: python
+        run: |
+          import hashlib,json,os
+          from pathlib import Path
+          root=Path('history-diagnostic-input')
+          assert sorted(p.name for p in root.iterdir()) == ['K5VisionSetup.exe','desktop-package.json','payload-manifest.json']
+          package=root/'desktop-package.json'
+          manifest=root/'payload-manifest.json'
+          setup=root/'K5VisionSetup.exe'
+          assert hashlib.sha256(package.read_bytes()).hexdigest()=='ac1828e9374166ada3758cde38449291ac305f071dac241ceab87a5863c01f72'
+          assert hashlib.sha256(manifest.read_bytes()).hexdigest()=='a3d2ec382426935bd68bd8c8506a349a7dac117f3b8bee947ada799582ae8d39'
+          data=json.loads(package.read_bytes())
+          assert data['qualification_status']=='unqualified' and data['schema_version']==1
+          assert data['head_sha']==json.loads(manifest.read_bytes())['head_sha']=='11efea1bd5d33533148c2aa3d53c445017d102f5'
+          assert setup.stat().st_size==data['setup_bytes']==300004641
+          with setup.open('rb') as stream:
+              actual=hashlib.file_digest(stream,'sha256').hexdigest()
+          assert actual==data['setup_sha256']=='529e1a232ac2d49ef00cae44e7f8d4ba49421c68c4940728246e835bf411a17f'
+          with Path(os.environ['GITHUB_ENV']).open('a',encoding='utf-8') as stream:
+              stream.write('K5_DESKTOP_SETUP='+str(setup.resolve())+'\n')
+              stream.write('K5_DESKTOP_SETUP_SHA256='+actual+'\n')
+          print('Exact unqualified failed-run installer admitted for diagnostic execution only')
+      - name: Install the original acceptance dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Original diagnostic dependency install failed" }
+      - name: Provision the original immutable native acceptance tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Provision the original admitted public person fixture
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw "Original public person fixture admission failed" }
+      - name: Run the unchanged original installed GUI tests with failure-only observations
+        timeout-minutes: 12
+        shell: pwsh
+        run: |
+          python .history-diagnostic-dispatcher/scripts/observe_paused_history_11efea1.py --source .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve only diagnostic identity and finite original outcome
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: paused-history-11efea1-probe-${{ matrix.probe }}-${{ github.run_id }}
+          path: |
+            paused-history-11efea1-identity.json
+            paused-history-11efea1-original.xml
+            paused-history-11efea1-observation.json
+          if-no-files-found: error
+          retention-days: 7
