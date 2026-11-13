@@ -400,13 +400,14 @@ def test_malformed_captured_metadata_is_projected_again_before_output(tmp_path):
 
 def test_file_inventory_emits_only_bounded_metadata_without_reading_contents(tmp_path, monkeypatch):
     (tmp_path / "2026-11-13_01-00-00-123456_Z.mp4").write_text(_PRIVATE)
-    (tmp_path / (_PRIVATE.replace("/", "_") + ".txt")).write_text(_PRIVATE)
+    private_filename = "PRIVATE-generated-recording-token.txt"
+    (tmp_path / private_filename).write_text(_PRIVATE)
     monkeypatch.setattr(Path, "read_bytes", lambda *args: pytest.fail("Recording content read"))
     result = _HELPER._file_inventory(tmp_path, _HELPER.time.monotonic() + 2, _REFERENCE)
     assert result["files"] == 2 and result["parsed"] == result["unparsed"] == 1
     assert result["entries"][0]["start_minus_request_entry_seconds"] == 0.123456
     raw = json.dumps(result, allow_nan=False)
-    assert _PRIVATE not in raw and str(tmp_path) not in raw
+    assert _PRIVATE not in raw and private_filename not in raw and str(tmp_path) not in raw
 
 
 def test_file_inventory_caps_entries_and_refuses_symlink_directory(tmp_path):
@@ -626,7 +627,9 @@ def test_http_body_and_read_budget_are_bounded_and_response_is_closed(monkeypatc
     assert len(opens) == 1
 
 
-@pytest.mark.parametrize("payload", [b"x" * 131_073, _PRIVATE.encode()])
+@pytest.mark.parametrize(
+    "payload", [b"x" * 131_073, _PRIVATE.encode()], ids=("oversized-body", "invalid-json")
+)
 def test_oversized_or_invalid_json_body_never_enters_metadata(payload):
     response = _Response([payload[:65_536], payload[65_536:131_072], payload[131_072:]])
     result, value = _HELPER._bounded_json(
