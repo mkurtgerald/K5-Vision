@@ -1,0 +1,152 @@
+name: Installer navigation supporting Windows diagnostic
+
+on:
+  pull_request:
+    types: [opened]
+    branches: [codex/beta-integration-20261112]
+    paths: [.github/workflows/diagnose-installer-navigation-ea14188.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  installer-navigation:
+    name: Installer navigation on Windows VM ${{ matrix.probe }}
+    runs-on: windows-2025
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        probe: [1, 2]
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: "false"
+      K5_VM_CLOCK_ACCEPTANCE: "0"
+      K5_INSTALLER_NAVIGATION_PROBE: ${{ matrix.probe }}
+      K5_DIAGNOSTIC_DISPATCHER_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Checkout exact reviewed repaired test controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 2d743342cdf393cb1a546340ada9e5b862f8a975
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Checkout separately pinned diagnostic dispatcher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: .installer-navigation-dispatcher
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Set up original development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Bind separate controller, original failed installer producer and exact artifact
+        shell: python
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+        run: |
+          import hashlib,json,os,platform,subprocess,urllib.request
+          from pathlib import Path
+          assert __debug__ and platform.system()=='Windows'
+          assert os.environ['GITHUB_REPOSITORY']=='mkurtgerald/K5-Vision'
+          assert os.environ['GITHUB_EVENT_NAME']=='pull_request' and os.environ['GITHUB_RUN_ATTEMPT']=='1'
+          assert os.environ['RUNNER_ENVIRONMENT']=='github-hosted' and os.environ['RUNNER_OS']=='Windows'
+          source='2d743342cdf393cb1a546340ada9e5b862f8a975'
+          candidate='ea14188f7ca021fe2ff770532c41bcdb317181f4'
+          tree='e8e1fa8aa93c5de19bd174c5ac0f6c93f096dc36'
+          dispatcher=Path('.installer-navigation-dispatcher').resolve()
+          def git(root,*args):
+              return subprocess.check_output(['git',*args],cwd=root,text=True).strip()
+          assert git('.','rev-parse','HEAD')==source and git('.','rev-parse','HEAD^{tree}')==tree
+          assert not git('.','status','--porcelain','--untracked-files=no')
+          assert git('.','rev-list','--parents','-n','1','HEAD').split()==[source,candidate]
+          assert git('.','diff','--name-only',candidate,source).splitlines()==['.github/workflows/operator-desktop-windows.yml','tests/integration/test_windows_desktop_app.py','tests/unit/test_windows_installer_navigation.py']
+          observed=git(dispatcher,'rev-parse','HEAD')
+          assert observed==os.environ['K5_DIAGNOSTIC_DISPATCHER_SHA']
+          assert git(dispatcher,'rev-list','--parents','-n','1','HEAD').split()==[observed,source]
+          allowed=['.github/workflows/diagnose-installer-navigation-ea14188.yml','diagnostics/test_windows_installer_navigation_protocol.py','scripts/diagnose_installer_navigation.py']
+          assert git(dispatcher,'diff','--name-status',source,'HEAD').splitlines()==['A	'+name for name in allowed]
+          for name,expected in {'tests/integration/test_windows_desktop_app.py': '24d2019f7a7ddd348fcfc22d0fbdb53b5193caa0ed0d5fc67382aa3f2ae63b2b', 'tests/unit/test_windows_installer_navigation.py': 'd4488c8fedad4ffc118841f32b31303efaee3723c68becc3526d1852691e3e9f', 'tests/unit/test_windows_desktop_cleanup.py': '2aeb67f43159f4ae6e762a4a0b4ec8cdce1c531ace26c7729538bc6c32002b50', '.github/workflows/operator-desktop-windows.yml': '7a332e2a57099f342a8013659073988ddbea186b9d0d298367dbceab028ca7a3'}.items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==expected
+          for name,expected in {'scripts/diagnose_installer_navigation.py': 'e10cd06e8e5bf60742e0482de8ea9486e3df44092392b8dfb75909f3b18258d4', 'diagnostics/test_windows_installer_navigation_protocol.py': 'eee02ad304ac8c28510d2e41557113a61e8bf0e602608cc832e52007ef145021'}.items():
+              assert hashlib.sha256((dispatcher/name).read_bytes()).hexdigest()==expected
+          headers={'Authorization':'Bearer '+os.environ['GH_READ_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'K5-installer-navigation-supporting-diagnostic'}
+          def document(route):
+              request=urllib.request.Request('https://api.github.com/repos/mkurtgerald/K5-Vision'+route,headers=headers)
+              with urllib.request.urlopen(request,timeout=30) as response: raw=response.read(4194305)
+              assert len(raw)<=4194304
+              return json.loads(raw)
+          run=document('/actions/runs/43359544737')
+          assert run['id']==43359544737 and run['head_sha']==candidate and run['run_attempt']==1
+          assert run['path']=='.github/workflows/operator-desktop-windows.yml'
+          assert run['status']=='completed' and run['conclusion']=='failure'
+          jobs=document('/actions/runs/43359544737/attempts/1/jobs?per_page=100')['jobs']
+          producer=[row for row in jobs if row['id']==131669521490]
+          assert len(producer)==1 and producer[0]['head_sha']==candidate and producer[0]['conclusion']=='failure'
+          assert producer[0]['name']=='Build and exercise actual graphical Windows installation'
+          upload=[row for row in producer[0]['steps'] if row['name']=='Upload non-release candidate for independent upgrade and reversal qualification']
+          assert len(upload)==1 and upload[0]['conclusion']=='success'
+          artifact=document('/actions/artifacts/14007264223')
+          assert artifact['id']==14007264223 and artifact['name']=='k5-vision-windows-upgrade-candidate-'+candidate
+          assert artifact['size_in_bytes']==298600115 and artifact['expired'] is False
+          assert artifact['digest']=='sha256:9478e10399af96431a11a7e60bc5547429f0d122af2c27b7f9064c6cce5a565a'
+          assert artifact['workflow_run']['id']==43359544737 and artifact['workflow_run']['head_sha']==candidate
+          identity={'scope':'installer-navigation-supporting-diagnostic-only','qualification':False,'controller_source':source,'controller_tree':tree,'candidate_source':candidate,'dispatcher_head':observed,'run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':1,'probe':os.environ['K5_INSTALLER_NAVIGATION_PROBE'],'input_native_run':43359544737,'input_failed_producer':131669521490,'candidate_artifact':14007264223,'candidate_is_unqualified':True,'normal_release_gates_required_separately':True,'clock_test_started':False,'app_startup_requested':False,'original_installer_deadline_seconds':90,'original_control_deadline_milliseconds':5000}
+          Path('installer-navigation-identity.json').write_text(json.dumps(identity,indent=2)+'\n',encoding='utf-8')
+      - name: Download exact unqualified EA installer
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          artifact-ids: "14007264223"
+          run-id: "43359544737"
+          github-token: ${{ github.token }}
+          path: installer-navigation-input
+          merge-multiple: true
+      - name: Bind exact installer package, manifest and executable bytes
+        shell: python
+        run: |
+          import hashlib,json,os
+          from pathlib import Path
+          root=Path('installer-navigation-input')
+          assert sorted(p.name for p in root.iterdir())==['K5VisionSetup.exe','desktop-package.json','payload-manifest.json']
+          package=root/'desktop-package.json';manifest=root/'payload-manifest.json';setup=root/'K5VisionSetup.exe'
+          assert hashlib.sha256(package.read_bytes()).hexdigest()=='b8b85fd7c3fb587a1f3b4b3a03cce410ec2cdb3d485c855ba6fd563927a91ede'
+          assert hashlib.sha256(manifest.read_bytes()).hexdigest()=='301eee64d03b1d989a793de8e2cf87b8db9de52e25c8b3b7b8e94cfc5b4a1483'
+          data=json.loads(package.read_bytes())
+          assert data['qualification_status']=='unqualified' and data['schema_version']==1
+          assert data['head_sha']==json.loads(manifest.read_bytes())['head_sha']=='ea14188f7ca021fe2ff770532c41bcdb317181f4'
+          assert data['payload_manifest_sha256']=='301eee64d03b1d989a793de8e2cf87b8db9de52e25c8b3b7b8e94cfc5b4a1483'
+          assert setup.stat().st_size==data['setup_bytes']==300005122
+          with setup.open('rb') as stream: actual=hashlib.file_digest(stream,'sha256').hexdigest()
+          assert actual==data['setup_sha256']=='2e719ba3deeef94d1c0703e71560dfce4edbff7f7bc772b92aa335b7bcc101b3'
+          with Path(os.environ['GITHUB_ENV']).open('a',encoding='utf-8') as stream:
+              stream.write('K5_DESKTOP_SETUP='+str(setup.resolve())+'\n')
+              stream.write('K5_DESKTOP_SETUP_SHA256='+actual+'\n')
+          print('Exact unqualified EA installer admitted only for supporting driver diagnostics')
+      - name: Install original test-only development dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exercise native message protocol and three exact installer cycles
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          python .installer-navigation-dispatcher/scripts/diagnose_installer_navigation.py --source . --protocol .installer-navigation-dispatcher/diagnostics/test_windows_installer_navigation_protocol.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve every supporting diagnostic outcome
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: installer-navigation-ea14188-probe-${{ matrix.probe }}-${{ github.run_id }}
+          path: |
+            installer-navigation-identity.json
+            installer-navigation-controls.xml
+            installer-navigation-result.json
+          if-no-files-found: error
+          retention-days: 7
