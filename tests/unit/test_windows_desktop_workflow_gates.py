@@ -49,9 +49,9 @@ def test_failed_gui_analytics_does_not_skip_independent_upgrade_reversal():
     assert "desktop-build/upgrade-candidate/" in desktop
     assert "desktop-build/release/" in desktop
 
-    assert "needs: [native-desktop, focused-windows]" in upgrade
-    assert "if: ${{ always()" in upgrade
-    assert "needs.focused-windows.result == 'success'" in upgrade
+    assert "needs: [native-desktop]" in upgrade
+    assert "if: ${{ always() && !cancelled() &&" in upgrade
+    assert "focused-windows" not in upgrade
     assert "needs.native-desktop.result == 'failure'" in upgrade
     assert 'qualification_status -ne "unqualified"' in upgrade
     assert upgrade.count(candidate) == 1
@@ -89,7 +89,8 @@ def test_two_clock_vms_run_independently_with_the_same_qualified_producer_inputs
         "name: Exercise real clock corrections on disposable Windows VM (${{ matrix.clock_run }}/2)"
         in clock
     )
-    assert "needs: [native-desktop, focused-windows]" in clock
+    assert "needs: [native-desktop]" in clock
+    assert "focused-windows" not in clock
     assert "runs-on: windows-2025" in clock
     assert "strategy:\n      fail-fast: false\n      matrix:\n        clock_run: [1, 2]" in clock
     assert "max-parallel:" not in clock

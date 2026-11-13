@@ -488,7 +488,7 @@ jobs:
 
   vm-clock:
     name: Exercise real clock corrections on disposable Windows VM (${{ matrix.clock_run }}/2)
-    needs: [native-desktop, focused-windows]
+    needs: [native-desktop]
     runs-on: windows-2025
     timeout-minutes: 15
     strategy:
@@ -639,11 +639,11 @@ jobs:
 
   cross-revision-upgrade:
     name: Install baseline, qualify stopped upgrade and manual reversal
-    needs: [native-desktop, focused-windows]
-    # Independent upgrade/reversal is not a graphical acceptance bypass.
-    # Run even when the other VM fails person-event acceptance, provided the
-    # focused Windows gates passed; a missing candidate artifact fails closed.
-    if: ${{ always() && needs.focused-windows.result == 'success' && (needs.native-desktop.result == 'success' || needs.native-desktop.result == 'failure') }}
+    needs: [native-desktop]
+    # Keep independent upgrade/reversal evidence when another Windows gate fails.
+    # Focused failures still fail the overall workflow and block release admission.
+    # A missing exact-source candidate artifact fails this job closed.
+    if: ${{ always() && !cancelled() && (needs.native-desktop.result == 'success' || needs.native-desktop.result == 'failure') }}
     runs-on: windows-2025
     timeout-minutes: 30
     env:
