@@ -68,6 +68,11 @@ _DESKTOP_CAMERAS = (
     ("Generated desktop yellow camera", "127.0.0.2", "yellow"),
 )
 
+# A native completion callback must outlive an outstanding cross-process send,
+# even when a failed installer is killed before its handler replies. Owners are
+# released only after PeekMessage delivers their final acknowledgment.
+_INSTALLER_COMMAND_OWNERS = []
+
 
 def _require(condition, message):
     __tracebackhide__ = True
@@ -111,6 +116,12 @@ class _Windows:
     def __init__(self):
         self.api = ctypes.WinDLL("user32", use_last_error=True)
         self.callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        self.click_callback_type = ctypes.WINFUNCTYPE(
+            None, wintypes.HWND, wintypes.UINT, ctypes.c_size_t, wintypes.LPARAM
+        )
+        self._clicks = {}
+        self._click_serial = itertools.count(1)
+        self._click_callback = self.click_callback_type(self._acknowledge_click)
         signatures = {
             "EnumWindows": ([self.callback, wintypes.LPARAM], wintypes.BOOL),
             "EnumChildWindows": ([wintypes.HWND, self.callback, wintypes.LPARAM], wintypes.BOOL),
@@ -127,6 +138,27 @@ class _Windows:
             "GetDlgCtrlID": ([wintypes.HWND], ctypes.c_int),
             "PostMessageW": (
                 [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM],
+                wintypes.BOOL,
+            ),
+            "SendMessageCallbackW": (
+                [
+                    wintypes.HWND,
+                    wintypes.UINT,
+                    wintypes.WPARAM,
+                    wintypes.LPARAM,
+                    self.click_callback_type,
+                    ctypes.c_size_t,
+                ],
+                wintypes.BOOL,
+            ),
+            "PeekMessageW": (
+                [
+                    ctypes.POINTER(wintypes.MSG),
+                    wintypes.HWND,
+                    wintypes.UINT,
+                    wintypes.UINT,
+                    wintypes.UINT,
+                ],
                 wintypes.BOOL,
             ),
             "SendMessageTimeoutW": (
@@ -233,7 +265,7 @@ class _Windows:
         self.message(window, 0x00F5)  # BM_CLICK
 
     def post_click(self, window):
-        """Queue a real button event whose handler may perform lengthy installation."""
+        """Send one asynchronous native click and retain its completion witness."""
         __tracebackhide__ = True
         _require(
             bool(window)
@@ -242,10 +274,48 @@ class _Windows:
             and self.api.IsWindowEnabled(window),
             "Expected enabled desktop button is unavailable",
         )
-        _require(
-            bool(self.api.PostMessageW(window, 0x00F5, 0, 0)),  # BM_CLICK
-            "Native desktop button click could not be queued",
+        ticket = SimpleNamespace(identifier=next(self._click_serial), completed=False)
+        self._clicks[ticket.identifier] = ticket
+        if self not in _INSTALLER_COMMAND_OWNERS:
+            _INSTALLER_COMMAND_OWNERS.append(self)
+        accepted = self.api.SendMessageCallbackW(
+            window,
+            0x00F5,
+            0,
+            0,
+            self._click_callback,
+            ticket.identifier,  # BM_CLICK
         )
+        if not accepted:
+            self._clicks.pop(ticket.identifier)
+            if not self._clicks:
+                _INSTALLER_COMMAND_OWNERS.remove(self)
+        _require(bool(accepted), "Native desktop button click could not be dispatched")
+        return ticket
+
+    def _acknowledge_click(self, _window, _message, identifier, _result):
+        ticket = self._clicks.get(identifier)
+        if ticket is not None:
+            ticket.completed = True
+
+    def click_completed(self, ticket):
+        """Pump sent-message callbacks without removing unrelated queued messages."""
+        message = wintypes.MSG()
+        self.api.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)  # PM_NOREMOVE
+        if not ticket.completed:
+            return False
+        self._clicks.pop(ticket.identifier, None)
+        if not self._clicks and self in _INSTALLER_COMMAND_OWNERS:
+            _INSTALLER_COMMAND_OWNERS.remove(self)
+        return True
+
+    def button_caption(self, window):
+        """Read a fresh GUI-thread response under the existing control deadline."""
+        value = ctypes.create_unicode_buffer(512)
+        self.message(
+            window, 0x000D, ctypes.cast(value, ctypes.c_void_p).value, parameter=len(value)
+        )
+        return _normalized_caption(value.value)
 
     def close(self, form):
         __tracebackhide__ = True
@@ -555,11 +625,15 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
     )
     deadline, clicked, launch_unchecked = time.monotonic() + 90, set(), False
     last_next_page = None
+    pending_click = None
     try:
         while process.poll() is None:
             if time.monotonic() >= deadline:
                 diagnostic["installer_timeout_activity"] = _installer_timeout_activity(process)
                 pytest.fail("Actual installer wizard exceeded its deadline", pytrace=False)
+            waiting_for_click = pending_click is not None and not api.click_completed(pending_click)
+            if not waiting_for_click:
+                pending_click = None
             root = psutil.Process(process.pid)
             pids = {root.pid, *(child.pid for child in root.children(recursive=True))}
             forms = [window for window in api.windows() if api.pid(window) in pids]
@@ -570,6 +644,9 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                         _classify_installed_seal_refusal(installed)
                     )
                     pytest.fail("Installer refused its extracted sealed payload", pytrace=False)
+            if waiting_for_click:
+                time.sleep(0.2)
+                continue
             for form in forms:
                 controls = [
                     window
@@ -584,8 +661,10 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                     diagnostic["installer_action"] = "payload_admission_refused"
                     pytest.fail("Installer rejected the extracted sealed payload", pytrace=False)
                 if "i accept the agreement" in captions:
-                    diagnostic["installer_action"] = "accept_license"
-                    api.click(captions["i accept the agreement"])
+                    agreement = captions["i accept the agreement"]
+                    if api.message(agreement, 0x00F0) != 1:  # BM_GETCHECK / BST_CHECKED
+                        diagnostic["installer_action"] = "accept_license"
+                        api.click(agreement)
                 if "launch k5 vision" in captions and not launch_unchecked:
                     diagnostic["installer_action"] = "uncheck_launch"
                     checkbox = captions["launch k5 vision"]
@@ -598,15 +677,19 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                     _require(launch_unchecked, "Installer launch checklist was unavailable")
                 for caption in ("finish", "install", "next >", "next"):
                     if caption in captions:
+                        # The Next HWND is also Inno's Install/Finish button.
+                        # Never dispatch an action from an earlier caption map.
+                        if api.button_caption(captions[caption]) != caption:
+                            break
                         if caption == "install":
                             if not diagnostic["installer_install_posted"]:
                                 diagnostic["installer_action"] = "install_dispatch"
                                 # Inno extracts the entire offline payload inside
                                 # its Install handler. A synchronous BM_CLICK's
                                 # five-second reply deadline is not an extraction
-                                # deadline. Queue it once, then observe the real
+                                # deadline. Dispatch it once, then observe the real
                                 # wizard and process under the existing 90s gate.
-                                api.post_click(captions[caption])
+                                pending_click = api.post_click(captions[caption])
                                 diagnostic["installer_install_posted"] = True
                                 diagnostic["installer_action"] = "install_wait"
                         else:
@@ -617,18 +700,21 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                                 # Inno's Next handler can synchronously prepare
                                 # an offline payload. SendMessageTimeout's 5s
                                 # control deadline is not an install deadline.
-                                # Queue one real BM_CLICK per observed page;
-                                # retain the unchanged 90s process deadline.
+                                # Await this actual handler's completion before
+                                # observing another page or sending any command.
+                                # The unchanged 90s gate bounds that wait.
                                 page = _installer_page_signature(api, controls)
                                 if page == last_next_page:
                                     break
                                 diagnostic["installer_next_clicks"] += 1
-                                api.post_click(captions[caption])
+                                pending_click = api.post_click(captions[caption])
                                 last_next_page = page
                             else:
                                 api.click(captions[caption])
                         clicked.add(caption)
                         break
+                if pending_click is not None:
+                    break
             time.sleep(0.2)
         _require(process.returncode == 0, "Actual GUI installer did not complete successfully")
         _require("install" in clicked and "finish" in clicked, "Installer wizard was not exercised")
