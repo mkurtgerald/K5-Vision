@@ -36,13 +36,14 @@ depends on the recorder's reference. See [time administration](WINDOWS_TIME_ADMI
 
 ## Audit trail
 
-**Audit trail** filters recorder and security activity. Results use stable append
-order across clock changes. A *Started / incomplete* row is retained attempt
-evidence; a terminal row with the same request identifier records its result.
-**Download audit JSON** uses a normal browser download, excludes credentials,
-and includes pagination fields when more than 5,000 matching rows exist.
-**Administration → Account activity** retains the narrower account-change view.
-See [operational auditing](OPERATIONAL_AUDIT.md).
+**Audit trail** filters recorder and security activity. A *Started / incomplete*
+entry records an attempted operation; a terminal entry with the same request
+identifier records its result. Results retain their order across clock changes.
+**Download audit JSON** saves matching activity through the browser. Downloads
+may contain only part of the matching history; check their pagination information.
+**Administration → Account activity** retains the separate account-change view.
+See [activity history](OPERATIONAL_AUDIT.md) for interpretation and download
+limitations.
 
 ## Integrations and events
 
