@@ -1,80 +1,29 @@
 # K5 Vision
 
-Native Windows surveillance with ONVIF and direct RTSP cameras, recording,
-continuous UTC playback, verified MP4 exports and local person detection.
+Windows video management for camera enrollment, live viewing, recording and
+playback.
 
 ## Windows beta
 
-Download **K5VisionSetup.exe** from the matching
-[public release](https://github.com/mkurtgerald/K5-Vision/releases) and double-click
-it. End users do not need PowerShell, Command Prompt, external Python, Docker,
-WSL or a separate model installation. Choose **Stop and quit** from the K5 tray
-menu before upgrading. Recording runs while the Windows user is signed in;
-first launch needs Internet to obtain the verified native media workers.
+For available Windows beta builds, download **K5VisionSetup.exe** from the matching
+[release](https://github.com/mkurtgerald/K5-Vision/releases). Review that release's
+installation requirements, supported features and limitations before installing.
 
-The workspace provides camera discovery/enrollment, a camera wall, recording
-controls, a zoomable UTC timeline, direct seeking, playback controls, normal MP4
-downloads, and background person events that open their recorded footage.
-Administration manages local users, roles, camera access, activation/reset and
-account activity. See the [desktop guide](docs/WINDOWS_DESKTOP_BETA.md).
+Choose **Stop and quit** from the K5 tray menu before upgrading. Recording
+requires a signed-in Windows session with K5 running. Beta installers are
+unsigned; Windows may display an unknown-publisher warning.
 
-Expanded administration in this source branch includes storage quota/reserve/
-retention settings and verified copy-first directory migration, Windows Time and
-ONVIF time controls, comprehensive activity downloads, constrained custom roles,
-TOTP MFA, and OIDC sign-in linked to existing accounts. The
-[settings guide](docs/ADMIN_SETTINGS_WORKSPACE.md) explains the graphical controls.
-Feature availability in an installer is established by its matching release
-notes and exact-source Windows receipts; a source change alone is not a
-qualified download.
+Use the matching release checksums to verify downloads. Test evidence applies
+only to the identified build and documented scope; source changes or passing
+development checks alone do not establish deployment readiness.
 
-Analytics Lab 0.1 ingestion and K5-Lab v2 observation/response adapters use scoped
-machine credentials and durable delivery. The Neural adapter is non-authorizing:
-a connected provider is required, and K5-Lab currently supplies no production
-shared Neural host. Saving a connection does not establish model execution.
+Camera compatibility, performance and long-running operation must be evaluated
+in the intended environment.
 
-Native release gates exercise the installed GUI, bundled inference, saved MP4s,
-restart persistence and actual +/-48-hour host clock corrections. Time
-administration has a separate native configuration/restoration witness. Source
-configuration, observed offset and successful synchronization are reported
-separately; clock-step resilience alone does not certify absolute UTC accuracy.
+## Development and contributions
 
-The [camera-setup roadmap](docs/CAMERA_SETUP_ROADMAP.md) tracks planned frame-rate
-and codec controls, motion-triggered recording and graphical inclusion/exclusion
-zones. These core setup controls take priority over advanced wall customization.
-
-The [video-wall roadmap](docs/VIDEO_WALL_ROADMAP.md) tracks automatic layouts,
-individual tile editing and adaptive display streams, including delivery order,
-dependencies and acceptance criteria.
-
-## Development
-
-Requirements: Python 3.12+
-
-```bash
-python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# Linux/macOS: source .venv/bin/activate
-pip install -e ".[dev]"
-ruff check src tests
-ruff format --check src tests
-pytest
-```
-
-## Engineering startup
-
-The older [Alpha bootstrap](scripts/windows-alpha/README.md) and source commands
-below are engineering paths. The normal Windows product uses the EXE above.
-
-
-`k5-vision serve` starts the local control plane on loopback by default.
-`k5-vision serve --operator` selects the existing Stage-One operator application
-factory. It uses the same authenticated application composition and private runtime
-configuration; selecting it does not enroll a source, start a media session, or bypass
-authorization. Missing private runtime configuration remains fail closed.
-
-## Contributions
-
-See `CONTRIBUTING.md` before opening a pull request.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, required checks and
+contribution guidance.
 
 ## Security
 
