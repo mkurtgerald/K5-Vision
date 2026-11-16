@@ -3959,6 +3959,9 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         _verify_installed_worker_bundle(installed)
         receipt["installed_worker_bundle_verified"] = True
         receipt["actual_gui_installer"] = True
+        _enter_stage("installed_integration_admission")
+        admission = _helpers("installed_integration_admission").qualify(installed, setup, parent)
+        record_testsuite_property("installed_integration_admission", json.dumps(admission))
         reservations, ports = helpers._reserve_ports(5)
         port, upstream_ports = ports[0], ports[1:]
         for listener in reservations:
