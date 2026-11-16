@@ -660,6 +660,8 @@ class OperatorIntegrationStore:
             raise IntegrationContractError("integration_invalid_request")
 
         def read(db):
+            # Admit credentials and scope under the same cross-process write lock.
+            db.execute("BEGIN IMMEDIATE")
             authority = self._machine(db, identifier, token, kind="neural")
             rows = db.execute(
                 "SELECT * FROM deliveries WHERE connection_id=? AND response IS NULL "
@@ -667,6 +669,7 @@ class OperatorIntegrationStore:
                 (str(identifier), MAX_ATTEMPTS),
             ).fetchall()
             result = []
+            leases = {}
             for row in rows:
                 key = (str(identifier), row["sequence"])
                 if self._leases.get(key, 0) > self._clock():
@@ -685,7 +688,7 @@ class OperatorIntegrationStore:
                     "UPDATE deliveries SET attempt=?,sent=1 WHERE sequence=?",
                     (attempt, row["sequence"]),
                 )
-                self._leases[key] = self._clock() + min(60, 2**attempt)
+                leases[key] = self._clock() + min(60, 2**attempt)
                 db.execute(
                     "UPDATE connections SET last_observation_utc=? WHERE id=?",
                     (_stamp(), str(identifier)),
@@ -703,6 +706,8 @@ class OperatorIntegrationStore:
                 )
                 if len(result) == limit:
                     break
+            db.execute("COMMIT")
+            self._leases.update(leases)
             return {"requests": result, "authority": "observe_only"}
 
         return self._execute(read)

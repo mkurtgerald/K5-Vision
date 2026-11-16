@@ -17,9 +17,20 @@ import sys
 import time
 from pathlib import Path
 
-_TEST = "test_operator_integration_admission_processes.py"
-_TEST_SHA = "b1c9c17027c7b348cc52f2381301bea631ae0e33443607a76c8fd5a33249b7e9"
-_SOURCE_SHA = "153b8c1f6e51371e19098e924817f84f1a8402e11183b430ada56e967e324e37"
+_TEST_HASHES = {
+    "test_operator_integration_admission_processes.py": (
+        "b1c9c17027c7b348cc52f2381301bea631ae0e33443607a76c8fd5a33249b7e9"
+    ),
+    "test_operator_pull_revocation_processes.py": (
+        "1ca5741d6bd21a5c3e0716359fe2544a4143824b297c8a21b9c5841419693218"
+    ),
+}
+_TEST_COUNTS = {
+    "test_operator_integration_admission_processes.py": 17,
+    "test_operator_pull_revocation_processes.py": 8,
+}
+_TOTAL_TESTS = sum(_TEST_COUNTS.values())
+_SOURCE_SHA = "42f844f540b227d16cf9eec8f84ff5549a0fc80173a33c47716c9b247607e1ed"
 
 
 def _sha(path):
@@ -80,9 +91,13 @@ class _Results:
     def accepted(self):
         return (
             not self.bad
-            and len(self.collected) == len(set(self.collected)) == 17
+            and len(self.collected) == len(set(self.collected)) == _TOTAL_TESTS
             and sorted(self.calls) == sorted(self.collected)
-            and all(node.split("::")[0].endswith(_TEST) for node in self.collected)
+            and {
+                name: sum(Path(node.split("::")[0]).name == name for node in self.collected)
+                for name in _TEST_COUNTS
+            }
+            == _TEST_COUNTS
         )
 
 
@@ -129,16 +144,22 @@ def _bootstrap(config):
     return installed
 
 
+def _test_paths(tests):
+    for name, digest in _TEST_HASHES.items():
+        _require(_sha(tests / name) == digest)
+    return [str(tests / name) for name in _TEST_HASHES]
+
+
 def _main(config, installed):
     import pytest
 
     tests = Path(config["tests"])
-    _require(_sha(tests / _TEST) == _TEST_SHA)
+    test_paths = _test_paths(tests)
     _manifest(installed, config["manifest_sha256"], config["head_sha"])
     results = _Results()
     code = pytest.main(
         [
-            str(tests / _TEST),
+            *test_paths,
             "-c",
             str(tests / "pytest.ini"),
             "--confcutdir",
@@ -162,10 +183,10 @@ def _main(config, installed):
         "manifest_sha256": config["manifest_sha256"],
         "installer_sha256": config["installer_sha256"],
         "source_sha256": _SOURCE_SHA,
-        "tests_sha256": _TEST_SHA,
+        "tests_sha256": _TEST_HASHES,
         "installed_imports": True,
         "spawned_installed_interpreter": True,
-        "passed": 17,
+        "passed": _TOTAL_TESTS,
         "failed": 0,
         "skipped": 0,
     }
@@ -189,8 +210,8 @@ def qualify(installed, setup, parent):
     worker = None
     try:
         source_tests = Path(__file__).resolve().parents[1] / "unit"
-        _require(_sha(source_tests / _TEST) == _TEST_SHA)
-        for name in (_TEST, "test_operator_integrations.py"):
+        _test_paths(source_tests)
+        for name in (*_TEST_HASHES, "test_operator_integrations.py"):
             shutil.copyfile(source_tests / name, test_root / name)
         (test_root / "pytest.ini").write_text("[pytest]\n", encoding="ascii")
         dependencies = test_root / "test-dependencies"
@@ -225,7 +246,7 @@ def qualify(installed, setup, parent):
         _require(worker.poll() == 0)
         _require(receipt_path.is_file() and receipt_path.stat().st_size < 4096)
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        _require(receipt["passed"] == 17 and receipt["failed"] == receipt["skipped"] == 0)
+        _require(receipt["passed"] == _TOTAL_TESTS and receipt["failed"] == receipt["skipped"] == 0)
         _require(receipt["head_sha"] == head and receipt["manifest_sha256"] == manifest_hash)
     finally:
         if worker is not None:

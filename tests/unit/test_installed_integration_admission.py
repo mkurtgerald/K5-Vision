@@ -71,15 +71,21 @@ def test_manifest_refuses_escaped_installed_file_even_with_valid_digest(tmp_path
         module._manifest(installed, module._sha(manifest), "a" * 40)
 
 
-@pytest.mark.parametrize("count", [0, 16, 17, 18])
-def test_only_exactly_seventeen_completed_calls_are_accepted(count):
+def _nodes(original=17, pull=8):
+    return [
+        f"test_operator_integration_admission_processes.py::case{i}" for i in range(original)
+    ] + [f"test_operator_pull_revocation_processes.py::case{i}" for i in range(pull)]
+
+
+@pytest.mark.parametrize(
+    "original,pull", [(0, 0), (17, 0), (17, 7), (17, 8), (17, 9), (25, 0), (16, 9)]
+)
+def test_only_complete_original_and_pull_suites_are_accepted(original, pull):
     results = _module()._Results()
-    results.collected = [
-        f"test_operator_integration_admission_processes.py::case{i}" for i in range(count)
-    ]
+    results.collected = _nodes(original, pull)
     results.calls = list(results.collected)
-    assert results.accepted() is (count == 17)
-    if count == 17:
+    assert results.accepted() is ((original, pull) == (17, 8))
+    if results.accepted():
         results.calls[-1] = results.calls[0]
         assert not results.accepted()
 
@@ -90,9 +96,7 @@ def test_only_exactly_seventeen_completed_calls_are_accepted(count):
 )
 def test_fixture_failure_skip_or_teardown_failure_cannot_pass(when, failed, skipped):
     results = _module()._Results()
-    results.collected = [
-        f"test_operator_integration_admission_processes.py::case{i}" for i in range(17)
-    ]
+    results.collected = _nodes()
     results.calls = list(results.collected)
     results.pytest_runtest_logreport(
         SimpleNamespace(when=when, failed=failed, skipped=skipped, passed=False)
@@ -105,10 +109,20 @@ def test_current_source_checkout_is_not_an_installed_import(tmp_path):
         _module()._imports(tmp_path)
 
 
-def test_controller_binds_the_unchanged_regressions():
+def test_controller_selects_and_hash_binds_both_suites(tmp_path):
     module = _module()
-    path = Path(__file__).with_name("test_operator_integration_admission_processes.py")
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == module._TEST_SHA
+    for name, digest in module._TEST_HASHES.items():
+        data = Path(__file__).with_name(name).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == digest
+        (tmp_path / name).write_bytes(data)
+    assert module._test_paths(tmp_path) == [str(tmp_path / name) for name in module._TEST_COUNTS]
+    for name in module._TEST_HASHES:
+        target = tmp_path / name
+        original = target.read_bytes()
+        target.write_bytes(original + b"\n")
+        with pytest.raises(RuntimeError, match="qualification refused"):
+            module._test_paths(tmp_path)
+        target.write_bytes(original)
 
 
 def test_external_dependencies_are_an_explicit_allowlist(tmp_path):
@@ -132,3 +146,23 @@ def test_external_dependencies_are_an_explicit_allowlist(tmp_path):
     assert {path.name for path in destination.iterdir()} == expected
     assert not list(destination.glob("*.pth"))
     assert not (destination / "k5vision").exists()
+
+
+def test_pytest_invocation_includes_both_hash_verified_suites(tmp_path, monkeypatch):
+    module = _module()
+    for name in module._TEST_HASHES:
+        (tmp_path / name).write_bytes(Path(__file__).with_name(name).read_bytes())
+    monkeypatch.setattr(module, "_manifest", lambda *args: None)
+    observed = []
+
+    class InvocationObserved(Exception):
+        pass
+
+    def observe(args, *, plugins):
+        observed.extend(args)
+        raise InvocationObserved
+
+    monkeypatch.setattr(pytest, "main", observe)
+    with pytest.raises(InvocationObserved):
+        module._main({"tests": str(tmp_path), "manifest_sha256": "a", "head_sha": "b"}, tmp_path)
+    assert observed[:2] == [str(tmp_path / name) for name in module._TEST_HASHES]
