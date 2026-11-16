@@ -521,6 +521,8 @@ class OperatorIntegrationStore:
 
     def ingest(self, identifier, token, payload: dict, *, known_camera):
         def write(db):
+            # Serialize credential/scope admission and journal decisions across processes.
+            db.execute("BEGIN IMMEDIATE")
             authority = self._machine(db, identifier, token, kind="analytics")
             try:
                 event = analytics_lab_event(
@@ -535,13 +537,14 @@ class OperatorIntegrationStore:
                         "UPDATE connections SET last_status='source_clock_ahead' WHERE id=?",
                         (str(identifier),),
                     )
+                    # Keep the existing durable health signal; no event was admitted.
+                    db.execute("COMMIT")
                 raise
             if event.source_id not in authority["camera_ids"] or not known_camera(
                 UUID(event.source_id)
             ):
                 raise OperatorIntegrationError("integration_camera_forbidden")
             body = event.model_dump_json()
-            db.execute("BEGIN IMMEDIATE")
             existing = db.execute(
                 "SELECT payload FROM received_events WHERE connection_id=? AND event_id=?",
                 (str(identifier), event.event_id),
@@ -706,6 +709,8 @@ class OperatorIntegrationStore:
 
     def respond(self, identifier, token, payload, *, known_camera):
         def write(db):
+            # Serialize credential/scope admission and journal decisions across processes.
+            db.execute("BEGIN IMMEDIATE")
             authority = self._machine(db, identifier, token, kind="neural")
             if type(payload) is not dict or payload.keys() != {"request", "response"}:
                 raise IntegrationContractError("integration_invalid_response")
@@ -731,7 +736,6 @@ class OperatorIntegrationStore:
             body = json.dumps(response, sort_keys=True, separators=(",", ":"))
             if row["response"] is not None and row["response"] != body:
                 raise IntegrationContractError("integration_response_conflict")
-            db.execute("BEGIN IMMEDIATE")
             db.execute("UPDATE deliveries SET response=? WHERE sequence=?", (body, row["sequence"]))
             db.execute(
                 "UPDATE connections SET last_response_utc=?,last_status='ready' WHERE id=?",
