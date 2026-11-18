@@ -168,7 +168,9 @@ Time administration gate verifies configuration, resynchronization and restore.
 
 Physical-camera compatibility, independent NTP/UTC accuracy, measured capacity
 and endurance still require [field qualification](WINDOWS_BETA_FIELD_TEST.md).
-This increment does not deliver a boot service, PTZ controls, motion-triggered
-recording, inclusion/exclusion zones, custom tile layouts or adaptive main/sub
-streams. See the [camera-setup](CAMERA_SETUP_ROADMAP.md) and
+Motion recording and inclusion/exclusion zones are implemented in the candidate
+source; their dedicated installed-Windows motion receipt must qualify the exact
+installer before a release claims support. See the [motion recording guide](CAMERA_MOTION_RECORDING.md).
+A boot service, PTZ controls, custom tile layouts and adaptive main/sub streams
+remain on the [camera-setup](CAMERA_SETUP_ROADMAP.md) and
 [video-wall](VIDEO_WALL_ROADMAP.md) roadmaps.

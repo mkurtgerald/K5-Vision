@@ -27,6 +27,7 @@ class MediaMTXSource:
     device: Device = field(repr=False)
     source_uri: str = field(repr=False)
     recording_enabled: bool = True
+    profile_key: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         valid = False
@@ -38,6 +39,11 @@ class MediaMTXSource:
             valid = (
                 isinstance(self.binding, MediaMTXBinding)
                 and type(self.recording_enabled) is bool
+                and type(self.profile_key) is str
+                and (
+                    self.profile_key == ""
+                    or re.fullmatch(r"[0-9a-f]{64}", self.profile_key) is not None
+                )
                 and isinstance(self.device, Device)
                 and self.device.id == self.binding.device_id
                 and self.device.kind

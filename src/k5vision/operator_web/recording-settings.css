@@ -1,0 +1,24 @@
+#recording-settings-dialog { width: min(54rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem); overflow: auto; }
+#recording-settings-dialog .dialog-heading h2 { margin: 0; }
+#recording-settings-dialog fieldset { min-width: 0; border: 1px solid var(--border, #344055); border-radius: 0.6rem; padding: 1rem; margin: 1rem 0; }
+.recording-policy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+.recording-policy-grid label { display: block; margin-bottom: 0.4rem; }
+.recording-policy-grid input, .recording-policy-grid select { width: 100%; }
+.motion-policy-status { font-weight: 700; margin-bottom: 0.3rem; }
+.motion-zones { padding-top: 0.5rem; }
+.motion-zones h3 { margin-bottom: 0.5rem; }
+.motion-preview-frame { margin: 1rem 0; background: #11151e; border: 1px solid #526078; border-radius: 0.4rem; overflow: hidden; }
+.motion-preview-frame[hidden] { display: none; }
+#motion-zone-canvas { display: block; width: 100%; height: auto; touch-action: manipulation; }
+#motion-zone-canvas.drawing { cursor: crosshair; }
+#motion-zone-canvas:focus-visible { outline: 3px solid #a7d3ff; outline-offset: -3px; }
+.motion-zone-polygon.include { stroke: #58b7ff; fill: #58b7ff44; }
+.motion-zone-polygon.exclude { stroke: #ffb05e; fill: #ffb05e55; stroke-dasharray: 7 4; }
+.motion-zone-polygon, .motion-zone-draft { stroke-width: 2; vector-effect: non-scaling-stroke; }
+.motion-zone-draft { fill: none; stroke: #fff; }
+.motion-zone-point { fill: #fff; stroke: #111; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.motion-zone-tools { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.8rem 0; }
+.motion-zone-list { padding-left: 1.3rem; }
+.motion-zone-list li { padding: 0.3rem 0; }
+.motion-zone-list li > span { margin-right: 0.75rem; }
+@media (max-width: 620px) { .recording-policy-grid { grid-template-columns: 1fr; } }

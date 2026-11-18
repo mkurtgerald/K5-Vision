@@ -200,7 +200,7 @@ def request_permission(path: str, method: str):
                 return "cameras.playback"
             if operation == "person-view":
                 return "cameras.view_live"
-            if operation == "recording":
+            if operation in {"recording", "recording-policy", "motion-preview"}:
                 return "recording.manage"
             if operation == "time":
                 return "time.manage"

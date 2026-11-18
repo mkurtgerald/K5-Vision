@@ -85,6 +85,7 @@ def _fingerprint(source):
         "device": device,
         "uri": source.source_uri,
         "recording_enabled": source.recording_enabled,
+        "profile_key": getattr(source, "profile_key", ""),
     }
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).digest()
 

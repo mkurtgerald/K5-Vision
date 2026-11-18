@@ -28,6 +28,8 @@ def assets(tmp_path):
         "analytics.css",
         "settings.js",
         "settings.css",
+        "recording-settings.js",
+        "recording-settings.css",
     ):
         (root / name).write_text("fixture", encoding="utf-8")
     return root
@@ -131,6 +133,9 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
         "/api/v1/operator/cameras/*/time/*",
         "/api/v1/operator/cameras/*/video-settings",
         "/api/v1/operator/cameras/*/video-settings/*",
+        "/api/v1/operator/cameras/*/recording-policy",
+        "/api/v1/operator/cameras/*/motion-preview",
+        "/api/v1/operator/cameras/*/motion-preview/*",
         "/api/v1/auth/oidc/*",
         "/api/v1/operator/cameras/*/person-view",
         "/api/v1/operator/camera-profiles",
@@ -155,6 +160,8 @@ def test_static_allowlist_and_public_javascript_have_no_directory_or_donor_api_r
         "/operator/analytics.js",
         "/operator/settings.css",
         "/operator/settings.js",
+        "/operator/recording-settings.css",
+        "/operator/recording-settings.js",
     ]
     javascript = next(
         route["handle"][0]

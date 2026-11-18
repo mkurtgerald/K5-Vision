@@ -1529,6 +1529,8 @@ def _product_application(
     calls = []
 
     async def start(sources):
+        assert service.recording_policies is not None
+        assert not service.recording_policies._closed
         calls.append(("start", sources))
         if fail_start:
             raise OperatorProductError("Native startup was refused")
@@ -1545,6 +1547,7 @@ def _product_application(
         start=start,
         stop=stop,
         status=lambda: "ready",
+        set_recording_policy_store=lambda store: setattr(service, "recording_policies", store),
     )
     application = product_module.create_operator_product_app(
         identity_directory=identity.directory, service=service
@@ -1594,6 +1597,7 @@ def test_product_lifespan_uses_existing_human_identity_and_closes_its_camera_sto
         }
     assert calls == [("start", ()), ("stop", ())]
     assert app.state.operator_camera_store.closed
+    assert app.state.operator_recording_policies._closed
     _assert_profile_lease_available(tmp_path / "identity")
 
 
@@ -1606,6 +1610,7 @@ def test_product_shutdown_closes_camera_store_even_when_native_cleanup_fails(
             pass
     assert calls == [("start", ()), ("stop", ())]
     assert app.state.operator_camera_store.closed
+    assert app.state.operator_recording_policies._closed
     _assert_profile_lease_available(tmp_path / "identity")
 
 
@@ -1618,6 +1623,7 @@ def test_product_startup_failure_closes_camera_store_and_attempts_native_cleanup
             pass
     assert calls == [("start", ()), ("stop", ())]
     assert app.state.operator_camera_store.closed
+    assert app.state.operator_recording_policies._closed
     _assert_profile_lease_available(tmp_path / "identity")
 
 

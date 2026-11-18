@@ -508,7 +508,12 @@ def install_operator_product_api(
                         raise asyncio.CancelledError
                     return result
 
-    async def authenticate_once(token: str) -> tuple[UserAccount, str]:
+    async def authenticate_once(
+        token: str,
+        *,
+        additional_permissions: frozenset[str] = frozenset(),
+        capture_fence: bool = False,
+    ):
         principal = await sessions.resolve(token)
         if principal is None:
             raise _unauthorized()
@@ -566,6 +571,10 @@ def install_operator_product_api(
         if permission_error is not None:
             raise permission_error
         validate_current_permission_snapshot(app, current, permission)
+        if additional_permissions and (
+            permission is None or not additional_permissions <= permission.permissions
+        ):
+            raise HTTPException(403, "Insufficient operator permission")
         if permission is not None:
             # A logout, replacement login, password/role change or disable may
             # have completed while the policy read was in flight. Resolution
@@ -581,9 +590,24 @@ def install_operator_product_api(
             # The role may have changed while that final resolution awaited
             # its own registry read. No positive policy cache survives here.
             validate_current_permission_snapshot(app, final, permission)
+        if capture_fence:
+            issued_current = sessions.current_session_guard(token, current.id)
+
+            def fence():
+                validate_current_permission_snapshot(app, current, permission)
+                if not issued_current():
+                    raise _unauthorized()
+
+            fence()
+            return current, token, fence
         return current, token
 
-    async def authenticate(token: str) -> tuple[UserAccount, str]:
+    async def authenticate(
+        token: str,
+        *,
+        additional_permissions: tuple[str, ...] = (),
+        capture_fence: bool = False,
+    ):
         # A separate role edit can land between this request's durable policy
         # read and final session resolution. Re-admit from current durable
         # account, credential, session and policy state instead of feeding a
@@ -592,7 +616,11 @@ def install_operator_product_api(
         # changes remain unavailable rather than extending work indefinitely.
         for attempt in range(3):
             try:
-                return await authenticate_once(token)
+                return await authenticate_once(
+                    token,
+                    additional_permissions=frozenset(additional_permissions),
+                    capture_fence=capture_fence,
+                )
             except PermissionSnapshotChanged:
                 if attempt == 2:
                     raise HTTPException(503, "roles_unavailable") from None
@@ -745,6 +773,32 @@ def install_operator_product_api(
             if video_settings_vault is None
             else video_settings_vault.source_revision(source),
         }
+        motion = None
+        policy_status = getattr(service, "recording_policy_status", None)
+        if callable(policy_status):
+            try:
+                value = policy_status(source.binding)
+                if (
+                    type(value) is not dict
+                    or value.get("mode") not in {"continuous", "motion"}
+                    or value.get("state")
+                    not in {
+                        "continuous",
+                        "armed",
+                        "recording",
+                        "post_capture",
+                        "paused",
+                        "storage_blocked",
+                        "unavailable",
+                        "zones_need_review",
+                    }
+                ):
+                    raise ValueError
+                motion = value
+                result["recording_mode"] = value["mode"]
+                result["motion_policy_state"] = value["state"]
+            except (RuntimeError, TypeError, ValueError):
+                result["motion_policy_state"] = "unavailable"
         if service.status() not in {"ready", "disk_full"}:
             if not source.recording_enabled:
                 result["recording_state"] = "paused"
@@ -791,6 +845,19 @@ def install_operator_product_api(
         elif result["status"] != "live":
             recording_started.pop(identifier, None)
             result["recording_state"], reason = "waiting", "camera_unavailable"
+        elif (
+            motion is not None
+            and motion["mode"] == "motion"
+            and motion["state"] in {"armed", "zones_need_review", "unavailable"}
+        ):
+            recording_started.pop(identifier, None)
+            result["recording_state"], reason = {
+                "armed": ("waiting", "motion_armed"),
+                "zones_need_review": ("paused", "zones_need_review"),
+                "unavailable": ("error", "motion_unavailable"),
+            }[motion["state"]]
+        elif callable(policy_status) and motion is None:
+            result["recording_state"], reason = "error", "motion_unavailable"
         elif result["recording"] is not True:
             result["recording_state"], reason = "error", "configuration_mismatch"
         else:
@@ -1016,6 +1083,7 @@ def install_operator_product_api(
         management_secure: bool = False,
         onvif: bool = False,
         stream_key: str | None = None,
+        profile_key: str | None = None,
         reconnect_id: UUID | None = None,
         before_store=None,
     ):
@@ -1031,7 +1099,10 @@ def install_operator_product_api(
             )
             provisional = Device(**request.model_dump())
             MediaMTXSource(
-                MediaMTXBinding(service.site_id, provisional.id), provisional, source_uri
+                MediaMTXBinding(service.site_id, provisional.id),
+                provisional,
+                source_uri,
+                profile_key="" if profile_key is None else profile_key,
             )
         except ValueError:
             raise HTTPException(422, "Invalid camera selection") from None
@@ -1090,6 +1161,7 @@ def install_operator_product_api(
                         source_uri,
                         management_port=management_port,
                         secure=management_secure,
+                        profile_key=profile_key,
                     )
                 else:
                     device = (
@@ -1097,7 +1169,7 @@ def install_operator_product_api(
                         if stream_key is not None
                         else registry.enroll(request).device
                     )
-                    source = cameras.upsert(device, source_uri)
+                    source = cameras.upsert(device, source_uri, profile_key=profile_key)
                 seen_live.discard(source.binding.device_id)
                 connection_started[source.binding.device_id] = monotonic()
                 recording_started.pop(source.binding.device_id, None)
@@ -1160,7 +1232,7 @@ def install_operator_product_api(
         # if the initiating request disappears after an authorized camera write.
         video_settings_ready(previous)
         replacement = cameras._validated_source(
-            previous.device, source_uri, previous.recording_enabled
+            previous.device, source_uri, previous.recording_enabled, previous.profile_key
         )
         if replacement.binding != previous.binding:
             raise HTTPException(409, "video_source_changed")
@@ -1242,6 +1314,34 @@ def install_operator_product_api(
         video_settings_vault.clear_user
     )
 
+    from k5vision.operator_recording_policy_api import install_operator_recording_policy_api
+
+    async def authenticate_motion_preview(token):
+        return await authenticate(token, additional_permissions=("cameras.view_live",))
+
+    async def capture_recording_authority_fence(token, *, live=False):
+        _account, _token, fence = await authenticate(
+            token,
+            additional_permissions=("cameras.view_live",) if live else (),
+            capture_fence=True,
+        )
+        return fence
+
+    motion_settings_vault = install_operator_recording_policy_api(
+        app,
+        require_admin=require_admin,
+        authenticate=authenticate,
+        authenticate_preview=authenticate_motion_preview,
+        capture_authority_fence=capture_recording_authority_fence,
+        selection=authorized_selection,
+        mutations=mutations,
+        service=service,
+        authority_read=authority_read,
+    )
+    app.state.operator_motion_settings_revocation_cleanup = sessions.add_revocation_listener(
+        motion_settings_vault.clear_user
+    )
+
     @app.put(_PREFIX + "/cameras/{device_id}/recording", tags=["operator"])
     async def recording_preference(
         device_id: UUID,
@@ -1298,6 +1398,7 @@ def install_operator_product_api(
             selection(device_id)
             try:
                 cameras.remove(device_id)
+                motion_settings_vault.clear_camera(device_id)
                 seen_live.discard(device_id)
                 connection_started.pop(device_id, None)
                 recording_started.pop(device_id, None)
@@ -1305,6 +1406,14 @@ def install_operator_product_api(
                 await service.apply_sources(selections())
             except (RuntimeError, OSError, ValueError):
                 raise HTTPException(503, "Camera configuration unavailable") from None
+            forget_policy = getattr(service, "forget_motion_policy", None)
+            if callable(forget_policy):
+                try:
+                    await forget_policy(device_id)
+                except (RuntimeError, OSError, ValueError):
+                    # Canonical removal has committed. Startup prunes orphan
+                    # policies again; a cleanup failure cannot restore a camera.
+                    pass
         return Response(status_code=204)
 
     @app.get(_PREFIX + "/cameras/{device_id}/history", tags=["operator"])
@@ -1525,6 +1634,7 @@ def install_operator_product_api(
             onvif_probes.clear_token(token)
             rtsp_probes.clear_token(token)
             video_settings_vault.clear_token(token)
+            motion_settings_vault.clear_token(token)
         if (
             analytics is not None
             and separator

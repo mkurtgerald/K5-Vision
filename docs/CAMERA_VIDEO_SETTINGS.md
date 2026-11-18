@@ -44,10 +44,10 @@ reacquires the saved stream. It does not automatically repeat the camera write
 or claim that the camera was rolled back. Confirm the readback before deciding
 whether to apply another change.
 
-The recording Pause/Resume controls remain available. Motion-triggered recording
-and graphical inclusion/exclusion zones are tracked in the
-[camera-setup roadmap](CAMERA_SETUP_ROADMAP.md); this increment does not implement
-them. Detection zones, when added, do not establish permanent privacy masking.
+The recording Pause/Resume controls remain separate from Continuous/Motion mode.
+See [Motion recording and zones](CAMERA_MOTION_RECORDING.md) for the candidate
+controls and the exact installer-evidence requirement. Trigger zones do not
+obscure live, recorded or exported pixels.
 
 The wall's **Auto** layout uses one tile for one authorized enrolled camera,
 four for two through four, and nine for five or more. Larger inventories use

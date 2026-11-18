@@ -28,6 +28,8 @@ _ASSETS = (
     "analytics.js",
     "settings.css",
     "settings.js",
+    "recording-settings.css",
+    "recording-settings.js",
 )
 _AUTH_ROUTE = "/api/v1/operator/media-auth"
 _UNTRUSTED_HEADERS = ["Forwarded", "X-Forwarded-*", "X-K5-*"]
@@ -208,6 +210,9 @@ def generate_operator_gateway_configuration(
                         "/api/v1/operator/cameras/*/time/*",
                         "/api/v1/operator/cameras/*/video-settings",
                         "/api/v1/operator/cameras/*/video-settings/*",
+                        "/api/v1/operator/cameras/*/recording-policy",
+                        "/api/v1/operator/cameras/*/motion-preview",
+                        "/api/v1/operator/cameras/*/motion-preview/*",
                         "/api/v1/auth/oidc/*",
                     ]
                 }

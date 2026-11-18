@@ -16,6 +16,8 @@
     <script defer src="/operator/admin.js"></script>
     <script defer src="/operator/analytics.js"></script>
     <script defer src="/operator/settings.js"></script>
+    <link rel="stylesheet" href="/operator/recording-settings.css">
+    <script defer src="/operator/recording-settings.js"></script>
     <script defer src="/operator/app.js"></script>
   </head>
   <body>
@@ -85,7 +87,7 @@
           </details>
           <div class="view-heading">
             <div><p class="eyebrow">SURVEILLANCE WORKSPACE</p><h1 id="camera-title">All cameras</h1><p id="camera-subtitle" class="muted">Live cameras, recording activity and your recorded video.</p></div>
-            <div class="camera-indicators"><span id="connection-badge" class="status-badge" hidden></span><span id="recording-badge" class="recording-badge" hidden>Checking recording</span><button id="toggle-recording" class="button secondary" type="button" hidden>Pause recording</button><button id="recent-recordings" class="button secondary" type="button" hidden>Latest recording</button><button id="camera-video-button" class="button quiet" type="button" hidden>Camera settings</button><button id="update-source-button" class="button quiet" type="button" hidden>Reconnect camera</button><button id="remove-camera-button" class="button quiet danger" type="button" hidden>Remove camera</button></div>
+            <div class="camera-indicators"><span id="connection-badge" class="status-badge" hidden></span><span id="recording-badge" class="recording-badge" hidden>Checking recording</span><button id="toggle-recording" class="button secondary" type="button" hidden>Pause recording</button><button id="recent-recordings" class="button secondary" type="button" hidden>Latest recording</button><button id="camera-recording-settings-button" class="button quiet" type="button" hidden>Recording and zones</button><button id="camera-video-button" class="button quiet" type="button" hidden>Camera settings</button><button id="update-source-button" class="button quiet" type="button" hidden>Reconnect camera</button><button id="remove-camera-button" class="button quiet danger" type="button" hidden>Remove camera</button></div>
           </div>
           <p id="recording-state-detail" class="field-help" role="status" aria-live="polite" hidden></p>
           <div class="system-status" aria-label="Service and recording storage"><div><span id="service-status" role="status" aria-live="polite">Checking media service…</span><span id="storage-status" class="muted">Checking recording storage…</span></div><button id="connection-help-button" class="button quiet" type="button">Connection help</button></div>
@@ -281,6 +283,8 @@
         <div class="dialog-actions"><button id="camera-video-cancel" class="button secondary" type="button">Cancel</button><button id="camera-video-refresh" class="button secondary" type="button">Refresh</button><button id="camera-video-apply" class="button primary" type="submit" disabled>Apply video settings</button></div>
       </form>
     </dialog>
+
+    <dialog id="recording-settings-dialog" aria-labelledby="recording-settings-title"></dialog>
 
     <dialog id="remove-camera-dialog" aria-labelledby="remove-camera-title" aria-describedby="remove-camera-consequences">
       <form id="remove-camera-form">

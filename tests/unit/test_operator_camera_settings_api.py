@@ -381,6 +381,18 @@ def test_vault_capacity_is_bounded_and_revisions_are_not_raw_password_hashes(pro
     assert product.vault.source_revision(source) != alternate.source_revision(source)
 
 
+def test_profile_alias_changes_retire_the_previous_video_inspection(product):
+    inspected = _read(product)
+    identifier = product.ids[0]
+    original = product.sources[identifier]
+    product.sources[identifier] = replace(original, profile_key="a" * 64)
+    assert product.vault.source_revision(original) != product.vault.source_revision(
+        product.sources[identifier]
+    )
+    response = _apply(product, inspected["settings_handle"])
+    assert response.status_code == 409
+
+
 @pytest.mark.parametrize(
     "changes",
     [

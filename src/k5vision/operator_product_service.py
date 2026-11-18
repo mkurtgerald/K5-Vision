@@ -26,6 +26,7 @@ from k5vision.media.mediamtx_provider import (
     _NoRedirect,
 )
 from k5vision.operator_media_gateway import generate_operator_gateway_configuration
+from k5vision.operator_motion import MotionRuntime
 from k5vision.operator_storage_settings import OperatorStorageSettings
 from k5vision.operator_time import HostClockObserver
 
@@ -176,6 +177,7 @@ class OperatorProductService:
         self._media_generation = 0
         self._media_file = self.state_root / "operator-mediamtx.json"
         self._gateway_file = self.state_root / "operator-gateway.json"
+        self._motion = MotionRuntime(self)
 
     def _configuration(self, sources: tuple[MediaMTXSource, ...]) -> dict:
         config = json.loads(
@@ -196,10 +198,44 @@ class OperatorProductService:
             {"action": "playback", "path": "~^k5_[0-9a-f]{64}$"},
         ]
         config["hlsCDNSecret"] = self.cdn_secret
-        if self._disk_full:
-            for path in config["paths"].values():
-                path["record"] = False
+        for source in sources:
+            config["paths"][source.binding.path_name]["record"] = self._motion.effective_record(
+                source
+            )
         return config
+
+    def set_recording_policy_store(self, store) -> None:
+        """Install the identity-anchored policy owner before native startup."""
+        self._motion.install(store)
+
+    def recording_policy_status(self, binding) -> dict:
+        """Return cached finite recorder state without native requests or disk I/O."""
+        return self._motion.status(binding)
+
+    async def get_motion_policy(self, source) -> dict:
+        return await self._motion.get_policy(source)
+
+    async def apply_motion_policy(
+        self,
+        source,
+        expected_revision,
+        policy,
+        before_commit=None,
+        *,
+        reference_generation=None,
+    ) -> dict:
+        return await self._motion.configure(
+            source, expected_revision, policy, before_commit, reference_generation
+        )
+
+    async def motion_preview(self, source) -> dict:
+        return await self._motion.preview(source)
+
+    def current_motion_reference(self, source):
+        return self._motion.current_reference(source)
+
+    async def forget_motion_policy(self, camera_id):
+        return await self._motion.forget(camera_id)
 
     def status(self) -> str:
         if not self._ready or any(
@@ -298,9 +334,11 @@ class OperatorProductService:
             was_ready = self._ready
             self._ready = False
             self._disk_full = paused
+            self._motion.invalidate()
             self._needs_reconcile = True
             preferences = {
-                source.binding.path_name: source.recording_enabled for source in self._sources
+                source.binding.path_name: self._motion.effective_record(source)
+                for source in self._sources
             }
             for path in self._paths:
                 await self._storage_operation(
@@ -309,6 +347,7 @@ class OperatorProductService:
                     route=f"/v3/config/paths/patch/{path}",
                     payload={"record": preferences.get(path, False) and not paused},
                 )
+                self._motion.note_gate(path, preferences.get(path, False) and not paused)
             await self._storage_operation(self._write_media)
             self._needs_reconcile = False
             self._ready = was_ready and not self._closing
@@ -384,6 +423,7 @@ class OperatorProductService:
     def _start_media(self) -> None:
         from k5vision.operator_native_process import OwnedNativeProcess
 
+        self._motion.invalidate()
         self._write_media()
         self._media = OwnedNativeProcess(
             [str(self.media_executable), str(self._media_file)], cwd=self.state_root
@@ -438,6 +478,7 @@ class OperatorProductService:
             self._storage_status = storage
             self._disk_full = not storage.recording_allowed
             self._sources = tuple(sources)
+            await self._motion.load(self._sources, prune=True)
             await self._spawn(self._start_media)
             await self._wait_media()
             self._paths = {source.binding.path_name for source in sources}
@@ -445,6 +486,7 @@ class OperatorProductService:
             await self._wait_gateway()
             self._ready = True
             self._task = asyncio.create_task(self._maintain(), name="operator-native-supervisor")
+            self._motion.start()
         except asyncio.CancelledError:
             await self.stop()
             raise
@@ -481,6 +523,7 @@ class OperatorProductService:
 
     async def apply_sources(self, sources: tuple[MediaMTXSource, ...]) -> None:
         async with self._lock:
+            await self._motion.load(tuple(sources))
             config = self._configuration(tuple(sources))
             self._sources = tuple(sources)
             self._needs_reconcile = True
@@ -570,6 +613,7 @@ class OperatorProductService:
         sources: tuple[MediaMTXSource, ...],
         settings: dict,
         persist: Callable[[], Awaitable[None]],
+        motion_before=None,
     ) -> None:
         before = self._sources
         path = previous.binding.path_name
@@ -597,6 +641,8 @@ class OperatorProductService:
             self._source_recovery.pop(path, None)
         except BaseException as error:
             self._sources = before
+            if motion_before is not None:
+                self._motion.restore_selection(motion_before)
             repair = asyncio.create_task(self._restore_camera_source(previous))
             await self._join_source_task(repair)
             if isinstance(error, asyncio.CancelledError):
@@ -638,6 +684,9 @@ class OperatorProductService:
                 sources = tuple(
                     replacement if source == previous else source for source in self._sources
                 )
+                motion_before = self._motion.selection_snapshot()
+                await self._motion.load(sources)
+                self._motion.invalidate((path,))
                 settings = self._configuration(sources)["paths"][path]
             except Exception:
                 raise OperatorProductError("Camera selection changed during the request") from None
@@ -650,7 +699,9 @@ class OperatorProductService:
             ):
                 raise OperatorProductError("Recording worker is unavailable")
             operation = asyncio.create_task(
-                self._refresh_camera_source(previous, replacement, sources, settings, persist)
+                self._refresh_camera_source(
+                    previous, replacement, sources, settings, persist, motion_before
+                )
             )
             self._source_refreshes.add(operation)
             try:
@@ -686,6 +737,7 @@ class OperatorProductService:
                 before[path].device != source.device
                 or before[path].source_uri != source.source_uri
                 or before[path].binding != source.binding
+                or getattr(before[path], "profile_key", "") != getattr(source, "profile_key", "")
                 for path, source in after.items()
             )
         ):
@@ -698,6 +750,7 @@ class OperatorProductService:
             if before[path].recording_enabled != after[path].recording_enabled
         ]
         applied = []
+        self._motion.invalidate(changed, clear_preview=False)
         try:
             for path in changed:
                 # Record-only PATCH keeps the camera source and its live readers.
@@ -705,20 +758,26 @@ class OperatorProductService:
                 self._mutation(
                     "PATCH",
                     f"/v3/config/paths/patch/{path}",
-                    {"record": after[path].recording_enabled and not self._disk_full},
+                    {"record": self._motion.effective_record(after[path])},
                 )
+                self._motion.note_gate(path, self._motion.effective_record(after[path]))
             self._sources = tuple(sources)
+            if self._motion.store is not None:
+                self._motion.sources = {source.binding.path_name: source for source in sources}
             self._write_media()
         except BaseException:
             self._sources = previous
+            if self._motion.store is not None:
+                self._motion.sources = {source.binding.path_name: source for source in previous}
             failed = False
             for path in reversed(applied):
                 try:
                     self._mutation(
                         "PATCH",
                         f"/v3/config/paths/patch/{path}",
-                        {"record": before[path].recording_enabled and not self._disk_full},
+                        {"record": self._motion.effective_record(before[path])},
                     )
+                    self._motion.note_gate(path, self._motion.effective_record(before[path]))
                 except Exception:
                     failed = True
             try:
@@ -880,6 +939,18 @@ class OperatorProductService:
                 except Exception:
                     break
         cleanup_failed = False
+        motion_close = asyncio.create_task(self._motion.close())
+        while not motion_close.done():
+            try:
+                await asyncio.shield(motion_close)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        try:
+            motion_close.result()
+        except BaseException:
+            cleanup_failed = True
         close_provider = asyncio.create_task(self.provider.aclose())
         # A canceled camera-list reader may leave its shared snapshot owner
         # finishing a native read. Close and join that boundary before the

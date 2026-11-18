@@ -1712,6 +1712,8 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
                     "analytics.css": "text/css",
                     "settings.js": "application/javascript",
                     "settings.css": "text/css",
+                    "recording-settings.js": "application/javascript",
+                    "recording-settings.css": "text/css",
                 }[name]
                 route.fulfill(
                     status=200,

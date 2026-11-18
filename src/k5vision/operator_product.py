@@ -117,12 +117,14 @@ def create_operator_product_app(
     from k5vision.operator_identity_security import AccountSecurityService, AccountSecurityStore
     from k5vision.operator_integrations import OperatorIntegrationStore
     from k5vision.operator_oidc import OIDCService, OIDCStore
+    from k5vision.operator_recording_policy import RecordingPolicyStore
     from k5vision.operator_role_policy import OperatorRolePolicy
     from k5vision.operator_time_admin import TimeAdministrationService
 
     # Account security and access policy are mandatory: damaged state cannot
     # silently restore password-only login or the account's broader base role.
     security_store = security = roles = audit = integrations = oidc = time_admin = None
+    recording_policies = None
     try:
         security_store = AccountSecurityStore(identity.directory, identity.site_id)
         security = AccountSecurityService(
@@ -133,12 +135,21 @@ def create_operator_product_app(
         integrations = OperatorIntegrationStore(identity.directory, identity.site_id)
         oidc = OIDCService(store=OIDCStore(security_store), users=application.state.user_registry)
         time_admin = TimeAdministrationService(identity.directory)
+        recording_policies = RecordingPolicyStore(identity.directory, identity.site_id)
+        service.set_recording_policy_store(recording_policies)
     except BaseException:
         with ExitStack() as cleanup:
             cleanup.callback(cameras.close)
             if "event_store" in locals():
                 cleanup.callback(event_store.close)
-            for component in (security or security_store, roles, audit, integrations, oidc):
+            for component in (
+                security or security_store,
+                roles,
+                audit,
+                integrations,
+                oidc,
+                recording_policies,
+            ):
                 if component is not None:
                     cleanup.callback(component.close)
         raise
@@ -148,10 +159,19 @@ def create_operator_product_app(
     application.state.operator_integrations = integrations
     application.state.operator_oidc = oidc
     application.state.operator_time_admin = time_admin
+    application.state.operator_recording_policies = recording_policies
 
     def close_admin_state():
         with ExitStack() as cleanup:
-            for component in (cameras, audit, security, roles, integrations, oidc):
+            for component in (
+                cameras,
+                audit,
+                security,
+                roles,
+                integrations,
+                oidc,
+                recording_policies,
+            ):
                 cleanup.callback(component.close)
 
     install_operator_product_api(
@@ -171,15 +191,25 @@ def create_operator_product_app(
 
     async def close_camera_settings():
         try:
-            video_settings = getattr(application.state, "operator_camera_settings_vault", None)
-            if video_settings is not None:
-                await video_settings.aclose()
+            motion_settings = getattr(application.state, "operator_motion_preview_vault", None)
+            if motion_settings is not None:
+                await motion_settings.aclose()
         finally:
-            remove_listener = getattr(
-                application.state, "operator_camera_settings_revocation_cleanup", None
-            )
-            if remove_listener is not None:
-                remove_listener()
+            try:
+                video_settings = getattr(application.state, "operator_camera_settings_vault", None)
+                if video_settings is not None:
+                    await video_settings.aclose()
+            finally:
+                remove_listener = getattr(
+                    application.state, "operator_camera_settings_revocation_cleanup", None
+                )
+                if remove_listener is not None:
+                    remove_listener()
+                remove_motion_listener = getattr(
+                    application.state, "operator_motion_settings_revocation_cleanup", None
+                )
+                if remove_motion_listener is not None:
+                    remove_motion_listener()
 
     @asynccontextmanager
     async def lifespan(app):

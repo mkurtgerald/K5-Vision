@@ -621,3 +621,59 @@ def test_native_worker_bundle_refuses_changed_upstream_license(builder, tmp_path
     payload.mkdir()
     with pytest.raises(ValueError, match="Worker archive member identity mismatch"):
         builder.bundle_worker(payload, source, "mediamtx")
+
+
+def _operator_assets(builder, tmp_path, monkeypatch):
+    root = tmp_path / "source"
+    source = root / "src/k5vision/operator_web"
+    source.mkdir(parents=True)
+    packages = tmp_path / "installed/Lib/site-packages"
+    installed = packages / "k5vision/operator_web"
+    installed.mkdir(parents=True)
+    for name in builder.OPERATOR_WEB_ASSETS:
+        raw = (name + " exact source bytes\n").encode()
+        (source / name).write_bytes(raw)
+        (installed / name).write_bytes(raw)
+    monkeypatch.setattr(builder, "ROOT", root)
+    return source, packages, installed
+
+
+def test_built_wheel_admits_all_fifteen_served_assets_with_exact_source_bytes(
+    builder, tmp_path, monkeypatch
+):
+    source, packages, installed = _operator_assets(builder, tmp_path, monkeypatch)
+    result = builder.admit_operator_web_assets(packages)
+    assert len(result) == len(builder.OPERATOR_WEB_ASSETS) == 15
+    assert {row["path"].split("/")[-1] for row in result} == set(builder.OPERATOR_WEB_ASSETS)
+    assert {"recording-settings.css", "recording-settings.js"} <= set(builder.OPERATOR_WEB_ASSETS)
+    for row in result:
+        path = installed / row["path"].split("/")[-1]
+        assert row["sha256"] == sha256(path.read_bytes()).hexdigest()
+        assert row["bytes"] == len(path.read_bytes())
+        assert path.read_bytes() == (source / path.name).read_bytes()
+
+
+@pytest.mark.parametrize("name", ["recording-settings.css", "recording-settings.js"])
+@pytest.mark.parametrize("fault", ["missing", "changed", "newline-adapted"])
+def test_new_motion_assets_cannot_be_missing_changed_or_newline_adapted(
+    builder, tmp_path, monkeypatch, name, fault
+):
+    _, packages, installed = _operator_assets(builder, tmp_path, monkeypatch)
+    asset = installed / name
+    if fault == "missing":
+        asset.unlink()
+    elif fault == "changed":
+        asset.write_bytes(b"different source module\n")
+    else:
+        asset.write_bytes(asset.read_bytes().replace(b"\n", b"\r\n"))
+    with pytest.raises(ValueError, match="operator asset"):
+        builder.admit_operator_web_assets(packages)
+
+
+def test_unclassified_new_served_asset_requires_explicit_source_inventory_update(
+    builder, tmp_path, monkeypatch
+):
+    source, packages, _ = _operator_assets(builder, tmp_path, monkeypatch)
+    (source / "unclassified.js").write_bytes(b"new unreviewed asset")
+    with pytest.raises(ValueError, match="source inventory differs"):
+        builder.admit_operator_web_assets(packages)

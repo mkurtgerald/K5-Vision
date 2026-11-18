@@ -26,6 +26,72 @@ from k5vision.services.user_registry import UserRegistry
 _SECRET = "source-fixture-private-secret"
 
 
+def test_private_profile_identity_survives_pause_refresh_and_restart(identity):
+    device = _device()
+    store = OperatorCameraStore(identity.directory, identity.site_id)
+    first = store.upsert(device, _uri(device), profile_key="a" * 64)
+    assert first.profile_key == "a" * 64
+    assert "a" * 64 not in repr(first)
+    paused = store.set_recording_enabled(device.id, False)
+    refreshed = store.upsert(device, _uri(device, "refreshed"))
+    assert paused.profile_key == refreshed.profile_key == first.profile_key
+    assert refreshed.recording_enabled is False
+    store.close()
+    reopened = OperatorCameraStore(identity.directory, identity.site_id)
+    try:
+        assert reopened.get(device.id) == refreshed
+        reopened.remove(device.id)
+        assert reopened.list_sources() == ()
+    finally:
+        reopened.close()
+
+
+def test_aliased_onvif_profile_change_keeps_camera_but_changes_private_identity(identity):
+    registry, store, device, previous = _registered_store(identity)
+    try:
+        first = store.reconnect_onvif(device.id, _uri(device), 80, False, profile_key="a" * 64)
+        store.set_recording_enabled(device.id, False)
+        second = store.reconnect_onvif(device.id, _uri(device), 80, False, profile_key="b" * 64)
+        assert first.source_uri == second.source_uri
+        assert first.binding == second.binding == previous.binding
+        assert first.profile_key != second.profile_key
+        assert second.recording_enabled is False
+        assert store.get(device.id) == second
+    finally:
+        store.close()
+        registry.close()
+
+
+@pytest.mark.parametrize("key", [False, 0, "PRIVATE_PROFILE_TOKEN", "A" * 64, "a" * 65])
+def test_invalid_private_profile_is_refused_without_changing_source(identity, key):
+    device = _device()
+    store = OperatorCameraStore(identity.directory, identity.site_id)
+    try:
+        original = store.upsert(device, _uri(device), profile_key="a" * 64)
+        with pytest.raises(OperatorCameraStoreError):
+            store.upsert(device, _uri(device, "replacement"), profile_key=key)
+        assert store.get(device.id) == original
+    finally:
+        store.close()
+
+
+def test_failed_profile_write_preserves_old_profile_and_source(identity):
+    device = _device()
+    store = OperatorCameraStore(identity.directory, identity.site_id)
+    try:
+        original = store.upsert(device, _uri(device), profile_key="a" * 64)
+        _change(
+            identity,
+            "CREATE TRIGGER refuse_profile BEFORE UPDATE ON camera_profiles "
+            "BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        with pytest.raises(OperatorCameraStoreError):
+            store.upsert(device, _uri(device, "replacement"), profile_key="b" * 64)
+        assert store.get(device.id) == original
+    finally:
+        store.close()
+
+
 @pytest.fixture
 def identity(tmp_path, monkeypatch):
     # The execution sandbox can present / and /tmp with nobody ownership. Model

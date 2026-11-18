@@ -625,6 +625,48 @@ def test_never_live_camera_has_monotonic_deadline_and_recovers_without_reenrollm
     assert product.cameras.get(UUID(identifier)) is not None
 
 
+@pytest.mark.parametrize(
+    ("motion_state", "recording_state", "reason"),
+    [
+        ("armed", "waiting", "motion_armed"),
+        ("zones_need_review", "paused", "zones_need_review"),
+        ("unavailable", "error", "motion_unavailable"),
+    ],
+)
+def test_motion_idle_and_review_states_do_not_report_an_unexpected_recording_gate(
+    product, motion_state, recording_state, reason
+):
+    identifier = product.enroll()
+    product.service.provider.recording = False
+    product.service.recording_policy_status = lambda _binding: {
+        "mode": "motion",
+        "state": motion_state,
+    }
+    response = product.client.get("/api/v1/operator/cameras", headers=product.headers)
+    assert response.status_code == 200
+    camera = next(c for c in response.json()["cameras"] if c["device_id"] == identifier)
+    assert camera["recording"] is False
+    assert camera["recording_mode"] == "motion"
+    assert camera["motion_policy_state"] == motion_state
+    assert camera["recording_state"] == recording_state
+    assert camera["recording_status"]["reason"] == reason
+
+
+def test_motion_post_capture_retains_observed_disk_progress(product):
+    product.enroll()
+    product.service.recording_policy_status = lambda _binding: {
+        "mode": "motion",
+        "state": "post_capture",
+    }
+    camera = product.client.get("/api/v1/operator/cameras", headers=product.headers).json()[
+        "cameras"
+    ][0]
+    assert camera["recording"] is True
+    assert camera["motion_policy_state"] == "post_capture"
+    assert camera["recording_state"] == "recording"
+    assert camera["recording_status"]["reason"] == "disk_progress"
+
+
 def test_recording_claim_requires_recent_complete_disk_progress(product, monkeypatch):
     clock = SimpleNamespace(value=100.0)
     monkeypatch.setattr("k5vision.operator_product_api.monotonic", lambda: clock.value)

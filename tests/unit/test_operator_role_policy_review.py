@@ -389,7 +389,11 @@ def composed_review(review_identity):
 
     service.start = start
     service.stop = stop
+    recording_policy_stores = []
+    service.set_recording_policy_store = recording_policy_stores.append
     app = create_operator_product_app(identity_directory=review_identity.directory, service=service)
+    assert len(recording_policy_stores) == 1
+    assert recording_policy_stores[0] is app.state.operator_recording_policies
     with TestClient(app, base_url="http://127.0.0.1:8080") as client:
         owner = app.state.user_registry.list()[0]
         login = client.post(

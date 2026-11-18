@@ -91,7 +91,7 @@
     exportEpoch: 0, exportController: null, exportJob: null, exportDownloadAllowed: false,
     securityTransition: false, capabilitiesResolved: false,
   };
-  let wall = null, timeline = null, administration = null, cameraAnalytics = null, settings = null, cameraVideoSettings = null;
+  let wall = null, timeline = null, administration = null, cameraAnalytics = null, settings = null, cameraVideoSettings = null, cameraRecordingSettings = null;
   const PLAYBACK_CHUNK_SECONDS = 120;
   const MAX_PREFETCH_BYTES = 32 * 1024 * 1024;
   let wallLayoutPending = false;
@@ -225,7 +225,7 @@
     $("admin-tab").hidden = account?.role !== "administrator" || !ADMIN_PERMISSIONS.some(allowed);
     $("security-tab").hidden = !account || !state.capabilitiesResolved || !window.K5Settings?.create;
     $("add-camera-button").hidden = !allowed("cameras.manage");
-    for (const node of $("camera-list").querySelectorAll(".camera-item")) node.disabled = !allowed("cameras.view_live") && !allowed("cameras.playback") && !allowed("cameras.manage");
+    for (const node of $("camera-list").querySelectorAll(".camera-item")) node.disabled = !allowed("cameras.view_live") && !allowed("cameras.playback") && !allowed("cameras.manage") && !allowed("recording.manage");
     $("admin-tab").textContent = allowed("users.manage") ? "Administration" : "Recorder settings";
     $("admin-settings-tab").hidden = !ADMIN_PERMISSIONS.some(allowed);
     $("account-role").title = account?.role === "administrator" ? "Manage users, cameras and recordings"
@@ -236,6 +236,7 @@
     $("clip-selection-label").hidden = !canExport();
     $("export-panel").hidden = !canExport();
     cameraVideoSettings?.authority();
+    cameraRecordingSettings?.authority();
   }
 
   class ApiError extends Error {
@@ -328,6 +329,7 @@
             if (path.startsWith("/api/v1/operator/admin/") && ADMIN_ERROR_CODES.has(candidate)) code = candidate;
             if (path.includes("/exports") && Object.hasOwn(EXPORT_ERRORS, candidate)) code = candidate;
             if (window.K5Settings?.errorCodes?.includes(candidate)) code = candidate;
+            if (window.K5RecordingSettings?.errorCodes?.includes(candidate)) code = candidate;
           } catch (_) { /* Unknown response text never becomes a user-facing error. */ }
         }
         throw new ApiError(response.status, code, clock);
@@ -360,6 +362,19 @@
     };
     if (state.workerStatus === "disk_full" || reason === "storage_paused") return {
       text: "Storage paused", detail: "Recording is paused because storage needs attention. Check the storage status above.", paused: true,
+    };
+    const motion = camera.motion_policy_state;
+    if (motion === "armed") return {
+      text: "Armed · Waiting for motion", detail: "The motion detector is active. New recording starts when an enabled region moves.", paused: false,
+    };
+    if (motion === "post_capture") return {
+      text: "Finishing motion recording", detail: "The motion gate remains open for the saved hold time. Disk activity confirms recorded footage.", paused: false,
+    };
+    if (motion === "zones_need_review") return {
+      text: "Zones need review", detail: "This camera view changed. Review its frozen frame and redraw motion zones before motion recording can resume.", paused: true,
+    };
+    if (motion === "unavailable") return {
+      text: "Motion unavailable", detail: "Motion recording is not confirmed. Check the camera and recorder health.", paused: true,
     };
     if (camera.recording_state === "recording") return {
       text: "Recording", detail: "New recording data has been observed on disk.", paused: false,
@@ -451,6 +466,7 @@
     administration?.hide();
     settings?.hide();
     cameraVideoSettings?.close();
+    cameraRecordingSettings?.close();
     state.securityTransition = false;
     cameraAnalytics?.clear();
     cancelExport();
@@ -539,6 +555,7 @@
   async function signOut() {
     if (state.signingOut) return;
     state.signingOut = true;
+    cameraRecordingSettings?.close();
     administration?.hide();
     closeAddCamera();
     const token = state.token;
@@ -577,7 +594,7 @@
       const button = document.createElement("button");
       button.type = "button";
       button.className = "camera-item";
-      button.disabled = !allowed("cameras.view_live") && !allowed("cameras.playback") && !allowed("cameras.manage");
+      button.disabled = !allowed("cameras.view_live") && !allowed("cameras.playback") && !allowed("cameras.manage") && !allowed("recording.manage");
       button.classList.toggle("selected", camera.device_id === state.selected);
       button.setAttribute("aria-pressed", String(camera.device_id === state.selected));
       const heading = document.createElement("span");
@@ -620,6 +637,7 @@
     $("connection-badge").hidden = !focused;
     $("recording-badge").hidden = !focused;
     $("camera-video-button").hidden = !focused || !allowed("cameras.manage");
+    $("camera-recording-settings-button").hidden = !focused || !allowed("recording.manage");
     $("update-source-button").hidden = !focused || !allowed("cameras.manage");
     $("remove-camera-button").hidden = !focused || !allowed("cameras.manage");
     $("toggle-recording").hidden = !focused || !allowed("recording.manage");
@@ -748,6 +766,7 @@
   }
 
   function clearCameraSelection(title = "Choose a camera to begin", description = "Your live feed will appear here.") {
+    cameraRecordingSettings?.close();
     state.selectionEpoch += 1;
     state.selectionController?.abort();
     stopLive(); stopPlayback();
@@ -812,6 +831,7 @@
       administration?.refreshCameras();
       settings?.refreshCameras();
       cameraVideoSettings?.inventory();
+      cameraRecordingSettings?.inventory(state.cameras);
       renderCameras();
       if (restoreWall && state.view === "wall" && allowed("cameras.view_live")) cameraWall().show(state.cameras);
       if (state.selected && !currentCamera() && !["admin", "settings"].includes(state.view)) {
@@ -867,12 +887,15 @@
     if (!state.token || state.signingOut) return;
     if (!allowed("cameras.view_live") && !allowed("cameras.playback")) {
       const camera = state.cameras.find((item) => item.device_id === deviceId);
-      if (camera && canManageCameras()) {
-        cameraVideoSettings?.selection(deviceId); state.selected = deviceId; renderCameras(); cameraVideoWorkspace().open(camera);
+      if (camera && (canManageCameras() || allowed("recording.manage"))) {
+        cameraVideoSettings?.selection(deviceId); cameraRecordingSettings?.selection(deviceId); state.selected = deviceId;
+        if (state.view === "wall") setView("live", false); renderCameras();
+        if (canManageCameras()) cameraVideoWorkspace().open(camera); else recordingSettingsWorkspace().open(camera);
       }
       return;
     }
     cameraVideoSettings?.selection(deviceId);
+    cameraRecordingSettings?.selection(deviceId);
     state.navigationEpoch += 1;
     if (["wall", "admin"].includes(state.view)) setView(allowed("cameras.view_live") ? "live" : "history", false);
     state.selectionController?.abort();
@@ -2466,6 +2489,20 @@
   }
   $("camera-video-button").addEventListener("click", () => {
     const camera = currentCamera(); if (camera && canManageCameras()) cameraVideoWorkspace().open(camera);
+  });
+
+  function recordingSettingsWorkspace() {
+    if (!cameraRecordingSettings) cameraRecordingSettings = window.K5RecordingSettings.create({
+      dialog: $("recording-settings-dialog"), request,
+      getSession: () => state.signingOut || !state.capabilitiesResolved ? null
+        : ({ token: state.token, epoch: state.sessionEpoch, account: state.account }),
+      onChanged: () => void refreshCameras(),
+    });
+    return cameraRecordingSettings;
+  }
+  $("camera-recording-settings-button").addEventListener("click", () => {
+    const camera = currentCamera();
+    if (camera && allowed("recording.manage")) recordingSettingsWorkspace().open(camera);
   });
 
   function cameraSetupType() {

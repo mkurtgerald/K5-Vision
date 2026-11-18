@@ -33,6 +33,23 @@ PERSON_MANIFEST = ROOT / "src/k5vision/data/operator-person-model-manifest.json"
 PERSON_MANIFEST_SHA256 = "b15ac68ec04b1fa9b1c95b320e2694469b8e764049fac544d6986a940f1fd794"
 PERSON_MODEL_ROOT = "runtime/Lib/site-packages/k5vision/data/person-models"
 _BUILD_PHASE = "initialization"
+OPERATOR_WEB_ASSETS = (
+    "index.html",
+    "app.css",
+    "app.js",
+    "wall.css",
+    "wall.js",
+    "timeline.css",
+    "timeline.js",
+    "admin.css",
+    "admin.js",
+    "analytics.css",
+    "analytics.js",
+    "settings.css",
+    "settings.js",
+    "recording-settings.css",
+    "recording-settings.js",
+)
 _BUILD_PHASES = frozenset(
     {
         "initialization",
@@ -42,6 +59,7 @@ _BUILD_PHASES = frozenset(
         "dependency_install",
         "product_wheel_build",
         "product_wheel_install",
+        "operator_web_assets",
         "cpp_runtime",
         "person_model_manifest",
         "person_model_xml",
@@ -148,6 +166,39 @@ def onvif_source_adaptation(payload: Path) -> dict[str, object]:
 def digest(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def admit_operator_web_assets(site_packages: Path) -> list[dict[str, object]]:
+    """Require the actual built wheel to retain every served operator asset.
+
+    Source and installed bytes stay exact; newline adaptation is not part of
+    native payload admission. The final payload manifest seals these files too.
+    """
+    source = ROOT / "src/k5vision/operator_web"
+    installed = site_packages / "k5vision/operator_web"
+    expected = set(OPERATOR_WEB_ASSETS)
+    if {
+        item.name for item in source.iterdir() if item.suffix in {".js", ".css", ".html"}
+    } != expected:
+        raise ValueError("Operator asset source inventory differs")
+    result = []
+    for name in OPERATOR_WEB_ASSETS:
+        original, bundled = source / name, installed / name
+        if any(path.is_symlink() or not path.is_file() for path in (original, bundled)):
+            raise ValueError("Required operator asset is not bundled")
+        if not 0 < original.stat().st_size <= 2 * 1024**2:
+            raise ValueError("Operator source asset is empty or oversized")
+        expected_bytes = original.read_bytes()
+        if bundled.stat().st_size != len(expected_bytes) or bundled.read_bytes() != expected_bytes:
+            raise ValueError("Bundled operator asset bytes differ")
+        result.append(
+            {
+                "path": "k5vision/operator_web/" + name,
+                "bytes": len(expected_bytes),
+                "sha256": hashlib.sha256(expected_bytes).hexdigest(),
+            }
+        )
+    return result
 
 
 def admit(path: Path, identity: dict[str, object]) -> None:
@@ -712,6 +763,8 @@ def build(args: argparse.Namespace) -> None:
         scripts = site_packages / name
         if scripts.exists():
             shutil.rmtree(scripts)
+    phase("operator_web_assets")
+    admit_operator_web_assets(site_packages)
     cpp_runtime = provision_cpp_runtime(payload, donors["cpp_runtime"])
     person_model = provision_person_model(payload)
     phase("native_workers")
@@ -778,8 +831,8 @@ def build(args: argparse.Namespace) -> None:
                 "camera_access_controls": True,
                 "camera_video_settings": True,
                 "automatic_wall_layout": True,
-                "motion_recording": False,
-                "camera_trigger_zones": False,
+                "motion_recording": True,
+                "camera_trigger_zones": True,
                 "writable_video_codecs": ["H264"],
                 "person_analytics_bundled": True,
                 "background_person_events": True,

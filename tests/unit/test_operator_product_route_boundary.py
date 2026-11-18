@@ -44,8 +44,17 @@ def composed(tmp_path, monkeypatch):
     async def stop():
         pass
 
-    service = SimpleNamespace(site_id=identity.site_id, public_port=8080, start=start, stop=stop)
+    recording_policy_stores = []
+    service = SimpleNamespace(
+        site_id=identity.site_id,
+        public_port=8080,
+        start=start,
+        stop=stop,
+        set_recording_policy_store=recording_policy_stores.append,
+    )
     app = create_operator_product_app(identity_directory=identity.directory, service=service)
+    assert len(recording_policy_stores) == 1
+    assert recording_policy_stores[0] is app.state.operator_recording_policies
     with TestClient(app, base_url="http://127.0.0.1:8080") as client:
 
         def login(username):
@@ -209,8 +218,17 @@ def test_product_drains_camera_writes_before_stopping_recorder(tmp_path, monkeyp
     async def stop():
         order.append("recorder-stopped")
 
-    service = SimpleNamespace(site_id=identity.site_id, public_port=8080, start=start, stop=stop)
+    recording_policy_stores = []
+    service = SimpleNamespace(
+        site_id=identity.site_id,
+        public_port=8080,
+        start=start,
+        stop=stop,
+        set_recording_policy_store=recording_policy_stores.append,
+    )
     app = create_operator_product_app(identity_directory=identity.directory, service=service)
+    assert len(recording_policy_stores) == 1
+    assert recording_policy_stores[0] is app.state.operator_recording_policies
     vault = app.state.operator_camera_settings_vault
     original_close = vault.aclose
 

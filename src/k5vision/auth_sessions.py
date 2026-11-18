@@ -213,6 +213,29 @@ class UserSessionManager:
                 return None
             return current
 
+    def current_session_guard(self, token: str, user_id: UUID) -> Callable[[], bool]:
+        """Capture a pure last-write fence after fresh durable authentication.
+
+        This does not authenticate an account or read durable permissions. It
+        only rejects a revoked, replaced or elapsed issued record while an
+        already authorized operation completes on its owned file worker.
+        """
+        if not isinstance(user_id, UUID) or not self._token_is_valid(token):
+            raise ValueError("Session admission guard is invalid")
+        digest = self._digest(token)
+        record = self._sessions.get(digest)
+
+        def current() -> bool:
+            return (
+                record is not None
+                and record.account.id == user_id
+                and self._sessions.get(digest) is record
+                and self._user_tokens.get(user_id) == digest
+                and record.deadline > monotonic()
+            )
+
+        return current
+
     async def revoke(self, token: str) -> bool:
         """Revoke one session token without exposing session state."""
         if not self._token_is_valid(token):

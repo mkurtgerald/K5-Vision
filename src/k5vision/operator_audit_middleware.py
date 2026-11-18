@@ -56,6 +56,8 @@ _RULES = (
     ),
     ("DELETE", _PREFIX + "/cameras/" + _ID, "camera.remove", "camera"),
     ("PUT", _PREFIX + "/cameras/" + _ID + r"/recording", "recording.configure", "camera"),
+    ("PUT", _PREFIX + "/cameras/" + _ID + r"/recording-policy", "recording.configure", "camera"),
+    ("POST", _PREFIX + "/cameras/" + _ID + r"/motion-preview", "camera.probe", "camera"),
     ("PATCH", _PREFIX + "/cameras/" + _ID + r"/analytics", "analytics.configure", "camera"),
     ("POST", _PREFIX + "/cameras/" + _ID + r"/exports", "export.prepare", "camera"),
     (
