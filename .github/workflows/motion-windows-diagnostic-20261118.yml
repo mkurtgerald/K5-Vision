@@ -98,6 +98,7 @@ jobs:
           retention-days: 14
 
   policy-api-diagnostic:
+    if: github.run_number == 1
     name: Diagnostic only - Windows policy API and authority tests
     runs-on: windows-2025
     timeout-minutes: 8

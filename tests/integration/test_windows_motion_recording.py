@@ -46,6 +46,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+_ASSERTION_CODES = {
+    "Graphical recording policy was not applied": "policy_put_http_rejected",
+    "Recording controls did not retain the selected actual capture policy": "policy_value_mismatch",
+    "Default motion zone was not the full frame": "initial_zones_not_whole_frame",
+    "Actual recording bytes disagreed with the motion gate": "target_growth_mismatch",
+    "Motion policy interrupted the other recorder": "other_camera_growth_mismatch",
+    "Motion recorder changed state during observation": "observation_state_changed",
+    "Installed motion recorder exited": "installed_recorder_exited",
+}
+
+
 def _require(value, message):
     __tracebackhide__ = True
     if not value:
@@ -150,8 +161,8 @@ def _login(page, client, username, password):
 class _GraphicalSaveDiagnostic:
     """Passive, bounded test-only evidence; never changes submission or validation."""
 
-    def __init__(self, page, camera, diagnostic, baseline):
-        self.page, self.diagnostic = page, diagnostic
+    def __init__(self, page, camera, diagnostic, baseline, *, name="zones"):
+        self.page, self.diagnostic, self.name = page, diagnostic, name
         self.route = f"/api/v1/operator/cameras/{camera}/recording-policy"
         self.network = {
             "put_requests": 0,
@@ -307,9 +318,13 @@ class _GraphicalSaveDiagnostic:
                 value["preview_elapsed_seconds"] = round(elapsed, 3)
                 value["preview_local_ttl_seconds"] = self.preview_ttl
                 value["preview_local_ttl_elapsed"] = elapsed >= self.preview_ttl
-            self.diagnostic.setdefault("graphical_save", {})[label] = value
+            self.diagnostic.setdefault("graphical_save", {}).setdefault(self.name, {})[label] = (
+                value
+            )
         except BaseException:
-            self.diagnostic.setdefault("graphical_save", {})[label] = {"observer_unavailable": True}
+            self.diagnostic.setdefault("graphical_save", {}).setdefault(self.name, {})[label] = {
+                "observer_unavailable": True
+            }
 
     def close(self):
         for name, callback in self.handlers.items():
@@ -766,13 +781,19 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
         page.locator("#recording-mode").select_option("motion")
         page.locator("#motion-post-capture").fill("3")
         page.locator("#motion-minimum-area").fill("0.1")
-        initial = _save_graphically(page, target)
+        observer = _GraphicalSaveDiagnostic(page, target, diagnostic, {}, name="initial_mode")
+        try:
+            initial = _save_graphically(page, target, observer=observer)
+        finally:
+            observer.snapshot("after_initial_save")
+            observer.close()
         _require(
             initial["zones"] == {"reference": None, "include": [], "exclude": []},
             "Default motion zone was not the full frame",
         )
         page.locator("#recording-settings-cancel").click()
         observations = {}
+        diagnostic["stage"] = "full_frame_idle"
         observations["full_frame_idle"] = _observe_recording(
             client,
             target,
@@ -785,6 +806,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             growing=False,
             app=app,
         )
+        diagnostic["stage"] = "full_frame_motion"
         observations["full_frame_motion"] = _observe_recording(
             client,
             target,
@@ -1095,11 +1117,19 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             else "other"
         )
         trace = error.__traceback__
+        callers = []
+        message = getattr(error, "msg", None)
         while trace is not None:
             if Path(trace.tb_frame.f_code.co_filename).name == Path(__file__).name:
                 diagnostic["failure_function"] = trace.tb_frame.f_code.co_name
                 diagnostic["failure_line"] = trace.tb_lineno
+                callers.append({"function": trace.tb_frame.f_code.co_name, "line": trace.tb_lineno})
+                if type(message) is str and message in trace.tb_frame.f_code.co_consts:
+                    diagnostic["failure_assertion_code"] = _ASSERTION_CODES.get(
+                        message, "literal_" + hashlib.sha256(message.encode()).hexdigest()[:12]
+                    )
             trace = trace.tb_next
+        diagnostic["failure_callers"] = callers[-4:]
     finally:
         for resource in (context, browser, playwright):
             if resource is not None:
@@ -1145,6 +1175,8 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     "failure_kind",
                     "failure_function",
                     "failure_line",
+                    "failure_callers",
+                    "failure_assertion_code",
                     "installer_action",
                     "installer_install_posted",
                     "installer_steps_seen",
