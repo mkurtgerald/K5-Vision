@@ -13,6 +13,7 @@ import re
 import sqlite3
 import threading
 import weakref
+from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
 
@@ -148,6 +149,18 @@ class OperatorCameraStore:
                         "(device_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL "
                         "CHECK (enabled IN (0, 1)))"
                     )
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS camera_profiles "
+                        "(device_id TEXT PRIMARY KEY, profile_key TEXT NOT NULL)"
+                    )
+                    # Older supported readers do not know the new profile
+                    # table. Their ordinary camera DELETE must still remove
+                    # the associated private profile identity.
+                    connection.execute(
+                        "CREATE TRIGGER IF NOT EXISTS camera_profiles_source_removed "
+                        "AFTER DELETE ON camera_sources BEGIN "
+                        "DELETE FROM camera_profiles WHERE device_id=OLD.device_id; END"
+                    )
                     connection.execute("COMMIT")
                 finally:
                     self._rollback(connection)
@@ -205,7 +218,11 @@ class OperatorCameraStore:
         return self._connection
 
     def _validated_source(
-        self, device: Device, source_uri: str, recording_enabled: bool = True
+        self,
+        device: Device,
+        source_uri: str,
+        recording_enabled: bool = True,
+        profile_key: str = "",
     ) -> MediaMTXSource:
         failed = False
         try:
@@ -214,7 +231,11 @@ class OperatorCameraStore:
             # Device models are mutable; store and return an independent copy.
             admitted = Device.model_validate(device.model_dump(mode="json"))
             source = MediaMTXSource(
-                MediaMTXBinding(self._site_id, admitted.id), admitted, source_uri, recording_enabled
+                MediaMTXBinding(self._site_id, admitted.id),
+                admitted,
+                source_uri,
+                recording_enabled,
+                profile_key,
             )
             if len(_device_json(admitted).encode("utf-8")) > _MAX_DEVICE_JSON_BYTES:
                 raise ValueError
@@ -225,9 +246,13 @@ class OperatorCameraStore:
         return source
 
     def _source(
-        self, device: Device, source_uri: str, recording_enabled: bool = True
+        self,
+        device: Device,
+        source_uri: str,
+        recording_enabled: bool = True,
+        profile_key: str = "",
     ) -> MediaMTXSource:
-        source = self._validated_source(device, source_uri, recording_enabled)
+        source = self._validated_source(device, source_uri, recording_enabled, profile_key)
         failed = False
         try:
             if self._registry is not None:
@@ -259,6 +284,34 @@ class OperatorCameraStore:
                 raise ValueError
             sources = []
             preferences = {}
+            profiles = {}
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='camera_profiles'"
+            ).fetchone():
+                columns = connection.execute("PRAGMA table_info(camera_profiles)").fetchall()
+                if [(row[1], row[2], row[3], row[5]) for row in columns] != [
+                    ("device_id", "TEXT", 0, 1),
+                    ("profile_key", "TEXT", 1, 0),
+                ]:
+                    raise ValueError
+                selected_profiles = connection.execute(
+                    "SELECT device_id, profile_key FROM camera_profiles LIMIT ?",
+                    (MAX_OPERATOR_CAMERAS + 1,),
+                ).fetchall()
+                if len(selected_profiles) > MAX_OPERATOR_CAMERAS:
+                    raise ValueError
+                identifiers = {row["device_id"] for row in rows}
+                for selected in selected_profiles:
+                    identifier, key = selected["device_id"], selected["profile_key"]
+                    if (
+                        str(UUID(identifier)) != identifier
+                        or identifier in profiles
+                        or identifier not in identifiers
+                        or type(key) is not str
+                        or (key != "" and re.fullmatch(r"[0-9a-f]{64}", key) is None)
+                    ):
+                        raise ValueError
+                    profiles[identifier] = key
             if connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='camera_recording'"
             ).fetchone():
@@ -289,7 +342,12 @@ class OperatorCameraStore:
                 if str(device.id) != row["device_id"]:
                     raise ValueError
                 sources.append(
-                    self._source(device, row["source_uri"], preferences.get(str(device.id), True))
+                    self._source(
+                        device,
+                        row["source_uri"],
+                        preferences.get(str(device.id), True),
+                        profiles.get(str(device.id), ""),
+                    )
                 )
             result = tuple(sources)
         except Exception:
@@ -332,7 +390,7 @@ class OperatorCameraStore:
                 )
                 self._admit()
                 connection.execute("COMMIT")
-                return MediaMTXSource(source.binding, source.device, source.source_uri, enabled)
+                return replace(source, recording_enabled=enabled)
             except Exception:
                 self._rollback(connection)
                 raise OperatorCameraStoreError("Recording preference could not be saved") from None
@@ -345,7 +403,9 @@ class OperatorCameraStore:
         except sqlite3.Error:
             pass
 
-    def upsert(self, device: Device, source_uri: str) -> MediaMTXSource:
+    def upsert(
+        self, device: Device, source_uri: str, *, profile_key: str | None = None
+    ) -> MediaMTXSource:
         """Atomically create or replace one admitted camera's private source."""
         failure = None
         with self._lock:
@@ -367,12 +427,25 @@ class OperatorCameraStore:
                     ),
                     True,
                 )
-                source = MediaMTXSource(source.binding, source.device, source.source_uri, enabled)
+                key = (
+                    next(
+                        (item.profile_key for item in existing if item.binding == source.binding),
+                        "",
+                    )
+                    if profile_key is None
+                    else profile_key
+                )
+                source = replace(source, recording_enabled=enabled, profile_key=key)
                 connection.execute(
                     """INSERT INTO camera_sources (device_id, device_json, source_uri)
                         VALUES (?, ?, ?) ON CONFLICT(device_id) DO UPDATE
                         SET device_json = excluded.device_json, source_uri = excluded.source_uri""",
                     (str(source.device.id), _device_json(source.device), source.source_uri),
+                )
+                connection.execute(
+                    "INSERT INTO camera_profiles VALUES (?, ?) ON CONFLICT(device_id) "
+                    "DO UPDATE SET profile_key=excluded.profile_key",
+                    (str(source.device.id), source.profile_key),
                 )
                 connection.execute("COMMIT")
             except OperatorCameraCapacityError:
@@ -413,8 +486,12 @@ class OperatorCameraStore:
         source_uri: str,
         management_port: int,
         secure: bool,
+        *,
+        profile_key: str | None = None,
     ) -> MediaMTXSource:
-        return self._reconnect_source(device_id, source_uri, management_port, secure, True, "")
+        return self._reconnect_source(
+            device_id, source_uri, management_port, secure, True, "", profile_key
+        )
 
     def reconnect_stream(
         self, device_id: UUID, source_uri: str, management_port: int, stream_key: str
@@ -431,6 +508,7 @@ class OperatorCameraStore:
         secure: bool,
         onvif: bool,
         stream_key: str,
+        profile_key: str | None = None,
     ) -> MediaMTXSource:
         """Migrate an enrolled endpoint and source in one durable SQLite transaction.
 
@@ -448,6 +526,7 @@ class OperatorCameraStore:
                     or not 1 <= management_port <= 65535
                     or type(secure) is not bool
                     or type(onvif) is not bool
+                    or (profile_key is not None and type(profile_key) is not str)
                     or (stream_key != "" and re.fullmatch(r"[0-9a-f]{64}", stream_key) is None)
                     or self._registry is None
                 ):
@@ -483,6 +562,9 @@ class OperatorCameraStore:
                         Device.model_validate(data),
                         source_uri,
                         True if previous is None else previous.recording_enabled,
+                        ("" if previous is None else previous.profile_key)
+                        if profile_key is None and onvif
+                        else (profile_key or ""),
                     )
                     if connection.in_transaction or connection.execute(
                         "PRAGMA main.journal_mode"
@@ -565,6 +647,11 @@ class OperatorCameraStore:
                             )
                             if updated.rowcount != 1:
                                 raise ValueError
+                        connection.execute(
+                            "INSERT INTO camera_profiles VALUES (?, ?) ON CONFLICT(device_id) "
+                            "DO UPDATE SET profile_key=excluded.profile_key",
+                            (str(device_id), source.profile_key),
+                        )
                         self._admit()
                         self._registry_files(path, registry_identity)
                         connection.execute("COMMIT")
@@ -601,6 +688,9 @@ class OperatorCameraStore:
                 )
                 connection.execute(
                     "DELETE FROM camera_recording WHERE device_id = ?", (str(device_id),)
+                )
+                connection.execute(
+                    "DELETE FROM camera_profiles WHERE device_id = ?", (str(device_id),)
                 )
                 connection.execute("COMMIT")
             except Exception:

@@ -41,6 +41,8 @@ ACTIONS = frozenset(
         "camera.reconnect",
         "camera.discover",
         "camera.probe",
+        "camera.video.read",
+        "camera.video.configure",
         "recording.configure",
         "export.prepare",
         "export.completed",

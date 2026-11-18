@@ -329,6 +329,88 @@ def test_unchanged_provider_poll_preserves_focused_playback_button(analytics_pag
     assert not errors
 
 
+def test_provider_event_seek_survives_range_change_while_refresh_is_pending(analytics_page):
+    page, errors = analytics_page
+    page.evaluate(
+        """camera => {
+          window.providerRows=[{sequence:34,source_id:camera,event_id:'external-event-34',
+            event_type:'analytics.person',status:'candidate',confidence:0.76,
+            observed_at:'2026-10-26T23:59:12Z',playback_at:'2026-10-26T23:59:12Z'}];
+          return window.analytics.refresh();
+        }""",
+        _CAMERA,
+    )
+    # A range update invalidates the request epoch before the asynchronous
+    # provider refresh completes. A still-visible event must remain actionable.
+    page.evaluate(
+        """() => {
+          window.hold=true;
+          window.analytics.setRange({
+            start:'2026-10-27T01:00:00Z',end:'2026-10-28T01:00:00Z'});
+        }"""
+    )
+    page.wait_for_function("window.waiters.length === 3")
+    page.locator(
+        '#analytics-provider-events [data-provider-event-id="external-event-34"] button'
+    ).click()
+    page.wait_for_function("window.seeks.length === 1")
+    assert page.evaluate("window.seeks[0]") == {
+        "cameraId": _CAMERA,
+        "timestamp": "2026-10-26T23:59:12Z",
+    }
+    page.evaluate(
+        """() => {
+          window.hold=false;
+          for(const waiter of window.waiters) {
+            waiter.resolve(waiter.path.includes('/integration-events')
+              ? {events:structuredClone(window.providerRows),has_more:false,next_before:null}
+              : waiter.path.endsWith('/analytics') ? structuredClone(window.settings)
+              : {events:structuredClone(window.eventRows),has_more:false,next_before:null});
+          }
+          window.waiters=[];
+        }"""
+    )
+    assert not errors
+
+
+def test_provider_event_seek_rebinds_after_visibility_change(analytics_page):
+    page, errors = analytics_page
+    page.evaluate(
+        """camera => {
+          window.providerRows=[{sequence:34,source_id:camera,event_id:'external-event-34',
+            event_type:'analytics.person',status:'candidate',confidence:0.76,
+            observed_at:'2026-10-26T23:59:12Z',playback_at:'2026-10-26T23:59:12Z'}];
+          return window.analytics.refresh();
+        }""",
+        _CAMERA,
+    )
+    page.evaluate(
+        """() => {
+          window.hold=true;
+          window.analytics.setVisible(false);
+          window.analytics.setVisible(true);
+        }"""
+    )
+    page.wait_for_function("window.waiters.length === 3")
+    page.locator(
+        '#analytics-provider-events [data-provider-event-id="external-event-34"] button'
+    ).click()
+    page.wait_for_function("window.seeks.length === 1")
+    assert page.evaluate("window.seeks[0]") == {
+        "cameraId": _CAMERA,
+        "timestamp": "2026-10-26T23:59:12Z",
+    }
+    page.evaluate(
+        """() => {
+          window.session=null;
+          document.querySelector('#analytics-provider-events button').click();
+        }"""
+    )
+    page.wait_for_timeout(50)
+    assert page.evaluate("window.seeks.length") == 1
+    assert not errors
+
+
 def test_unassigned_provider_event_is_rejected_and_custom_role_cannot_change_detection(
     analytics_page,
 ):

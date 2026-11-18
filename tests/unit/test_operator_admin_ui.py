@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -91,6 +92,7 @@ def workspace():
             }
         ]
         state = {
+            "cameras": cameras,
             "users": [account.copy()],
             "requests": [],
             "bootstrap_status": 204,
@@ -101,6 +103,9 @@ def workspace():
             "hold_camera_refresh": hold_camera_refresh,
             "held_inventory": None,
             "inventory_count": 0,
+            "inventory_error": None,
+            "hold_users": False,
+            "held_users": [],
         }
         channel = os.getenv(
             "K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium"
@@ -182,6 +187,10 @@ def workspace():
                     )
                 if path == "/api/v1/operator/cameras":
                     state["inventory_count"] += 1
+                    if state["inventory_error"] is not None:
+                        return respond(
+                            route, {"detail": "temporarily unavailable"}, state["inventory_error"]
+                        )
                     if state["hold_camera_refresh"] and state["inventory_count"] == 1:
                         return respond(route, _ui_inventory(account, [], worker_status="ready"))
                     if state["hold_camera_refresh"]:
@@ -197,7 +206,11 @@ def workspace():
                         else respond(route, _ui_inventory(account, cameras, worker_status="ready"))
                     )
                 if path == "/api/v1/operator/admin/users" and method == "GET":
-                    return respond(route, {"users": state["users"], "has_more": False})
+                    response = {"users": state["users"], "has_more": False}
+                    if state["hold_users"]:
+                        state["held_users"].append((route, json.loads(json.dumps(response))))
+                        return None
+                    return respond(route, response)
                 if path == "/api/v1/operator/admin/users" and method == "POST":
                     row = dict(body, id=str(uuid4()), credential_status="pending")
                     state["users"].append(row)
@@ -477,4 +490,185 @@ def test_unchanged_camera_refresh_does_not_replace_active_permissions_controls(
             "camera_ids": [_CAMERA],
         }
         page.locator("#admin-credential-dialog").wait_for(state="visible")
+        assert not errors
+
+
+def test_changed_camera_inventory_keeps_grant_controls_attached_and_scoped(workspace):
+    """A newly discovered camera must not retarget an existing checkbox click."""
+    with workspace() as (page, state, _account, errors):
+        _login(page)
+        page.locator("#admin-tab").click()
+        page.locator("#admin-users-list tr").wait_for()
+        page.locator("#admin-create-user").click()
+        selection = page.locator(f'#admin-camera-choices input[value="{_CAMERA}"]')
+        selection.check()
+        original_node = selection.element_handle()
+        assert original_node is not None
+
+        new_id = "da5b6910-09a9-4d9b-a6df-10a8083da6a1"
+        state["cameras"].insert(
+            0,
+            {
+                "device_id": new_id,
+                "name": "Generated new camera",
+                "host": "127.0.0.1",
+                "status": "live",
+                "recording": False,
+                "recording_enabled": False,
+                "recording_state": "stopped",
+                "analytics_status": "disabled",
+            },
+        )
+        state["cameras"][1]["name"] = "Renamed generated entrance camera"
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "GET"
+                and urlsplit(response.url).path == "/api/v1/operator/cameras"
+            )
+        ) as refreshed:
+            page.evaluate("document.getElementById('refresh-cameras').click()")
+        assert refreshed.value.status == 200
+        page.locator('#admin-camera-choices input[value="' + new_id + '"]').wait_for()
+        page.locator("#admin-camera-choices").filter(
+            has_text="Renamed generated entrance camera"
+        ).wait_for()
+        assert original_node.evaluate("(input) => input.isConnected")
+        assert original_node.evaluate("(input) => input.checked")
+        assert selection.is_checked()
+        new_choice = page.locator(f'#admin-camera-choices input[value="{new_id}"]')
+        assert not new_choice.is_checked()
+
+        # Selecting by position during an inventory update previously changed
+        # the wrong grant when renderCameraChoices replaced all input nodes.
+        page.locator("#admin-username").fill("inventory-stable-viewer")
+        page.locator("#admin-display-name").fill("Inventory stable viewer")
+        page.locator("#admin-role").select_option("viewer")
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST"
+                and urlsplit(response.url).path == "/api/v1/operator/admin/users"
+            )
+        ) as created:
+            page.locator("#admin-save-user").click()
+        assert created.value.status == 201
+        assert created.value.json()["account"]["camera_access"] == {
+            "mode": "selected",
+            "camera_ids": [_CAMERA],
+        }
+        assert not errors
+
+
+def _wait_admin_condition(page, condition, label):
+    deadline = time.monotonic() + 6
+    while not condition() and time.monotonic() < deadline:
+        page.wait_for_timeout(10)
+    assert condition(), label
+
+
+@pytest.mark.parametrize("fail_recovery", [False, True])
+def test_authority_recovery_requires_fresh_users_before_account_actions(workspace, fail_recovery):
+    with workspace() as (page, state, _account, errors):
+        _login(page)
+        page.locator("#admin-tab").click()
+        page.locator("#admin-users-list tr[data-user-id]").wait_for()
+        state["hold_users"] = True
+        page.locator("#admin-refresh-users").click()
+        _wait_admin_condition(page, lambda: len(state["held_users"]) == 1, "initial users refresh")
+        if not fail_recovery:
+            page.locator("#admin-audit-tab").click()
+            page.locator("#admin-audit-panel").wait_for(state="visible")
+        selected = "users" if fail_recovery else "audit"
+        state["inventory_error"] = 503
+        _wait_admin_condition(
+            page,
+            lambda: (
+                "permissions could not be verified" in page.locator("#admin-message").inner_text()
+            ),
+            "automatic inventory failure must suspend administration",
+        )
+        assert page.locator("#admin-create-user").is_disabled()
+        state["inventory_error"] = None
+        _wait_admin_condition(
+            page,
+            lambda: len(state["held_users"]) == 2,
+            "authority recovery must request a new account list",
+        )
+        assert page.locator(f"#admin-{selected}-panel").is_visible()
+        assert page.locator(f"#admin-{selected}-tab").get_attribute("aria-current") == "page"
+        assert page.locator("#admin-create-user").is_disabled()
+        assert page.locator("#admin-users-list").get_attribute("aria-busy") == "true"
+        assert page.locator("#admin-users-list [data-user-action=edit]").first.is_disabled()
+
+        old_route, old_reply = state["held_users"][0]
+        stale = dict(old_reply["users"][0])
+        stale.update(id="d4fc38d7-c242-4531-b2fd-c842e052b41d", username="stale-list-row")
+        try:
+            old_route.fulfill(
+                content_type="application/json",
+                body=json.dumps({"users": [stale], "has_more": False}),
+            )
+        except Exception:
+            pass  # The original request may already have been cancelled.
+        page.evaluate(
+            "() => new Promise(resolve => requestAnimationFrame(() => "
+            "requestAnimationFrame(resolve)))"
+        )
+        assert (
+            page.locator(
+                '#admin-users-list [data-user-id="d4fc38d7-c242-4531-b2fd-c842e052b41d"]'
+            ).count()
+            == 0
+        )
+        assert page.locator("#admin-create-user").is_disabled()
+
+        fresh_route, fresh_reply = state["held_users"][1]
+        state["users"][0]["display_name"] = "Fresh authoritative administrator"
+        fresh_reply["users"][0]["display_name"] = "Fresh authoritative administrator"
+        if fail_recovery:
+            fresh_route.fulfill(
+                status=503,
+                content_type="application/json",
+                body=json.dumps({"detail": "admin_unavailable"}),
+            )
+            _wait_admin_condition(
+                page,
+                lambda: "Account actions are paused" in page.locator("#admin-message").inner_text(),
+                "a failed replacement list must keep changes paused",
+            )
+            assert page.locator("#admin-create-user").is_disabled()
+            assert page.locator("#admin-users-list").get_attribute("aria-busy") == "true"
+            assert page.locator("#admin-refresh-users").is_enabled()
+            state["hold_users"] = False
+            page.locator("#admin-refresh-users").click()
+        else:
+            fresh_route.fulfill(content_type="application/json", body=json.dumps(fresh_reply))
+        _wait_admin_condition(
+            page,
+            lambda: page.locator("#admin-users-list").get_attribute("aria-busy") == "false",
+            "new account list must commit before actions recover",
+        )
+        assert page.locator("#admin-create-user").is_enabled()
+        assert page.locator(f"#admin-{selected}-panel").is_visible()
+        assert page.locator(f"#admin-{selected}-tab").get_attribute("aria-current") == "page"
+        assert "Fresh authoritative administrator" in page.locator("#admin-users-list").inner_text()
+
+        state["hold_users"] = False
+        if selected != "users":
+            page.locator("#admin-users-tab").click()
+        _wait_admin_condition(
+            page, lambda: page.locator("#admin-create-user").is_enabled(), "current users list"
+        )
+        _create(page)
+        page.locator("#admin-credential-dialog").wait_for(state="visible")
+        assert page.locator("#admin-temporary-credential").input_value() == _CODE
+        assert (
+            len(
+                [
+                    request
+                    for request in state["requests"]
+                    if request[0] == "POST" and request[1] == "/api/v1/operator/admin/users"
+                ]
+            )
+            == 1
+        )
         assert not errors

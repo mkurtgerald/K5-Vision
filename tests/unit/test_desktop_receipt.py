@@ -67,6 +67,8 @@ _NVR_FLAGS = (
 _ANALYTICS_TRUE = (
     "product_analytics_enablement analytics_bundled_native_inference analytics_gui_configuration "
     "analytics_person_event_recorded analytics_event_utc_playback analytics_public_fixture_only "
+    "analytics_sampled_native_boxes analytics_sampled_same_frame_overlay "
+    "analytics_sampled_canvas_cleared "
     "analytics_browser_closed_detection analytics_role_camera_permissions "
     "analytics_settings_events_persisted"
 ).split()
@@ -137,6 +139,8 @@ def _receipt() -> dict:
         "analytics_event_playback_decoded_frames": 4,
         "analytics_positive_person_count": 1,
         "analytics_processed_frames": 1,
+        "analytics_sampled_overlay_pixels": 25,
+        "analytics_sampled_live_decoded_frames": 8,
         "analytics_background_event_count_before": 1,
         "analytics_background_event_count_after": 2,
         "analytics_denied_http_statuses": [404, 404, 404, 403, 404, 404, 403, 401, 401],
@@ -623,6 +627,25 @@ def test_native_receipt_requires_executed_sprint_product_features(tmp_path, fiel
         _VERIFIER.verify(_report(tmp_path, receipt))
 
 
+@pytest.mark.parametrize(
+    "field",
+    (
+        "analytics_sampled_native_boxes",
+        "analytics_sampled_same_frame_overlay",
+        "analytics_sampled_canvas_cleared",
+    ),
+)
+@pytest.mark.parametrize("invalid", [False, 1, None, _MISSING])
+def test_desktop_receipt_requires_installed_same_frame_person_boxes(tmp_path, field, invalid):
+    receipt = _receipt()
+    if invalid is _MISSING:
+        del receipt[field]
+    else:
+        receipt[field] = invalid
+    with pytest.raises(ValueError):
+        _VERIFIER.verify(_report(tmp_path, receipt))
+
+
 @pytest.mark.parametrize("field", _ANALYTICS_FALSE)
 @pytest.mark.parametrize("invalid", [True, 0, None, _MISSING])
 def test_native_receipt_requires_real_inference_without_accuracy_claims(tmp_path, field, invalid):
@@ -660,6 +683,13 @@ def test_native_receipt_requires_real_inference_without_accuracy_claims(tmp_path
         ("analytics_processed_frames", 0),
         ("analytics_processed_frames", _MISSING),
         ("analytics_processed_frames", 100001),
+        ("analytics_sampled_overlay_pixels", 11),
+        ("analytics_sampled_overlay_pixels", True),
+        ("analytics_sampled_overlay_pixels", 544 * 320 + 1),
+        ("analytics_sampled_overlay_pixels", _MISSING),
+        ("analytics_sampled_live_decoded_frames", 3),
+        ("analytics_sampled_live_decoded_frames", 1_000_001),
+        ("analytics_sampled_live_decoded_frames", _MISSING),
         ("analytics_background_event_count_before", 0),
         ("analytics_background_event_count_before", 2),
         ("analytics_background_event_count_after", 1),

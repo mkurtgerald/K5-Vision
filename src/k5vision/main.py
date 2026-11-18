@@ -282,6 +282,11 @@ def create_app(
         try:
             yield
         finally:
+            # Authentication workers may still be completing a bounded verifier;
+            # close them before the underlying credential registry is closed.
+            login_executor = getattr(_application.state, "user_login_executor", None)
+            if login_executor is not None:
+                login_executor.shutdown(wait=True, cancel_futures=True)
             if user_registry is not None:
                 user_registry.close()
             if registry is not None:
