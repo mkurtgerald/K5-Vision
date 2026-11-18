@@ -94,11 +94,14 @@ jobs:
             motion-windows.xml
             motion-windows-receipt.json
             diagnostic-only-source.json
+            opencv-diagnostic-output/opencv-probe.json
+            opencv-diagnostic-output/private/opencv-main-stack.txt
+            opencv-diagnostic-output/private/opencv-executor-stack.txt
           if-no-files-found: warn
           retention-days: 14
 
   policy-api-diagnostic:
-    if: github.run_number == 1
+    if: github.run_number == 4
     name: Diagnostic only - Windows policy API and authority tests
     runs-on: windows-2025
     timeout-minutes: 8
@@ -122,13 +125,16 @@ jobs:
         timeout-minutes: 6
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_operator_recording_policy_api.py tests/unit/test_operator_motion_authority.py -o addopts= --no-cov -vv --tb=short -o faulthandler_timeout=30 --durations=10 --junitxml=diagnostic-only-policy-api.xml
+          python scripts/diagnose_policy_api_windows.py --source $env:GITHUB_WORKSPACE --output "$env:GITHUB_WORKSPACE/policy-api-diagnostic-output"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve original diagnostic policy test result
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: diagnostic-only-eda-policy-api-${{ github.run_id }}
-          path: diagnostic-only-policy-api.xml
+          path: |
+            policy-api-diagnostic-output/policy-api-diagnostic.log
+            policy-api-diagnostic-output/policy-api-supervisor.json
+            policy-api-diagnostic-output/policy-api-tests.xml
           if-no-files-found: warn
           retention-days: 14

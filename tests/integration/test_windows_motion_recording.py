@@ -8,6 +8,7 @@ and a saved MP4 are observed. Camera events and motion decisions are not mocked.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import importlib.util
 import json
 import os
@@ -15,6 +16,7 @@ import platform
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
@@ -333,6 +335,58 @@ class _GraphicalSaveDiagnostic:
             self.page.evaluate("() => window.__k5MotionDiagnostic?.close()")
         except BaseException:
             pass
+
+
+def _failure_read(client, route, *, policy=False):
+    """One one-second loopback GET; retain only finite diagnostic fields."""
+    began = time.monotonic()
+    connection = http.client.HTTPConnection("127.0.0.1", urlsplit(client.origin).port, timeout=1)
+    result = {"outcome": "probe_error"}
+    try:
+        connection.request(
+            "GET",
+            route,
+            headers={"Authorization": "Bearer " + client.token, "Origin": client.origin},
+        )
+        response = connection.getresponse()
+        result = {"outcome": "response", "http_status": response.status}
+        if policy and response.status == 200:
+            if connection.sock is not None:
+                connection.sock.settimeout(max(0.001, 1 - (time.monotonic() - began)))
+            raw = response.read(65_537)
+            if len(raw) <= 65_536:
+                value = json.loads(raw)
+                if type(value) is dict:
+                    if type(value.get("revision")) is int and 0 <= value["revision"] < 2**63:
+                        result["revision"] = value["revision"]
+                    if value.get("mode") in {"motion", "continuous"}:
+                        result["mode"] = value["mode"]
+                    if value.get("status") in {
+                        "armed",
+                        "recording",
+                        "post_capture",
+                        "continuous",
+                        "paused",
+                        "unavailable",
+                        "storage_blocked",
+                        "zones_need_review",
+                    }:
+                        result["state"] = value["status"]
+                    zones = value.get("zones")
+                    if type(zones) is dict:
+                        for kind in ("include", "exclude"):
+                            if type(zones.get(kind)) is list and len(zones[kind]) <= 8:
+                                result[kind + "_count"] = len(zones[kind])
+    except TimeoutError:
+        result = {"outcome": "timeout"}
+    except (OSError, http.client.HTTPException):
+        result = {"outcome": "transport_error"}
+    except (ValueError, TypeError):
+        result = {"outcome": "invalid_response"}
+    finally:
+        connection.close()
+    result["elapsed_seconds"] = round(time.monotonic() - began, 3)
+    return result
 
 
 def _save_graphically(page, camera, *, zones=False, observer=None):
@@ -1130,6 +1184,13 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     )
             trace = trace.tb_next
         diagnostic["failure_callers"] = callers[-4:]
+        if diagnostic.get("stage") == "graphical_zone_authoring":
+            diagnostic["failure_reads"] = {
+                "health": _failure_read(client, "/api/v1/health"),
+                "policy": _failure_read(
+                    client, f"/api/v1/operator/cameras/{target}/recording-policy", policy=True
+                ),
+            }
     finally:
         for resource in (context, browser, playwright):
             if resource is not None:
@@ -1160,6 +1221,25 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                 cleanup_failed = True
         for listener in reservations:
             listener.close()
+        if failed and receipt.get("installed_worker_bundle_verified") is True:
+            try:
+                helper_path = (
+                    Path(__file__).resolve().parents[2]
+                    / "scripts/diagnose_installed_motion_mask.py"
+                )
+                spec = importlib.util.spec_from_file_location("k5_mask_diagnostic", helper_path)
+                assert spec is not None and spec.loader is not None
+                helper = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = helper
+                try:
+                    spec.loader.exec_module(helper)
+                    diagnostic["installed_mask_probe"] = helper.probe_installed_mask(
+                        installed, Path.cwd() / "opencv-diagnostic-output"
+                    )
+                finally:
+                    sys.modules.pop(spec.name, None)
+            except BaseException:
+                diagnostic["installed_mask_probe"] = {"probe_helper_failed": True}
         if parent.exists():
             try:
                 shutil.rmtree(parent)
@@ -1185,6 +1265,8 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     "foreign_preview_http_status",
                     "foreign_preview_api_code",
                     "graphical_save",
+                    "installed_mask_probe",
+                    "failure_reads",
                 }
             }
             safe.update(failed=failed, cleanup_failed=cleanup_failed)
