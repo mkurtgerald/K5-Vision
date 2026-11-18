@@ -43,6 +43,10 @@ jobs:
         run: |
           python -m pip install -e ".[dev]" "playwright==1.58.0"
           if ($LASTEXITCODE -ne 0) { throw "Motion acceptance dependency install failed" }
+          python -m pip install --no-deps "https://files.pythonhosted.org/packages/6a/95/6ef39a234f17b05cc28efb4a584e93d36fdf633f306b8e10bbbe1409fc51/py_spy-0.4.3-py2.py3-none-win_amd64.whl#sha256=b14e00fddd4bfb12628e5c04b7d22c6754ae4c31bdfad0728adbe091ed26445f"
+          if ($LASTEXITCODE -ne 0) { throw "Pinned development-only stack tool install failed" }
+          python -c 'import hashlib,subprocess,sys; from pathlib import Path; p=Path(sys.executable).parent/"Scripts/py-spy.exe"; assert p.stat().st_size==4887040 and hashlib.sha256(p.read_bytes()).hexdigest()=="0890578ca20bf839d7f890bbcdb508a21cb9f1b71f99bf32be371c5e492a0b48"; r=subprocess.run([str(p),"--version"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5,creationflags=subprocess.CREATE_NO_WINDOW,check=True); assert r.stdout.strip()==b"py-spy 0.4.3"'
+          if ($LASTEXITCODE -ne 0) { throw "Pinned development-only stack tool warmup failed" }
       - name: Provision immutable generated-media tools before changing guest time
         uses: ./.github/actions/provision-operator-tools
       - name: Download the exact installer exercised by the first VM
@@ -94,14 +98,14 @@ jobs:
             motion-windows.xml
             motion-windows-receipt.json
             diagnostic-only-source.json
-            opencv-diagnostic-output/opencv-probe.json
-            opencv-diagnostic-output/private/opencv-main-stack.txt
-            opencv-diagnostic-output/private/opencv-executor-stack.txt
+            original-backend-diagnostic-output/original-backend-stack.json
+            live-backend-diagnostic-output/live-backend-probe.json
+            live-backend-diagnostic-output/private/live-backend-stack.txt
           if-no-files-found: warn
           retention-days: 14
 
   policy-api-diagnostic:
-    if: github.run_number == 4
+    if: github.run_number == 5
     name: Diagnostic only - Windows policy API and authority tests
     runs-on: windows-2025
     timeout-minutes: 8

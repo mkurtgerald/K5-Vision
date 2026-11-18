@@ -337,6 +337,50 @@ class _GraphicalSaveDiagnostic:
             pass
 
 
+def _original_backend_stack(app, cohort, installed):
+    """Reuse the proven bounded sampler; target only the remembered direct child."""
+    result = {"scope": "original_owned_backend_stack_only", "product_qualification": False}
+    try:
+        targets = [
+            item
+            for item in cohort.snapshot()
+            if item.is_running()
+            and item.ppid() == app.pid
+            and item.name().casefold() == "python.exe"
+            and Path(item.exe()).resolve() == (installed / "runtime/python.exe").resolve()
+        ]
+        result["candidate_count"] = min(16, len(targets))
+        if len(targets) != 1:
+            result["status"] = "ambiguous_backend"
+            return result
+        root = Path(__file__).resolve().parents[2]
+        spec = importlib.util.spec_from_file_location(
+            "k5_owned_stack_sampler", root / "scripts/sample_owned_backend_motion.py"
+        )
+        assert spec is not None and spec.loader is not None
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        executable = helper.prepare_executable(Path(sys.executable).parent / "Scripts/py-spy.exe")
+        index = helper.public_index(root / "src/k5vision")
+        samples = []
+        for _ in range(3):
+            samples.append(helper.sample_once(executable, targets[0], index, timeout=0.8))
+            if samples[-1]["outcome"] == "sampler_cleanup_incomplete":
+                break
+        output = Path.cwd() / "original-backend-diagnostic-output"
+        output.mkdir(mode=0o700)
+        with (output / "original-backend-stack.json").open("x", encoding="utf-8") as stream:
+            json.dump({"product_qualification": False, "samples": samples}, stream, sort_keys=True)
+            stream.write("\n")
+        result["status"] = "sampled"
+        result["outcomes"] = [sample["outcome"] for sample in samples]
+        result["sample_cap_seconds"] = 0.8
+        result["raw_data_retained"] = False
+    except BaseException:
+        result["status"] = "sample_unavailable"
+    return result
+
+
 def _failure_read(client, route, *, policy=False):
     """One one-second loopback GET; retain only finite diagnostic fields."""
     began = time.monotonic()
@@ -1191,6 +1235,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     client, f"/api/v1/operator/cameras/{target}/recording-policy", policy=True
                 ),
             }
+            diagnostic["original_backend_stack"] = _original_backend_stack(app, cohort, installed)
     finally:
         for resource in (context, browser, playwright):
             if resource is not None:
@@ -1208,6 +1253,30 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                 pass
             except BaseException:
                 cleanup_failed = True
+        if failed and diagnostic.get("stage") == "graphical_zone_authoring":
+            try:
+                helper_path = (
+                    Path(__file__).resolve().parents[2] / "scripts/diagnose_live_motion_backend.py"
+                )
+                spec = importlib.util.spec_from_file_location("k5_live_diagnostic", helper_path)
+                assert spec is not None and spec.loader is not None
+                helper = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = helper
+                try:
+                    spec.loader.exec_module(helper)
+                    diagnostic["live_backend_probe"] = helper.probe_live_backend(
+                        installed,
+                        profile,
+                        ports[0],
+                        Path.cwd() / "live-backend-diagnostic-output",
+                        username=username,
+                        password=password,
+                        camera_id=target,
+                    )
+                finally:
+                    sys.modules.pop(spec.name, None)
+            except BaseException:
+                diagnostic["live_backend_probe"] = {"probe_helper_failed": True}
         for resource in [publisher, *fixtures]:
             if resource is not None:
                 try:
@@ -1221,25 +1290,6 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                 cleanup_failed = True
         for listener in reservations:
             listener.close()
-        if failed and receipt.get("installed_worker_bundle_verified") is True:
-            try:
-                helper_path = (
-                    Path(__file__).resolve().parents[2]
-                    / "scripts/diagnose_installed_motion_mask.py"
-                )
-                spec = importlib.util.spec_from_file_location("k5_mask_diagnostic", helper_path)
-                assert spec is not None and spec.loader is not None
-                helper = importlib.util.module_from_spec(spec)
-                sys.modules[spec.name] = helper
-                try:
-                    spec.loader.exec_module(helper)
-                    diagnostic["installed_mask_probe"] = helper.probe_installed_mask(
-                        installed, Path.cwd() / "opencv-diagnostic-output"
-                    )
-                finally:
-                    sys.modules.pop(spec.name, None)
-            except BaseException:
-                diagnostic["installed_mask_probe"] = {"probe_helper_failed": True}
         if parent.exists():
             try:
                 shutil.rmtree(parent)
@@ -1265,8 +1315,9 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     "foreign_preview_http_status",
                     "foreign_preview_api_code",
                     "graphical_save",
-                    "installed_mask_probe",
+                    "live_backend_probe",
                     "failure_reads",
+                    "original_backend_stack",
                 }
             }
             safe.update(failed=failed, cleanup_failed=cleanup_failed)
