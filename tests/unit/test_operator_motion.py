@@ -702,9 +702,27 @@ def test_startup_prunes_only_orphaned_saved_cameras(engine):
     asyncio.run(scenario())
 
 
-def test_actual_background_loop_runs_without_browser_or_recording_files(engine):
+@pytest.mark.parametrize("hold_enable_reply", [False, True], ids=["immediate-ack", "held-ack"])
+def test_actual_background_loop_runs_without_browser_or_recording_files(
+    engine, monkeypatch, hold_enable_reply
+):
     async def scenario():
         service, source = engine.service, engine.sources[0]
+        applied, release = threading.Event(), threading.Event()
+        original_mutation = service._mutation
+
+        def mutation(method, route, payload=None, **kwargs):
+            result = original_mutation(method, route, payload, **kwargs)
+            if (
+                hold_enable_reply
+                and route.endswith(source.binding.path_name)
+                and payload == {"record": True}
+            ):
+                applied.set()
+                assert release.wait(2), "Native reply control was not released"
+            return result
+
+        monkeypatch.setattr(service, "_mutation", mutation)
         await service.start(engine.sources)
         try:
             await service.apply_motion_policy(source, 0, _body(post_capture_seconds=1))
@@ -715,8 +733,21 @@ def test_actual_background_loop_runs_without_browser_or_recording_files(engine):
             )
             worker = engine.workers[-1]
             worker.moving = True
+            if hold_enable_reply:
+                assert await asyncio.to_thread(applied.wait, 1)
+                # MediaMTX can apply a request before its HTTP reply returns.
+                # That is still the original Armed stage until the service
+                # observes the acknowledgment, not the next post-capture idle.
+                assert service._media.paths[source.binding.path_name]["record"] is True
+                assert service.recording_policy_status(source.binding)["state"] == "armed"
+                assert service._motion.pending_gates[source.binding.path_name] is False
+                release.set()
             await _HARNESS._until(
-                lambda: service._media.paths[source.binding.path_name]["record"] is True, timeout=2
+                lambda: (
+                    service._media.paths[source.binding.path_name]["record"] is True
+                    and service.recording_policy_status(source.binding)["state"] == "recording"
+                ),
+                timeout=2,
             )
             worker.moving = False
             await _HARNESS._until(
@@ -726,6 +757,7 @@ def test_actual_background_loop_runs_without_browser_or_recording_files(engine):
             assert service._media.paths[source.binding.path_name]["record"] is False
             assert service._media.paths[engine.sources[1].binding.path_name]["record"] is True
         finally:
+            release.set()
             await service.stop()
         assert all(worker.reaped for worker in engine.workers)
         assert service._motion.executor_closed

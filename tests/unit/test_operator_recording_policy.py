@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+from k5vision import identity_state
 from k5vision.domain.devices import Device
 from k5vision.identity_state import initialize_identity_state
 from k5vision.media.mediamtx_config import MediaMTXSource
@@ -86,7 +87,64 @@ def test_policy_and_private_source_key_survive_restart(policy):
     assert reopened.get(source) == saved
     public = json.dumps(saved)
     assert "private-password" not in public and "rtsp://" not in public
-    assert (identity.directory / "operator-recording-policy.json").stat().st_mode & 0o077 == 0
+    policy_file = identity.directory / "operator-recording-policy.json"
+    if os.name == "posix":
+        assert policy_file.stat().st_mode & 0o077 == 0
+    # Windows st_mode does not represent DACL privacy. Exercise the native
+    # ownership/access admission also used for every private policy read/write.
+    identity_state._windows_admission(policy_file, private=True)
+
+
+@pytest.mark.parametrize("operation", ["read", "save", "reopen"])
+def test_native_policy_acl_refusal_blocks_access_without_changing_state(
+    policy, monkeypatch, operation
+):
+    store, source, identity = policy
+    saved = store.save(source, 0, _motion(store, source))
+    before = store.path.read_bytes()
+    native_admission = identity_state._windows_admission
+    refused_policy = []
+
+    def refused(path, **options):
+        if path == store.path and options.get("private") is True:
+            refused_policy.append(path.name)
+            raise identity_state.IdentityStateError("native private access refused")
+        return native_admission(path, **options)
+
+    monkeypatch.setattr(identity_state, "_windows_admission", refused)
+    with pytest.raises(RecordingPolicyError, match="^motion_policy_unavailable$"):
+        if operation == "read":
+            store.get(source)
+        elif operation == "save":
+            store.save(source, saved["revision"], MotionPolicy().model_dump(mode="json"))
+        else:
+            RecordingPolicyStore(identity.directory, identity.site_id)
+    assert refused_policy == [store.path.name]
+    assert store.path.read_bytes() == before
+
+
+def test_native_staged_policy_acl_refusal_prevents_atomic_replacement(policy, monkeypatch):
+    store, source, _ = policy
+    before = store.path.read_bytes()
+    native_admission = identity_state._windows_admission
+    refused_staging = []
+
+    def refused(path, **options):
+        if (
+            path.parent == store.root
+            and path.name.startswith(".k5-motion-")
+            and options.get("private") is True
+        ):
+            refused_staging.append(path.name)
+            raise identity_state.IdentityStateError("native staging access refused")
+        return native_admission(path, **options)
+
+    monkeypatch.setattr(identity_state, "_windows_admission", refused)
+    with pytest.raises(RecordingPolicyError, match="^motion_policy_unavailable$"):
+        store.save(source, 0, _motion(store, source))
+    assert refused_staging
+    assert store.path.read_bytes() == before
+    assert not list(store.root.glob(".k5-motion-*.tmp"))
 
 
 def test_master_pause_and_labels_do_not_invalidate_source_basis(policy):

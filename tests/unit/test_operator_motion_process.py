@@ -94,9 +94,33 @@ class Process:
         return self.returncode
 
 
-@pytest.fixture
-def worker(monkeypatch):
-    events, processes, arguments = [], [], []
+@pytest.fixture(params=["posix", "nt"], ids=["posix", "windows"])
+def worker(monkeypatch, request):
+    from k5vision import operator_native_process
+
+    events, processes, arguments, jobs = [], [], [], []
+
+    class Job:
+        """Ownership double paired with Process, never a real Windows handle."""
+
+        def __init__(self):
+            self.assigned = None
+            self.closed = False
+            jobs.append(self)
+            events.append("job")
+
+        def assign(self, process):
+            assert self.assigned is None and not self.closed
+            assert process in processes and process.returncode is None
+            assert process.stdin.recorded == b""
+            self.assigned = process
+            events.append("assign")
+
+        def close(self):
+            if not self.closed:
+                assert self.assigned is None or self.assigned.returncode is not None
+                self.closed = True
+                events.append("job_close")
 
     def start(args, **kwargs):
         arguments.append((args, kwargs))
@@ -105,9 +129,32 @@ def worker(monkeypatch):
         processes.append(process)
         return process
 
-    monkeypatch.setattr(motion.subprocess, "Popen", start)
+    monkeypatch.setattr(
+        motion,
+        "subprocess",
+        SimpleNamespace(
+            Popen=start,
+            PIPE=subprocess.PIPE,
+            DEVNULL=subprocess.DEVNULL,
+            TimeoutExpired=subprocess.TimeoutExpired,
+            CREATE_NO_WINDOW=0x08000000 if request.param == "nt" else 0,
+        ),
+    )
+    # Process has no native _handle. Pair its ownership double with it on
+    # every host, and exercise both platform branches explicitly on Linux too.
+    # The separate real-process tests retain the actual Windows Job boundary.
+    monkeypatch.setattr(operator_native_process, "_WindowsJob", Job)
+    monkeypatch.setattr(motion, "os", SimpleNamespace(name=request.param))
     instance = motion.LiveMotionWorker(URI)
-    yield SimpleNamespace(instance=instance, events=events, processes=processes, args=arguments)
+    yield SimpleNamespace(
+        instance=instance,
+        events=events,
+        processes=processes,
+        args=arguments,
+        jobs=jobs,
+        job_type=Job,
+        platform=request.param,
+    )
     for process in processes:
         process.fail_wait = False
     instance.close()
@@ -211,24 +258,83 @@ def test_unreaped_owned_process_is_retained_for_cleanup_retry(worker):
 
 
 def test_windows_job_is_assigned_before_private_source_is_written(monkeypatch, worker):
-    from k5vision import operator_native_process
-
-    class Job:
-        def __init__(self):
-            worker.events.append("job")
-
-        def assign(self, process):
-            worker.events.append("assign")
-
-        def close(self):
-            worker.events.append("job_close")
-
-    monkeypatch.setattr(operator_native_process, "_WindowsJob", Job)
     monkeypatch.setattr(motion, "os", SimpleNamespace(name="nt"))
-    monkeypatch.setattr(motion.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setattr(motion.subprocess, "CREATE_NO_WINDOW", 0x08000000)
     worker.instance.sample(policy())
     assert worker.events[:4] == ["job", "spawn", "assign", "write"]
     assert worker.args[0][1]["creationflags"] == 0x08000000
+    assert worker.args[0][1]["start_new_session"] is False
+    assert worker.jobs[0].assigned is worker.processes[0]
+    worker.instance.close()
+    assert worker.jobs[0].closed is True
+
+
+def test_fake_process_platforms_keep_their_ownership_boundary(worker):
+    worker.instance.sample(policy())
+    if worker.platform == "nt":
+        assert len(worker.jobs) == 1
+        assert worker.jobs[0].assigned is worker.processes[0]
+        assert worker.events[:4] == ["job", "spawn", "assign", "write"]
+        assert worker.args[0][1]["start_new_session"] is False
+        assert worker.args[0][1]["creationflags"] == 0x08000000
+    else:
+        assert worker.jobs == []
+        assert worker.events[:2] == ["spawn", "write"]
+        assert worker.args[0][1]["start_new_session"] is True
+        assert worker.args[0][1]["creationflags"] == 0
+
+
+def test_refused_windows_assignment_never_grants_private_source(monkeypatch, worker):
+    from k5vision import operator_native_process
+
+    class RefusedJob(worker.job_type):
+        def assign(self, process):
+            worker.events.append("assign_refused")
+            raise operator_native_process.NativeProcessError("PRIVATE_NATIVE_ERROR")
+
+    monkeypatch.setattr(operator_native_process, "_WindowsJob", RefusedJob)
+    monkeypatch.setattr(motion, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(motion.subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    with pytest.raises(motion.MotionProcessError, match="ownership is unavailable") as error:
+        worker.instance.sample(policy())
+    assert "PRIVATE_NATIVE_ERROR" not in str(error.value)
+    assert worker.processes[0].stdin.recorded == b""
+    assert worker.processes[0].returncode == -9
+    assert worker.events == ["job", "spawn", "assign_refused", "kill", "wait", "job_close"]
+    assert worker.jobs[0].closed is True
+    assert worker.instance._process is None and worker.instance._job is None
+
+
+def test_real_windows_job_assignment_refuses_a_process_without_native_handle():
+    from k5vision import operator_native_process
+
+    owner = object.__new__(operator_native_process._WindowsJob)
+    calls = []
+    owner._handle = 123
+    owner._api = SimpleNamespace(AssignProcessToJobObject=lambda *args: calls.append(args))
+    process = Process(response(), [])
+    with pytest.raises(AttributeError, match="_handle"):
+        owner.assign(process)
+    assert calls == [] and process.stdin.recorded == b""
+
+
+def test_real_windows_job_assignment_refuses_native_api_rejection():
+    from k5vision import operator_native_process
+
+    owner = object.__new__(operator_native_process._WindowsJob)
+    calls = []
+    owner._handle = 123
+
+    def refuse(*args):
+        calls.append(args)
+        return False
+
+    owner._api = SimpleNamespace(AssignProcessToJobObject=refuse)
+    process = Process(response(), [])
+    process._handle = 456
+    with pytest.raises(operator_native_process.NativeProcessError, match="ownership"):
+        owner.assign(process)
+    assert calls == [(123, 456)] and process.stdin.recorded == b""
 
 
 @pytest.mark.parametrize(
