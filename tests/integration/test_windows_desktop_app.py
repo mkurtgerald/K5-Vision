@@ -1273,11 +1273,250 @@ def _desktop_status(api, form):
     return "unclassified"
 
 
-def _observer_reauthenticate(runtime, client, username, password, diagnostic):
+class _ObserverLogoutTraffic:
+    """Passive finite events for the generated page; never inspect request data."""
+
+    def __init__(self, page):
+        self.page = page
+        self.started = time.monotonic()
+        self.pending = {}
+        self.closed = False
+        self.value = {
+            "scope": "observer_logout_diagnostic_only",
+            "product_qualification": False,
+            "observer_failed": False,
+            "truncated": False,
+            "routes": {
+                key: {"requests": 0, "responses": 0, "failed": 0, "events": []}
+                for key in ("logout", "media_session_delete")
+            },
+        }
+        self.handlers = {
+            "request": self.request,
+            "response": self.response,
+            "requestfailed": self.failed,
+        }
+        for event, callback in self.handlers.items():
+            page.on(event, callback)
+
+    def _category(self, request):
+        route = urlsplit(request.url).path
+        return {
+            ("POST", "/api/v1/auth/logout"): "logout",
+            ("DELETE", "/api/v1/operator/media-session"): "media_session_delete",
+        }.get((request.method, route))
+
+    def _event(self, category, phase, started=None, status=None):
+        value = self.value["routes"][category]
+        field = {"request": "requests", "response": "responses", "failed": "failed"}[phase]
+        value[field] = min(32, value[field] + 1)
+        if len(value["events"]) >= 16:
+            self.value["truncated"] = True
+            return
+        now = time.monotonic()
+        event = {"phase": phase, "at_seconds": round(min(3600, now - self.started), 3)}
+        if started is not None:
+            event["elapsed_seconds"] = round(min(3600, max(0, now - started)), 3)
+        if status is not None:
+            event["http_status"] = status if type(status) is int and 100 <= status <= 599 else 0
+        value["events"].append(event)
+
+    def request(self, request):
+        try:
+            category = self._category(request)
+            if category is None:
+                return
+            self._event(category, "request")
+            if len(self.pending) < 32:
+                self.pending[id(request)] = (category, time.monotonic(), request)
+            else:
+                self.value["truncated"] = True
+        except Exception:
+            self.value["observer_failed"] = True
+
+    def response(self, response):
+        try:
+            self._complete(response.request, "response", response.status)
+        except Exception:
+            self.value["observer_failed"] = True
+
+    def failed(self, request):
+        self._complete(request, "failed")
+
+    def _complete(self, request, phase, status=None):
+        try:
+            category = self._category(request)
+            if category is not None:
+                remembered = self.pending.pop(id(request), None)
+                self._event(category, phase, remembered[1] if remembered else None, status)
+        except Exception:
+            self.value["observer_failed"] = True
+
+    def close(self):
+        if self.closed:
+            return self.value
+        self.closed = True
+        for event, callback in self.handlers.items():
+            try:
+                self.page.remove_listener(event, callback)
+            except Exception:
+                self.value["observer_failed"] = True
+        self.value["pending_count"] = min(32, len(self.pending))
+        self.pending.clear()
+        return self.value
+
+
+class _ObserverLoginSampler:
+    """Sample our remembered backend while the unchanged main-thread login waits."""
+
+    def __init__(self, app, cohort, installed):
+        self.stop = threading.Event()
+        self.thread = None
+        self.started = None
+        self.finished = False
+        self.samples = []
+        self.app = app
+        self.installed = installed
+        self.value = {
+            "scope": "original_owned_backend_stack_only",
+            "product_qualification": False,
+            "raw_data_retained": False,
+            "sample_cap_seconds": 0.8,
+            "status": "preparation_unavailable",
+        }
+        try:
+            remembered = cohort.snapshot()
+            roots = [item for item in remembered if item.pid == app.pid and item.is_running()]
+            if len(roots) != 1:
+                self.value["status"] = "owned_app_unavailable"
+                return
+            self.root = roots[0]
+            targets = [item for item in remembered if self._admitted(item)]
+            self.value["candidate_count"] = min(16, len(targets))
+            if len(targets) != 1:
+                self.value["status"] = "ambiguous_backend"
+                return
+            self.target = targets[0]
+            root = Path(__file__).resolve().parents[2]
+            spec = importlib.util.spec_from_file_location(
+                "k5_observer_stack_sampler", root / "scripts/sample_owned_backend_motion.py"
+            )
+            assert spec is not None and spec.loader is not None
+            self.helper = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(self.helper)
+            self.executable = self.helper.prepare_executable(
+                Path(sys.executable).parent / "Scripts/py-spy.exe"
+            )
+            self.index = self.helper.public_index(root / "src/k5vision")
+            self.value["status"] = "prepared"
+        except Exception:
+            self.value["status"] = "preparation_unavailable"
+
+    def _admitted(self, process):
+        return (
+            self.root.is_running()
+            and process.is_running()
+            and process.ppid() == self.app.pid
+            and process.name().casefold() == "python.exe"
+            and Path(process.exe()).resolve(strict=True)
+            == (self.installed / "runtime/python.exe").resolve(strict=True)
+        )
+
+    def _sample(self, phase, scheduled=None):
+        try:
+            sampled_at = time.monotonic()
+            if not self._admitted(self.target):
+                sample = {"outcome": "owned_identity_exited", "threads": []}
+            elif phase == "pending" and self.stop.is_set():
+                return
+            else:
+                sample = self.helper.sample_once(
+                    self.executable, self.target, self.index, timeout=0.8
+                )
+            item = {
+                "phase": phase,
+                "started_seconds": round(max(0, sampled_at - self.started), 3),
+                "sample": sample,
+            }
+            if scheduled is not None:
+                item["scheduled_seconds"] = scheduled
+            self.samples.append(item)
+            if sample["outcome"] == "sampler_cleanup_incomplete":
+                self.stop.set()
+                self.value["status"] = "sampler_cleanup_incomplete"
+        except Exception:
+            self.stop.set()
+            self.value["status"] = "sample_unavailable"
+
+    def _observe(self):
+        for offset in (0.75, 1.5, 2.25):
+            if self.stop.wait(max(0, self.started + offset - time.monotonic())):
+                return
+            self._sample("pending", offset)
+            if self.stop.is_set():
+                return
+
+    def begin(self):
+        self.started = time.monotonic()
+        if self.value["status"] == "prepared":
+            try:
+                self.thread = threading.Thread(target=self._observe, daemon=True)
+                self.thread.start()
+                self.value["status"] = "observing"
+            except Exception:
+                self.thread = None
+                self.value["status"] = "worker_start_unavailable"
+
+    def finish(self, *, failed=False):
+        if self.finished:
+            return self.value
+        self.finished = True
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=1.5)
+            if self.thread.is_alive():
+                self.value["status"] = "worker_cleanup_incomplete"
+            elif failed and self.value["status"] == "observing":
+                self._sample("failure")
+            if self.value["status"] == "observing":
+                self.value["status"] = "completed"
+        self.value["worker_stopped"] = self.thread is None or not self.thread.is_alive()
+        self.value["samples"] = list(self.samples)
+        self.value["outcomes"] = [item["sample"]["outcome"] for item in self.samples]
+        return self.value
+
+
+def _write_observer_sidecar(name, value):
+    """Two fixed fresh diagnostic artifacts; no arbitrary file destination."""
+    if name not in {"observer-login-samples.json", "observer-logout-traffic.json"}:
+        return False
+    try:
+        with (Path.cwd() / name).open("x", encoding="utf-8") as stream:
+            json.dump(value, stream, sort_keys=True)
+            stream.write("\n")
+        return True
+    except Exception:
+        return False
+
+
+def _observer_reauthenticate(runtime, client, username, password, diagnostic, *, sampler=None):
     """Retain the existing bounded transport classification before later cleanup."""
+    failed = True
+    began = time.monotonic()
+    if sampler is not None:
+        sampler.begin()
     try:
         runtime._login(client, username, password)
+        failed = False
     finally:
+        if sampler is not None:
+            diagnostic["observer_login_elapsed_seconds"] = round(time.monotonic() - began, 3)
+            diagnostic["observer_login_completed"] = not failed
+            status = client.last_http_status
+            diagnostic["observer_login_http_status"] = (
+                status if type(status) is int and 100 <= status <= 599 else 0
+            )
+            sampler.finish(failed=failed)
         if client.transport_failure is not None:
             diagnostic["observer_login_transport"] = {
                 **client.transport_failure,
@@ -3793,6 +4032,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     recording_diagnostic = {}
     vm_clock_diagnostic = {}
     nvr_diagnostic = {}
+    observer_traffic = observer_sampler = None
     export_proof = {}
     receipt = {
         "schema_version": "1",
@@ -4507,6 +4747,10 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         browser_helpers._wall_frames(page, camera_ids, [color for _, _, color in _DESKTOP_CAMERAS])
         wall_videos = page.locator("#wall-panel video").element_handles()
         _require(len(wall_videos) == 4, "Installed logout proof did not own four live players")
+        # Diagnostic preparation happens before the observed calls. It neither
+        # gates nor retries the original browser logout or synchronous login.
+        observer_sampler = _ObserverLoginSampler(app, cohort, installed)
+        observer_traffic = _ObserverLogoutTraffic(page)
         page.locator("#sign-out-button").click()
         page.locator("#sign-in").wait_for(state="visible")
         _require(
@@ -4523,7 +4767,10 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         # The browser has signed out. A fresh observer login now authorizes
         # subsequent tray checks without replacing an active browser session.
         _enter_stage("observer_reauthentication")
-        _observer_reauthenticate(runtime, client, username, password, nvr_diagnostic)
+        _observer_reauthenticate(
+            runtime, client, username, password, nvr_diagnostic, sampler=observer_sampler
+        )
+        observer_traffic.close()
         _enter_stage("browser_closing")
         context.close()
         context = None
@@ -4907,6 +5154,23 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     finally:
         stage_durations.append((stage, round(time.monotonic() - stage_started, 2)))
         cleanup_started = time.monotonic()
+        observer_stacks = (
+            observer_sampler.finish()
+            if observer_sampler is not None
+            else {"product_qualification": False, "status": "not_entered", "samples": []}
+        )
+        observer_network = (
+            observer_traffic.close()
+            if observer_traffic is not None
+            else {"product_qualification": False, "status": "not_entered"}
+        )
+        nvr_diagnostic["observer_stack_artifact_written"] = _write_observer_sidecar(
+            "observer-login-samples.json", observer_stacks
+        )
+        nvr_diagnostic["observer_logout_artifact_written"] = _write_observer_sidecar(
+            "observer-logout-traffic.json", observer_network
+        )
+        nvr_diagnostic["observer_sampler_status"] = observer_stacks["status"]
         if failure is not None and page is not None:
             try:
                 nvr_diagnostic["wall_state_at_failure"] = browser_helpers._wall_state(page)

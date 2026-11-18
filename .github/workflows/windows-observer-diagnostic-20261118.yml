@@ -1,0 +1,180 @@
+name: Diagnostic only - exact04 observer login and installed motion
+
+on:
+  push:
+    branches: [codex/windows-observer-diagnostic-20261118]
+    paths:
+      - .github/workflows/windows-observer-diagnostic-20261118.yml
+      - tests/integration/test_windows_desktop_app.py
+      - scripts/sample_owned_backend_motion.py
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: windows-observer-diagnostic-20261118-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  observer-gui:
+    name: Diagnostic only - original04 graphical journey and observer login
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      K5_BETA_HEAD_SHA: 04bb5f4fb0de71e1b1c0b8b3353abb7f62df65d0
+      K5_DESKTOP_HEAD_SHA: 04bb5f4fb0de71e1b1c0b8b3353abb7f62df65d0
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_VM_CLOCK_ACCEPTANCE: "0"
+    steps:
+      - name: Checkout diagnostic harness with unchanged04 product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up native development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install development acceptance dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Provision immutable generated-media tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Download original unqualified04 candidate bytes
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: 14456048612
+          run-id: 44364456141
+          github-token: ${{ github.token }}
+          path: diagnostic-input
+          merge-multiple: true
+      - name: Bind diagnostic to exact original unqualified candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Get-Content -LiteralPath diagnostic-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath diagnostic-input/payload-manifest.json -Raw | ConvertFrom-Json
+          $setup = Get-Item -LiteralPath diagnostic-input/K5VisionSetup.exe
+          $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifestSha = (Get-FileHash -LiteralPath diagnostic-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($package.qualification_status -ne 'unqualified' -or
+              $package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $sha -ne '37220f076b36fce15a86f441c36c48f7b5a343aaa2e37a4c7c4991b82dbe5d99' -or
+              $setup.Length -ne 300041805 -or $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
+              $manifestSha -ne '2e938ea99eb69efcae6f4b9d8626d4ba28ab5bd768dc0809d25b102a6949d5fa' -or $package.payload_manifest_sha256 -ne $manifestSha) {
+            throw 'Exact unqualified04 diagnostic input mismatch'
+          }
+          @{diagnostic_only=$true; qualification_status='unqualified'; product_head=$env:K5_DESKTOP_HEAD_SHA; setup_sha256=$sha; test_head=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID} | ConvertTo-Json | Set-Content -LiteralPath diagnostic-only-source.json -Encoding utf8
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_SETUP_SHA256=$sha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Provision the same admitted public person fixture
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Admit and warm proven development-only no-locals sampler
+        shell: pwsh
+        run: |
+          python -m pip install --no-deps "https://files.pythonhosted.org/packages/6a/95/6ef39a234f17b05cc28efb4a584e93d36fdf633f306b8e10bbbe1409fc51/py_spy-0.4.3-py2.py3-none-win_amd64.whl#sha256=b14e00fddd4bfb12628e5c04b7d22c6754ae4c31bdfad0728adbe091ed26445f"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c 'import hashlib,subprocess,sys; from pathlib import Path; p=Path(sys.executable).parent/"Scripts/py-spy.exe"; assert p.stat().st_size==4887040 and hashlib.sha256(p.read_bytes()).hexdigest()=="0890578ca20bf839d7f890bbcdb508a21cb9f1b71f99bf32be371c5e492a0b48"; r=subprocess.run([str(p),"--version"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5,creationflags=subprocess.CREATE_NO_WINDOW,check=True); assert r.stdout.strip()==b"py-spy 0.4.3"'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exercise original graphical journey with passive observer diagnostics
+        timeout-minutes: 12
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_desktop_app.py -o addopts= --no-cov -s -o faulthandler_timeout=400 --junitxml=desktop-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve original GUI result and public-frame-only diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-04b-gui-${{ github.run_id }}
+          path: |
+            desktop-windows.xml
+            diagnostic-only-source.json
+            observer-login-samples.json
+            observer-logout-traffic.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  installed-motion:
+    name: Diagnostic only - repaired04 installed motion and actual clock journey
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      K5_BETA_HEAD_SHA: 04bb5f4fb0de71e1b1c0b8b3353abb7f62df65d0
+      K5_DESKTOP_HEAD_SHA: 04bb5f4fb0de71e1b1c0b8b3353abb7f62df65d0
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_NATIVE_MOTION_ACCEPTANCE: "1"
+      K5_VM_CLOCK_ACCEPTANCE: "1"
+    steps:
+      - name: Checkout diagnostic harness with unchanged04 product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up native development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install development acceptance dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Provision immutable generated-media tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Download original unqualified04 candidate bytes
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: 14456048612
+          run-id: 44364456141
+          github-token: ${{ github.token }}
+          path: diagnostic-input
+          merge-multiple: true
+      - name: Bind diagnostic to exact original unqualified candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Get-Content -LiteralPath diagnostic-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath diagnostic-input/payload-manifest.json -Raw | ConvertFrom-Json
+          $setup = Get-Item -LiteralPath diagnostic-input/K5VisionSetup.exe
+          $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifestSha = (Get-FileHash -LiteralPath diagnostic-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($package.qualification_status -ne 'unqualified' -or
+              $package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $sha -ne '37220f076b36fce15a86f441c36c48f7b5a343aaa2e37a4c7c4991b82dbe5d99' -or
+              $setup.Length -ne 300041805 -or $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
+              $manifestSha -ne '2e938ea99eb69efcae6f4b9d8626d4ba28ab5bd768dc0809d25b102a6949d5fa' -or $package.payload_manifest_sha256 -ne $manifestSha) {
+            throw 'Exact unqualified04 diagnostic input mismatch'
+          }
+          @{diagnostic_only=$true; qualification_status='unqualified'; product_head=$env:K5_DESKTOP_HEAD_SHA; setup_sha256=$sha; test_head=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID} | ConvertTo-Json | Set-Content -LiteralPath diagnostic-only-source.json -Encoding utf8
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_SETUP_SHA256=$sha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Exercise unchanged actual installed motion and clock test
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_motion_recording.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=460 --junitxml=motion-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_windows_motion_recording_receipt.py motion-windows.xml motion-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve diagnostic-only actual motion and restored clock result
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-04b-motion-${{ github.run_id }}
+          path: |
+            motion-windows.xml
+            motion-windows-receipt.json
+            diagnostic-only-source.json
+          if-no-files-found: warn
+          retention-days: 14
