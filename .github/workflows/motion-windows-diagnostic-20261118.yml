@@ -1,0 +1,133 @@
+name: Diagnostic only - EDA installed motion and Windows policy tests
+
+on:
+  push:
+    branches: [codex/motion-windows-diagnostic-20261118]
+    paths:
+      - .github/workflows/motion-windows-diagnostic-20261118.yml
+      - tests/integration/test_windows_motion_recording.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: motion-windows-diagnostic-20261118-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  motion-recording:
+    name: Diagnostic only - exact EDA installed motion journey
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      K5_DESKTOP_HEAD_SHA: eda506bd90800050198d1526ec15083ba39e0e2e
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_NATIVE_MOTION_ACCEPTANCE: "1"
+      K5_VM_CLOCK_ACCEPTANCE: "1"
+    steps:
+      - name: Checkout the tested motion installer revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up development Python for the separate motion gate
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install motion acceptance dependencies before changing guest time
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw "Motion acceptance dependency install failed" }
+      - name: Provision immutable generated-media tools before changing guest time
+        uses: ./.github/actions/provision-operator-tools
+      - name: Download the exact installer exercised by the first VM
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: 14445468624
+          run-id: 44343941333
+          github-token: ${{ github.token }}
+          path: motion-input
+          merge-multiple: true
+      - name: Bind motion qualification to the exact tested installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Get-Content -LiteralPath motion-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath motion-input/payload-manifest.json -Raw | ConvertFrom-Json
+          $setup = Get-Item -LiteralPath motion-input/K5VisionSetup.exe
+          $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -ne "984e2e6c101dca4b798bdd830be57f3d3a1154ccd2b39acddd77e3fba43d2f2a" -or
+              $setup.Length -ne 300042271 -or $package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
+              $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath motion-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
+              $package.motion_recording -ne $true -or $package.camera_trigger_zones -ne $true -or
+              $package.no_terminal_required -ne $true -or $package.workers_bundled -ne $true) {
+            throw "Motion qualification source, installer or feature identity mismatch"
+          }
+          @{diagnostic_only=$true; product_head=$env:K5_DESKTOP_HEAD_SHA; setup_sha256=$sha; test_head=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID} | ConvertTo-Json | Set-Content -LiteralPath diagnostic-only-source.json -Encoding utf8
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_SETUP_SHA256=$sha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Verify strict motion evidence admission and generated camera controls
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_windows_motion_recording_receipt.py tests/unit/test_motion_camera_fixture.py -o addopts= --no-cov --tb=short
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exercise real installed motion zones, retained video and owned clock restoration
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_motion_recording.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=460 --junitxml=motion-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_windows_motion_recording_receipt.py motion-windows.xml motion-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve finite motion evidence after UTC restoration
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-eda-motion-${{ github.run_id }}
+          path: |
+            motion-windows.xml
+            motion-windows-receipt.json
+            diagnostic-only-source.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  policy-api-diagnostic:
+    name: Diagnostic only - Windows policy API and authority tests
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - name: Checkout diagnostic source with unchanged EDA product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up native development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install exact native lane dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0" "numpy==2.2.6" "opencv-python-headless==5.0.0.93"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Isolate Windows policy API and authority with bounded stack evidence
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_operator_recording_policy_api.py tests/unit/test_operator_motion_authority.py -o addopts= --no-cov -vv --tb=short -o faulthandler_timeout=30 --durations=10 --junitxml=diagnostic-only-policy-api.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve original diagnostic policy test result
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-eda-policy-api-${{ github.run_id }}
+          path: diagnostic-only-policy-api.xml
+          if-no-files-found: warn
+          retention-days: 14

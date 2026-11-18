@@ -147,13 +147,193 @@ def _login(page, client, username, password):
     page.locator("#workspace").wait_for(state="visible")
 
 
-def _save_graphically(page, camera, *, zones=False):
+class _GraphicalSaveDiagnostic:
+    """Passive, bounded test-only evidence; never changes submission or validation."""
+
+    def __init__(self, page, camera, diagnostic, baseline):
+        self.page, self.diagnostic = page, diagnostic
+        self.route = f"/api/v1/operator/cameras/{camera}/recording-policy"
+        self.network = {
+            "put_requests": 0,
+            "put_responses": 0,
+            "put_failed": 0,
+            "put_http_statuses": [],
+            "console_errors": 0,
+            "page_errors": 0,
+        }
+        self.baseline = baseline
+        self.preview_started = None
+        self.preview_ttl = None
+        self.preview_matches_source = None
+        self.handlers = {
+            "request": self._request,
+            "response": self._response,
+            "requestfailed": self._failed,
+            "console": self._console,
+            "pageerror": self._pageerror,
+        }
+        for name, callback in self.handlers.items():
+            page.on(name, callback)
+        page.evaluate("""() => {
+          const counters={click:0, trustedClick:0, submit:0, trustedSubmit:0, invalid:0};
+          const listener=e=>{
+            if(e.type==='click' && e.target.closest?.('#recording-settings-save')) {
+              counters.click=Math.min(16,counters.click+1);
+              if(e.isTrusted)counters.trustedClick=Math.min(16,counters.trustedClick+1);
+            }
+            if(e.type==='submit' && e.target.id==='recording-settings-form') {
+              counters.submit=Math.min(16,counters.submit+1);
+              if(e.isTrusted)counters.trustedSubmit=Math.min(16,counters.trustedSubmit+1);
+            }
+            if(e.type==='invalid' && e.target.closest?.('#recording-settings-form'))
+              counters.invalid=Math.min(16,counters.invalid+1);
+          };
+          for(const event of ['click','submit','invalid'])
+            document.addEventListener(event,listener,true);
+          window.__k5MotionDiagnostic={counters,close:()=>{
+            for(const event of ['click','submit','invalid'])
+              document.removeEventListener(event,listener,true);
+            delete window.__k5MotionDiagnostic;
+          }};
+        }""")
+
+    def _matches(self, request):
+        return request.method == "PUT" and urlsplit(request.url).path == self.route
+
+    def _request(self, request):
+        if self._matches(request):
+            self.network["put_requests"] = min(16, self.network["put_requests"] + 1)
+
+    def _response(self, response):
+        if self._matches(response.request):
+            self.network["put_responses"] = min(16, self.network["put_responses"] + 1)
+            if len(self.network["put_http_statuses"]) < 16:
+                self.network["put_http_statuses"].append(response.status)
+
+    def _failed(self, request):
+        if self._matches(request):
+            self.network["put_failed"] = min(16, self.network["put_failed"] + 1)
+
+    def _console(self, message):
+        if message.type == "error":
+            self.network["console_errors"] = min(16, self.network["console_errors"] + 1)
+
+    def _pageerror(self, _error):
+        self.network["page_errors"] = min(16, self.network["page_errors"] + 1)
+
+    def captured(self, preview):
+        self.preview_started = time.monotonic()
+        self.preview_ttl = preview["expires_in_seconds"]
+        self.preview_matches_source = preview["source_revision"] == self.baseline["source_revision"]
+
+    def snapshot(self, label):
+        try:
+            value = self.page.evaluate("""() => {
+              const q=id=>document.getElementById(id);
+              const form=q('recording-settings-form'), save=q('recording-settings-save');
+              const validity={};
+              for(const id of ['recording-mode','motion-sensitivity',
+                'motion-minimum-area','motion-post-capture']) {
+                const input=q(id), flags={};
+                if(input)for(const key of ['badInput','customError','patternMismatch',
+                  'rangeOverflow','rangeUnderflow',
+                  'stepMismatch','tooLong','tooShort','typeMismatch','valid','valueMissing'])
+                    flags[key]=Boolean(input.validity[key]);
+                validity[id]={present:Boolean(input),disabled:Boolean(input?.disabled),
+                  will_validate:Boolean(input?.willValidate),flags};
+              }
+              const messages={
+                '':'empty',
+                ["The frozen frame expired. Capture a new frame be" +
+                 "fore saving zone changes."]:
+                  "preview_expired",
+                ["The camera connection changed. Refresh recording" +
+                 " settings and review the zones."]:
+                  "connection_changed",
+                ["Check the recording values and finish or cancel " +
+                 "the zone being drawn."]:
+                  "invalid_request",
+                ["The zones leave no area for motion detection. Re" +
+                 "move or reduce an exclusion."]:
+                  "zones_empty",
+                'These settings changed elsewhere. Refresh before saving again.':'policy_conflict',
+                ["The camera connection or view changed. Refresh s" +
+                 "ettings and review the zones."]:
+                  "source_changed",
+                ["The save outcome could not be confirmed. Refresh" +
+                 " before making another change."]:
+                  "save_unconfirmed",
+                'Your session ended. Sign in again.':'session_ended',
+                ["Your current account cannot change these recordi" +
+                 "ng settings or view this frame."]:
+                  "permission_denied",
+                ["Recording settings saved. This camera uses the s" +
+                 "aved mode even when this dialog or browser close" +
+                 "s."]:
+                  "saved"
+              };
+              const states={'Continuous recording':'continuous',
+                'Armed · Waiting for motion':'armed',
+                'Motion recording':'recording','Finishing motion recording':'post_capture',
+                'Recording paused':'paused','Storage blocked':'storage_blocked',
+                'Motion unavailable':'unavailable',
+                'Zones need review':'zones_need_review','Settings need refresh':'needs_refresh',
+                'Reading recording settings…':'reading'};
+              const svg=q('motion-zone-canvas'), image=svg?.querySelector('image');
+              const cap=n=>Math.min(16,n);
+              return {
+                dialog_open:Boolean(q('recording-settings-dialog')?.open),save_present:Boolean(save),
+                save_disabled:Boolean(save?.disabled),form_present:Boolean(form),
+                form_no_validate:Boolean(form?.noValidate),
+                form_valid:Object.values(validity).every(v=>!v.will_validate || v.flags.valid),
+                aria_busy:['true','false'].includes(form?.getAttribute('aria-busy'))?form.getAttribute('aria-busy'):'other',
+                validity,message_code:messages[q('recording-settings-message')?.textContent]||'other',
+                message_is_error:Boolean(q('recording-settings-message')?.classList.contains('error')),
+                status_code:states[q('recording-settings-status')?.textContent]||'other',
+                preview_blob_present:Boolean(image?.href?.baseVal?.startsWith('blob:')),
+                preview_frame_hidden:Boolean(q('motion-preview-frame')?.hidden),
+                include_count:cap(svg?.querySelectorAll('.motion-zone-polygon.include').length||0),
+                exclude_count:cap(svg?.querySelectorAll('.motion-zone-polygon.exclude').length||0),
+                draft_present:Boolean(svg?.querySelector('.motion-zone-draft')),
+                draft_points:cap(svg?.querySelector('.motion-zone-draft')?.points?.numberOfItems||0),
+                events:window.__k5MotionDiagnostic?.counters||null
+              };
+            }""")
+            value.update(self.network)
+            value["put_http_statuses"] = list(self.network["put_http_statuses"])
+            value["preview_matches_initial_source"] = self.preview_matches_source
+            if self.preview_started is not None:
+                elapsed = time.monotonic() - self.preview_started
+                value["preview_elapsed_seconds"] = round(elapsed, 3)
+                value["preview_local_ttl_seconds"] = self.preview_ttl
+                value["preview_local_ttl_elapsed"] = elapsed >= self.preview_ttl
+            self.diagnostic.setdefault("graphical_save", {})[label] = value
+        except BaseException:
+            self.diagnostic.setdefault("graphical_save", {})[label] = {"observer_unavailable": True}
+
+    def close(self):
+        for name, callback in self.handlers.items():
+            self.page.remove_listener(name, callback)
+        try:
+            self.page.evaluate("() => window.__k5MotionDiagnostic?.close()")
+        except BaseException:
+            pass
+
+
+def _save_graphically(page, camera, *, zones=False, observer=None):
     route = f"/api/v1/operator/cameras/{camera}/recording-policy"
-    with page.expect_response(
-        lambda r: r.request.method == "PUT" and urlsplit(r.url).path == route,
-        timeout=30_000,
-    ) as response:
-        page.locator("#recording-settings-save").click()
+    if observer is not None:
+        observer.snapshot("before_click")
+    try:
+        with page.expect_response(
+            lambda r: r.request.method == "PUT" and urlsplit(r.url).path == route,
+            timeout=30_000,
+        ) as response:
+            page.locator("#recording-settings-save").click()
+    except BaseException:
+        if observer is not None:
+            observer.snapshot("original_failure")
+        raise
     _require(response.value.status == 200, "Graphical recording policy was not applied")
     value, sent = response.value.json(), response.value.request.post_data_json
     _require(
@@ -181,7 +361,7 @@ def _draw_zone(page, kind, points):
     page.locator("#motion-zone-finish").click()
 
 
-def _author_zones(page, camera):
+def _author_zones(page, camera, *, observer=None):
     preview_route = f"/api/v1/operator/cameras/{camera}/motion-preview"
     with page.expect_response(
         lambda r: r.request.method == "POST" and urlsplit(r.url).path == preview_route,
@@ -190,6 +370,8 @@ def _author_zones(page, camera):
         page.locator("#motion-preview-capture").click()
     _require(response.value.status == 200, "Trusted decoded preview was unavailable")
     preview = response.value.json()
+    if observer is not None:
+        observer.captured(preview)
     _require(
         preview["width"] == 320 and preview["height"] == 240 and preview["rotation"] == 0,
         "Frozen preview was not bound to the actual decoded source geometry",
@@ -214,7 +396,7 @@ def _author_zones(page, camera):
     )
     _draw_zone(page, "include", [(0.02, 0.02), (0.8, 0.02), (0.8, 0.98), (0.02, 0.98)])
     _draw_zone(page, "exclude", [(0.49, 0.02), (0.8, 0.02), (0.8, 0.98), (0.49, 0.98)])
-    saved = _save_graphically(page, camera, zones=True)
+    saved = _save_graphically(page, camera, zones=True, observer=observer)
     _require(
         saved["zones"]["reference"]
         == {
@@ -619,7 +801,12 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
         _policy_state(client, target, {"armed"}, desktop, app=app)
         diagnostic["stage"] = "graphical_zone_authoring"
         page.locator("#camera-recording-settings-button").click()
-        saved, preview = _author_zones(page, target)
+        observer = _GraphicalSaveDiagnostic(page, target, diagnostic, initial)
+        try:
+            saved, preview = _author_zones(page, target, observer=observer)
+        finally:
+            observer.snapshot("after_zone_authoring")
+            observer.close()
         page.locator("#recording-settings-cancel").click()
         diagnostic["stage"] = "motion_permissions_and_preview_owner"
         receipt["permission_statuses"] = _permission_journey(
@@ -965,6 +1152,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     "health_http_status",
                     "foreign_preview_http_status",
                     "foreign_preview_api_code",
+                    "graphical_save",
                 }
             }
             safe.update(failed=failed, cleanup_failed=cleanup_failed)
