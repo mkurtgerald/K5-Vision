@@ -13,7 +13,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: motion-windows-diagnostic-20261118-${{ github.ref }}
+  group: motion-windows-diagnostic-20261118-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
