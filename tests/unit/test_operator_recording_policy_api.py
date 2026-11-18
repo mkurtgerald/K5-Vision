@@ -352,7 +352,11 @@ def test_policy_revision_conflict_prevents_native_apply(api):
     assert result.status_code == 409 and not api.service.apply_calls
 
 
-@pytest.mark.parametrize("value", [b"not-a-jpeg", b"\xff\xd8\xffmissing-end", b"x" * (1024**2 + 1)])
+@pytest.mark.parametrize(
+    "value",
+    [b"not-a-jpeg", b"\xff\xd8\xffmissing-end", b"x" * (1024**2 + 1)],
+    ids=["not-jpeg", "truncated-jpeg", "oversized-jpeg"],
+)
 def test_invalid_or_oversized_capture_is_not_exposed(api, value):
     api.service.preview_bytes = value
     response = api.client.post(api.prefix + "/motion-preview", headers=api.headers)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import subprocess
@@ -505,3 +506,277 @@ def test_jpeg_frame_header_geometry_is_checked():
     assert motion._jpeg_geometry(JPEG) == (1, 1)
     assert motion._jpeg_geometry(b"\xff\xd8INVALID\xff\xd9") is None
     assert motion._jpeg_geometry(JPEG[:-1]) is None
+
+
+def mask_policy():
+    return {
+        "camera_id": "PRIVATE_CAMERA_ID",
+        "source_revision": "PRIVATE_SOURCE_ID",
+        "zones": {
+            "reference": {"width": 640, "height": 360, "source_revision": "PRIVATE_SOURCE_ID"},
+            "include": [],
+            "exclude": [],
+        },
+    }
+
+
+def mask_wire(policy):
+    zones = policy["zones"]
+    return json.dumps(
+        {
+            "width": zones["reference"]["width"],
+            "height": zones["reference"]["height"],
+            "include": [item["points"] for item in zones["include"]],
+            "exclude": [item["points"] for item in zones["exclude"]],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii")
+
+
+def mask_response(policy, status="valid"):
+    return (
+        json.dumps(
+            {"status": status, "request_sha256": hashlib.sha256(mask_wire(policy)).hexdigest()}
+        ).encode()
+        + b"\n"
+    )
+
+
+@pytest.fixture
+def mask_worker(monkeypatch, worker):
+    state = SimpleNamespace(
+        instance=motion.MaskValidationWorker(), worker=worker, output=mask_response(mask_policy())
+    )
+
+    def start(args, **kwargs):
+        worker.args.append((args, kwargs))
+        worker.events.append("spawn")
+        process = Process(state.output, worker.events)
+        worker.processes.append(process)
+        return process
+
+    monkeypatch.setattr(motion.subprocess, "Popen", start)
+    yield state
+    state.instance.close()
+
+
+@pytest.mark.parametrize("status", ["valid", "empty"])
+def test_mask_validation_is_bound_to_geometry_and_exposes_no_camera_material(mask_worker, status):
+    item = mask_policy()
+    mask_worker.output = mask_response(item, status)
+    assert mask_worker.instance.validate(item) is (status == "valid")
+    owner = mask_worker.worker
+    args, options = owner.args[0]
+    assert args[-1] == "--mask-child" and args[1:4] == ["-I", "-B", "-m"]
+    assert options["stderr"] == subprocess.DEVNULL and options["close_fds"] is True
+    raw = bytes(owner.processes[0].stdin.recorded)
+    assert raw == mask_wire(item) + b"\n"
+    assert b"PRIVATE" not in raw and URI.encode() not in raw
+    assert set(json.loads(raw)) == {"width", "height", "include", "exclude"}
+    if owner.platform == "nt":
+        assert owner.events[:4] == ["job", "spawn", "assign", "write"]
+        assert options["creationflags"] == 0x08000000
+
+
+def test_mask_without_a_reference_or_zones_needs_no_native_worker(mask_worker):
+    item = {"zones": {"reference": None, "include": [], "exclude": []}}
+    assert mask_worker.instance.validate(item) is True
+    assert mask_worker.worker.processes == []
+    mask_worker.instance.close()
+    with pytest.raises(motion.MotionProcessError, match="closed"):
+        mask_worker.instance.validate(item)
+
+
+@pytest.mark.parametrize(
+    "fault", ["digest", "status", "foreign", "duplicate", "nonfinite", "truncated"]
+)
+def test_mask_worker_refuses_unbound_or_malformed_results_and_reaps(mask_worker, fault):
+    answer = {
+        "status": "valid",
+        "request_sha256": hashlib.sha256(mask_wire(mask_policy())).hexdigest(),
+    }
+    if fault == "digest":
+        answer["request_sha256"] = "0" * 64
+    elif fault == "status":
+        answer["status"] = True
+    elif fault == "foreign":
+        answer["private"] = "PRIVATE_CAMERA"
+    raw = json.dumps(answer).encode() + b"\n"
+    if fault == "duplicate":
+        raw = b'{"status":"valid","status":"empty","request_sha256":"0"}\n'
+    elif fault == "nonfinite":
+        raw = b'{"status":"valid","request_sha256":NaN}\n'
+    elif fault == "truncated":
+        raw = raw[:-1]
+    mask_worker.output = raw
+    with pytest.raises(motion.MotionProcessError, match="validation is unavailable") as error:
+        mask_worker.instance.validate(mask_policy())
+    assert "PRIVATE_CAMERA" not in str(error.value)
+    assert mask_worker.worker.processes[0].returncode == -9
+    assert mask_worker.instance._process is None
+
+
+def test_mask_response_cannot_be_replayed_for_another_region_selection(mask_worker):
+    item = mask_policy()
+    mask_worker.output = mask_response(item) * 2
+    assert mask_worker.instance.validate(item) is True
+    item["zones"]["exclude"] = [{"points": [[0, 0], [1, 0], [1, 1], [0, 1]]}]
+    with pytest.raises(motion.MotionProcessError):
+        mask_worker.instance.validate(item)
+    assert mask_worker.worker.processes[0].returncode == -9
+
+
+@pytest.mark.parametrize("fault", ["reference", "geometry", "polygon", "nonfinite", "too_many"])
+def test_mask_invalid_geometry_is_refused_before_native_start(mask_worker, fault):
+    item = mask_policy()
+    if fault == "reference":
+        item["zones"]["reference"] = None
+        item["zones"]["include"] = [{"points": [[0, 0], [1, 0], [1, 1]]}]
+    elif fault == "geometry":
+        item["zones"]["reference"]["width"] = True
+    elif fault == "polygon":
+        item["zones"]["exclude"] = [{"points": [[0, 0], [1, 0]]}]
+    elif fault == "nonfinite":
+        item["zones"]["include"] = [{"points": [[0, 0], [1, 0], [1, float("inf")]]}]
+    elif fault == "too_many":
+        item["zones"]["include"] = [{"points": [[0, 0], [1, 0], [1, 1]]}] * 9
+    with pytest.raises(motion.MotionProcessError):
+        mask_worker.instance.validate(item)
+    assert mask_worker.worker.processes == []
+
+
+def test_mask_assignment_refusal_reaps_before_any_geometry_is_granted(monkeypatch, mask_worker):
+    from k5vision import operator_native_process
+
+    class RefusedJob(mask_worker.worker.job_type):
+        def assign(self, process):
+            raise operator_native_process.NativeProcessError("PRIVATE_ASSIGNMENT")
+
+    monkeypatch.setattr(operator_native_process, "_WindowsJob", RefusedJob)
+    monkeypatch.setattr(motion, "os", SimpleNamespace(name="nt"))
+    with pytest.raises(motion.MotionProcessError, match="ownership is unavailable"):
+        mask_worker.instance.validate(mask_policy())
+    process = mask_worker.worker.processes[0]
+    assert process.stdin.recorded == b"" and process.returncode == -9
+    assert mask_worker.worker.jobs[0].closed is True
+
+
+def test_mask_child_uses_the_detector_analysis_dimensions_and_mask_semantics(monkeypatch):
+    from k5vision import operator_motion
+
+    calls, threads = [], []
+
+    def allowed(width, height, include, exclude):
+        calls.append((width, height, include, exclude))
+        return SimpleNamespace(any=lambda: not exclude)
+
+    first = mask_policy()
+    second = mask_policy()
+    second["zones"]["exclude"] = [{"points": [[0, 0], [1, 0], [1, 1], [0, 1]]}]
+    incoming = io.BytesIO(mask_wire(first) + b"\n" + mask_wire(second) + b"\n")
+    outgoing = io.BytesIO()
+    monkeypatch.setitem(sys.modules, "cv2", SimpleNamespace(setNumThreads=threads.append))
+    monkeypatch.setattr(operator_motion, "allowed_mask", allowed)
+    monkeypatch.setattr(
+        motion,
+        "sys",
+        SimpleNamespace(
+            stdin=SimpleNamespace(buffer=incoming), stdout=SimpleNamespace(buffer=outgoing)
+        ),
+    )
+    assert motion._mask_child_main() == 0
+    replies = [json.loads(line) for line in outgoing.getvalue().splitlines()]
+    assert [reply["status"] for reply in replies] == ["valid", "empty"]
+    assert [reply["request_sha256"] for reply in replies] == [
+        hashlib.sha256(mask_wire(item)).hexdigest() for item in (first, second)
+    ]
+    assert calls == [(320, 180, [], []), (320, 180, [], [second["zones"]["exclude"][0]["points"]])]
+    assert threads == [1]
+
+
+def test_mask_child_never_imports_native_code_before_a_valid_geometry_request(monkeypatch):
+    import builtins
+
+    original = builtins.__import__
+    forbidden = []
+
+    def importing(name, *args, **kwargs):
+        if name in {"cv2", "numpy"}:
+            forbidden.append(name)
+            raise AssertionError("native import before admitted geometry")
+        return original(name, *args, **kwargs)
+
+    incoming, outgoing = (
+        io.BytesIO(b'{"width":640,"height":360,"include":[],"exclude":[],"camera":"PRIVATE"}\n'),
+        io.BytesIO(),
+    )
+    monkeypatch.setattr(builtins, "__import__", importing)
+    monkeypatch.setattr(
+        motion,
+        "sys",
+        SimpleNamespace(
+            stdin=SimpleNamespace(buffer=incoming), stdout=SimpleNamespace(buffer=outgoing)
+        ),
+    )
+    assert motion._mask_child_main() == 1
+    assert forbidden == [] and b"PRIVATE" not in outgoing.getvalue()
+
+
+def test_hung_native_mask_validation_is_killed_and_reaped(monkeypatch):
+    real_start = subprocess.Popen
+    owned = []
+
+    def start(_args, **kwargs):
+        child = real_start(
+            [sys.executable, "-I", "-B", "-c", "import sys; sys.stdin.buffer.read()"], **kwargs
+        )
+        owned.append(child)
+        return child
+
+    monkeypatch.setattr(motion.subprocess, "Popen", start)
+    monkeypatch.setattr(motion, "_REQUEST_SECONDS", 0.15)
+    validator = motion.MaskValidationWorker()
+    started = time.monotonic()
+    try:
+        with pytest.raises(motion.MotionProcessError, match="validation is unavailable"):
+            validator.validate(mask_policy())
+        assert time.monotonic() - started < 2
+        assert owned[0].poll() is not None and validator._process is None
+    finally:
+        validator.close()
+    assert not validator._deadline._thread.is_alive()
+
+
+def test_mask_begin_close_interrupts_and_reaps_active_validation(monkeypatch):
+    real_start = subprocess.Popen
+    launched, outcome = threading.Event(), []
+    owned = []
+
+    def start(_args, **kwargs):
+        child = real_start(
+            [sys.executable, "-I", "-B", "-c", "import sys; sys.stdin.buffer.read()"], **kwargs
+        )
+        owned.append(child)
+        launched.set()
+        return child
+
+    monkeypatch.setattr(motion.subprocess, "Popen", start)
+    validator = motion.MaskValidationWorker()
+
+    def validate():
+        try:
+            validator.validate(mask_policy())
+        except motion.MotionProcessError:
+            outcome.append("closed")
+
+    thread = threading.Thread(target=validate)
+    thread.start()
+    assert launched.wait(1)
+    validator.begin_close()
+    validator.close()
+    thread.join(timeout=1)
+    assert not thread.is_alive() and outcome == ["closed"]
+    assert owned[0].poll() is not None and validator._process is None
+    assert not validator._deadline._thread.is_alive()

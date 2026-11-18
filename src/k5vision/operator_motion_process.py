@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
@@ -103,8 +104,14 @@ def _policy(value: object) -> dict:
         or not 0.1 <= value["minimum_area_percent"] <= 100
     ):
         raise MotionProcessError("Motion policy was refused")
-    for name in ("include", "exclude"):
-        polygons = value[name]
+    _regions(value["include"], value["exclude"])
+    # A private JSON copy makes a concurrent caller mutation unable to change a
+    # request after its validation or while its native child evaluates it.
+    return _document(json.dumps(value, allow_nan=False).encode("ascii"))
+
+
+def _regions(include: object, exclude: object) -> None:
+    for polygons in (include, exclude):
         if type(polygons) is not list or len(polygons) > 8:
             raise MotionProcessError("Motion policy was refused")
         for polygon in polygons:
@@ -122,11 +129,47 @@ def _policy(value: object) -> dict:
                     )
                 ):
                     raise MotionProcessError("Motion policy was refused")
-    if len(value["include"]) + len(value["exclude"]) > 8:
+    if len(include) + len(exclude) > 8:
         raise MotionProcessError("Motion policy was refused")
-    # A private JSON copy makes a concurrent caller mutation unable to change a
-    # request after its validation or while its native child evaluates it.
-    return _document(json.dumps(value, allow_nan=False).encode("ascii"))
+
+
+def _mask_wire(value: object) -> bytes:
+    if (
+        type(value) is not dict
+        or set(value) != {"width", "height", "include", "exclude"}
+        or not _geometry(value["width"], value["height"])
+    ):
+        raise MotionProcessError("Motion mask configuration was refused")
+    _regions(value["include"], value["exclude"])
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("ascii")
+
+
+def _mask_request(policy: object) -> bytes | None:
+    try:
+        if type(policy) is not dict or type(policy["zones"]) is not dict:
+            raise ValueError
+        zones = policy["zones"]
+        include = zones["include"]
+        exclude = zones["exclude"]
+        if type(include) is not list or type(exclude) is not list:
+            raise ValueError
+        reference = zones["reference"]
+        if reference is None:
+            if include or exclude:
+                raise ValueError
+            return None
+        if type(reference) is not dict:
+            raise ValueError
+        return _mask_wire(
+            {
+                "width": reference["width"],
+                "height": reference["height"],
+                "include": [polygon["points"] for polygon in include],
+                "exclude": [polygon["points"] for polygon in exclude],
+            }
+        )
+    except (KeyError, TypeError, ValueError, MotionProcessError):
+        raise MotionProcessError("Motion mask configuration was refused") from None
 
 
 def _geometry(width: object, height: object) -> bool:
@@ -232,6 +275,9 @@ class LiveMotionWorker:
 
     def __init__(self, relay_uri: str):
         self._relay_uri = _relay(relay_uri)
+        self._initialize_owner()
+
+    def _initialize_owner(self):
         self._lock = threading.RLock()
         self._closing = threading.Event()
         self._process = None
@@ -241,7 +287,9 @@ class LiveMotionWorker:
         self._public_sequence = 0
         self._deadline = _RequestDeadline()
 
-    def _start(self):
+    def _start(self, child_mode="--child"):
+        if child_mode not in {"--child", "--mask-child"}:
+            raise MotionProcessError("Motion worker mode was refused")
         if self._closing.is_set():
             raise MotionProcessError("Motion worker is closed")
         if self._process is not None and self._process.poll() is None:
@@ -253,7 +301,7 @@ class LiveMotionWorker:
         process = None
         try:
             process = subprocess.Popen(
-                [sys.executable, "-I", "-B", "-m", "k5vision.operator_motion_process", "--child"],
+                [sys.executable, "-I", "-B", "-m", "k5vision.operator_motion_process", child_mode],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -411,6 +459,86 @@ class LiveMotionWorker:
             self._deadline.close(timeout=max(0.0, deadline - time.monotonic()))
 
 
+class MaskValidationWorker(LiveMotionWorker):
+    """Rasterize zone geometry in an owned child, never in the API process."""
+
+    def __init__(self):
+        self._initialize_owner()
+
+    def validate(self, policy: dict) -> bool:
+        request = _mask_request(policy)
+        with self._lock:
+            if self._closing.is_set():
+                raise MotionProcessError("Motion worker is closed")
+            if request is None:
+                return True
+            if len(request) + 1 > _MAX_REQUEST:
+                raise MotionProcessError("Motion mask configuration was refused")
+            self._start("--mask-child")
+            process = self._process
+            expired = self._deadline.arm(process)
+            try:
+                if self._closing.is_set():
+                    raise MotionProcessError("Motion worker is closed")
+                self._write(process.stdin, request + b"\n")
+                raw = process.stdout.readline(4097)
+                if not raw.endswith(b"\n") or len(raw) > 4096:
+                    raise MotionProcessError("Motion mask response was refused")
+                response = _document(raw)
+                if (
+                    set(response) != {"status", "request_sha256"}
+                    or response["status"] not in {"valid", "empty"}
+                    or response["request_sha256"] != hashlib.sha256(request).hexdigest()
+                    or expired.is_set()
+                    or self._closing.is_set()
+                ):
+                    raise MotionProcessError("Motion mask response was refused")
+                return response["status"] == "valid"
+            except (OSError, ValueError, TypeError, MotionProcessError):
+                self._dispose()
+                raise MotionProcessError("Motion mask validation is unavailable") from None
+            finally:
+                self._deadline.disarm()
+
+
+def _mask_child_main() -> int:
+    """Receive geometry only after Job assignment; native imports stay here."""
+    prepared = False
+    try:
+        while True:
+            raw = sys.stdin.buffer.readline(_MAX_REQUEST + 1)
+            if not raw:
+                return 0
+            if len(raw) > _MAX_REQUEST or not raw.endswith(b"\n"):
+                return 1
+            request = _mask_wire(_document(raw))
+            selection = _document(request)
+            if not prepared:
+                import cv2
+
+                cv2.setNumThreads(1)
+                from k5vision.operator_motion import allowed_mask, analysis_dimensions
+
+                prepared = True
+            width, height = analysis_dimensions(selection["width"], selection["height"])
+            allowed = bool(
+                allowed_mask(width, height, selection["include"], selection["exclude"]).any()
+            )
+            response = {
+                "status": "valid" if allowed else "empty",
+                "request_sha256": hashlib.sha256(request).hexdigest(),
+            }
+            sys.stdout.buffer.write(json.dumps(response).encode("ascii") + b"\n")
+            sys.stdout.buffer.flush()
+    except BaseException:
+        try:
+            sys.stdout.buffer.write(b'{"status":"unavailable"}\n')
+            sys.stdout.buffer.flush()
+        except (OSError, ValueError):
+            pass
+        return 1
+
+
 def _child_main() -> int:
     """One trusted relay, continuously drained; stdout contains bounded samples."""
     stopped = threading.Event()
@@ -544,4 +672,8 @@ def _child_main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(_child_main() if sys.argv[1:] == ["--child"] else 1)
+    if sys.argv[1:] == ["--child"]:
+        raise SystemExit(_child_main())
+    if sys.argv[1:] == ["--mask-child"]:
+        raise SystemExit(_mask_child_main())
+    raise SystemExit(1)

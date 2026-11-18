@@ -210,6 +210,9 @@ class MotionRuntime:
         self.pending_gates = {}
         self.interest = {}
         self.inflight = {}
+        self.mask_lock = asyncio.Lock()
+        self.mask_tasks = set()
+        self.mask_worker = None
         self.operations = set()
         self.last_sample = {}
         self.task = None
@@ -689,6 +692,83 @@ class MotionRuntime:
             await asyncio.sleep(0.05)
         raise MotionUnavailable("Motion frame is unavailable")
 
+    @staticmethod
+    def _new_mask_validator():
+        from k5vision.operator_motion_process import MaskValidationWorker
+
+        return MaskValidationWorker()
+
+    async def _validate_mask(self, policy):
+        # A whole-frame policy needs neither a native import nor a child. The
+        # admitted DTO already rejects polygons without a reference image.
+        if policy["zones"]["reference"] is None:
+            return
+        owner = asyncio.current_task()
+        self.mask_tasks.add(owner)
+        try:
+            async with self.mask_lock:
+                if self.closing or self.service._closing:
+                    raise MotionUnavailable("Motion policy is stopping")
+                created = []
+                cancelled = False
+
+                def create():
+                    worker = self._new_mask_validator()
+                    created.append(worker)
+                    return worker
+
+                try:
+                    worker = await self._run(create)
+                    self.mask_worker = worker
+                    if self.closing or self.service._closing:
+                        raise MotionUnavailable("Motion policy is stopping")
+                    request = self._submit(worker.validate, policy)
+                    self.operations.add(request)
+                    try:
+                        while not request.done():
+                            try:
+                                await asyncio.shield(request)
+                            except asyncio.CancelledError:
+                                cancelled = True
+                                worker.begin_close()
+                            except Exception:
+                                break
+                        if cancelled:
+                            raise asyncio.CancelledError
+                        allowed = request.result()
+                    finally:
+                        self.operations.discard(request)
+                finally:
+                    # This source-free validation child belongs to one request,
+                    # including when the API owner later rejects a canceled or
+                    # revoked operation. Never retain its native import in the
+                    # API process, or return before its owned cleanup completes.
+                    if created:
+                        worker = created[0]
+                        worker.begin_close()
+                        try:
+                            await self._run(worker.close)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                        except Exception:
+                            self.failed_workers.append(worker)
+                            raise MotionUnavailable(
+                                "Motion validation cleanup was incomplete"
+                            ) from None
+                        finally:
+                            if self.mask_worker is worker:
+                                self.mask_worker = None
+                if cancelled:
+                    raise asyncio.CancelledError
+                if type(allowed) is not bool:
+                    raise MotionUnavailable("Motion validation was refused")
+                if not allowed:
+                    raise MotionUnavailable(
+                        "Motion regions exclude the entire camera frame", code="motion_zones_empty"
+                    )
+        finally:
+            self.mask_tasks.discard(owner)
+
     async def configure(
         self, source, expected_revision, policy, before_commit, reference_generation=None
     ):
@@ -700,6 +780,11 @@ class MotionRuntime:
         if self.store is None or self.closing:
             raise MotionUnavailable("Motion policy is unavailable")
         admitted = validate_motion_policy(policy)
+        # Pure region admission can load a native image library. Keep it in its
+        # killable child and outside the recorder lock; camera sampling and
+        # post-capture deadlines must progress while it runs. All mutable state
+        # and authority are rechecked below after the bounded result arrives.
+        await self._validate_mask(admitted)
         async with self.service._lock:
             path = source.binding.path_name
             current = self.sources.get(path)
@@ -714,7 +799,6 @@ class MotionRuntime:
                 "revision": expected_revision + 1,
                 "policy_source_revision": previous["source_revision"],
             }
-            await self._run(validate_effective_mask, candidate)
 
             def check_reference():
                 reference = admitted["zones"]["reference"]
@@ -808,8 +892,11 @@ class MotionRuntime:
 
     async def close(self):
         self.closing = True
+        if self.mask_worker is not None:
+            self.mask_worker.begin_close()
         self.invalidate()
         tasks = [*self.inflight.values()]
+        tasks.extend(self.mask_tasks)
         tasks.extend(self.cleanup_tasks)
         if self.task is not None:
             tasks.append(self.task)

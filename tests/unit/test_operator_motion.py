@@ -227,6 +227,30 @@ class _Worker:
         self.reaped = True
 
 
+class _MaskValidator:
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = None
+        self.allowed = True
+        self.closed = False
+        self.reaped = False
+
+    def validate(self, _policy):
+        self.started.set()
+        if self.release is not None:
+            assert self.release.wait(2), "Mask validation control was not released"
+        return self.allowed
+
+    def begin_close(self):
+        self.closed = True
+        if self.release is not None:
+            self.release.set()
+
+    def close(self):
+        self.begin_close()
+        self.reaped = True
+
+
 @pytest.fixture
 def engine(native, monkeypatch):
     service = native.service
@@ -241,11 +265,20 @@ def engine(native, monkeypatch):
         return value
 
     monkeypatch.setattr(service._motion, "_new_worker", worker)
+    validators = []
+
+    def mask_validator():
+        value = _MaskValidator()
+        validators.append(value)
+        return value
+
+    monkeypatch.setattr(service._motion, "_new_mask_validator", mask_validator)
     attempts = _HARNESS._fake_mutations(native, monkeypatch)
     return SimpleNamespace(
         service=service,
         policies=policies,
         workers=workers,
+        validators=validators,
         attempts=attempts,
         sources=(_HARNESS._source(1), _HARNESS._source(2)),
     )
