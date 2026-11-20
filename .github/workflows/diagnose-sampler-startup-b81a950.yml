@@ -1,0 +1,95 @@
+name: Sampler-only startup and owned-Python baseline b81a950
+on:
+  pull_request:
+    types: [opened]
+    paths:
+      - .github/workflows/diagnose-sampler-startup-b81a950.yml
+permissions:
+  contents: read
+concurrency:
+  group: sampler-startup-b81-${{ github.run_id }}
+  cancel-in-progress: false
+jobs:
+  sampler-startup:
+    runs-on: windows-2025
+    timeout-minutes: 5
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: "false"
+      K5_SAMPLER_DISPATCH_HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Checkout separately owned diagnostic dispatcher only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Set up disposable native Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Admit diagnostic ownership and pinned official sampler bytes
+        shell: python {0}
+        run: |
+          import hashlib,json,os,re,subprocess,urllib.request,uuid,zipfile
+          from pathlib import Path
+          PINS = {'diagnostics/clock-sampler-b81/run_sampler_startup.py': '7be0171a3ffa6383af0010b7ebae8e76179c3b4d7b37b892223bd8c8d0034e27', 'diagnostics/clock-sampler-b81/sample_owned_backend.py': '9d563a3a6efec500ebf62ce5133be949dab90610eab8e80cf909a7ea4a73a0d1', 'diagnostics/clock-sampler-b81/k5vision/clock_sampler_baseline.py': '644a5c08364f8655379639bf3cac45230df595eaa554ba3a756fbcb2063c6eb6'}
+          assert os.name == 'nt' and os.environ['GITHUB_ACTIONS'] == 'true'
+          assert os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted' and os.environ['RUNNER_OS'] == 'Windows'
+          assert os.environ['GITHUB_REPOSITORY'] == 'mkurtgerald/K5-Vision'
+          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
+          head=os.environ['K5_SAMPLER_DISPATCH_HEAD']
+          assert re.fullmatch('[a-f0-9]{40}',head) and subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==head
+          assert subprocess.check_output(['git','rev-parse','HEAD^'],text=True).strip()=='b81a950975e50979f57b20fb13cdbfbe73fd1aac'
+          changed=subprocess.check_output(['git','diff-tree','--no-commit-id','--name-status','-r','HEAD'],text=True).splitlines()
+          assert set(changed)=={'A\t'+name for name in [*PINS,'.github/workflows/diagnose-sampler-startup-b81a950.yml']}
+          assert not subprocess.check_output(['git','status','--porcelain','--untracked-files=no'],text=True)
+          for name,digest in PINS.items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest
+          root=Path(os.environ['RUNNER_TEMP'])/('K5 sampler startup '+uuid.uuid4().hex)
+          root.mkdir()
+          with Path(os.environ['GITHUB_ENV']).open('a',encoding='utf-8') as env:
+              env.write('K5_SAMPLER_STARTUP_ROOT='+str(root)+'\n')
+          wheel=root/'py_spy-0.4.3-py2.py3-none-win_amd64.whl'
+          url='https://files.pythonhosted.org/packages/6a/95/6ef39a234f17b05cc28efb4a584e93d36fdf633f306b8e10bbbe1409fc51/py_spy-0.4.3-py2.py3-none-win_amd64.whl'
+          checksum=hashlib.sha256();count=0
+          with urllib.request.urlopen(url,timeout=30) as response,wheel.open('xb') as output:
+              while block:=response.read(1024*1024):
+                  count+=len(block);assert count<=1919678;checksum.update(block);output.write(block)
+          assert count==1919678 and checksum.hexdigest()=='b14e00fddd4bfb12628e5c04b7d22c6754ae4c31bdfad0728adbe091ed26445f'
+          with zipfile.ZipFile(wheel) as bundle:
+              exe=bundle.read('py_spy-0.4.3.data/scripts/py-spy.exe')
+          assert len(exe)==4887040 and hashlib.sha256(exe).hexdigest()=='0890578ca20bf839d7f890bbcdb508a21cb9f1b71f99bf32be371c5e492a0b48'
+          (root/'py-spy.exe').write_bytes(exe)
+          Path('sampler-startup-preflight.json').write_text(json.dumps({'scope':'sampler-startup-preflight-only','source_parent':'b81a950975e50979f57b20fb13cdbfbe73fd1aac','dispatcher_head':head,'run_id':int(os.environ['GITHUB_RUN_ID']),'attempt':1,'script_pins':PINS,'clock_changes':False,'http_requests_to_product':0,'release_qualification':False},indent=2)+'\n',encoding='utf-8')
+      - name: Warm pinned tool and require three owned public Python frame captures
+        shell: pwsh
+        run: |
+          python diagnostics/clock-sampler-b81/run_sampler_startup.py --sampler diagnostics/clock-sampler-b81/sample_owned_backend.py --executable "$env:K5_SAMPLER_STARTUP_ROOT/py-spy.exe" --baseline diagnostics/clock-sampler-b81/k5vision/clock_sampler_baseline.py --output sampler-startup-result.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve finite sampler measurements and every outcome
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: sampler-startup-b81a950-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: |
+            sampler-startup-preflight.json
+            sampler-startup-result.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Remove only owned tool directory after owned process cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not [string]::IsNullOrEmpty($env:K5_SAMPLER_STARTUP_ROOT)) {
+            $path = [IO.Path]::GetFullPath($env:K5_SAMPLER_STARTUP_ROOT)
+            $parent = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar)
+            if (-not [string]::Equals([IO.Directory]::GetParent($path).FullName, $parent, [StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($path) -notmatch '^K5 sampler startup [a-f0-9]{32}$') { throw 'Sampler cleanup ownership refused' }
+            if (Test-Path -LiteralPath $path) {
+              $item = Get-Item -LiteralPath $path
+              if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Sampler redirected directory refused' }
+              Remove-Item -LiteralPath $path -Recurse -Force
+            }
+          }
