@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import socket
+import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 from k5vision.operator_analytics_person import _manifest
@@ -19,8 +22,24 @@ _FIXTURE_SHA = "2be4dfa4d874e5f7929bebd1baf401e2ee630c4bf36cead7a2f8d5421d583959
 
 def download(url: str, path: Path, size: int, algorithm: str, expected: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with urlopen(url, timeout=120) as response:
-        payload = response.read(size + 1)
+    # Transport retries are finite. Byte count and SHA admission never change.
+    # Do not emit URLs or exception messages into hosted test logs.
+    for attempt in range(3):
+        try:
+            with urlopen(url, timeout=120) as response:
+                payload = response.read(size + 1)
+        except HTTPError as error:
+            if error.code not in {408, 429, 500, 502, 503, 504} or attempt == 2:
+                raise RuntimeError("Pinned development artifact transport refused") from None
+        except URLError as error:
+            if not isinstance(error.reason, (socket.gaierror, TimeoutError)) or attempt == 2:
+                raise RuntimeError("Pinned development artifact transport refused") from None
+        except TimeoutError:
+            if attempt == 2:
+                raise RuntimeError("Pinned development artifact transport refused") from None
+        else:
+            break
+        time.sleep(2 * (attempt + 1))
     if len(payload) != size or hashlib.new(algorithm, payload).hexdigest() != expected:
         raise ValueError("Person development artifact identity was refused")
     with path.open("xb") as output:

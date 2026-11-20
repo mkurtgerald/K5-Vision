@@ -27,6 +27,9 @@ from k5vision.operator_storage_settings import OperatorStorageSettings
 from k5vision.operator_time import HostClockObserver
 
 _RECORDING_FLUSH_SECONDS = 3.0
+_STORAGE_IDLE_REFRESH_SECONDS = 15.0
+_STORAGE_ANALYTICS_REFRESH_SECONDS = 6.0
+_STORAGE_ANALYTICS_INTEREST_SECONDS = 12.0
 
 
 class OperatorProductError(RuntimeError):
@@ -160,6 +163,9 @@ class OperatorProductService:
         self._storage_operations: set[asyncio.Task] = set()
         self._storage = None
         self._storage_status = None
+        # Only an enabled, active recorded-person sampler asks for this cache.
+        # Normal operator polling retains the slower full-retention scan cadence.
+        self._analytics_inventory_interest_at: float | None = None
         self._health_failures = {"media": 0, "gateway": 0}
         self._clock = HostClockObserver()
         self._media_generation = 0
@@ -322,6 +328,10 @@ class OperatorProductService:
         """Private cached inventory for the recorder-owned analytics sampler."""
         if self._storage is None:
             return None
+        # Inventory consumers never walk retained recordings. A recent
+        # background inference request instead asks existing maintenance to
+        # refresh the already-admitted cache sooner after segment rollover.
+        self._analytics_inventory_interest_at = time.monotonic()
         return self._storage.recording_files(binding.path_name)
 
     def _check_gateway(self) -> None:
@@ -608,7 +618,19 @@ class OperatorProductService:
                             except Exception:
                                 self._health_failures[component] += 1
                         last_health = time.monotonic()
-                    if time.monotonic() - last_storage >= 15:
+                    now = time.monotonic()
+                    interest_age = (
+                        None
+                        if self._analytics_inventory_interest_at is None
+                        else now - self._analytics_inventory_interest_at
+                    )
+                    refresh_seconds = (
+                        _STORAGE_ANALYTICS_REFRESH_SECONDS
+                        if interest_age is not None
+                        and 0 <= interest_age <= _STORAGE_ANALYTICS_INTEREST_SECONDS
+                        else _STORAGE_IDLE_REFRESH_SECONDS
+                    )
+                    if now - last_storage >= refresh_seconds:
                         result = await self._storage_operation(self._storage.prune)
                         await self._apply_storage_status(result)
                         last_storage = time.monotonic()

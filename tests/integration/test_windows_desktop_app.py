@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import http.client
 import importlib.util
 import json
 import os
@@ -27,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from uuid import UUID, uuid4
 
 import psutil
@@ -405,6 +406,108 @@ def _classify_installed_seal_refusal(installed):
         return "bounded_inspection_incomplete"
 
 
+def _installer_page_signature(api, controls):
+    """Ephemeral native wizard-page identity, never written to diagnostics.
+
+    The same Next control is reused across pages. A queued native click must
+    not be queued again until actual visible wizard controls change.
+    """
+    return tuple(
+        sorted(
+            (api.api.GetDlgCtrlID(window), api.class_name(window), api.text(window))
+            for window in controls
+        )
+    )
+
+
+def _installer_timeout_activity(process):
+    """Bounded process-only witness for a graphical Setup deadline failure.
+
+    Never inspect command lines, filenames, handles, environment or output:
+    these may expose an owner's install location or other private material.
+    CPU time distinguishes an extraction-heavy pre-wizard stall from a process
+    that spent the same interval without doing measurable work.
+    """
+    try:
+        root = psutil.Process(process.pid)
+        processes = [root, *root.children(recursive=True)]
+        seconds = 0.0
+        observed = 0
+        for item in processes[:64]:
+            try:
+                usage = item.cpu_times()
+                seconds += usage.user + usage.system
+                observed += 1
+            except (psutil.Error, OSError):
+                continue
+        return {
+            "observed_processes": observed,
+            "processes_capped": len(processes) > 64,
+            "aggregate_cpu_seconds": round(min(seconds, 3600.0), 2),
+            "root_running": root.is_running(),
+        }
+    except (psutil.Error, OSError):
+        return {"observation": "unavailable"}
+
+
+def _clock_live_gateway_probe(live_url, token, *, dial=None):
+    """Classify one failed clock-step live request without retaining any media.
+
+    Runs only *after* the original five-second browser request has failed.
+    The sole target is the same local media gateway and the same authorized
+    opaque session; the response body is never read, copied or logged.
+    This must not retry the acceptance request or replace its result.
+    """
+    try:
+        target = urlsplit(live_url)
+        port = target.port
+        valid = (
+            target.scheme == "http"
+            and target.hostname == "127.0.0.1"
+            and port is not None
+            and not target.username
+            and not target.password
+            and not target.query
+            and not target.fragment
+            and re.fullmatch(r"/media/live/k5_[0-9a-f]{64}/index\.m3u8", target.path)
+            and isinstance(token, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token)
+        )
+    except (AttributeError, ValueError):
+        valid = False
+    if not valid:
+        return {"classification": "refused"}
+    connection = None
+    started = time.monotonic()
+    try:
+        connector = http.client.HTTPConnection if dial is None else dial
+        connection = connector("127.0.0.1", port, timeout=2.0)
+        connection.request(
+            "GET",
+            target.path,
+            headers={"Cookie": "k5_operator_media=" + token},
+        )
+        response = connection.getresponse()
+        return {
+            "classification": "response",
+            "http_status": int(response.status),
+            "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000)),
+        }
+    except TimeoutError:
+        return {
+            "classification": "timeout",
+            "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000)),
+        }
+    except (OSError, http.client.HTTPException):
+        return {
+            "classification": "transport_error",
+            "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000)),
+        }
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def _install_gui(setup, installed, api, *, diagnostic=None):
     """Drive the actual Inno wizard without suppressing its user interface."""
     __tracebackhide__ = True
@@ -429,9 +532,12 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
         stderr=subprocess.DEVNULL,
     )
     deadline, clicked, launch_unchecked = time.monotonic() + 90, set(), False
+    last_next_page = None
     try:
         while process.poll() is None:
-            _require(time.monotonic() < deadline, "Actual installer wizard exceeded its deadline")
+            if time.monotonic() >= deadline:
+                diagnostic["installer_timeout_activity"] = _installer_timeout_activity(process)
+                pytest.fail("Actual installer wizard exceeded its deadline", pytrace=False)
             root = psutil.Process(process.pid)
             pids = {root.pid, *(child.pid for child in root.children(recursive=True))}
             forms = [window for window in api.windows() if api.pid(window) in pids]
@@ -486,8 +592,19 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                                 "finish" if caption == "finish" else "next"
                             )
                             if caption.startswith("next"):
+                                # Inno's Next handler can synchronously prepare
+                                # an offline payload. SendMessageTimeout's 5s
+                                # control deadline is not an install deadline.
+                                # Queue one real BM_CLICK per observed page;
+                                # retain the unchanged 90s process deadline.
+                                page = _installer_page_signature(api, controls)
+                                if page == last_next_page:
+                                    break
                                 diagnostic["installer_next_clicks"] += 1
-                            api.click(captions[caption])
+                                api.post_click(captions[caption])
+                                last_next_page = page
+                            else:
+                                api.click(captions[caption])
                         clicked.add(caption)
                         break
             time.sleep(0.2)
@@ -1737,16 +1854,424 @@ def _installed_person_fixture(parent, ffmpeg):
     return video
 
 
-def _installed_person_events(client, route, diagnostic):
-    """Keep the event-poll status before any later diagnostic request replaces it."""
+def _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, diagnostic):
+    """Prove native boxes are visible on the same transient installed browser frame.
+
+    No sampled pixels, camera URI, request body, screenshot or bearer token is
+    copied to CI evidence. A painted native rectangle is required, not merely a
+    successful person-detection API response.
+    """
+    __tracebackhide__ = True
+    diagnostic["analytics_sample_stage"] = "open_live"
+    browser_helpers._open_camera_watch(page, camera_id)
     try:
-        return client.json(route)["events"]
+        diagnostic["analytics_sample_stage"] = "panel_visible"
+        page.locator("#person-view-panel").wait_for(state="visible")
+        diagnostic["analytics_sample_stage"] = "live_decoded"
+        page.wait_for_function(
+            """() => {
+              const video = document.getElementById('live-video');
+              return video && !video.paused && video.readyState >= 2 &&
+                video.videoWidth > 0 && video.videoHeight > 0 &&
+                video.getVideoPlaybackQuality().totalVideoFrames >= 4;
+            }""",
+            timeout=25_000,
+        )
+    except Exception:
+        # Keep only finite player and control states; never inspect or retain
+        # the source URL, session, request body, video frame or screenshot.
+        try:
+            diagnostic["analytics_sample_live_state"] = page.evaluate(
+                """() => {
+                  const video = document.getElementById('live-video');
+                  const panel = document.getElementById('person-view-panel');
+                  const quality = video?.getVideoPlaybackQuality?.();
+                  const frames = quality?.totalVideoFrames;
+                  return {
+                    panel_visible: !!panel && !panel.hidden,
+                    live_visible: !document.getElementById('live-panel')?.hidden,
+                    paused: video?.paused ?? null,
+                    ready_state: video?.readyState ?? null,
+                    has_dimensions: !!video && video.videoWidth > 0 && video.videoHeight > 0,
+                    decoded_frames: Number.isSafeInteger(frames) ?
+                      Math.min(frames, 1000000) : null,
+                    video_error: video?.error?.code ?? null,
+                    retry_visible: !document.getElementById('retry-live')?.hidden,
+                    play_visible: !document.getElementById('play-live')?.hidden,
+                    sample_button_enabled: !document.getElementById('toggle-person-view')?.disabled
+                  };
+                }"""
+            )
+        except Exception:
+            diagnostic["analytics_sample_live_state"] = {"available": False}
+        raise
+    # Native decoding and authoritative camera status can become ready in
+    # adjacent browser tasks. Require the real enabled control, not a stale
+    # instantaneous disabled-button snapshot.
+    diagnostic["analytics_sample_stage"] = "control_ready"
+    try:
+        page.wait_for_function(
+            """() => {
+              const button = document.getElementById('toggle-person-view');
+              const video = document.getElementById('live-video');
+              const panel = document.getElementById('person-view-panel');
+              return !!button && !button.disabled && !!panel && !panel.hidden
+                && !!video && !video.paused && video.readyState >= 2
+                && video.videoWidth > 0 && video.videoHeight > 0;
+            }""",
+            timeout=5_000,
+        )
+    except Exception:
+        # Enumerated control/player evidence only; no camera identifiers, URLs,
+        # browser exceptions, sampled frames, request data or response bodies.
+        try:
+            diagnostic["analytics_sample_control_state"] = page.evaluate(
+                """() => {
+                  const video = document.getElementById('live-video');
+                  const button = document.getElementById('toggle-person-view');
+                  const panel = document.getElementById('person-view-panel');
+                  const frames = video?.getVideoPlaybackQuality?.().totalVideoFrames;
+                  const ready = video?.readyState;
+                  return {
+                    control_present: !!button,
+                    control_enabled: !!button && !button.disabled,
+                    panel_visible: !!panel && !panel.hidden,
+                    camera_online_badge: !!document.getElementById('connection-badge')
+                      ?.classList.contains('online'),
+                    live_playing: !!video && !video.paused && ready >= 2,
+                    has_dimensions: !!video && video.videoWidth > 0 && video.videoHeight > 0,
+                    ready_state: Number.isInteger(ready) && ready >= 0 && ready <= 4
+                      ? ready : null,
+                    decoded_frames: Number.isSafeInteger(frames) && frames >= 0
+                      ? Math.min(frames, 1000000) : null
+                  };
+                }"""
+            )
+        except Exception:
+            diagnostic["analytics_sample_control_state"] = {"available": False}
+        raise
+    button = page.locator("#toggle-person-view")
+    _require(button.is_enabled(), "Installed sampled-person control was not enabled")
+    route = f"/api/v1/operator/cameras/{camera_id}/person-view"
+    diagnostic["analytics_sample_stage"] = "native_frame_request"
+    # Observe only route identity and bounded finite counts/statuses. Never
+    # retain URLs, query parameters, upload pixels or request/response bodies.
+    traffic = {"requests": 0, "responses": 0, "failed": 0, "http_status": 0}
+    first_sent_at = [None]
+    control_probe = {}
+    control_thread = [None]
+
+    def measure_control_plane():
+        # A single independent, unauthenticated loopback health request during
+        # the sampled POST distinguishes gateway/backend starvation from a
+        # slow person handler. Never retain response bodies or local addresses.
+        began = time.monotonic()
+        try:
+            time.sleep(0.75)
+            independent = client.__class__(urlsplit(client.origin).port)
+            status, body, _ = independent.get("/api/v1/health", max_bytes=1024)
+            control_probe["status"] = status if status in {200, 404, 503, 504} else 0
+            try:
+                healthy = status == 200 and json.loads(body).get("status") == "ok"
+            except (TypeError, ValueError, AttributeError):
+                healthy = False
+            control_probe["healthy"] = healthy
+        except Exception:
+            control_probe["status"] = "transport_unavailable"
+            control_probe["healthy"] = False
+        finally:
+            control_probe["elapsed_ms"] = min(
+                30_000, max(0, int((time.monotonic() - began) * 1000))
+            )
+
+    def is_sample(request):
+        return request.method == "POST" and urlsplit(request.url).path == route
+
+    def observed_request(request):
+        if is_sample(request):
+            traffic["requests"] = min(5, traffic["requests"] + 1)
+            if first_sent_at[0] is None:
+                first_sent_at[0] = time.monotonic()
+                control_thread[0] = threading.Thread(target=measure_control_plane, daemon=True)
+                control_thread[0].start()
+
+    def observed_response(response):
+        if is_sample(response.request):
+            traffic["responses"] = min(5, traffic["responses"] + 1)
+            # HTTP status and elapsed time are finite transport evidence, not
+            # response content. Preserve unexpected 5xx classes to distinguish
+            # proxy/backend faults from a native inference refusal.
+            traffic["http_status"] = response.status if 100 <= response.status <= 599 else 0
+            if response.status == 429:
+                phase = response.headers.get("x-k5-person-phase")
+                traffic["busy_phase"] = phase if phase in {"capacity", "preparing"} else "other"
+            if first_sent_at[0] is not None:
+                elapsed_ms = min(120000, max(0, int((time.monotonic() - first_sent_at[0]) * 1000)))
+                # The first reply is authoritative for backend responsiveness.
+                # Do not overwrite it with the last 429/retry response.
+                traffic.setdefault("first_response_ms", elapsed_ms)
+                traffic["last_response_ms"] = elapsed_ms
+
+    def observed_failure(request):
+        if is_sample(request):
+            traffic["failed"] = min(5, traffic["failed"] + 1)
+            if first_sent_at[0] is not None:
+                traffic["first_failure_ms"] = min(
+                    120000, max(0, int((time.monotonic() - first_sent_at[0]) * 1000))
+                )
+            # Preserve only a finite transport classification, never the
+            # request URL, uploaded frame, headers or browser exception text.
+            failure = request.failure
+            traffic["failure_class"] = (
+                "aborted"
+                if failure == "net::ERR_ABORTED"
+                else "timed_out"
+                if failure == "net::ERR_TIMED_OUT"
+                else "connection_closed"
+                if failure in {"net::ERR_CONNECTION_CLOSED", "net::ERR_CONNECTION_RESET"}
+                else "other"
+            )
+
+    page.on("request", observed_request)
+    page.on("response", observed_response)
+    page.on("requestfailed", observed_failure)
+    try:
+        with page.expect_response(
+            # The product explicitly treats transient HTTP 429 as busy and retries.
+            # Only accept a real successful inference response; the positive
+            # same-frame box and canvas checks below remain mandatory.
+            lambda response: is_sample(response.request) and response.status == 200,
+            timeout=27_000,
+        ) as first:
+            button.click()
+        response = first.value
+    except Exception:
+        diagnostic["analytics_sample_request_traffic"] = dict(traffic)
+        # The API client already carries the operator's bearer authorization.
+        # Only the finite preparation phase enters evidence, never headers,
+        # credentials, server diagnostics, exception strings, or camera media.
+        try:
+            status_report = client.json("/api/v1/operator/status", max_bytes=8192)
+            preparation_phase = (
+                status_report.get("person_preparation_phase")
+                if type(status_report) is dict
+                else None
+            )
+            diagnostic["analytics_sample_backend_preparation"] = (
+                preparation_phase
+                if preparation_phase in {"not_requested", "preparing", "ready", "failed", "closed"}
+                else "unknown"
+            )
+        except Exception:
+            diagnostic["analytics_sample_backend_preparation"] = "unavailable"
+        try:
+            diagnostic["analytics_sample_request_state"] = page.evaluate(
+                """() => {
+                  const message = document.getElementById('person-view-message')?.textContent || '';
+                  const video = document.getElementById('live-video');
+                  const button = document.getElementById('toggle-person-view');
+                  // Only finite, locally defined categories are admitted to
+                  // failure evidence. Never retain DOM text, camera identifiers,
+                  // source addresses, request data, credentials or sampled pixels.
+                  const liveState = document.getElementById('live-state')?.textContent || '';
+                  const liveTitleNode = document.getElementById('live-placeholder-title');
+                  const liveTitle = liveTitleNode?.textContent || '';
+                  const cameraListNode = document.getElementById('camera-list-message');
+                  const cameraListMessage = cameraListNode?.textContent || '';
+                  const liveStatusClass = liveState.startsWith('Disconnected')
+                    ? 'disconnected'
+                    : liveState.startsWith('Reconnecting') ? 'reconnecting'
+                    : liveState.startsWith('Restoring media access') ? 'restoring_access'
+                    : liveState.startsWith('Live view unavailable') ? 'access_unavailable'
+                    : liveState.startsWith('Buffering live video') ? 'buffering'
+                    : liveState.startsWith('Unsupported video') ? 'unsupported_codec'
+                    : liveState.startsWith('Ready') ? 'ready'
+                    : liveState.startsWith('Connecting') ? 'connecting'
+                    : liveState.startsWith('Playing') ? 'playing'
+                    : 'other';
+                  const livePlaceholderClass = liveTitle.startsWith('Live view disconnected')
+                    ? 'disconnected'
+                    : liveTitle.startsWith('Reconnecting') ? 'reconnecting'
+                    : liveTitle.startsWith('Restoring media access') ? 'restoring_access'
+                    : liveTitle.startsWith('Media access unavailable') ? 'access_unavailable'
+                    : liveTitle.startsWith('Video format unavailable') ? 'unsupported_codec'
+                    : liveTitle.startsWith('Opening live view') ? 'opening'
+                    : 'other';
+                  const classification = message.startsWith('Processing a sampled frame')
+                    ? 'processing'
+                    : message.startsWith('Person detection is busy') ? 'busy'
+                    : message.startsWith('Person detection is unavailable') ? 'unavailable'
+                    : message.startsWith('Sampled view stopped while live video is paused')
+                      ? 'paused'
+                    : message.startsWith('Sampled view stopped while live video is buffering')
+                      ? 'buffering'
+                    : message.startsWith('Sampled view stopped while live video is unavailable')
+                      ? 'video_unavailable'
+                    : message.startsWith('Sampled view stopped while the camera is unavailable')
+                      ? 'camera_unavailable'
+                    : message.startsWith('Sampled view stopped') ? 'stopped_other'
+                    : message.startsWith('Select Start sampled view') ? 'reset_default'
+                    : message.includes(' in this sample') ? 'sample_received'
+                    : 'other';
+                  return {
+                    message_class: classification,
+                    live_status_class: liveStatusClass,
+                    live_placeholder_class: livePlaceholderClass,
+                    camera_list_error: cameraListMessage.includes('Camera list unavailable'),
+                    capabilities_tab_hidden: !!document.getElementById('live-tab')?.hidden,
+                    live_panel_visible: !document.getElementById('live-panel')?.hidden,
+                    retry_visible: !document.getElementById('retry-live')?.hidden,
+                    workspace_visible: !document.getElementById('workspace')?.hidden,
+                    enabled: button?.getAttribute('aria-pressed') === 'true',
+                    sample_button_enabled: !!button && !button.disabled,
+                    live_playing: !!video && !video.paused && video.readyState >= 2,
+                    canvas_visible: !document.getElementById('person-view-canvas')?.hidden
+                  };
+                }"""
+            )
+        except Exception:
+            diagnostic["analytics_sample_request_state"] = {"available": False}
+        raise
     finally:
-        diagnostic["analytics_events_http_status"] = client.last_http_status
-        if client.transport_failure is not None:
-            diagnostic["analytics_events_transport"] = dict(client.transport_failure)
-        else:
-            diagnostic.pop("analytics_events_transport", None)
+        page.remove_listener("request", observed_request)
+        page.remove_listener("response", observed_response)
+        page.remove_listener("requestfailed", observed_failure)
+        if control_thread[0] is not None:
+            control_thread[0].join(timeout=0.1)
+        diagnostic["analytics_sample_concurrent_health"] = (
+            dict(control_probe) if "elapsed_ms" in control_probe else {"completed": False}
+        )
+    diagnostic["analytics_sample_request_traffic"] = dict(traffic)
+    diagnostic["analytics_sample_response_no_store"] = (
+        response.headers.get("cache-control") == "no-store"
+    )
+    _require(
+        response.status == 200 and response.headers.get("cache-control") == "no-store",
+        "Installed sampled-person response was refused or could be cached",
+    )
+    query = parse_qs(urlsplit(response.url).query, strict_parsing=True)
+    _require(
+        set(query) == {"width", "height", "frame_id"}
+        and all(len(values) == 1 for values in query.values()),
+        "Installed person frame used an unexpected bounded request contract",
+    )
+    width, height, frame_id = (int(query[name][0]) for name in ("width", "height", "frame_id"))
+    received = response.json()
+    payload = response.request.post_data_buffer
+    # Restrict failure evidence to the server's finite status and booleans.
+    # Neither transient frames nor response bodies enter the CI receipt.
+    native_status = received.get("status") if type(received) is dict else None
+    diagnostic["analytics_sample_response_contract"] = {
+        "native_status": (
+            native_status
+            if type(native_status) is str and native_status in {"active", "busy", "unavailable"}
+            else "invalid"
+        ),
+        "frame_correlated": (type(received) is dict and received.get("frame_id") == frame_id),
+        "post_bytes_valid": isinstance(payload, bytes) and len(payload) == width * height * 4,
+        "box_count": (
+            min(33, len(received["boxes"]))
+            if type(received) is dict and type(received.get("boxes")) is list
+            else -1
+        ),
+    }
+    _require(
+        1 <= width <= 544
+        and 1 <= height <= 320
+        and 1 <= frame_id < 2**31
+        and isinstance(payload, bytes)
+        and len(payload) == width * height * 4
+        and type(received) is dict
+        and set(received) == {"status", "frame_id", "boxes"}
+        and received["frame_id"] == frame_id
+        and received["status"] in {"active", "busy"}
+        and type(received["boxes"]) is list
+        and len(received["boxes"]) <= 32,
+        "Installed native person sampling did not bind to the captured live frame",
+    )
+    diagnostic["analytics_sample_stage"] = "same_frame_canvas"
+    # Inspect only finite booleans, geometry and the number of the precise
+    # RGB stroke pixels used by the shipped renderer. Never snapshot media.
+    painted = page.wait_for_function(
+        """() => {
+          const canvas = document.getElementById('person-view-canvas');
+          const video = document.getElementById('live-video');
+          const message = document.getElementById('person-view-message')?.textContent || '';
+          if (!canvas || canvas.hidden || !video || video.paused ||
+              video.getVideoPlaybackQuality().totalVideoFrames < 4 ||
+              canvas.width <= 0 || canvas.height <= 0 ||
+              canvas.width > 544 || canvas.height > 320 ||
+              !message.includes(' in this sample') || message.startsWith('0 ')) return false;
+          const pixels = canvas.getContext('2d').getImageData(
+            0, 0, canvas.width, canvas.height).data;
+          let green = 0;
+          for (let i = 0; i < pixels.length; i += 4) {
+            if (pixels[i] === 104 && pixels[i + 1] === 210 &&
+                pixels[i + 2] === 164 && pixels[i + 3] === 255) green++;
+          }
+          if (green < 12) return false;
+          return {
+            overlay_pixels: green,
+            live_frames: video.getVideoPlaybackQuality().totalVideoFrames
+          };
+        }""",
+        timeout=30_000,
+    ).json_value()
+    _require(
+        type(painted) is dict
+        and type(painted.get("overlay_pixels")) is int
+        and 12 <= painted["overlay_pixels"] <= 544 * 320
+        and type(painted.get("live_frames")) is int
+        and 4 <= painted["live_frames"] <= 1_000_000,
+        "Installed person rectangle was not painted over its immutable sample",
+    )
+    diagnostic["analytics_sample_stage"] = "clear_sample"
+    button.click()
+    page.wait_for_function(
+        """() => {
+          const canvas = document.getElementById('person-view-canvas');
+          return canvas && canvas.hidden && canvas.width === 0 && canvas.height === 0;
+        }""",
+        timeout=5_000,
+    )
+    browser_helpers._open_camera_recordings(page, camera_id)
+    diagnostic["analytics_sample_stage"] = "complete"
+    return {
+        "analytics_sampled_native_boxes": True,
+        "analytics_sampled_same_frame_overlay": True,
+        "analytics_sampled_canvas_cleared": True,
+        "analytics_sampled_overlay_pixels": painted["overlay_pixels"],
+        "analytics_sampled_live_decoded_frames": painted["live_frames"],
+    }
+
+
+def _poll_installed_person_event(client, route, diagnostic):
+    """Tolerate only bounded gateway reconnection during the original 25s gate.
+
+    The real positive person-event and same-frame box requirements remain
+    mandatory. Retain only a finite HTTP status, never any response content.
+    """
+    status, body, _ = client.get(route + "/events")
+    if status != 200:
+        diagnostic["analytics_event_poll_status"] = (
+            status if status in {401, 403, 404, 429, 500, 502, 503, 504} else "other"
+        )
+        if status in {502, 503, 504}:
+            return None
+        _require(False, "Installed person-event endpoint refused its authenticated poll")
+    diagnostic["analytics_event_poll_status"] = 200
+    payload = json.loads(body)
+    _require(
+        type(payload) is dict and type(payload.get("events")) is list,
+        "Installed person-event endpoint returned an invalid event envelope",
+    )
+    if not payload["events"]:
+        return None
+    _require(
+        type(payload["events"][0]) is dict,
+        "Installed person-event endpoint returned an invalid event",
+    )
+    return payload["events"][0]
 
 
 def _installed_analytics_journey(
@@ -1807,13 +2332,14 @@ def _installed_analytics_journey(
         credentials=publisher_credentials,
     )
     processes.append(publishers[0])
+    positive_source_switched_at = datetime.now(UTC)
     detected = {}
 
     def positive_event():
-        result = _installed_person_events(client, route + "/events", diagnostic)
-        if not result:
+        event = _poll_installed_person_event(client, route, diagnostic)
+        if event is None:
             return False
-        detected.update(result[0])
+        detected.update(event)
         return (
             detected.get("camera_id") == camera_id
             and type(detected.get("person_count")) is int
@@ -1834,16 +2360,58 @@ def _installed_analytics_journey(
         # recorder using only typed, credential-free backend status.
         try:
             state = client.json(route + "/analytics")
+            sampled_at = state.get("last_sample_at")
+            try:
+                fresh_sample = (
+                    datetime.fromisoformat(sampled_at.replace("Z", "+00:00"))
+                    >= positive_source_switched_at
+                )
+            except (AttributeError, TypeError, ValueError):
+                fresh_sample = False
             diagnostic["analytics_failure_state"] = {
-                key: state.get(key) for key in ("status", "processed_frames", "event_count")
+                key: state.get(key)
+                for key in (
+                    "status",
+                    "processed_frames",
+                    "event_count",
+                    "sample_attempts",
+                    "sample_phase",
+                    "last_completed_phase",
+                    "native_write_cause",
+                )
             }
+            diagnostic["analytics_failure_state"]["sample_after_source_switch"] = fresh_sample
         except Exception:
             diagnostic["analytics_failure_state"] = {"available": False}
+        try:
+            inventory = client.json("/api/v1/operator/cameras")
+            camera = next(
+                item for item in inventory["cameras"] if item.get("device_id") == camera_id
+            )
+            recording = camera.get("recording_status") or {}
+            observed = recording.get("observed_bytes")
+            progress_age = recording.get("last_progress_age_seconds")
+            recording_state = camera.get("recording_state")
+            diagnostic["analytics_failure_recorder"] = {
+                "publisher_running": publishers[0].poll() is None,
+                "camera_live": camera.get("status") == "live",
+                "state": recording_state
+                if recording_state in {"recording", "waiting", "paused", "stalled", "error"}
+                else "other",
+                "observed_bytes_positive": type(observed) is int and observed > 0,
+                "recent_disk_progress": type(progress_age) in (int, float)
+                and 0 <= progress_age <= 15,
+            }
+        except Exception:
+            diagnostic["analytics_failure_recorder"] = {"available": False}
         raise
     occurred = datetime.fromisoformat(detected["occurred_at"].replace("Z", "+00:00"))
     _require(
         abs((datetime.now(UTC) - occurred).total_seconds()) < 30,
         "Person event was not mapped to the fresh recording's UTC timestamp",
+    )
+    sampled_evidence = _installed_sampled_person_boxes(
+        page, camera_id, client, browser_helpers, diagnostic
     )
     diagnostic["analytics_stage"] = "event_recording_navigation"
     diagnostic["analytics_navigation_step"] = "history_range_click"
@@ -1940,6 +2508,7 @@ def _installed_analytics_journey(
         "analytics_mock_inference": False,
         "analytics_accuracy_acceptance": False,
         "analytics_public_fixture_only": True,
+        **sampled_evidence,
     }, detected
 
 
@@ -2259,7 +2828,16 @@ def _vm_clock_phase(
                 mark_clock_phase(direction + "_two_maintenance_cycles")
                 diagnostic["vm_clock_stage"] = direction + "_live"
                 diagnostic["vm_clock_stage"] = direction + "_live_media"
-                live_status = context.request.get(live_url, timeout=5000).status
+                try:
+                    live_status = context.request.get(live_url, timeout=5000).status
+                except Exception:
+                    # Classify the local gateway independently after the
+                    # original browser request has failed. Never count this as
+                    # accepted media or grant another browser attempt.
+                    diagnostic["vm_clock_live_gateway_probe"] = _clock_live_gateway_probe(
+                        live_url, original_token
+                    )
+                    raise
                 diagnostic["vm_clock_media_http_status"] = live_status
                 _require(live_status == 200, "VM clock step expired authenticated live media")
                 _require(
@@ -2402,11 +2980,28 @@ def _vm_clock_phase(
     diagnostic["vm_clock_stage"] = "restored_history_query"
     try:
         restored_history = client.json(route + "/history" + history_query)["spans"]
-    finally:
-        # The local client reports transport failures as RuntimeError. Retain
-        # only its bounded, route-free exception class and elapsed time.
+    except RuntimeError:
+        # Preserve the failed history request and its three-second deadline.
+        # After UTC restoration, probe health once, without retrying history.
+        # Only retain finite status/error types, never routes or camera data.
         if client.transport_failure is not None:
             diagnostic["vm_clock_history_transport"] = dict(client.transport_failure)
+        try:
+            observed = {}
+            ready = _healthy(client, observed)
+            diagnostic["vm_clock_postfailure_health"] = {
+                "reachable": True,
+                "ready": ready,
+                "status": observed.get("health_http_status", 0),
+            }
+        except RuntimeError:
+            failure = client.transport_failure or {}
+            diagnostic["vm_clock_postfailure_health"] = {
+                "reachable": False,
+                "exception_type": failure.get("exception_type", "other"),
+                "elapsed_seconds": failure.get("elapsed_seconds"),
+            }
+        raise
     diagnostic["vm_clock_stage"] = "restored_history_unchanged"
     _require(
         all(span in restored_history for span in before_history),
@@ -3626,6 +4221,46 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 nvr_diagnostic["wall_state_at_failure"] = browser_helpers._wall_state(page)
             except BaseException:
                 nvr_diagnostic["wall_state_probe_failed"] = True
+        if failure is not None and stage == "installed_continuous_person_analytics":
+            # Reproduce a camera-free native model prime in the *installed*
+            # runtime while the failing desktop instance remains alive. The
+            # packaged-payload smoke does not exercise this installed context.
+            # Capture only a finite outcome; never stdout, stderr, model paths,
+            # credentials, request content, recording bytes or source URIs.
+            probe = (
+                "from k5vision.operator_events import _RecordedNativeWorker\n"
+                "from k5vision.operator_analytics_person import "
+                "load_installed_person_configuration\n"
+                "config = load_installed_person_configuration({})\n"
+                "assert config is not None\n"
+                "worker = _RecordedNativeWorker(config)\n"
+                "try:\n"
+                "    assert worker.request(None) is None and worker._person_ready\n"
+                "finally:\n"
+                "    worker.close()\n"
+            )
+            try:
+                completed = subprocess.run(
+                    [str(installed / "runtime/python.exe"), "-I", "-B", "-c", probe],
+                    cwd=installed,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    timeout=22,
+                    check=False,
+                )
+                nvr_diagnostic["analytics_installed_native_child_probe"] = (
+                    "passed"
+                    if completed.returncode == 0
+                    else "refused"
+                    if completed.returncode in {1, 2}
+                    else "abnormal_exit"
+                )
+            except subprocess.TimeoutExpired:
+                nvr_diagnostic["analytics_installed_native_child_probe"] = "timed_out"
+            except (OSError, ValueError):
+                nvr_diagnostic["analytics_installed_native_child_probe"] = "unavailable"
         if failure is not None and stage.startswith("actual_wall"):
             try:
                 status, body, _ = client.get("/api/v1/operator/cameras")
@@ -3654,27 +4289,68 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         except BaseException:
             desktop_status = "unresponsive"
             desktop_probe = {"available": False}
+
+        def record_cleanup_failure(phase, error):
+            # First finite failure stage and type only: never an OS exception
+            # message, local path, process command, credential or source URI.
+            stages = {
+                "admin_executor",
+                "permissions_executor",
+                "browser_context",
+                "browser",
+                "playwright",
+                "cohort_process",
+                "publisher_process",
+                "onvif_fixture",
+                "temporary_files",
+            }
+            if phase not in stages:
+                phase = "other"
+            kind = type(error).__name__
+            kinds = {
+                "OSError",
+                "PermissionError",
+                "FileNotFoundError",
+                "TimeoutExpired",
+                "RuntimeError",
+                "AccessDenied",
+                "Error",
+                "ValueError",
+            }
+            nvr_diagnostic.setdefault("cleanup_failure_phase", phase)
+            nvr_diagnostic.setdefault("cleanup_failure_type", kind if kind in kinds else "other")
+            nvr_diagnostic["cleanup_failure_count"] = min(
+                9, nvr_diagnostic.get("cleanup_failure_count", 0) + 1
+            )
+
         if admin_executor is not None:
             try:
                 admin_executor.shutdown(wait=True, cancel_futures=True)
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("admin_executor", error)
         if permissions_executor is not None:
             try:
                 permissions_executor.shutdown(wait=True, cancel_futures=True)
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("permissions_executor", error)
         process_counts = _cohort_diagnostic(cohort)
         app_exit_code = app.poll() if app else None
         form_alive = bool(form and api.api.IsWindow(form))
         form_visible = bool(form and api.api.IsWindowVisible(form))
         cohort.finish()
-        for resource in (context, browser, playwright):
+        for name, resource in (
+            ("browser_context", context),
+            ("browser", browser),
+            ("playwright", playwright),
+        ):
             if resource is not None:
                 try:
-                    resource.stop() if resource is playwright else resource.close()
-                except Exception:
+                    resource.stop() if name == "playwright" else resource.close()
+                except Exception as error:
                     cleanup_failed = True
+                    record_cleanup_failure(name, error)
         for process in reversed(cohort.snapshot()):
             try:
                 if process.is_running():
@@ -3682,25 +4358,29 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                     process.wait(timeout=10)
             except psutil.NoSuchProcess:
                 pass
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("cohort_process", error)
         for process in reversed(processes):
             try:
                 helpers._stop_owned(process)
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("publisher_process", error)
         for camera_fixture in onvif_cameras:
             try:
                 camera_fixture.close()
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("onvif_fixture", error)
         for listener in reservations:
             listener.close()
         if parent.exists():
             try:
                 shutil.rmtree(parent)
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("temporary_files", error)
         stage_durations.append(("cleanup", round(time.monotonic() - cleanup_started, 2)))
         diagnostic = {
             "stage": stage,

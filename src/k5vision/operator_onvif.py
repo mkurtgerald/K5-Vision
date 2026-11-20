@@ -920,7 +920,10 @@ def _discover(interface: str | None, budget: float, interface_provider=None) -> 
             raise OnvifError("unreachable")
         packets = 0
         while packets < 256 and len(results) < 64:
-            remaining = deadline - time.monotonic()
+            # Floating-point rounding can make deadline - now exceed the
+            # original budget by a few ulps. Never hand select a larger wait
+            # than the caller authorized, even on a quiet Windows runner.
+            remaining = min(budget, deadline - time.monotonic())
             if remaining <= 0:
                 break
             readable, _, _ = select.select(wires, [], [], remaining)

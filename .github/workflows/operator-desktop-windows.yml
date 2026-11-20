@@ -183,7 +183,23 @@ jobs:
           $compilerRoot = Join-Path $env:RUNNER_TEMP ("K5 desktop compiler " + [guid]::NewGuid().ToString("N"))
           New-Item -ItemType Directory -Path $compilerRoot | Out-Null
           $archive = Join-Path $compilerRoot "innosetup-6.4.3.exe"
-          Invoke-WebRequest -Uri $identity.url -OutFile $archive -TimeoutSec 180
+          # GitHub's release CDN intermittently serves HTTP 500/502/504.
+          # Retry only transport outages, never an identity or hash mismatch.
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              Invoke-WebRequest -Uri $identity.url -OutFile $archive -TimeoutSec 180 -ErrorAction Stop
+              break
+            } catch {
+              $response = $_.Exception.Response
+              $status = if ($null -ne $response) { [int]$response.StatusCode } else { 0 }
+              Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+              if ($status -notin @(408, 429, 500, 502, 503, 504) -or $attempt -eq 3) {
+                throw "Reviewed Inno Setup archive transport unavailable"
+              }
+              Write-Host "Reviewed compiler transport $status; bounded retry $attempt"
+              Start-Sleep -Seconds (2 * $attempt)
+            }
+          }
           $actual = Get-Item -LiteralPath $archive
           if ($actual.Length -ne $identity.bytes -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $identity.sha256) {
             throw "Inno Setup compiler archive identity mismatch"
@@ -218,6 +234,40 @@ jobs:
           }
           "K5_DESKTOP_SETUP=$(Join-Path $output 'K5VisionSetup.exe')" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           "K5_DESKTOP_PAYLOAD=$payload" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Stage byte-admitted unqualified candidate for independent upgrade testing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = Get-Item -LiteralPath $env:K5_DESKTOP_SETUP
+          $payload = (Resolve-Path -LiteralPath desktop-build/payload).Path
+          $manifestPath = Join-Path $payload "payload-manifest.json"
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA) {
+            throw "Unqualified upgrade candidate manifest head mismatch"
+          }
+          $launcher = Get-Item -LiteralPath (Join-Path $payload "K5Vision.exe")
+          $candidate = Join-Path $env:GITHUB_WORKSPACE "desktop-build/upgrade-candidate"
+          New-Item -ItemType Directory -Force -Path $candidate | Out-Null
+          Copy-Item -LiteralPath $setup.FullName -Destination (Join-Path $candidate "K5VisionSetup.exe")
+          Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $candidate "payload-manifest.json")
+          # This artifact is NOT a release or a passed graphical witness. It
+          # exists so cross-version upgrade/reversal can run when person boxes
+          # still block the independent installed GUI acceptance.
+          @{
+            schema_version=1; qualification_status='unqualified';
+            head_sha=$env:K5_DESKTOP_HEAD_SHA;
+            setup_sha256=(Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant();
+            setup_bytes=$setup.Length;
+            launcher_sha256=(Get-FileHash -LiteralPath $launcher.FullName -Algorithm SHA256).Hash.ToLowerInvariant();
+            payload_manifest_sha256=(Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $candidate "desktop-package.json") -Encoding utf8
+      - name: Upload non-release candidate for independent upgrade and reversal qualification
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: k5-vision-windows-upgrade-candidate-${{ github.event.pull_request.head.sha || github.sha }}
+          path: desktop-build/upgrade-candidate/
+          if-no-files-found: error
+          retention-days: 14
       - name: Exercise actual installer, first-run account, tray, media and uninstall
         timeout-minutes: 12
         shell: pwsh
@@ -269,6 +319,8 @@ jobs:
             'product_analytics_enablement', 'analytics_bundled_native_inference',
             'analytics_gui_configuration', 'analytics_person_event_recorded',
             'analytics_event_utc_playback', 'analytics_public_fixture_only',
+            'analytics_sampled_native_boxes', 'analytics_sampled_same_frame_overlay',
+            'analytics_sampled_canvas_cleared',
             'analytics_browser_closed_detection', 'analytics_role_camera_permissions',
             'analytics_settings_events_persisted',
             'settings_admin_gui',
@@ -319,6 +371,7 @@ jobs:
             direct_rtsp_enrollment=$true
             admin_user_management=$true; role_permissions=$true; camera_access_controls=$true
             person_analytics_bundled=$true; background_person_events=$true
+            installed_person_sampled_boxes=$true
             storage_settings=$true; windows_time_administration=$true; camera_time_administration=$true
             operational_audit=$true; custom_roles=$true; mfa=$true; oidc_sso=$true
             neural_adapter_v2=$true; analytics_event_adapter=$true; shared_neural_host=$false
@@ -430,6 +483,10 @@ jobs:
   cross-revision-upgrade:
     name: Install baseline, qualify stopped upgrade and manual reversal
     needs: [native-desktop, focused-windows]
+    # Independent upgrade/reversal is not a graphical acceptance bypass.
+    # Run even when the other VM fails person-event acceptance, provided the
+    # focused Windows gates passed; a missing candidate artifact fails closed.
+    if: ${{ always() && needs.focused-windows.result == 'success' && (needs.native-desktop.result == 'success' || needs.native-desktop.result == 'failure') }}
     runs-on: windows-2025
     timeout-minutes: 30
     env:
@@ -467,8 +524,33 @@ jobs:
           if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or $env:RUNNER_OS -ne "Windows") {
             throw "Cross-revision test requires a disposable hosted Windows VM"
           }
-          python baseline-source/scripts/build_desktop_payload.py --output baseline-build --head-sha $env:K5_DESKTOP_BASELINE_HEAD_SHA --media-exe $env:K5_MEDIAMTX_DONOR_EXE --gateway-exe $env:K5_CADDY_DONOR_EXE
-          if ($LASTEXITCODE -ne 0) { throw "Previously qualified baseline payload could not be reproduced" }
+          # The pinned historical builder predates archive retry support. Only a
+          # native-worker HTTP transport refusal may retry. Historical source,
+          # hashes, accepted archives, payload admission, and upgrade tests stay exact.
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            $log = Join-Path $env:RUNNER_TEMP ("k5-baseline-build-" + [guid]::NewGuid().ToString("N") + ".txt")
+            try {
+              & python baseline-source/scripts/build_desktop_payload.py --output baseline-build --head-sha $env:K5_DESKTOP_BASELINE_HEAD_SHA --media-exe $env:K5_MEDIAMTX_DONOR_EXE --gateway-exe $env:K5_CADDY_DONOR_EXE *> $log
+              $exitCode = $LASTEXITCODE
+              $output = Get-Content -LiteralPath $log -Raw -ErrorAction Stop
+              if ($exitCode -eq 0) {
+                Write-Host "Exact historical baseline payload built with pinned donor identities"
+                break
+              }
+              # This is the historical builder's existing fixed error vocabulary;
+              # never print the captured output, source URL, or donor contents.
+              $retryable = $output -match '\{"desktop_payload_refused": true, "stage": "native_workers", "error_type": "HTTPError"\}'
+              if (-not $retryable -or $attempt -eq 3) {
+                throw "Previously qualified baseline payload could not be reproduced"
+              }
+              $output = $null
+              Remove-Item -LiteralPath baseline-build -Recurse -Force -ErrorAction Stop
+              Write-Host "Historical native-worker archive transport refused; bounded retry $attempt"
+              Start-Sleep -Seconds (2 * $attempt)
+            } finally {
+              Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
+            }
+          }
       - name: Compile exact historical graphical supervisor
         shell: pwsh
         run: |
@@ -489,7 +571,23 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP ("k5-upgrade-inno-" + [guid]::NewGuid().ToString("N"))
           New-Item -ItemType Directory -Path $root | Out-Null
           $archive = Join-Path $root "innosetup-6.4.3.exe"
-          Invoke-WebRequest -Uri $pin.url -OutFile $archive -TimeoutSec 180
+          # Match the graphical installer lane's bounded CDN outage recovery.
+          # Only retry transient transport errors; the byte/SHA gate below is mandatory.
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              Invoke-WebRequest -Uri $pin.url -OutFile $archive -TimeoutSec 180 -ErrorAction Stop
+              break
+            } catch {
+              $response = $_.Exception.Response
+              $status = if ($null -ne $response) { [int]$response.StatusCode } else { 0 }
+              Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+              if ($status -notin @(408, 429, 500, 502, 503, 504) -or $attempt -eq 3) {
+                throw "Baseline Inno Setup archive transport unavailable"
+              }
+              Write-Host "Baseline compiler transport $status; bounded retry $attempt"
+              Start-Sleep -Seconds (2 * $attempt)
+            }
+          }
           if ((Get-Item -LiteralPath $archive).Length -ne $pin.bytes -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pin.sha256) {
             throw "Inno Setup baseline compiler byte identity mismatch"
           }
@@ -518,10 +616,10 @@ jobs:
           if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "Baseline installer unavailable" }
           "K5_DESKTOP_BASELINE_SETUP=$setup" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           "K5_DESKTOP_BASELINE_SETUP_SHA256=$((Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant())" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
-      - name: Retrieve exact installer verified by the current source VM
+      - name: Retrieve exact unqualified candidate for independent upgrade testing
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          name: k5-vision-windows-setup-${{ github.event.pull_request.head.sha || github.sha }}
+          name: k5-vision-windows-upgrade-candidate-${{ github.event.pull_request.head.sha || github.sha }}
           path: candidate-setup
       - name: Admit candidate executable and complete release manifest
         shell: pwsh
@@ -531,7 +629,8 @@ jobs:
           $manifest = Get-Content -LiteralPath candidate-setup/payload-manifest.json -Raw | ConvertFrom-Json
           $setup = Get-Item -LiteralPath candidate-setup/K5VisionSetup.exe
           $hash = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($meta.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+          if ($meta.qualification_status -ne "unqualified" -or
+              $meta.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
               $meta.setup_sha256 -ne $hash -or $meta.setup_bytes -ne $setup.Length -or
               $meta.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath candidate-setup/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
               $meta.launcher_sha256 -notmatch '^[a-f0-9]{64}$') {

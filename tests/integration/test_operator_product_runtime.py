@@ -513,6 +513,21 @@ def test_assembled_operator_product_login_live_recording_logout_and_restart(
                 "operator_product_transport_failure",
                 json.dumps(client.transport_failure, sort_keys=True),
             )
+            # Failure-only independent health probe. Do not retry the failed
+            # authentication or extend its original three-second budget.
+            # Distinguishes a blocked login path from loss of control-plane
+            # responsiveness during a real native restart. Never retain the
+            # request, response body, credentials, paths or source addresses.
+            health_class = "unreachable"
+            try:
+                health_status, _body, _headers = _Client(product_ports[0]).get("/api/v1/health")
+                health_class = "healthy" if health_status == 200 else "non_200"
+            except RuntimeError:
+                pass
+            record_testsuite_property(
+                "operator_product_failure_health",
+                json.dumps({"independent_health": health_class}, sort_keys=True),
+            )
         print("Product phase: stop and reap owned application and fixtures", flush=True)
         cleanup_failures = 0
         for product in reversed(products):

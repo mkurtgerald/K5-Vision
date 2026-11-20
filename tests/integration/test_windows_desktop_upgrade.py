@@ -16,9 +16,11 @@ import secrets
 import shutil
 import socket
 import subprocess
+import time
 from pathlib import Path
 from uuid import uuid4
 
+import psutil
 import pytest
 
 from k5vision import identity_state
@@ -84,10 +86,6 @@ def _free_local_port() -> int:
 def _assert_running_upgrade_refused(setup: Path, installed: Path, api) -> None:
     """Exercise a real double-click-style refusal, not a hidden modal installer."""
     import subprocess
-    import time
-
-    import psutil
-
     process = subprocess.Popen(
         [str(setup), "/SP-", "/NORESTART", "/DIR=" + str(installed)],
         stdin=subprocess.DEVNULL,
@@ -140,6 +138,57 @@ def _assert_running_upgrade_refused(setup: Path, installed: Path, api) -> None:
                     pass
 
 
+def _uninstall_through_clone_completion(uninstaller: Path) -> tuple[int, bool]:
+    """Wait for the actual Inno uninstall clone, not just its original EXE.
+
+    Inno's TEMP clone may still be completing its deletion after the original
+    uninstaller returns success. Keep the same 45-second total deadline for
+    both processes, and never inspect or persist their paths or arguments.
+    """
+    process = subprocess.Popen(
+        [str(uninstaller), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 45
+    children: dict[int, psutil.Process] = {}
+    try:
+        while process.poll() is None:
+            try:
+                for child in psutil.Process(process.pid).children(recursive=True)[:32]:
+                    children[child.pid] = child
+            except psutil.Error:
+                pass
+            if time.monotonic() >= deadline:
+                pytest.fail("Candidate uninstaller exceeded its 45-second deadline", pytrace=False)
+            time.sleep(0.05)
+
+        # A successful return code alone does not mean Inno's clone has exited.
+        # Do not retry, terminate early, or skip a still-running clone.
+        if process.returncode == 0:
+            for child in children.values():
+                while child.is_running():
+                    if time.monotonic() >= deadline:
+                        pytest.fail(
+                            "Candidate uninstall clone exceeded its 45-second deadline",
+                            pytrace=False,
+                        )
+                    time.sleep(0.05)
+        return process.returncode, bool(children)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        for child in children.values():
+            try:
+                if child.is_running():
+                    child.kill()
+                    child.wait(timeout=5)
+            except psutil.Error:
+                pass
+
+
 def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_property):
     assert all(os.environ.get(name) for name in _INPUTS), "Missing exact upgrade test input"
     d = _desktop_helpers()
@@ -171,13 +220,19 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
     cohort = d._Cohort(api)
     verified = []
     cleanup_failed = False
+    phase = "baseline_setup"
+    installer_diagnostic = {}
+    uninstall_clone_observed = False
+    health_statuses = set()
+    readiness_attempts = 0
+    last_health_transport = None
     try:
-        d._install_gui(baseline, installed, api)
+        d._install_gui(baseline, installed, api, diagnostic=installer_diagnostic)
         _assert_installed(installed, old_head, old_launcher)
         client = runtime._Client(port)
 
         def start_and_login(*, first: bool) -> str:
-            nonlocal app
+            nonlocal app, readiness_attempts, last_health_transport
             app = d._start_app(installed, profile, port, cohort)
             form = d._wait(lambda: api.form(app.pid), "Installed upgrade window", process=app)
             if first:
@@ -190,9 +245,29 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
                 api.set_text(form, d._PASSWORD, password)
                 api.set_text(form, d._CONFIRM, password)
                 api.click(api.control(form, d._CREATE))
+            health_statuses.clear()
+            readiness_attempts = 0
+            last_health_transport = None
+
+            def observed_health():
+                nonlocal readiness_attempts, last_health_transport
+                readiness_attempts += 1
+                diagnostic = {}
+                try:
+                    ready = d._healthy(client, diagnostic)
+                except RuntimeError:
+                    # Store only the transport helper's bounded type and timing,
+                    # never a route, payload, account or local profile path.
+                    if client.transport_failure is not None:
+                        last_health_transport = dict(client.transport_failure)
+                    raise
+                if "health_http_status" in diagnostic:
+                    health_statuses.add(diagnostic["health_http_status"])
+                return ready
+
             d._wait(
-                lambda: d._healthy(client, {}),
-                "Cross-revision installed backend ready",
+                observed_health,
+                "Cross-revision " + phase + " installed backend ready",
                 process=app,
                 timeout=60,
             )
@@ -203,6 +278,7 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
             app = None
             return str(result)
 
+        phase = "baseline_login"
         original_site = start_and_login(first=True)
         verified.append("baseline_login")
 
@@ -221,6 +297,7 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
 
         # Prove the candidate's Inno guard refuses replacement of a live
         # product before it changes the currently installed executable.
+        phase = "live_upgrade_refusal"
         app = d._start_app(installed, profile, port, cohort)
         form = d._wait(lambda: api.form(app.pid), "Running baseline window", process=app)
         d._wait(
@@ -236,7 +313,9 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
         app = None
         verified.append("live_upgrade_refused")
 
-        d._install_gui(candidate, installed, api)
+        phase = "candidate_install"
+        installer_diagnostic.clear()
+        d._install_gui(candidate, installed, api, diagnostic=installer_diagnostic)
         _assert_installed(installed, new_head, new_launcher)
         assert _installed_payload_check(installed) == 0
         # A changed installed licensing byte must fail the same admission used
@@ -252,18 +331,85 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
             licensed.write_bytes(original)
         assert _installed_payload_check(installed) == 0
         assert_preserved()
+        phase = "candidate_login"
         assert start_and_login(first=False) == original_site
         verified.append("new_revision_login")
 
-        # A stopped user-initiated reversal is *not* automatic rollback of a
-        # failed activation. It demonstrates compatibility of both installers
-        # with the same persistent operator account and profile bytes.
-        d._install_gui(baseline, installed, api)
+        # An older baseline cannot trust unlisted files left by a newer
+        # revision. A safe *manual* reversal must first remove the stopped
+        # candidate with its real, identity-admitted Windows uninstaller,
+        # then install the baseline. This is not automatic failed-activation
+        # rollback or a claim of in-place downgrade compatibility.
+        phase = "reversal_uninstall"
+        uninstaller = installed / "unins000.exe"
+        assert uninstaller.is_file(), "Candidate uninstaller is missing"
+        uninstall_exit, uninstall_clone_observed = _uninstall_through_clone_completion(
+            uninstaller
+        )
+        assert uninstall_exit == 0, "Candidate manual reversal uninstall failed"
+        # Inno can terminate its original uninstaller before the TEMP clone
+        # finishes. The next real installer must not race that cleanup.
+        assert not (installed / "K5Vision.exe").exists(), "Candidate executable survived uninstall"
+        assert_preserved()
+        verified.append("candidate_uninstall_preserved_profile")
+
+        phase = "reversal_install"
+        installer_diagnostic.clear()
+        d._install_gui(baseline, installed, api, diagnostic=installer_diagnostic)
         _assert_installed(installed, old_head, old_launcher)
         assert_preserved()
+        phase = "reversal_login"
         assert start_and_login(first=False) == original_site
         verified.append("baseline_reversal_login")
     finally:
+        # Distinguish an alive-but-unready supervisor from a UI refusal.
+        # Classify known message prefixes; never retain actual window text.
+        desktop_phase = "unavailable"
+        try:
+            if app is not None and app.poll() is None:
+                last_form = api.form(app.pid)
+                if last_form is not None:
+                    desktop_phase = d._desktop_status(api, last_form)
+        except (OSError, RuntimeError):
+            pass
+        # Retain only finite stage and health evidence on both pass and fail.
+        record_testsuite_property(
+            "desktop_cross_revision_stage_diagnostic",
+            json.dumps(
+                {
+                    "phase": phase,
+                    "verified_steps": verified,
+                    "uninstall_clone_observed": uninstall_clone_observed,
+                    "installer": {
+                        "action": installer_diagnostic.get("installer_action"),
+                        "install_posted": bool(
+                            installer_diagnostic.get("installer_install_posted", False)
+                        ),
+                        "next_clicks": installer_diagnostic.get("installer_next_clicks", 0),
+                        "modal_visible": bool(
+                            installer_diagnostic.get("installer_modal_visible", False)
+                        ),
+                        "modal_class": installer_diagnostic.get(
+                            "installer_modal_classification", "none"
+                        ),
+                        "seal_class": installer_diagnostic.get(
+                            "installer_seal_refusal_category", "none"
+                        ),
+                        "steps_seen": installer_diagnostic.get("installer_steps_seen", []),
+                        "exit_code": installer_diagnostic.get("installer_exit_code"),
+                        "timeout_activity": installer_diagnostic.get(
+                            "installer_timeout_activity", {"observation": "not_applicable"}
+                        ),
+                    },
+                    "health_http_statuses": sorted(health_statuses),
+                    "readiness_attempts": readiness_attempts,
+                    "last_health_transport": last_health_transport,
+                    "desktop_phase": desktop_phase,
+                    "supervisor_exit_code": app.poll() if app is not None else None,
+                },
+                sort_keys=True,
+            ),
+        )
         cohort.finish()
         for process in reversed(cohort.snapshot()):
             try:
@@ -283,6 +429,7 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
         "baseline_login",
         "live_upgrade_refused",
         "new_revision_login",
+        "candidate_uninstall_preserved_profile",
         "baseline_reversal_login",
     ]
     record_testsuite_property(
@@ -296,6 +443,8 @@ def test_stopped_graphical_cross_revision_upgrade_and_reversal(record_testsuite_
                 "live_upgrade_refused": True,
                 "account_and_profile_retained": True,
                 "stopped_manual_reversal": True,
+                "candidate_uninstall_preserved_profile": True,
+                "manual_reversal_requires_candidate_uninstall": True,
                 "automatic_failed_activation_rollback": False,
                 "media_compatibility_qualified": False,
                 "synthetic_input_only": True,

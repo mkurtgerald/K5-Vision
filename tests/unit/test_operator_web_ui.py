@@ -23,6 +23,114 @@ _CAMERA = "e4fd401d-ae8e-4ac2-9f92-e8287f241532"
 _OTHER = "2cad3cbb-c56a-4368-b3e6-e5032576b77a"
 
 
+def test_busy_person_sample_preserves_last_verified_canvas_until_new_active_sample():
+    """A transient native-capacity busy response has no boxes to redraw."""
+    source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    busy_branch = 'if (result.status === "busy") {'
+    assert source.count(busy_branch) == 1
+    after_busy = source.split(busy_branch, 1)[1]
+    busy_body, active_body = after_busy.split("} else {", 1)
+    assert '"person-view-canvas").hidden' in busy_body
+    assert "putImageData" not in busy_body
+    assert "canvas.width =" not in busy_body
+    assert "output.putImageData(snapshot, 0, 0);" in active_body
+    assert "output.strokeRect" in active_body
+
+
+def test_installed_sampled_person_recovers_from_only_two_transient_service_failures():
+    """Two local HTTP 503 retries never mask bad results or revocation."""
+    source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    sample = source.split("async function samplePerson(epoch)", 1)[1].split(
+        "async function startLive(", 1
+    )[0]
+    assert 'throw new ApiError(503, "person_contract_invalid")' in sample
+    assert 'error.status === 503 && error.code !== "person_contract_invalid"' in sample
+    assert "state.personTransient503 < 2 && canSamplePerson()" in sample
+    assert "state.personTransient503 += 1;" in sample
+    assert "state.personTransient503 = 0;" in sample
+    assert "stopPersonView(apiMessage(error," in sample
+    assert "state.personTimer = setTimeout(() => void samplePerson(epoch)" in sample
+    stop = source.split("function stopPersonView(", 1)[1].split("function validPersonBox(", 1)[0]
+    assert "state.personTransient503 = 0;" in stop
+    assert "state.personController?.abort();" in stop
+    start_click = source.split('$("toggle-person-view").addEventListener("click"', 1)[1].split(
+        "void samplePerson(epoch)", 1
+    )[0]
+    assert "state.personTransient503 = 0;" in start_click
+
+
+def test_inflight_person_response_survives_transient_hls_buffering():
+    """A successful immutable frame stays renderable if live video re-buffers."""
+    source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    submitted = source.split("async function samplePerson(epoch)", 1)[1].split(
+        "async function startLive(", 1
+    )[0]
+    # Submission still requires actively decoded live media.
+    assert "if (!canSamplePerson())" in submitted
+    # Completion remains bound to a valid camera and session without depending
+    # on the transient decoder readyState after the immutable POST was sent.
+    fulfilled = submitted.split("const result = await request(", 1)[1].split("if (!result ||", 1)[0]
+    for guard in (
+        "epoch !== state.personEpoch",
+        "!state.personEnabled",
+        "cameraId !== state.selected",
+        "!state.token",
+        "state.signingOut",
+        'state.view !== "live"',
+        'selectedCamera?.analytics_status !== "configured"',
+        'statusDetails(selectedCamera).style !== "online"',
+        'state.workerStatus === "unavailable"',
+    ):
+        assert guard in fulfilled
+    assert "!canSamplePerson()" not in fulfilled
+    assert "video.readyState" not in fulfilled
+    assert "video.paused" not in fulfilled
+    assert "state.personController?.abort();" in source
+
+
+def test_buffering_does_not_cancel_an_already_submitted_person_frame():
+    """One frozen authorized sample must finish independently of later HLS buffering."""
+    source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    buffer = source.split("function checkPersonBuffer(", 1)[1].split(
+        '$("live-video").addEventListener("waiting"', 1
+    )[0]
+    assert "if (state.personController)" in buffer
+    assert "checkPersonBuffer(epoch, video, frames)" in buffer
+    assert "stopPersonView(" in buffer
+    # Actual revocation and camera teardown must still abort pending samples.
+    stop = source.split("function stopPersonView(", 1)[1].split("function validPersonBox(", 1)[0]
+    assert "state.personController?.abort();" in stop
+
+
+def test_transient_live_pause_preserves_only_submitted_person_frame():
+    """An HLS decoder pause may not abort a previously authorized immutable POST."""
+    source = (Path(__file__).resolve().parents[2] / "src/k5vision/operator_web/app.js").read_text(
+        encoding="utf-8"
+    )
+    handler = source.split('$("live-video").addEventListener("pause", () => {', 1)[1].split(
+        "function checkPersonBuffer(", 1
+    )[0]
+    assert "if (!state.personEnabled) return;" in handler
+    assert "if (state.personController)" in handler
+    assert "state.personBufferTimer === null" in handler
+    assert "checkPersonBuffer(epoch, video, frames);" in handler
+    assert handler.index("if (state.personController)") < handler.index("stopPersonView(")
+    # A deliberate camera change, browser logout or HLS teardown must still
+    # invalidate and abort that request before resetting the live decoder.
+    teardown = source.split("function stopLive(", 1)[1].split("function stopPlayback(", 1)[0]
+    assert teardown.index("stopPersonView();") < teardown.index('resetVideo($("live-video"));')
+    stopper = source.split("function stopPersonView(", 1)[1].split("function validPersonBox(", 1)[0]
+    assert "state.personController?.abort();" in stopper
+
+
 def _ui_core(account):
     return {
         "id": account.get("id", "a22c22bc-4089-45b7-a370-f360bb9d33c0"),
@@ -508,6 +616,13 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
               // Playback itself is qualified by the actual media acceptance.
               // Keep the authentic media-session DTO while disabling transport.
               window.Hls = {isSupported: () => false};
+              // Capture actual production request deadlines, without clock sleeps.
+              window.__k5RequestDeadlines = [];
+              const realDeadline = AbortSignal.timeout.bind(AbortSignal);
+              AbortSignal.timeout = (ms) => {
+                window.__k5RequestDeadlines.push(ms);
+                return realDeadline(ms);
+              };
               const RealDate = Date;
               window.Date = class extends RealDate {
                 constructor(...args) { super(...(args.length ? args : [RealDate.now() + shift])); }
@@ -797,6 +912,9 @@ def test_profile_acceptance_and_enrollment_wait_for_actual_stream_status(
         expect(page.locator("#sign-in")).to_be_visible()
         expect(notice).not_to_be_visible()
         assert calls == {"profiles": 2, "connect": 1}
+        # Both ONVIF profile probes use the finite 20s UI budget; the
+        # installed backend may legitimately use most of its 12s socket limit.
+        assert page.evaluate("window.__k5RequestDeadlines.filter(ms => ms === 20000).length") >= 2
         assert not script_errors
     finally:
         if context is not None:
@@ -944,7 +1062,18 @@ def test_live_media_cookie_recovery_preserves_authoritative_session(outcome):
         assert baseline_sources[-1] == media_urls(_CAMERA)["live_url"]
         page.evaluate("window.__selectedHlsIndex = window.__hlsPlayers.length - 1")
         if outcome == "logout_race":
-            page.locator("#sign-out-button").click()
+            # The request event can precede route interception on Windows.
+            # Wait for the intentionally withheld logout route rather than
+            # assuming the handler has already run when click() returns.
+            with page.expect_request(
+                lambda request: urlsplit(request.url).path == "/api/v1/auth/logout",
+                timeout=10_000,
+            ):
+                page.locator("#sign-out-button").click()
+            for _ in range(100):
+                if pending:
+                    break
+                page.wait_for_timeout(50)
             assert len(pending) == 1
             page.locator("#wall-tab").click()
             page.evaluate("""async () => {
@@ -1370,5 +1499,136 @@ def test_direct_rtsp_enrollment_tests_privately_and_connects_only_an_opaque_prob
             expect(page.locator("#new-camera-password")).to_have_value("")
             page.locator("#cancel-add-camera").click()
             assert errors == []
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["verified_busy", "changed_grant", "denied", "malformed", "unverified_busy"],
+)
+def test_transient_camera_inventory_reverifies_authority_before_preserving_live(outcome):
+    """A media inventory stall cannot silently revoke or invent a live camera grant."""
+    browser_api = pytest.importorskip("playwright.sync_api")
+    channel = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
+    assets = Path(__file__).resolve().parents[2] / "src/k5vision/operator_web"
+    account = {"username": "fixture-admin", "role": "administrator", "display_name": "Fixture"}
+    camera = {
+        "device_id": _CAMERA,
+        "name": "Generated camera",
+        "status": "live",
+        "recording": True,
+        "analytics_status": "configured",
+    }
+    token = "generated-inventory-revalidation-session-token-000000000"
+    armed = {"value": False, "failures": 0, "authority": 0}
+    errors = []
+    with browser_api.sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel=channel, headless=True)
+        try:
+            context = browser.new_context()
+            try:
+                context.add_init_script("""(() => {
+                  window.__hlsPlayers = [];
+                  HTMLMediaElement.prototype.play = () => Promise.reject(
+                    new DOMException("Generated video test", "NotAllowedError"));
+                  window.Hls = class {
+                    static Events = {
+                      ERROR: "error", MEDIA_ATTACHED: "attached", MANIFEST_PARSED: "parsed"
+                    };
+                    static isSupported() { return true; }
+                    constructor() { this.handlers = {}; window.__hlsPlayers.push(this); }
+                    on(name, handler) { this.handlers[name] = handler; }
+                    attachMedia() { queueMicrotask(() => this.handlers.attached?.()); }
+                    loadSource() { queueMicrotask(() => this.handlers.parsed?.()); }
+                    destroy() { this.destroyed = true; }
+                  };
+                })();""")
+                page = context.new_page()
+                page.set_default_timeout(10_000)
+                page.on("pageerror", lambda _error: errors.append("script_error"))
+
+                def intercept(route):
+                    path = urlsplit(route.request.url).path
+                    if _operator_asset(route, assets):
+                        return
+                    status, data = 200, {}
+                    if path == "/api/v1/auth/login":
+                        data = {
+                            "session_token": token,
+                            "account": account,
+                            "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                            "expires_in_seconds": 300,
+                        }
+                    elif path == "/api/v1/auth/me":
+                        data = _ui_core(account)
+                    elif path in {"/api/v1/operator/cameras", "/api/v1/operator/capabilities"}:
+                        snapshot = _ui_inventory(account, [camera], worker_status="ready")
+                        snapshot["capabilities"]["account"]["camera_access"] = {
+                            "mode": "all",
+                            "camera_ids": [],
+                        }
+                        if path.endswith("/capabilities"):
+                            armed["authority"] += 1
+                            data = snapshot["capabilities"]
+                            if outcome == "changed_grant":
+                                data["account"]["camera_access"] = {
+                                    "mode": "selected",
+                                    "camera_ids": [],
+                                }
+                            if outcome == "unverified_busy":
+                                status = 503
+                        elif armed["value"] and armed["failures"] == 0:
+                            armed["failures"] += 1
+                            if outcome == "denied":
+                                status = 403
+                            elif outcome == "malformed":
+                                data = {"cameras": "invalid"}
+                            else:
+                                status = 503
+                        else:
+                            data = snapshot
+                    elif path == "/api/v1/operator/status":
+                        data = {
+                            "worker_status": "ready",
+                            "server_utc": datetime.now(UTC).isoformat(),
+                            "clock": {"status": "observing", "sync_verified": False},
+                        }
+                    elif path.endswith("/media-session"):
+                        data = {
+                            "live_url": f"/media/live/{_CAMERA}/index.m3u8",
+                            "playback_url": f"/media/playback?path={_CAMERA}",
+                        }
+                    else:
+                        status = 404
+                    route.fulfill(
+                        status=status, content_type="application/json", body=json.dumps(data)
+                    )
+
+                page.route("**/*", intercept)
+                page.goto("http://127.0.0.1:8000/operator/")
+                page.locator("#username").fill(account["username"])
+                page.locator("#password").fill("generated-fixture-password")
+                page.locator("#sign-in-button").click()
+                page.locator(".camera-item").first.click()
+                page.wait_for_function("window.__hlsPlayers.length >= 1")
+                browser_api.expect(page.locator("#live-panel")).to_be_visible()
+                armed["value"] = True
+                page.locator("#refresh-cameras").click()
+                if outcome == "verified_busy":
+                    browser_api.expect(page.locator("#camera-list-message")).to_contain_text(
+                        "Account access reverified"
+                    )
+                    assert armed["authority"] >= 1
+                    assert not page.evaluate("window.__hlsPlayers.at(-1).destroyed === true")
+                    browser_api.expect(page.locator("#live-panel")).to_be_visible()
+                else:
+                    page.wait_for_function("window.__hlsPlayers.at(-1).destroyed === true")
+                    assert armed["authority"] == (0 if outcome in {"denied", "malformed"} else 1)
+                    browser_api.expect(page.locator("#toggle-person-view")).to_be_disabled()
+                assert armed["failures"] == 1
+                assert not errors
+            finally:
+                context.close()
         finally:
             browser.close()

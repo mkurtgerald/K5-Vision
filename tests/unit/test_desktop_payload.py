@@ -26,6 +26,33 @@ def builder() -> ModuleType:
     return module
 
 
+def test_native_worker_archive_reuses_only_verified_ci_donor(builder, tmp_path, monkeypatch):
+    root = tmp_path / "CI verified donors"
+    root.mkdir()
+    raw = b"immutable pinned official worker archive"
+    source = root / "mediamtx.zip"
+    source.write_bytes(raw)
+    identity = {"bytes": len(raw), "sha256": sha256(raw).hexdigest()}
+    monkeypatch.setenv("K5_DONOR_TOOL_ROOT", str(root))
+
+    def no_redownload(*_args, **_kwargs):
+        raise AssertionError("Verified CI donor must not be fetched again")
+
+    monkeypatch.setattr(builder, "download", no_redownload)
+    destination = tmp_path / "worker-mediamtx-official.zip"
+    builder.acquire_worker_archive(identity, destination, "mediamtx")
+    assert destination.read_bytes() == raw
+
+    # A changed archive fails without falling back to the network.
+    source.write_bytes(b"tampered upstream archive")
+    refused = tmp_path / "refused.zip"
+    with pytest.raises(ValueError, match="identity mismatch"):
+        builder.acquire_worker_archive(identity, refused, "mediamtx")
+    assert not refused.exists()
+    with pytest.raises(ValueError, match="component"):
+        builder.acquire_worker_archive(identity, refused, "unknown")
+
+
 def test_exact_donor_identity_detects_size_and_content_tampering(builder, tmp_path):
     donor = tmp_path / "donor.zip"
     donor.write_bytes(b"verified native donor")
@@ -61,6 +88,29 @@ def test_actual_combined_embedded_smoke_script_is_valid_python(builder):
     expression = max(expressions, key=lambda node: len(ast.get_source_segment(source, node)))
     assembled = eval(compile(ast.Expression(expression), "<smoke argument>", "eval"), vars(builder))
     compile(assembled, "<actual embedded -c smoke>", "exec")
+    # The installed view path uses one native CPU thread; the recording-child
+    # smoke separately qualifies the unchanged two-thread detector. A package
+    # must not claim native view support by probing only the recording budget.
+    assert (
+        "detector=_PersonDetector(person, inference_threads=1, fixed_view_input=True)" in assembled
+    )
+    assert "detector.infer(bytes(544*320*4),544,320,544*4,0)==()" in assembled
+    # The same sealed worker must accept non-native aspect ratio input and
+    # resize transient pixels without changing recorded-person detection.
+    assert "detector.infer(bytes(544*306*4),544,306,544*4,0)==()" in assembled
+
+
+def test_embedded_decoder_child_probe_uses_real_worker_with_no_camera_media(builder):
+    # The deployed worker's local pipe, process ownership and isolated
+    # embedded Python import path must work before packaging is admitted.
+    script = builder.NATIVE_DECODER_CHILD_SMOKE
+    compile(script, "<embedded decoder-child smoke>", "exec")
+    assert "load_installed_person_configuration" in script
+    assert "_RecordedNativeWorker(person)" in script
+    assert "worker.request(None)" in script
+    assert "worker._person_ready" in script
+    assert "__k5_missing_native_probe__.mp4" in script
+    assert "worker.close()" in script
 
 
 def _identity_crypto_material(builder, tmp_path, monkeypatch):

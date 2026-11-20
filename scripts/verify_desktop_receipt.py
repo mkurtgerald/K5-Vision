@@ -52,6 +52,8 @@ _TRUE = (
     "export_download_opened_in_edge "
     "product_analytics_enablement analytics_bundled_native_inference analytics_gui_configuration "
     "analytics_person_event_recorded analytics_event_utc_playback analytics_public_fixture_only "
+    "analytics_sampled_native_boxes analytics_sampled_same_frame_overlay "
+    "analytics_sampled_canvas_cleared "
     "analytics_browser_closed_detection analytics_role_camera_permissions "
     "analytics_settings_events_persisted"
 ).split()
@@ -176,6 +178,8 @@ def _nvr_journey(receipt):
         ("analytics_event_playback_decoded_frames", 4, 100000),
         ("analytics_positive_person_count", 1, 32),
         ("analytics_processed_frames", 1, 100000),
+        ("analytics_sampled_overlay_pixels", 12, 544 * 320),
+        ("analytics_sampled_live_decoded_frames", 4, 1_000_000),
         ("analytics_background_event_count_before", 1, 100000),
         ("analytics_background_event_count_after", 2, 100000),
     ):
