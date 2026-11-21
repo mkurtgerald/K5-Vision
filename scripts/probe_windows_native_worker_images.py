@@ -7,6 +7,7 @@ Cleanup calls OwnedNativeProcess.stop(), never terminates enumerated processes.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import importlib.util
 import json
@@ -16,6 +17,7 @@ import socket
 import sys
 import tempfile
 import time
+from ctypes import wintypes
 from pathlib import Path, PureWindowsPath
 
 from k5vision.operator_native_process import OwnedNativeProcess
@@ -70,6 +72,28 @@ def _row(tree, identity, role, expected):
     return result
 
 
+def _pin_job_observation(tree, owner, row):
+    """Pin this exact process and query this specific owned Job, never NULL."""
+    job = owner._job
+    if job is None or not job._handle:
+        raise RuntimeError("Specific owned Job is unavailable")
+    handle = tree.api.OpenProcess(0x00101000, False, row["pid"])
+    if not handle:
+        raise OSError("Exact process query handle unavailable")
+    try:
+        if tree.birth(row["pid"], handle=handle) != row["created_100ns"]:
+            raise ProcessLookupError("Exact process identity changed")
+        member = wintypes.BOOL()
+        if not tree.api.IsProcessInJob(handle, job._handle, ctypes.byref(member)):
+            raise OSError("Specific owned Job query unavailable")
+        row["specific_owned_job_member"] = bool(member.value)
+        row["exact_query_handle_pinned"] = True
+        return handle
+    except BaseException:
+        tree.api.CloseHandle(handle)
+        raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--identity-module", type=Path, required=True)
@@ -83,8 +107,9 @@ def main():
         "actual_camera_data": False,
         "cleanup_completed": False,
     }
-    owners, listeners = [], []
+    owners, listeners, pinned = [], [], []
     workspace = None
+    tree = None
     try:
         if (
             os.name != "nt"
@@ -94,6 +119,14 @@ def main():
             raise RuntimeError("Fresh hosted Windows QA required")
         module = _module(arguments.identity_module.resolve(strict=True))
         tree = module.NativeProcessTree()
+        tree.api.IsProcessInJob.argtypes = [
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        tree.api.IsProcessInJob.restype = wintypes.BOOL
+        tree.api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        tree.api.WaitForSingleObject.restype = wintypes.DWORD
         current = tree.details((os.getpid(), tree.birth(os.getpid())))
         receipt["caller"] = {key: current[key] for key in ("sid", "session", "elevated")}
         if isinstance(receipt["caller"]["sid"], bytes):
@@ -217,6 +250,8 @@ def main():
             receipt["observations"].append(
                 {"worker": role, "listener_ready": ready, "processes": rows}
             )
+            for row in rows:
+                pinned.append((_pin_job_observation(tree, owner, row), row))
         receipt["status"] = "diagnostic_complete"
     except Exception as error:
         receipt["failure_type"] = type(error).__name__
@@ -227,6 +262,40 @@ def main():
                 owner.stop()
             except Exception as error:
                 cleanup_errors.append(type(error).__name__)
+        # An open process handle pins identity, not execution. Observe each
+        # exact instance after closing only the two production-owned Jobs.
+        began = time.monotonic()
+        deadline = began + 10
+        remaining = list(pinned)
+        while remaining:
+            live = []
+            for handle, row in remaining:
+                outcome = tree.api.WaitForSingleObject(handle, 0)
+                if outcome not in {0, 258}:
+                    cleanup_errors.append("ProcessWaitFailed")
+                    row["post_stop_wait_failed"] = True
+                    continue
+                row["post_stop_exited"] = outcome == 0
+                row["post_stop_wait_seconds"] = round(time.monotonic() - began, 3)
+                if outcome == 0:
+                    code = wintypes.DWORD()
+                    if tree.api.GetExitCodeProcess(handle, ctypes.byref(code)):
+                        row["post_stop_exit_code"] = code.value
+                else:
+                    live.append((handle, row))
+            if not live or time.monotonic() >= deadline:
+                break
+            remaining = live
+            time.sleep(0.05)
+        for handle, _row_value in pinned:
+            tree.api.CloseHandle(handle)
+        receipt["post_stop_observation_seconds"] = round(time.monotonic() - began, 3)
+        receipt["post_stop_live_observed_count"] = sum(
+            row.get("post_stop_exited") is False for _handle, row in pinned
+        )
+        receipt["all_observed_processes_exited"] = bool(pinned) and all(
+            row.get("post_stop_exited") is True for _handle, row in pinned
+        )
         for listener in listeners:
             listener.close()
         if workspace is not None:
