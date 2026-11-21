@@ -423,7 +423,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
             process=app,
             timeout=60,
         )
-        runtime._login(client, username, password)
+        desktop._observer_reauthenticate(runtime, client, username, password, diagnostic)
         administrator_id = client.json("/api/v1/auth/me")["id"]
         _require(
             api.control_text(form, desktop._PASSWORD) == ""

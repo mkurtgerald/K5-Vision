@@ -513,7 +513,7 @@ class NativeProcessTree:
             error = ctypes.get_last_error()
             if error in {87, 1168}:  # Invalid PID / process no longer exists.
                 return None
-            raise OSError("Native owned process could not be opened")
+            raise OSError(0, "Native owned process could not be opened", None, error)
         try:
             return self._handle_birth(handle)
         finally:
@@ -545,7 +545,7 @@ class NativeProcessTree:
         def identity(pid):
             try:
                 return self.birth(pid)
-            except OSError:
+            except OSError as error:
                 raise OwnershipFailure(
                     {
                         "pid": pid,
@@ -556,6 +556,7 @@ class NativeProcessTree:
                         "session": None,
                         "accepted": False,
                         "outcome": "proof_unavailable",
+                        "native_code": getattr(error, "winerror", None),
                     }
                 ) from None
 

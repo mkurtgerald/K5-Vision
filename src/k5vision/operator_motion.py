@@ -566,7 +566,6 @@ class MotionRuntime:
                     return
                 self.workers[path] = worker
             result = await self._run(worker.sample, worker_policy(policy))
-            completed_at = time.monotonic()
             async with self.service._lock:
                 if (
                     not self._current(source, policy, generation)
@@ -576,12 +575,16 @@ class MotionRuntime:
                 if not (
                     type(result.age_seconds) in (int, float)
                     and math.isfinite(result.age_seconds)
-                    and 0 <= result.age_seconds + time.monotonic() - completed_at <= 2
+                    and 0 <= result.age_seconds <= 2
+                    and type(result.captured_monotonic) in (int, float)
+                    and math.isfinite(result.captured_monotonic)
+                    and 0 <= time.monotonic() - result.captured_monotonic <= 2
                 ):
                     raise MotionUnavailable("Motion frame is no longer current")
-                captured_at = self._cache_sample(
-                    source, policy, result, completed_at - result.age_seconds
-                )
+                # The child's validated capture clock survives both executor
+                # dispatch and recorder-lock waits. Reconstructing it from an
+                # earlier age after either wait would make old pixels fresh.
+                captured_at = self._cache_sample(source, policy, result, result.captured_monotonic)
                 if self._zones_stale(path, policy):
                     self.health[path] = "zones_need_review"
                     self.holds.pop(path, None)

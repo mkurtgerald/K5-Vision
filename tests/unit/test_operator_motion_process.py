@@ -192,6 +192,7 @@ def test_private_source_stays_in_stdin_and_sample_is_immutable(worker):
     assert requests == [{"relay_uri": URI}, {"policy": policy()}]
     assert result.jpeg == JPEG and result.motion is True and result.sequence == 1
     assert 0 <= result.age_seconds <= 2
+    assert 0 <= time.monotonic() - result.captured_monotonic <= 2
     with pytest.raises(FrozenInstanceError):
         result.sequence = 3
 

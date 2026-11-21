@@ -217,6 +217,7 @@ class _Worker:
             self.moving,
             self.age,
             b"generated-jpeg",
+            motion.time.monotonic() - self.age,
         )
 
     def begin_close(self):
@@ -473,6 +474,48 @@ def test_frame_that_ages_while_waiting_for_service_lock_cannot_trigger(engine, m
             await pending
             assert service._media.paths[source.binding.path_name]["record"] is False
             assert service.recording_policy_status(source.binding)["state"] == "unavailable"
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("handoff_seconds", [0.25, 2.25])
+def test_executor_handoff_preserves_capture_freshness_and_hold_deadline(
+    engine, monkeypatch, handoff_seconds
+):
+    async def scenario():
+        service, source = engine.service, engine.sources[0]
+        runtime, path = service._motion, source.binding.path_name
+        clock = SimpleNamespace(value=100.0)
+        monkeypatch.setattr(motion, "time", SimpleNamespace(monotonic=lambda: clock.value))
+        await service.start(engine.sources)
+        try:
+            await service.apply_motion_policy(source, 0, _body())
+            await _sample(engine)
+            worker = engine.workers[-1]
+            worker.moving = True
+            run = runtime._run
+
+            async def delayed_handoff(operation, *args, **kwargs):
+                result = await run(operation, *args, **kwargs)
+                if operation == worker.sample:
+                    # The executor has finished. Delay delivery to the service
+                    # coroutine without changing its decoded capture timestamp.
+                    clock.value += handoff_seconds
+                return result
+
+            monkeypatch.setattr(runtime, "_run", delayed_handoff)
+            await _sample(engine)
+            if handoff_seconds > 2:
+                assert service.recording_policy_status(source.binding)["state"] == "unavailable"
+                assert service._media.paths[path]["record"] is False
+                assert path not in runtime.holds
+                assert worker.closed
+            else:
+                assert service.recording_policy_status(source.binding)["state"] == "recording"
+                assert runtime.samples[path]["captured_at"] == 100.0
+                assert runtime.holds[path] == 102.0
         finally:
             await service.stop()
 

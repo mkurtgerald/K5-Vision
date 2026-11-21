@@ -490,6 +490,28 @@ def _approve_time(
     return result
 
 
+def _install_fixture(desktop, setup, installed, profile, api, record):
+    """Keep finite installer evidence before failed fixture state is torn down."""
+    diagnostic = {}
+    try:
+        desktop._install_gui(setup, installed, api, diagnostic=diagnostic)
+    except BaseException:
+        try:
+            snapshot = desktop._helpers("windows_service_acceptance")
+            diagnostic["installation_snapshot"] = snapshot.installer_failure_snapshot(
+                installed, profile
+            )
+        except BaseException:
+            diagnostic["installation_snapshot_unavailable"] = True
+        try:
+            record("k5_native_time_installer_diagnostic", json.dumps(diagnostic, sort_keys=True))
+        except BaseException:
+            # Evidence collection must not replace the actual installer failure.
+            pass
+        raise
+    record("k5_native_time_installer_diagnostic", json.dumps(diagnostic, sort_keys=True))
+
+
 def _cleanup_fixture(actions, record, *, primary_error=None):
     """Keep an original failure while reporting every bounded cleanup attempt."""
     allowed = {
@@ -579,7 +601,7 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
         "physical_camera_acceptance": False,
     }
     try:
-        desktop._install_gui(setup, installed, api)
+        _install_fixture(desktop, setup, installed, profile, api, record_testsuite_property)
         assert hashlib.sha256(executable.read_bytes()).hexdigest() == supervisor_sha
         assert (installed / "payload-manifest.json").read_bytes() == manifest_bytes
         admitted = subprocess.run(

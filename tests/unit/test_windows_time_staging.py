@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import test_operator_time_admin as time_helpers
@@ -182,6 +183,90 @@ def test_uninstaller_timeout_cannot_replace_original_installer_failure(primary_t
     assert diagnostic["cleanup_error_type"] == "TimeoutExpired"
     assert diagnostic["cleanup_error_stage"] == "uninstall"
     assert "private-uninstaller-path" not in records[0][1]
+
+
+def test_installer_failure_evidence_precedes_teardown_and_preserves_primary():
+    primary = pytest.fail.Exception("Actual installer wizard exceeded its deadline")
+    events, records = [], []
+
+    def install(setup, installed, api, *, diagnostic):
+        diagnostic.update(installer_action="install_wait", installer_install_posted=True)
+        raise primary
+
+    def snapshot(installed, profile):
+        events.append("snapshot")
+        return {"service_registered": True, "scm": {"state": 2}}
+
+    desktop = SimpleNamespace(
+        _install_gui=install,
+        _helpers=lambda name: SimpleNamespace(installer_failure_snapshot=snapshot),
+    )
+    with pytest.raises(pytest.fail.Exception) as failure:
+        try:
+            _HELPERS._install_fixture(
+                desktop, None, None, None, None, lambda name, value: records.append((name, value))
+            )
+        finally:
+            events.append("teardown")
+    assert failure.value is primary
+    assert events == ["snapshot", "teardown"]
+    assert records[0][0] == "k5_native_time_installer_diagnostic"
+    diagnostic = json.loads(records[0][1])
+    assert diagnostic["installer_action"] == "install_wait"
+    assert diagnostic["installer_install_posted"] is True
+    assert diagnostic["installation_snapshot"]["scm"] == {"state": 2}
+
+
+@pytest.mark.parametrize("evidence_failure", ["snapshot", "record"])
+def test_secondary_installer_evidence_errors_cannot_mask_deadline(evidence_failure):
+    primary = RuntimeError("Actual installer wizard exceeded its deadline")
+    records = []
+
+    def install(setup, installed, api, *, diagnostic):
+        diagnostic["installer_action"] = "next"
+        raise primary
+
+    def snapshot(installed, profile):
+        if evidence_failure == "snapshot":
+            raise OSError("private profile path and credential")
+        return {"service_registered": False}
+
+    def record(name, value):
+        if evidence_failure == "record":
+            raise RuntimeError("Private artifact output path")
+        records.append((name, value))
+
+    desktop = SimpleNamespace(
+        _install_gui=install,
+        _helpers=lambda name: SimpleNamespace(installer_failure_snapshot=snapshot),
+    )
+    with pytest.raises(RuntimeError) as failure:
+        _HELPERS._install_fixture(desktop, None, None, None, None, record)
+    assert failure.value is primary
+    if evidence_failure == "snapshot":
+        assert json.loads(records[0][1])["installation_snapshot_unavailable"] is True
+        assert "private" not in records[0][1].casefold()
+
+
+def test_successful_installer_retains_diagnostic_without_failure_snapshot():
+    records = []
+
+    def install(setup, installed, api, *, diagnostic):
+        diagnostic.update(installer_action="finish", installer_next_clicks=2)
+
+    def unexpected_snapshot(name):
+        pytest.fail("Successful install must not collect a failure snapshot")
+
+    desktop = SimpleNamespace(_install_gui=install, _helpers=unexpected_snapshot)
+    _HELPERS._install_fixture(
+        desktop, None, None, None, None, lambda name, value: records.append((name, value))
+    )
+    assert records == [
+        (
+            "k5_native_time_installer_diagnostic",
+            '{"installer_action": "finish", "installer_next_clicks": 2}',
+        )
+    ]
 
 
 def test_cleanup_timeout_after_success_is_still_a_failed_native_time_test():

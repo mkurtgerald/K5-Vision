@@ -36,6 +36,7 @@ class MotionSample:
     motion: bool
     age_seconds: float
     jpeg: bytes = field(repr=False)
+    captured_monotonic: float
 
 
 def _relay(value: object) -> str:
@@ -413,6 +414,7 @@ class LiveMotionWorker:
                     metadata["motion"],
                     age,
                     pixels,
+                    captured,
                 )
             except (OSError, ValueError, TypeError, MotionProcessError):
                 self._dispose()

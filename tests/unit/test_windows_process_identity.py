@@ -222,6 +222,8 @@ def _cohort(monkeypatch, births, parents, details=None):
     cohort.console_pins = {}
     cohort.console_individual_termination_used = False
     cohort.failed = False
+    cohort.first_failure = None
+    cohort.last_cleanup_observation = None
     cohort.service = SimpleNamespace(installed=_INSTALL)
     cohort.lock = threading.Lock()
     return cohort
@@ -718,7 +720,8 @@ def test_finish_live_helper_fails_once_with_existing_cleanup_budget_and_no_kill(
     _finish_ready(cohort)
     cohort.service_stopped = False
 
-    def observe(_cohort):
+    def observe(_cohort, *, service_only=False):
+        assert service_only
         calls.append("existing_wait")
         raise RuntimeError("Live helper must fail cleanup")
 
@@ -729,3 +732,83 @@ def test_finish_live_helper_fails_once_with_existing_cleanup_budget_and_no_kill(
     assert cohort.failed and kernel.closed == [handle]
     assert pin.cached_exit == {"exited": False, "exit_code": None}
     assert not cohort.console_individual_termination_used
+
+
+def test_finish_drains_service_without_misclassifying_a_live_gui_root(monkeypatch):
+    cohort, kernel, births = _console_cohort(monkeypatch)
+    cohort.snapshot()
+    gui_identity = 17, _BASE + 17 * _STEP
+    births[17] = gui_identity[1]
+    cohort.add(SimpleNamespace(pid=17), role="gui")
+    gui = next(p for p in cohort.snapshot() if p.pid == 17)
+    gui.name = lambda: "K5Vision.exe"
+    for pid in (11, 12, 13):
+        births.pop(pid)
+    pin = next(iter(cohort.console_pins.values()))
+    kernel.objects[pin.handle]["running"] = False
+    # The original helper still requires ALL roots unless service-only scope
+    # is explicitly requested by finish's engine drain.
+    with pytest.raises(pytest.fail.Exception):
+        _DESKTOP._wait_owned_cleanup(cohort, timeout=0)
+    _finish_ready(cohort)
+    cohort.finish()
+    assert not cohort.failed and cohort.first_failure is None
+    assert cohort.is_owned_running(gui) and pin.cached_exit["exited"]
+    assert cohort.last_cleanup_observation["scope"] == "service"
+    assert not any(cohort.last_cleanup_observation["live_counts"].values())
+    killed = []
+    gui.kill = lambda: (killed.append(gui_identity), births.pop(17))
+    gui.wait = lambda timeout: 0
+    assert cohort.terminate_owned(gui) is True
+    assert killed == [gui_identity] and not cohort.failed
+
+
+@pytest.mark.parametrize("survivor", ["console", "service"])
+def test_service_only_finish_scope_still_fails_actual_engine_survivors(monkeypatch, survivor):
+    cohort, kernel, births = _console_cohort(monkeypatch)
+    cohort.snapshot()
+    pin = next(iter(cohort.console_pins.values()))
+    kernel.objects[pin.handle]["running"] = survivor == "console"
+    if survivor == "console":
+        births.pop(11)
+        births.pop(12)
+    else:
+        births.pop(12)
+        births.pop(13)
+    for process in cohort.processes.values():
+        process.name = lambda: "conhost.exe" if survivor == "console" else "K5VisionRecorder.exe"
+    original = _DESKTOP._wait_owned_cleanup
+    monkeypatch.setattr(
+        _DESKTOP, "_wait_owned_cleanup", lambda c, **kwargs: original(c, timeout=0, **kwargs)
+    )
+    _finish_ready(cohort)
+    cohort.finish()
+    assert cohort.failed
+    assert cohort.first_failure["phase"] == "finish_drain"
+    assert cohort.first_failure["exception_type"] == "Failed"
+    assert cohort.last_cleanup_observation["scope"] == "service"
+    assert any(cohort.last_cleanup_observation["live_counts"].values())
+    assert kernel.closed and not cohort.console_individual_termination_used
+
+
+def test_observer_retains_first_finite_failure_without_private_exception_content():
+    cohort = _DESKTOP._Cohort.__new__(_DESKTOP._Cohort)
+    cohort.failed, cohort.first_failure = False, None
+    cohort.stop = SimpleNamespace(wait=lambda _seconds: False)
+    error = OSError("private path, credentials and command must stay unretained")
+    error.winerror = 5
+
+    def failed_snapshot():
+        raise error
+
+    cohort.snapshot = failed_snapshot
+    cohort._observe()
+    assert cohort.failed
+    note = cohort.first_failure
+    assert note["phase"] == "observer_snapshot" and note["exception_type"] == "OSError"
+    assert note["native_code"] == 5
+    assert note["source"]["file"] == "test_windows_desktop_app.py"
+    assert note["source"]["function"] == "_observe"
+    assert "private path" not in str(note) and "credentials" not in str(note)
+    cohort._record_failure(RuntimeError("later private failure"), "finish_pin_close")
+    assert cohort.first_failure is note

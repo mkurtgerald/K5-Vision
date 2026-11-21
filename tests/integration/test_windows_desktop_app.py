@@ -343,6 +343,8 @@ class _Cohort:
         self.console_individual_termination_used = False
         self.console_seen = False
         self.failed = False
+        self.first_failure = None
+        self.last_cleanup_observation = None
         self.service = None
         self.service_stopped = True
         self.stop = threading.Event()
@@ -355,6 +357,61 @@ class _Cohort:
             self.failed = True
             raise RuntimeError("Native ownership inventory exceeded its bound")
         self.ownership_records[identity] = {**note, "role": role}
+
+    def _record_failure(self, error, phase):
+        if getattr(self, "first_failure", None) is not None:
+            return
+        allowed = {
+            "RuntimeError",
+            "OSError",
+            "PermissionError",
+            "ProcessLookupError",
+            "NoSuchProcess",
+            "AccessDenied",
+            "TimeoutError",
+            "Failed",
+            "AssertionError",
+            "AttributeError",
+            "ValueError",
+            "TypeError",
+            "OwnershipFailure",
+            "ArgumentError",
+            "OverflowError",
+        }
+        phases = {
+            "observer_snapshot",
+            "observer_windows",
+            "candidate_admission",
+            "finish_snapshot",
+            "finish_stop",
+            "finish_drain",
+            "finish_pin_exit",
+            "finish_pin_close",
+        }
+        source = None
+        trace = error.__traceback__
+        while trace is not None:
+            code = trace.tb_frame.f_code
+            filename = Path(code.co_filename).name
+            if filename in {"test_windows_desktop_app.py", "windows_process_identity.py"}:
+                source = {
+                    "file": filename,
+                    "function": code.co_name[:80],
+                    "line": min(20000, trace.tb_lineno),
+                }
+            trace = trace.tb_next
+        native_code = getattr(error, "winerror", None)
+        if type(native_code) is not int:
+            details = getattr(error, "diagnostic", None)
+            native_code = details.get("native_code") if type(details) is dict else None
+        self.first_failure = {
+            "phase": phase if phase in phases else "other",
+            "exception_type": type(error).__name__ if type(error).__name__ in allowed else "other",
+            "source": source,
+            "native_code": native_code
+            if type(native_code) is int and 0 <= native_code <= 65535
+            else None,
+        }
 
     def _admit_service(self, identity, *, root=False):
         helper = _helpers("windows_process_identity")
@@ -415,7 +472,8 @@ class _Cohort:
             self._record_ownership(identity, error.diagnostic, role="service")
             self.failed = True
             raise
-        except (OSError, ValueError, TypeError, RuntimeError):
+        except (OSError, ValueError, TypeError, RuntimeError) as error:
+            self._record_failure(error, "candidate_admission")
             note = {
                 "pid": identity[0],
                 "created_100ns": identity[1],
@@ -454,6 +512,8 @@ class _Cohort:
             "candidate_count": len(records),
             "rejected_counts": rejected,
             "instances": refused[:16] + admitted[-(32 - min(16, len(refused))) :],
+            "first_failure": getattr(self, "first_failure", None),
+            "last_cleanup": getattr(self, "last_cleanup_observation", None),
         }
 
     def ownership_receipt(self):
@@ -651,6 +711,11 @@ class _Cohort:
             and process.is_running()
         )
 
+    def is_service_owned(self, process):
+        identity = self.native_identities.get(id(process))
+        note = self.ownership_records.get(identity)
+        return bool(note and note["accepted"] and note["role"] == "service")
+
     def terminate_owned(self, process):
         identity = self.native_identities.get(id(process))
         if identity in self.console_pins:
@@ -665,18 +730,22 @@ class _Cohort:
         return False
 
     def _observe(self):
+        phase = "observer_snapshot"
         try:
             while not self.stop.wait(0.05):
+                phase = "observer_snapshot"
                 pids = {
                     process.pid for process in self.snapshot() if self.is_owned_running(process)
                 }
+                phase = "observer_windows"
                 if any(
                     self.api.pid(window) in pids
                     and self.api.class_name(window) == "ConsoleWindowClass"
                     for window in self.api.windows()
                 ):
                     self.console_seen = True
-        except Exception:
+        except Exception as error:
+            self._record_failure(error, phase)
             self.failed = True
 
     def finish(self):
@@ -689,32 +758,39 @@ class _Cohort:
         if self.service is not None and not self.service_stopped:
             try:
                 self.snapshot()
-            except BaseException:
+            except BaseException as error:
+                self._record_failure(error, "finish_snapshot")
                 self.failed = True
             try:
+                phase = "finish_stop"
                 _service_control(self.service.installed, "stop")
                 self.service_stopped = True
                 cleanup_observed = True
-                _wait_owned_cleanup(self)
-            except BaseException:
+                phase = "finish_drain"
+                _wait_owned_cleanup(self, service_only=True)
+            except BaseException as error:
+                self._record_failure(error, phase)
                 self.failed = True
         if self.console_pins:
             try:
                 if not cleanup_observed:
-                    _wait_owned_cleanup(self)
-            except BaseException:
+                    _wait_owned_cleanup(self, service_only=True)
+            except BaseException as error:
+                self._record_failure(error, "finish_drain")
                 self.failed = True
             finally:
                 for pin in self.console_pins.values():
                     try:
                         if not pin.exited():
                             self.failed = True
-                    except BaseException:
+                    except BaseException as error:
+                        self._record_failure(error, "finish_pin_exit")
                         self.failed = True
                     finally:
                         try:
                             pin.close()
-                        except BaseException:
+                        except BaseException as error:
+                            self._record_failure(error, "finish_pin_close")
                             self.failed = True
 
 
@@ -1650,7 +1726,7 @@ def test_native_browser_handoff_rejects_unreaped_descendants(monkeypatch):
         _retire_temporary_browser_processes({(123, 456): child})
 
 
-def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
+def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None, service_only=False):
     """Wait for owned process identities, never a historical PID's later occupant."""
     __tracebackhide__ = True
     diagnostic = {} if diagnostic is None else diagnostic
@@ -1667,6 +1743,8 @@ def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
     while True:
         try:
             tracked = cohort.snapshot()
+            if service_only:
+                tracked = [p for p in tracked if cohort.is_service_owned(p)]
         finally:
             if hasattr(cohort, "ownership_diagnostic"):
                 diagnostic["process_ownership"] = cohort.ownership_diagnostic()
@@ -1688,6 +1766,13 @@ def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
             stop_identity_checks=checks,
             stop_wait_seconds=round(time.monotonic() - started, 3),
         )
+        if hasattr(cohort, "last_cleanup_observation"):
+            cohort.last_cleanup_observation = {
+                "scope": "service" if service_only else "all",
+                "live_counts": dict(counts),
+                "checks": checks,
+                "elapsed_seconds": diagnostic["stop_wait_seconds"],
+            }
         if not any(counts.values()):
             return
         remaining = deadline - time.monotonic()
