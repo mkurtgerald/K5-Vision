@@ -3,6 +3,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -21,6 +23,15 @@ namespace K5VisionDesktop
             "msedge", "chrome", "firefox", "brave", "opera", "vivaldi", "iexplore" };
         private static volatile bool firstRun, errorPage, chooser, uiaDone, uiaUnavailable;
         private static volatile bool stopping, originRequest, originResponse;
+        private static volatile bool documentTitle, pageHeading, addressMatches;
+        private static readonly object CaptureGate = new object();
+        private static readonly List<Dictionary<string, object>> Labels = new List<Dictionary<string, object>>();
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WindowRectangle { internal int Left, Top, Right, Bottom; }
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr window, out WindowRectangle rectangle);
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr window);
         [UnmanagedFunctionPointer(CallingConvention.Winapi)]
         private delegate bool EnumWindowsCallback(IntPtr window, IntPtr data);
         [DllImport("user32.dll")]
@@ -53,6 +64,7 @@ namespace K5VisionDesktop
         {
             try
             {
+                lock (CaptureGate) Labels.Clear();
                 AutomationElement root = AutomationElement.FromHandle(window);
                 Queue<AutomationElement> pending = new Queue<AutomationElement>();
                 pending.Enqueue(root);
@@ -60,7 +72,28 @@ namespace K5VisionDesktop
                 while (pending.Count != 0 && ++observed <= 160 && !stopping)
                 {
                     AutomationElement element = pending.Dequeue();
-                    Classify(element.Current.Name);
+                    string name = element.Current.Name ?? "";
+                    string kind = element.Current.ControlType.ProgrammaticName;
+                    string value = "";
+                    Classify(name);
+                    if (kind == "ControlType.Document" && name.Contains("K5 Vision")) documentTitle = true;
+                    if (name == "K5 Vision browser probe") pageHeading = true;
+                    if (kind == "ControlType.Edit" || kind == "ControlType.Document")
+                    {
+                        object pattern;
+                        if (element.TryGetCurrentPattern(ValuePattern.Pattern, out pattern))
+                            value = ((ValuePattern)pattern).Current.Value ?? "";
+                        if (value == "http://127.0.0.1:8000/operator/" || value == "127.0.0.1:8000/operator/")
+                            addressMatches = true;
+                    }
+                    if (name.Length != 0 || value.Length != 0)
+                        lock (CaptureGate)
+                        {
+                            if (Labels.Count < 96)
+                                Labels.Add(new Dictionary<string, object> {
+                                    { "control_type", Clip(kind, 64) }, { "name", Clip(name, 240) },
+                                    { "value", Clip(value, 240) } });
+                        }
                     AutomationElement child = TreeWalker.ControlViewWalker.GetFirstChild(element);
                     for (int count = 0; child != null && count < 24; count++)
                     {
@@ -71,6 +104,32 @@ namespace K5VisionDesktop
             }
             catch { uiaUnavailable = true; }
             finally { uiaDone = true; }
+        }
+
+        private static string Clip(string value, int maximum)
+        { return value.Length <= maximum ? value : value.Substring(0, maximum); }
+
+        private static bool CaptureWindow(IntPtr window, uint expectedPid)
+        {
+            uint pid;
+            GetWindowThreadProcessId(window, out pid);
+            if (window == IntPtr.Zero || pid != expectedPid || !IsWindowVisible(window)) return false;
+            using (Process process = Process.GetProcessById((int)pid))
+                if (!Browsers.Contains(process.ProcessName)) return false;
+            SetForegroundWindow(window);
+            Thread.Sleep(200);
+            WindowRectangle bounds;
+            if (!GetWindowRect(window, out bounds)) return false;
+            Rectangle screen = SystemInformation.VirtualScreen;
+            Rectangle area = Rectangle.Intersect(screen, Rectangle.FromLTRB(bounds.Left, bounds.Top, bounds.Right, bounds.Bottom));
+            if (area.Width < 50 || area.Height < 50 || area.Width > 4096 || area.Height > 3072) return false;
+            using (Bitmap image = new Bitmap(area.Width, area.Height))
+            using (Graphics graphics = Graphics.FromImage(image))
+            {
+                graphics.CopyFromScreen(area.Left, area.Top, 0, 0, area.Size, CopyPixelOperation.SourceCopy);
+                image.Save("browser-dispatch-native.png", ImageFormat.Png);
+            }
+            return true;
         }
 
         private static void Serve(TcpListener listener)
@@ -149,6 +208,10 @@ namespace K5VisionDesktop
                 result["dispatch_native_error"] = nativeError;
                 bool visible = false, title = false, automationStarted = false;
                 long lastAutomation = -1000;
+                IntPtr captureWindow = IntPtr.Zero;
+                uint capturePid = 0;
+                long captureArea = 0;
+                List<string> captions = new List<string>();
                 HashSet<uint> observed = new HashSet<uint>();
                 Stopwatch elapsed = Stopwatch.StartNew();
                 while (elapsed.ElapsedMilliseconds < 23000)
@@ -166,7 +229,18 @@ namespace K5VisionDesktop
                                 if (!browser && name != "OpenWith" && name != "SystemSettings" && name != "ApplicationFrameHost") return true;
                                 StringBuilder text = new StringBuilder(2048); GetWindowText(window, text, text.Capacity);
                                 Classify(text.ToString());
-                                if (browser) { observed.Add(pid); visible = true; title |= text.ToString().Contains("K5 Vision"); }
+                                if (browser)
+                                {
+                                    observed.Add(pid); visible = true; title |= text.ToString().Contains("K5 Vision");
+                                    WindowRectangle bounds;
+                                    if (GetWindowRect(window, out bounds))
+                                    {
+                                        long area = (long)(bounds.Right - bounds.Left) * (bounds.Bottom - bounds.Top);
+                                        if (area > captureArea) { captureWindow = window; capturePid = pid; captureArea = area; }
+                                    }
+                                    string caption = Clip(text.ToString(), 240);
+                                    if (captions.Count < 8 && !captions.Contains(caption)) captions.Add(caption);
+                                }
                                 if (!automationStarted || (uiaDone && !firstRun && !errorPage && !chooser &&
                                     elapsed.ElapsedMilliseconds - lastAutomation >= 1000))
                                 {
@@ -196,6 +270,13 @@ namespace K5VisionDesktop
                 result["default_app_chooser_observed"] = chooser;
                 result["uia_completed"] = uiaDone;
                 result["uia_unavailable"] = uiaUnavailable;
+                result["document_title_matches"] = documentTitle;
+                result["page_heading_matches"] = pageHeading;
+                result["address_matches"] = addressMatches;
+                result["qa_browser_captions"] = captions;
+                lock (CaptureGate) result["qa_uia_projection"] = Labels.ToArray();
+                try { result["qa_window_capture_saved"] = CaptureWindow(captureWindow, capturePid); }
+                catch (Exception error) { result["qa_window_capture_saved"] = false; result["qa_capture_failure_type"] = error.GetType().Name; }
                 // A diagnostic must not sweep/kill processes by name. The
                 // disposable VM owns its lifetime; preserve every browser here.
                 result["unowned_processes_preserved"] = true;
