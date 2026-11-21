@@ -11,6 +11,40 @@ from __future__ import annotations
 import ctypes
 import os
 from ctypes import wintypes
+from pathlib import PureWindowsPath
+
+
+class OwnershipFailure(RuntimeError):
+    def __init__(self, diagnostic):
+        super().__init__("Native process ownership proof failed")
+        self.diagnostic = diagnostic
+
+
+def service_candidate(details, service_sid, images, *, root=False):
+    """Parent PID topology nominates candidates; token/image/session admit them."""
+    kind = images.get(str(PureWindowsPath(details["image"])).casefold(), "outside_payload")
+    result = {
+        "pid": details["pid"],
+        "created_100ns": details["created_100ns"],
+        "parent_pid": details["parent_pid"],
+        "kind": kind,
+        "sid_role": "service" if details["sid"] == service_sid else "foreign",
+        "session": details["session"],
+        "accepted": False,
+    }
+    if result["sid_role"] != "service":
+        result["outcome"] = "foreign_token"
+        if root:
+            raise OwnershipFailure(result)
+        return result
+    if kind == "outside_payload" or (root and kind != "wrapper"):
+        result["outcome"] = "unexpected_service_image"
+        raise OwnershipFailure(result)
+    if details["session"] != 0:
+        result["outcome"] = "unexpected_service_session"
+        raise OwnershipFailure(result)
+    result.update(accepted=True, outcome="admitted")
+    return result
 
 
 def descendant_identities(root, parent_pids, read_identity, reread_parent_pids):
@@ -89,6 +123,9 @@ class NativeProcessTree:
         if os.name != "nt":
             raise RuntimeError("Native process identity requires Windows")
         self.api = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.security = ctypes.WinDLL("advapi32", use_last_error=True)
+        self._service_sid = None
+        self.last_parents = {}
         self.api.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
         self.api.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
         for name in ("Process32FirstW", "Process32NextW"):
@@ -103,6 +140,148 @@ class NativeProcessTree:
         self.api.GetExitCodeProcess.restype = wintypes.BOOL
         self.api.CloseHandle.argtypes = [wintypes.HANDLE]
         self.api.CloseHandle.restype = wintypes.BOOL
+        self.api.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        self.api.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        self.api.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        self.api.ProcessIdToSessionId.restype = wintypes.BOOL
+        self.api.GetSystemDirectoryW.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+        self.api.GetSystemDirectoryW.restype = wintypes.UINT
+        self.security.OpenProcessToken.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.HANDLE),
+        ]
+        self.security.OpenProcessToken.restype = wintypes.BOOL
+        self.security.GetTokenInformation.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        self.security.GetTokenInformation.restype = wintypes.BOOL
+        self.security.IsValidSid.argtypes, self.security.IsValidSid.restype = (
+            [ctypes.c_void_p],
+            wintypes.BOOL,
+        )
+        self.security.GetLengthSid.argtypes, self.security.GetLengthSid.restype = (
+            [ctypes.c_void_p],
+            wintypes.DWORD,
+        )
+        self.security.LookupAccountNameW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        self.security.LookupAccountNameW.restype = wintypes.BOOL
+
+    def _sid_bytes(self, pointer):
+        if not pointer or not self.security.IsValidSid(pointer):
+            raise OSError("Native process token SID was invalid")
+        length = self.security.GetLengthSid(pointer)
+        if not 8 <= length <= 68:
+            raise OSError("Native process token SID exceeded its bound")
+        return ctypes.string_at(pointer, length)
+
+    def service_sid(self):
+        if self._service_sid is None:
+            size, domain_size, use = (wintypes.DWORD() for _ in range(3))
+            account = r"NT SERVICE\K5VisionRecorder"
+            self.security.LookupAccountNameW(
+                None,
+                account,
+                None,
+                ctypes.byref(size),
+                None,
+                ctypes.byref(domain_size),
+                ctypes.byref(use),
+            )
+            if not 8 <= size.value <= 68 or not 1 <= domain_size.value <= 256:
+                raise OSError("Native recorder account SID could not be resolved")
+            sid = ctypes.create_string_buffer(size.value)
+            domain = ctypes.create_unicode_buffer(domain_size.value)
+            if not self.security.LookupAccountNameW(
+                None,
+                account,
+                sid,
+                ctypes.byref(size),
+                domain,
+                ctypes.byref(domain_size),
+                ctypes.byref(use),
+            ):
+                raise OSError("Native recorder account SID could not be read")
+            self._service_sid = self._sid_bytes(sid)
+        return self._service_sid
+
+    def system_directory(self):
+        result = ctypes.create_unicode_buffer(32768)
+        length = self.api.GetSystemDirectoryW(result, len(result))
+        if not 1 <= length < len(result):
+            raise OSError("Native Windows system directory could not be read")
+        return result.value
+
+    def details(self, identity):
+        """Private native facts; callers expose only the finite projection."""
+        handle = self.api.OpenProcess(0x1000, False, identity[0])
+        if not handle:
+            if self.birth(identity[0]) is None:
+                raise ProcessLookupError("Candidate exited during ownership observation")
+            raise OSError("Native candidate ownership could not be opened")
+        token = wintypes.HANDLE()
+        try:
+            if self._handle_birth(handle) != identity[1]:
+                raise ProcessLookupError("Candidate changed during ownership observation")
+            image, length = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
+            if not self.api.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(length)):
+                raise OSError("Native candidate image could not be read")
+            if not self.security.OpenProcessToken(handle, 8, ctypes.byref(token)):
+                raise OSError("Native candidate token could not be read")
+            size = wintypes.DWORD()
+            self.security.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
+            if not ctypes.sizeof(ctypes.c_void_p) <= size.value <= 4096:
+                raise OSError("Native candidate token exceeded its bound")
+            user = ctypes.create_string_buffer(size.value)
+            if not self.security.GetTokenInformation(token, 1, user, len(user), ctypes.byref(size)):
+                raise OSError("Native candidate TokenUser could not be read")
+            sid = self._sid_bytes(ctypes.c_void_p.from_buffer(user).value)
+            elevation, elevation_size = wintypes.DWORD(), wintypes.DWORD()
+            if not self.security.GetTokenInformation(
+                token,
+                20,
+                ctypes.byref(elevation),
+                ctypes.sizeof(elevation),
+                ctypes.byref(elevation_size),
+            ):
+                raise OSError("Native candidate token elevation could not be read")
+            session = wintypes.DWORD()
+            if not self.api.ProcessIdToSessionId(identity[0], ctypes.byref(session)):
+                raise OSError("Native candidate session could not be read")
+            if self._handle_birth(handle) != identity[1] or self.birth(identity[0]) != identity[1]:
+                raise ProcessLookupError("Candidate changed during ownership observation")
+            if identity[0] not in self.last_parents:
+                self.parents()
+            return {
+                "pid": identity[0],
+                "created_100ns": identity[1],
+                "parent_pid": self.last_parents.get(identity[0], 0),
+                "image": image.value,
+                "sid": sid,
+                "session": session.value,
+                "elevated": elevation.value != 0,
+            }
+        finally:
+            if token:
+                self.api.CloseHandle(token)
+            self.api.CloseHandle(handle)
 
     def _handle_birth(self, handle):
         created, exited, kernel, user = (_FileTime() for _ in range(4))
@@ -148,9 +327,29 @@ class NativeProcessTree:
                 present = self.api.Process32NextW(handle, ctypes.byref(entry))
             if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
                 raise OSError("Native process topology did not complete")
+            self.last_parents = result
             return result
         finally:
             self.api.CloseHandle(handle)
 
     def descendants(self, root):
-        return descendant_identities(root, self.parents(), self.birth, self.parents)
+        parents = self.parents()
+
+        def identity(pid):
+            try:
+                return self.birth(pid)
+            except OSError:
+                raise OwnershipFailure(
+                    {
+                        "pid": pid,
+                        "created_100ns": root[1] if pid == root[0] else 0,
+                        "parent_pid": parents.get(pid, 0),
+                        "kind": "unavailable",
+                        "sid_role": "unavailable",
+                        "session": None,
+                        "accepted": False,
+                        "outcome": "proof_unavailable",
+                    }
+                ) from None
+
+        return descendant_identities(root, parents, identity, self.parents)

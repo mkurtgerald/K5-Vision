@@ -116,3 +116,36 @@ def test_native_qualification_is_triggered_by_each_service_acceptance_source():
         "tests/unit/test_windows_service_workflow.py",
     ):
         assert "      - " + name in source
+
+
+def test_candidate_artifacts_bind_the_producer_attempt_before_retry_downloads():
+    native = _job("native-desktop")
+    assert "run_id=[long]$env:GITHUB_RUN_ID; run_attempt=[int]$env:GITHUB_RUN_ATTEMPT;" in native
+    assert "-${{ github.run_id }}-attempt-${{ github.run_attempt }}" in native
+    for name in ("service-recording", "time-administration"):
+        job = _job(name)
+        admission, download = job.split(
+            "      - name: Download the original unqualified candidate without rebuilding", 1
+        )
+        assert (
+            "CANDIDATE_RUN_ATTEMPT: ${{ needs.native-desktop.outputs.primary_run_attempt }}"
+            in admission
+        )
+        assert "$env:CANDIDATE_RUN_ATTEMPT -ne $env:GITHUB_RUN_ATTEMPT" in admission
+        assert "-attempt-$($env:CANDIDATE_RUN_ATTEMPT)" in admission
+        assert "run_attempt=[int]$env:CANDIDATE_RUN_ATTEMPT" in admission
+        assert "github-token: ${{ github.token }}" in download
+        assert "run-id: ${{ github.run_id }}" in download
+        assert "$package.run_id -ne [long]$env:GITHUB_RUN_ID" in download
+        assert "$package.run_attempt -ne [int]$env:GITHUB_RUN_ATTEMPT" in download
+        assert "continue-on-error:" not in download
+
+
+def test_upgrade_consumer_uses_the_same_attempt_qualified_candidate():
+    upgrade = _job("cross-revision-upgrade")
+    assert "actions: read" in upgrade
+    assert "-${{ github.run_id }}-attempt-${{ github.run_attempt }}" in upgrade
+    assert "github-token: ${{ github.token }}" in upgrade
+    assert "run-id: ${{ github.run_id }}" in upgrade
+    assert "$meta.run_id -ne [long]$env:GITHUB_RUN_ID" in upgrade
+    assert "$meta.run_attempt -ne [int]$env:GITHUB_RUN_ATTEMPT" in upgrade

@@ -18,6 +18,7 @@ _TRUE = {
     "installed_service_session_zero",
     "installed_service_api",
     "native_gui_time_approval",
+    "native_approval_helper_observed",
     "no_console_windows",
     "native_configuration_readback",
     "native_resync_requested",

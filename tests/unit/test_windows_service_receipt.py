@@ -43,6 +43,14 @@ def _receipt():
         "browser_channel": "msedge",
         "browser_version": "142.0.1.1",
         "playwright_version": "1.58.0",
+        "process_ownership": {
+            **dict.fromkeys(_VERIFIER["_OWNERSHIP_TRUE"], True),
+            "admitted_service_images": sorted(_VERIFIER["_OWNERSHIP_IMAGES"]),
+            "admitted_service_count": 20,
+            "rejected_foreign_count": 0,
+            "unreadable_identity_count": 0,
+            "unexpected_service_image_count": 0,
+        },
         "scm": {
             "service_type": 16,
             "start_type": 2,
@@ -116,6 +124,43 @@ def test_service_receipt_accepts_only_installer_bound_real_process_and_recording
 ):
     value = _receipt()
     assert _verify(_report(tmp_path, value)) == value
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"service_token_verified": False},
+        {"service_token_verified": 1},
+        {"session_zero_verified": False},
+        {"installed_images_verified": False},
+        {"admitted_service_images": ["host", "python", "wrapper"]},
+        {"admitted_service_images": ["caddy", "host", "mediamtx", "python", "other"]},
+        {"admitted_service_count": 4},
+        {"admitted_service_count": 4097},
+        {"admitted_service_count": 4096, "rejected_foreign_count": 1},
+        {"rejected_foreign_count": -1},
+        {"rejected_foreign_count": True},
+        {"unreadable_identity_count": 1},
+        {"unreadable_identity_count": False},
+        {"unexpected_service_image_count": 1},
+        {"unexpected_service_image_count": False},
+        {"private_path": "must-not-qualify"},
+    ],
+)
+def test_service_receipt_requires_actual_token_session_and_installed_image_ownership(
+    tmp_path, change
+):
+    value = _receipt()
+    value["process_ownership"].update(change)
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, value))
+
+
+def test_service_receipt_cannot_reuse_an_older_cleanup_only_receipt(tmp_path):
+    value = _receipt()
+    value.pop("process_ownership")
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, value))
 
 
 @pytest.mark.parametrize(

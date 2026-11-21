@@ -132,6 +132,7 @@ def _failure_note(error, diagnostic, service):
         "test_windows_service_recording.py",
         "windows_service_acceptance.py",
         "windows_standard_user_acceptance.py",
+        "windows_process_identity.py",
         "test_windows_desktop_app.py",
         "test_operator_product_runtime.py",
         "test_operator_beta_browser.py",
@@ -278,6 +279,7 @@ def _growth(service, desktop, profile, client, camera_id, *, previous=None, mini
 
 def _stop_during_startup(service, profile, desktop, cohort, diagnostic):
     """Stop a genuine new pre-ready host, without injecting a pause or test mode."""
+    diagnostic["stage"] = "normal_stop_before_startup_regression"
     _, backend = service.processes()
     old_host = psutil.Process(backend.ppid())
     previous = (old_host.pid, service.native_birth(old_host))
@@ -320,7 +322,7 @@ def _stop_during_startup(service, profile, desktop, cohort, diagnostic):
             (event["host_pid"], event["host_created_100ns"]) != previous,
             "Startup-stop proof observed the previous recorder host",
         )
-        cohort.add(psutil.Process(snapshot["scm"]["pid"]))
+        cohort.add(psutil.Process(snapshot["scm"]["pid"]), role="service")
         return event
 
     observed = desktop._wait(pre_ready, "Native new-host pre-readiness bootstrap", timeout=15)
@@ -596,7 +598,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
             "Actual SCM recovery after embedded backend failure",
             timeout=45,
         )
-        cohort.add(service.processes()[0])
+        cohort.add(service.processes()[0], role="service")
         desktop._wait(
             lambda: desktop._healthy(client, diagnostic), "Recovered backend health", timeout=30
         )
@@ -610,7 +612,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
             "Actual SCM recovery after wrapper failure",
             timeout=60,
         )
-        cohort.add(service.processes()[0])
+        cohort.add(service.processes()[0], role="service")
         desktop._wait(
             lambda: desktop._healthy(client, diagnostic), "Recovered SCM health", timeout=30
         )
@@ -766,9 +768,16 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         if cohort.failed:
             cleanup_failed = True
             _cleanup_note(diagnostic, "cohort_observer", RuntimeError())
-        for process in reversed(cohort.snapshot()):
+        try:
+            owned = cohort.snapshot()
+        except BaseException as error:
+            cleanup_failed = True
+            _cleanup_note(diagnostic, "cohort_snapshot", error)
+            owned = []
+        diagnostic["process_ownership"] = cohort.ownership_diagnostic()
+        for process in reversed(owned):
             try:
-                if process.is_running():
+                if cohort.is_owned_running(process):
                     process.kill()
                     process.wait(timeout=10)
             except psutil.NoSuchProcess:
@@ -807,6 +816,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         "Installed unattended service qualification failed: "
         + json.dumps(diagnostic, sort_keys=True),
     )
+    receipt["process_ownership"] = cohort.ownership_receipt()
     receipt.update(
         schema_version=1,
         head_sha=os.environ["K5_DESKTOP_HEAD_SHA"],

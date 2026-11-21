@@ -921,9 +921,16 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                 except BaseException:
                     cleanup_failed = True
         cohort.finish()
-        for process in reversed(cohort.snapshot()):
+        cleanup_failed = cleanup_failed or cohort.failed
+        try:
+            owned = cohort.snapshot()
+        except BaseException:
+            cleanup_failed = True
+            owned = []
+        diagnostic["process_ownership"] = cohort.ownership_diagnostic()
+        for process in reversed(owned):
             try:
-                if process.is_running():
+                if cohort.is_owned_running(process):
                     process.kill()
                     process.wait(timeout=10)
             except psutil.NoSuchProcess:
@@ -965,6 +972,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     "health_http_status",
                     "foreign_preview_http_status",
                     "foreign_preview_api_code",
+                    "process_ownership",
                 }
             }
             safe.update(failed=failed, cleanup_failed=cleanup_failed)

@@ -106,7 +106,7 @@ namespace K5VisionDesktop
         private readonly Button create = new Button(), open = new Button(), quit = new Button(), approveTime = new Button();
         private readonly NotifyIcon tray = new NotifyIcon();
         private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
-        private bool checkedPayload, busy, disposed, ready, openedBrowser, legacyProfile;
+        private bool checkedPayload, busy, disposed, ready, openedBrowser, legacyProfile, exitRequested;
         private string phase = "preparing";
         private string browserDispatch = "not_requested";
         private int browserAttempts, browserNativeError;
@@ -150,11 +150,11 @@ namespace K5VisionDesktop
             open.Click += delegate { OpenDashboard(); }; Controls.Add(open);
             quit.Text = "Close K5 Vision"; quit.Name = "CloseK5Vision";
             quit.Location = new Point(340, 389); quit.Size = new Size(180, 36); SetId(quit, 1005);
-            quit.Click += delegate { Close(); }; Controls.Add(quit);
+            quit.Click += delegate { ExitClient(); }; Controls.Add(quit);
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.Add("Open camera wall", null, delegate { ShowOwner(); OpenDashboard(); });
             menu.Items.Add("Show K5 Vision", null, delegate { ShowOwner(); });
-            menu.Items.Add("Close K5 Vision (recording continues)", null, delegate { Close(); });
+            menu.Items.Add("Close K5 Vision (recording continues)", null, delegate { ExitClient(); });
             tray.Icon = SystemIcons.Application; Icon = SystemIcons.Application; tray.Text = "K5 Vision";
             tray.ContextMenuStrip = menu; tray.Visible = true;
             tray.DoubleClick += delegate { ShowOwner(); OpenDashboard(); };
@@ -325,6 +325,16 @@ namespace K5VisionDesktop
                 status.Text = "Approve the Windows permission prompt to complete the pending time change.";
             }
             catch { status.Text = "Time approval was not opened. Select Approve time change to try again before the request expires."; }
+        }
+        private void ExitClient() { exitRequested = true; Close(); }
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (!exitRequested && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                Hide();
+            }
+            base.OnFormClosing(e);
         }
         private void ShowOwner() { Show(); WindowState = FormWindowState.Normal; Activate(); BringToFront(); }
         private void Fail(string message) { phase = "failed"; busy = false; status.Text = message; open.Enabled = false; UpdateDiagnostic(); }

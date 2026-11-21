@@ -80,6 +80,20 @@ _FIELDS = {
     "clock_health_after_restart",
     "standard_windows_user",
     "startup_shutdown",
+    "process_ownership",
+}
+_OWNERSHIP_TRUE = {
+    "service_token_verified",
+    "session_zero_verified",
+    "installed_images_verified",
+}
+_OWNERSHIP_IMAGES = {"wrapper", "host", "python", "mediamtx", "caddy"}
+_OWNERSHIP_FIELDS = {
+    "admitted_service_images",
+    "admitted_service_count",
+    "rejected_foreign_count",
+    "unreadable_identity_count",
+    "unexpected_service_image_count",
 }
 _PHASES = ("initial", "client_closed", "backend_recovered", "wrapper_recovered")
 _OBSERVATION = {
@@ -217,6 +231,18 @@ def verify(report: Path, *, expected_head: str, installer_sha256: str) -> dict:
         and re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", value["browser_version"])
     )
     _number(value["duration_seconds"], 1, 360)
+    ownership = value["process_ownership"]
+    _require(type(ownership) is dict and set(ownership) == _OWNERSHIP_TRUE | _OWNERSHIP_FIELDS)
+    _require(all(ownership[key] is True for key in _OWNERSHIP_TRUE))
+    _require(
+        type(ownership["admitted_service_images"]) is list
+        and ownership["admitted_service_images"] == sorted(_OWNERSHIP_IMAGES)
+    )
+    admitted = _integer(ownership["admitted_service_count"], len(_OWNERSHIP_IMAGES), 4096)
+    rejected = _integer(ownership["rejected_foreign_count"], 0, 4096)
+    _require(admitted + rejected <= 4096)
+    _integer(ownership["unreadable_identity_count"], 0, 0)
+    _integer(ownership["unexpected_service_image_count"], 0, 0)
     scm = value["scm"]
     _require(
         type(scm) is dict

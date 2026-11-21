@@ -289,6 +289,7 @@ jobs:
           # still block the independent installed GUI acceptance.
           @{
             schema_version=1; qualification_status='unqualified';
+            run_id=[long]$env:GITHUB_RUN_ID; run_attempt=[int]$env:GITHUB_RUN_ATTEMPT;
             head_sha=$env:K5_DESKTOP_HEAD_SHA;
             setup_sha256=(Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant();
             setup_bytes=$setup.Length;
@@ -299,7 +300,7 @@ jobs:
         id: unqualified_desktop_candidate
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: k5-vision-windows-upgrade-candidate-${{ github.event.pull_request.head.sha || github.sha }}
+          name: k5-vision-windows-upgrade-candidate-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: desktop-build/upgrade-candidate/
           if-no-files-found: error
           retention-days: 14
@@ -747,6 +748,9 @@ jobs:
   cross-revision-upgrade:
     name: Install baseline, qualify stopped upgrade and manual reversal
     needs: [native-desktop]
+    permissions:
+      contents: read
+      actions: read
     # Keep independent upgrade/reversal evidence when another Windows gate fails.
     # Focused failures still fail the overall workflow and block release admission.
     # A missing exact-source candidate artifact fails this job closed.
@@ -885,7 +889,9 @@ jobs:
       - name: Retrieve exact unqualified candidate for independent upgrade testing
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          name: k5-vision-windows-upgrade-candidate-${{ github.event.pull_request.head.sha || github.sha }}
+          name: k5-vision-windows-upgrade-candidate-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
           path: candidate-setup
       - name: Admit candidate executable and complete release manifest
         shell: pwsh
@@ -896,6 +902,8 @@ jobs:
           $setup = Get-Item -LiteralPath candidate-setup/K5VisionSetup.exe
           $hash = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($meta.qualification_status -ne "unqualified" -or
+              $meta.run_id -ne [long]$env:GITHUB_RUN_ID -or
+              $meta.run_attempt -ne [int]$env:GITHUB_RUN_ATTEMPT -or
               $meta.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
               $meta.setup_sha256 -ne $hash -or $meta.setup_bytes -ne $setup.Length -or
               $meta.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath candidate-setup/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
@@ -959,26 +967,31 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_ARTIFACT_ID: ${{ needs.native-desktop.outputs.candidate_artifact_id }}
+          CANDIDATE_RUN_ATTEMPT: ${{ needs.native-desktop.outputs.primary_run_attempt }}
           EXECUTION_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
           if ($env:CANDIDATE_ARTIFACT_ID -notmatch '^[1-9][0-9]*$') { throw "Candidate artifact id absent" }
+          if ($env:CANDIDATE_RUN_ATTEMPT -notmatch '^[1-9][0-9]*$' -or
+              $env:CANDIDATE_RUN_ATTEMPT -ne $env:GITHUB_RUN_ATTEMPT) { throw "Candidate producer attempt mismatch" }
           $headers = @{ Authorization="Bearer $env:GH_TOKEN"; Accept="application/vnd.github+json"; "X-GitHub-Api-Version"="2022-11-28" }
           $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:CANDIDATE_ARTIFACT_ID"
           $meta = Invoke-RestMethod -Uri $uri -Headers $headers
-          $expectedName = "k5-vision-windows-upgrade-candidate-$env:K5_DESKTOP_HEAD_SHA"
+          $expectedName = "k5-vision-windows-upgrade-candidate-$($env:K5_DESKTOP_HEAD_SHA)-$($env:GITHUB_RUN_ID)-attempt-$($env:CANDIDATE_RUN_ATTEMPT)"
           if ([string]$meta.id -ne $env:CANDIDATE_ARTIFACT_ID -or $meta.name -ne $expectedName -or
               [string]$meta.workflow_run.id -ne $env:GITHUB_RUN_ID -or
               $meta.workflow_run.head_sha -ne $env:EXECUTION_HEAD_SHA -or $meta.expired -ne $false) {
             throw "Service candidate artifact producer mismatch"
           }
-          @{ artifact_id=$meta.id; run_id=$meta.workflow_run.id; run_attempt=$env:GITHUB_RUN_ATTEMPT;
+          @{ artifact_id=$meta.id; run_id=$meta.workflow_run.id; run_attempt=[int]$env:CANDIDATE_RUN_ATTEMPT;
              head_sha=$env:K5_DESKTOP_HEAD_SHA; installer_qualification_status='unqualified' } |
             ConvertTo-Json | Set-Content -LiteralPath service-candidate-provenance.json -Encoding utf8
       - name: Download the original unqualified candidate without rebuilding
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           artifact-ids: ${{ needs.native-desktop.outputs.candidate_artifact_id }}
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
           path: service-input
           merge-multiple: true
       - name: Bind service proof to exact unqualified candidate bytes
@@ -990,6 +1003,8 @@ jobs:
           $setup = Get-Item -LiteralPath service-input/K5VisionSetup.exe
           $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($package.qualification_status -ne "unqualified" -or
+              $package.run_id -ne [long]$env:GITHUB_RUN_ID -or
+              $package.run_attempt -ne [int]$env:GITHUB_RUN_ATTEMPT -or
               $package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
               $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
               $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath service-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
@@ -1063,26 +1078,31 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_ARTIFACT_ID: ${{ needs.native-desktop.outputs.candidate_artifact_id }}
+          CANDIDATE_RUN_ATTEMPT: ${{ needs.native-desktop.outputs.primary_run_attempt }}
           EXECUTION_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
           if ($env:CANDIDATE_ARTIFACT_ID -notmatch '^[1-9][0-9]*$') { throw "Candidate artifact id absent" }
+          if ($env:CANDIDATE_RUN_ATTEMPT -notmatch '^[1-9][0-9]*$' -or
+              $env:CANDIDATE_RUN_ATTEMPT -ne $env:GITHUB_RUN_ATTEMPT) { throw "Candidate producer attempt mismatch" }
           $headers = @{ Authorization="Bearer $env:GH_TOKEN"; Accept="application/vnd.github+json"; "X-GitHub-Api-Version"="2022-11-28" }
           $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:CANDIDATE_ARTIFACT_ID"
           $meta = Invoke-RestMethod -Uri $uri -Headers $headers
-          $expectedName = "k5-vision-windows-upgrade-candidate-$env:K5_DESKTOP_HEAD_SHA"
+          $expectedName = "k5-vision-windows-upgrade-candidate-$($env:K5_DESKTOP_HEAD_SHA)-$($env:GITHUB_RUN_ID)-attempt-$($env:CANDIDATE_RUN_ATTEMPT)"
           if ([string]$meta.id -ne $env:CANDIDATE_ARTIFACT_ID -or $meta.name -ne $expectedName -or
               [string]$meta.workflow_run.id -ne $env:GITHUB_RUN_ID -or
               $meta.workflow_run.head_sha -ne $env:EXECUTION_HEAD_SHA -or $meta.expired -ne $false) {
             throw "Time candidate artifact producer mismatch"
           }
-          @{ artifact_id=$meta.id; run_id=$meta.workflow_run.id; run_attempt=$env:GITHUB_RUN_ATTEMPT;
+          @{ artifact_id=$meta.id; run_id=$meta.workflow_run.id; run_attempt=[int]$env:CANDIDATE_RUN_ATTEMPT;
              head_sha=$env:K5_DESKTOP_HEAD_SHA; installer_qualification_status='unqualified' } |
             ConvertTo-Json | Set-Content -LiteralPath time-candidate-provenance.json -Encoding utf8
       - name: Download the original unqualified candidate without rebuilding
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           artifact-ids: ${{ needs.native-desktop.outputs.candidate_artifact_id }}
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
           path: time-input
           merge-multiple: true
       - name: Bind time proof to exact unqualified candidate bytes
@@ -1094,6 +1114,8 @@ jobs:
           $setup = Get-Item -LiteralPath time-input/K5VisionSetup.exe
           $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($package.qualification_status -ne "unqualified" -or
+              $package.run_id -ne [long]$env:GITHUB_RUN_ID -or
+              $package.run_attempt -ne [int]$env:GITHUB_RUN_ATTEMPT -or
               $package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
               $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
               $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath time-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
