@@ -52,6 +52,31 @@ def _require(value, message):
         pytest.fail(message, pytrace=False)
 
 
+def _cleanup_note(diagnostic, stage, error):
+    notes = diagnostic.setdefault("cleanup_failures", [])
+    if len(notes) < 8:
+        kind = type(error).__name__
+        notes.append(
+            {
+                "stage": stage,
+                "kind": kind
+                if kind
+                in {
+                    "AssertionError",
+                    "Failed",
+                    "OSError",
+                    "PermissionError",
+                    "RuntimeError",
+                    "TimeoutError",
+                    "TimeoutExpired",
+                    "FileNotFoundError",
+                    "Error",
+                }
+                else "other",
+            }
+        )
+
+
 def _helpers(name):
     spec = importlib.util.spec_from_file_location(
         "k5_motion_acceptance_" + name, Path(__file__).with_name(name + ".py")
@@ -91,6 +116,7 @@ def _observe_recording(
     growing,
     app=None,
     seconds=4,
+    diagnostic=None,
 ):
     publisher.movement(movement)
     _policy_state(client, camera, state, desktop, app=app)
@@ -117,6 +143,18 @@ def _observe_recording(
         time.sleep(0.2)
     elapsed = time.monotonic() - began
     after = [desktop._recording_bytes(profile, path) for path in paths]
+    if diagnostic is not None:
+        diagnostic["motion_observation"] = {
+            "movement": movement,
+            "expected_growing": growing,
+            "expected_states": sorted(state),
+            "observed_states": sorted(observed_states),
+            "target_before": before[0],
+            "target_after": after[0],
+            "other_before": before[1],
+            "other_after": after[1],
+            "elapsed_seconds": round(elapsed, 3),
+        }
     _require(
         after[0] > before[0] if growing else after[0] == before[0],
         "Actual recording bytes disagreed with the motion gate",
@@ -147,15 +185,28 @@ def _login(page, client, username, password):
     page.locator("#workspace").wait_for(state="visible")
 
 
-def _save_graphically(page, camera, *, zones=False):
+def _save_graphically(page, camera, *, zones=False, diagnostic=None):
     route = f"/api/v1/operator/cameras/{camera}/recording-policy"
     with page.expect_response(
         lambda r: r.request.method == "PUT" and urlsplit(r.url).path == route,
         timeout=30_000,
     ) as response:
         page.locator("#recording-settings-save").click()
+    if diagnostic is not None:
+        diagnostic["motion_save_http_status"] = response.value.status
     _require(response.value.status == 200, "Graphical recording policy was not applied")
     value, sent = response.value.json(), response.value.request.post_data_json
+    if diagnostic is not None:
+        diagnostic["motion_saved_policy"] = {
+            key: value.get(key)
+            for key in ("mode", "pre_capture_seconds", "post_capture_seconds", "status")
+        }
+        saved_zones = value.get("zones", {})
+        diagnostic["motion_saved_zone_counts"] = {
+            "reference_present": saved_zones.get("reference") is not None,
+            "include": len(saved_zones.get("include", [])),
+            "exclude": len(saved_zones.get("exclude", [])),
+        }
     _require(
         value["mode"] == "motion"
         and value["pre_capture_seconds"] == 0
@@ -454,6 +505,24 @@ def _history_export(
 
 def test_native_windows_motion_recording_and_zones(record_testsuite_property):
     __tracebackhide__ = True
+    diagnostic_only = os.environ.get("K5_MOTION_DIAGNOSTIC_ONLY") == "1"
+
+    def record(name, value):
+        prefix = "diagnostic_only_" if diagnostic_only else ""
+        record_testsuite_property(prefix + name, value)
+
+    if diagnostic_only:
+        record(
+            "motion_scope",
+            json.dumps(
+                {
+                    "diagnostic_only": True,
+                    "installer_head": os.environ.get("K5_DESKTOP_HEAD_SHA"),
+                    "harness_head": os.environ.get("K5_MOTION_DIAGNOSTIC_HARNESS_SHA"),
+                },
+                sort_keys=True,
+            ),
+        )
     started, receipt, diagnostic = time.monotonic(), {}, {"stage": "graphical_install"}
     desktop, runtime = (
         _helpers("test_windows_desktop_app"),
@@ -585,7 +654,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
         page.locator("#recording-mode").select_option("motion")
         page.locator("#motion-post-capture").fill("3")
         page.locator("#motion-minimum-area").fill("0.1")
-        initial = _save_graphically(page, target)
+        initial = _save_graphically(page, target, diagnostic=diagnostic)
         _require(
             initial["zones"] == {"reference": None, "include": [], "exclude": []},
             "Default motion zone was not the full frame",
@@ -603,6 +672,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         observations["full_frame_motion"] = _observe_recording(
             client,
@@ -615,6 +685,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"recording"},
             growing=True,
             app=app,
+            diagnostic=diagnostic,
         )
         publisher.movement("idle")
         _policy_state(client, target, {"armed"}, desktop, app=app)
@@ -909,45 +980,72 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
         )
         trace = error.__traceback__
         while trace is not None:
-            if Path(trace.tb_frame.f_code.co_filename).name == Path(__file__).name:
+            if (
+                Path(trace.tb_frame.f_code.co_filename).name == Path(__file__).name
+                and trace.tb_frame.f_code.co_name != "_require"
+            ):
                 diagnostic["failure_function"] = trace.tb_frame.f_code.co_name
                 diagnostic["failure_line"] = trace.tb_lineno
             trace = trace.tb_next
     finally:
-        for resource in (context, browser, playwright):
+        for label, resource in (
+            ("browser_context", context),
+            ("browser", browser),
+            ("browser_runtime", playwright),
+        ):
             if resource is not None:
                 try:
                     resource.stop() if resource is playwright else resource.close()
-                except BaseException:
+                except BaseException as error:
                     cleanup_failed = True
-        cohort.finish()
-        for process in reversed(cohort.snapshot()):
+                    _cleanup_note(diagnostic, label, error)
+        try:
+            cohort.finish()
+        except BaseException as error:
+            cleanup_failed = True
+            _cleanup_note(diagnostic, "cohort_finish", error)
+        diagnostic["cohort_failed_after_finish"] = cohort.failed
+        cleanup_failed = cleanup_failed or cohort.failed
+        try:
+            owned = cohort.snapshot()
+        except BaseException as error:
+            cleanup_failed = True
+            owned = []
+            _cleanup_note(diagnostic, "cohort_snapshot", error)
+        diagnostic["process_ownership"] = cohort.ownership_diagnostic()
+        for process in reversed(owned):
             try:
-                if process.is_running():
-                    process.kill()
-                    process.wait(timeout=10)
+                cohort.terminate_owned(process)
             except psutil.NoSuchProcess:
                 pass
-            except BaseException:
+            except BaseException as error:
                 cleanup_failed = True
+                _cleanup_note(diagnostic, "cohort_retirement", error)
         for resource in [publisher, *fixtures]:
             if resource is not None:
                 try:
                     resource.close()
-                except BaseException:
+                except BaseException as error:
                     cleanup_failed = True
+                    _cleanup_note(diagnostic, "generated_publisher_or_camera", error)
         for process in reversed(processes):
             try:
                 helpers._stop_owned(process)
-            except BaseException:
+            except BaseException as error:
                 cleanup_failed = True
+                _cleanup_note(diagnostic, "generated_process", error)
         for listener in reservations:
-            listener.close()
+            try:
+                listener.close()
+            except BaseException as error:
+                cleanup_failed = True
+                _cleanup_note(diagnostic, "listener", error)
         if parent.exists():
             try:
                 shutil.rmtree(parent)
-            except BaseException:
+            except BaseException as error:
                 cleanup_failed = True
+                _cleanup_note(diagnostic, "temporary_tree", error)
         if failed or cleanup_failed:
             safe = {
                 k: v
@@ -958,6 +1056,12 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     "failure_kind",
                     "failure_function",
                     "failure_line",
+                    "motion_save_http_status",
+                    "motion_saved_policy",
+                    "motion_saved_zone_counts",
+                    "motion_observation",
+                    "cleanup_failures",
+                    "cohort_failed_after_finish",
                     "installer_action",
                     "installer_install_posted",
                     "installer_steps_seen",
@@ -965,17 +1069,18 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     "health_http_status",
                     "foreign_preview_http_status",
                     "foreign_preview_api_code",
+                    "process_ownership",
                 }
             }
             safe.update(failed=failed, cleanup_failed=cleanup_failed)
-            record_testsuite_property("motion_windows_diagnostic", json.dumps(safe, sort_keys=True))
+            record("motion_windows_diagnostic", json.dumps(safe, sort_keys=True))
             print("Motion qualification diagnostic: " + json.dumps(safe, sort_keys=True))
     _require(not failed and not cleanup_failed, "Installed motion qualification failed")
     duration = time.monotonic() - started
     _require(duration < 420, "Installed motion controls exceeded their bounded duration")
     receipt.update(duration_seconds=round(duration, 3), owned_cleanup=True)
     receipt.update(dict.fromkeys(_FALSE_FLAGS, False))
-    record_testsuite_property("motion_windows_receipt", json.dumps(receipt, sort_keys=True))
+    record("motion_windows_receipt", json.dumps(receipt, sort_keys=True))
 
 
 _TRUE_FLAGS = {

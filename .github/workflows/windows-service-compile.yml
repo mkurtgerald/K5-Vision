@@ -14,6 +14,7 @@ on:
       - scripts/probe_windows_recorder_wire.cs
       - scripts/probe_windows_browser_launch.cs
       - scripts/probe_windows_native_worker_images.py
+      - tests/integration/test_windows_motion_recording.py
   pull_request:
     branches: [main]
     paths:
@@ -26,6 +27,7 @@ on:
       - scripts/probe_windows_recorder_wire.cs
       - scripts/probe_windows_browser_launch.cs
       - scripts/probe_windows_native_worker_images.py
+      - tests/integration/test_windows_motion_recording.py
 
 permissions:
   contents: read
@@ -35,6 +37,127 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  motion-diagnostic:
+    name: DIAGNOSTIC ONLY - replay original 333 motion installer without rebuilding
+    runs-on: windows-2025
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      actions: read
+    env:
+      K5_DESKTOP_HEAD_SHA: 333685876d8f5dfd65cc4dcafeb2b4a694393283
+      K5_DESKTOP_SETUP_SHA256: 647a2e2231b17efbfd08ff7bced749d42fef889ce17c83df8ee43225f6f9d730
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_NATIVE_MOTION_ACCEPTANCE: "1"
+      K5_VM_CLOCK_ACCEPTANCE: "1"
+      K5_MOTION_DIAGNOSTIC_ONLY: "1"
+      K5_MOTION_DIAGNOSTIC_HARNESS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout original immutable installer runtime and acceptance helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 333685876d8f5dfd65cc4dcafeb2b4a694393283
+          persist-credentials: false
+      - name: Checkout the separate diagnostic harness without replacing product source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: diagnostic-source
+          persist-credentials: false
+      - name: Admit the original successful producer and immutable artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization="Bearer $env:GH_TOKEN"; Accept='application/vnd.github+json'; 'X-GitHub-Api-Version'='2022-11-28' }
+          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions"
+          $meta = Invoke-RestMethod -Uri "$api/artifacts/14729726222" -Headers $headers
+          $attempt = Invoke-RestMethod -Uri "$api/runs/44960391488/attempts/1" -Headers $headers
+          $jobs = Invoke-RestMethod -Uri "$api/runs/44960391488/attempts/1/jobs?per_page=100" -Headers $headers
+          $producer = @($jobs.jobs | Where-Object { $_.id -eq 137017687325 })
+          if ($meta.id -ne 14729726222 -or $meta.expired -ne $false -or
+              $meta.name -ne "k5-vision-windows-setup-$env:K5_DESKTOP_HEAD_SHA" -or
+              $meta.digest -ne 'sha256:75cef53e0aa8aa25df83d1d2403d4b77e6c97a400ea4123b62b3f1eb78fda349' -or
+              $meta.size_in_bytes -ne 298920547 -or $meta.workflow_run.id -ne 44960391488 -or
+              $meta.workflow_run.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $attempt.id -ne 44960391488 -or $attempt.run_attempt -ne 1 -or
+              $attempt.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $producer.Count -ne 1 -or $producer[0].conclusion -ne 'success') {
+            throw 'Original motion replay producer or artifact identity mismatch'
+          }
+      - name: Download original qualified primary installer by exact artifact ID
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: 14729726222
+          github-token: ${{ github.token }}
+          run-id: 44960391488
+          path: motion-replay-input
+          merge-multiple: true
+      - name: Bind original bytes and overlay only the diagnostic motion test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Get-Content -LiteralPath motion-replay-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath motion-replay-input/payload-manifest.json -Raw | ConvertFrom-Json
+          $setup = Get-Item -LiteralPath motion-replay-input/K5VisionSetup.exe
+          $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $overlay = 'diagnostic-source/tests/integration/test_windows_motion_recording.py'
+          $overlaySha = (Get-FileHash -LiteralPath $overlay -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -ne $env:K5_DESKTOP_SETUP_SHA256 -or $package.setup_sha256 -ne $sha -or
+              $package.setup_bytes -ne $setup.Length -or
+              $package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath motion-replay-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
+              $package.motion_recording -ne $true -or $package.camera_trigger_zones -ne $true -or
+              $package.no_terminal_required -ne $true -or $package.workers_bundled -ne $true -or
+              $overlaySha -ne 'cb77f657cee15edf4a8b6007fb8101ea5b32a42ce7fecb324a56536e91706fdc' -or
+              $env:K5_MOTION_DIAGNOSTIC_HARNESS_SHA -eq $env:K5_DESKTOP_HEAD_SHA) {
+            throw 'Diagnostic motion replay source or installer byte identity mismatch'
+          }
+          Copy-Item -LiteralPath $overlay -Destination tests/integration/test_windows_motion_recording.py -Force
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          @{ schema_version=1; diagnostic_only=$true; product_qualification=$false;
+             installer_head=$env:K5_DESKTOP_HEAD_SHA; harness_head=$env:K5_MOTION_DIAGNOSTIC_HARNESS_SHA;
+             source_run_id=44960391488; source_run_attempt=1; artifact_id=14729726222;
+             setup_sha256=$sha; overlay_sha256=$overlaySha; replay_run_id=$env:GITHUB_RUN_ID } |
+            ConvertTo-Json | Set-Content -LiteralPath motion-replay-provenance.json -Encoding utf8
+      - name: Prepare only the disposable CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
+      - name: Set up development Python for the diagnostic controller
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install original acceptance dependencies before changing guest time
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic motion dependency installation failed' }
+      - name: Provision original pinned generated-media tools before changing guest time
+        uses: ./.github/actions/provision-operator-tools
+      - name: Replay original installed motion criteria with diagnostic-only properties
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_motion_recording.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=460 --junitxml=motion-replay-diagnostic.xml
+          $testResult = $LASTEXITCODE
+          [xml]$report = Get-Content -LiteralPath motion-replay-diagnostic.xml -Raw
+          if ($report.SelectNodes('//property[@name="motion_windows_receipt"]').Count -ne 0 -or
+              $report.SelectNodes('//property[@name="diagnostic_only_motion_scope"]').Count -ne 1) {
+            throw 'Diagnostic replay emitted an invalid qualification scope'
+          }
+          if ($testResult -ne 0) { throw 'Diagnostic-only motion replay reproduced a failing criterion' }
+      - name: Retain diagnostic-only replay observations without promotion
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-motion-replay-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            motion-replay-diagnostic.xml
+            motion-replay-provenance.json
+          if-no-files-found: warn
+          retention-days: 14
   worker-images:
     name: Observe actual owned worker image identities without installing K5
     runs-on: windows-2025
