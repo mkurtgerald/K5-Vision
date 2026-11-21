@@ -9,6 +9,8 @@ on:
       - windows/desktop/**
       - scripts/compile_desktop_launcher.py
       - tests/integration/windows_standard_user_probe.cs
+      - scripts/probe_windows_machine_admission.cs
+      - scripts/probe_windows_machine_admission.py
   pull_request:
     branches: [main]
     paths:
@@ -16,6 +18,8 @@ on:
       - windows/desktop/**
       - scripts/compile_desktop_launcher.py
       - tests/integration/windows_standard_user_probe.cs
+      - scripts/probe_windows_machine_admission.cs
+      - scripts/probe_windows_machine_admission.py
 
 permissions:
   contents: read
@@ -58,6 +62,26 @@ jobs:
           $probeOutput = Join-Path (Resolve-Path -LiteralPath compile-only).Path 'OrdinaryUserProbe.exe'
           & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 /reference:System.dll /reference:System.Core.dll /reference:System.Web.Extensions.dll "/out:$probeOutput" $probeSource
           if ($LASTEXITCODE -ne 0) { throw "Ordinary Windows account probe compilation failed" }
-          # This executable has a placeholder identity. Never execute or upload
-          # it, or treat source compilation as installed-service qualification.
+          $admissionSource = (Resolve-Path -LiteralPath scripts/probe_windows_machine_admission.cs).Path
+          $admissionOutput = Join-Path (Resolve-Path -LiteralPath compile-only).Path 'MachineAdmissionProbe.exe'
+          & $compiler /nologo /target:exe /platform:x64 /warn:4 /warnaserror+ /reference:System.dll /reference:System.Core.dll /reference:System.Web.Extensions.dll "/out:$admissionOutput" $admissionSource
+          if ($LASTEXITCODE -ne 0) { throw "Read-only admission probe compilation failed" }
+          $launcher = (Resolve-Path -LiteralPath compile-only/payload/K5Vision.exe).Path
+          & $admissionOutput $launcher | Tee-Object -FilePath machine-admission-native.json
+          if ($LASTEXITCODE -ne 0) { throw "Read-only native admission observation failed" }
+          python scripts/probe_windows_machine_admission.py | Tee-Object -FilePath machine-admission-python.json
+          if ($LASTEXITCODE -ne 0) { throw "Read-only Python admission observation failed" }
+          # The probe invokes only the actual guard's read-only admission method.
+          # Never launch or distribute this placeholder product executable, or
+          # treat a completed diagnostic as installed-service qualification.
           Remove-Item -LiteralPath compile-only -Recurse -Force
+      - name: Retain finite machine-admission observations
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: machine-admission-${{ github.run_id }}
+          path: |
+            machine-admission-native.json
+            machine-admission-python.json
+          if-no-files-found: warn
+          retention-days: 14
