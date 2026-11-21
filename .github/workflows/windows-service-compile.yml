@@ -12,6 +12,7 @@ on:
       - scripts/probe_windows_machine_admission.cs
       - scripts/probe_windows_machine_admission.py
       - scripts/probe_windows_recorder_wire.cs
+      - scripts/probe_windows_browser_launch.cs
   pull_request:
     branches: [main]
     paths:
@@ -22,6 +23,7 @@ on:
       - scripts/probe_windows_machine_admission.cs
       - scripts/probe_windows_machine_admission.py
       - scripts/probe_windows_recorder_wire.cs
+      - scripts/probe_windows_browser_launch.cs
 
 permissions:
   contents: read
@@ -31,6 +33,61 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  browser:
+    name: Observe actual Windows default-browser dispatch independently
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact candidate browser client and native observation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Compile and run actual client browser dispatch against owned local HTML
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compilerRoot = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319'
+          $compiler = Join-Path $compilerRoot 'csc.exe'
+          New-Item -ItemType Directory -Path browser-proof | Out-Null
+          @'
+          namespace K5VisionDesktop {
+            internal static class PayloadIdentity {
+              internal const string ManifestSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+              internal const string HeadSha = "0000000000000000000000000000000000000000";
+            }
+          }
+          '@ | Set-Content -LiteralPath browser-proof/PayloadIdentity.cs -Encoding utf8
+          $identity = (Resolve-Path -LiteralPath browser-proof/PayloadIdentity.cs).Path
+          $fixture = (Resolve-Path -LiteralPath scripts/probe_windows_browser_launch.cs).Path
+          $sources = @('K5Vision.cs', 'K5RecorderHost.cs', 'K5ServiceInstallation.cs', 'K5VisionClient.cs') |
+            ForEach-Object { (Resolve-Path -LiteralPath (Join-Path 'windows/desktop' $_)).Path }
+          $references = @('System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll',
+            'System.Web.Extensions.dll', 'System.IO.Compression.dll', 'System.IO.Compression.FileSystem.dll')
+          $referenceFlags = @($references | ForEach-Object { '/reference:' + $_ })
+          $referenceFlags += '/reference:' + (Join-Path $compilerRoot 'WPF/UIAutomationClient.dll')
+          $referenceFlags += '/reference:' + (Join-Path $compilerRoot 'WPF/UIAutomationTypes.dll')
+          $referenceFlags += '/reference:' + (Join-Path $compilerRoot 'WPF/WindowsBase.dll')
+          $output = Join-Path (Resolve-Path -LiteralPath browser-proof).Path 'BrowserLaunchProbe.exe'
+          & $compiler /nologo /target:exe /main:K5VisionDesktop.BrowserLaunchProbe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 @referenceFlags "/out:$output" @sources $identity $fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Actual client browser observation compilation failed' }
+          # Only QA Main executes. It invokes the real OpenDashboard against
+          # its own static HTML listener; no product Main, profile or service.
+          # Match the installed-client acceptance's deliberately minimal env.
+          $env:PATH = (Join-Path $env:SYSTEMROOT 'System32') + ';' + $env:SYSTEMROOT
+          $env:PYTHONHOME = Join-Path (Resolve-Path -LiteralPath browser-proof).Path 'no external Python'
+          $env:PYTHONPATH = Join-Path (Resolve-Path -LiteralPath browser-proof).Path 'no external modules'
+          & $output | Tee-Object -FilePath browser-dispatch-native.json
+          if ($LASTEXITCODE -ne 0) { throw 'Native browser observation did not complete' }
+          Remove-Item -LiteralPath browser-proof -Recurse -Force
+      - name: Retain finite default-browser observations without claiming product qualification
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: browser-dispatch-${{ github.run_id }}
+          path: browser-dispatch-native.json
+          if-no-files-found: warn
+          retention-days: 14
   wire:
     name: Reproduce and fix the actual Framework async pipe lifecycle
     runs-on: windows-2025

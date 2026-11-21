@@ -1184,6 +1184,36 @@ def _retire_temporary_browser_processes(owned):
     _require(not remaining, "Native browser handoff left owned processes running")
 
 
+def _operator_document_observation(port):
+    """Inspect the fixed recorder HTML route; retain no body, headers or title."""
+    observed = {
+        "operator_document_http_status": 0,
+        "operator_document_html": False,
+        "operator_document_expected_title": False,
+    }
+    connection = None
+    try:
+        if type(port) is not int or not 1 <= port <= 65535:
+            return observed
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        connection.request("GET", "/operator/", headers={"Accept-Encoding": "identity"})
+        response = connection.getresponse()
+        observed["operator_document_http_status"] = response.status
+        observed["operator_document_html"] = (
+            response.getheader("Content-Type", "").split(";", 1)[0].strip().casefold()
+            == "text/html"
+        )
+        body = response.read(1024 * 1024 + 1)
+        title = re.search(rb"<title\b[^>]*>([^<]{0,256})</title>", body, re.IGNORECASE)
+        observed["operator_document_expected_title"] = bool(title and b"K5 Vision" in title[1])
+    except (OSError, http.client.HTTPException, ValueError):
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+    return observed
+
+
 def _default_browser_handoff(api, form, port, *, diagnostic=None):
     """Observe real OS dispatch, origin traffic and the new product browser window."""
     diagnostic = {} if diagnostic is None else diagnostic
@@ -1288,6 +1318,8 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
         }
     finally:
         watcher_finished = watcher.finish()
+        if diagnostic.get("browser_handoff_stage") != "dispatch_origin_window_verified":
+            diagnostic.update(_operator_document_observation(port))
         diagnostic["browser_handoff_observer_stopped"] = watcher_finished
         diagnostic.update(
             native_launch_argument_matched=watcher.argument_matched,

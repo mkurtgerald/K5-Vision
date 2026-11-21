@@ -243,3 +243,62 @@ def test_ordinary_probe_projection_rejects_unbounded_numbers_unknown_classes_and
         "ordinary_probe_product_frames": [],
         "ordinary_probe_completed_checks": {},
     }
+
+
+def _journey_helper():
+    source = Path(__file__).parents[1] / "integration/test_windows_service_recording.py"
+    spec = importlib.util.spec_from_file_location("k5_service_cleanup_test", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_successful_uninstall_cleanup_uses_scm_absence_even_if_directory_lingers(tmp_path):
+    def forbidden(*args):
+        raise AssertionError("Removed launcher must not execute after successful uninstall")
+
+    cohort = SimpleNamespace(service_stopped=False)
+    _journey_helper()._cleanup_service_registration(
+        SimpleNamespace(absent=lambda: True),
+        tmp_path,
+        SimpleNamespace(_service_control=forbidden),
+        cohort,
+    )
+    assert cohort.service_stopped is True
+
+
+def test_cleanup_stops_registered_running_service_and_preserves_failure_on_stop_error(tmp_path):
+    state, calls = {"state": 4}, []
+
+    def stop(installed, action):
+        calls.append(action)
+        state["state"] = 1
+
+    service = SimpleNamespace(absent=lambda: False, status=lambda: state)
+    desktop = SimpleNamespace(
+        _service_control=stop, _wait=lambda condition, *args, **kwargs: condition()
+    )
+    cohort = SimpleNamespace(service_stopped=False)
+    _journey_helper()._cleanup_service_registration(service, tmp_path, desktop, cohort)
+    assert calls == ["stop"] and cohort.service_stopped is True
+    state["state"], cohort.service_stopped = 4, False
+    desktop._service_control = lambda *args: (_ for _ in ()).throw(RuntimeError("private detail"))
+    with pytest.raises(RuntimeError):
+        _journey_helper()._cleanup_service_registration(service, tmp_path, desktop, cohort)
+    assert cohort.service_stopped is False
+
+
+def test_cleanup_failure_diagnostics_retain_completed_proof_without_private_exception_text():
+    module, diagnostic = _journey_helper(), {}
+    module._cleanup_note(diagnostic, "service_registration", FileNotFoundError("private path"))
+    module._completed_note(
+        {"client_quit_recording_continues": True, "export_bytes": 1000},
+        {"initial": {"recording_bytes_after": 100}},
+        diagnostic,
+    )
+    assert diagnostic["cleanup_failures"] == [
+        {"stage": "service_registration", "exception_type": "FileNotFoundError"}
+    ]
+    assert diagnostic["completed_checks"] == ["client_quit_recording_continues"]
+    assert diagnostic["recording_observations"]["initial"]["recording_bytes_after"] == 100
+    assert "private" not in json.dumps(diagnostic)

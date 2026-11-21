@@ -63,6 +63,66 @@ def _digest(value):
     ).hexdigest()
 
 
+def _cleanup_service_registration(service, installed, desktop, cohort):
+    """SCM presence, rather than a lingering uninstall directory, owns cleanup."""
+    if service is None:
+        if not installed.exists():
+            return
+        service = _helpers("windows_service_acceptance").InstalledService(installed)
+    if service.absent():
+        cohort.service_stopped = True
+        return
+    if service.status()["state"] != 1:
+        desktop._service_control(installed, "stop")
+        desktop._wait(
+            lambda: service.status()["state"] == 1, "Cleanup SCM recorder stopped", timeout=60
+        )
+    cohort.service_stopped = True
+
+
+def _cleanup_note(diagnostic, stage, error):
+    allowed = {
+        "Failed",
+        "RuntimeError",
+        "OSError",
+        "PermissionError",
+        "FileNotFoundError",
+        "TimeoutExpired",
+        "TimeoutError",
+        "NoSuchProcess",
+        "AccessDenied",
+        "ProcessLookupError",
+        "AssertionError",
+        "Exception",
+    }
+    kind = type(error).__name__
+    note = {"stage": stage, "exception_type": kind if kind in allowed else "Other"}
+    native = getattr(error, "winerror", None)
+    if type(native) is int and 0 <= native <= 65535:
+        note["win32_error"] = native
+    diagnostic.setdefault("cleanup_failures", [])
+    if len(diagnostic["cleanup_failures"]) < 8:
+        diagnostic["cleanup_failures"].append(note)
+
+
+def _completed_note(receipt, observations, diagnostic):
+    diagnostic["completed_checks"] = sorted(key for key, value in receipt.items() if value is True)
+    diagnostic["recording_observations"] = observations
+    for key in ("standard_windows_user", "startup_shutdown"):
+        if key in receipt:
+            diagnostic[key] = receipt[key]
+    diagnostic["retained_validation"] = {
+        key: receipt[key]
+        for key in (
+            "playback_decoded_frames",
+            "export_decoded_frames",
+            "export_bytes",
+            "export_sha256",
+        )
+        if key in receipt
+    }
+
+
 def _failure_note(error, diagnostic, service):
     """Only public source locations, finite categories and SCM numbers leave the VM."""
     kind = type(error).__name__
@@ -678,21 +738,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         receipt.update(service_removed_on_uninstall=True, uninstall_preserves_profile=True)
     except BaseException as error:
         failed = True
-        diagnostic["completed_checks"] = sorted(
-            key
-            for key in (
-                "actual_gui_installer",
-                "actual_gui_account_setup",
-                "actual_edge_ui",
-                "actual_scm_readback",
-                "client_quit_recording_continues",
-                "backend_failure_scm_recovery",
-                "wrapper_failure_scm_recovery",
-                "service_token_mfa_decrypted_after_restart",
-            )
-            if receipt.get(key) is True
-        )
-        diagnostic["recording_observations"] = observations
+        _completed_note(receipt, observations, diagnostic)
         if service is None:
             diagnostic["installation_snapshot"] = scm.installer_failure_snapshot(installed, profile)
         _failure_note(error, diagnostic, service)
@@ -700,18 +746,26 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
             "assertion" if isinstance(error, pytest.fail.Exception) else "exception"
         )
     finally:
-        for resource in (context, browser, playwright):
+        for label, resource in (
+            ("browser_context", context),
+            ("browser", browser),
+            ("playwright", playwright),
+        ):
             if resource is not None:
                 try:
                     resource.stop() if resource is playwright else resource.close()
-                except BaseException:
+                except BaseException as error:
                     cleanup_failed = True
-        if installed.exists():
-            try:
-                desktop._service_control(installed, "stop")
-            except BaseException:
-                cleanup_failed = True
+                    _cleanup_note(diagnostic, label, error)
+        try:
+            _cleanup_service_registration(service, installed, desktop, cohort)
+        except BaseException as error:
+            cleanup_failed = True
+            _cleanup_note(diagnostic, "service_registration", error)
         cohort.finish()
+        if cohort.failed:
+            cleanup_failed = True
+            _cleanup_note(diagnostic, "cohort_observer", RuntimeError())
         for process in reversed(cohort.snapshot()):
             try:
                 if process.is_running():
@@ -719,21 +773,35 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
                     process.wait(timeout=10)
             except psutil.NoSuchProcess:
                 pass
-            except BaseException:
+            except BaseException as error:
                 cleanup_failed = True
+                _cleanup_note(diagnostic, "cohort_process", error)
         for process in reversed(processes):
             try:
                 helpers._stop_owned(process)
-            except BaseException:
+            except BaseException as error:
                 cleanup_failed = True
+                _cleanup_note(diagnostic, "generated_source", error)
         if camera is not None:
-            camera.close()
+            try:
+                camera.close()
+            except BaseException as error:
+                cleanup_failed = True
+                _cleanup_note(diagnostic, "generated_camera", error)
         for reservation in reservations:
-            reservation.close()
+            try:
+                reservation.close()
+            except BaseException as error:
+                cleanup_failed = True
+                _cleanup_note(diagnostic, "listener", error)
         try:
             desktop._remove_owned_temporary_tree(parent)
-        except BaseException:
+        except BaseException as error:
             cleanup_failed = True
+            _cleanup_note(diagnostic, "temporary_tree", error)
+    if failed or cleanup_failed:
+        _completed_note(receipt, observations, diagnostic)
+        diagnostic["cleanup_failed"] = cleanup_failed
     _require(
         not failed and not cleanup_failed,
         "Installed unattended service qualification failed: "

@@ -34,6 +34,7 @@ def test_browser_failure_before_page_window_retains_dispatch_and_origin_observat
         finish=lambda: True,
     )
     monkeypatch.setattr(desktop, "_BrowserLaunchWatch", lambda *_args: watcher)
+    monkeypatch.setattr(desktop, "_operator_document_observation", lambda _port: {})
     monkeypatch.setattr(desktop.psutil, "process_iter", lambda **_kwargs: [])
     monkeypatch.setattr(
         desktop.psutil, "Process", lambda _pid: SimpleNamespace(name=lambda: "msedge.exe")
@@ -80,3 +81,26 @@ def test_native_browser_dispatch_projection_keeps_only_allowed_fields(desktop):
     data.update(browser_dispatch="PRIVATE", browser_attempts=-1, browser_native_error=2**32)
     observed = desktop._desktop_probe(api, 1)
     assert not {"browser_dispatch", "browser_attempts", "browser_native_error"} & observed.keys()
+
+
+def test_operator_document_observation_verifies_title_without_retaining_html(desktop, monkeypatch):
+    requests = []
+    response = SimpleNamespace(
+        status=200,
+        getheader=lambda *_args: "text/html; charset=utf-8",
+        read=lambda size: b"<title>K5 Vision - Operator</title><body>PRIVATE DATA</body>",
+    )
+    connection = SimpleNamespace(
+        request=lambda *args, **kwargs: requests.append((args, kwargs)),
+        getresponse=lambda: response,
+        close=lambda: requests.append("closed"),
+    )
+    monkeypatch.setattr(desktop.http.client, "HTTPConnection", lambda *_args, **_kwargs: connection)
+    observed = desktop._operator_document_observation(8000)
+    assert observed == {
+        "operator_document_http_status": 200,
+        "operator_document_html": True,
+        "operator_document_expected_title": True,
+    }
+    assert requests[0][0] == ("GET", "/operator/") and requests[-1] == "closed"
+    assert "PRIVATE" not in json.dumps(observed)
