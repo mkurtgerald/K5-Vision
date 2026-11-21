@@ -6,6 +6,7 @@ on:
     branches: [codex/unattended-windows-20261121]
     paths:
       - .github/workflows/windows-service-compile.yml
+      - .github/actions/prepare-windows-browser/**
       - windows/desktop/**
       - scripts/compile_desktop_launcher.py
       - tests/integration/windows_standard_user_probe.cs
@@ -17,6 +18,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/windows-service-compile.yml
+      - .github/actions/prepare-windows-browser/**
       - windows/desktop/**
       - scripts/compile_desktop_launcher.py
       - tests/integration/windows_standard_user_probe.cs
@@ -43,6 +45,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Prepare the disposable CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
       - name: Compile and run actual client browser dispatch against owned local HTML
         shell: pwsh
         run: |
@@ -79,6 +83,15 @@ jobs:
           $env:PYTHONPATH = Join-Path (Resolve-Path -LiteralPath browser-proof).Path 'no external modules'
           & $output | Tee-Object -FilePath browser-dispatch-native.json
           if ($LASTEXITCODE -ne 0) { throw 'Native browser observation did not complete' }
+          $browserEvidence = Get-Content -LiteralPath browser-dispatch-native.json -Raw | ConvertFrom-Json
+          if ($browserEvidence.schema_version -ne 1 -or $browserEvidence.status -ne 'diagnostic_complete') {
+            throw 'Native browser observation did not produce a completed receipt'
+          }
+          foreach ($field in @('actual_product_dispatch', 'origin_request_observed', 'origin_response_sent', 'browser_window_visible', 'browser_title_matches')) {
+            if ($browserEvidence.$field -isnot [bool] -or $browserEvidence.$field -ne $true) {
+              throw "Prepared default-browser acceptance failed: $field"
+            }
+          }
           Remove-Item -LiteralPath browser-proof -Recurse -Force
       - name: Retain finite default-browser observations without claiming product qualification
         if: always()

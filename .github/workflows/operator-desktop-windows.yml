@@ -8,6 +8,7 @@ on:
       - .gitattributes
       - .github/workflows/operator-desktop-windows.yml
       - .github/actions/provision-operator-tools/**
+      - .github/actions/prepare-windows-browser/**
       - windows/desktop/**
       - scripts/build_desktop_payload.py
       - scripts/compile_desktop_launcher.py
@@ -178,6 +179,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Prepare the disposable CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
       - name: Set up native development Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
@@ -449,6 +452,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Prepare the disposable CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
       - name: Set up development Python for the separate camera gate
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
@@ -525,6 +530,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Prepare the disposable CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
       - name: Set up development Python for the separate motion gate
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
@@ -611,6 +618,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Prepare the disposable CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
       - name: Set up development Python on the isolated VM
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
@@ -753,6 +762,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Prepare the disposable CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
       - name: Install development test runner
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
@@ -929,6 +940,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Prepare the disposable CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
       - name: Set up separate service acceptance runner
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
@@ -1033,6 +1046,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Prepare the disposable CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
       - name: Set up separate time acceptance runner
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
