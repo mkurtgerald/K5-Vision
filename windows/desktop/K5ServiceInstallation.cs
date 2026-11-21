@@ -141,7 +141,7 @@ namespace K5VisionDesktop
         }
         internal static string DataRoot
         {
-            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "K5Vision"); }
+            get { return Custody.MachineDataRoot; }
         }
         private static void Require(bool condition)
         {
@@ -217,21 +217,30 @@ namespace K5VisionDesktop
             string parent = Path.GetDirectoryName(directory);
             // ProgramData itself permits creation of unrelated children. The
             // private boundary begins at our own atomically secured child.
-            Custody.Admit(parent, directory);
+            Custody.AdmitMachineData(parent, directory);
             SecurityIdentifier service = (SecurityIdentifier)new NTAccount(Account).Translate(typeof(SecurityIdentifier));
             if (!Directory.Exists(directory))
-            {
-                DirectorySecurity security = new DirectorySecurity();
-                security.SetAccessRuleProtection(true, false);
-                security.SetOwner(new SecurityIdentifier("S-1-5-32-544"));
-                foreach (SecurityIdentifier principal in new[] { service,
-                    new SecurityIdentifier("S-1-5-18"), new SecurityIdentifier("S-1-5-32-544") })
-                    security.AddAccessRule(new FileSystemAccessRule(principal, FileSystemRights.FullControl,
-                        InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
-                        PropagationFlags.None, AccessControlType.Allow));
-                Directory.CreateDirectory(directory, security);
-            }
+                Directory.CreateDirectory(directory, DataDirectorySecurity(service));
             AdmitData(directory, service);
+            // Storage's default leaf already exists before Session 0 starts.
+            // Its preparation therefore validates this private child directly,
+            // without trying to create its already-existing private parent.
+            string recordings = Path.Combine(directory, "recordings");
+            if (!Directory.Exists(recordings))
+                Directory.CreateDirectory(recordings, DataDirectorySecurity(service));
+            AdmitData(recordings, service);
+        }
+        private static DirectorySecurity DataDirectorySecurity(SecurityIdentifier service)
+        {
+            DirectorySecurity security = new DirectorySecurity();
+            security.SetAccessRuleProtection(true, false);
+            security.SetOwner(new SecurityIdentifier("S-1-5-32-544"));
+            foreach (SecurityIdentifier principal in new[] { service,
+                new SecurityIdentifier("S-1-5-18"), new SecurityIdentifier("S-1-5-32-544") })
+                security.AddAccessRule(new FileSystemAccessRule(principal, FileSystemRights.FullControl,
+                    InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                    PropagationFlags.None, AccessControlType.Allow));
+            return security;
         }
         private static DirectorySecurity CodeDirectorySecurity(bool inherit)
         {

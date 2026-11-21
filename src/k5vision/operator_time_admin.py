@@ -21,6 +21,7 @@ from xml.sax.saxutils import escape
 
 from k5vision.domain.devices import DeviceProtocol
 from k5vision.identity_state import _checked_path, _regular_file, _windows_admission
+from k5vision.installed_code_security import checked_executable_file
 from k5vision.operator_onvif import (
     _DEVICE,
     OnvifConnector,
@@ -492,7 +493,7 @@ class WindowsTimeAdministrator:
                 "nonce": nonce,
                 **owner,
             }
-            _regular_file(self.executable)
+            checked_executable_file(self.executable)
             _windows_admission(self.executable, private=False)
             _private_configuration(request, json.dumps(payload, allow_nan=False))
         except Exception:

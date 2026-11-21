@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from k5vision import identity_state
 from k5vision.identity_state import initialize_identity_state
 from k5vision.operator_storage_settings import (
     OperatorStorageSettings,
@@ -48,6 +49,49 @@ def _recordings(root):
     first.write_bytes(b"retained first recording" * 100)
     second.write_bytes(b"retained second recording" * 75)
     return first, second
+
+
+@pytest.mark.parametrize("recordings_precreated", [False, True])
+def test_machine_storage_starts_with_precreated_private_child_without_blessing_shared_parent(
+    storage, monkeypatch, recordings_precreated
+):
+    _, _, _, temporary = storage
+    shared = temporary / "shared-container"
+    shared.mkdir(mode=0o700)
+    data = shared / "K5Vision"
+    data.mkdir(mode=0o700)
+    recordings = data / "recordings"
+    if recordings_precreated:
+        recordings.mkdir(mode=0o700)
+    original = identity_state._windows_admission
+    shared_private_probes = []
+
+    def protected_child_policy(path, *, private, directory=False):
+        if path == shared and private:
+            shared_private_probes.append(path)
+            raise identity_state.IdentityStateError("Shared container cannot be private storage")
+        return original(path, private=private, directory=directory)
+
+    monkeypatch.setattr(identity_state, "_windows_admission", protected_child_policy)
+    identity = initialize_identity_state(
+        data / "identity", username="machine-storage-admin", password="machine-storage-password"
+    )
+    if not recordings_precreated:
+        with pytest.raises(identity_state.IdentityStateError):
+            prepare_operator_recording_storage(
+                state_root=identity.directory,
+                site_id=identity.site_id,
+                default_recording_directory=recordings,
+            )
+        assert shared_private_probes and not recordings.exists()
+    else:
+        policy = prepare_operator_recording_storage(
+            state_root=identity.directory,
+            site_id=identity.site_id,
+            default_recording_directory=recordings,
+        )
+        assert policy["recording_directory"] == str(recordings)
+        assert not shared_private_probes
 
 
 def test_policy_is_private_site_bound_and_survives_restart(storage):

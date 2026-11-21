@@ -177,6 +177,21 @@ namespace K5VisionDesktop
         private const string TrustedInstaller = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern uint QueryDosDevice(string name, StringBuilder target, int maximum);
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern int SHGetKnownFolderPath(ref Guid folder, uint flags, IntPtr token, out IntPtr path);
+
+        internal static string MachineDataRoot
+        {
+            get
+            {
+                Guid folder = new Guid("62AB5D82-FDC1-4DC3-A9DD-070D1D495D97");
+                IntPtr memory;
+                if (SHGetKnownFolderPath(ref folder, 0, IntPtr.Zero, out memory) != 0 || memory == IntPtr.Zero)
+                    throw new InvalidOperationException();
+                try { return OrdinaryAbsolute(Path.Combine(Marshal.PtrToStringUni(memory), "K5Vision")); }
+                finally { Marshal.FreeCoTaskMem(memory); }
+            }
+        }
 
         internal static string OrdinaryAbsolute(string path)
         {
@@ -204,19 +219,40 @@ namespace K5VisionDesktop
             AdmitPath(path, applicationRoot, false);
         }
 
+        internal static void AdmitMachineData(string path, string privateRoot)
+        {
+            RequireMachineBoundary(privateRoot);
+            AdmitPath(path, privateRoot, true, null, false, true);
+        }
+
+        private static void RequireMachineBoundary(string boundary)
+        {
+            string root = MachineDataRoot;
+            boundary = OrdinaryAbsolute(boundary);
+            if (!String.Equals(boundary, root, StringComparison.OrdinalIgnoreCase) &&
+                !boundary.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException();
+            if (!new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator) &&
+                Program.Sid != ((SecurityIdentifier)new NTAccount("NT SERVICE", "K5VisionRecorder")
+                    .Translate(typeof(SecurityIdentifier))).Value)
+                throw new InvalidOperationException();
+        }
+
         internal static void AdmitServiceData(string path, string serviceIdentity)
         {
             string fixedIdentity = Path.Combine(RecorderPaths.DataRoot, "identity");
             if (!String.Equals(OrdinaryAbsolute(serviceIdentity), fixedIdentity, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException();
-            AdmitPath(path, fixedIdentity, true, RecorderPaths.ServiceSid);
+            RequireMachineBoundary(fixedIdentity);
+            AdmitPath(path, fixedIdentity, true, RecorderPaths.ServiceSid, false, true);
         }
 
         private static void AdmitPath(string path, string boundary, bool privateData, string privateIdentity = null,
-            bool stagingOwner = false)
+            bool stagingOwner = false, bool machineData = false)
         {
             path = OrdinaryAbsolute(path);
             boundary = OrdinaryAbsolute(boundary);
+            string machineContainer = machineData ? Path.GetDirectoryName(MachineDataRoot) : null;
             string current = path;
             while (!String.IsNullOrEmpty(current))
             {
@@ -241,8 +277,17 @@ namespace K5VisionDesktop
                         (rule.PropagationFlags & PropagationFlags.InheritOnly) != 0) continue;
                     string sid = rule.IdentityReference.Value;
                     if (sid == "S-1-3-4") sid = owner;
-                    if (!trusted.Contains(sid) && ((uint)rule.FileSystemRights &
-                        (withinBoundary ? (privateData ? UInt32.MaxValue : 0x510D0156u) : 0x510D0150u)) != 0)
+                    uint forbidden = withinBoundary ? (privateData ? UInt32.MaxValue : 0x510D0156u) : 0x510D0150u;
+                    // Windows' native shared ProgramData container grants
+                    // Builtin Users metadata writes (WA/WEA) alongside child
+                    // creation. Those do not grant access to our independently
+                    // protected private child. Keep namespace replacement,
+                    // ownership/ACL mutation, all other principals/ancestors,
+                    // and every private-boundary check unchanged.
+                    if (machineData && privateData && !withinBoundary && sid == "S-1-5-32-545" &&
+                        String.Equals(current, machineContainer, StringComparison.OrdinalIgnoreCase))
+                        forbidden &= ~0x110u;
+                    if (!trusted.Contains(sid) && ((uint)rule.FileSystemRights & forbidden) != 0)
                         throw new InvalidOperationException();
                 }
                 current = Path.GetDirectoryName(current);
@@ -826,7 +871,9 @@ namespace K5VisionDesktop
         {
             // The owner workstation must not download executable dependencies.
             // Verify the installation and exact source identities on every start.
-            Custody.Admit(profile, profile);
+            if (String.Equals(Custody.OrdinaryAbsolute(profile), Custody.MachineDataRoot,
+                StringComparison.OrdinalIgnoreCase)) Custody.AdmitMachineData(profile, profile);
+            else Custody.Admit(profile, profile);
             string path = Path.Combine(application, "workers", "donor-downloads.json");
             Custody.AdmitCode(path, application);
             Dictionary<string, object> manifest = Json.Parse(File.ReadAllText(path, Encoding.UTF8));

@@ -33,6 +33,13 @@ SYSTEM may access private site state. First-account creation executes under
 the recorder identity so subsequent secret protection and file admission use
 the same identity.
 
+ProgramData remains a shared Windows container. Machine-state admission permits
+its standard built-in Users attribute/extended-attribute rights only at that
+exact native known-folder ancestor. Delete, delete-child, ownership and ACL
+mutation remain forbidden there. The exception does not apply to K5's private
+directories, other principals, arbitrary paths, or executable code. Windows'
+global ProgramData permissions are never rewritten.
+
 The pinned WinSW service wrapper supplies Windows Service Control Manager
 integration. Recovery restarts are configured for 5, 15, and 60 seconds, with a
 one-hour failure-count reset. The host owns its embedded Python backend and

@@ -80,6 +80,26 @@ internal static class MachineAdmissionProbe
             catch (TargetInvocationException error) { exceptionType = FailureType(error); }
             result["admitted"] = admitted;
             result["admission_exception_type"] = exceptionType;
+            MethodInfo machineAdmit = custody.GetMethod("AdmitMachineData", BindingFlags.Static | BindingFlags.NonPublic);
+            if (machineAdmit == null) throw new MissingMethodException();
+            bool machineAdmitted = false;
+            string machineException = null;
+            try { machineAdmit.Invoke(null, new object[] { parent, Path.Combine(parent, "K5Vision") }); machineAdmitted = true; }
+            catch (TargetInvocationException error) { machineException = FailureType(error); }
+            result["machine_admitted"] = machineAdmitted;
+            result["machine_admission_exception_type"] = machineException;
+            bool wrongBoundaryRefused = false, sharedPrivateBoundaryRefused = false;
+            try { machineAdmit.Invoke(null, new object[] { parent, Path.Combine(parent, "K5Vision-other") }); }
+            catch (TargetInvocationException) { wrongBoundaryRefused = true; }
+            try { machineAdmit.Invoke(null, new object[] { parent, parent }); }
+            catch (TargetInvocationException) { sharedPrivateBoundaryRefused = true; }
+            result["wrong_boundary_refused"] = wrongBoundaryRefused;
+            result["shared_private_boundary_refused"] = sharedPrivateBoundaryRefused;
+            // Actual native descriptor/production-method regression: the new
+            // machine scope must not change generic admission or admit shared
+            // ProgramData as private storage. No test changes a descriptor.
+            if (admitted || !machineAdmitted || !wrongBoundaryRefused || !sharedPrivateBoundaryRefused)
+                throw new InvalidOperationException();
             result["probe_completed"] = true;
             exit = 0;
         }

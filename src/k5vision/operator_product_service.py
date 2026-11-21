@@ -16,6 +16,7 @@ from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
 from k5vision.identity_state import _checked_path, _regular_file, _windows_admission
+from k5vision.installed_code_security import checked_executable_file
 from k5vision.media.mediamtx_config import MediaMTXSource, generate_mediamtx_configuration
 from k5vision.media.mediamtx_provider import (
     MediaMTXBinding,
@@ -46,7 +47,7 @@ def admit_native_executable(path: Path, component: str) -> Path:
         if component not in {"mediamtx", "caddy"}:
             raise ValueError
         path = Path(path)
-        info = _regular_file(path)
+        info = checked_executable_file(path)
         if info.st_size > 200 * 1024 * 1024:
             raise ValueError
         manifest_path = Path(__file__).parent / "data" / f"{component}-donor-manifest.json"
@@ -57,7 +58,7 @@ def admit_native_executable(path: Path, component: str) -> Path:
         with path.open("rb") as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
-        current = _regular_file(path)
+        current = checked_executable_file(path)
         if (
             digest.hexdigest() != artifact["executable_sha256"]
             or info.st_size != artifact["executable_bytes"]

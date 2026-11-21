@@ -446,7 +446,7 @@ namespace K5VisionDesktop
                 string data = RecorderPaths.DataRoot;
                 // Installation creates this protected parent. Never repair an
                 // existing root or adopt a partial identity from another owner.
-                Custody.Admit(data, data);
+                Custody.AdmitMachineData(data, data);
                 using (RecorderLifetime lifetime = new RecorderLifetime(root, data)) return lifetime.Run();
             }
             catch { return 1; }
@@ -498,13 +498,13 @@ namespace K5VisionDesktop
             {
                 string directory = Path.Combine(data, "identity", "time-admin");
                 if (!Directory.Exists(directory)) return NoPendingTime();
-                Custody.Admit(directory, data);
+                Custody.AdmitMachineData(directory, data);
                 string[] files = Directory.EnumerateFiles(directory, ".time-admin-*.json").Take(3).ToArray();
                 foreach (string request in files)
                 {
                     string name = Path.GetFileName(request);
                     if (!System.Text.RegularExpressions.Regex.IsMatch(name, "^[.]time-admin-[a-f0-9]{32}[.]json$")) continue;
-                    Custody.Admit(request, data);
+                    Custody.AdmitMachineData(request, data);
                     FileInfo info = new FileInfo(request);
                     if (info.Length < 1 || info.Length > 4096) continue;
                     string response = request.Substring(0, request.Length - 5) + ".result.json";
