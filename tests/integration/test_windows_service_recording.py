@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import secrets
 import sqlite3
 import subprocess
@@ -60,6 +61,43 @@ def _digest(value):
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _failure_note(error, diagnostic, service):
+    """Only public source locations, finite categories and SCM numbers leave the VM."""
+    kind = type(error).__name__
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", kind):
+        diagnostic["exception_type"] = kind
+    allowed = {
+        "test_windows_service_recording.py",
+        "windows_service_acceptance.py",
+        "windows_standard_user_acceptance.py",
+        "test_windows_desktop_app.py",
+        "test_operator_product_runtime.py",
+        "test_operator_beta_browser.py",
+        "installed_settings_acceptance.py",
+    }
+    frames, trace = [], error.__traceback__
+    while trace is not None:
+        source = Path(trace.tb_frame.f_code.co_filename)
+        if (
+            source.name in allowed
+            and source.resolve().parent == Path(__file__).resolve().parent
+            and 1 <= trace.tb_lineno <= 10000
+        ):
+            frames.append({"file": source.name, "line": trace.tb_lineno})
+        trace = trace.tb_next
+    diagnostic["source_frames"] = frames[-8:]
+    if service is not None:
+        try:
+            status = service.status()
+            diagnostic["scm_at_failure"] = {
+                key: status[key]
+                for key in ("state", "win32_exit", "service_exit")
+                if type(status.get(key)) is int and 0 <= status[key] <= 2**32 - 1
+            }
+        except BaseException:
+            diagnostic["scm_at_failure_unavailable"] = True
 
 
 def _source_fingerprint(profile):
@@ -383,6 +421,25 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
             previous=observations["initial"],
         )
         receipt["client_quit_recording_continues"] = True
+        diagnostic["stage"] = "ordinary_windows_user_ipc"
+        probe_before = desktop._recording_bytes(profile)
+        probe = _helpers("windows_standard_user_acceptance").run_probe(
+            installed, parent, diagnostic
+        )
+        observations["client_closed"] = _growth(
+            service,
+            desktop,
+            profile,
+            client,
+            camera_id,
+            previous=observations["client_closed"],
+        )
+        receipt["standard_windows_user"] = {
+            **probe,
+            "recording_bytes_before": probe_before,
+            "recording_bytes_after": desktop._recording_bytes(profile),
+            "service_identity_unchanged": True,
+        }
         diagnostic["stage"] = "embedded_backend_failure"
         service.kill_owned(observations["client_closed"], backend=True)
 
@@ -546,6 +603,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         receipt.update(service_removed_on_uninstall=True, uninstall_preserves_profile=True)
     except BaseException as error:
         failed = True
+        _failure_note(error, diagnostic, service)
         diagnostic["failure_kind"] = (
             "assertion" if isinstance(error, pytest.fail.Exception) else "exception"
         )

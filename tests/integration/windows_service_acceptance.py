@@ -137,7 +137,13 @@ class InstalledService:
                 service, 0, ctypes.byref(value), ctypes.sizeof(value), ctypes.byref(needed)
             ):
                 raise RuntimeError("SCM recorder status could not be read")
-            return {"state": value.state, "pid": value.pid, "type": value.type}
+            return {
+                "state": value.state,
+                "pid": value.pid,
+                "type": value.type,
+                "win32_exit": value.exit,
+                "service_exit": value.specific_exit,
+            }
 
         return self._query(query)
 

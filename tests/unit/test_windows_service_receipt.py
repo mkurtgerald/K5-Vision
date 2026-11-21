@@ -52,6 +52,15 @@ def _receipt():
             "installed_executable_verified": True,
         },
         "observations": observations,
+        "standard_windows_user": {
+            **dict.fromkeys(_VERIFIER["_STANDARD_TRUE"], True),
+            **dict.fromkeys(_VERIFIER["_STANDARD_FALSE"], False),
+            "slow_status_seconds": 5.01,
+            "product_status_success_count": 4,
+            "probe_executable_sha256": "f" * 64,
+            "recording_bytes_before": 100,
+            "recording_bytes_after": 200,
+        },
         "retained_file_hashes_before": ["c" * 64],
         "retained_file_hashes_after": ["c" * 64],
         **{
@@ -98,6 +107,46 @@ def test_service_receipt_accepts_only_installer_bound_real_process_and_recording
 ):
     value = _receipt()
     assert _verify(_report(tmp_path, value)) == value
+
+
+@pytest.mark.parametrize(
+    "field", sorted(_VERIFIER["_STANDARD_TRUE"] | _VERIFIER["_STANDARD_FALSE"])
+)
+def test_service_receipt_requires_real_ordinary_user_boundary_and_cleanup(tmp_path, field):
+    value = _receipt()
+    value["standard_windows_user"][field] = int(value["standard_windows_user"][field])
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, value))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"administrator_group_present": True},
+        {"token_elevated": True},
+        {"product_status_success_count": 3},
+        {"slow_status_seconds": 0.1},
+        {"slow_status_seconds": 9},
+        {"recording_bytes_after": 100},
+        {"generated_account_removed": False},
+        {"probe_executable_sha256": "invalid"},
+    ],
+    ids=[
+        "admin-group",
+        "elevated",
+        "missing-reconnect",
+        "no-timeout",
+        "unbounded",
+        "no-recording",
+        "account-left",
+        "unbound-probe",
+    ],
+)
+def test_service_receipt_rejects_false_ordinary_user_or_reconnect_proof(tmp_path, change):
+    value = _receipt()
+    value["standard_windows_user"].update(change)
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, value))
 
 
 @pytest.mark.parametrize(

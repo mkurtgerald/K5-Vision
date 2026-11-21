@@ -5,13 +5,26 @@ on:
   pull_request:
     branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-beta-sprint, codex/windows-desktop-beta, codex/windows-onvif-onboarding, codex/windows-surveillance-workspace, codex/video-wall-roadmap-20261101, codex/camera-setup-beta-20261102]
     paths:
+      - .gitattributes
       - .github/workflows/operator-desktop-windows.yml
       - .github/actions/provision-operator-tools/**
       - windows/desktop/**
       - scripts/build_desktop_payload.py
+      - scripts/compile_desktop_launcher.py
+      - scripts/verify_windows_service_receipt.py
       - scripts/verify_desktop_receipt.py
       - src/k5vision/**
       - tests/integration/test_windows_desktop_app.py
+      - tests/integration/test_windows_service*.py
+      - tests/integration/windows_service_acceptance.py
+      - tests/integration/windows_standard_user_acceptance.py
+      - tests/integration/windows_standard_user_probe.cs
+      - tests/integration/windows_standard_user_acceptance.py
+      - tests/integration/windows_standard_user_probe.cs
+      - tests/unit/test_service_setup.py
+      - tests/unit/test_windows_service*.py
+      - tests/unit/test_operator_service_time_approval.py
+      - tests/unit/test_operator_security_revocation_progress.py
       - tests/integration/test_windows_desktop_upgrade.py
       - tests/integration/test_windows_camera_video_settings.py
       - tests/integration/onvif_video_camera_fixture.py
@@ -63,10 +76,12 @@ on:
       - scripts/verify_windows_service_receipt.py
       - tests/unit/test_windows_service_receipt.py
       - tests/unit/test_windows_service_workflow.py
+      - tests/unit/test_windows_service_failure_diagnostic.py
       - tests/unit/test_operator_permission_read_concurrency.py
       - tests/unit/test_operator_permission_refresh.py
       - tests/unit/test_operator_web_ui.py
       - docs/WINDOWS_DESKTOP*.md
+      - docs/WINDOWS_UNATTENDED_RECORDING.md
       - third_party/licenses/**
       - THIRD_PARTY_NOTICES.md
       - pyproject.toml
@@ -108,6 +123,20 @@ jobs:
         run: |
           python -m pip install -e ".[dev]" "playwright==1.58.0" "numpy==2.2.6" "opencv-python-headless==5.0.0.93"
           if ($LASTEXITCODE -ne 0) { throw "Desktop development install failed" }
+      - name: Verify privileged sealing refuses hardlinks and active writers
+        if: matrix.lane == 'setup'
+        env:
+          K5_WINDOWS_SERVICE_SEAL_TEST: "1"
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_service_seal.py -o addopts= --no-cov -q
+          if ($LASTEXITCODE -ne 0) { throw "Native service sealer qualification failed" }
+      - name: Verify service setup and revocation progress
+        if: matrix.lane == 'setup'
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_service_setup.py tests/unit/test_operator_service_time_approval.py tests/unit/test_operator_security_revocation_progress.py -o addopts= --no-cov -q
+          if ($LASTEXITCODE -ne 0) { throw "Service setup and security regression failed" }
       - name: Verify desktop setup and process ownership on Windows
         if: matrix.lane == 'setup'
         shell: pwsh
@@ -986,7 +1015,7 @@ jobs:
       - name: Verify fail-closed native service receipt admission
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_windows_service_receipt.py tests/unit/test_windows_service_workflow.py -o addopts= --no-cov --tb=short
+          python -m pytest tests/unit/test_windows_service_receipt.py tests/unit/test_windows_service_workflow.py tests/unit/test_windows_service_failure_diagnostic.py -o addopts= --no-cov --tb=short
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Exercise independent recording and actual SCM failure recovery
         timeout-minutes: 8

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import os
 import subprocess
 import time
@@ -32,35 +33,53 @@ def _build(tmp_path: Path, reject: bool) -> Path:
     (payload / "licenses").mkdir()
     (payload / "licenses/INSTALLATION-LICENSE.txt").write_text("Test fixture only")
     (payload / "payload-manifest.json").write_text("{}")
-    # Independent mutex namespace, no backend, accounts, recordings or sockets.
-    # Rejection happens ONLY after extraction, so the old ssPostInstall script
-    # demonstrably reaches its defective success path.
+    # No backend, accounts, recordings, sockets, or real SCM operations. The
+    # actual production script controls when each fixed outcome is consumed.
+    # In particular, failed final admission must never install/start a service.
     fixture = tmp_path / "Guard.cs"
     fixture.write_text(
         """using System;
 using System.IO;
-using System.Security.Principal;
 class Guard {
+  const string Root = INSTALL_ROOT;
+  const string Journal = CONTROL_JOURNAL;
+  static void Observe(string operation) {
+    File.AppendAllText(Journal, operation + "\\n");
+  }
   static int Main(string[] args) {
     if (args.Length == 2 && args[0] == "--installation-identity") {
-      File.WriteAllText(args[1], "Global\\\\K5VisionDesktop-" +
-        WindowsIdentity.GetCurrent().User.Value + "-MUTEX_SUFFIX");
+      File.WriteAllText(args[1], "Global\\\\K5VisionMachineInstallation");
       return 0;
     }
-    string root = AppDomain.CurrentDomain.BaseDirectory;
-    if (args.Length == 1 && args[0] == "--installation-extraction-check") {
-      File.WriteAllText(Path.Combine(root, "extraction-observed"), "yes");
+    if (args.Length == 1 && args[0] == "--installation-machine-extraction-check") {
+      Observe("extraction");
+      File.WriteAllText(Path.Combine(Root, "extraction-observed"), "yes");
       return 0;
     }
     if (args.Length == 1 && args[0] == "--installation-payload-check") {
-      File.WriteAllText(Path.Combine(root, "final-observed"), "yes");
+      Observe("final");
+      File.WriteAllText(Path.Combine(Root, "final-observed"), "yes");
       return FINAL_RESULT;
     }
-    File.WriteAllText(Path.Combine(root, "launch-observed"), "yes");
-    return 0;
+    if (args.Length == 1) {
+      foreach (string operation in new[] {
+          "legacy-check", "stop", "prepare", "seal", "install", "start" }) {
+        if (args[0] == "--installation-service-" + operation) {
+          Observe(operation); return 0;
+        }
+      }
+    }
+    if (args.Length == 0) {
+      Observe("launch");
+      File.WriteAllText(Path.Combine(Root, "launch-observed"), "yes");
+      return 0;
+    }
+    return 1;
   }
 }
-""".replace("MUTEX_SUFFIX", str(uuid4().int)).replace("FINAL_RESULT", "1" if reject else "0")
+""".replace("INSTALL_ROOT", json.dumps(str(tmp_path / "installed")))
+        .replace("CONTROL_JOURNAL", json.dumps(str(tmp_path / "control-observed.txt")))
+        .replace("FINAL_RESULT", "1" if reject else "0")
     )
     launcher = payload / "K5Vision.exe"
     subprocess.run(
@@ -126,7 +145,7 @@ def _gui_completion(process, reject: bool):
                 text = "\n".join(captions)
                 if reject:
                     assert "k5 vision installation failed" in text
-                    assert "do not use this installation" in text
+                    assert "could not verify or start the recording service" in text
                     assert "setup has finished installing" not in text
                     assert not any(api.class_name(w) == "TNewCheckListBox" for w in controls)
                 else:
@@ -161,8 +180,13 @@ def test_actual_installer_completion_after_final_guard_result(tmp_path, reject, 
         assert result == (1 if reject else 0)
         assert (installed / "extraction-observed").is_file()
         assert (installed / "final-observed").is_file()
+        observed = (tmp_path / "control-observed.txt").read_text().splitlines()
+        assert observed[:6] == ["legacy-check", "stop", "prepare", "extraction", "seal", "final"]
         if reject:
             assert not (installed / "launch-observed").exists()
+            assert observed == ["legacy-check", "stop", "prepare", "extraction", "seal", "final"]
+        else:
+            assert observed[6:8] == ["install", "start"]
     finally:
         # Kill only this fixture's descendants if a failed assertion left them.
         if process.poll() is None:

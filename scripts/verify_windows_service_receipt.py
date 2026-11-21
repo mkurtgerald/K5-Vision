@@ -78,6 +78,7 @@ _FIELDS = {
     "export_sha256",
     "clock_health_before_restart",
     "clock_health_after_restart",
+    "standard_windows_user",
 }
 _PHASES = ("initial", "client_closed", "backend_recovered", "wrapper_recovered")
 _OBSERVATION = {
@@ -93,6 +94,28 @@ _OBSERVATION = {
     "recording_bytes_after",
 }
 _HASH = re.compile(r"[a-f0-9]{64}\Z")
+_STANDARD_TRUE = {
+    "ordinary_token_user_verified",
+    "builtin_users_group_present",
+    "admin_pipe_denied",
+    "control_pipe_denied",
+    "malformed_status_reconnect",
+    "eof_status_reconnect",
+    "slow_status_reconnect",
+    "actual_product_client",
+    "generated_account_removed",
+    "generated_profile_removed",
+    "generated_probe_tree_removed",
+    "service_identity_unchanged",
+}
+_STANDARD_FALSE = {"administrator_group_present", "token_elevated"}
+_STANDARD_FIELDS = {
+    "slow_status_seconds",
+    "product_status_success_count",
+    "probe_executable_sha256",
+    "recording_bytes_before",
+    "recording_bytes_after",
+}
 
 
 def _require(value):
@@ -223,6 +246,26 @@ def verify(report: Path, *, expected_head: str, installer_sha256: str) -> dict:
         _require(identities["initial"] == identities["client_closed"])
         _require(identities["backend_recovered"] != identities["client_closed"])
         _require(identities["wrapper_recovered"] != identities["backend_recovered"])
+    ordinary = value["standard_windows_user"]
+    _require(
+        type(ordinary) is dict
+        and set(ordinary) == _STANDARD_TRUE | _STANDARD_FALSE | _STANDARD_FIELDS
+    )
+    _require(all(ordinary[key] is True for key in _STANDARD_TRUE))
+    _require(all(ordinary[key] is False for key in _STANDARD_FALSE))
+    _require(
+        type(ordinary["product_status_success_count"]) is int
+        and ordinary["product_status_success_count"] == 4
+    )
+    _number(ordinary["slow_status_seconds"], 4, 8.499999)
+    _require(
+        type(ordinary["probe_executable_sha256"]) is str
+        and _HASH.fullmatch(ordinary["probe_executable_sha256"]) is not None
+    )
+    _require(
+        _integer(ordinary["recording_bytes_after"], 1)
+        > _integer(ordinary["recording_bytes_before"], 0)
+    )
     before, after = value["retained_file_hashes_before"], value["retained_file_hashes_after"]
     _require(type(before) is list and 1 <= len(before) <= 64 and before == after)
     _require(all(type(item) is str and _HASH.fullmatch(item) is not None for item in before))
