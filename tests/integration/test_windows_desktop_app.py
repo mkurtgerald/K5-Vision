@@ -1206,19 +1206,31 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
         api.click(api.control(form, _OPEN))
 
         def browser_window():
+            categories = {
+                "new_product": 0,
+                "existing_product": 0,
+                "new_other": 0,
+                "existing_other": 0,
+            }
+            found = None
             for window in api.windows():
-                if (
-                    window not in previous_windows
-                    and api.api.IsWindowVisible(window)
-                    and "K5 Vision" in api.text(window)
-                ):
-                    try:
-                        process = psutil.Process(api.pid(window))
-                        if process.name().casefold() in {"msedge.exe", "chrome.exe"}:
-                            return window
-                    except psutil.NoSuchProcess:
-                        pass
-            return None
+                if not api.api.IsWindowVisible(window):
+                    continue
+                try:
+                    process = psutil.Process(api.pid(window))
+                    if process.name().casefold() not in {"msedge.exe", "chrome.exe"}:
+                        continue
+                    product = "K5 Vision" in api.text(window)
+                    category = ("existing_" if window in previous_windows else "new_") + (
+                        "product" if product else "other"
+                    )
+                    categories[category] = min(64, categories[category] + 1)
+                    if window not in previous_windows and product and found is None:
+                        found = window
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            diagnostic["browser_handoff_window_counts"] = categories
+            return found
 
         opened = _wait(browser_window, "Actual default-browser K5 window", timeout=25)
         process = psutil.Process(api.pid(opened))
@@ -1277,6 +1289,12 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
     finally:
         watcher_finished = watcher.finish()
         diagnostic["browser_handoff_observer_stopped"] = watcher_finished
+        diagnostic.update(
+            native_launch_argument_matched=watcher.argument_matched,
+            browser_handoff_new_browser_processes=min(64, len(watcher.observed)),
+            browser_handoff_cached_origin_records=min(64, len(watcher.origin_ancestries)),
+            browser_handoff_observer_failed=watcher.failed,
+        )
         if opened and api.api.IsWindow(opened):
             api.close(opened)
         # Existing browsers are not owned. Only new descendants observed
@@ -1601,6 +1619,11 @@ def _desktop_probe(api, form):
         if status in {"none", "ready", "new", "refused", "running", "stopped"}
         else "unclassified"
     )
+    if data.get("browser_dispatch") in {"not_requested", "dispatched", "failed"}:
+        result["browser_dispatch"] = data["browser_dispatch"]
+    for key, maximum in (("browser_attempts", 1000), ("browser_native_error", 65535)):
+        if type(data.get(key)) is int and 0 <= data[key] <= maximum:
+            result[key] = data[key]
     return result
 
 

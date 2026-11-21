@@ -458,7 +458,7 @@ namespace K5VisionDesktop
     internal static class RecorderWire
     {
         private static void Transfer(Stream stream, byte[] buffer, bool writing, int milliseconds,
-            WaitHandle cancellation)
+            WaitHandle cancellation, bool expectEndOfStream = false)
         {
             Stopwatch budget = Stopwatch.StartNew();
             int offset = 0;
@@ -481,6 +481,11 @@ namespace K5VisionDesktop
                     else
                     {
                         int count = stream.EndRead(result);
+                        if (expectEndOfStream)
+                        {
+                            if (count == 0) return;
+                            throw new InvalidOperationException();
+                        }
                         if (count <= 0) throw new InvalidOperationException();
                         offset += count;
                     }
@@ -504,6 +509,19 @@ namespace K5VisionDesktop
                         catch { }
                     }
                 }
+            }
+        }
+
+        internal static void AwaitPeerClose(Stream stream, int milliseconds, WaitHandle cancellation)
+        {
+            byte[] sentinel = new byte[1];
+            RecorderIncompleteIo pending = null;
+            try { Transfer(stream, sentinel, false, milliseconds, cancellation, true); }
+            catch (RecorderIncompleteIo error) { pending = error; throw; }
+            finally
+            {
+                if (pending == null || !Object.ReferenceEquals(pending.PendingBuffer, sentinel))
+                    Array.Clear(sentinel, 0, sentinel.Length);
             }
         }
 
@@ -687,6 +705,11 @@ namespace K5VisionDesktop
                     if (!publicStatus) RecorderNative.AdmitAdministrator(current);
                     Dictionary<string, object> reply = handler(request);
                     RecorderWire.Write(current, reply, 2048, 5000, stopping);
+                    // DisconnectNamedPipe discards unread buffered replies.
+                    // Existing clients validate the frame and close their end;
+                    // wait for that EOF with a finite, cancellable read instead
+                    // of the unbounded FlushFileBuffers/WaitForPipeDrain APIs.
+                    RecorderWire.AwaitPeerClose(current, 5000, stopping);
                     bool stop = afterStopReply != null && Object.Equals(reply["status"], "stopping");
                     current.Disconnect();
                     if (stop) afterStopReply();

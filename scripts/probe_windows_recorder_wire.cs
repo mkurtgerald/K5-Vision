@@ -3,7 +3,9 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.IO.Pipes;
+using System.Reflection;
 using System.Threading;
 
 namespace K5VisionDesktop
@@ -85,12 +87,99 @@ namespace K5VisionDesktop
             Require(refused && elapsed.ElapsedMilliseconds < 2500);
         }
 
+        private static void AwaitPeerClose(Pair pair, ManualResetEvent cancel, int budget)
+        {
+            // Reflection keeps this common fixture compilable with immutable
+            // baseline sources that predate the production close-wait helper.
+            MethodInfo method = typeof(RecorderWire).GetMethod("AwaitPeerClose",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            if (method == null) throw new MissingMethodException();
+            try { method.Invoke(null, new object[] { pair.Server, budget, cancel }); }
+            catch (TargetInvocationException error) { throw error.InnerException; }
+        }
+
+        private static bool DisconnectDiscardsUnreadReply()
+        {
+            using (Pair pair = new Pair())
+            using (ManualResetEvent cancel = new ManualResetEvent(false))
+            {
+                RecorderWire.Write(pair.Server, Message("reply"), 512, 2000, cancel);
+                pair.Server.Disconnect();
+                Thread.Sleep(120); // No client read is issued before disconnect.
+                try { RecorderWire.Read(pair.Client, 512, 1000, cancel); }
+                catch (ObjectDisposedException) { throw; }
+                catch (IOException) { return true; }
+                catch (InvalidOperationException) { return true; }
+                return false;
+            }
+        }
+
+        private static void DelayedReaderReceivesReply()
+        {
+            using (Pair pair = new Pair())
+            using (ManualResetEvent cancel = new ManualResetEvent(false))
+            using (ManualResetEvent waiting = new ManualResetEvent(false))
+            {
+                Exception failure = null;
+                RecorderWire.Write(pair.Server, Message("reply"), 512, 2000, cancel);
+                Thread closer = new Thread(delegate {
+                    waiting.Set();
+                    try { AwaitPeerClose(pair, cancel, 2000); pair.Server.Disconnect(); }
+                    catch (Exception error) { failure = error; }
+                }) { IsBackground = true };
+                closer.Start();
+                try
+                {
+                    Require(waiting.WaitOne(1000));
+                    Thread.Sleep(120);
+                    Dictionary<string, object> response = RecorderWire.Read(pair.Client, 512, 1000, cancel);
+                    Require(RecorderWire.Operation(response) == "reply");
+                }
+                finally
+                {
+                    pair.Client.Dispose(); // The actual client also closes after reading.
+                    Require(closer.Join(4000));
+                }
+                if (failure != null) throw failure;
+            }
+        }
+
+        private static void NonclosingPeerIsBounded()
+        {
+            using (Pair pair = new Pair())
+            using (ManualResetEvent cancel = new ManualResetEvent(false))
+            {
+                RecorderWire.Write(pair.Server, Message("reply"), 512, 2000, cancel);
+                Require(RecorderWire.Operation(RecorderWire.Read(pair.Client, 512, 1000, cancel)) == "reply");
+                Stopwatch elapsed = Stopwatch.StartNew();
+                bool refused = false;
+                try { AwaitPeerClose(pair, cancel, 120); }
+                catch (InvalidOperationException error)
+                {
+                    if (error is ObjectDisposedException) throw;
+                    refused = true;
+                }
+                Require(refused && elapsed.ElapsedMilliseconds < 2500);
+                pair.Reconnect(); Roundtrip(pair);
+            }
+        }
+
         private static int Main(string[] arguments)
         {
             Dictionary<string, object> receipt = new Dictionary<string, object> { { "schema_version", 1 } };
             try
             {
-                Require(arguments.Length == 1 && (arguments[0] == "--baseline" || arguments[0] == "--fixed"));
+                Require(arguments.Length == 1 && (arguments[0] == "--baseline" ||
+                    arguments[0] == "--delivery-baseline" || arguments[0] == "--fixed"));
+                if (arguments[0] == "--delivery-baseline")
+                {
+                    Require(DisconnectDiscardsUnreadReply());
+                    receipt["status"] = "delivery_baseline_reproduced";
+                    receipt["failure_type"] = "UnreadResponseDiscarded";
+                    receipt["disconnect_discards_unread_reply"] = true;
+                    Console.WriteLine(Json.Serializer.Serialize(receipt));
+                    return 11;
+                }
                 using (Pair pair = new Pair())
                 {
                     if (arguments[0] == "--baseline")
@@ -130,6 +219,10 @@ namespace K5VisionDesktop
                     receipt["cancellation_refused"] = true;
                     receipt["same_instance_reconnect"] = true;
                 }
+                DelayedReaderReceivesReply();
+                receipt["delayed_reader_response_preserved"] = true;
+                NonclosingPeerIsBounded();
+                receipt["nonclosing_peer_bounded"] = true;
                 receipt["status"] = "passed";
                 Console.WriteLine(Json.Serializer.Serialize(receipt));
                 return 0;

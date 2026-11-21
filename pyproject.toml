@@ -49,7 +49,7 @@ dev = [
 packages = ["src/k5vision"]
 
 [tool.pytest.ini_options]
-addopts = "-q --strict-config --strict-markers --cov=src/k5vision --cov-report=term-missing --cov-fail-under=80"
+addopts = "-q --strict-config --strict-markers --cov=src/k5vision --cov-config=pyproject.toml --cov-report=term-missing --cov-fail-under=80"
 testpaths = ["tests"]
 
 [tool.ruff]

@@ -43,9 +43,46 @@ internal static class StandardUserProbe
         out int value, int size, out int needed);
 
     private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+    private static readonly Dictionary<string, object> Completed = new Dictionary<string, object>();
     private static string stage = "start";
     private static void Require(bool condition) { if (!condition) throw new InvalidOperationException(); }
     private static string Quote(string value) { Require(value.IndexOf('"') < 0); return "\"" + value + "\""; }
+
+    private static string FailureType(Exception error)
+    {
+        string value = error.GetType().Name;
+        return new[] { "TargetInvocationException", "TypeInitializationException", "InvalidOperationException",
+            "UnauthorizedAccessException", "IOException", "Win32Exception", "ArgumentException",
+            "NotSupportedException", "SecurityException", "TimeoutException", "IdentityNotMappedException",
+            "ObjectDisposedException" }.Contains(value) ? value : "Other";
+    }
+
+    private static void Failure(Dictionary<string, object> result, Exception error)
+    {
+        if (result.ContainsKey("failure_type")) return;
+        result["failure_outer_type"] = FailureType(error);
+        for (int depth = 0; depth < 4 && error.InnerException != null &&
+            (error is TargetInvocationException || error is TypeInitializationException); depth++)
+            error = error.InnerException;
+        result["failure_type"] = FailureType(error);
+        result["failure_hresult"] = (long)unchecked((uint)error.HResult);
+        HashSet<string> allowed = new HashSet<string>(new[] {
+            "RecorderClient.Exchange", "RecorderClient.ExchangeOwned", "RecorderNative.AdmitStatusOwner",
+            "RecorderPaths..cctor", "RecorderWire.Transfer", "RecorderWire.Read", "RecorderWire.Write",
+            "RecorderWire.Operation", "Json.Parse" });
+        List<string> frames = new List<string>();
+        foreach (StackFrame frame in new StackTrace(error, false).GetFrames() ?? new StackFrame[0])
+        {
+            MethodBase method = frame.GetMethod();
+            if (method == null || method.DeclaringType == null || method.DeclaringType.Namespace != "K5VisionDesktop") continue;
+            string name = method.DeclaringType.Name + "." + method.Name;
+            if (allowed.Contains(name) && frames.Count < 8) frames.Add(name);
+        }
+        result["failure_product_frames"] = frames;
+        Win32Exception native = error as Win32Exception;
+        if (native != null && native.NativeErrorCode >= 0 && native.NativeErrorCode <= 65535)
+            result["failure_win32_error"] = native.NativeErrorCode;
+    }
 
     private static bool StartupOwned(MethodInfo predicate, long hostBirth, long hostAgain,
         long parentAgain, uint creator, uint hostPid)
@@ -96,7 +133,7 @@ internal static class StandardUserProbe
 
     private static Dictionary<string, object> Child(string installed, string expectedSid)
     {
-        Dictionary<string, object> result = new Dictionary<string, object>();
+        Dictionary<string, object> result = Completed;
         stage = "ordinary_token";
         using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
         {
@@ -170,8 +207,8 @@ internal static class StandardUserProbe
         {
             try { File.WriteAllText(arguments[3], Json.Serialize(Child(arguments[1], arguments[2])), Encoding.UTF8); return 0; }
             catch (Exception error) {
-                File.WriteAllText(arguments[3], Json.Serialize(new {
-                    failure_stage = stage, failure_type = error.GetType().Name }), Encoding.UTF8); return 1; }
+                Completed["failure_stage"] = stage; Failure(Completed, error);
+                File.WriteAllText(arguments[3], Json.Serialize(Completed), Encoding.UTF8); return 1; }
         }
         if (arguments.Length != 2) return 2;
         string username = "k5qa" + Guid.NewGuid().ToString("N").Substring(0, 12);
@@ -237,10 +274,7 @@ internal static class StandardUserProbe
         }
         catch (Exception error) {
             if (!receipt.ContainsKey("failure_stage")) receipt["failure_stage"] = stage;
-            if (!receipt.ContainsKey("failure_type")) receipt["failure_type"] = error.GetType().Name;
-            Win32Exception native = error as Win32Exception;
-            if (native != null && native.NativeErrorCode >= 0 && native.NativeErrorCode <= 65535)
-                receipt["failure_win32_error"] = native.NativeErrorCode;
+            Failure(receipt, error);
         }
         finally
         {

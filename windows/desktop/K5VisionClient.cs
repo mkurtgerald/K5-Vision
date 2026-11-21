@@ -108,6 +108,8 @@ namespace K5VisionDesktop
         private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         private bool checkedPayload, busy, disposed, ready, openedBrowser, legacyProfile;
         private string phase = "preparing";
+        private string browserDispatch = "not_requested";
+        private int browserAttempts, browserNativeError;
 
         internal RecorderWindow(bool noBrowser, bool setupAdministrator)
         {
@@ -226,7 +228,9 @@ namespace K5VisionDesktop
                 }
                 else if (ready)
                 {
-                    status.Text = "Recording service is running. Open the camera wall to view cameras, recordings and administration.";
+                    status.Text = browserDispatch == "failed" ?
+                        "Recording service is running. Windows could not open your browser. Choose a default browser in Windows Settings, then select Open camera wall." :
+                        "Recording service is running. Open the camera wall to view cameras, recordings and administration.";
                     help.Text = "The Windows recording service starts automatically when this PC starts. Recording continues when you close this app, close the browser, or sign out of Windows.";
                     tray.Text = "K5 Vision — recording service running";
                     if (!openedBrowser && !noBrowser) { openedBrowser = true; OpenDashboard(); }
@@ -294,8 +298,22 @@ namespace K5VisionDesktop
         private void OpenDashboard()
         {
             if (!ready || disposed) return;
-            try { Process.Start(new ProcessStartInfo("http://127.0.0.1:8000/operator/") { UseShellExecute = true }); }
-            catch { status.Text = "Choose a default browser in Windows Settings, then select Open camera wall."; }
+            browserAttempts = Math.Min(1000, browserAttempts + 1); browserNativeError = 0;
+            try
+            {
+                using (Process launched = Process.Start(new ProcessStartInfo("http://127.0.0.1:8000/operator/")
+                    { UseShellExecute = true })) { }
+                browserDispatch = "dispatched";
+            }
+            catch (System.ComponentModel.Win32Exception error)
+            {
+                browserDispatch = "failed";
+                browserNativeError = error.NativeErrorCode >= 0 && error.NativeErrorCode <= 65535 ? error.NativeErrorCode : 0;
+            }
+            catch { browserDispatch = "failed"; }
+            if (browserDispatch == "failed")
+                status.Text = "Choose a default browser in Windows Settings, then select Open camera wall.";
+            UpdateDiagnostic();
         }
         private void ApproveTime()
         {
@@ -316,6 +334,8 @@ namespace K5VisionDesktop
                 { "schema_version", 1 }, { "phase", phase }, { "ready", ready }, { "exiting", disposed },
                 { "service_client", true }, { "backend_present", false }, { "backend_exited", false },
                 { "backend_exit_code", null }, { "backend_invalid_output", false }, { "backend_status", phase },
+                { "browser_dispatch", browserDispatch }, { "browser_attempts", browserAttempts },
+                { "browser_native_error", browserNativeError },
                 { "setup_administrator", setupAdministrator } });
         }
         protected override void Dispose(bool disposing)

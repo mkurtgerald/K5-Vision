@@ -18,6 +18,14 @@ def _snapshot_helper():
     return module
 
 
+def _ordinary_helper():
+    source = Path(__file__).parents[1] / "integration/windows_standard_user_acceptance.py"
+    spec = importlib.util.spec_from_file_location("k5_ordinary_failure_test", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_service_failure_note_retains_source_location_and_only_finite_scm_fields():
     source = Path(__file__).parents[1] / "integration/test_windows_service_recording.py"
     spec = importlib.util.spec_from_file_location("k5_service_failure_test", source)
@@ -181,3 +189,57 @@ def test_bootstrap_binding_discards_previous_appended_hosts_and_pid_reuse():
     raw = "\n".join(json.dumps(value) for value in (previous, current, unrelated)).encode()
     assert helper._bound_bootstrap(raw, {"host": {"instances": [binding]}}) == [current]
     assert helper._bound_bootstrap(raw, {}) == []
+
+
+def test_ordinary_probe_preserves_unwrapped_public_class_code_frames_and_completed_checks():
+    diagnostic = {}
+    _ordinary_helper()._probe_failure_note(
+        {
+            "failure_stage": "product_status",
+            "failure_type": "UnauthorizedAccessException",
+            "failure_outer_type": "TargetInvocationException",
+            "failure_hresult": 0x80070005,
+            "failure_win32_error": 5,
+            "failure_message": "private-path-and-password",
+            "failure_product_frames": [
+                "RecorderNative.AdmitStatusOwner",
+                "private-path-and-password",
+                "RecorderClient.ExchangeOwned",
+            ],
+            "ordinary_token_user_verified": True,
+            "token_elevated": False,
+        },
+        diagnostic,
+    )
+    assert diagnostic["ordinary_probe_exception_type"] == "UnauthorizedAccessException"
+    assert diagnostic["ordinary_probe_outer_exception_type"] == "TargetInvocationException"
+    assert diagnostic["ordinary_probe_hresult"] == 0x80070005
+    assert diagnostic["ordinary_probe_win32_error"] == 5
+    assert diagnostic["ordinary_probe_product_frames"] == [
+        "RecorderNative.AdmitStatusOwner",
+        "RecorderClient.ExchangeOwned",
+    ]
+    assert diagnostic["ordinary_probe_completed_checks"] == {
+        "ordinary_token_user_verified": True,
+        "token_elevated": False,
+    }
+    assert "private" not in json.dumps(diagnostic)
+
+
+def test_ordinary_probe_projection_rejects_unbounded_numbers_unknown_classes_and_private_stages():
+    diagnostic = {}
+    _ordinary_helper()._probe_failure_note(
+        {
+            "failure_stage": ["private"],
+            "failure_type": "private",
+            "failure_outer_type": {},
+            "failure_hresult": True,
+            "failure_win32_error": 65536,
+            "failure_product_frames": ["private"],
+        },
+        diagnostic,
+    )
+    assert diagnostic == {
+        "ordinary_probe_product_frames": [],
+        "ordinary_probe_completed_checks": {},
+    }

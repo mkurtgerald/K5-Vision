@@ -330,7 +330,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
     processes, reservations = [], []
     service = camera = app = form = playwright = browser = context = None
     failed = cleanup_failed = False
-    diagnostic, receipt = {"stage": "graphical_install"}, {}
+    diagnostic, receipt, observations = {"stage": "graphical_install"}, {}, {}
     try:
         desktop._install_gui(setup, installed, api, diagnostic=diagnostic)
         desktop._verify_installed_worker_bundle(installed)
@@ -678,6 +678,21 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         receipt.update(service_removed_on_uninstall=True, uninstall_preserves_profile=True)
     except BaseException as error:
         failed = True
+        diagnostic["completed_checks"] = sorted(
+            key
+            for key in (
+                "actual_gui_installer",
+                "actual_gui_account_setup",
+                "actual_edge_ui",
+                "actual_scm_readback",
+                "client_quit_recording_continues",
+                "backend_failure_scm_recovery",
+                "wrapper_failure_scm_recovery",
+                "service_token_mfa_decrypted_after_restart",
+            )
+            if receipt.get(key) is True
+        )
+        diagnostic["recording_observations"] = observations
         if service is None:
             diagnostic["installation_snapshot"] = scm.installer_failure_snapshot(installed, profile)
         _failure_note(error, diagnostic, service)

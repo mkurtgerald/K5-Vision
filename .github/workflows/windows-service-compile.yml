@@ -48,6 +48,13 @@ jobs:
           path: wire-baseline
           persist-credentials: false
           sparse-checkout: windows/desktop
+      - name: Checkout immutable source with the unread-response disconnect race
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 6556833488ea51f246254185cd988f5873da35a1
+          path: wire-delivery-baseline
+          persist-credentials: false
+          sparse-checkout: windows/desktop
       - name: Compile and run the real production wire against native asynchronous pipes
         shell: pwsh
         run: |
@@ -68,8 +75,10 @@ jobs:
           $references = @('System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll',
             'System.Web.Extensions.dll', 'System.IO.Compression.dll', 'System.IO.Compression.FileSystem.dll')
           $referenceFlags = @($references | ForEach-Object { '/reference:' + $_ })
-          foreach ($variant in @('baseline', 'fixed')) {
-            $sourceRoot = if ($variant -eq 'baseline') { 'wire-baseline/windows/desktop' } else { 'windows/desktop' }
+          foreach ($variant in @('baseline', 'delivery-baseline', 'fixed')) {
+            $sourceRoot = if ($variant -eq 'baseline') { 'wire-baseline/windows/desktop' }
+              elseif ($variant -eq 'delivery-baseline') { 'wire-delivery-baseline/windows/desktop' }
+              else { 'windows/desktop' }
             $sources = @('K5Vision.cs', 'K5RecorderHost.cs', 'K5ServiceInstallation.cs', 'K5VisionClient.cs') |
               ForEach-Object { (Resolve-Path -LiteralPath (Join-Path $sourceRoot $_)).Path }
             $output = Join-Path (Resolve-Path -LiteralPath wire-proof).Path ($variant + '.exe')
@@ -79,7 +88,7 @@ jobs:
             # product entry point, service, profile, account or clock operation.
             & $output ('--' + $variant) | Tee-Object -FilePath ('recorder-wire-' + $variant + '.json')
             $observed = $LASTEXITCODE
-            $expected = if ($variant -eq 'baseline') { 10 } else { 0 }
+            $expected = if ($variant -eq 'baseline') { 10 } elseif ($variant -eq 'delivery-baseline') { 11 } else { 0 }
             if ($observed -ne $expected) { throw "Native wire $variant did not establish its required result" }
           }
           Remove-Item -LiteralPath wire-proof -Recurse -Force
@@ -90,6 +99,7 @@ jobs:
           name: recorder-wire-${{ github.run_id }}
           path: |
             recorder-wire-baseline.json
+            recorder-wire-delivery-baseline.json
             recorder-wire-fixed.json
           if-no-files-found: warn
           retention-days: 14

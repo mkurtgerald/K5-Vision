@@ -42,6 +42,57 @@ _STAGES = {
     "profile_cleanup",
     "tree_cleanup",
 }
+_FAILURE_TYPES = {
+    "TargetInvocationException",
+    "TypeInitializationException",
+    "InvalidOperationException",
+    "UnauthorizedAccessException",
+    "IOException",
+    "Win32Exception",
+    "ArgumentException",
+    "NotSupportedException",
+    "SecurityException",
+    "TimeoutException",
+    "IdentityNotMappedException",
+    "ObjectDisposedException",
+    "Other",
+}
+_PRODUCT_FRAMES = {
+    "RecorderClient.Exchange",
+    "RecorderClient.ExchangeOwned",
+    "RecorderNative.AdmitStatusOwner",
+    "RecorderPaths..cctor",
+    "RecorderWire.Transfer",
+    "RecorderWire.Read",
+    "RecorderWire.Write",
+    "RecorderWire.Operation",
+    "Json.Parse",
+}
+
+
+def _probe_failure_note(value, diagnostic):
+    if type(value.get("failure_stage")) is str and value["failure_stage"] in _STAGES:
+        diagnostic["ordinary_probe_stage"] = value["failure_stage"]
+    for source, target in (
+        ("failure_type", "ordinary_probe_exception_type"),
+        ("failure_outer_type", "ordinary_probe_outer_exception_type"),
+    ):
+        if type(value.get(source)) is str and value[source] in _FAILURE_TYPES:
+            diagnostic[target] = value[source]
+    for source, target, maximum in (
+        ("failure_hresult", "ordinary_probe_hresult", 2**32 - 1),
+        ("failure_win32_error", "ordinary_probe_win32_error", 65535),
+    ):
+        if type(value.get(source)) is int and 0 <= value[source] <= maximum:
+            diagnostic[target] = value[source]
+    frames = value.get("failure_product_frames")
+    if type(frames) is list:
+        diagnostic["ordinary_probe_product_frames"] = [
+            frame for frame in frames if type(frame) is str and frame in _PRODUCT_FRAMES
+        ][:8]
+    diagnostic["ordinary_probe_completed_checks"] = {
+        key: value[key] for key in _TRUE | _FALSE if type(value.get(key)) is bool
+    }
 
 
 def run_probe(installed, parent, diagnostic):
@@ -92,14 +143,7 @@ def run_probe(installed, parent, diagnostic):
     if type(value) is not dict:
         raise RuntimeError("Ordinary-account probe result was invalid")
     if result.returncode:
-        if value.get("failure_stage") in _STAGES:
-            diagnostic["ordinary_probe_stage"] = value["failure_stage"]
-        failure_type = value.get("failure_type")
-        if type(failure_type) is str and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", failure_type):
-            diagnostic["ordinary_probe_exception_type"] = failure_type
-        native = value.get("failure_win32_error")
-        if type(native) is int and 0 <= native <= 65535:
-            diagnostic["ordinary_probe_win32_error"] = native
+        _probe_failure_note(value, diagnostic)
         raise RuntimeError("Ordinary-account installed IPC boundary failed")
     if set(value) != _TRUE | _FALSE | _FIELDS:
         raise RuntimeError("Ordinary-account probe evidence was incomplete")
