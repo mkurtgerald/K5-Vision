@@ -122,7 +122,7 @@ namespace K5VisionDesktop
             {
                 Exception failure = null;
                 RecorderWire.Write(pair.Server, Message("reply"), 512, 2000, cancel);
-                Thread closer = new Thread(delegate {
+                Thread closer = new Thread(delegate() {
                     waiting.Set();
                     try { AwaitPeerClose(pair, cancel, 2000); pair.Server.Disconnect(); }
                     catch (Exception error) { failure = error; }
