@@ -43,6 +43,22 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Complete the disposable CI user's browser prerequisite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
+            throw 'Browser preparation requires a disposable hosted Windows VM'
+          }
+          # Test-runner user only, never an installer or product operation.
+          # Official policy: https://learn.microsoft.com/deployedge/microsoft-edge-browser-policies/hidefirstrunexperience
+          $edgePolicy = 'HKCU:\Software\Policies\Microsoft\Edge'
+          New-Item -Path $edgePolicy -Force | Out-Null
+          New-ItemProperty -Path $edgePolicy -Name HideFirstRunExperience -PropertyType DWord -Value 1 -Force | Out-Null
+          if ((Get-ItemPropertyValue -Path $edgePolicy -Name HideFirstRunExperience) -ne 1) {
+            throw 'Disposable browser prerequisite could not be verified'
+          }
+          Write-Host 'Prepared the disposable CI user for native default-browser acceptance'
       - name: Compile and run actual client browser dispatch against owned local HTML
         shell: pwsh
         run: |
@@ -79,6 +95,15 @@ jobs:
           $env:PYTHONPATH = Join-Path (Resolve-Path -LiteralPath browser-proof).Path 'no external modules'
           & $output | Tee-Object -FilePath browser-dispatch-native.json
           if ($LASTEXITCODE -ne 0) { throw 'Native browser observation did not complete' }
+          $browserEvidence = Get-Content -LiteralPath browser-dispatch-native.json -Raw | ConvertFrom-Json
+          if ($browserEvidence.schema_version -ne 1 -or $browserEvidence.status -ne 'diagnostic_complete') {
+            throw 'Native browser observation did not produce a completed receipt'
+          }
+          foreach ($field in @('actual_product_dispatch', 'origin_request_observed', 'origin_response_sent', 'browser_window_visible', 'browser_title_matches')) {
+            if ($browserEvidence.$field -isnot [bool] -or $browserEvidence.$field -ne $true) {
+              throw "Prepared default-browser acceptance failed: $field"
+            }
+          }
           Remove-Item -LiteralPath browser-proof -Recurse -Force
       - name: Retain synthetic browser-window evidence without claiming product qualification
         if: always()
