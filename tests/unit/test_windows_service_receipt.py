@@ -61,6 +61,15 @@ def _receipt():
             "recording_bytes_before": 100,
             "recording_bytes_after": 200,
         },
+        "startup_shutdown": {
+            **dict.fromkeys(_VERIFIER["_STARTUP_TRUE"], True),
+            "previous_host_pid": 300,
+            "previous_host_created_100ns": 133000000000000000,
+            "host_pid": 400,
+            "host_created_100ns": 133000000100000000,
+            "observed_stage": "payload_verify",
+            "stop_seconds": 12.5,
+        },
         "retained_file_hashes_before": ["c" * 64],
         "retained_file_hashes_after": ["c" * 64],
         **{
@@ -145,6 +154,40 @@ def test_service_receipt_requires_real_ordinary_user_boundary_and_cleanup(tmp_pa
 def test_service_receipt_rejects_false_ordinary_user_or_reconnect_proof(tmp_path, change):
     value = _receipt()
     value["standard_windows_user"].update(change)
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, value))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"native_start_without_readiness": False},
+        {"new_host_verified": 1},
+        {"observed_stage": "running"},
+        {"observed_stage": "account_required"},
+        {"host_pid": 300, "host_created_100ns": 133000000000000000},
+        {"host_created_100ns": True},
+        {"scm_stopped": False},
+        {"owned_children_exited": False},
+        {"stop_seconds": 70},
+    ],
+    ids=[
+        "waited-ready",
+        "unverified-host",
+        "already-running",
+        "already-ready",
+        "old-host",
+        "invalid-birth",
+        "scm-live",
+        "orphan",
+        "deadline",
+    ],
+)
+def test_service_receipt_requires_real_new_host_pre_ready_shutdown_with_original_budget(
+    tmp_path, change
+):
+    value = _receipt()
+    value["startup_shutdown"].update(change)
     with pytest.raises(ValueError):
         _verify(_report(tmp_path, value))
 

@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -149,3 +150,80 @@ def test_installed_time_candidate_cannot_change_pins_or_claim_prior_qualificatio
     path.write_text(json.dumps(metadata))
     with pytest.raises(AssertionError):
         _HELPERS._candidate(setup, "a" * 40, setup_sha)
+
+
+@pytest.mark.parametrize("primary_type", [RuntimeError, pytest.fail.Exception])
+def test_uninstaller_timeout_cannot_replace_original_installer_failure(primary_type):
+    primary = primary_type("Original installer deadline")
+    attempted, records = [], []
+
+    def uninstall():
+        attempted.append("uninstall")
+        raise subprocess.TimeoutExpired(["private-uninstaller-path"], 45)
+
+    with pytest.raises(primary_type, match="Original installer deadline") as failure:
+        try:
+            raise primary
+        finally:
+            _HELPERS._cleanup_fixture(
+                (
+                    ("uninstall", uninstall),
+                    ("temporary_state", lambda: attempted.append("temporary_state")),
+                ),
+                lambda name, value: records.append((name, value)),
+                primary_error=primary,
+            )
+    assert failure.value is primary
+    assert attempted == ["uninstall", "temporary_state"]
+    assert records[0][0] == "k5_native_time_cleanup_diagnostic"
+    diagnostic = json.loads(records[0][1])
+    assert diagnostic["primary_failed"] is True
+    assert diagnostic["cleanup_timeout"] is True
+    assert diagnostic["cleanup_error_type"] == "TimeoutExpired"
+    assert diagnostic["cleanup_error_stage"] == "uninstall"
+    assert "private-uninstaller-path" not in records[0][1]
+
+
+def test_cleanup_timeout_after_success_is_still_a_failed_native_time_test():
+    records = []
+
+    def uninstall():
+        raise subprocess.TimeoutExpired(["private-command"], 45)
+
+    with pytest.raises(
+        pytest.fail.Exception, match="Native time fixture cleanup failed"
+    ) as failure:
+        _HELPERS._cleanup_fixture(
+            (("uninstall", uninstall),), lambda name, value: records.append(value)
+        )
+    diagnostic = json.loads(records[0])
+    assert diagnostic["primary_failed"] is False and diagnostic["cleanup_failed"] is True
+    assert diagnostic["cleanup_timeout"] is True
+    assert "private-command" not in str(failure.value)
+
+
+def test_secondary_cleanup_errors_are_finite_and_do_not_skip_later_cleanup():
+    attempted, records = [], []
+
+    class PrivateError(Exception):
+        pass
+
+    def stop():
+        attempted.append("client")
+        raise PrivateError("private source, credential and path")
+
+    primary = RuntimeError("Original failure")
+    _HELPERS._cleanup_fixture(
+        (
+            ("client", stop),
+            ("cohort", lambda: attempted.append("cohort")),
+            ("temporary_state", lambda: attempted.append("temporary_state")),
+        ),
+        lambda name, value: records.append(value),
+        primary_error=primary,
+    )
+    assert attempted == ["client", "cohort", "temporary_state"]
+    diagnostic = json.loads(records[0])
+    assert diagnostic["cleanup_error_type"] == "other"
+    assert diagnostic["cleanup_timeout"] is False
+    assert "PrivateError" not in records[0] and "credential" not in records[0]

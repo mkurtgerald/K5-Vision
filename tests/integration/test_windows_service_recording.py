@@ -216,6 +216,82 @@ def _growth(service, desktop, profile, client, camera_id, *, previous=None, mini
     }
 
 
+def _stop_during_startup(service, profile, desktop, cohort, diagnostic):
+    """Stop a genuine new pre-ready host, without injecting a pause or test mode."""
+    _, backend = service.processes()
+    old_host = psutil.Process(backend.ppid())
+    previous = (old_host.pid, service.native_birth(old_host))
+    desktop._service_control(service.installed, "stop")
+    desktop._wait(
+        lambda: service.status()["state"] == 1,
+        "Normal service stop before cold restart",
+        timeout=60,
+    )
+    cohort.service_stopped = True
+    desktop._wait_owned_cleanup(cohort, diagnostic=diagnostic)
+    diagnostic["stage"] = "native_restart_before_readiness"
+    service.start_without_readiness()
+    cohort.service_stopped = False
+    snapshot_helper = _helpers("windows_service_acceptance")
+
+    def pre_ready():
+        snapshot = snapshot_helper.installer_failure_snapshot(service.installed, profile)
+        envelopes = [
+            envelope for log in snapshot.get("logs", []) for envelope in log.get("bootstrap", [])
+        ]
+        diagnostic["startup_stop_observation"] = {
+            "scm": snapshot.get("scm", {}),
+            "processes": snapshot.get("processes", {}),
+            "bootstrap": envelopes[-3:],
+        }
+        if not envelopes:
+            return False
+        event = envelopes[-1]
+        _require(
+            "failure_type" not in event, "New recorder host failed before the startup-stop request"
+        )
+        _require(
+            event["k5_recorder_bootstrap"] not in {"account_required", "serve_start", "running"},
+            "New recorder reached readiness before the startup-stop observation",
+        )
+        if event["k5_recorder_bootstrap"] not in {"token", "code_admission", "payload_verify"}:
+            return False
+        _require(
+            (event["host_pid"], event["host_created_100ns"]) != previous,
+            "Startup-stop proof observed the previous recorder host",
+        )
+        cohort.add(psutil.Process(snapshot["scm"]["pid"]))
+        return event
+
+    observed = desktop._wait(pre_ready, "Native new-host pre-readiness bootstrap", timeout=15)
+    diagnostic["stage"] = "scm_stop_during_startup"
+    began = time.monotonic()
+    service.request_stop()
+    desktop._wait(
+        lambda: service.status()["state"] == 1,
+        "SCM stopped during host startup",
+        timeout=max(0.1, 70 - (time.monotonic() - began)),
+    )
+    cohort.service_stopped = True
+    desktop._wait_owned_cleanup(
+        cohort, diagnostic=diagnostic, timeout=max(0.1, min(10, 70 - (time.monotonic() - began)))
+    )
+    elapsed = time.monotonic() - began
+    _require(elapsed < 70, "Stopping during startup exceeded the existing stop budget")
+    return {
+        "native_start_without_readiness": True,
+        "new_host_verified": True,
+        "previous_host_pid": previous[0],
+        "previous_host_created_100ns": previous[1],
+        "host_pid": observed["host_pid"],
+        "host_created_100ns": observed["host_created_100ns"],
+        "observed_stage": observed["k5_recorder_bootstrap"],
+        "scm_stopped": True,
+        "owned_children_exited": True,
+        "stop_seconds": round(elapsed, 3),
+    }
+
+
 def test_native_windows_unattended_service_recording_and_recovery(record_testsuite_property):
     __tracebackhide__ = True
     started = time.monotonic()
@@ -576,11 +652,10 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         context = None
         browser.close()
         browser = None
+        receipt["startup_shutdown"] = _stop_during_startup(
+            service, profile, desktop, cohort, diagnostic
+        )
         diagnostic["stage"] = "service_uninstall_preserves_data"
-        desktop._service_control(installed, "stop")
-        desktop._wait(lambda: service.status()["state"] == 1, "SCM graceful stop", timeout=60)
-        cohort.service_stopped = True
-        desktop._wait_owned_cleanup(cohort, diagnostic=diagnostic)
         result = subprocess.run(
             [str(installed / "unins000.exe"), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
             stdin=subprocess.DEVNULL,

@@ -19,6 +19,8 @@ on:
       - tests/integration/windows_service_acceptance.py
       - tests/integration/windows_standard_user_acceptance.py
       - tests/integration/windows_standard_user_probe.cs
+      - tests/integration/windows_process_identity.py
+      - tests/unit/test_windows_process_identity.py
       - tests/integration/windows_standard_user_acceptance.py
       - tests/integration/windows_standard_user_probe.cs
       - tests/unit/test_service_setup.py
@@ -135,7 +137,7 @@ jobs:
         if: matrix.lane == 'setup'
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_service_setup.py tests/unit/test_operator_service_time_approval.py tests/unit/test_operator_security_revocation_progress.py -o addopts= --no-cov -q
+          python -m pytest tests/unit/test_service_setup.py tests/unit/test_operator_service_time_approval.py tests/unit/test_operator_security_revocation_progress.py tests/unit/test_windows_process_identity.py -o addopts= --no-cov -q
           if ($LASTEXITCODE -ne 0) { throw "Service setup and security regression failed" }
       - name: Verify desktop setup and process ownership on Windows
         if: matrix.lane == 'setup'

@@ -28,7 +28,7 @@ namespace K5VisionDesktop
             Preflight = 10, Manifest = 11, OpenHandle = 12, FileIdentity = 13,
             Inventory = 14, Hash = 15, Acl = 16, ScmOpen = 20,
             ScmConfiguration = 21, ScmCreate = 22, ScmStop = 23, Data = 24,
-            Recovery = 25, ScmStart = 26, Readiness = 27
+            Recovery = 25, ScmStart = 26, Readiness = 27, Logging = 28
         }
         private static RefusalPhase refusalPhase = RefusalPhase.Preflight;
         private static int FailureCode(int nativeError)
@@ -527,6 +527,17 @@ namespace K5VisionDesktop
             RequireWin32(SetServiceObjectSecurity(service, 4, bytes));
         }
 
+        private static void RegisterEventLog()
+        {
+            refusalPhase = RefusalPhase.Logging;
+            // Match WinSW's privileged install-time source registration. The
+            // runtime virtual account must never create or rebind providers.
+            if (!EventLog.SourceExists(Name, "."))
+                EventLog.CreateEventSource(new EventSourceCreationData(Name, "Application"));
+            Require(String.Equals(EventLog.LogNameFromSourceName(Name, "."),
+                "Application", StringComparison.OrdinalIgnoreCase));
+        }
+
         internal static int Execute(string operation, string root)
         {
             IntPtr manager = IntPtr.Zero, service = IntPtr.Zero;
@@ -579,6 +590,7 @@ namespace K5VisionDesktop
                     RequireWin32(ChangeServiceConfig(service, 0xFFFFFFFF, 2, 0xFFFFFFFF, null,
                         null, IntPtr.Zero, null, Account, null, "K5 Vision Recorder"));
                     ConfigureRecovery(service);
+                    RegisterEventLog();
                     PrepareData();
                     return 0;
                 }
@@ -616,6 +628,7 @@ namespace K5VisionDesktop
                 }
             }
             catch (Refused error) { return error.Code; }
+            catch (System.ComponentModel.Win32Exception error) { return FailureCode(error.NativeErrorCode); }
             catch (IOException error) { return FailureCode(NativeHResult(error.HResult)); }
             catch (UnauthorizedAccessException) { return FailureCode(5); }
             catch { return FailureCode(0); }

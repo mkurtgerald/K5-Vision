@@ -190,6 +190,35 @@ def test_installer_timeout_activity_refuses_unavailable_process_metadata(monkeyp
     }
 
 
+def test_installer_timeout_projects_only_owned_native_guard_operation(monkeypatch):
+    child = _ProcessActivityFixture(pid=92, user=1, system=1)
+    child.exe = lambda: r"C:\PRIVATE\K5Vision.exe"
+    child.cmdline = lambda: [r"C:\PRIVATE\K5Vision.exe", "--installation-service-start"]
+    unrelated = _ProcessActivityFixture(pid=93, user=0, system=0)
+    unrelated.exe = lambda: r"C:\PRIVATE\other.exe"
+
+    def forbidden():
+        raise AssertionError("An unrelated executable's command line must not be read")
+
+    unrelated.cmdline = forbidden
+    root = _ProcessActivityFixture(pid=91, user=1, system=1, children=(child, unrelated))
+    monkeypatch.setattr(_DESKTOP.psutil, "Process", lambda _pid: root)
+    witness = _DESKTOP._installer_timeout_activity(SimpleNamespace(pid=91))
+    assert witness["owned_guard_operations"] == {"--installation-service-start": 1}
+    assert "PRIVATE" not in json.dumps(witness)
+
+
+def test_installer_timeout_does_not_retain_supplied_native_arguments(monkeypatch):
+    child = _ProcessActivityFixture(pid=92, user=1, system=1)
+    child.exe = lambda: r"C:\PRIVATE\K5Vision.exe"
+    child.cmdline = lambda: [r"C:\PRIVATE\K5Vision.exe", "--profile", "PRIVATE rtsp://secret"]
+    root = _ProcessActivityFixture(pid=91, user=1, system=1, children=(child,))
+    monkeypatch.setattr(_DESKTOP.psutil, "Process", lambda _pid: root)
+    witness = _DESKTOP._installer_timeout_activity(SimpleNamespace(pid=91))
+    assert "owned_guard_operations" not in witness
+    assert "PRIVATE" not in json.dumps(witness)
+
+
 class _DelayedInstaller:
     """A shared Next/Install HWND with controllable handler completion."""
 

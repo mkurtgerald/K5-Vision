@@ -79,6 +79,7 @@ _FIELDS = {
     "clock_health_before_restart",
     "clock_health_after_restart",
     "standard_windows_user",
+    "startup_shutdown",
 }
 _PHASES = ("initial", "client_closed", "backend_recovered", "wrapper_recovered")
 _OBSERVATION = {
@@ -95,6 +96,7 @@ _OBSERVATION = {
 }
 _HASH = re.compile(r"[a-f0-9]{64}\Z")
 _STANDARD_TRUE = {
+    "startup_identity_timestamp_order_independent",
     "ordinary_token_user_verified",
     "builtin_users_group_present",
     "admin_pipe_denied",
@@ -115,6 +117,20 @@ _STANDARD_FIELDS = {
     "probe_executable_sha256",
     "recording_bytes_before",
     "recording_bytes_after",
+}
+_STARTUP_TRUE = {
+    "native_start_without_readiness",
+    "new_host_verified",
+    "scm_stopped",
+    "owned_children_exited",
+}
+_STARTUP_FIELDS = {
+    "previous_host_pid",
+    "previous_host_created_100ns",
+    "host_pid",
+    "host_created_100ns",
+    "observed_stage",
+    "stop_seconds",
 }
 
 
@@ -266,6 +282,18 @@ def verify(report: Path, *, expected_head: str, installer_sha256: str) -> dict:
         _integer(ordinary["recording_bytes_after"], 1)
         > _integer(ordinary["recording_bytes_before"], 0)
     )
+    startup = value["startup_shutdown"]
+    _require(type(startup) is dict and set(startup) == _STARTUP_TRUE | _STARTUP_FIELDS)
+    _require(all(startup[key] is True for key in _STARTUP_TRUE))
+    for prefix in ("", "previous_"):
+        _integer(startup[prefix + "host_pid"], 1, 2**32 - 1)
+        _integer(startup[prefix + "host_created_100ns"], 1, 2**63 - 1)
+    _require(
+        (startup["host_pid"], startup["host_created_100ns"])
+        != (startup["previous_host_pid"], startup["previous_host_created_100ns"])
+    )
+    _require(startup["observed_stage"] in {"token", "code_admission", "payload_verify"})
+    _number(startup["stop_seconds"], 0.001, 69.999999)
     before, after = value["retained_file_hashes_before"], value["retained_file_hashes_after"]
     _require(type(before) is list and 1 <= len(before) <= 64 and before == after)
     _require(all(type(item) is str and _HASH.fullmatch(item) is not None for item in before))

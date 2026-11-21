@@ -213,6 +213,7 @@ begin
     FinalPayloadVerified := False;
     FinalFailureStage := 'seal';
     FinalFailureCode := -1;
+    WizardForm.StatusLabel.Caption := 'Securing K5 Vision...';
     try
       FinalPayloadVerified := Exec(ExpandConstant('{tmp}\K5VisionInstallGuard.exe'),
         '--installation-service-seal', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
@@ -227,6 +228,7 @@ begin
       end;
       if FinalPayloadVerified then begin
         FinalFailureStage := 'payload';
+        WizardForm.StatusLabel.Caption := 'Verifying K5 Vision...';
         FinalPayloadVerified := Exec(ExpandConstant('{app}\K5Vision.exe'),
           '--installation-payload-check', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
         FinalFailureCode := ExitCode;
@@ -234,6 +236,7 @@ begin
       end;
       if FinalPayloadVerified then begin
         FinalFailureStage := 'install';
+        WizardForm.StatusLabel.Caption := 'Preparing the recording service...';
         FinalPayloadVerified := Exec(ExpandConstant('{app}\K5Vision.exe'),
           '--installation-service-install', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
         FinalFailureCode := ExitCode;
@@ -241,6 +244,7 @@ begin
       end;
       if FinalPayloadVerified then begin
         FinalFailureStage := 'start';
+        WizardForm.StatusLabel.Caption := 'Starting the recording service...';
         FinalPayloadVerified := Exec(ExpandConstant('{app}\K5Vision.exe'),
           '--installation-service-start', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
         FinalFailureCode := ExitCode;

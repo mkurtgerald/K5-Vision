@@ -369,6 +369,49 @@ def _approve_time(client, operation, *, desktop, api, app, form, profile, servic
     return result
 
 
+def _cleanup_fixture(actions, record, *, primary_error=None):
+    """Keep an original failure while reporting every bounded cleanup attempt."""
+    allowed = {
+        "AssertionError",
+        "Failed",
+        "FileNotFoundError",
+        "OSError",
+        "PermissionError",
+        "RuntimeError",
+        "TimeoutError",
+        "TimeoutExpired",
+        "TimeAdministrationError",
+        "WindowsVmClockError",
+    }
+
+    def finite_type(error):
+        name = type(error).__name__
+        return name if name in allowed else "other"
+
+    diagnostic = {
+        "primary_failed": primary_error is not None,
+        "primary_error_type": "none" if primary_error is None else finite_type(primary_error),
+        "cleanup_failed": False,
+        "cleanup_timeout": False,
+        "cleanup_error_type": "none",
+        "cleanup_error_stage": "none",
+    }
+    for stage, action in actions:
+        try:
+            action()
+        except BaseException as error:
+            diagnostic["cleanup_timeout"] |= isinstance(
+                error, (subprocess.TimeoutExpired, TimeoutError)
+            )
+            if not diagnostic["cleanup_failed"]:
+                diagnostic["cleanup_error_type"] = finite_type(error)
+                diagnostic["cleanup_error_stage"] = stage
+            diagnostic["cleanup_failed"] = True
+    record("k5_native_time_cleanup_diagnostic", json.dumps(diagnostic, sort_keys=True))
+    if diagnostic["cleanup_failed"] and primary_error is None:
+        pytest.fail("Native time fixture cleanup failed: " + json.dumps(diagnostic), pytrace=False)
+
+
 def test_native_windows_time_configuration_readback_and_resync_with_restoration(
     record_testsuite_property,
 ):
@@ -394,7 +437,7 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
     guard_path = parent / "time-restoration.json"
     api, runtime = desktop._Windows(), desktop._helpers("test_operator_product_runtime")
     cohort = desktop._Cohort(api)
-    app = form = None
+    app = form = primary_error = None
     proof = {
         "schema_version": 2,
         "head_sha": os.environ.get("K5_DESKTOP_HEAD_SHA"),
@@ -575,12 +618,20 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
         record_testsuite_property(
             "k5_native_time_administration_receipt", json.dumps(proof, sort_keys=True)
         )
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        try:
+
+        def stop_client():
             if app is not None and app.poll() is None and form is not None:
                 desktop._stop_app(app, form, api, cohort)
-        finally:
+
+        def finish_cohort():
             cohort.finish()
+            assert not cohort.failed, "Native time fixture process cleanup failed"
+
+        def uninstall():
             if (installed / "unins000.exe").is_file():
                 result = subprocess.run(
                     [
@@ -596,4 +647,14 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
                     check=False,
                 )
                 assert result.returncode == 0, "Native time fixture uninstall failed"
-            desktop._remove_owned_temporary_tree(parent)
+
+        _cleanup_fixture(
+            (
+                ("client", stop_client),
+                ("cohort", finish_cohort),
+                ("uninstall", uninstall),
+                ("temporary_state", lambda: desktop._remove_owned_temporary_tree(parent)),
+            ),
+            record_testsuite_property,
+            primary_error=primary_error,
+        )

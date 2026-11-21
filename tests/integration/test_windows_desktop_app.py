@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from uuid import UUID, uuid4
@@ -333,8 +333,10 @@ class _Cohort:
 
     def __init__(self, api):
         self.api = api
+        self.native = _helpers("windows_process_identity").NativeProcessTree()
         self.roots = []
         self.processes = {}
+        self.native_identities = {}
         self.console_seen = False
         self.failed = False
         self.service = None
@@ -347,10 +349,16 @@ class _Cohort:
     def add(self, process):
         try:
             root = psutil.Process(process.pid)
+            birth = self.native.birth(root.pid, handle=getattr(process, "_handle", None))
+            if birth is None or self.native.birth(root.pid) != birth or not root.is_running():
+                return
         except psutil.NoSuchProcess:
             return
         with self.lock:
-            self.roots.append(root)
+            identity = (root.pid, birth)
+            self.roots.append(identity)
+            self.processes[identity] = root
+            self.native_identities[id(root)] = identity
 
     def snapshot(self):
         with self.lock:
@@ -358,21 +366,39 @@ class _Cohort:
 
     def _snapshot(self):
         for root in list(self.roots):
-            try:
-                cohort = [root, *root.children(recursive=True)]
-            except psutil.NoSuchProcess:
-                continue
-            for process in cohort:
+            for identity in self.native.descendants(root):
+                if identity in self.processes:
+                    continue
                 try:
-                    self.processes[(process.pid, process.create_time())] = process
+                    process = psutil.Process(identity[0])
+                    if self.native.birth(process.pid) != identity[1] or not process.is_running():
+                        continue
+                    self.processes[identity] = process
+                    self.native_identities[id(process)] = identity
                 except psutil.NoSuchProcess:
                     continue
-        return list(self.processes.values())
+        # Keep exited identities for the existing cleanup witness, but never
+        # return a historical PID's new occupant as owned by this journey.
+        return [
+            process
+            for identity, process in self.processes.items()
+            if not process.is_running() or self.native.birth(identity[0]) == identity[1]
+        ]
+
+    def is_owned_running(self, process):
+        identity = self.native_identities.get(id(process))
+        return bool(
+            identity is not None
+            and self.native.birth(identity[0]) == identity[1]
+            and process.is_running()
+        )
 
     def _observe(self):
         try:
             while not self.stop.wait(0.05):
-                pids = {process.pid for process in self.snapshot() if process.is_running()}
+                pids = {
+                    process.pid for process in self.snapshot() if self.is_owned_running(process)
+                }
                 if any(
                     self.api.pid(window) in pids
                     and self.api.class_name(window) == "ConsoleWindowClass"
@@ -528,16 +554,29 @@ def _installer_page_signature(api, controls):
 def _installer_timeout_activity(process):
     """Bounded process-only witness for a graphical Setup deadline failure.
 
-    Never inspect command lines, filenames, handles, environment or output:
-    these may expose an owner's install location or other private material.
-    CPU time distinguishes an extraction-heavy pre-wizard stall from a process
-    that spent the same interval without doing measurable work.
+    Retain only CPU metrics and fixed operation flags from owned native guard
+    processes. Their argv is inspected in memory; executable paths, supplied
+    arguments, handles, environment and output are never retained. CPU time
+    distinguishes extraction work from a process awaiting a control response.
     """
     try:
         root = psutil.Process(process.pid)
         processes = [root, *root.children(recursive=True)]
         seconds = 0.0
         observed = 0
+        operations = {}
+        allowed_operations = {
+            "--installation-identity",
+            "--installation-machine-extraction-check",
+            "--installation-payload-check",
+            "--installation-service-legacy-check",
+            "--installation-service-stop",
+            "--installation-service-prepare",
+            "--installation-service-seal",
+            "--installation-service-install",
+            "--installation-service-start",
+            "--installation-service-remove",
+        }
         for item in processes[:64]:
             try:
                 usage = item.cpu_times()
@@ -545,12 +584,30 @@ def _installer_timeout_activity(process):
                 observed += 1
             except (psutil.Error, OSError):
                 continue
-        return {
+            try:
+                image = PureWindowsPath(item.exe()).name.casefold()
+                if image not in {
+                    "k5vision.exe",
+                    "k5visioninstallguard.exe",
+                    "k5visionuninstallguard.exe",
+                }:
+                    continue
+                arguments = item.cmdline()
+                if 2 <= len(arguments) <= 3 and arguments[1] in allowed_operations:
+                    operation = arguments[1]
+                    if len(arguments) == (3 if operation == "--installation-identity" else 2):
+                        operations[operation] = min(64, operations.get(operation, 0) + 1)
+            except (psutil.Error, OSError, AttributeError, TypeError, ValueError):
+                continue
+        result = {
             "observed_processes": observed,
             "processes_capped": len(processes) > 64,
             "aggregate_cpu_seconds": round(min(seconds, 3600.0), 2),
             "root_running": root.is_running(),
         }
+        if operations:
+            result["owned_guard_operations"] = operations
+        return result
     except (psutil.Error, OSError):
         return {"observation": "unavailable"}
 
@@ -630,7 +687,7 @@ def _installer_finish_refusal(captions, diagnostic):
             diagnostic["installer_failed_stage"] = match[1]
             diagnostic["installer_guard_exit_code"] = value
             phase = value >> 16
-            if phase in {10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 26, 27}:
+            if phase in {10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 26, 27, 28}:
                 diagnostic["installer_guard_phase"] = phase
                 diagnostic["installer_guard_win32"] = value & 65535
     return True
@@ -1271,7 +1328,8 @@ def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
                 # psutil.wait_procs()/Process.wait() can reopen a recycled PID
                 # without checking its original creation identity. is_running()
                 # verifies (PID, creation time) and rejects that later occupant.
-                if process.is_running():
+                alive = getattr(cohort, "is_owned_running", lambda item: item.is_running())
+                if alive(process):
                     counts[names.get(process.name().casefold(), "other")] += 1
             except psutil.NoSuchProcess:
                 continue

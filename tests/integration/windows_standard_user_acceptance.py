@@ -11,6 +11,7 @@ from pathlib import Path
 
 _TRUE = {
     "ordinary_token_user_verified",
+    "startup_identity_timestamp_order_independent",
     "builtin_users_group_present",
     "admin_pipe_denied",
     "control_pipe_denied",
@@ -27,6 +28,7 @@ _FIELDS = {"slow_status_seconds", "product_status_success_count"}
 _STAGES = {
     "start",
     "ordinary_token",
+    "clock_independent_startup_identity",
     "product_status",
     "admin_pipe_denial",
     "control_pipe_denial",

@@ -47,6 +47,27 @@ internal static class StandardUserProbe
     private static void Require(bool condition) { if (!condition) throw new InvalidOperationException(); }
     private static string Quote(string value) { Require(value.IndexOf('"') < 0); return "\"" + value + "\""; }
 
+    private static bool StartupOwned(MethodInfo predicate, long hostBirth, long hostAgain,
+        long parentAgain, uint creator, uint hostPid)
+    {
+        return (bool)predicate.Invoke(null, new object[] {
+            11u, 133000000000000000L, 11u, parentAgain, 22u, hostPid, creator, hostBirth, hostAgain });
+    }
+
+    private static void ClockIndependentIdentity(Assembly product)
+    {
+        MethodInfo predicate = product.GetType("K5VisionDesktop.RecorderProcessIdentity", true).GetMethod(
+            "OwnedStartupHost", BindingFlags.Static | BindingFlags.NonPublic);
+        Require(predicate != null);
+        long anchor = 133000000000000000L, shift = 1728000000000L;
+        Require(StartupOwned(predicate, anchor + shift, anchor + shift, anchor, 11u, 33u));
+        Require(StartupOwned(predicate, anchor - shift, anchor - shift, anchor, 11u, 33u));
+        Require(!StartupOwned(predicate, anchor, anchor + 1, anchor, 11u, 33u));
+        Require(!StartupOwned(predicate, anchor, anchor, anchor + 1, 11u, 33u));
+        Require(!StartupOwned(predicate, anchor, anchor, anchor, 99u, 33u));
+        Require(!StartupOwned(predicate, anchor, anchor, anchor, 11u, 22u));
+    }
+
     private static NamedPipeClientStream Open(string name)
     {
         NamedPipeClientStream pipe = new NamedPipeClientStream(".", name,
@@ -91,6 +112,9 @@ internal static class StandardUserProbe
         result["administrator_group_present"] = false;
         result["token_elevated"] = false;
         Assembly product = Assembly.LoadFrom(Path.Combine(installed, "K5Vision.exe"));
+        stage = "clock_independent_startup_identity";
+        ClockIndependentIdentity(product);
+        result["startup_identity_timestamp_order_independent"] = true;
         MethodInfo exchange = product.GetType("K5VisionDesktop.RecorderClient", true).GetMethod(
             "Exchange", BindingFlags.Static | BindingFlags.NonPublic);
         Require(exchange != null);
