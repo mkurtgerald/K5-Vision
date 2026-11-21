@@ -73,7 +73,7 @@ jobs:
           $harnessHead = (& git -C diagnostic-source rev-parse HEAD).Trim()
           & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:scripts/probe_windows_motion_sampler.py > scripts/probe_windows_motion_sampler.py'
           $scriptSha = (Get-FileHash -LiteralPath scripts/probe_windows_motion_sampler.py -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne 'f10a83c158e88c67b49154b6aad7cb7884c24c264995956e0a44445cd16c5b7b' -or
+          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne '1abf13531e8612c8a68c21580ff9d9364fee24df54b1bab88b3a265e379819a6' -or
               $harnessHead -ne $env:K5_DIAGNOSTIC_HARNESS_SHA -or $harnessHead -eq $env:K5_DESKTOP_HEAD_SHA) {
             throw 'Diagnostic motion sampler source identity mismatch'
           }

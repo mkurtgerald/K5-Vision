@@ -60,6 +60,11 @@ def _child():
                     if type(captured) in (float, int):
                         note["frame_age_seconds"] = round(time.monotonic() - captured, 4)
                 events.append(note)
+                # Production responds unavailable before its finally block;
+                # its owner may reap it immediately after that response. Emit
+                # this finite cause before the response can race process exit.
+                sys.stderr.write(_MARKER + json.dumps({"events": [note]}) + "\n")
+                sys.stderr.flush()
         return trace
 
     sys.settrace(trace)
@@ -141,6 +146,7 @@ def main():
         "numpy": numpy.__version__,
         "observations": [],
         "child_diagnostics": [],
+        "native_stderr": [],
         "cleanup_complete": False,
     }
     servers, worker, publisher = [], None, None
@@ -324,7 +330,7 @@ def main():
                 policy,
                 motion,
                 phase="traced_quiet_live",
-                count=12,
+                count=24,
                 observations=receipt["observations"],
                 metadata=metadata,
                 source_state=source_state,
@@ -370,7 +376,19 @@ def main():
             for stream in diagnostic_streams:
                 stream.close()
             for path in sorted(root.glob("child-*.log")):
-                for line in path.read_text(encoding="utf-8", errors="replace")[:65536].splitlines():
+                native_text = path.read_bytes()[:65536].decode("utf-8", errors="replace")
+                lowered = native_text.lower()
+                receipt["native_stderr"].append(
+                    {
+                        "child_index": int(path.stem.split("-")[1]),
+                        "stream_timeout": "stream timeout triggered" in lowered,
+                        "rtsp_describe_failed": "method describe failed" in lowered,
+                        "decoder_error": "error while decoding" in lowered,
+                        "demux_error": "error during demuxing" in lowered,
+                        "capture_backend_refused": "can't be used to capture by name" in lowered,
+                    }
+                )
+                for line in native_text.splitlines():
                     if line.startswith(_MARKER):
                         receipt["child_diagnostics"].append(json.loads(line[len(_MARKER) :]))
             receipt["cleanup_complete"] = cleanup
