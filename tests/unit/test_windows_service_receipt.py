@@ -50,6 +50,12 @@ def _receipt():
             "rejected_foreign_count": 0,
             "unreadable_identity_count": 0,
             "unexpected_service_image_count": 0,
+            "console_hosts": {
+                **dict.fromkeys(_VERIFIER["_CONSOLE_TRUE"], True),
+                "observed_count": 4,
+                "exited_count": 4,
+                "individual_termination_used": False,
+            },
         },
         "scm": {
             "service_type": 16,
@@ -159,6 +165,46 @@ def test_service_receipt_requires_actual_token_session_and_installed_image_owner
 def test_service_receipt_cannot_reuse_an_older_cleanup_only_receipt(tmp_path):
     value = _receipt()
     value.pop("process_ownership")
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, value))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"system_file_identity_verified": False},
+        {"system_file_identity_verified": 1},
+        {"trusted_code_custody_verified": False},
+        {"admitted_parent_identity_verified": False},
+        {"pinned_native_exit_verified": False},
+        {"individual_termination_used": True},
+        {"individual_termination_used": 0},
+        {"observed_count": -1},
+        {"observed_count": True},
+        {"observed_count": 4097},
+        {"exited_count": 3},
+        {"exited_count": False},
+        {"unexpected_field": "refused"},
+    ],
+)
+def test_service_receipt_requires_authorized_console_hosts_to_exit_without_individual_kill(
+    tmp_path, change
+):
+    value = _receipt()
+    value["process_ownership"]["console_hosts"].update(change)
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, value))
+
+
+def test_service_receipt_allows_no_console_host_without_claiming_one_was_observed(tmp_path):
+    value = _receipt()
+    value["process_ownership"]["console_hosts"].update(observed_count=0, exited_count=0)
+    assert _verify(_report(tmp_path, value)) == value
+
+
+def test_service_receipt_requires_optional_console_host_lifetime_evidence_field(tmp_path):
+    value = _receipt()
+    value["process_ownership"].pop("console_hosts")
     with pytest.raises(ValueError):
         _verify(_report(tmp_path, value))
 

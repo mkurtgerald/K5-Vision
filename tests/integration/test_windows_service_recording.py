@@ -777,9 +777,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         diagnostic["process_ownership"] = cohort.ownership_diagnostic()
         for process in reversed(owned):
             try:
-                if cohort.is_owned_running(process):
-                    process.kill()
-                    process.wait(timeout=10)
+                cohort.terminate_owned(process)
             except psutil.NoSuchProcess:
                 pass
             except BaseException as error:

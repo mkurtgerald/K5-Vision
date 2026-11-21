@@ -41,6 +41,7 @@ def test_native_process_tree_binds_an_actual_owned_child():
         stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
+    pinned_child = None
     try:
         identity = child.pid, native.birth(child.pid, handle=child._handle)
         assert identity[1] is not None
@@ -53,6 +54,23 @@ def test_native_process_tree_binds_an_actual_owned_child():
         assert child_details["created_100ns"] == identity[1]
         assert child_details["parent_pid"] == os.getpid()
         assert type(child_details["elevated"]) is bool
+        file_identity = _NATIVE.image_diagnostic(sys.executable, {sys.executable: "python"})
+        assert file_identity["matching_payload_roles"] == ["python"]
+        assert file_identity["samefile_unavailable_count"] == 0
+        console_file = str(PureWindowsPath(native.system_directory()) / "conhost.exe")
+        assert _NATIVE.admit_system_console_file(console_file, native.system_directory()) == {
+            "system_file_identity_verified": True,
+            "trusted_code_custody_verified": True,
+        }
+        handle = native.api.OpenProcess(0x00101000, False, child.pid)
+        assert handle
+        pinned_child = _NATIVE.PinnedConsoleHost(native, identity, handle, {})
+        assert not pinned_child.exited()
+        child.stdin.close()
+        child.wait(timeout=5)
+        assert pinned_child.exited() and pinned_child.cached_exit["exit_code"] == 0
+        pinned_child.close()
+        assert pinned_child.handle is None and pinned_child.exited()
     finally:
         child.stdin.close()
         try:
@@ -60,6 +78,9 @@ def test_native_process_tree_binds_an_actual_owned_child():
         except subprocess.TimeoutExpired:
             child.kill()
             child.wait(timeout=5)
+        finally:
+            if pinned_child is not None:
+                pinned_child.close()
 
 
 @pytest.mark.parametrize("correction", [-_STEP, _STEP], ids=["backward48h", "forward48h"])
@@ -162,7 +183,8 @@ def _cohort(monkeypatch, births, parents, details=None):
             raise AssertionError("Floating-point birth dates are not native identities")
 
     class Native:
-        last_parents = parents
+        def __init__(self):
+            self.last_parents = parents
 
         def birth(self, pid, **_kwargs):
             return births.get(pid)
@@ -175,6 +197,9 @@ def _cohort(monkeypatch, births, parents, details=None):
 
         def system_directory(self):
             return r"C:\Windows\System32"
+
+        def parents(self):
+            return dict(parents)
 
         def details(self, identity):
             if details is not None and identity[0] in details:
@@ -194,6 +219,8 @@ def _cohort(monkeypatch, births, parents, details=None):
     cohort.native = Native()
     cohort.roots, cohort.processes, cohort.native_identities = [], {}, {}
     cohort.root_roles, cohort.ownership_records = {}, {}
+    cohort.console_pins = {}
+    cohort.console_individual_termination_used = False
     cohort.failed = False
     cohort.service = SimpleNamespace(installed=_INSTALL)
     cohort.lock = threading.Lock()
@@ -383,3 +410,322 @@ def test_time_helper_requires_explicit_fixed_image_and_current_admin_authority(m
         with pytest.raises(RuntimeError):
             cohort.add(SimpleNamespace(pid=11), role="time_helper", expected_identity=expected)
         assert not cohort.processes
+
+
+def _image_inventory():
+    return {
+        str(_INSTALL / relative).casefold(): kind
+        for relative, kind in (
+            ("K5VisionRecorder.exe", "wrapper"),
+            ("K5Vision.exe", "host"),
+            ("runtime/python.exe", "python"),
+            ("workers/mediamtx.exe", "mediamtx"),
+            ("workers/caddy.exe", "caddy"),
+        )
+    }
+
+
+@pytest.mark.parametrize(
+    "image,form,short",
+    [
+        (r"\\?\C:\Program Files\K5 Vision\workers\mediamtx.exe", "extended_drive", False),
+        (r"C:\PROGRA~1\K5 Vision\workers\mediamtx.exe", "normal_drive", True),
+    ],
+)
+def test_alias_file_identity_is_diagnostic_and_never_admits_image(image, form, short):
+    inventory = _image_inventory()
+    details = _details(12, _BASE, 11)
+    details["image"] = image
+
+    def compare(_actual, expected):
+        return expected.endswith("mediamtx.exe")
+
+    with pytest.raises(_NATIVE.OwnershipFailure) as failure:
+        _NATIVE.service_candidate(
+            details,
+            _SERVICE_SID,
+            inventory,
+            diagnose_image=lambda actual, expected: _NATIVE.image_diagnostic(
+                actual, expected, same_file=compare
+            ),
+        )
+    note = failure.value.diagnostic
+    assert note["outcome"] == "unexpected_service_image" and note["accepted"] is False
+    projected = note["image_diagnostic"]
+    assert projected["matching_payload_roles"] == ["mediamtx"]
+    assert projected["path_form"] == form and projected["short_component"] is short
+    assert image not in str(projected)
+
+
+@pytest.mark.parametrize(
+    "name,category",
+    [
+        ("mediamtx.exe", "mediamtx"),
+        ("conhost.exe", "conhost"),
+        ("mfpmp.exe", "mfpmp"),
+        ("WerFault.exe", "werfault"),
+        ("pythonw.exe", "pythonw"),
+        ("private-name.exe", "other"),
+    ],
+)
+def test_matching_basename_of_foreign_file_is_never_payload_authority(name, category):
+    image = str(PureWindowsPath(r"C:\private location") / name)
+    projected = _NATIVE.image_diagnostic(image, _image_inventory(), same_file=lambda *_: False)
+    assert projected["basename_category"] == category
+    assert projected["matching_payload_roles"] == []
+    assert "private location" not in str(projected) and "private-name" not in str(projected)
+
+
+def test_unreadable_file_identity_diagnostic_preserves_original_hard_failure():
+    details = _details(12, _BASE, 11, kind="foreign")
+
+    def unavailable(*_args):
+        raise OSError("unretained private filename")
+
+    with pytest.raises(_NATIVE.OwnershipFailure) as failure:
+        _NATIVE.service_candidate(
+            details,
+            _SERVICE_SID,
+            _image_inventory(),
+            diagnose_image=lambda actual, expected: _NATIVE.image_diagnostic(
+                actual, expected, same_file=unavailable
+            ),
+        )
+    note = failure.value.diagnostic
+    assert note["outcome"] == "unexpected_service_image" and note["accepted"] is False
+    assert note["image_diagnostic"]["samefile_unavailable_count"] == 5
+    assert "unretained" not in str(note)
+
+
+@pytest.mark.parametrize(
+    "image,status",
+    [
+        (r"\\server\share\mediamtx.exe", "skipped_nonlocal"),
+        (r"\\?\UNC\server\share\mediamtx.exe", "skipped_nonlocal"),
+        (r"\Device\HarddiskVolume1\mediamtx.exe", "skipped_nonlocal"),
+        (r"relative\mediamtx.exe", "skipped_nonlocal"),
+        (r"Z:\mapped\mediamtx.exe", "skipped_other_drive"),
+    ],
+)
+def test_image_diagnostic_never_opens_remote_or_unbound_drive_paths(image, status):
+    def forbidden(*_args):
+        pytest.fail("Image diagnostic attempted an unbound file open")
+
+    projected = _NATIVE.image_diagnostic(image, _image_inventory(), same_file=forbidden)
+    assert projected["comparison_status"] == status
+    assert projected["matching_payload_roles"] == []
+
+
+def test_decisive_service_image_failure_precedes_many_foreign_candidates(monkeypatch):
+    births = {11: _BASE, **{pid: _BASE - pid * _STEP for pid in range(12, 35)}}
+    parents = {pid: 11 for pid in range(12, 35)}
+    details = {
+        pid: _details(pid, births[pid], 11, kind="foreign", sid=b"SYSTEM TokenUser")
+        for pid in range(12, 34)
+    }
+    details[34] = _details(34, births[34], 11, kind="foreign")
+    cohort = _cohort(monkeypatch, births, parents, details)
+    cohort.add(SimpleNamespace(pid=11), role="service")
+    with pytest.raises(RuntimeError):
+        cohort.snapshot()
+    diagnostic = cohort.ownership_diagnostic()
+    assert diagnostic["instances"][0]["pid"] == 34
+    assert diagnostic["instances"][0]["outcome"] == "unexpected_service_image"
+    assert diagnostic["rejected_counts"]["foreign_token"] == 22
+
+
+def _console_cohort(monkeypatch, *, parent_kind="python", fault=None):
+    kinds = {11: "wrapper", 12: parent_kind}
+    births = {11: _BASE, 12: _BASE - _STEP, 13: _BASE + _STEP}
+    parents = {12: 11, 13: 12}
+    details = {
+        pid: _details(pid, births[pid], parents.get(pid, 0), kind=kind)
+        for pid, kind in kinds.items()
+    }
+    console = _details(13, births[13], 12)
+    console["image"] = r"C:\Windows\System32\conhost.exe"
+    if fault == "image":
+        console["image"] = r"C:\foreign\conhost.exe"
+    elif fault == "sid":
+        console["sid"] = b"different TokenUser"
+    elif fault == "session":
+        console["session"] = 1
+    details[13] = console
+    cohort = _cohort(monkeypatch, births, parents, details)
+
+    class Kernel:
+        def __init__(self):
+            self.objects, self.closed = {}, []
+
+        def OpenProcess(self, rights, inherited, pid):
+            assert rights == 0x00101000 and not rights & 1 and not inherited
+            handle = 100 + len(self.objects)
+            self.objects[handle] = {"identity": (pid, births[pid]), "running": True}
+            return handle
+
+        def WaitForSingleObject(self, handle, timeout):
+            assert timeout == 0
+            return 258 if self.objects[handle]["running"] else 0
+
+        def GetExitCodeProcess(self, handle, output):
+            output._obj.value = 259 if self.objects[handle]["running"] else 1
+            return True
+
+        def CloseHandle(self, handle):
+            self.closed.append(handle)
+            return True
+
+    kernel = Kernel()
+    cohort.native.api = kernel
+    cohort.native._handle_birth = lambda handle: (
+        kernel.objects[handle]["identity"][1] if kernel.objects[handle]["running"] else None
+    )
+    cohort.native.admit_console_host = _NATIVE.NativeProcessTree.admit_console_host.__get__(
+        cohort.native
+    )
+
+    def custody(image, system):
+        if fault == "custody" or PureWindowsPath(image) != PureWindowsPath(system) / "conhost.exe":
+            raise RuntimeError("OS file custody was refused")
+        return {"system_file_identity_verified": True, "trusted_code_custody_verified": True}
+
+    monkeypatch.setattr(_NATIVE, "admit_system_console_file", custody)
+    cohort.add(SimpleNamespace(pid=11), role="service")
+    return cohort, kernel, births
+
+
+@pytest.mark.parametrize("parent_kind", ["python", "mediamtx", "caddy"])
+def test_only_fixed_os_console_host_with_admitted_parent_gains_pinned_ownership(
+    monkeypatch, parent_kind
+):
+    cohort, kernel, _ = _console_cohort(monkeypatch, parent_kind=parent_kind)
+    assert {p.pid for p in cohort.snapshot()} == {11, 12, 13}
+    pin = next(iter(cohort.console_pins.values()))
+    assert pin.facts["admitted_parent_identity_verified"] is True
+    process = next(p for p in cohort.snapshot() if p.pid == 13)
+    with pytest.raises(RuntimeError, match="survived"):
+        cohort.terminate_owned(process)
+    assert kernel.closed == [] and not cohort.console_individual_termination_used
+
+
+@pytest.mark.parametrize("fault", ["image", "session", "custody"])
+def test_console_nomination_never_waives_image_session_or_os_custody(monkeypatch, fault):
+    cohort, kernel, _ = _console_cohort(monkeypatch, fault=fault)
+    with pytest.raises(RuntimeError):
+        cohort.snapshot()
+    assert cohort.failed and not cohort.console_pins
+    assert len(kernel.closed) == 1
+
+
+def test_foreign_token_console_host_is_excluded_before_any_handle_pin(monkeypatch):
+    cohort, kernel, _ = _console_cohort(monkeypatch, fault="sid")
+    assert {p.pid for p in cohort.snapshot()} == {11, 12}
+    assert not kernel.objects and not cohort.console_pins
+
+
+def test_console_host_under_host_wrapper_cannot_borrow_an_allowed_parent_role(monkeypatch):
+    cohort, kernel, _ = _console_cohort(monkeypatch, parent_kind="host")
+    with pytest.raises(RuntimeError):
+        cohort.snapshot()
+    assert cohort.failed and not kernel.objects
+
+
+def test_pinned_exit_does_not_follow_pid_reuse_or_individual_termination(monkeypatch):
+    cohort, kernel, births = _console_cohort(monkeypatch)
+    process = next(p for p in cohort.snapshot() if p.pid == 13)
+    pin = next(iter(cohort.console_pins.values()))
+    births[13] += _STEP
+    assert cohort.is_owned_running(process)  # Original pinned object still alive.
+    kernel.objects[pin.handle]["running"] = False
+    assert not cohort.is_owned_running(process)
+    assert cohort.terminate_owned(process) is False
+    handle = pin.handle
+    pin.close()
+    pin.close()
+    assert kernel.closed == [handle] and pin.cached_exit == {"exited": True, "exit_code": 1}
+    assert pin.exited() and not cohort.console_individual_termination_used
+
+
+def test_pinned_close_caches_a_live_leak_as_failure_without_killing_it(monkeypatch):
+    cohort, kernel, _ = _console_cohort(monkeypatch)
+    process = next(p for p in cohort.snapshot() if p.pid == 13)
+    pin = next(iter(cohort.console_pins.values()))
+    handle = pin.handle
+    pin.close()
+    assert pin.cached_exit == {"exited": False, "exit_code": None}
+    assert cohort.is_owned_running(process)
+    with pytest.raises(RuntimeError):
+        cohort.terminate_owned(process)
+    assert cohort.failed and kernel.closed == [handle]
+
+
+def test_pin_close_failure_retains_handle_and_blocks_release_proof(monkeypatch):
+    cohort, kernel, _ = _console_cohort(monkeypatch)
+    cohort.snapshot()
+    pin = next(iter(cohort.console_pins.values()))
+    kernel.objects[pin.handle]["running"] = False
+    kernel.CloseHandle = lambda _handle: False
+    with pytest.raises(RuntimeError, match="released"):
+        pin.close()
+    assert pin.handle is not None
+
+
+def _finish_ready(cohort):
+    cohort.stop = SimpleNamespace(set=lambda: None)
+    cohort.thread = SimpleNamespace(join=lambda timeout: None)
+    cohort.service_stopped = True
+
+
+def test_finish_closes_exited_pin_once_and_receipt_keeps_os_helper_separate(monkeypatch):
+    cohort, kernel, births = _console_cohort(monkeypatch)
+    original_details = cohort.native.details
+    extra = {}
+    for pid, kind in ((14, "mediamtx"), (15, "caddy"), (16, "host")):
+        births[pid] = _BASE - pid * _STEP
+        cohort.native.last_parents[pid] = 12
+        extra[pid] = _details(pid, births[pid], 12, kind=kind)
+    cohort.native.details = lambda identity: (
+        extra[identity[0]] if identity[0] in extra else original_details(identity)
+    )
+    assert len(cohort.snapshot()) == 6
+    pin = next(iter(cohort.console_pins.values()))
+    handle = pin.handle
+    kernel.objects[handle]["running"] = False
+    births.clear()
+    _finish_ready(cohort)
+    cohort.finish()
+    assert not cohort.failed and kernel.closed == [handle]
+    receipt = cohort.ownership_receipt()
+    assert receipt["admitted_service_count"] == 5
+    assert receipt["admitted_service_images"] == ["caddy", "host", "mediamtx", "python", "wrapper"]
+    assert receipt["console_hosts"] == {
+        "observed_count": 1,
+        "exited_count": 1,
+        "system_file_identity_verified": True,
+        "trusted_code_custody_verified": True,
+        "admitted_parent_identity_verified": True,
+        "pinned_native_exit_verified": True,
+        "individual_termination_used": False,
+    }
+    assert cohort.ownership_diagnostic()["instances"][2]["pinned_exit"]["exit_code"] == 1
+
+
+def test_finish_live_helper_fails_once_with_existing_cleanup_budget_and_no_kill(monkeypatch):
+    cohort, kernel, _ = _console_cohort(monkeypatch)
+    cohort.snapshot()
+    pin = next(iter(cohort.console_pins.values()))
+    handle, calls = pin.handle, []
+    _finish_ready(cohort)
+    cohort.service_stopped = False
+
+    def observe(_cohort):
+        calls.append("existing_wait")
+        raise RuntimeError("Live helper must fail cleanup")
+
+    monkeypatch.setattr(_DESKTOP, "_service_control", lambda *_args: calls.append("stop"))
+    monkeypatch.setattr(_DESKTOP, "_wait_owned_cleanup", observe)
+    cohort.finish()
+    assert calls == ["stop", "existing_wait"]
+    assert cohort.failed and kernel.closed == [handle]
+    assert pin.cached_exit == {"exited": False, "exit_code": None}
+    assert not cohort.console_individual_termination_used

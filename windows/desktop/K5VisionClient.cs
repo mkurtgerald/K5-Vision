@@ -58,7 +58,12 @@ namespace K5VisionDesktop
             try
             {
                 if (setup && !IsAdministrator()) return 1;
-                using (RecorderWindow window = new RecorderWindow(noBrowser, setup)) Application.Run(window);
+                using (ClientInstance instance = new ClientInstance(setup))
+                {
+                    if (!instance.IsPrimary) return 0;
+                    using (RecorderWindow window = new RecorderWindow(noBrowser, setup, instance.Activation))
+                        Application.Run(window);
+                }
                 return 0;
             }
             catch
@@ -91,6 +96,86 @@ namespace K5VisionDesktop
         }
     }
 
+    // Only restore this Windows user's client in this interactive session.
+    // Elevated credential entry has its own window; helpers and the recording
+    // service never acquire these objects or receive activation commands.
+    internal sealed class ClientInstance : IDisposable
+    {
+        private Mutex mutex;
+        private EventWaitHandle activation;
+        private bool owned;
+        internal bool IsPrimary { get { return owned; } }
+        internal EventWaitHandle Activation { get { return activation; } }
+
+        internal ClientInstance(bool setupAdministrator)
+        {
+            try
+            {
+                string sid;
+                using (WindowsIdentity identity = WindowsIdentity.GetCurrent()) sid = identity.User.Value;
+                int session;
+                using (Process current = Process.GetCurrentProcess()) session = current.SessionId;
+                if (session <= 0) throw new InvalidOperationException();
+                string name = "Local\\K5VisionClient.v1." + sid + "." +
+                    session.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    (setupAdministrator ? ".Setup" : ".Main");
+                SecurityIdentifier owner = new SecurityIdentifier(sid);
+                string[] principals = new[] { sid, "S-1-5-18", "S-1-5-32-544" };
+                EventWaitHandleSecurity eventSecurity = new EventWaitHandleSecurity();
+                eventSecurity.SetOwner(owner); eventSecurity.SetAccessRuleProtection(true, false);
+                foreach (string principal in principals)
+                    eventSecurity.AddAccessRule(new EventWaitHandleAccessRule(new SecurityIdentifier(principal),
+                        EventWaitHandleRights.FullControl, AccessControlType.Allow));
+                // Publish the event before taking the mutex. A simultaneous
+                // second launch can always signal the winning client, even
+                // before its first window has been constructed.
+                bool created;
+                activation = new EventWaitHandle(false, EventResetMode.AutoReset, name + ".Activate",
+                    out created, eventSecurity);
+                Admit(activation.GetAccessControl(), principals);
+                MutexSecurity mutexSecurity = new MutexSecurity();
+                mutexSecurity.SetOwner(owner); mutexSecurity.SetAccessRuleProtection(true, false);
+                foreach (string principal in principals)
+                    mutexSecurity.AddAccessRule(new MutexAccessRule(new SecurityIdentifier(principal),
+                        MutexRights.FullControl, AccessControlType.Allow));
+                mutex = new Mutex(false, name, out created, mutexSecurity);
+                Admit(mutex.GetAccessControl(), principals);
+                try { owned = mutex.WaitOne(0); }
+                catch (AbandonedMutexException) { owned = true; }
+                if (!owned) activation.Set();
+            }
+            catch { Dispose(); throw; }
+        }
+
+        private static void Admit(NativeObjectSecurity security, string[] principals)
+        {
+            string owner = security.GetOwner(typeof(SecurityIdentifier)).Value;
+            if (Array.IndexOf(principals, owner) < 0 || !security.AreAccessRulesProtected)
+                throw new InvalidOperationException();
+            HashSet<string> admitted = new HashSet<string>(StringComparer.Ordinal);
+            foreach (AccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            {
+                string principal = rule.IdentityReference.Value;
+                if (rule.IsInherited || rule.AccessControlType != AccessControlType.Allow ||
+                    Array.IndexOf(principals, principal) < 0) throw new InvalidOperationException();
+                MutexAccessRule mutexRule = rule as MutexAccessRule;
+                EventWaitHandleAccessRule eventRule = rule as EventWaitHandleAccessRule;
+                if ((mutexRule != null && mutexRule.MutexRights == MutexRights.FullControl) ||
+                    (eventRule != null && eventRule.EventWaitHandleRights == EventWaitHandleRights.FullControl))
+                    admitted.Add(principal);
+                else throw new InvalidOperationException();
+            }
+            if (admitted.Count != principals.Length) throw new InvalidOperationException();
+        }
+
+        public void Dispose()
+        {
+            if (owned && mutex != null) { owned = false; mutex.ReleaseMutex(); }
+            if (mutex != null) { mutex.Dispose(); mutex = null; }
+            if (activation != null) { activation.Dispose(); activation = null; }
+        }
+    }
+
     // This window is a service client. Its close, exception, disposal, or user
     // session ending has no control channel to stop the recording engine.
     internal sealed class RecorderWindow : Form
@@ -106,12 +191,15 @@ namespace K5VisionDesktop
         private readonly Button create = new Button(), open = new Button(), quit = new Button(), approveTime = new Button();
         private readonly NotifyIcon tray = new NotifyIcon();
         private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer activationTimer = new System.Windows.Forms.Timer();
         private bool checkedPayload, busy, disposed, ready, openedBrowser, legacyProfile, exitRequested;
         private string phase = "preparing";
         private string browserDispatch = "not_requested";
         private int browserAttempts, browserNativeError;
 
         internal RecorderWindow(bool noBrowser, bool setupAdministrator)
+            : this(noBrowser, setupAdministrator, null) { }
+        internal RecorderWindow(bool noBrowser, bool setupAdministrator, EventWaitHandle activation)
         {
             this.noBrowser = noBrowser; this.setupAdministrator = setupAdministrator;
             Text = "K5 Vision"; Font = new Font("Segoe UI", 10);
@@ -159,6 +247,19 @@ namespace K5VisionDesktop
             tray.ContextMenuStrip = menu; tray.Visible = true;
             tray.DoubleClick += delegate { ShowOwner(); OpenDashboard(); };
             timer.Interval = 1500; timer.Tick += delegate { RefreshStatus(); };
+            if (activation != null)
+            {
+                activationTimer.Interval = 200;
+                activationTimer.Tick += delegate
+                {
+                    if (!disposed && activation.WaitOne(0))
+                    {
+                        ShowOwner();
+                        if (!noBrowser) OpenDashboard();
+                    }
+                };
+                activationTimer.Start();
+            }
             Shown += delegate { Prepare(); };
             UpdateDiagnostic();
         }
@@ -352,7 +453,8 @@ namespace K5VisionDesktop
         {
             if (disposing && !disposed)
             {
-                disposed = true; timer.Stop(); timer.Dispose(); tray.Visible = false; tray.Dispose();
+                disposed = true; activationTimer.Stop(); activationTimer.Dispose();
+                timer.Stop(); timer.Dispose(); tray.Visible = false; tray.Dispose();
                 password.Clear(); confirmation.Clear();
             }
             base.Dispose(disposing);

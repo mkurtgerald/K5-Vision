@@ -645,22 +645,30 @@ def test_native_windows_vm_clock_qualification(record_testsuite_property):
             "Error": "browser_error",
         }.get(type(error).__name__, "qualification_error")
     finally:
-        cohort.finish()
+        try:
+            cohort.finish()
+        except BaseException:
+            cleanup_failed = True
+        cleanup_failed |= cohort.failed
         for resource in (context, browser, playwright):
             if resource is not None:
                 try:
                     resource.stop() if resource is playwright else resource.close()
                 except Exception:
                     cleanup_failed = True
-        for process in reversed(cohort.snapshot()):
+        try:
+            owned_processes = cohort.snapshot()
+        except BaseException:
+            cleanup_failed = True
+            owned_processes = []
+        for process in reversed(owned_processes):
             try:
-                if process.is_running():
-                    process.kill()
-                    process.wait(timeout=10)
+                cohort.terminate_owned(process)
             except psutil.NoSuchProcess:
                 pass
-            except Exception:
+            except BaseException:
                 cleanup_failed = True
+        cleanup_failed |= cohort.failed
         for process in reversed(processes):
             try:
                 helpers._stop_owned(process)

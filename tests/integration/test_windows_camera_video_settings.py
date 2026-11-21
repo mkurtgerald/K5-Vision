@@ -1377,16 +1377,24 @@ def test_native_windows_camera_video_settings_and_automatic_wall(record_testsuit
                     resource.stop() if resource is playwright else resource.close()
                 except BaseException:
                     cleanup_failed = True
-        cohort.finish()
-        for process in reversed(cohort.snapshot()):
+        try:
+            cohort.finish()
+        except BaseException:
+            cleanup_failed = True
+        cleanup_failed |= cohort.failed
+        try:
+            owned_processes = cohort.snapshot()
+        except BaseException:
+            cleanup_failed = True
+            owned_processes = []
+        for process in reversed(owned_processes):
             try:
-                if process.is_running():
-                    process.kill()
-                    process.wait(timeout=10)
+                cohort.terminate_owned(process)
             except psutil.NoSuchProcess:
                 pass
             except BaseException:
                 cleanup_failed = True
+        cleanup_failed |= cohort.failed
         for fixture in fixtures:
             try:
                 fixture.close()

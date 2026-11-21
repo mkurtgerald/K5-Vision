@@ -94,7 +94,15 @@ _OWNERSHIP_FIELDS = {
     "rejected_foreign_count",
     "unreadable_identity_count",
     "unexpected_service_image_count",
+    "console_hosts",
 }
+_CONSOLE_TRUE = {
+    "system_file_identity_verified",
+    "trusted_code_custody_verified",
+    "admitted_parent_identity_verified",
+    "pinned_native_exit_verified",
+}
+_CONSOLE_FIELDS = {"observed_count", "exited_count", "individual_termination_used"}
 _PHASES = ("initial", "client_closed", "backend_recovered", "wrapper_recovered")
 _OBSERVATION = {
     "service_pid",
@@ -240,9 +248,15 @@ def verify(report: Path, *, expected_head: str, installer_sha256: str) -> dict:
     )
     admitted = _integer(ownership["admitted_service_count"], len(_OWNERSHIP_IMAGES), 4096)
     rejected = _integer(ownership["rejected_foreign_count"], 0, 4096)
-    _require(admitted + rejected <= 4096)
     _integer(ownership["unreadable_identity_count"], 0, 0)
     _integer(ownership["unexpected_service_image_count"], 0, 0)
+    console = ownership["console_hosts"]
+    _require(type(console) is dict and set(console) == _CONSOLE_TRUE | _CONSOLE_FIELDS)
+    _require(all(console[key] is True for key in _CONSOLE_TRUE))
+    _require(console["individual_termination_used"] is False)
+    observed = _integer(console["observed_count"], 0, 4096)
+    _require(_integer(console["exited_count"], 0, 4096) == observed)
+    _require(admitted + rejected + observed <= 4096)
     scm = value["scm"]
     _require(
         type(scm) is dict

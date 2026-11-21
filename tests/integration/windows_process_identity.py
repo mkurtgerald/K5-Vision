@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
+import stat
 from ctypes import wintypes
-from pathlib import PureWindowsPath
+from pathlib import Path, PureWindowsPath
 
 
 class OwnershipFailure(RuntimeError):
@@ -20,7 +22,169 @@ class OwnershipFailure(RuntimeError):
         self.diagnostic = diagnostic
 
 
-def service_candidate(details, service_sid, images, *, root=False):
+def admit_system_console_file(image, system_directory):
+    """Read-only custody for the fixed OS helper, including normal OS hardlinks."""
+    from k5vision.installed_code_security import _code_policy, _native_security
+    from k5vision.windows_identity_security import check_windows_volume
+
+    expected = PureWindowsPath(system_directory) / "conhost.exe"
+    _form, actual = _local_image_path(image)
+    if actual != expected:
+        raise RuntimeError("Console host image is not the fixed native OS file")
+    check_windows_volume(str(expected))
+    native, snapshots = _native_security(), []
+    for component in reversed((expected, *expected.parents)):
+        info = Path(component).lstat()
+        if getattr(info, "st_file_attributes", 0) & 0x400 or stat.S_ISLNK(info.st_mode):
+            raise RuntimeError("Console host code has a reparse boundary")
+        if component == expected:
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink < 1:
+                raise RuntimeError("Console host code is not an ordinary OS file")
+        elif not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError("Console host code ancestor is not a directory")
+        _code_policy(native, component, within=component.is_relative_to(expected.parent))
+        snapshots.append(
+            (
+                component,
+                (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_mode,
+                    info.st_nlink,
+                    info.st_size,
+                    info.st_mtime_ns,
+                    getattr(info, "st_file_attributes", 0),
+                ),
+            )
+        )
+    if not _same_local_file(image, str(expected)):
+        raise RuntimeError("Console host OS file identity differs")
+    for component, before in snapshots:
+        info = Path(component).lstat()
+        if before != (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_nlink,
+            info.st_size,
+            info.st_mtime_ns,
+            getattr(info, "st_file_attributes", 0),
+        ):
+            raise RuntimeError("Console host OS custody changed during admission")
+    return {"system_file_identity_verified": True, "trusted_code_custody_verified": True}
+
+
+class PinnedConsoleHost:
+    """An original process object held with query/synchronize rights only."""
+
+    def __init__(self, native, identity, handle, facts):
+        self.native, self.identity, self.handle = native, identity, handle
+        self.facts, self.cached_exit = facts, None
+
+    def exited(self):
+        if self.handle is None:
+            if self.cached_exit is None:
+                raise RuntimeError("Console host exit observation was unavailable")
+            return self.cached_exit["exited"]
+        state = self.native.api.WaitForSingleObject(self.handle, 0)
+        if state == 258:
+            return False
+        if state != 0:
+            raise RuntimeError("Console host pinned exit observation failed")
+        code = wintypes.DWORD()
+        if not self.native.api.GetExitCodeProcess(self.handle, ctypes.byref(code)):
+            raise RuntimeError("Console host pinned exit code was unavailable")
+        self.cached_exit = {"exited": True, "exit_code": code.value}
+        return True
+
+    def close(self):
+        if self.handle is None:
+            return
+        failure = None
+        try:
+            if not self.exited():
+                self.cached_exit = {"exited": False, "exit_code": None}
+        except BaseException as error:
+            failure = error
+        closed = self.native.api.CloseHandle(self.handle)
+        if closed:
+            self.handle = None
+        if failure is not None:
+            raise failure
+        if not closed:
+            raise RuntimeError("Console host query handle could not be released")
+
+
+def _local_image_path(image):
+    value = str(image)
+    if value.startswith("\\\\?\\") and re.match(r"^[A-Za-z]:\\", value[4:]):
+        return "extended_drive", PureWindowsPath(value[4:])
+    if re.match(r"^[A-Za-z]:\\", value):
+        return "normal_drive", PureWindowsPath(value)
+    if value.startswith("\\Device\\") or value.startswith("\\??\\"):
+        return "nt_device", None
+    if value.startswith("\\\\"):
+        return "unc", None
+    return "other", None
+
+
+def _same_local_file(image, expected):
+    # Reject reparse ancestors before following a local-looking path into an
+    # arbitrary remote target. Both actual and expected files are read-only.
+    for value in (image, expected):
+        path = Path(value)
+        for component in reversed((path, *path.parents)):
+            if getattr(component.lstat(), "st_file_attributes", 0) & 0x400:
+                raise OSError("Image identity diagnostic refuses a reparse path")
+    return Path(image).samefile(expected)
+
+
+def image_diagnostic(image, images, *, same_file=None):
+    """Finite alias evidence; it never admits or repairs an unexpected image."""
+    categories = {
+        "k5visionrecorder.exe": "wrapper",
+        "k5vision.exe": "host",
+        "python.exe": "python",
+        "mediamtx.exe": "mediamtx",
+        "caddy.exe": "caddy",
+        "conhost.exe": "conhost",
+        "mfpmp.exe": "mfpmp",
+        "werfault.exe": "werfault",
+        "pythonw.exe": "pythonw",
+    }
+    form, local = _local_image_path(image)
+    result = {
+        "basename_category": categories.get(PureWindowsPath(image).name.casefold(), "other"),
+        "path_form": form,
+        "short_component": bool(re.search(r"~[0-9]", str(image))),
+        "matching_payload_roles": [],
+        "samefile_unavailable_count": 0,
+        "comparison_status": "skipped_nonlocal",
+    }
+    expected = list(images.items())[:5]
+    expected_drives = {
+        _local_image_path(path)[1].drive.casefold()
+        for path, _ in expected
+        if _local_image_path(path)[1] is not None
+    }
+    if local is None:
+        return result
+    if len(expected_drives) != 1 or local.drive.casefold() not in expected_drives:
+        result["comparison_status"] = "skipped_other_drive"
+        return result
+    result["comparison_status"] = "compared"
+    compare = _same_local_file if same_file is None else same_file
+    for path, role in expected:
+        try:
+            if compare(str(image), path):
+                result["matching_payload_roles"].append(role)
+        except (OSError, ValueError, TypeError):
+            result["samefile_unavailable_count"] += 1
+    result["matching_payload_roles"].sort()
+    return result
+
+
+def service_candidate(details, service_sid, images, *, root=False, diagnose_image=None):
     """Parent PID topology nominates candidates; token/image/session admit them."""
     kind = images.get(str(PureWindowsPath(details["image"])).casefold(), "outside_payload")
     result = {
@@ -39,6 +203,11 @@ def service_candidate(details, service_sid, images, *, root=False):
         return result
     if kind == "outside_payload" or (root and kind != "wrapper"):
         result["outcome"] = "unexpected_service_image"
+        if diagnose_image is not None:
+            try:
+                result["image_diagnostic"] = diagnose_image(details["image"], images)
+            except (OSError, ValueError, TypeError, RuntimeError):
+                result["image_diagnostic"] = {"comparison_status": "unavailable"}
         raise OwnershipFailure(result)
     if details["session"] != 0:
         result["outcome"] = "unexpected_service_session"
@@ -140,6 +309,8 @@ class NativeProcessTree:
         self.api.GetExitCodeProcess.restype = wintypes.BOOL
         self.api.CloseHandle.argtypes = [wintypes.HANDLE]
         self.api.CloseHandle.restype = wintypes.BOOL
+        self.api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        self.api.WaitForSingleObject.restype = wintypes.DWORD
         self.api.QueryFullProcessImageNameW.argtypes = [
             wintypes.HANDLE,
             wintypes.DWORD,
@@ -228,6 +399,42 @@ class NativeProcessTree:
         if not 1 <= length < len(result):
             raise OSError("Native Windows system directory could not be read")
         return result.value
+
+    def admit_console_host(self, identity, parent, parent_kind, service_sid):
+        if parent_kind not in {"python", "mediamtx", "caddy"}:
+            raise RuntimeError("Console host parent is not an admitted native executor")
+        handle = self.api.OpenProcess(0x00101000, False, identity[0])
+        if not handle:
+            raise RuntimeError("Console host original process could not be pinned")
+        transferred = False
+        try:
+            if self._handle_birth(handle) != identity[1] or self.birth(parent[0]) != parent[1]:
+                raise ProcessLookupError("Console host or parent changed before admission")
+            details = self.details(identity)
+            if (
+                details["sid"] != service_sid
+                or details["session"] != 0
+                or self.parents().get(identity[0]) != parent[0]
+            ):
+                raise RuntimeError("Console host native authority was not admitted")
+            facts = admit_system_console_file(details["image"], self.system_directory())
+            if (
+                self.birth(parent[0]) != parent[1]
+                or self._handle_birth(handle) != identity[1]
+                or self.parents().get(identity[0]) != parent[0]
+            ):
+                raise ProcessLookupError("Console host or parent changed during admission")
+            facts.update(
+                admitted_parent_identity_verified=True,
+                parent_pid=parent[0],
+                parent_created_100ns=parent[1],
+            )
+            result = PinnedConsoleHost(self, identity, handle, facts)
+            transferred = True
+            return result
+        finally:
+            if not transferred:
+                self.api.CloseHandle(handle)
 
     def details(self, identity):
         """Private native facts; callers expose only the finite projection."""

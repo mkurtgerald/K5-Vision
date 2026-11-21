@@ -14,6 +14,7 @@ on:
       - scripts/probe_windows_machine_admission.py
       - scripts/probe_windows_recorder_wire.cs
       - scripts/probe_windows_browser_launch.cs
+      - scripts/probe_windows_client_singleton.cs
   pull_request:
     branches: [main]
     paths:
@@ -26,6 +27,7 @@ on:
       - scripts/probe_windows_machine_admission.py
       - scripts/probe_windows_recorder_wire.cs
       - scripts/probe_windows_browser_launch.cs
+      - scripts/probe_windows_client_singleton.cs
 
 permissions:
   contents: read
@@ -35,6 +37,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  client-singleton:
+    name: Verify native client singleton and session activation without starting K5
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact client and native singleton regression
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Compile and run actual client mutex and activation events across processes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+          New-Item -ItemType Directory -Path client-proof | Out-Null
+          @'
+          namespace K5VisionDesktop {
+            internal static class PayloadIdentity {
+              internal const string ManifestSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+              internal const string HeadSha = "0000000000000000000000000000000000000000";
+            }
+          }
+          '@ | Set-Content -LiteralPath client-proof/PayloadIdentity.cs -Encoding utf8
+          $identity = (Resolve-Path -LiteralPath client-proof/PayloadIdentity.cs).Path
+          $fixture = (Resolve-Path -LiteralPath scripts/probe_windows_client_singleton.cs).Path
+          $sources = @('K5Vision.cs', 'K5RecorderHost.cs', 'K5ServiceInstallation.cs', 'K5VisionClient.cs') |
+            ForEach-Object { (Resolve-Path -LiteralPath (Join-Path 'windows/desktop' $_)).Path }
+          $references = @('System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll',
+            'System.Web.Extensions.dll', 'System.IO.Compression.dll', 'System.IO.Compression.FileSystem.dll')
+          $referenceFlags = @($references | ForEach-Object { '/reference:' + $_ })
+          $output = Join-Path (Resolve-Path -LiteralPath client-proof).Path 'ClientSingletonProbe.exe'
+          & $compiler /nologo /target:exe /main:K5VisionDesktop.ClientSingletonProbe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 @referenceFlags "/out:$output" @sources $identity $fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Actual client singleton regression compilation failed' }
+          # Only the QA entry point runs. It creates actual production leases
+          # and launches its own duplicate children; no product Main or engine.
+          & $output | Tee-Object -FilePath client-singleton-native.json
+          if ($LASTEXITCODE -ne 0) { throw 'Actual client singleton regression failed' }
+          $evidence = Get-Content -LiteralPath client-singleton-native.json -Raw | ConvertFrom-Json
+          if ($evidence.schema_version -ne 1 -or $evidence.status -ne 'passed') {
+            throw 'Actual client singleton regression did not pass'
+          }
+          Remove-Item -LiteralPath client-proof -Recurse -Force
+      - name: Retain finite native singleton observations
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: client-singleton-${{ github.run_id }}
+          path: client-singleton-native.json
+          if-no-files-found: warn
+          retention-days: 14
   browser:
     name: Observe actual Windows default-browser dispatch independently
     runs-on: windows-2025

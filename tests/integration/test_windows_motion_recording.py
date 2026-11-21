@@ -930,9 +930,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
         diagnostic["process_ownership"] = cohort.ownership_diagnostic()
         for process in reversed(owned):
             try:
-                if cohort.is_owned_running(process):
-                    process.kill()
-                    process.wait(timeout=10)
+                cohort.terminate_owned(process)
             except psutil.NoSuchProcess:
                 pass
             except BaseException:
