@@ -103,8 +103,14 @@ jobs:
           $manifest = Get-Content -LiteralPath motion-replay-input/payload-manifest.json -Raw | ConvertFrom-Json
           $setup = Get-Item -LiteralPath motion-replay-input/K5VisionSetup.exe
           $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          $overlay = 'diagnostic-source/tests/integration/test_windows_motion_recording.py'
+          $worktreeOverlaySha = (Get-FileHash -LiteralPath diagnostic-source/tests/integration/test_windows_motion_recording.py -Algorithm SHA256).Hash.ToLowerInvariant()
+          # Read the exact immutable Git blob, before checkout EOL filters.
+          # cmd's native byte redirection avoids PowerShell text re-encoding.
+          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:tests/integration/test_windows_motion_recording.py > motion-overlay-admitted.py'
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic motion overlay Git blob unavailable' }
+          $overlay = 'motion-overlay-admitted.py'
           $overlaySha = (Get-FileHash -LiteralPath $overlay -Algorithm SHA256).Hash.ToLowerInvariant()
+          @{ checkout_overlay_sha256=$worktreeOverlaySha; git_blob_overlay_sha256=$overlaySha } | ConvertTo-Json -Compress | Write-Host
           if ($sha -ne $env:K5_DESKTOP_SETUP_SHA256 -or $package.setup_sha256 -ne $sha -or
               $package.setup_bytes -ne $setup.Length -or
               $package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
