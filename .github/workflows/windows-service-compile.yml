@@ -13,6 +13,7 @@ on:
       - scripts/probe_windows_machine_admission.py
       - scripts/probe_windows_recorder_wire.cs
       - scripts/probe_windows_browser_launch.cs
+      - scripts/probe_windows_native_worker_images.py
   pull_request:
     branches: [main]
     paths:
@@ -24,6 +25,7 @@ on:
       - scripts/probe_windows_machine_admission.py
       - scripts/probe_windows_recorder_wire.cs
       - scripts/probe_windows_browser_launch.cs
+      - scripts/probe_windows_native_worker_images.py
 
 permissions:
   contents: read
@@ -33,6 +35,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  worker-images:
+    name: Observe actual owned worker image identities without installing K5
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact diagnostic and production relay
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Checkout exact native identity implementation from the failed candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ec5e898aa7c43b309bf937ca2471f2ed847fbef6
+          path: identity-source
+          persist-credentials: false
+      - name: Set up native development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Provision immutable native donor workers for the synthetic probe
+        uses: ./.github/actions/provision-operator-tools
+      - name: Observe actual production relay and native worker images
+        shell: pwsh
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identityModule = (Resolve-Path -LiteralPath identity-source/tests/integration/windows_process_identity.py).Path
+          python scripts/probe_windows_native_worker_images.py --identity-module $identityModule
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic native worker observation failed' }
+          $evidence = Get-Content -LiteralPath native-worker-images.json -Raw | ConvertFrom-Json
+          if ($evidence.schema_version -ne 1 -or $evidence.status -ne 'diagnostic_complete') {
+            throw 'Synthetic native worker observation did not complete'
+          }
+      - name: Retain only synthetic worker image observations
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: native-worker-images-${{ github.run_id }}
+          path: native-worker-images.json
+          if-no-files-found: warn
+          retention-days: 14
   browser:
     name: Observe actual Windows default-browser dispatch independently
     runs-on: windows-2025
