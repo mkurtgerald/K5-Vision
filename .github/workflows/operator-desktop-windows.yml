@@ -204,36 +204,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           python scripts/compile_desktop_launcher.py --build desktop-build
           if ($LASTEXITCODE -ne 0) { throw "Native recording service and client compilation failed" }
-      - name: Exercise native Windows Time configuration and restoration
-        timeout-minutes: 6
-        shell: pwsh
-        env:
-          K5_NATIVE_TIME_ACCEPTANCE: "1"
-          K5_VM_CLOCK_ACCEPTANCE: "1"
-        run: |
-          $ErrorActionPreference = "Stop"
-          if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or $env:RUNNER_OS -ne "Windows") {
-            throw "Native time configuration requires a disposable hosted Windows VM"
-          }
-          $env:K5_DESKTOP_PAYLOAD = (Resolve-Path -LiteralPath desktop-build/payload).Path
-          $supervisor = Join-Path $env:K5_DESKTOP_PAYLOAD "K5Vision.exe"
-          $manifest = Join-Path $env:K5_DESKTOP_PAYLOAD "payload-manifest.json"
-          $supervisorSha = (Get-FileHash -LiteralPath $supervisor -Algorithm SHA256).Hash.ToLowerInvariant()
-          $manifestSha = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash.ToLowerInvariant()
-          python -m pytest tests/integration/test_windows_time_administration.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=90 --junitxml=desktop-build/time-administration-windows.xml
-          if ($LASTEXITCODE -ne 0) { throw "Actual native time configuration qualification failed" }
-          python scripts/verify_windows_time_administration_receipt.py desktop-build/time-administration-windows.xml desktop-build/time-administration-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --supervisor-sha256 $supervisorSha --payload-manifest-sha256 $manifestSha
-          if ($LASTEXITCODE -ne 0) { throw "Native time configuration receipt admission failed" }
-      - name: Preserve finite native time-administration evidence
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: time-administration-windows-witness-${{ github.run_id }}
-          path: |
-            desktop-build/time-administration-windows.xml
-            desktop-build/time-administration-windows-receipt.json
-          if-no-files-found: warn
-          retention-days: 14
       - name: Provision exact reviewed Inno Setup compiler
         shell: pwsh
         run: |
@@ -939,6 +909,9 @@ jobs:
 
   service-recording:
     name: Exercise actual installed SCM recording and recovery
+    permissions:
+      contents: read
+      actions: read
     needs: [native-desktop]
     if: ${{ always() && !cancelled() && (needs.native-desktop.result == 'success' || needs.native-desktop.result == 'failure') && needs.native-desktop.outputs.candidate_artifact_id != '' }}
     runs-on: windows-2025
@@ -971,7 +944,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_ARTIFACT_ID: ${{ needs.native-desktop.outputs.candidate_artifact_id }}
-          EXECUTION_HEAD_SHA: ${{ github.sha }}
+          EXECUTION_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
           if ($env:CANDIDATE_ARTIFACT_ID -notmatch '^[1-9][0-9]*$') { throw "Candidate artifact id absent" }
@@ -1034,5 +1007,109 @@ jobs:
             service-windows.xml
             service-windows-receipt.json
             service-candidate-provenance.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  time-administration:
+    name: Exercise installed service time configuration and restoration
+    permissions:
+      contents: read
+      actions: read
+    needs: [native-desktop]
+    if: ${{ always() && !cancelled() && (needs.native-desktop.result == 'success' || needs.native-desktop.result == 'failure') && needs.native-desktop.outputs.candidate_artifact_id != '' }}
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_NATIVE_TIME_ACCEPTANCE: "1"
+      K5_VM_CLOCK_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+    steps:
+      - name: Checkout exact time candidate acceptance source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up separate time acceptance runner
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install time acceptance dependencies outside the product
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify exact current-attempt candidate artifact producer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_ARTIFACT_ID: ${{ needs.native-desktop.outputs.candidate_artifact_id }}
+          EXECUTION_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:CANDIDATE_ARTIFACT_ID -notmatch '^[1-9][0-9]*$') { throw "Candidate artifact id absent" }
+          $headers = @{ Authorization="Bearer $env:GH_TOKEN"; Accept="application/vnd.github+json"; "X-GitHub-Api-Version"="2022-11-28" }
+          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:CANDIDATE_ARTIFACT_ID"
+          $meta = Invoke-RestMethod -Uri $uri -Headers $headers
+          $expectedName = "k5-vision-windows-upgrade-candidate-$env:K5_DESKTOP_HEAD_SHA"
+          if ([string]$meta.id -ne $env:CANDIDATE_ARTIFACT_ID -or $meta.name -ne $expectedName -or
+              [string]$meta.workflow_run.id -ne $env:GITHUB_RUN_ID -or
+              $meta.workflow_run.head_sha -ne $env:EXECUTION_HEAD_SHA -or $meta.expired -ne $false) {
+            throw "Time candidate artifact producer mismatch"
+          }
+          @{ artifact_id=$meta.id; run_id=$meta.workflow_run.id; run_attempt=$env:GITHUB_RUN_ATTEMPT;
+             head_sha=$env:K5_DESKTOP_HEAD_SHA; installer_qualification_status='unqualified' } |
+            ConvertTo-Json | Set-Content -LiteralPath time-candidate-provenance.json -Encoding utf8
+      - name: Download the original unqualified candidate without rebuilding
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: ${{ needs.native-desktop.outputs.candidate_artifact_id }}
+          path: time-input
+          merge-multiple: true
+      - name: Bind time proof to exact unqualified candidate bytes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Get-Content -LiteralPath time-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath time-input/payload-manifest.json -Raw | ConvertFrom-Json
+          $setup = Get-Item -LiteralPath time-input/K5VisionSetup.exe
+          $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($package.qualification_status -ne "unqualified" -or
+              $package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
+              $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath time-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
+              $package.launcher_sha256 -notmatch '^[a-f0-9]{64}$' -or
+              $manifest.files.path -notcontains "K5VisionRecorder.exe" -or
+              $manifest.files.path -notcontains "K5VisionRecorder.xml") {
+            throw "Time candidate exact installer identity mismatch"
+          }
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_SETUP_SHA256=$sha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_LAUNCHER_SHA256=$($package.launcher_sha256)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_MANIFEST_SHA256=$($package.payload_manifest_sha256)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Verify strict native time receipt admission
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_windows_time_administration_receipt.py tests/unit/test_windows_time_staging.py -o addopts= --no-cov --tb=short
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exercise native Windows Time configuration and restoration
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_time_administration.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=90 --junitxml=time-administration-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_windows_time_administration_receipt.py time-administration-windows.xml time-administration-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --supervisor-sha256 $env:K5_DESKTOP_LAUNCHER_SHA256 --payload-manifest-sha256 $env:K5_DESKTOP_MANIFEST_SHA256 --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve finite native time-administration evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: time-administration-windows-witness-${{ github.run_id }}
+          path: |
+            time-administration-windows.xml
+            time-administration-windows-receipt.json
+            time-candidate-provenance.json
           if-no-files-found: warn
           retention-days: 14

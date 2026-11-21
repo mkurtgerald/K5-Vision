@@ -99,3 +99,53 @@ def test_different_supervisor_is_rejected_without_rebuilding_or_repinning(payloa
     with pytest.raises(AssertionError):
         _HELPERS._stage_private_payload(source, parent, **pins)
     assert not (parent / "sealed native payload").exists()
+
+
+@pytest.fixture
+def installer_candidate(payload):
+    source, pins, _ = payload
+    setup = source / "K5VisionSetup.exe"
+    setup.write_bytes(b"original generated installer")
+    setup_sha = hashlib.sha256(setup.read_bytes()).hexdigest()
+    metadata = {
+        "schema_version": 1,
+        "qualification_status": "unqualified",
+        "head_sha": "a" * 40,
+        "setup_sha256": setup_sha,
+        "setup_bytes": setup.stat().st_size,
+        "launcher_sha256": pins["supervisor_sha"],
+        "payload_manifest_sha256": pins["manifest_sha"],
+    }
+    path = source / "desktop-package.json"
+    path.write_text(json.dumps(metadata))
+    return setup, setup_sha, metadata, path
+
+
+def test_installed_time_candidate_binds_original_installer_and_payload_before_install(
+    installer_candidate,
+):
+    setup, setup_sha, metadata, _ = installer_candidate
+    actual, package, manifest = _HELPERS._candidate(setup, "a" * 40, setup_sha)
+    assert actual == setup and package == metadata
+    assert hashlib.sha256(manifest).hexdigest() == metadata["payload_manifest_sha256"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("qualification_status", "qualified"),
+        ("head_sha", "b" * 40),
+        ("setup_sha256", "0" * 64),
+        ("setup_bytes", 1),
+        ("launcher_sha256", "unsealed executable"),
+        ("payload_manifest_sha256", "0" * 64),
+    ],
+)
+def test_installed_time_candidate_cannot_change_pins_or_claim_prior_qualification(
+    installer_candidate, field, value
+):
+    setup, setup_sha, metadata, path = installer_candidate
+    metadata[field] = value
+    path.write_text(json.dumps(metadata))
+    with pytest.raises(AssertionError):
+        _HELPERS._candidate(setup, "a" * 40, setup_sha)

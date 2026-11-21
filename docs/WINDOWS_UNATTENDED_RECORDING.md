@@ -76,6 +76,15 @@ that UTC is accurate or that an NTP reference is reachable.
 
 ## Qualification required before release
 
+The complete native workflow must pass, including its separate
+`service-recording`, `time-administration`, camera, motion, upgrade, and clock
+lanes. A graphical-installation witness alone does not qualify the service or
+time controls. The service and time lanes use the original candidate artifact
+from the same run, with matching source, installer, launcher, and manifest
+identities; a failed GUI lane must not prevent independent diagnosis of those
+boundaries. Older desktop-only publication checks are insufficient for this
+architecture.
+
 The actual installer and its source and payload hashes must be tied to a
 Windows acceptance receipt that establishes:
 

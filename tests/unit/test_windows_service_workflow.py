@@ -40,6 +40,8 @@ def test_service_lane_runs_when_the_original_gui_journey_fails_after_build():
 
 def test_service_lane_uses_original_current_attempt_artifact_and_exact_candidate_bytes():
     service = _job("service-recording")
+    assert "EXECUTION_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}" in service
+    assert "actions: read" in service
     assert "artifact-ids: ${{ needs.native-desktop.outputs.candidate_artifact_id }}" in service
     assert "actions/artifacts/$env:CANDIDATE_ARTIFACT_ID" in service
     for check in (
@@ -62,6 +64,19 @@ def test_service_lane_uses_original_current_attempt_artifact_and_exact_candidate
         "build_desktop_payload.py" not in service and "compile_desktop_launcher.py" not in service
     )
     assert "releases/latest" not in service
+
+
+def test_time_gate_qualifies_the_installed_service_from_the_same_candidate():
+    time = _job("time-administration")
+    assert "needs: [native-desktop]" in time and "always() && !cancelled()" in time
+    assert "artifact-ids: ${{ needs.native-desktop.outputs.candidate_artifact_id }}" in time
+    assert 'K5_NATIVE_TIME_ACCEPTANCE: "1"' in time
+    assert 'K5_VM_CLOCK_ACCEPTANCE: "1"' in time
+    assert "tests/integration/test_windows_time_administration.py" in time
+    assert "scripts/verify_windows_time_administration_receipt.py" in time
+    assert "--installer-sha256 $env:K5_DESKTOP_SETUP_SHA256" in time
+    assert "continue-on-error:" not in time
+    assert "time-administration-windows-receipt.json" in time
 
 
 def test_service_lane_runs_real_installed_test_then_strict_receipt_and_retains_failure():
@@ -94,6 +109,8 @@ def test_native_qualification_is_triggered_by_each_service_acceptance_source():
     for name in (
         "tests/integration/test_windows_service_recording.py",
         "tests/integration/windows_service_acceptance.py",
+        "tests/integration/windows_standard_user_acceptance.py",
+        "tests/integration/windows_standard_user_probe.cs",
         "scripts/verify_windows_service_receipt.py",
         "tests/unit/test_windows_service_receipt.py",
         "tests/unit/test_windows_service_workflow.py",
