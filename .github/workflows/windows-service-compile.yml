@@ -11,6 +11,7 @@ on:
       - tests/integration/windows_standard_user_probe.cs
       - scripts/probe_windows_machine_admission.cs
       - scripts/probe_windows_machine_admission.py
+      - scripts/probe_windows_recorder_wire.cs
   pull_request:
     branches: [main]
     paths:
@@ -20,6 +21,7 @@ on:
       - tests/integration/windows_standard_user_probe.cs
       - scripts/probe_windows_machine_admission.cs
       - scripts/probe_windows_machine_admission.py
+      - scripts/probe_windows_recorder_wire.cs
 
 permissions:
   contents: read
@@ -29,6 +31,68 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  wire:
+    name: Reproduce and fix the actual Framework async pipe lifecycle
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact candidate wire and native regression
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Checkout immutable source that reproduced the readiness failure
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: d9f6a49099760485fb4b968cca309715cecf7885
+          path: wire-baseline
+          persist-credentials: false
+          sparse-checkout: windows/desktop
+      - name: Compile and run the real production wire against native asynchronous pipes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+          $fixture = (Resolve-Path -LiteralPath scripts/probe_windows_recorder_wire.cs).Path
+          New-Item -ItemType Directory -Path wire-proof | Out-Null
+          @'
+          namespace K5VisionDesktop {
+            internal static class PayloadIdentity {
+              internal const string ManifestSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+              internal const string HeadSha = "0000000000000000000000000000000000000000";
+            }
+          }
+          '@ | Set-Content -LiteralPath wire-proof/PayloadIdentity.cs -Encoding utf8
+          $identity = (Resolve-Path -LiteralPath wire-proof/PayloadIdentity.cs).Path
+          $references = @('System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll',
+            'System.Web.Extensions.dll', 'System.IO.Compression.dll', 'System.IO.Compression.FileSystem.dll')
+          $referenceFlags = @($references | ForEach-Object { '/reference:' + $_ })
+          foreach ($variant in @('baseline', 'fixed')) {
+            $sourceRoot = if ($variant -eq 'baseline') { 'wire-baseline/windows/desktop' } else { 'windows/desktop' }
+            $sources = @('K5Vision.cs', 'K5RecorderHost.cs', 'K5ServiceInstallation.cs', 'K5VisionClient.cs') |
+              ForEach-Object { (Resolve-Path -LiteralPath (Join-Path $sourceRoot $_)).Path }
+            $output = Join-Path (Resolve-Path -LiteralPath wire-proof).Path ($variant + '.exe')
+            & $compiler /nologo /target:exe /main:K5VisionDesktop.RecorderWireProbe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 @referenceFlags "/out:$output" @sources $identity $fixture
+            if ($LASTEXITCODE -ne 0) { throw 'Actual native wire fixture compilation failed' }
+            # Only the fixture's Main executes: private generated pipes, no
+            # product entry point, service, profile, account or clock operation.
+            & $output ('--' + $variant) | Tee-Object -FilePath ('recorder-wire-' + $variant + '.json')
+            $observed = $LASTEXITCODE
+            $expected = if ($variant -eq 'baseline') { 10 } else { 0 }
+            if ($observed -ne $expected) { throw "Native wire $variant did not establish its required result" }
+          }
+          Remove-Item -LiteralPath wire-proof -Recurse -Force
+      - name: Retain finite native wire red and green observations
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: recorder-wire-${{ github.run_id }}
+          path: |
+            recorder-wire-baseline.json
+            recorder-wire-fixed.json
+          if-no-files-found: warn
+          retention-days: 14
   compile:
     name: Compile native recorder and client without building an installer
     runs-on: windows-2025

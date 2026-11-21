@@ -436,6 +436,25 @@ namespace K5VisionDesktop
         }
     }
 
+    internal sealed class RecorderIncompleteIo : IOException
+    {
+        internal readonly byte[] PendingBuffer;
+        internal RecorderIncompleteIo(byte[] buffer) { PendingBuffer = buffer; }
+
+        internal void Drain(Stream stream, IAsyncResult result, bool writing, WaitHandle completed)
+        {
+            object gate = new object();
+            RegisteredWaitHandle registration = null;
+            lock (gate)
+                registration = ThreadPool.RegisterWaitForSingleObject(completed, delegate {
+                    lock (gate) registration.Unregister(null);
+                    try { if (writing) stream.EndWrite(result); else stream.EndRead(result); }
+                    catch { }
+                    finally { Array.Clear(PendingBuffer, 0, PendingBuffer.Length); }
+                }, null, Timeout.Infinite, true);
+        }
+    }
+
     internal static class RecorderWire
     {
         private static void Transfer(Stream stream, byte[] buffer, bool writing, int milliseconds,
@@ -450,19 +469,14 @@ namespace K5VisionDesktop
                 IAsyncResult result = writing ? stream.BeginWrite(buffer, offset, buffer.Length - offset, null, null)
                     : stream.BeginRead(buffer, offset, buffer.Length - offset, null, null);
                 WaitHandle completed = result.AsyncWaitHandle;
+                bool endInvoked = false;
                 try
                 {
                     int selected = WaitHandle.WaitAny(new[] { completed, cancellation }, remaining);
-                    if (selected != 0)
-                    {
-                        RecorderNative.Cancel((PipeStream)stream);
-                        if (completed.WaitOne(1000))
-                        {
-                            try { if (writing) stream.EndWrite(result); else stream.EndRead(result); }
-                            catch { }
-                        }
-                        throw new InvalidOperationException();
-                    }
+                    if (selected != 0) throw new InvalidOperationException();
+                    // Framework PipeStream.End* owns and closes the APM wait
+                    // handle, including when it throws. Never touch it again.
+                    endInvoked = true;
                     if (writing) { stream.EndWrite(result); offset = buffer.Length; }
                     else
                     {
@@ -471,7 +485,25 @@ namespace K5VisionDesktop
                         offset += count;
                     }
                 }
-                finally { if (completed.WaitOne(0)) completed.Close(); }
+                finally
+                {
+                    if (!endInvoked)
+                    {
+                        try { RecorderNative.Cancel((PipeStream)stream); }
+                        catch (ObjectDisposedException) { }
+                        if (!completed.WaitOne(1000))
+                        {
+                            // Preserve the buffer until native I/O completes;
+                            // the endpoint must fail, never reuse this pipe.
+                            RecorderIncompleteIo failure = new RecorderIncompleteIo(buffer);
+                            failure.Drain(stream, result, writing, completed);
+                            throw failure;
+                        }
+                        endInvoked = true;
+                        try { if (writing) stream.EndWrite(result); else stream.EndRead(result); }
+                        catch { }
+                    }
+                }
             }
         }
 
@@ -480,6 +512,7 @@ namespace K5VisionDesktop
         {
             byte[] header = new byte[4];
             byte[] payload = null;
+            RecorderIncompleteIo pending = null;
             try
             {
                 Transfer(stream, header, false, milliseconds, cancellation);
@@ -489,10 +522,13 @@ namespace K5VisionDesktop
                 Transfer(stream, payload, false, milliseconds, cancellation);
                 return Json.Parse(new UTF8Encoding(false, true).GetString(payload));
             }
+            catch (RecorderIncompleteIo error) { pending = error; throw; }
             finally
             {
-                Array.Clear(header, 0, header.Length);
-                if (payload != null) Array.Clear(payload, 0, payload.Length);
+                if (pending == null || !Object.ReferenceEquals(pending.PendingBuffer, header))
+                    Array.Clear(header, 0, header.Length);
+                if (payload != null && (pending == null || !Object.ReferenceEquals(pending.PendingBuffer, payload)))
+                    Array.Clear(payload, 0, payload.Length);
             }
         }
 
@@ -501,6 +537,7 @@ namespace K5VisionDesktop
         {
             byte[] payload = new UTF8Encoding(false, true).GetBytes(Json.Serializer.Serialize(value));
             byte[] header = new byte[4];
+            RecorderIncompleteIo pending = null;
             try
             {
                 if (payload.Length == 0 || payload.Length > maximum) throw new InvalidOperationException();
@@ -508,7 +545,14 @@ namespace K5VisionDesktop
                 Transfer(stream, header, true, milliseconds, cancellation);
                 Transfer(stream, payload, true, milliseconds, cancellation);
             }
-            finally { Array.Clear(header, 0, header.Length); Array.Clear(payload, 0, payload.Length); }
+            catch (RecorderIncompleteIo error) { pending = error; throw; }
+            finally
+            {
+                if (pending == null || !Object.ReferenceEquals(pending.PendingBuffer, header))
+                    Array.Clear(header, 0, header.Length);
+                if (pending == null || !Object.ReferenceEquals(pending.PendingBuffer, payload))
+                    Array.Clear(payload, 0, payload.Length);
+            }
         }
 
         internal static string Operation(Dictionary<string, object> request, params string[] fields)
@@ -647,6 +691,7 @@ namespace K5VisionDesktop
                     current.Disconnect();
                     if (stop) afterStopReply();
                 }
+                catch (RecorderIncompleteIo) { infrastructureFailure(); return; }
                 catch
                 {
                     lock (gate)
