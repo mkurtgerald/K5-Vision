@@ -14,11 +14,12 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.error import HTTPError
 from urllib.request import Request
 from uuid import uuid4
 
+import psutil
 import pytest
 
 from k5vision import identity_state
@@ -294,7 +295,111 @@ def _time_request(client, operation):
         return result
 
 
-def _approve_time(client, operation, *, desktop, api, app, form, profile, service):
+def _time_processes():
+    for entry in psutil.process_iter(("name",)):
+        try:
+            if (entry.info.get("name") or "").casefold() in {"k5vision.exe", "w32tm.exe"}:
+                yield psutil.Process(entry.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+
+class _TimeHelperTracker:
+    """Observe explicit approving processes independently of AppInfo ancestry."""
+
+    def __init__(self, cohort, installed, native):
+        self.cohort, self.native = cohort, native
+        self.images = {
+            str(PureWindowsPath(installed) / "K5Vision.exe").casefold(): "helper",
+            str(PureWindowsPath(native.system_directory()) / "w32tm.exe").casefold(): "command",
+        }
+        runner = (os.getpid(), native.birth(os.getpid()))
+        expected = native.details(runner)
+        assert expected["elevated"] is True, "Time qualification runner is not elevated"
+        self.sid, self.session = expected["sid"], expected["session"]
+        self.helpers, self.commands = set(), set()
+        self.baseline = set()
+        for process in _time_processes():
+            try:
+                birth = native.birth(process.pid)
+                if birth is not None:
+                    self.baseline.add((process.pid, birth))
+            except (ProcessLookupError, psutil.NoSuchProcess):
+                continue
+            except OSError:
+                raise RuntimeError("Native time helper baseline identity was unavailable") from None
+
+    def sample(self):
+        self.native.parents()
+        candidates = []
+        for process in _time_processes():
+            try:
+                identity = (process.pid, self.native.birth(process.pid))
+                if identity[1] is None or identity in self.baseline:
+                    continue
+                if identity in self.helpers or identity in self.commands:
+                    continue
+                details = self.native.details(identity)
+                kind = self.images.get(str(PureWindowsPath(details["image"])).casefold())
+                if (
+                    kind is None
+                    or details["sid"] != self.sid
+                    or details["session"] != self.session
+                    or details["elevated"] is not True
+                ):
+                    continue
+                arguments = process.cmdline()
+                if (
+                    not arguments
+                    or str(PureWindowsPath(arguments[0])).casefold()
+                    != str(PureWindowsPath(details["image"])).casefold()
+                    or self.native.birth(process.pid) != identity[1]
+                ):
+                    continue
+                candidates.append((kind, identity, process, details, arguments[1:]))
+            except (OSError, ProcessLookupError, psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        # Process IDs are not a birth ordering. A reused command PID may be
+        # smaller than its helper's PID, so admit helper candidates first.
+        for kind, identity, process, _details, arguments in candidates:
+            if kind == "helper" and arguments == ["--approve-time"]:
+                if self.cohort.add(process, role="time_helper", expected_identity=identity):
+                    self.helpers.add(identity)
+        for kind, identity, process, details, arguments in candidates:
+            if kind != "command" or arguments not in (
+                ["/config", "/update"],
+                ["/resync", "/rediscover"],
+            ):
+                continue
+            parents = [item for item in self.helpers if item[0] == details["parent_pid"]]
+            if len(parents) != 1 or self.native.birth(parents[0][0]) != parents[0][1]:
+                continue
+            # New since the pre-click baseline, with a still-live, admitted
+            # parent instance. A historical/reused PPID alone grants nothing.
+            try:
+                current = self.native.details(identity)
+                if current["parent_pid"] != parents[0][0]:
+                    continue
+                if self.native.birth(parents[0][0]) != parents[0][1]:
+                    continue
+                if self.cohort.add(process, role="time_helper", expected_identity=identity):
+                    self.commands.add(identity)
+            except (OSError, ProcessLookupError, psutil.NoSuchProcess):
+                continue  # A short native command may already have exited.
+
+    def evidence(self, operation):
+        return {
+            "operation": operation,
+            "helper_count": len(self.helpers),
+            "helper_observed": len(self.helpers) == 1,
+            "native_command_count": len(self.commands),
+            "native_command_observed": bool(self.commands),
+        }
+
+
+def _approve_time(
+    client, operation, *, desktop, api, app, form, profile, service, cohort, ownership
+):
     """Exercise authenticated HTTP -> service capability -> native GUI approval."""
     before = service.observe()
     assert before["backend_session"] == before["service_session"] == 0
@@ -348,8 +453,24 @@ def _approve_time(client, operation, *, desktop, api, app, form, profile, servic
             assert payload["operation"] == operation
             assert type(payload["nonce"]) is str and len(payload["nonce"]) == 32
             assert request.name == ".time-admin-" + payload["nonce"] + ".json"
-            api.click(button)
-            result = future.result(timeout=80)
+            tracker = _TimeHelperTracker(
+                cohort,
+                service.installed,
+                desktop._helpers("windows_process_identity").NativeProcessTree(),
+            )
+            try:
+                api.click(button)
+                deadline = time.monotonic() + 80
+                while not future.done():
+                    tracker.sample()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Native time approval exceeded its existing deadline")
+                    time.sleep(min(0.02, remaining))
+                tracker.sample()
+                result = future.result(timeout=0)
+            finally:
+                ownership.append(tracker.evidence(operation))
             assert not request.exists(), "Completed time operation retained its admission token"
         except BaseException:
             # Revoke this generated fixture's sole pending capability before
@@ -367,6 +488,28 @@ def _approve_time(client, operation, *, desktop, api, app, form, profile, servic
     )
     assert result["capabilities"]["requires_interactive_approval"] is True
     return result
+
+
+def _install_fixture(desktop, setup, installed, profile, api, record):
+    """Keep finite installer evidence before failed fixture state is torn down."""
+    diagnostic = {}
+    try:
+        desktop._install_gui(setup, installed, api, diagnostic=diagnostic)
+    except BaseException:
+        try:
+            snapshot = desktop._helpers("windows_service_acceptance")
+            diagnostic["installation_snapshot"] = snapshot.installer_failure_snapshot(
+                installed, profile
+            )
+        except BaseException:
+            diagnostic["installation_snapshot_unavailable"] = True
+        try:
+            record("k5_native_time_installer_diagnostic", json.dumps(diagnostic, sort_keys=True))
+        except BaseException:
+            # Evidence collection must not replace the actual installer failure.
+            pass
+        raise
+    record("k5_native_time_installer_diagnostic", json.dumps(diagnostic, sort_keys=True))
 
 
 def _cleanup_fixture(actions, record, *, primary_error=None):
@@ -415,6 +558,24 @@ def _cleanup_fixture(actions, record, *, primary_error=None):
 def test_native_windows_time_configuration_readback_and_resync_with_restoration(
     record_testsuite_property,
 ):
+    diagnostic_only = os.environ.get("K5_TIME_DIAGNOSTIC_ONLY") == "1"
+
+    def record(name, value):
+        prefix = "diagnostic_only_" if diagnostic_only else ""
+        record_testsuite_property(prefix + name, value)
+
+    if diagnostic_only:
+        record(
+            "time_scope",
+            json.dumps(
+                {
+                    "diagnostic_only": True,
+                    "installer_head": os.environ.get("K5_DESKTOP_HEAD_SHA"),
+                    "harness_head": os.environ.get("K5_TIME_DIAGNOSTIC_HARNESS_SHA"),
+                },
+                sort_keys=True,
+            ),
+        )
     import test_windows_desktop_app as desktop
     from windows_time_configuration import WindowsTimeConfigurationGuard, _configuration
 
@@ -438,6 +599,7 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
     api, runtime = desktop._Windows(), desktop._helpers("test_operator_product_runtime")
     cohort = desktop._Cohort(api)
     app = form = primary_error = None
+    time_ownership = []
     proof = {
         "schema_version": 2,
         "head_sha": os.environ.get("K5_DESKTOP_HEAD_SHA"),
@@ -457,7 +619,7 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
         "physical_camera_acceptance": False,
     }
     try:
-        desktop._install_gui(setup, installed, api)
+        _install_fixture(desktop, setup, installed, profile, api, record)
         assert hashlib.sha256(executable.read_bytes()).hexdigest() == supervisor_sha
         assert (installed / "payload-manifest.json").read_bytes() == manifest_bytes
         admitted = subprocess.run(
@@ -561,6 +723,8 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
                 form=form,
                 profile=profile,
                 service=service,
+                cohort=cohort,
+                ownership=time_ownership,
             )
             assert configured["host"]["mode"] == "manual"
             assert configured["host"]["ntp_servers"] == ["time.cloudflare.com"]
@@ -584,6 +748,8 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
                     form=form,
                     profile=profile,
                     service=service,
+                    cohort=cohort,
+                    ownership=time_ownership,
                 )
             except TimeAdministrationError as error:
                 if error.code == "time_ntp_unreachable":
@@ -602,6 +768,11 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
                     synchronized["host"]["reference"]["status"] == "measured"
                 )
         restored = guard.result
+        record("k5_native_time_helper_ownership", json.dumps(time_ownership, sort_keys=True))
+        assert len(time_ownership) == 2 and all(
+            item["helper_observed"] is True for item in time_ownership
+        ), "Native approving helper ownership was not observed for both time operations"
+        proof["native_approval_helper_observed"] = True
         assert all(
             restored[key] is True
             for key in ("clock_restored", "services_restored", "time_configuration_restored")
@@ -615,9 +786,7 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
         assert hashlib.sha256(executable.read_bytes()).hexdigest() == supervisor_sha
         proof["no_console_windows"] = not cohort.console_seen and not cohort.failed
         proof["duration_seconds"] = round(time.monotonic() - started, 3)
-        record_testsuite_property(
-            "k5_native_time_administration_receipt", json.dumps(proof, sort_keys=True)
-        )
+        record("k5_native_time_administration_receipt", json.dumps(proof, sort_keys=True))
     except BaseException as error:
         primary_error = error
         raise
@@ -655,6 +824,6 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
                 ("uninstall", uninstall),
                 ("temporary_state", lambda: desktop._remove_owned_temporary_tree(parent)),
             ),
-            record_testsuite_property,
+            record,
             primary_error=primary_error,
         )

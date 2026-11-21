@@ -132,6 +132,7 @@ def _failure_note(error, diagnostic, service):
         "test_windows_service_recording.py",
         "windows_service_acceptance.py",
         "windows_standard_user_acceptance.py",
+        "windows_process_identity.py",
         "test_windows_desktop_app.py",
         "test_operator_product_runtime.py",
         "test_operator_beta_browser.py",
@@ -278,6 +279,7 @@ def _growth(service, desktop, profile, client, camera_id, *, previous=None, mini
 
 def _stop_during_startup(service, profile, desktop, cohort, diagnostic):
     """Stop a genuine new pre-ready host, without injecting a pause or test mode."""
+    diagnostic["stage"] = "normal_stop_before_startup_regression"
     _, backend = service.processes()
     old_host = psutil.Process(backend.ppid())
     previous = (old_host.pid, service.native_birth(old_host))
@@ -320,7 +322,7 @@ def _stop_during_startup(service, profile, desktop, cohort, diagnostic):
             (event["host_pid"], event["host_created_100ns"]) != previous,
             "Startup-stop proof observed the previous recorder host",
         )
-        cohort.add(psutil.Process(snapshot["scm"]["pid"]))
+        cohort.add(psutil.Process(snapshot["scm"]["pid"]), role="service")
         return event
 
     observed = desktop._wait(pre_ready, "Native new-host pre-readiness bootstrap", timeout=15)
@@ -354,6 +356,21 @@ def _stop_during_startup(service, profile, desktop, cohort, diagnostic):
 
 def test_native_windows_unattended_service_recording_and_recovery(record_testsuite_property):
     __tracebackhide__ = True
+    _require(
+        os.environ.get("K5_SERVICE_DIAGNOSTIC_ONLY") == "1",
+        "Diagnostic-only service harness requires explicit diagnostic scope",
+    )
+    _require(
+        os.environ.get("K5_DESKTOP_HEAD_SHA") == "333685876d8f5dfd65cc4dcafeb2b4a694393283"
+        and os.environ.get("K5_DESKTOP_SETUP_SHA256")
+        == "647a2e2231b17efbfd08ff7bced749d42fef889ce17c83df8ee43225f6f9d730"
+        and re.fullmatch(r"[a-f0-9]{40}", os.environ.get("K5_SERVICE_DIAGNOSTIC_HARNESS_SHA", "")),
+        "Diagnostic-only service product or harness scope was not admitted",
+    )
+
+    def record(name, value):
+        record_testsuite_property("diagnostic_only_" + name, value)
+
     started = time.monotonic()
     desktop, runtime, browser_helpers, settings, scm = (
         _helpers(name)
@@ -373,6 +390,26 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
     _require(
         setup_hash == os.environ["K5_DESKTOP_SETUP_SHA256"],
         "Service gate received a different Setup",
+    )
+    record(
+        "service_scope",
+        json.dumps(
+            {
+                "diagnostic_only": True,
+                "installer_head": os.environ["K5_DESKTOP_HEAD_SHA"],
+                "installer_sha256": setup_hash,
+                "harness_head": os.environ["K5_SERVICE_DIAGNOSTIC_HARNESS_SHA"],
+                "harness_files_sha256": {
+                    name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                    for name in (
+                        "test_windows_service_recording.py",
+                        "test_windows_desktop_app.py",
+                        "windows_process_identity.py",
+                    )
+                },
+            },
+            sort_keys=True,
+        ),
     )
     parent = Path(os.environ["LOCALAPPDATA"]) / ("K5 Service Proof-" + uuid4().hex)
     parent.mkdir(mode=0o700)
@@ -421,7 +458,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
             process=app,
             timeout=60,
         )
-        runtime._login(client, username, password)
+        desktop._observer_reauthenticate(runtime, client, username, password, diagnostic)
         administrator_id = client.json("/api/v1/auth/me")["id"]
         _require(
             api.control_text(form, desktop._PASSWORD) == ""
@@ -596,7 +633,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
             "Actual SCM recovery after embedded backend failure",
             timeout=45,
         )
-        cohort.add(service.processes()[0])
+        cohort.add(service.processes()[0], role="service")
         desktop._wait(
             lambda: desktop._healthy(client, diagnostic), "Recovered backend health", timeout=30
         )
@@ -610,7 +647,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
             "Actual SCM recovery after wrapper failure",
             timeout=60,
         )
-        cohort.add(service.processes()[0])
+        cohort.add(service.processes()[0], role="service")
         desktop._wait(
             lambda: desktop._healthy(client, diagnostic), "Recovered SCM health", timeout=30
         )
@@ -766,11 +803,16 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         if cohort.failed:
             cleanup_failed = True
             _cleanup_note(diagnostic, "cohort_observer", RuntimeError())
-        for process in reversed(cohort.snapshot()):
+        try:
+            owned = cohort.snapshot()
+        except BaseException as error:
+            cleanup_failed = True
+            _cleanup_note(diagnostic, "cohort_snapshot", error)
+            owned = []
+        diagnostic["process_ownership"] = cohort.ownership_diagnostic()
+        for process in reversed(owned):
             try:
-                if process.is_running():
-                    process.kill()
-                    process.wait(timeout=10)
+                cohort.terminate_owned(process)
             except psutil.NoSuchProcess:
                 pass
             except BaseException as error:
@@ -807,6 +849,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         "Installed unattended service qualification failed: "
         + json.dumps(diagnostic, sort_keys=True),
     )
+    receipt["process_ownership"] = cohort.ownership_receipt()
     receipt.update(
         schema_version=1,
         head_sha=os.environ["K5_DESKTOP_HEAD_SHA"],
@@ -838,4 +881,4 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         receipt["no_console_windows"] and receipt["duration_seconds"] < 360,
         "Installed service qualification exceeded its native execution boundary",
     )
-    record_testsuite_property("service_windows_receipt", json.dumps(receipt, sort_keys=True))
+    record("service_windows_receipt", json.dumps(receipt, sort_keys=True))

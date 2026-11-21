@@ -337,8 +337,14 @@ class _Cohort:
         self.roots = []
         self.processes = {}
         self.native_identities = {}
+        self.root_roles = {}
+        self.ownership_records = {}
+        self.console_pins = {}
+        self.console_individual_termination_used = False
         self.console_seen = False
         self.failed = False
+        self.first_failure = None
+        self.last_cleanup_observation = None
         self.service = None
         self.service_stopped = True
         self.stop = threading.Event()
@@ -346,19 +352,300 @@ class _Cohort:
         self.thread = threading.Thread(target=self._observe, daemon=True)
         self.thread.start()
 
-    def add(self, process):
+    def _record_ownership(self, identity, note, *, role):
+        if len(self.ownership_records) >= 4096 and identity not in self.ownership_records:
+            self.failed = True
+            raise RuntimeError("Native ownership inventory exceeded its bound")
+        self.ownership_records[identity] = {**note, "role": role}
+
+    def _record_failure(self, error, phase):
+        if getattr(self, "first_failure", None) is not None:
+            return
+        allowed = {
+            "RuntimeError",
+            "OSError",
+            "PermissionError",
+            "ProcessLookupError",
+            "NoSuchProcess",
+            "AccessDenied",
+            "TimeoutError",
+            "Failed",
+            "AssertionError",
+            "AttributeError",
+            "ValueError",
+            "TypeError",
+            "OwnershipFailure",
+            "ArgumentError",
+            "OverflowError",
+        }
+        phases = {
+            "observer_snapshot",
+            "observer_windows",
+            "candidate_admission",
+            "finish_snapshot",
+            "finish_stop",
+            "finish_drain",
+            "finish_pin_exit",
+            "finish_pin_close",
+        }
+        source = None
+        trace = error.__traceback__
+        while trace is not None:
+            code = trace.tb_frame.f_code
+            filename = Path(code.co_filename).name
+            if filename in {"test_windows_desktop_app.py", "windows_process_identity.py"}:
+                source = {
+                    "file": filename,
+                    "function": code.co_name[:80],
+                    "line": min(20000, trace.tb_lineno),
+                }
+            trace = trace.tb_next
+        native_code = getattr(error, "winerror", None)
+        if type(native_code) is not int:
+            details = getattr(error, "diagnostic", None)
+            native_code = details.get("native_code") if type(details) is dict else None
+        self.first_failure = {
+            "phase": phase if phase in phases else "other",
+            "exception_type": type(error).__name__ if type(error).__name__ in allowed else "other",
+            "source": source,
+            "native_code": native_code
+            if type(native_code) is int and 0 <= native_code <= 65535
+            else None,
+        }
+
+    def _admit_service(self, identity, *, root=False):
+        helper = _helpers("windows_process_identity")
+        images = {
+            str(PureWindowsPath(self.service.installed / relative)).casefold(): kind
+            for relative, kind in (
+                ("K5VisionRecorder.exe", "wrapper"),
+                ("K5Vision.exe", "host"),
+                ("runtime/python.exe", "python"),
+                ("workers/mediamtx.exe", "mediamtx"),
+                ("workers/caddy.exe", "caddy"),
+            )
+        }
+        try:
+            details = self.native.details(identity)
+            if (
+                not root
+                and PureWindowsPath(details["image"]).name.casefold() == "conhost.exe"
+                and details["sid"] == self.native.service_sid()
+            ):
+                parent_pid = self.native.parents().get(identity[0])
+                parent = parent_pid, self.native.birth(parent_pid) if parent_pid else None
+                admitted_parent = self.ownership_records.get(parent)
+                if (
+                    admitted_parent is None
+                    or not admitted_parent["accepted"]
+                    or admitted_parent["role"] != "service"
+                    or admitted_parent["kind"] not in {"python", "mediamtx", "caddy"}
+                ):
+                    raise RuntimeError("Console host parent identity was not positively admitted")
+                pin = self.native.admit_console_host(
+                    identity, parent, admitted_parent["kind"], self.native.service_sid()
+                )
+                self.console_pins[identity] = pin
+                note = {
+                    "pid": identity[0],
+                    "created_100ns": identity[1],
+                    "parent_pid": parent[0],
+                    "kind": "console_host",
+                    "sid_role": "service",
+                    "session": 0,
+                    "accepted": True,
+                    "outcome": "admitted",
+                    "console_facts": dict(pin.facts),
+                }
+                self._record_ownership(identity, note, role="service")
+                return True
+            note = helper.service_candidate(
+                details,
+                self.native.service_sid(),
+                images,
+                root=root,
+                diagnose_image=helper.image_diagnostic,
+            )
+        except ProcessLookupError:
+            return False
+        except helper.OwnershipFailure as error:
+            self._record_ownership(identity, error.diagnostic, role="service")
+            self.failed = True
+            raise
+        except (OSError, ValueError, TypeError, RuntimeError) as error:
+            self._record_failure(error, "candidate_admission")
+            note = {
+                "pid": identity[0],
+                "created_100ns": identity[1],
+                "parent_pid": self.native.last_parents.get(identity[0], 0),
+                "kind": "unavailable",
+                "sid_role": "unavailable",
+                "session": None,
+                "accepted": False,
+                "outcome": "proof_unavailable",
+            }
+            self._record_ownership(identity, note, role="service")
+            self.failed = True
+            raise RuntimeError("Native service ownership proof was unavailable") from None
+        self._record_ownership(identity, note, role="service")
+        return note["accepted"]
+
+    def ownership_diagnostic(self):
+        with self.lock:
+            records = [
+                {**note, "pinned_exit": self.console_pins[identity].cached_exit}
+                if identity in self.console_pins
+                else dict(note)
+                for identity, note in self.ownership_records.items()
+            ]
+        rejected = {}
+        for note in records:
+            if not note["accepted"]:
+                outcome = note["outcome"]
+                rejected[outcome] = rejected.get(outcome, 0) + 1
+        refused = sorted(
+            (v for v in records if not v["accepted"]),
+            key=lambda value: value["outcome"] == "foreign_token",
+        )
+        admitted = [v for v in records if v["accepted"]]
+        return {
+            "candidate_count": len(records),
+            "rejected_counts": rejected,
+            "instances": refused[:16] + admitted[-(32 - min(16, len(refused))) :],
+            "first_failure": getattr(self, "first_failure", None),
+            "last_cleanup": getattr(self, "last_cleanup_observation", None),
+        }
+
+    def ownership_receipt(self):
+        with self.lock:
+            records = [v for v in self.ownership_records.values() if v["role"] == "service"]
+        admitted = [v for v in records if v["accepted"]]
+        payload = [v for v in admitted if v["kind"] != "console_host"]
+        consoles = [v for v in admitted if v["kind"] == "console_host"]
+        images = sorted({v["kind"] for v in payload})
+        unreadable = sum(v["outcome"] == "proof_unavailable" for v in records)
+        unexpected = sum(v["outcome"] == "unexpected_service_image" for v in records)
+        exited = sum(
+            pin.cached_exit is not None and pin.cached_exit["exited"] is True
+            for pin in self.console_pins.values()
+        )
+        console_receipt = {
+            "observed_count": len(consoles),
+            "exited_count": exited,
+            "system_file_identity_verified": all(
+                v["console_facts"]["system_file_identity_verified"] for v in consoles
+            ),
+            "trusted_code_custody_verified": all(
+                v["console_facts"]["trusted_code_custody_verified"] for v in consoles
+            ),
+            "admitted_parent_identity_verified": all(
+                v["console_facts"]["admitted_parent_identity_verified"] for v in consoles
+            ),
+            "pinned_native_exit_verified": len(self.console_pins) == len(consoles) == exited
+            and all(pin.handle is None for pin in self.console_pins.values()),
+            "individual_termination_used": self.console_individual_termination_used,
+        }
+        _require(
+            images == ["caddy", "host", "mediamtx", "python", "wrapper"]
+            and unreadable == unexpected == 0
+            and not self.failed
+            and all(v["sid_role"] == "service" and v["session"] == 0 for v in admitted),
+            "Installed service cleanup ownership proof was incomplete",
+        )
+        _require(
+            all(v is True for k, v in console_receipt.items() if k.endswith("verified"))
+            and not console_receipt["individual_termination_used"],
+            "Console host lifetime ownership proof was incomplete",
+        )
+        return {
+            "service_token_verified": bool(admitted),
+            "session_zero_verified": bool(admitted),
+            "installed_images_verified": bool(admitted),
+            "admitted_service_images": images,
+            "admitted_service_count": len(payload),
+            "rejected_foreign_count": sum(v["outcome"] == "foreign_token" for v in records),
+            "unreadable_identity_count": unreadable,
+            "unexpected_service_image_count": unexpected,
+            "console_hosts": console_receipt,
+        }
+
+    def add(self, process, *, role="gui", expected_identity=None):
+        _require(role in {"gui", "service", "time_helper"}, "Unknown native ownership root role")
         try:
             root = psutil.Process(process.pid)
             birth = self.native.birth(root.pid, handle=getattr(process, "_handle", None))
             if birth is None or self.native.birth(root.pid) != birth or not root.is_running():
                 return
+            if expected_identity is not None and expected_identity != (root.pid, birth):
+                raise RuntimeError("Explicit native root identity changed before admission")
         except psutil.NoSuchProcess:
             return
         with self.lock:
             identity = (root.pid, birth)
+            if role == "service":
+                _require(
+                    self.service is not None, "SCM ownership lacks its installed service identity"
+                )
+                if not self._admit_service(identity, root=True):
+                    return
+            else:
+                try:
+                    details = self.native.details(identity)
+                    if role == "time_helper":
+                        if expected_identity is None:
+                            raise RuntimeError("Time helper lacks its explicit observed identity")
+                        current = self.native.details((os.getpid(), self.native.birth(os.getpid())))
+                        allowed = {
+                            str(PureWindowsPath(_machine_paths()[0] / "K5Vision.exe")).casefold(),
+                            str(
+                                PureWindowsPath(self.native.system_directory()) / "w32tm.exe"
+                            ).casefold(),
+                        }
+                        if (
+                            str(PureWindowsPath(details["image"])).casefold() not in allowed
+                            or details["sid"] != current["sid"]
+                            or details["session"] != current["session"]
+                            or details["elevated"] is not True
+                        ):
+                            raise RuntimeError("Time helper native authority was not admitted")
+                    self._record_ownership(
+                        identity,
+                        {
+                            "pid": identity[0],
+                            "created_100ns": identity[1],
+                            "parent_pid": details["parent_pid"],
+                            "kind": "gui_client" if role == "gui" else "time_helper",
+                            "sid_role": "explicit_root" if role == "gui" else "current_admin",
+                            "session": details["session"],
+                            "accepted": True,
+                            "outcome": "admitted",
+                        },
+                        role=role,
+                    )
+                except ProcessLookupError:
+                    return
+                except (OSError, ValueError, TypeError, RuntimeError):
+                    self.failed = True
+                    self._record_ownership(
+                        identity,
+                        {
+                            "pid": identity[0],
+                            "created_100ns": identity[1],
+                            "parent_pid": self.native.last_parents.get(identity[0], 0),
+                            "kind": "unavailable",
+                            "sid_role": "unavailable",
+                            "session": None,
+                            "accepted": False,
+                            "outcome": "proof_unavailable",
+                        },
+                        role=role,
+                    )
+                    raise RuntimeError("Explicit root ownership proof was unavailable") from None
             self.roots.append(identity)
+            self.root_roles[identity] = role
             self.processes[identity] = root
             self.native_identities[id(root)] = identity
+            return identity
 
     def snapshot(self):
         with self.lock:
@@ -366,10 +653,37 @@ class _Cohort:
 
     def _snapshot(self):
         for root in list(self.roots):
-            for identity in self.native.descendants(root):
+            if self.root_roles[root] != "service":
+                continue  # GUI and elevated helpers are explicit roots only.
+            try:
+                candidates = self.native.descendants(root)
+            except (OSError, RuntimeError) as error:
+                note = getattr(error, "diagnostic", None)
+                if note is None:
+                    note = {
+                        "pid": root[0],
+                        "created_100ns": root[1],
+                        "parent_pid": self.native.last_parents.get(root[0], 0),
+                        "kind": "unavailable",
+                        "sid_role": "unavailable",
+                        "session": None,
+                        "accepted": False,
+                        "outcome": "proof_unavailable",
+                    }
+                self._record_ownership((note["pid"], note["created_100ns"]), note, role="service")
+                self.failed = True
+                raise
+            for identity in candidates:
                 if identity in self.processes:
                     continue
                 try:
+                    previous = self.ownership_records.get(identity)
+                    if previous is not None and not previous["accepted"]:
+                        if previous["outcome"] != "foreign_token":
+                            raise RuntimeError("Native service ownership previously failed")
+                        continue
+                    if not self._admit_service(identity):
+                        continue
                     process = psutil.Process(identity[0])
                     if self.native.birth(process.pid) != identity[1] or not process.is_running():
                         continue
@@ -382,46 +696,102 @@ class _Cohort:
         return [
             process
             for identity, process in self.processes.items()
-            if not process.is_running() or self.native.birth(identity[0]) == identity[1]
+            if identity in self.console_pins
+            or not process.is_running()
+            or self.native.birth(identity[0]) == identity[1]
         ]
 
     def is_owned_running(self, process):
         identity = self.native_identities.get(id(process))
+        if identity in self.console_pins:
+            return not self.console_pins[identity].exited()
         return bool(
             identity is not None
             and self.native.birth(identity[0]) == identity[1]
             and process.is_running()
         )
 
+    def is_service_owned(self, process):
+        identity = self.native_identities.get(id(process))
+        note = self.ownership_records.get(identity)
+        return bool(note and note["accepted"] and note["role"] == "service")
+
+    def terminate_owned(self, process):
+        identity = self.native_identities.get(id(process))
+        if identity in self.console_pins:
+            if not self.console_pins[identity].exited():
+                self.failed = True
+                raise RuntimeError("A console host survived its owned engine shutdown")
+            return False
+        if self.is_owned_running(process):
+            process.kill()
+            process.wait(timeout=10)
+            return True
+        return False
+
     def _observe(self):
+        phase = "observer_snapshot"
         try:
             while not self.stop.wait(0.05):
+                phase = "observer_snapshot"
                 pids = {
                     process.pid for process in self.snapshot() if self.is_owned_running(process)
                 }
+                phase = "observer_windows"
                 if any(
                     self.api.pid(window) in pids
                     and self.api.class_name(window) == "ConsoleWindowClass"
                     for window in self.api.windows()
                 ):
                     self.console_seen = True
-        except Exception:
+        except Exception as error:
+            self._record_failure(error, phase)
             self.failed = True
 
     def finish(self):
         self.stop.set()
         self.thread.join(timeout=5)
+        cleanup_observed = False
         # A failed UI journey must not kill the wrapper and let SCM restart an
         # unobserved engine. Stop the actual installed service before retiring
         # process identities. GUI-only exit is tested by the dedicated lane.
         if self.service is not None and not self.service_stopped:
             try:
                 self.snapshot()
+            except BaseException as error:
+                self._record_failure(error, "finish_snapshot")
+                self.failed = True
+            try:
+                phase = "finish_stop"
                 _service_control(self.service.installed, "stop")
                 self.service_stopped = True
-                _wait_owned_cleanup(self)
-            except BaseException:
+                cleanup_observed = True
+                phase = "finish_drain"
+                _wait_owned_cleanup(self, service_only=True)
+            except BaseException as error:
+                self._record_failure(error, phase)
                 self.failed = True
+        if self.console_pins:
+            try:
+                if not cleanup_observed:
+                    _wait_owned_cleanup(self, service_only=True)
+            except BaseException as error:
+                self._record_failure(error, "finish_drain")
+                self.failed = True
+            finally:
+                for pin in self.console_pins.values():
+                    try:
+                        if not pin.exited():
+                            self.failed = True
+                    except BaseException as error:
+                        self._record_failure(error, "finish_pin_exit")
+                        self.failed = True
+                    finally:
+                        try:
+                            pin.close()
+                        except BaseException as error:
+                            self._record_failure(error, "finish_pin_close")
+                            self.failed = True
 
 
 def _wait(condition, label, *, timeout=30, process=None):
@@ -999,7 +1369,7 @@ def _attach_installed_service(installed, cohort):
     root = psutil.Process(service.status()["pid"])
     _require(service.session(root) == 0, "Installed recorder is outside Session 0")
     cohort.service, cohort.service_stopped = service, False
-    cohort.add(root)
+    cohort.add(root, role="service")
 
 
 def _start_app(installed, profile, port, cohort):
@@ -1031,7 +1401,7 @@ def _start_app(installed, profile, port, cohort):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    cohort.add(process)
+    cohort.add(process, role="gui")
     return process
 
 
@@ -1356,7 +1726,7 @@ def test_native_browser_handoff_rejects_unreaped_descendants(monkeypatch):
         _retire_temporary_browser_processes({(123, 456): child})
 
 
-def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
+def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None, service_only=False):
     """Wait for owned process identities, never a historical PID's later occupant."""
     __tracebackhide__ = True
     diagnostic = {} if diagnostic is None else diagnostic
@@ -1371,7 +1741,13 @@ def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
         "caddy.exe": "caddy",
     }
     while True:
-        tracked = cohort.snapshot()
+        try:
+            tracked = cohort.snapshot()
+            if service_only:
+                tracked = [p for p in tracked if cohort.is_service_owned(p)]
+        finally:
+            if hasattr(cohort, "ownership_diagnostic"):
+                diagnostic["process_ownership"] = cohort.ownership_diagnostic()
         counts = {kind: 0 for kind in ("desktop", "python", "mediamtx", "caddy", "other")}
         for process in tracked:
             try:
@@ -1390,6 +1766,13 @@ def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
             stop_identity_checks=checks,
             stop_wait_seconds=round(time.monotonic() - started, 3),
         )
+        if hasattr(cohort, "last_cleanup_observation"):
+            cohort.last_cleanup_observation = {
+                "scope": "service" if service_only else "all",
+                "live_counts": dict(counts),
+                "checks": checks,
+                "elapsed_seconds": diagnostic["stop_wait_seconds"],
+            }
         if not any(counts.values()):
             return
         remaining = deadline - time.monotonic()
@@ -1606,7 +1989,8 @@ def _cohort_diagnostic(cohort):
     }
     for process in cohort.snapshot():
         try:
-            if process.is_running():
+            alive = getattr(cohort, "is_owned_running", lambda item: item.is_running())
+            if alive(process):
                 counts[allowed.get(process.name().casefold(), "other")] += 1
         except psutil.NoSuchProcess:
             continue
@@ -5309,7 +5693,12 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             except Exception as error:
                 cleanup_failed = True
                 record_cleanup_failure("permissions_executor", error)
-        process_counts = _cohort_diagnostic(cohort)
+        try:
+            process_counts = _cohort_diagnostic(cohort)
+        except BaseException as error:
+            process_counts = None
+            cleanup_failed = True
+            record_cleanup_failure("cohort_process", error)
         app_exit_code = app.poll() if app else None
         form_alive = bool(form and api.api.IsWindow(form))
         form_visible = bool(form and api.api.IsWindowVisible(form))
@@ -5325,11 +5714,16 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 except Exception as error:
                     cleanup_failed = True
                     record_cleanup_failure(name, error)
-        for process in reversed(cohort.snapshot()):
+        try:
+            cleanup_processes = cohort.snapshot()
+        except BaseException as error:
+            cleanup_processes = []
+            cleanup_failed = True
+            record_cleanup_failure("cohort_process", error)
+        nvr_diagnostic["process_ownership"] = cohort.ownership_diagnostic()
+        for process in reversed(cleanup_processes):
             try:
-                if process.is_running():
-                    process.kill()
-                    process.wait(timeout=10)
+                cohort.terminate_owned(process)
             except psutil.NoSuchProcess:
                 pass
             except Exception as error:
