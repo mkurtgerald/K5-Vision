@@ -57,6 +57,49 @@ def test_wizard_signature_tracks_control_identity_not_only_caption():
     assert current != _DESKTOP._installer_page_signature(wizard, [2, 3])
 
 
+def test_failed_finish_reports_native_guard_boundary_without_private_caption_values():
+    diagnostic = {}
+    code = (12 << 16) | 32
+    assert _DESKTOP._installer_finish_refusal(
+        {
+            "K5 Vision installation failed": 1,
+            "K5 Vision could not verify or start the recording service. "
+            f"Install check: seal/{code}. PRIVATE rtsp://secret@private-host": 2,
+        },
+        diagnostic,
+    )
+    assert diagnostic == {
+        "installer_action": "final_admission_refused",
+        "installer_failed_stage": "seal",
+        "installer_guard_exit_code": code,
+        "installer_guard_phase": 12,
+        "installer_guard_win32": 32,
+    }
+    assert "PRIVATE" not in json.dumps(diagnostic)
+
+
+@pytest.mark.parametrize(
+    "detail", ["", "Install check: SECRET/1.", "Install check: start/9999999999."]
+)
+def test_failed_finish_without_valid_finite_code_still_refuses(detail):
+    diagnostic = {}
+    assert _DESKTOP._installer_finish_refusal(
+        {"K5 Vision installation failed": 1, detail: 2}, diagnostic
+    )
+    assert diagnostic == {
+        "installer_action": "final_admission_refused",
+        "installer_failed_stage": "unclassified",
+    }
+
+
+def test_successful_finish_is_not_classified_from_an_untrusted_code_fragment():
+    diagnostic = {}
+    assert not _DESKTOP._installer_finish_refusal(
+        {"Setup has finished installing": 1, "Install check: start/1769472.": 2}, diagnostic
+    )
+    assert diagnostic == {}
+
+
 class _EventPollClient:
     def __init__(self, status, envelope=None):
         self.status = status
@@ -295,6 +338,32 @@ def test_acknowledged_driver_observes_actual_install_after_delayed_next(monkeypa
     assert diagnostic["installer_next_clicks"] == 1
     assert diagnostic["installer_steps_seen"] == ["finish", "install", "next >"]
     assert "PRIVATE" not in json.dumps(diagnostic)
+
+
+def test_failed_finish_is_rejected_before_looking_for_hidden_launch_checkbox(monkeypatch):
+    wizard = _DelayedInstaller()
+    original_text = wizard.text
+    code = (27 << 16) | 5
+
+    def text(window):
+        if wizard.phase == 2 and window == 3:
+            return "K5 Vision installation failed"
+        if wizard.phase == 2 and window == 4:
+            return "K5 Vision could not verify or start the recording service. " + (
+                f"Install check: start/{code}."
+            )
+        return original_text(window)
+
+    wizard.text = text
+
+    def hidden_launch(*_args):
+        pytest.fail("A failed Finish must not require the hidden launch checkbox")
+
+    monkeypatch.setattr(_DESKTOP, "_uncheck_launch", hidden_launch)
+    with pytest.raises(pytest.fail.Exception, match="Installer failed its start check"):
+        _drive_delayed_installer(monkeypatch, wizard)
+    assert wizard.actual_actions == ["next", "install"]
+    assert wizard.killed and wizard.waited
 
 
 def test_unacknowledged_native_command_keeps_original_deadline_and_cleanup(monkeypatch):

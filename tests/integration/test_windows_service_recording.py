@@ -603,6 +603,8 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         receipt.update(service_removed_on_uninstall=True, uninstall_preserves_profile=True)
     except BaseException as error:
         failed = True
+        if service is None:
+            diagnostic["installation_snapshot"] = scm.installer_failure_snapshot(installed, profile)
         _failure_note(error, diagnostic, service)
         diagnostic["failure_kind"] = (
             "assertion" if isinstance(error, pytest.fail.Exception) else "exception"

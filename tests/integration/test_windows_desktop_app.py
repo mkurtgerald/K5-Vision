@@ -613,6 +613,29 @@ def _clock_live_gateway_probe(live_url, token, *, dial=None):
             connection.close()
 
 
+def _installer_finish_refusal(captions, diagnostic):
+    """Retain only fixed refusal stages and numeric codes from a failed Finish."""
+    text = " ".join(str(value).casefold()[:2048] for value in list(captions)[:128])
+    if (
+        "k5 vision installation failed" not in text
+        and "k5 vision could not verify or start the recording service" not in text
+    ):
+        return False
+    diagnostic["installer_action"] = "final_admission_refused"
+    diagnostic["installer_failed_stage"] = "unclassified"
+    match = re.search(r"install check: (seal|launcher|payload|install|start)/(-?\d{1,10})\.", text)
+    if match:
+        value = int(match[2])
+        if -2 <= value <= 2147483647:
+            diagnostic["installer_failed_stage"] = match[1]
+            diagnostic["installer_guard_exit_code"] = value
+            phase = value >> 16
+            if phase in {10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 26, 27}:
+                diagnostic["installer_guard_phase"] = phase
+                diagnostic["installer_guard_win32"] = value & 65535
+    return True
+
+
 def _install_gui(setup, installed, api, *, diagnostic=None):
     """Drive the actual Inno wizard without suppressing its user interface."""
     __tracebackhide__ = True
@@ -667,6 +690,11 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                     if api.api.IsWindowVisible(window) and api.api.IsWindowEnabled(window)
                 ]
                 captions = {_normalized_caption(api.text(window)): window for window in controls}
+                if _installer_finish_refusal(captions, diagnostic):
+                    pytest.fail(
+                        "Installer failed its " + diagnostic["installer_failed_stage"] + " check",
+                        pytrace=False,
+                    )
                 if any(
                     caption.startswith("k5 vision could not verify the installed application")
                     for caption in captions

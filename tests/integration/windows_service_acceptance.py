@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
+import stat
 import subprocess
 from ctypes import wintypes
 from pathlib import Path
@@ -16,6 +18,104 @@ import psutil
 
 SERVICE_NAME = "K5VisionRecorder"
 SERVICE_ACCOUNT = r"NT SERVICE\K5VisionRecorder"
+
+
+def _classify_log(raw):
+    """Project fixed WinSW/native failure categories, never private log text."""
+    text = raw.decode("utf-8", errors="replace")
+    return {
+        "process_started": min(100, len(re.findall(r"(?i)started (?:the )?process", text))),
+        "process_finished_nonzero": min(
+            100,
+            len(
+                re.findall(
+                    r"(?i)(?:exit(?:ed)?(?: with)?|finished with|exitcode)[^\r\n]{0,30}"
+                    r"(?:code[=: ]*)?[1-9][0-9]*",
+                    text,
+                )
+            ),
+        ),
+        "access_denied": bool(
+            re.search(r"(?i)access (?:is )?denied|UnauthorizedAccessException", text)
+        ),
+        "file_not_found": bool(
+            re.search(r"FileNotFoundException|DirectoryNotFoundException", text)
+        ),
+        "logon_failed": bool(re.search(r"(?i)logon failure|logon failed|error 1069", text)),
+        "dotnet_exception": bool(re.search(r"\bSystem[.][A-Za-z.]+Exception\b", text)),
+    }
+
+
+def installer_failure_snapshot(installed, profile):
+    """Observe a failed real installation before GUI setup returned a service owner."""
+    result = {"installed_root_present": Path(installed).is_dir()}
+    try:
+        service = InstalledService(installed)
+        result["service_registered"] = not service.absent()
+        if result["service_registered"]:
+            status = service.status()
+            result["scm"] = {
+                key: status[key]
+                for key in (
+                    "state",
+                    "pid",
+                    "win32_exit",
+                    "service_exit",
+                )
+                if type(status.get(key)) is int and 0 <= status[key] <= 2**32 - 1
+            }
+            configuration = service.configuration()
+            result["configuration"] = {
+                "service_type": configuration["service_type"],
+                "start_type": configuration["start_type"],
+                "virtual_account": configuration["account"].casefold()
+                == SERVICE_ACCOUNT.casefold(),
+                "installed_executable_verified": configuration["installed_executable_verified"],
+            }
+    except (OSError, RuntimeError, ValueError):
+        result["scm_query_unavailable"] = True
+    profile = Path(profile)
+    for name, path in (
+        ("data", profile),
+        ("identity", profile / "identity"),
+        ("logs", profile / "logs"),
+    ):
+        result[name + "_directory_present"] = path.is_dir()
+    logs = []
+    try:
+        info = (profile / "logs").lstat()
+        if not stat.S_ISDIR(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise RuntimeError("Diagnostic log root is not an ordinary directory")
+        for index, path in enumerate((profile / "logs").iterdir()):
+            if index >= 16:
+                break
+            kind = next(
+                (
+                    kind
+                    for kind in ("wrapper", "out", "err")
+                    if path.name.endswith("." + kind + ".log")
+                ),
+                None,
+            )
+            if kind is None:
+                continue
+            info = path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or getattr(info, "st_file_attributes", 0) & 0x400
+            ):
+                continue
+            with path.open("rb") as stream:
+                stream.seek(max(0, info.st_size - 65536))
+                raw = stream.read(65536)
+            logs.append(
+                {"kind": kind, "bytes": min(info.st_size, 2**31 - 1), "events": _classify_log(raw)}
+            )
+    except (OSError, RuntimeError, ValueError):
+        result["log_query_unavailable"] = True
+    result["logs"] = logs
+    return result
 
 
 class _Status(ctypes.Structure):

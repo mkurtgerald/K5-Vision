@@ -73,6 +73,8 @@ var
   InstallationMutex: THandle;
   InstallationLease: Boolean;
   FinalPayloadVerified: Boolean;
+  FinalFailureStage: String;
+  FinalFailureCode: Integer;
 
 function CreateMutex(var Security: TMutexSecurity; InitialOwner: Integer; Name: String): THandle;
   external 'CreateMutexW@kernel32.dll stdcall';
@@ -209,27 +211,39 @@ begin
     // Inno 6.4.3 catches exceptions from this callback and continues. Keep
     // failure latched before Exec, including if Exec itself raises.
     FinalPayloadVerified := False;
+    FinalFailureStage := 'seal';
+    FinalFailureCode := -1;
     try
       FinalPayloadVerified := Exec(ExpandConstant('{tmp}\K5VisionInstallGuard.exe'),
         '--installation-service-seal', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+      FinalFailureCode := ExitCode;
       if FinalPayloadVerified then FinalPayloadVerified := ExitCode = 0;
       // The launcher is excluded from its own payload manifest. Pin its bytes
       // after private code sealing and before its first elevated execution.
-      if FinalPayloadVerified then
-        FinalPayloadVerified := CompareText(GetSHA256OfFile(ExpandConstant('{app}\K5Vision.exe')), '{#LauncherSha}') = 0;
       if FinalPayloadVerified then begin
+        FinalFailureStage := 'launcher';
+        FinalFailureCode := 1;
+        FinalPayloadVerified := CompareText(GetSHA256OfFile(ExpandConstant('{app}\K5Vision.exe')), '{#LauncherSha}') = 0;
+      end;
+      if FinalPayloadVerified then begin
+        FinalFailureStage := 'payload';
         FinalPayloadVerified := Exec(ExpandConstant('{app}\K5Vision.exe'),
           '--installation-payload-check', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+        FinalFailureCode := ExitCode;
         if FinalPayloadVerified then FinalPayloadVerified := ExitCode = 0;
       end;
       if FinalPayloadVerified then begin
+        FinalFailureStage := 'install';
         FinalPayloadVerified := Exec(ExpandConstant('{app}\K5Vision.exe'),
           '--installation-service-install', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+        FinalFailureCode := ExitCode;
         if FinalPayloadVerified then FinalPayloadVerified := ExitCode = 0;
       end;
       if FinalPayloadVerified then begin
+        FinalFailureStage := 'start';
         FinalPayloadVerified := Exec(ExpandConstant('{app}\K5Vision.exe'),
           '--installation-service-start', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+        FinalFailureCode := ExitCode;
         if FinalPayloadVerified then FinalPayloadVerified := ExitCode = 0;
       end;
     except
@@ -246,7 +260,8 @@ begin
     // Inno writes its success labels AFTER ssPostInstall. Override them here.
     WizardForm.FinishedHeadingLabel.Caption := 'K5 Vision installation failed';
     WizardForm.FinishedLabel.Caption :=
-      'K5 Vision could not verify or start the recording service. Run Setup again to repair this installation. Your account and recordings were preserved.';
+      'K5 Vision could not verify or start the recording service. Run Setup again to repair this installation. Your account and recordings were preserved. ' +
+      'Install check: ' + FinalFailureStage + '/' + IntToStr(FinalFailureCode) + '.';
     WizardForm.RunList.Visible := False;
   end;
 end;

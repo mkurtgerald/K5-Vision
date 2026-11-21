@@ -23,6 +23,27 @@ namespace K5VisionDesktop
         private const uint QueryConfig = 1, QueryStatus = 4, Start = 0x10, Stop = 0x20;
         private const uint Delete = 0x10000, ReadControl = 0x20000;
         private const int MissingService = 1060;
+        private enum RefusalPhase
+        {
+            Preflight = 10, Manifest = 11, OpenHandle = 12, FileIdentity = 13,
+            Inventory = 14, Hash = 15, Acl = 16, ScmOpen = 20,
+            ScmConfiguration = 21, ScmCreate = 22, ScmStop = 23, Data = 24,
+            Recovery = 25, ScmStart = 26, Readiness = 27
+        }
+        private static RefusalPhase refusalPhase = RefusalPhase.Preflight;
+        private static int FailureCode(int nativeError)
+        {
+            return ((int)refusalPhase << 16) | (nativeError >= 0 && nativeError <= 65535 ? nativeError : 0);
+        }
+        private sealed class Refused : Exception
+        {
+            internal readonly int Code;
+            internal Refused(int nativeError) { Code = FailureCode(nativeError); }
+        }
+        private static int NativeHResult(int value)
+        {
+            return ((uint)value & 0xFFFF0000u) == 0x80070000u ? value & 65535 : 0;
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         private struct ServiceStatus
@@ -124,23 +145,28 @@ namespace K5VisionDesktop
         }
         private static void Require(bool condition)
         {
-            if (!condition) throw new InvalidOperationException();
+            if (!condition) throw new Refused(0);
+        }
+        private static void RequireWin32(bool condition)
+        {
+            if (!condition) throw new Refused(Marshal.GetLastWin32Error());
         }
         private static ProcessStatus Status(IntPtr service)
         {
             ProcessStatus result; int required;
-            Require(QueryServiceStatusEx(service, 0, out result, Marshal.SizeOf(typeof(ProcessStatus)), out required));
+            RequireWin32(QueryServiceStatusEx(service, 0, out result, Marshal.SizeOf(typeof(ProcessStatus)), out required));
             return result;
         }
         private static void AdmitConfiguration(IntPtr service, string root)
         {
+            refusalPhase = RefusalPhase.ScmConfiguration;
             int required;
             QueryServiceConfig(service, IntPtr.Zero, 0, out required);
             Require(required >= Marshal.SizeOf(typeof(Configuration)) && required <= 32768);
             IntPtr buffer = Marshal.AllocHGlobal(required);
             try
             {
-                Require(QueryServiceConfig(service, buffer, required, out required));
+                RequireWin32(QueryServiceConfig(service, buffer, required, out required));
                 Configuration value = (Configuration)Marshal.PtrToStructure(buffer, typeof(Configuration));
                 Require(value.Type == 0x10 && String.Equals(Marshal.PtrToStringUni(value.Binary),
                     "\"" + Path.Combine(root, "K5VisionRecorder.exe") + "\"", StringComparison.OrdinalIgnoreCase));
@@ -150,6 +176,7 @@ namespace K5VisionDesktop
         }
         private static void StopAndWait(IntPtr service)
         {
+            refusalPhase = RefusalPhase.ScmStop;
             Stopwatch elapsed = Stopwatch.StartNew();
             ProcessStatus current = Status(service);
             IntPtr process = IntPtr.Zero;
@@ -159,12 +186,16 @@ namespace K5VisionDesktop
                 {
                     Require(current.Pid != 0);
                     process = OpenProcess(0x100000, false, current.Pid);
-                    Require(process != IntPtr.Zero);
+                    RequireWin32(process != IntPtr.Zero);
                     if (current.State != 3)
                     {
                         ServiceStatus ignored;
                         if (!ControlService(service, 1, out ignored))
-                            Require(Marshal.GetLastWin32Error() == 1062 && Status(service).State == 1);
+                        {
+                            int error = Marshal.GetLastWin32Error();
+                            if (error != 1062) throw new Refused(error);
+                            Require(Status(service).State == 1);
+                        }
                     }
                 }
                 while (Status(service).State != 1)
@@ -181,6 +212,7 @@ namespace K5VisionDesktop
         }
         private static void PrepareData()
         {
+            refusalPhase = RefusalPhase.Data;
             string directory = Custody.OrdinaryAbsolute(DataRoot);
             string parent = Path.GetDirectoryName(directory);
             // ProgramData itself permits creation of unrelated children. The
@@ -215,6 +247,7 @@ namespace K5VisionDesktop
         }
         private static void PrepareCode(string root)
         {
+            refusalPhase = RefusalPhase.Preflight;
             Custody.AdmitCode(Path.GetDirectoryName(root), root);
             if (!Directory.Exists(root)) Directory.CreateDirectory(root, CodeDirectorySecurity(true));
             else Custody.AdmitCode(root, root);
@@ -228,6 +261,7 @@ namespace K5VisionDesktop
 
             internal PinnedEntry(string path, string relative)
             {
+                refusalPhase = RefusalPhase.OpenHandle;
                 Relative = relative;
                 // OPEN_REPARSE_POINT prevents following a newly planted link;
                 // BACKUP_SEMANTICS admits ordinary directories. Share READ only
@@ -239,8 +273,10 @@ namespace K5VisionDesktop
                 try
                 {
                     FileIdentity identity = new FileIdentity();
-                    Require(Handle != null && !Handle.IsInvalid && GetFileType(Handle) == 1 &&
-                        GetFileInformationByHandle(Handle, out identity));
+                    RequireWin32(Handle != null && !Handle.IsInvalid);
+                    refusalPhase = RefusalPhase.FileIdentity;
+                    Require(GetFileType(Handle) == 1);
+                    RequireWin32(GetFileInformationByHandle(Handle, out identity));
                     Require((identity.Attributes & 0x400u) == 0);
                     Directory = (identity.Attributes & 0x10u) != 0;
                     if (!Directory)
@@ -253,14 +289,17 @@ namespace K5VisionDesktop
             }
             internal void AssertOrdinary()
             {
+                refusalPhase = RefusalPhase.FileIdentity;
                 FileIdentity identity;
-                Require(GetFileType(Handle) == 1 && GetFileInformationByHandle(Handle, out identity) &&
-                    (identity.Attributes & 0x400u) == 0 && ((identity.Attributes & 0x10u) != 0) == Directory &&
+                Require(GetFileType(Handle) == 1);
+                RequireWin32(GetFileInformationByHandle(Handle, out identity));
+                Require((identity.Attributes & 0x400u) == 0 && ((identity.Attributes & 0x10u) != 0) == Directory &&
                     (Directory || identity.Links == 1));
             }
             internal void ApplySecurity()
             {
                 AssertOrdinary();
+                refusalPhase = RefusalPhase.Acl;
                 FileSystemSecurity security;
                 // No inheritable ACEs: SetSecurityInfo may otherwise propagate
                 // a directory DACL to an unlisted child added during staging.
@@ -282,11 +321,13 @@ namespace K5VisionDesktop
                 try
                 {
                     IntPtr owner, dacl; bool defaulted, present;
-                    Require(GetSecurityDescriptorOwner(pinned.AddrOfPinnedObject(), out owner, out defaulted));
-                    Require(GetSecurityDescriptorDacl(pinned.AddrOfPinnedObject(), out present, out dacl, out defaulted) && present);
+                    RequireWin32(GetSecurityDescriptorOwner(pinned.AddrOfPinnedObject(), out owner, out defaulted));
+                    RequireWin32(GetSecurityDescriptorDacl(pinned.AddrOfPinnedObject(), out present, out dacl, out defaulted));
+                    Require(present);
                     // OWNER | DACL | PROTECTED_DACL, applied to the already
                     // verified object, never a path resolved a second time.
-                    Require(SetSecurityInfo(Handle, 1, 0x80000005u, owner, IntPtr.Zero, dacl, IntPtr.Zero) == 0);
+                    uint error = SetSecurityInfo(Handle, 1, 0x80000005u, owner, IntPtr.Zero, dacl, IntPtr.Zero);
+                    if (error != 0) throw new Refused(error <= 65535 ? (int)error : 0);
                 }
                 finally { pinned.Free(); Array.Clear(descriptor, 0, descriptor.Length); }
             }
@@ -303,15 +344,18 @@ namespace K5VisionDesktop
             PinnedEntry current = new PinnedEntry(directory, relative);
             try
             {
+                refusalPhase = RefusalPhase.Inventory;
                 Require(current.Directory && allowedDirectories.Contains(relative));
                 pinned.Add(relative, current); current = null;
                 foreach (string path in Directory.GetFileSystemEntries(directory))
                 {
+                    refusalPhase = RefusalPhase.Inventory;
                     string name = path.Substring(root.Length + 1).Replace('\\', '/');
                     Require(allowedFiles.Contains(name) || allowedDirectories.Contains(name));
                     PinnedEntry entry = new PinnedEntry(path, name);
                     try
                     {
+                        refusalPhase = RefusalPhase.Inventory;
                         if (entry.Directory)
                         {
                             Require(allowedDirectories.Contains(name));
@@ -332,6 +376,7 @@ namespace K5VisionDesktop
         private static void RecheckCodeInventory(string directory, string root, Dictionary<string, PinnedEntry> pinned,
             HashSet<string> observed)
         {
+            refusalPhase = RefusalPhase.Inventory;
             string relative = directory.Length == root.Length ? "" : directory.Substring(root.Length + 1).Replace('\\', '/');
             Require(pinned.ContainsKey(relative) && pinned[relative].Directory && observed.Add(relative));
             foreach (string path in Directory.GetFileSystemEntries(directory))
@@ -344,6 +389,7 @@ namespace K5VisionDesktop
         }
         private static void SealCode(string root)
         {
+            refusalPhase = RefusalPhase.Manifest;
             byte[] raw;
             using (FileStream source = new FileStream(Path.Combine(root, "payload-manifest.json"),
                 FileMode.Open, FileAccess.Read, FileShare.Read))
@@ -380,6 +426,7 @@ namespace K5VisionDesktop
                 PinCodeTree(root, root, allowedFiles, allowedDirectories, pinned);
                 foreach (KeyValuePair<string, Dictionary<string, object>> item in expected)
                 {
+                    refusalPhase = RefusalPhase.Hash;
                     Require(pinned.ContainsKey(item.Key) && !pinned[item.Key].Directory);
                     FileStream content = pinned[item.Key].Content;
                     Require(content.Length == Convert.ToInt64(item.Value["bytes"]));
@@ -446,12 +493,13 @@ namespace K5VisionDesktop
         }
         private static void ConfigureRecovery(IntPtr service)
         {
+            refusalPhase = RefusalPhase.Recovery;
             Flag sid = new Flag { Value = 1 }; // SERVICE_SID_TYPE_UNRESTRICTED
             Flag nondelayed = new Flag { Value = 0 };
             Flag failedExit = new Flag { Value = 1 };
-            Require(ChangeServiceConfig2(service, 5, ref sid));
-            Require(ChangeServiceConfig2(service, 3, ref nondelayed));
-            Require(ChangeServiceConfig2(service, 4, ref failedExit));
+            RequireWin32(ChangeServiceConfig2(service, 5, ref sid));
+            RequireWin32(ChangeServiceConfig2(service, 3, ref nondelayed));
+            RequireWin32(ChangeServiceConfig2(service, 4, ref failedExit));
             int size = Marshal.SizeOf(typeof(RecoveryAction));
             IntPtr actions = Marshal.AllocHGlobal(size * 3);
             try
@@ -461,13 +509,13 @@ namespace K5VisionDesktop
                     Marshal.StructureToPtr(new RecoveryAction { Type = 1, Delay = delays[index] },
                         IntPtr.Add(actions, index * size), false);
                 FailureActions failure = new FailureActions { ResetPeriod = 3600, Count = 3, Actions = actions };
-                Require(ChangeServiceConfig2(service, 2, ref failure));
+                RequireWin32(ChangeServiceConfig2(service, 2, ref failure));
             }
             finally { Marshal.FreeHGlobal(actions); }
             RawSecurityDescriptor descriptor = new RawSecurityDescriptor(
                 "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;CCLCSWLORC;;;AU)");
             byte[] bytes = new byte[descriptor.BinaryLength]; descriptor.GetBinaryForm(bytes, 0);
-            Require(SetServiceObjectSecurity(service, 4, bytes));
+            RequireWin32(SetServiceObjectSecurity(service, 4, bytes));
         }
 
         internal static int Execute(string operation, string root)
@@ -475,6 +523,7 @@ namespace K5VisionDesktop
             IntPtr manager = IntPtr.Zero, service = IntPtr.Zero;
             try
             {
+                refusalPhase = RefusalPhase.Preflight;
                 Require(new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator));
                 Require(operation == "stop" || operation == "install" || operation == "start" || operation == "remove" ||
                     operation == "prepare" || operation == "seal" || operation == "legacy-check");
@@ -484,45 +533,60 @@ namespace K5VisionDesktop
                 if (operation == "prepare") { PrepareCode(root); return 0; }
                 if (operation == "seal")
                 {
+                    refusalPhase = RefusalPhase.Manifest;
                     Custody.VerifySealedFiles(root);
                     SealCode(root);
                     return 0;
                 }
+                refusalPhase = RefusalPhase.ScmOpen;
                 manager = OpenSCManager(null, null, operation == "install" ? 3u : 1u);
-                Require(manager != IntPtr.Zero);
+                RequireWin32(manager != IntPtr.Zero);
                 uint access = operation == "install" ? AllAccess : QueryConfig | QueryStatus | ReadControl |
                     (operation == "start" ? Start : Stop) | (operation == "remove" ? Delete : 0u);
                 service = OpenService(manager, Name, access);
                 if (service == IntPtr.Zero)
                 {
-                    Require(Marshal.GetLastWin32Error() == MissingService);
+                    int error = Marshal.GetLastWin32Error();
+                    if (error != MissingService) throw new Refused(error);
                     if (operation == "stop" || operation == "remove") return 0;
                     Require(operation == "install");
+                    refusalPhase = RefusalPhase.Manifest;
                     Custody.VerifyPayload(root);
+                    refusalPhase = RefusalPhase.ScmCreate;
                     service = CreateService(manager, Name, "K5 Vision Recorder", AllAccess,
                         0x10, 2, 1, "\"" + Path.Combine(root, "K5VisionRecorder.exe") + "\"",
                         null, IntPtr.Zero, null, Account, null);
-                    Require(service != IntPtr.Zero);
+                    RequireWin32(service != IntPtr.Zero);
                 }
                 AdmitConfiguration(service, root);
                 if (operation == "stop" || operation == "remove" || operation == "install") StopAndWait(service);
-                if (operation == "remove") { Require(DeleteService(service)); return 0; }
+                if (operation == "remove") { RequireWin32(DeleteService(service)); return 0; }
                 if (operation == "stop") return 0;
+                refusalPhase = RefusalPhase.Manifest;
                 Custody.VerifyPayload(root);
                 if (operation == "install")
                 {
-                    Require(ChangeServiceConfig(service, 0xFFFFFFFF, 2, 0xFFFFFFFF, null,
+                    refusalPhase = RefusalPhase.ScmConfiguration;
+                    RequireWin32(ChangeServiceConfig(service, 0xFFFFFFFF, 2, 0xFFFFFFFF, null,
                         null, IntPtr.Zero, null, Account, null, "K5 Vision Recorder"));
                     ConfigureRecovery(service);
                     PrepareData();
                     return 0;
                 }
-                Require(StartService(service, 0, IntPtr.Zero) || Marshal.GetLastWin32Error() == 1056);
+                refusalPhase = RefusalPhase.ScmStart;
+                if (!StartService(service, 0, IntPtr.Zero))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    if (error != 1056) throw new Refused(error);
+                }
+                refusalPhase = RefusalPhase.Readiness;
                 Stopwatch elapsed = Stopwatch.StartNew();
+                int readinessError = 0;
                 while (true)
                 {
                     ProcessStatus current = Status(service);
-                    Require(current.State != 1 && elapsed.ElapsedMilliseconds < 45000);
+                    if (current.State == 1 || elapsed.ElapsedMilliseconds >= 45000)
+                        throw new Refused(readinessError);
                     if (current.State == 4)
                     {
                         // WinSW reports SCM_RUNNING before the engine is ready.
@@ -535,12 +599,17 @@ namespace K5VisionDesktop
                             string state = health["status"] as string;
                             if (state == "account_required" || state == "running" || state == "preparing_recordings") return 0;
                         }
-                        catch { }
+                        catch (IOException error) { readinessError = NativeHResult(error.HResult); }
+                        catch (UnauthorizedAccessException) { readinessError = 5; }
+                        catch { readinessError = 0; }
                     }
                     Thread.Sleep(100);
                 }
             }
-            catch { return 1; }
+            catch (Refused error) { return error.Code; }
+            catch (IOException error) { return FailureCode(NativeHResult(error.HResult)); }
+            catch (UnauthorizedAccessException) { return FailureCode(5); }
+            catch { return FailureCode(0); }
             finally
             {
                 if (service != IntPtr.Zero) CloseServiceHandle(service);
