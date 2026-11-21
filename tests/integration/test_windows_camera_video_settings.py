@@ -698,7 +698,7 @@ def run_camera_video_journey(
             )
         )
     target, other = camera_ids[:2]
-    identity = identity_state.load_identity_state(Path(profile) / "identity")
+    identity = desktop._profile_identity(profile)
     paths = [
         Path(profile) / "recordings" / MediaMTXBinding(identity.site_id, UUID(identifier)).path_name
         for identifier in camera_ids
@@ -1215,7 +1215,7 @@ def test_native_windows_camera_video_settings_and_automatic_wall(record_testsuit
     parent = Path(os.environ["LOCALAPPDATA"]) / ("K5 Camera Video Proof-" + uuid4().hex)
     identity_state.validate_new_identity_directory(parent)
     parent.mkdir(mode=0o700)
-    installed, profile = parent / "installed app with spaces", parent / "private profile"
+    installed, profile = desktop._machine_paths()
     api = desktop._Windows()
     cohort = desktop._Cohort(api)
     processes, fixtures, reservations = [], [], []
@@ -1229,7 +1229,7 @@ def test_native_windows_camera_video_settings_and_automatic_wall(record_testsuit
         reservations, ports = helpers._reserve_ports(3)
         for listener in reservations:
             listener.close()
-        port = ports[0]
+        port = 8000
         app = desktop._start_app(installed, profile, port, cohort)
         form = desktop._wait(
             lambda: api.form(app.pid), "Camera gate first-account window", process=app
@@ -1351,7 +1351,7 @@ def test_native_windows_camera_video_settings_and_automatic_wall(record_testsuit
         _require(receipt["no_console_windows"], "Installed camera controls opened a console window")
         retained = list((profile / "recordings").rglob("*.mp4"))
         _require(bool(retained), "Camera controls retained no recording files")
-        identity = identity_state.load_identity_state(profile / "identity")
+        identity = desktop._profile_identity(profile)
         result = subprocess.run(
             [str(installed / "unins000.exe"), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
             stdin=subprocess.DEVNULL,
@@ -1363,8 +1363,7 @@ def test_native_windows_camera_video_settings_and_automatic_wall(record_testsuit
         _require(
             result.returncode == 0
             and all(path.is_file() for path in retained)
-            and identity_state.load_identity_state(profile / "identity").site_id
-            == identity.site_id,
+            and desktop._profile_identity(profile).site_id == identity.site_id,
             "Camera gate uninstall changed retained profile or footage",
         )
         receipt["uninstall_preserves_profile"] = True

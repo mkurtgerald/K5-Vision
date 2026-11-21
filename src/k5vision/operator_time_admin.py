@@ -335,9 +335,16 @@ class WindowsTimeAdministrator:
 
     def _owned_elevation(self, executable: Path, request: Path, response: Path):
         from k5vision.operator_native_process import _WindowsJob
+        from k5vision.service_setup import is_recorder_account
 
         if os.name != "nt":
             raise TimeAdministrationError("time_unsupported")
+        if is_recorder_account():
+            # Session 0 has no interactive desktop for UAC. The admitted GUI
+            # explicitly elevates the fixed helper, which consumes this same
+            # private, live-issuer capability and writes its existing result.
+            self._wait_service_approval(request, response)
+            return
         job, process = None, None
         try:
             job = _WindowsJob()
@@ -378,6 +385,39 @@ class WindowsTimeAdministrator:
             if job is not None:
                 job.close()
 
+    def _wait_service_approval(self, request: Path, response: Path):
+        deadline = time.monotonic() + 65.0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeAdministrationError("time_operation_timeout")
+            with self._ownership:
+                if self._closed.is_set():
+                    raise TimeAdministrationError("time_unavailable")
+                if request not in self._pending:
+                    raise TimeAdministrationError("time_elevation_cancelled")
+                try:
+                    _regular_file(request)
+                except FileNotFoundError:
+                    raise TimeAdministrationError("time_elevation_cancelled") from None
+                try:
+                    _regular_file(response)
+                    # The native helper publishes with FileShare.None. Wait
+                    # for its writer to close before the existing strict
+                    # result/nonce validation reads the completed document.
+                    with response.open("rb") as completed:
+                        completed.read(1)
+                except FileNotFoundError:
+                    pass
+                except PermissionError as error:
+                    if getattr(error, "winerror", None) != 32:
+                        raise
+                else:
+                    if time.monotonic() >= deadline:
+                        raise TimeAdministrationError("time_operation_timeout")
+                    return
+            self._closed.wait(min(0.1, remaining))
+
     def cancel_current(self):
         with self._ownership:
             # Remove admission tokens before ending a still-pending UAC broker.
@@ -387,6 +427,7 @@ class WindowsTimeAdministrator:
                     file.unlink(missing_ok=True)
                 except OSError:
                     pass
+            self._pending.clear()
             if self._broker is not None and self._broker.poll() is None:
                 self._broker.kill()
 
@@ -402,9 +443,15 @@ class WindowsTimeAdministrator:
         if reference and host["mode"] == "manual" and host["ntp_servers"]:
             host["reference"] = self._measure(host["ntp_servers"][0])
         capable = os.name == "nt" and self.executable.is_file()
+        capabilities = {"configure_ntp": capable, "resynchronize": capable}
+        if capable:
+            from k5vision.service_setup import is_recorder_account
+
+            if is_recorder_account():
+                capabilities["requires_interactive_approval"] = True
         return {
             "host": host,
-            "capabilities": {"configure_ntp": capable, "resynchronize": capable},
+            "capabilities": capabilities,
             "absolute_accuracy_certified": False,
         }
 

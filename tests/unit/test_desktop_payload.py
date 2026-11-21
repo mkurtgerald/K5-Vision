@@ -66,6 +66,51 @@ def test_exact_donor_identity_detects_size_and_content_tampering(builder, tmp_pa
         builder.admit(donor, identity)
 
 
+def test_recorder_wrapper_and_complete_notice_are_admitted_and_sealed(
+    builder, tmp_path, monkeypatch
+):
+    root = tmp_path / "source"
+    payload = tmp_path / "payload"
+    (root / "third_party/licenses").mkdir(parents=True)
+    (root / "windows/desktop").mkdir(parents=True)
+    payload.mkdir()
+    raw = b"pinned native SCM wrapper"
+    notice = b"MIT License\nCopyright original author\nComplete permission notice\n"
+    (root / "third_party/licenses/WinSW-MIT.txt").write_bytes(notice)
+    configuration = b"<service><id>K5VisionRecorder</id></service>\n"
+    (root / "windows/desktop/K5VisionRecorder.xml").write_bytes(configuration)
+    identity = {
+        "bytes": len(raw),
+        "sha256": sha256(raw).hexdigest(),
+        "license_path": "third_party/licenses/WinSW-MIT.txt",
+        "license_sha256": sha256(notice).hexdigest(),
+    }
+    monkeypatch.setattr(builder, "ROOT", root)
+
+    def donor_download(expected, path):
+        path.write_bytes(raw)
+        builder.admit(path, expected)
+
+    monkeypatch.setattr(builder, "download", donor_download)
+    inventory = builder.provision_recorder_service(payload, identity)
+    assert (payload / "K5VisionRecorder.exe").read_bytes() == raw
+    assert (payload / "licenses/WinSW-MIT.txt").read_bytes() == notice
+    assert (payload / "K5VisionRecorder.xml").read_bytes() == configuration
+    assert inventory["runtime_downloads"] is False
+    generated = tmp_path / "PayloadIdentity.generated.cs"
+    builder.write_manifest(payload, "a" * 40, generated)
+    sealed = json.loads((payload / "payload-manifest.json").read_bytes())
+    files = {entry["path"]: entry for entry in sealed["files"]}
+    assert files["K5VisionRecorder.exe"]["sha256"] == sha256(raw).hexdigest()
+    assert files["K5VisionRecorder.xml"]["sha256"] == sha256(configuration).hexdigest()
+    assert files["licenses/WinSW-MIT.txt"]["sha256"] == sha256(notice).hexdigest()
+    (root / "third_party/licenses/WinSW-MIT.txt").write_bytes(b"abridged notice")
+    refused = tmp_path / "refused"
+    refused.mkdir()
+    with pytest.raises(ValueError, match="license identity mismatch"):
+        builder.provision_recorder_service(refused, identity)
+
+
 def test_identity_native_smoke_executes_rs256_jwk_and_totp_primitives(builder):
     # This executes genuine crypto primitives; the Windows payload builder runs
     # the same code in its isolated embedded interpreter before packaging.

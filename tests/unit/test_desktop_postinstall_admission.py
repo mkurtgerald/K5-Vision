@@ -17,8 +17,8 @@ def test_native_setup_verifies_bytes_during_extraction_and_exact_tree_before_suc
     early = setup.split("procedure AdmitExtractedPayload();", 1)[1].split(
         "procedure CurStepChanged(Step: TSetupStep);", 1
     )[0]
-    assert "ExpandConstant('{app}\\K5Vision.exe')" in early
-    assert "'--installation-extraction-check'" in early
+    assert "ExpandConstant('{tmp}\\K5VisionInstallGuard.exe')" in early
+    assert "'--installation-machine-extraction-check'" in early
     assert "'--installation-payload-check'" not in early
     assert "ewWaitUntilTerminated" in early
     assert "(ExitCode <> 0)" in early
@@ -30,6 +30,14 @@ def test_native_setup_verifies_bytes_during_extraction_and_exact_tree_before_suc
     )[0]
     assert "Step = ssPostInstall" in post
     assert "'--installation-payload-check'" in post
+    assert post.index("'--installation-service-seal'") < post.index(
+        "'--installation-payload-check'"
+    )
+    assert (
+        post.index("'--installation-payload-check'")
+        < post.index("'--installation-service-install'")
+        < post.index("'--installation-service-start'")
+    )
     assert "ewWaitUntilTerminated" in post
     assert "FinalPayloadVerified := False;" in post
     assert "FinalPayloadVerified := ExitCode = 0;" in post

@@ -38,6 +38,7 @@ _SETTINGS_TRUE = [
     "settings_restored_before_restart",
 ]
 _TRUE = [
+    "windows_service",
     "native_windows_execution",
     "generated_media_only",
     "actual_gui_installer",
@@ -119,7 +120,6 @@ _FALSE = [
     "physical_camera_acceptance",
     "capacity_acceptance",
     "endurance_acceptance",
-    "windows_service",
     "mocked_gui",
     "user_terminal_required",
     "analytics_mock_inference",
@@ -462,6 +462,7 @@ _PRIMARY_TESTS = {
     "test_owned_cleanup_accepts_a_delayed_real_owned_process_exit",
 }
 _SCOPED_TRUE = [
+    "windows_service",
     "native_windows_execution",
     "generated_media_only",
     "actual_gui_installer",
@@ -488,7 +489,6 @@ _SCOPED_FALSE = [
     "physical_camera_acceptance",
     "capacity_acceptance",
     "endurance_acceptance",
-    "windows_service",
     "mocked_gui",
     "user_terminal_required",
     "analytics_mock_inference",

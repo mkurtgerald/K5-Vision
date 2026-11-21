@@ -1,0 +1,27 @@
+<service>
+  <id>K5VisionRecorder</id>
+  <name>K5 Vision Recorder</name>
+  <description>Records enrolled K5 Vision cameras before sign-in and independently of the operator client.</description>
+  <executable>%BASE%\K5Vision.exe</executable>
+  <startarguments>--recorder-host</startarguments>
+  <stopexecutable>%BASE%\K5Vision.exe</stopexecutable>
+  <stoparguments>--recorder-stop</stoparguments>
+  <workingdirectory>%BASE%</workingdirectory>
+  <startmode>Automatic</startmode>
+  <stoptimeout>60 sec</stoptimeout>
+  <stopparentprocessfirst>true</stopparentprocessfirst>
+  <onfailure action="restart" delay="5 sec" />
+  <onfailure action="restart" delay="15 sec" />
+  <onfailure action="restart" delay="60 sec" />
+  <resetfailure>1 hour</resetfailure>
+  <serviceaccount>
+    <domain>NT SERVICE</domain>
+    <user>K5VisionRecorder</user>
+  </serviceaccount>
+  <securityDescriptor>D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;CCLCSWLORC;;;AU)</securityDescriptor>
+  <logpath>%ProgramData%\K5Vision\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>1024</sizeThreshold>
+    <keepFiles>4</keepFiles>
+  </log>
+</service>

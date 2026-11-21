@@ -480,7 +480,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
     parent = Path(os.environ["LOCALAPPDATA"]) / ("K5 Motion Proof-" + uuid4().hex)
     identity_state.validate_new_identity_directory(parent)
     parent.mkdir(mode=0o700)
-    installed, profile = parent / "installed app with spaces", parent / "private profile"
+    installed, profile = desktop._machine_paths()
     api, processes, fixtures, reservations = desktop._Windows(), [], [], []
     cohort = desktop._Cohort(api)
     app = form = playwright = browser = context = page = publisher = None
@@ -492,6 +492,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
         reservations, ports = helpers._reserve_ports(3)
         for listener in reservations:
             listener.close()
+        ports = (8000, *ports[1:])
         app = desktop._start_app(installed, profile, ports[0], cohort)
         form = desktop._wait(lambda: api.form(app.pid), "Motion first-account window", process=app)
         desktop._wait(
@@ -559,7 +560,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             )
             ids.append(camera["device_id"])
         target, other = ids
-        identity = identity_state.load_identity_state(profile / "identity")
+        identity = desktop._profile_identity(profile)
         paths = [
             profile / "recordings" / MediaMTXBinding(identity.site_id, UUID(x)).path_name
             for x in ids
@@ -887,8 +888,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             result.returncode == 0
             and files
             and all(x.is_file() for x in files)
-            and identity_state.load_identity_state(profile / "identity").site_id
-            == identity.site_id,
+            and desktop._profile_identity(profile).site_id == identity.site_id,
             "Uninstall lost the motion profile or footage",
         )
         receipt.update(dict.fromkeys(_TRUE_FLAGS, True))

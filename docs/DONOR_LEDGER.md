@@ -21,6 +21,9 @@ For each donor component or copied source block, record:
 
 ## Current donor imports
 
+The unattended Windows recorder also bundles the unchanged WinSW service
+wrapper recorded below. Its MIT terms and original notices remain effective.
+
 The operator's ONVIF camera onboarding adapts the reviewed go2rtc source slice
 recorded below. The retained upstream MIT terms continue to cover that donor
 material; the surrounding K5 license does not replace them.
@@ -29,6 +32,42 @@ No Analytics business logic is vendored in K5. The following entry records the
 separate, exact-source engineering wheel and its supplemental license notice.
 
 Package dependencies declared in `pyproject.toml` are dependencies, not automatically donor-source imports. If source from one of those projects is copied or substantially adapted into this repository, add a ledger entry before merge.
+
+## WinSW Windows recorder service wrapper
+
+- **Source:** https://github.com/winsw/winsw
+- **Version/commit:** `v2.12.0`,
+  `eef5bade59fca0254e387ac73ed7625ba6aa7147`
+- **License:** MIT.
+- **Copyright:** Copyright (c) 2008-2020 Kohsuke Kawaguchi, Sun Microsystems,
+  Inc., CloudBees, Inc., Oleg Nenashev and other contributors.
+- **K5 files affected:** `windows/desktop/donors.json`,
+  `windows/desktop/K5VisionRecorder.xml`, the native host/installer, and
+  `scripts/build_desktop_payload.py`.
+- **Integration method:** bundle the unchanged official .NET 4.6.1 executable
+  as `K5VisionRecorder.exe`; configure it to supervise the sealed K5 recorder
+  host under a dedicated Windows virtual service account. No WinSW source is
+  copied into K5's implementation.
+- **Modifications:** none to the upstream executable or license. K5 supplies
+  its service configuration, bounded stop helper, private-data admission, and
+  backend lifetime management. The stop helper bounds the donor's
+  `stoparguments` path rather than assuming its `stoptimeout` applies there.
+- **Required notices:** retain the complete unchanged upstream MIT notice at
+  `third_party/licenses/WinSW-MIT.txt` and `licenses/WinSW-MIT.txt` in the
+  installer. Preserve attribution in `THIRD_PARTY_NOTICES.md`.
+- **Commercial use:** MIT permits commercial redistribution with its copyright
+  and permission notice preserved. This records the exact donor scope;
+  unattended-operation qualification is separate.
+- **Reviewed by/on:** automated official release, exact tag/source, executable
+  identity, license and service-lifecycle inspection, 2026-11-21.
+- **Integrity:** official `WinSW.NET461.exe`, 655,872 bytes, SHA-256
+  `b5066b7bbdfba1293e5d15cda3caaea88fbeab35bd5b38c41c913d492aadfc4f`;
+  unchanged license SHA-256
+  `1cdf703c10a70e5973bf3acf2a5eeabe7746237155b92db2034aeae26fdf7802`.
+  Both files are pinned by the build and the installed payload seal.
+- **Replacement boundary:** Windows SCM wrapper only. A donor upgrade requires
+  renewed artifact and notice admission plus actual installed-service start,
+  stop, failure recovery and private-profile acceptance.
 
 ## Entry template
 

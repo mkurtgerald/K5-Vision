@@ -34,6 +34,17 @@ runtime package is described below; all upstream rights remain effective.
 
 ## Runtime and development dependencies
 
+### WinSW Windows recorder service
+
+The native machine installer bundles the unchanged WinSW 2.12.0 .NET 4.6.1
+service wrapper from [winsw/winsw](https://github.com/winsw/winsw/tree/v2.12.0).
+WinSW is copyright its upstream authors and distributed under the MIT License.
+The complete unchanged copyright and permission notice is retained at
+`third_party/licenses/WinSW-MIT.txt` and installed as `licenses/WinSW-MIT.txt`.
+Exact binary size, SHA-256, source and notice identity are pinned in
+`windows/desktop/donors.json`; the installed payload seal also covers the wrapper
+and service XML. K5's source license does not replace WinSW's MIT permissions.
+
 Dependencies declared in `pyproject.toml` must be reviewed under `docs/COMMERCIAL_DEPENDENCY_POLICY.md` before commercial distribution. Their inclusion as package dependencies does not transfer their copyrights to K5 Vision and does not change their governing licenses.
 
 ### Native Windows authentication libraries

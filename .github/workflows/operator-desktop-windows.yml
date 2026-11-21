@@ -58,6 +58,11 @@ on:
       - tests/unit/test_operator_recording_policy*.py
       - tests/unit/test_operator_motion_ui.py
       - tests/unit/test_windows_motion_workflow.py
+      - tests/integration/test_windows_service_recording.py
+      - tests/integration/windows_service_acceptance.py
+      - scripts/verify_windows_service_receipt.py
+      - tests/unit/test_windows_service_receipt.py
+      - tests/unit/test_windows_service_workflow.py
       - tests/unit/test_operator_permission_read_concurrency.py
       - tests/unit/test_operator_permission_refresh.py
       - tests/unit/test_operator_web_ui.py
@@ -126,6 +131,7 @@ jobs:
     name: Build and exercise actual graphical Windows installation
     outputs:
       setup_artifact_id: ${{ steps.qualified_desktop_setup.outputs.artifact-id }}
+      candidate_artifact_id: ${{ steps.unqualified_desktop_candidate.outputs.artifact-id }}
       primary_witness_artifact_id: ${{ steps.primary_desktop_witness.outputs.artifact-id }}
       primary_run_attempt: ${{ github.run_attempt }}
     runs-on: windows-2025
@@ -167,13 +173,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $compiler = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-          if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw "Native .NET Framework compiler unavailable" }
-          $source = (Resolve-Path -LiteralPath windows/desktop/K5Vision.cs).Path
-          $identity = (Resolve-Path -LiteralPath desktop-build/PayloadIdentity.generated.cs).Path
-          $output = Join-Path $env:GITHUB_WORKSPACE "desktop-build\payload\K5Vision.exe"
-          & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll ('/out:' + $output) $source $identity
-          if ($LASTEXITCODE -ne 0) { throw "Native graphical supervisor compilation failed" }
+          python scripts/compile_desktop_launcher.py --build desktop-build
+          if ($LASTEXITCODE -ne 0) { throw "Native recording service and client compilation failed" }
       - name: Exercise native Windows Time configuration and restoration
         timeout-minutes: 6
         shell: pwsh
@@ -291,12 +292,14 @@ jobs:
             payload_manifest_sha256=(Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
           } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $candidate "desktop-package.json") -Encoding utf8
       - name: Upload non-release candidate for independent upgrade and reversal qualification
+        id: unqualified_desktop_candidate
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: k5-vision-windows-upgrade-candidate-${{ github.event.pull_request.head.sha || github.sha }}
           path: desktop-build/upgrade-candidate/
           if-no-files-found: error
           retention-days: 14
+
       - name: Exercise actual installer, first-run account, tray, media and uninstall
         timeout-minutes: 12
         shell: pwsh
@@ -902,5 +905,105 @@ jobs:
         with:
           name: desktop-upgrade-windows-witness-${{ github.run_id }}
           path: desktop-upgrade-windows.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  service-recording:
+    name: Exercise actual installed SCM recording and recovery
+    needs: [native-desktop]
+    if: ${{ always() && !cancelled() && (needs.native-desktop.result == 'success' || needs.native-desktop.result == 'failure') && needs.native-desktop.outputs.candidate_artifact_id != '' }}
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_NATIVE_SERVICE_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+    steps:
+      - name: Checkout exact service candidate acceptance source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up separate service acceptance runner
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install service acceptance dependencies outside the product
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Provision immutable generated camera tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Verify exact current-attempt candidate artifact producer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_ARTIFACT_ID: ${{ needs.native-desktop.outputs.candidate_artifact_id }}
+          EXECUTION_HEAD_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:CANDIDATE_ARTIFACT_ID -notmatch '^[1-9][0-9]*$') { throw "Candidate artifact id absent" }
+          $headers = @{ Authorization="Bearer $env:GH_TOKEN"; Accept="application/vnd.github+json"; "X-GitHub-Api-Version"="2022-11-28" }
+          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:CANDIDATE_ARTIFACT_ID"
+          $meta = Invoke-RestMethod -Uri $uri -Headers $headers
+          $expectedName = "k5-vision-windows-upgrade-candidate-$env:K5_DESKTOP_HEAD_SHA"
+          if ([string]$meta.id -ne $env:CANDIDATE_ARTIFACT_ID -or $meta.name -ne $expectedName -or
+              [string]$meta.workflow_run.id -ne $env:GITHUB_RUN_ID -or
+              $meta.workflow_run.head_sha -ne $env:EXECUTION_HEAD_SHA -or $meta.expired -ne $false) {
+            throw "Service candidate artifact producer mismatch"
+          }
+          @{ artifact_id=$meta.id; run_id=$meta.workflow_run.id; run_attempt=$env:GITHUB_RUN_ATTEMPT;
+             head_sha=$env:K5_DESKTOP_HEAD_SHA; installer_qualification_status='unqualified' } |
+            ConvertTo-Json | Set-Content -LiteralPath service-candidate-provenance.json -Encoding utf8
+      - name: Download the original unqualified candidate without rebuilding
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: ${{ needs.native-desktop.outputs.candidate_artifact_id }}
+          path: service-input
+          merge-multiple: true
+      - name: Bind service proof to exact unqualified candidate bytes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Get-Content -LiteralPath service-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath service-input/payload-manifest.json -Raw | ConvertFrom-Json
+          $setup = Get-Item -LiteralPath service-input/K5VisionSetup.exe
+          $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($package.qualification_status -ne "unqualified" -or
+              $package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
+              $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath service-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
+              $package.launcher_sha256 -notmatch '^[a-f0-9]{64}$' -or
+              $manifest.files.path -notcontains "K5VisionRecorder.exe" -or
+              $manifest.files.path -notcontains "K5VisionRecorder.xml") {
+            throw "Service candidate exact installer identity mismatch"
+          }
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_DESKTOP_SETUP_SHA256=$sha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Verify fail-closed native service receipt admission
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_windows_service_receipt.py tests/unit/test_windows_service_workflow.py -o addopts= --no-cov --tb=short
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exercise independent recording and actual SCM failure recovery
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_service_recording.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=400 --junitxml=service-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_windows_service_receipt.py service-windows.xml service-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve finite service evidence without asserting overall beta qualification
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: service-windows-witness-${{ github.run_id }}
+          path: |
+            service-windows.xml
+            service-windows-receipt.json
+            service-candidate-provenance.json
           if-no-files-found: warn
           retention-days: 14

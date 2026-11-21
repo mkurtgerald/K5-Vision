@@ -39,6 +39,7 @@ def test_motion_is_a_ninth_independent_success_required_native_job():
         "motion-recording",
         "vm-clock",
         "cross-revision-upgrade",
+        "service-recording",
     }
     assert "lane: [setup, onvif, cameras]" in text
     assert "clock_run: [1, 2]" in _job("vm-clock")

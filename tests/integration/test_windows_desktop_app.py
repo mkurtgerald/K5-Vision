@@ -329,7 +329,7 @@ class _Windows:
 
 
 class _Cohort:
-    """Observe only processes descended from this test's desktop executable."""
+    """Observe explicit GUI and installed-SCM process roots owned by this test."""
 
     def __init__(self, api):
         self.api = api
@@ -337,6 +337,8 @@ class _Cohort:
         self.processes = {}
         self.console_seen = False
         self.failed = False
+        self.service = None
+        self.service_stopped = True
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._observe, daemon=True)
@@ -383,6 +385,17 @@ class _Cohort:
     def finish(self):
         self.stop.set()
         self.thread.join(timeout=5)
+        # A failed UI journey must not kill the wrapper and let SCM restart an
+        # unobserved engine. Stop the actual installed service before retiring
+        # process identities. GUI-only exit is tested by the dedicated lane.
+        if self.service is not None and not self.service_stopped:
+            try:
+                self.snapshot()
+                _service_control(self.service.installed, "stop")
+                self.service_stopped = True
+                _wait_owned_cleanup(self)
+            except BaseException:
+                self.failed = True
 
 
 def _wait(condition, label, *, timeout=30, process=None):
@@ -796,6 +809,114 @@ def _verify_installed_worker_bundle(installed: Path) -> None:
     _require(seen == set(expected), "Installed native worker set is incomplete")
 
 
+def _machine_paths():
+    """Use the same protected, fixed locations as the installed product."""
+    return (
+        Path(os.environ.get("ProgramW6432", os.environ["ProgramFiles"])) / "K5 Vision",
+        Path(os.environ["PROGRAMDATA"]) / "K5Vision",
+    )
+
+
+def _profile_identity(profile):
+    """Read generated fixture identity as an elevated administrator.
+
+    Production admission must run under the service token. Calling its private
+    owner checks under the test runner would wrongly treat the service SID as
+    a foreign principal; this test-only bounded read grants no product trust.
+    """
+    if os.name != "nt" or Path(profile) != _machine_paths()[1]:
+        return identity_state.load_identity_state(Path(profile) / "identity")
+    path = Path(profile) / "identity" / "identity.json"
+    raw = path.read_bytes()
+    _require(0 < len(raw) <= 1024, "Installed identity manifest exceeded its bound")
+    value = json.loads(raw)
+    _require(
+        type(value) is dict
+        and set(value) == {"schema_version", "site_id"}
+        and type(value["schema_version"]) is int
+        and value["schema_version"] == 1
+        and type(value["site_id"]) is str
+        and re.fullmatch(r"install-[a-f0-9]{32}", value["site_id"]) is not None,
+        "Installed generated identity manifest was invalid",
+    )
+    return SimpleNamespace(site_id=value["site_id"])
+
+
+def _service_control(installed, action):
+    _require(action in {"start", "stop"}, "Unsupported acceptance service action")
+    result = subprocess.run(
+        [str(Path(installed) / "K5Vision.exe"), "--installation-service-" + action],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=70 if action == "stop" else 35,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    _require(result.returncode == 0, "Installed SCM controller refused " + action)
+
+
+def _prepare_generated_recording(path):
+    """Give test-created archive media a normally admitted administrator owner.
+
+    Real service recordings retain their service owner. The generated archive
+    is written by the elevated test runner, whose user SID the service must
+    correctly refuse; only these explicit new fixture files are adjusted.
+    """
+    path = Path(path)
+    _require(
+        path.is_file() and path.is_relative_to(_machine_paths()[1] / "recordings"),
+        "Generated archive ownership target is outside the fixture recording root",
+    )
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    security.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    security.ConvertStringSidToSidW.restype = wintypes.BOOL
+    security.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    security.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    kernel.LocalFree.argtypes, kernel.LocalFree.restype = [ctypes.c_void_p], ctypes.c_void_p
+    owner = ctypes.c_void_p()
+    _require(
+        security.ConvertStringSidToSidW("S-1-5-32-544", ctypes.byref(owner)),
+        "Generated archive administrator SID could not be prepared",
+    )
+    try:
+        _require(
+            security.SetNamedSecurityInfoW(str(path), 1, 1, owner, None, None, None) == 0,
+            "Generated archive administrator ownership could not be established",
+        )
+    finally:
+        kernel.LocalFree(owner)
+
+
+def _attach_installed_service(installed, cohort):
+    service = _helpers("windows_service_acceptance").InstalledService(installed)
+    state = service.status()
+    if state["state"] == 1:
+        _service_control(installed, "start")
+    _wait(lambda: service.status()["state"] == 4, "Installed SCM recorder running", timeout=30)
+    configuration = service.configuration()
+    _require(
+        configuration["service_type"] == 0x10
+        and configuration["start_type"] == 2
+        and configuration["account"].casefold() == r"NT SERVICE\K5VisionRecorder".casefold()
+        and configuration["installed_executable_verified"] is True,
+        "Installed recorder SCM configuration was not admitted",
+    )
+    root = psutil.Process(service.status()["pid"])
+    _require(service.session(root) == 0, "Installed recorder is outside Session 0")
+    cohort.service, cohort.service_stopped = service, False
+    cohort.add(root)
+
+
 def _start_app(installed, profile, port, cohort):
     environment = dict(os.environ)
     environment["PATH"] = os.pathsep.join(
@@ -803,15 +924,22 @@ def _start_app(installed, profile, port, cohort):
     )
     environment["PYTHONHOME"] = str(profile.parent / "no external Python")
     environment["PYTHONPATH"] = str(profile.parent / "no external modules")
+    command = [str(installed / "K5Vision.exe")]
+    wrapper_present = (installed / "K5VisionRecorder.exe").is_file()
+    machine_paths_requested = (installed, profile) == _machine_paths()
+    if wrapper_present or machine_paths_requested:
+        _require(
+            wrapper_present and machine_paths_requested and port == 8000,
+            "Machine service acceptance tried to redirect protected state or port",
+        )
+        _attach_installed_service(installed, cohort)
+    else:
+        # Retain the historical baseline launcher protocol for the separately
+        # scoped cross-revision migration test; it is never SCM evidence.
+        command += ["--profile", str(profile), "--port", str(port)]
+    command.append("--no-browser")
     process = subprocess.Popen(
-        [
-            str(installed / "K5Vision.exe"),
-            "--profile",
-            str(profile),
-            "--port",
-            str(port),
-            "--no-browser",
-        ],
+        command,
         cwd=installed,
         env=environment,
         stdin=subprocess.DEVNULL,
@@ -1194,6 +1322,11 @@ def _stop_app(process, form, api, cohort, *, diagnostic=None):
     __tracebackhide__ = True
     api.click(api.control(form, _STOP))
     _require(process.wait(timeout=40) == 0, "Desktop stop and quit did not finish successfully")
+    if cohort.service is not None and not cohort.service_stopped:
+        # Intentional engine shutdown for reinstall/restart and closed-file
+        # inspection is a separate SCM operation, never a client exit effect.
+        _service_control(cohort.service.installed, "stop")
+        cohort.service_stopped = True
     _wait_owned_cleanup(cohort, diagnostic=diagnostic)
 
 
@@ -1910,7 +2043,16 @@ def _desktop_nvr_journey(
     evidence["resumed_recording_bytes"] = sizes()[0]
 
     mark_nvr_phase("historical_navigation")
-    seeded = browser_helpers._seed_recorded_history(camera_directories[0], ffmpeg, parent)
+    seeded = browser_helpers._seed_recorded_history(
+        camera_directories[0],
+        ffmpeg,
+        parent,
+        prepare_file=(
+            _prepare_generated_recording
+            if os.name == "nt" and Path(profile) == _machine_paths()[1]
+            else None
+        ),
+    )
     evidence.update(
         browser_helpers._recording_navigation_journey(
             page, device_id=camera_ids[0], seeded=seeded, diagnostic=diagnostic
@@ -3763,7 +3905,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     parent = Path(os.environ["LOCALAPPDATA"]) / ("K5 Desktop Proof-" + uuid4().hex)
     identity_state.validate_new_identity_directory(parent)
     parent.mkdir(mode=0o700)
-    installed, profile = parent / "installed app with spaces", parent / "profile with spaces"
+    installed, profile = _machine_paths()
     username, password = "fixture-admin", secrets.token_urlsafe(32)
     processes, reservations = [], []
     admin_executor = None
@@ -3802,7 +3944,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         "physical_camera_acceptance": False,
         "capacity_acceptance": False,
         "endurance_acceptance": False,
-        "windows_service": False,
+        "windows_service": True,
         "host_clock_step_acceptance": False,
         "mocked_gui": False,
         "user_terminal_required": False,
@@ -3960,7 +4102,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["installed_worker_bundle_verified"] = True
         receipt["actual_gui_installer"] = True
         reservations, ports = helpers._reserve_ports(5)
-        port, upstream_ports = ports[0], ports[1:]
+        port, upstream_ports = 8000, ports[1:]
         for listener in reservations:
             listener.close()
         _enter_stage("first_account_screen")
@@ -4005,7 +4147,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             timeout=10,
         )
         receipt.update(_default_browser_handoff(api, form, port, diagnostic=readiness_diagnostic))
-        identity = identity_state.load_identity_state(profile / "identity")
+        identity = _profile_identity(profile)
         python_processes = [
             process
             for process in cohort.snapshot()
@@ -4687,7 +4829,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         )
         _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
         _require(
-            identity_state.load_identity_state(profile / "identity").site_id == identity.site_id,
+            _profile_identity(profile).site_id == identity.site_id,
             "Stopped reinstall replaced the existing account identity",
         )
         _require(
@@ -4734,7 +4876,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "Native restart lost the operator's paused recording choice",
         )
         _require(
-            identity_state.load_identity_state(profile / "identity").site_id == identity.site_id,
+            _profile_identity(profile).site_id == identity.site_id,
             "Desktop restart changed the durable account site",
         )
         _require(all(path.is_file() for path in saved_files), "Restart removed recorded files")
@@ -4861,7 +5003,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         _require(result.returncode == 0, "Native desktop uninstall failed")
         _require(not (installed / "K5Vision.exe").exists(), "Uninstall left the installed app")
         _require(
-            identity_state.load_identity_state(profile / "identity").site_id == identity.site_id,
+            _profile_identity(profile).site_id == identity.site_id,
             "Uninstall removed or changed durable account state",
         )
         _require(all(path.is_file() for path in saved_files), "Uninstall removed recording files")

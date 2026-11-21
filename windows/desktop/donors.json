@@ -347,5 +347,16 @@
         "license": "Apache-2.0"
       }
     ]
+  },
+  "winsw": {
+    "version": "2.12.0",
+    "url": "https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW.NET461.exe",
+    "bytes": 655872,
+    "sha256": "b5066b7bbdfba1293e5d15cda3caaea88fbeab35bd5b38c41c913d492aadfc4f",
+    "source": "https://github.com/winsw/winsw/tree/eef5bade59fca0254e387ac73ed7625ba6aa7147",
+    "source_revision": "eef5bade59fca0254e387ac73ed7625ba6aa7147",
+    "license": "MIT",
+    "license_path": "third_party/licenses/WinSW-MIT.txt",
+    "license_sha256": "1cdf703c10a70e5973bf3acf2a5eeabe7746237155b92db2034aeae26fdf7802"
   }
 }

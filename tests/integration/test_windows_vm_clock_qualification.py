@@ -336,7 +336,7 @@ def test_native_windows_vm_clock_qualification(record_testsuite_property):
     parent = Path(os.environ["LOCALAPPDATA"]) / ("K5 Clock Proof-" + uuid4().hex)
     identity_state.validate_new_identity_directory(parent)
     parent.mkdir(mode=0o700)
-    installed, profile = parent / "installed app with spaces", parent / "profile with spaces"
+    installed, profile = desktop._machine_paths()
     username, password = "fixture-admin", secrets.token_urlsafe(32)
     processes, reservations = [], []
     onvif_cameras, publishers, sources = [], [], []
@@ -359,7 +359,7 @@ def test_native_windows_vm_clock_qualification(record_testsuite_property):
         "physical_camera_acceptance": False,
         "capacity_acceptance": False,
         "endurance_acceptance": False,
-        "windows_service": False,
+        "windows_service": True,
         "mocked_gui": False,
         "user_terminal_required": False,
         "browser_channel": "msedge",
@@ -372,7 +372,7 @@ def test_native_windows_vm_clock_qualification(record_testsuite_property):
         require((installed / "runtime/python.exe").is_file(), "Embedded Python was not installed")
         receipt["actual_gui_installer"] = True
         reservations, ports = helpers._reserve_ports(5)
-        port, upstream_ports = ports[0], ports[1:]
+        port, upstream_ports = 8000, ports[1:]
         for listener in reservations:
             listener.close()
         stage = "first_account_screen"
@@ -409,7 +409,7 @@ def test_native_windows_vm_clock_qualification(record_testsuite_property):
             "Desktop left the initial password in its input controls",
         )
         receipt.update(actual_gui_account_setup=True, administrator_login=True)
-        identity = identity_state.load_identity_state(profile / "identity")
+        identity = desktop._profile_identity(profile)
         python_processes = [
             process
             for process in cohort.snapshot()

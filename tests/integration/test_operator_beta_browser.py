@@ -828,7 +828,7 @@ def test_timeline_clip_selects_playable_span_after_short_recording_fragment(inte
     assert _playable_timeline_span(intervals) == expected
 
 
-def _seed_recorded_history(recording_directory, ffmpeg, parent, *, color="red"):
+def _seed_recorded_history(recording_directory, ffmpeg, parent, *, color="red", prepare_file=None):
     """Create real donor-readable historical media, not a mocked history response.
 
     Eighteen ten-minute files provide three hours of decodable footage with an
@@ -890,6 +890,8 @@ def _seed_recorded_history(recording_directory, ffmpeg, parent, *, color="red"):
             if os.name == "posix":
                 os.fchmod(output.fileno(), 0o600)
             output.write(payload)
+        if prepare_file is not None:
+            prepare_file(destination)
         files.append(destination)
     return {
         "first": first,

@@ -23,7 +23,8 @@ _BETA_SPEC.loader.exec_module(_BETA_VERIFIER)
 
 _CASE = "test_native_windows_click_install_account_browser_tray_restart_uninstall"
 _REQUIRED_TRUE = (
-    "native_windows_execution generated_media_only actual_gui_installer actual_gui_account_setup "
+    "native_windows_execution windows_service generated_media_only "
+    "actual_gui_installer actual_gui_account_setup "
     "installed_worker_bundle_verified "
     "administrator_login embedded_python_independent_of_path actual_edge_login_enrollment_live "
     "close_hides_to_tray recording_continues_after_browser_and_window_close "
@@ -35,7 +36,7 @@ _REQUIRED_TRUE = (
     "onvif_time_health_displayed recorder_time_health_displayed"
 ).split()
 _REQUIRED_FALSE = (
-    "physical_camera_acceptance capacity_acceptance endurance_acceptance windows_service "
+    "physical_camera_acceptance capacity_acceptance endurance_acceptance "
     "mocked_gui user_terminal_required host_clock_step_acceptance"
 ).split()
 _CLOCK_FIELDS = (

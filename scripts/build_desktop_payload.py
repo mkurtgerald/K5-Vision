@@ -65,6 +65,7 @@ _BUILD_PHASES = frozenset(
         "person_model_xml",
         "person_model_weights",
         "native_workers",
+        "recorder_service",
         "required_notices",
         "decoder_binary",
         "decoder_source_ffmpeg",
@@ -221,6 +222,42 @@ def download(identity: dict[str, object], destination: Path) -> None:
                 raise ValueError("Donor size exceeded")
             stream.write(block)
     admit(destination, identity)
+
+
+def provision_recorder_service(payload: Path, identity: dict[str, object]) -> dict[str, object]:
+    """Bundle the exact WinSW SCM wrapper and its unchanged MIT notice.
+
+    The wrapper is never downloaded by an installed recorder. The build seal
+    covers its bytes, immutable service XML and complete original license.
+    """
+    phase("recorder_service")
+    executable = payload / "K5VisionRecorder.exe"
+    download(identity, executable)
+    notice = ROOT / str(identity["license_path"])
+    if (
+        notice.is_symlink()
+        or not notice.is_file()
+        or digest(notice) != identity["license_sha256"]
+    ):
+        raise ValueError("Recorder service donor license identity mismatch")
+    destination = payload / "licenses" / "WinSW-MIT.txt"
+    destination.parent.mkdir(exist_ok=True)
+    shutil.copyfile(notice, destination)
+    configuration = ROOT / "windows" / "desktop" / "K5VisionRecorder.xml"
+    if configuration.is_symlink() or not configuration.is_file():
+        raise ValueError("Recorder service configuration missing")
+    shutil.copyfile(configuration, payload / "K5VisionRecorder.xml")
+    return {
+        **identity,
+        "executable": "K5VisionRecorder.exe",
+        "configuration": "K5VisionRecorder.xml",
+        "configuration_sha256": digest(payload / "K5VisionRecorder.xml"),
+        "retained_notice": "licenses/WinSW-MIT.txt",
+        "runtime_downloads": False,
+        "service_name": "K5VisionRecorder",
+        "service_account": "NT SERVICE\\K5VisionRecorder",
+        "automatic_start": True,
+    }
 
 
 def acquire_worker_archive(identity: dict[str, object], archive: Path, name: str) -> None:
@@ -801,6 +838,7 @@ def build(args: argparse.Namespace) -> None:
     identity_crypto = provision_identity_crypto_material(payload, donors["identity_crypto"])
     phase("onvif_notice")
     onvif_adaptation = onvif_source_adaptation(payload)
+    recorder_service = provision_recorder_service(payload, donors["winsw"])
     # The official Windows interpreter explicitly requires external end users
     # to agree to terms protecting its Microsoft Distributable Code. Present
     # these terms in the normal installer license page, with upstream text
@@ -846,6 +884,9 @@ def build(args: argparse.Namespace) -> None:
                 "neural_adapter_v2": True,
                 "analytics_event_adapter": True,
                 "shared_neural_host": False,
+                "unattended_recording_service": recorder_service,
+                "windows_service": True,
+                "interactive_client_owns_recording": False,
                 "manual_stream_uri_required": False,
                 "python": donors["python"],
                 "worker_downloads": workers,

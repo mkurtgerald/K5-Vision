@@ -1,4 +1,6 @@
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -6,6 +8,7 @@ using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Threading;
 using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
 
 namespace K5VisionDesktop
 {
@@ -88,6 +91,28 @@ namespace K5VisionDesktop
         private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
         [DllImport("kernel32.dll")]
         private static extern bool CloseHandle(IntPtr handle);
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileIdentity
+        {
+            internal uint Attributes;
+            internal System.Runtime.InteropServices.ComTypes.FILETIME Created, Accessed, Written;
+            internal uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(string path, uint access, uint share,
+            IntPtr security, uint creation, uint attributes, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileIdentity identity);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint GetFileType(SafeFileHandle handle);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool GetSecurityDescriptorOwner(IntPtr descriptor, out IntPtr owner, out bool defaulted);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool GetSecurityDescriptorDacl(IntPtr descriptor, out bool present,
+            out IntPtr acl, out bool defaulted);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern uint SetSecurityInfo(SafeFileHandle handle, int kind, uint information,
+            IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
 
         internal static string InstallRoot
         {
@@ -176,7 +201,7 @@ namespace K5VisionDesktop
             }
             AdmitData(directory, service);
         }
-        private static DirectorySecurity CodeDirectorySecurity()
+        private static DirectorySecurity CodeDirectorySecurity(bool inherit)
         {
             DirectorySecurity security = new DirectorySecurity();
             security.SetAccessRuleProtection(true, false);
@@ -184,41 +209,195 @@ namespace K5VisionDesktop
             foreach (string sid in new[] { "S-1-5-18", "S-1-5-32-544", "S-1-5-32-545" })
                 security.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid),
                     sid == "S-1-5-32-545" ? FileSystemRights.ReadAndExecute : FileSystemRights.FullControl,
-                    InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                    inherit ? InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit : InheritanceFlags.None,
                     PropagationFlags.None, AccessControlType.Allow));
             return security;
         }
         private static void PrepareCode(string root)
         {
             Custody.AdmitCode(Path.GetDirectoryName(root), root);
-            if (!Directory.Exists(root)) Directory.CreateDirectory(root, CodeDirectorySecurity());
-            else
-            {
-                Custody.AdmitCode(root, root);
-                Directory.SetAccessControl(root, CodeDirectorySecurity());
-            }
+            if (!Directory.Exists(root)) Directory.CreateDirectory(root, CodeDirectorySecurity(true));
+            else Custody.AdmitCode(root, root);
         }
-        private static void SealCode(string directory, string root)
+        private sealed class PinnedEntry : IDisposable
         {
-            Require((File.GetAttributes(directory) & FileAttributes.ReparsePoint) == 0);
-            Directory.SetAccessControl(directory, CodeDirectorySecurity());
-            foreach (string entry in Directory.GetFileSystemEntries(directory))
+            internal readonly string Relative;
+            internal readonly bool Directory;
+            internal readonly SafeFileHandle Handle;
+            internal readonly FileStream Content;
+
+            internal PinnedEntry(string path, string relative)
             {
-                Require((File.GetAttributes(entry) & FileAttributes.ReparsePoint) == 0);
-                if (Directory.Exists(entry)) SealCode(entry, root);
+                Relative = relative;
+                // OPEN_REPARSE_POINT prevents following a newly planted link;
+                // BACKUP_SEMANTICS admits ordinary directories. Share READ only
+                // pins names/ancestors against rename and denies live writers.
+                // MAXIMUM_ALLOWED is deliberate: SetSecurityInfo documents
+                // that handles opened this way do not propagate ACL changes
+                // to children. Every admitted object is secured explicitly.
+                Handle = CreateFile(path, 0x02000000u, 1, IntPtr.Zero, 3, 0x02200000u, IntPtr.Zero);
+                try
+                {
+                    FileIdentity identity = new FileIdentity();
+                    Require(Handle != null && !Handle.IsInvalid && GetFileType(Handle) == 1 &&
+                        GetFileInformationByHandle(Handle, out identity));
+                    Require((identity.Attributes & 0x400u) == 0);
+                    Directory = (identity.Attributes & 0x10u) != 0;
+                    if (!Directory)
+                    {
+                        Require(identity.Links == 1);
+                        Content = new FileStream(Handle, FileAccess.Read, 65536, false);
+                    }
+                }
+                catch { Handle.Dispose(); throw; }
+            }
+            internal void AssertOrdinary()
+            {
+                FileIdentity identity;
+                Require(GetFileType(Handle) == 1 && GetFileInformationByHandle(Handle, out identity) &&
+                    (identity.Attributes & 0x400u) == 0 && ((identity.Attributes & 0x10u) != 0) == Directory &&
+                    (Directory || identity.Links == 1));
+            }
+            internal void ApplySecurity()
+            {
+                AssertOrdinary();
+                FileSystemSecurity security;
+                // No inheritable ACEs: SetSecurityInfo may otherwise propagate
+                // a directory DACL to an unlisted child added during staging.
+                // Each admitted child receives its own protected DACL below.
+                if (Directory) security = CodeDirectorySecurity(false);
                 else
                 {
-                    FileSecurity security = new FileSecurity();
-                    security.SetAccessRuleProtection(true, false);
-                    security.SetOwner(new SecurityIdentifier("S-1-5-32-544"));
+                    FileSecurity file = new FileSecurity();
+                    file.SetAccessRuleProtection(true, false);
+                    file.SetOwner(new SecurityIdentifier("S-1-5-32-544"));
                     foreach (string sid in new[] { "S-1-5-18", "S-1-5-32-544", "S-1-5-32-545" })
-                        security.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid),
+                        file.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid),
                             sid == "S-1-5-32-545" ? FileSystemRights.ReadAndExecute : FileSystemRights.FullControl,
                             AccessControlType.Allow));
-                    File.SetAccessControl(entry, security);
+                    security = file;
+                }
+                byte[] descriptor = security.GetSecurityDescriptorBinaryForm();
+                GCHandle pinned = GCHandle.Alloc(descriptor, GCHandleType.Pinned);
+                try
+                {
+                    IntPtr owner, dacl; bool defaulted, present;
+                    Require(GetSecurityDescriptorOwner(pinned.AddrOfPinnedObject(), out owner, out defaulted));
+                    Require(GetSecurityDescriptorDacl(pinned.AddrOfPinnedObject(), out present, out dacl, out defaulted) && present);
+                    // OWNER | DACL | PROTECTED_DACL, applied to the already
+                    // verified object, never a path resolved a second time.
+                    Require(SetSecurityInfo(Handle, 1, 0x80000005u, owner, IntPtr.Zero, dacl, IntPtr.Zero) == 0);
+                }
+                finally { pinned.Free(); Array.Clear(descriptor, 0, descriptor.Length); }
+            }
+            public void Dispose()
+            {
+                if (Content != null) Content.Dispose();
+                if (Handle != null) Handle.Dispose();
+            }
+        }
+        private static void PinCodeTree(string directory, string root, HashSet<string> allowedFiles,
+            HashSet<string> allowedDirectories, Dictionary<string, PinnedEntry> pinned)
+        {
+            string relative = directory.Length == root.Length ? "" : directory.Substring(root.Length + 1).Replace('\\', '/');
+            PinnedEntry current = new PinnedEntry(directory, relative);
+            try
+            {
+                Require(current.Directory && allowedDirectories.Contains(relative));
+                pinned.Add(relative, current); current = null;
+                foreach (string path in Directory.GetFileSystemEntries(directory))
+                {
+                    string name = path.Substring(root.Length + 1).Replace('\\', '/');
+                    Require(allowedFiles.Contains(name) || allowedDirectories.Contains(name));
+                    PinnedEntry entry = new PinnedEntry(path, name);
+                    try
+                    {
+                        if (entry.Directory)
+                        {
+                            Require(allowedDirectories.Contains(name));
+                            entry.Dispose(); entry = null;
+                            PinCodeTree(path, root, allowedFiles, allowedDirectories, pinned);
+                        }
+                        else
+                        {
+                            Require(allowedFiles.Contains(name));
+                            pinned.Add(name, entry); entry = null;
+                        }
+                    }
+                    finally { if (entry != null) entry.Dispose(); }
                 }
             }
-            Directory.SetAccessControl(directory, CodeDirectorySecurity());
+            finally { if (current != null) current.Dispose(); }
+        }
+        private static void RecheckCodeInventory(string directory, string root, Dictionary<string, PinnedEntry> pinned,
+            HashSet<string> observed)
+        {
+            string relative = directory.Length == root.Length ? "" : directory.Substring(root.Length + 1).Replace('\\', '/');
+            Require(pinned.ContainsKey(relative) && pinned[relative].Directory && observed.Add(relative));
+            foreach (string path in Directory.GetFileSystemEntries(directory))
+            {
+                string name = path.Substring(root.Length + 1).Replace('\\', '/');
+                Require(pinned.ContainsKey(name));
+                if (pinned[name].Directory) RecheckCodeInventory(path, root, pinned, observed);
+                else Require(observed.Add(name));
+            }
+        }
+        private static void SealCode(string root)
+        {
+            byte[] raw;
+            using (FileStream source = new FileStream(Path.Combine(root, "payload-manifest.json"),
+                FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                Require(source.Length > 0 && source.Length <= 4 * 1024 * 1024);
+                raw = new byte[(int)source.Length];
+                int offset = 0;
+                while (offset < raw.Length)
+                {
+                    int count = source.Read(raw, offset, raw.Length - offset);
+                    Require(count > 0); offset += count;
+                }
+            }
+            Require(Custody.Sha256(raw) == PayloadIdentity.ManifestSha256);
+            Dictionary<string, object> manifest = Json.Parse(System.Text.Encoding.UTF8.GetString(raw));
+            Require(Convert.ToInt32(manifest["schema_version"]) == 1 && (string)manifest["head_sha"] == PayloadIdentity.HeadSha);
+            Dictionary<string, Dictionary<string, object>> expected = new Dictionary<string, Dictionary<string, object>>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> allowedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+                "K5Vision.exe", "payload-manifest.json", "unins000.exe", "unins000.dat", "unins000.msg" };
+            HashSet<string> allowedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "" };
+            foreach (object value in (IEnumerable)manifest["files"])
+            {
+                Dictionary<string, object> item = (Dictionary<string, object>)value;
+                string path = (string)item["path"];
+                Require(path.Length != 0 && !path.Contains("\\") && !path.StartsWith("/") &&
+                    Array.TrueForAll(path.Split('/'), part => part.Length != 0 && part != "." && part != ".."));
+                Require(!allowedFiles.Contains(path)); allowedFiles.Add(path); expected.Add(path, item);
+                int slash = path.LastIndexOf('/');
+                while (slash >= 0) { allowedDirectories.Add(path.Substring(0, slash)); slash = path.LastIndexOf('/', slash - 1); }
+            }
+            Dictionary<string, PinnedEntry> pinned = new Dictionary<string, PinnedEntry>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                PinCodeTree(root, root, allowedFiles, allowedDirectories, pinned);
+                foreach (KeyValuePair<string, Dictionary<string, object>> item in expected)
+                {
+                    Require(pinned.ContainsKey(item.Key) && !pinned[item.Key].Directory);
+                    FileStream content = pinned[item.Key].Content;
+                    Require(content.Length == Convert.ToInt64(item.Value["bytes"]));
+                    using (System.Security.Cryptography.SHA256 hash = System.Security.Cryptography.SHA256.Create())
+                        Require(BitConverter.ToString(hash.ComputeHash(content)).Replace("-", "").ToLowerInvariant() == (string)item.Value["sha256"]);
+                }
+                Require(pinned.ContainsKey("K5Vision.exe") && pinned.ContainsKey("payload-manifest.json"));
+                using (System.Security.Cryptography.SHA256 hash = System.Security.Cryptography.SHA256.Create())
+                    Require(BitConverter.ToString(hash.ComputeHash(pinned["payload-manifest.json"].Content)).Replace("-", "").ToLowerInvariant() == PayloadIdentity.ManifestSha256);
+                HashSet<string> observed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                RecheckCodeInventory(root, root, pinned, observed);
+                Require(observed.Count == pinned.Count);
+                foreach (PinnedEntry entry in pinned.Values) entry.AssertOrdinary();
+                // No ACL change occurs until the entire allowed tree and all
+                // ordinary single-link objects have been admitted and pinned.
+                foreach (PinnedEntry entry in pinned.Values) entry.ApplySecurity();
+            }
+            finally { foreach (PinnedEntry entry in pinned.Values) entry.Dispose(); }
         }
         private static void RequireNoLegacyProfiles()
         {
@@ -306,7 +485,7 @@ namespace K5VisionDesktop
                 if (operation == "seal")
                 {
                     Custody.VerifySealedFiles(root);
-                    SealCode(root, root);
+                    SealCode(root);
                     return 0;
                 }
                 manager = OpenSCManager(null, null, operation == "install" ? 3u : 1u);
