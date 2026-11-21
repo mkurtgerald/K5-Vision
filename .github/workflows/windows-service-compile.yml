@@ -1,0 +1,56 @@
+name: Windows recorder source compilation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/unattended-windows-20261121]
+    paths:
+      - .github/workflows/windows-service-compile.yml
+      - windows/desktop/**
+      - scripts/compile_desktop_launcher.py
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/windows-service-compile.yml
+      - windows/desktop/**
+      - scripts/compile_desktop_launcher.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recorder-source-compile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    name: Compile native recorder and client without building an installer
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Compile all native entry points with warnings as errors
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path compile-only/payload -Force | Out-Null
+          @'
+          namespace K5VisionDesktop {
+            internal static class PayloadIdentity {
+              internal const string ManifestSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+              internal const string HeadSha = "0000000000000000000000000000000000000000";
+            }
+          }
+          '@ | Set-Content -LiteralPath compile-only/PayloadIdentity.generated.cs -Encoding utf8
+          python scripts/compile_desktop_launcher.py --build compile-only
+          if ($LASTEXITCODE -ne 0) { throw "Native recorder source compilation failed" }
+          # This executable has a placeholder identity. Never execute or upload
+          # it, or treat source compilation as installed-service qualification.
+          Remove-Item -LiteralPath compile-only -Recurse -Force

@@ -196,8 +196,27 @@ namespace K5VisionDesktop
 
         internal static void Admit(string path, string privateRoot)
         {
+            AdmitPath(path, privateRoot, true);
+        }
+
+        internal static void AdmitCode(string path, string applicationRoot)
+        {
+            AdmitPath(path, applicationRoot, false);
+        }
+
+        internal static void AdmitServiceData(string path, string serviceIdentity)
+        {
+            string fixedIdentity = Path.Combine(RecorderPaths.DataRoot, "identity");
+            if (!String.Equals(OrdinaryAbsolute(serviceIdentity), fixedIdentity, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException();
+            AdmitPath(path, fixedIdentity, true, RecorderPaths.ServiceSid);
+        }
+
+        private static void AdmitPath(string path, string boundary, bool privateData, string privateIdentity = null,
+            bool stagingOwner = false)
+        {
             path = OrdinaryAbsolute(path);
-            privateRoot = OrdinaryAbsolute(privateRoot);
+            boundary = OrdinaryAbsolute(boundary);
             string current = path;
             while (!String.IsNullOrEmpty(current))
             {
@@ -208,10 +227,14 @@ namespace K5VisionDesktop
                     ? (FileSystemSecurity)Directory.GetAccessControl(current, AccessControlSections.Access | AccessControlSections.Owner)
                     : File.GetAccessControl(current, AccessControlSections.Access | AccessControlSections.Owner);
                 string owner = security.GetOwner(typeof(SecurityIdentifier)).Value;
-                HashSet<string> trusted = new HashSet<string>(new[] { Program.Sid, "S-1-5-18", "S-1-5-32-544", TrustedInstaller });
+                bool withinBoundary = String.Equals(current, boundary, StringComparison.OrdinalIgnoreCase) ||
+                    current.StartsWith(boundary + "\\", StringComparison.OrdinalIgnoreCase);
+                HashSet<string> trusted = new HashSet<string>(new[] { "S-1-5-18", "S-1-5-32-544" });
+                if (privateData) trusted.Add(privateIdentity ?? Program.Sid);
+                if (!privateData || !withinBoundary) trusted.Add(TrustedInstaller);
+                if (!privateData && stagingOwner && new WindowsPrincipal(WindowsIdentity.GetCurrent())
+                    .IsInRole(WindowsBuiltInRole.Administrator)) trusted.Add(Program.Sid);
                 if (!trusted.Contains(owner)) throw new InvalidOperationException();
-                bool privateBoundary = String.Equals(current, privateRoot, StringComparison.OrdinalIgnoreCase) ||
-                    current.StartsWith(privateRoot + "\\", StringComparison.OrdinalIgnoreCase);
                 foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
                 {
                     if (rule.AccessControlType != AccessControlType.Allow ||
@@ -219,7 +242,7 @@ namespace K5VisionDesktop
                     string sid = rule.IdentityReference.Value;
                     if (sid == "S-1-3-4") sid = owner;
                     if (!trusted.Contains(sid) && ((uint)rule.FileSystemRights &
-                        (privateBoundary ? UInt32.MaxValue : 0x010D0150u)) != 0)
+                        (withinBoundary ? (privateData ? UInt32.MaxValue : 0x510D0156u) : 0x510D0150u)) != 0)
                         throw new InvalidOperationException();
                 }
                 current = Path.GetDirectoryName(current);
@@ -244,9 +267,9 @@ namespace K5VisionDesktop
 
         private static void VerifyPayload(string root, bool requireFullTree)
         {
-            Admit(root, root);
+            AdmitPath(root, root, false, null, !requireFullTree);
             string manifestPath = Path.Combine(root, "payload-manifest.json");
-            Admit(manifestPath, root);
+            AdmitPath(manifestPath, root, false, null, !requireFullTree);
             if (new FileInfo(manifestPath).Length > 4 * 1024 * 1024) throw new InvalidOperationException();
             byte[] bytes = File.ReadAllBytes(manifestPath);
             if (Sha256(bytes) != PayloadIdentity.ManifestSha256) throw new InvalidOperationException();
@@ -262,7 +285,7 @@ namespace K5VisionDesktop
                     relative.Split('/').Any(part => part == ".." || part == "." || part.Length == 0) ||
                     !admitted.Add(relative)) throw new InvalidOperationException();
                 string target = Path.Combine(root, relative.Replace('/', '\\'));
-                Admit(target, root);
+                AdmitPath(target, root, false, null, !requireFullTree);
                 using (FileStream stream = new FileStream(target, FileMode.Open, FileAccess.Read, FileShare.Read))
                 using (SHA256 hash = SHA256.Create())
                 {
@@ -272,6 +295,8 @@ namespace K5VisionDesktop
                 }
             }
             if (!admitted.Contains("runtime/python.exe") || !admitted.Contains("runtime/python312._pth") ||
+                !admitted.Contains("K5VisionRecorder.exe") || !admitted.Contains("K5VisionRecorder.xml") ||
+                !admitted.Contains("licenses/WinSW-MIT.txt") ||
                 !admitted.Contains("workers/donor-downloads.json") ||
                 !admitted.Contains("workers/mediamtx.exe") || !admitted.Contains("workers/caddy.exe") ||
                 !admitted.Contains("workers/mediamtx-LICENSE") || !admitted.Contains("workers/caddy-LICENSE"))
@@ -283,10 +308,10 @@ namespace K5VisionDesktop
 
         private static void VerifyTree(string directory, string root, HashSet<string> admitted)
         {
-            Admit(directory, root);
+            AdmitCode(directory, root);
             foreach (string entry in Directory.GetFileSystemEntries(directory))
             {
-                Admit(entry, root);
+                AdmitCode(entry, root);
                 if (Directory.Exists(entry)) VerifyTree(entry, root, admitted);
                 else if (!admitted.Contains(entry.Substring(root.Length + 1).Replace('\\', '/')))
                     throw new InvalidOperationException();
@@ -394,6 +419,8 @@ namespace K5VisionDesktop
         {
             internal IntPtr Handle;
             private ulong created100ns;
+            private readonly string expectedSid;
+            internal LiveIssuer(string expectedSid) { this.expectedSid = expectedSid; }
             internal void Bind(uint pid, ulong created)
             {
                 if (Handle != IntPtr.Zero || pid == 0 || created == 0) throw new InvalidOperationException();
@@ -423,7 +450,7 @@ namespace K5VisionDesktop
                     if (!GetTokenInformation(token, 1, buffer, needed, out needed))
                         throw new InvalidOperationException();
                     IntPtr sid = Marshal.ReadIntPtr(buffer);
-                    if (sid == IntPtr.Zero || new SecurityIdentifier(sid).Value != Program.Sid)
+                    if (sid == IntPtr.Zero || new SecurityIdentifier(sid).Value != expectedSid)
                         throw new UnauthorizedAccessException();
                     if (WaitForSingleObject(Handle, 0) != 258) throw new InvalidOperationException();
                 }
@@ -442,7 +469,7 @@ namespace K5VisionDesktop
         private sealed class DirectoryPins : IDisposable
         {
             private readonly List<SafeFileHandle> handles = new List<SafeFileHandle>();
-            internal void Acquire(string directory, string root)
+            internal void Acquire(string directory, string root, bool serviceMode)
             {
                 List<string> ancestors = new List<string>();
                 for (string current = directory; !String.IsNullOrEmpty(current);
@@ -450,7 +477,7 @@ namespace K5VisionDesktop
                 ancestors.Reverse();
                 foreach (string ancestor in ancestors)
                 {
-                    Custody.Admit(ancestor, root);
+                    AdmitTimePath(ancestor, root, serviceMode);
                     // Pin every directory from the fixed volume downwards.
                     // No FILE_SHARE_DELETE: a later reparse/rename cannot redirect
                     // elevated response creation to a different directory.
@@ -465,7 +492,7 @@ namespace K5VisionDesktop
                     }
                     handles.Add(handle);
                 }
-                Custody.Admit(directory, root);
+                AdmitTimePath(directory, root, serviceMode);
             }
             public void Dispose()
             {
@@ -536,10 +563,10 @@ namespace K5VisionDesktop
         }
 
         private static void CheckCapability(string path, string root, byte[] admitted,
-            FileIdentity expected, LiveIssuer owner)
+            FileIdentity expected, LiveIssuer owner, bool serviceMode)
         {
             owner.Check();
-            Custody.Admit(path, root);
+            AdmitTimePath(path, root, serviceMode);
             using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read,
                 FileShare.Read | FileShare.Delete))
             {
@@ -567,7 +594,7 @@ namespace K5VisionDesktop
             if (remaining <= 0) throw new TimeoutException();
             string system = Environment.GetFolderPath(Environment.SpecialFolder.System);
             string executable = Path.Combine(system, "w32tm.exe");
-            Custody.Admit(executable, Path.GetDirectoryName(Application.ExecutablePath));
+            Custody.AdmitCode(executable, Path.GetDirectoryName(executable));
             string windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
             string environment = "PATH=" + system + ";" + windows + "\0SystemDrive=" +
                 Path.GetPathRoot(windows).TrimEnd('\\') + "\0SystemRoot=" + windows +
@@ -624,10 +651,26 @@ namespace K5VisionDesktop
 
         internal static int Execute(string requestArgument, string responseArgument)
         {
+            return ExecuteOwned(requestArgument, responseArgument, false);
+        }
+
+        internal static int ExecuteService(string requestArgument, string responseArgument)
+        {
+            return ExecuteOwned(requestArgument, responseArgument, true);
+        }
+
+        private static void AdmitTimePath(string path, string root, bool serviceMode)
+        {
+            if (serviceMode) Custody.AdmitServiceData(path, root);
+            else Custody.Admit(path, root);
+        }
+
+        private static int ExecuteOwned(string requestArgument, string responseArgument, bool serviceMode)
+        {
             using (System.Threading.Timer watchdog = new System.Threading.Timer(
                 delegate { Environment.Exit(1); }, null, 45000, Timeout.Infinite))
             using (DirectoryPins directoryPins = new DirectoryPins())
-            using (LiveIssuer owner = new LiveIssuer())
+            using (LiveIssuer owner = new LiveIssuer(serviceMode ? RecorderPaths.ServiceSid : Program.Sid))
             {
             string response = null, root = null, nonce = null;
             string code = "invalid_request";
@@ -644,10 +687,12 @@ namespace K5VisionDesktop
                     StringComparison.OrdinalIgnoreCase) || Path.GetFileName(directory) != "time-admin")
                     throw new InvalidOperationException();
                 root = Path.GetDirectoryName(directory);
-                directoryPins.Acquire(directory, root);
-                Custody.Admit(directory, root);
+                if (serviceMode && !String.Equals(root, Path.Combine(RecorderPaths.DataRoot, "identity"),
+                    StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException();
+                directoryPins.Acquire(directory, root, serviceMode);
+                AdmitTimePath(directory, root, serviceMode);
                 if (File.Exists(response) || Directory.Exists(response)) throw new InvalidOperationException();
-                Custody.Admit(requestPath, root);
+                AdmitTimePath(requestPath, root, serviceMode);
                 byte[] bytes;
                 FileIdentity requestIdentity;
                 using (FileStream input = new FileStream(requestPath, FileMode.Open, FileAccess.Read,
@@ -701,7 +746,7 @@ namespace K5VisionDesktop
                 WindowsPrincipal principal = new WindowsPrincipal(WindowsIdentity.GetCurrent());
                 if (!principal.IsInRole(WindowsBuiltInRole.Administrator))
                     throw new UnauthorizedAccessException();
-                Action admit = delegate { CheckCapability(requestPath, root, bytes, requestIdentity, owner); };
+                Action admit = delegate { CheckCapability(requestPath, root, bytes, requestIdentity, owner, serviceMode); };
                 admit();
                 StartTimeService(admit, elapsed);
                 admit();
@@ -734,15 +779,30 @@ namespace K5VisionDesktop
                 // No delayed response/profile write after its issuing backend
                 // has exited, including a hard-killed owner with a live file.
                 owner.Check();
-                Custody.Admit(Path.GetDirectoryName(response), root);
-                using (FileStream output = new FileStream(response, FileMode.CreateNew,
-                    FileAccess.Write, FileShare.None))
+                AdmitTimePath(Path.GetDirectoryName(response), root, serviceMode);
+                FileSecurity responseSecurity = null;
+                if (serviceMode)
+                {
+                    // The approving administrator may be a different Windows
+                    // user. Create the response with the machine authority's
+                    // owner/ACL atomically, so the service never has to trust
+                    // that user's SID or repair permissions after creation.
+                    responseSecurity = new FileSecurity();
+                    responseSecurity.SetOwner(new SecurityIdentifier("S-1-5-32-544"));
+                    responseSecurity.SetAccessRuleProtection(true, false);
+                    foreach (string sid in new[] { RecorderPaths.ServiceSid, "S-1-5-18", "S-1-5-32-544" })
+                        responseSecurity.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid),
+                            FileSystemRights.FullControl, AccessControlType.Allow));
+                }
+                using (FileStream output = serviceMode ? new FileStream(response, FileMode.CreateNew,
+                    FileSystemRights.Write, FileShare.None, 4096, FileOptions.WriteThrough, responseSecurity) :
+                    new FileStream(response, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                 {
                     byte[] result = Encoding.UTF8.GetBytes(Json.Serializer.Serialize(new Dictionary<string, object> {
                         { "schema_version", 1 }, { "nonce", nonce }, { "succeeded", succeeded }, { "code", code } }));
                     output.Write(result, 0, result.Length); output.Flush(true);
                 }
-                Custody.Admit(response, root);
+                AdmitTimePath(response, root, serviceMode);
             }
             catch { return 1; }
             return succeeded ? 0 : 1;
@@ -754,7 +814,7 @@ namespace K5VisionDesktop
     {
         private static void VerifyFile(string path, string root, long bytes, string expected)
         {
-            Custody.Admit(path, root);
+            Custody.AdmitCode(path, root);
             using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
             using (SHA256 hash = SHA256.Create())
                 if ((bytes >= 0 && stream.Length != bytes) ||
@@ -768,7 +828,7 @@ namespace K5VisionDesktop
             // Verify the installation and exact source identities on every start.
             Custody.Admit(profile, profile);
             string path = Path.Combine(application, "workers", "donor-downloads.json");
-            Custody.Admit(path, application);
+            Custody.AdmitCode(path, application);
             Dictionary<string, object> manifest = Json.Parse(File.ReadAllText(path, Encoding.UTF8));
             if (Convert.ToInt32(manifest["schema_version"]) != 1) throw new InvalidOperationException();
             Dictionary<string, string> result = new Dictionary<string, string>();
@@ -866,11 +926,12 @@ namespace K5VisionDesktop
         internal volatile bool PreparingRecordings;
         internal volatile int RecordingsProgress;
 
-        internal Bridge(string root, Dictionary<string, object> request, ProcessJob job, bool persistent)
+        internal Bridge(string root, Dictionary<string, object> request, ProcessJob job, bool persistent,
+            bool serviceWorker = false)
         {
             this.persistent = persistent;
             ProcessStartInfo start = new ProcessStartInfo(Path.Combine(root, "runtime", "python.exe"),
-                "-I -B -m k5vision.desktop_setup");
+                serviceWorker ? "-I -B -m k5vision.service_setup" : "-I -B -m k5vision.desktop_setup");
             start.WorkingDirectory = root;
             start.UseShellExecute = false;
             start.CreateNoWindow = true;
