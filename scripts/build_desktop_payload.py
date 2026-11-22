@@ -234,11 +234,7 @@ def provision_recorder_service(payload: Path, identity: dict[str, object]) -> di
     executable = payload / "K5VisionRecorder.exe"
     download(identity, executable)
     notice = ROOT / str(identity["license_path"])
-    if (
-        notice.is_symlink()
-        or not notice.is_file()
-        or digest(notice) != identity["license_sha256"]
-    ):
+    if notice.is_symlink() or not notice.is_file() or digest(notice) != identity["license_sha256"]:
         raise ValueError("Recorder service donor license identity mismatch")
     destination = payload / "licenses" / "WinSW-MIT.txt"
     destination.parent.mkdir(exist_ok=True)
@@ -421,24 +417,32 @@ def worker_download(source: Path, name: str) -> dict[str, object]:
         raise ValueError("Worker platform identity invalid")
     artifact = artifacts[0]
     admit(source, {"bytes": artifact["executable_bytes"], "sha256": artifact["executable_sha256"]})
+    archive_bytes = artifact.get("archive_bytes")
+    if archive_bytes is None:
+        if name == "mediamtx" and manifest["version"] == "v1.21.2-k5-monotonic1":
+            raise ValueError("Derivative worker archive size pin missing")
+        archive_bytes = {"mediamtx": 28583662, "caddy": 18479498}[name]
+    if type(archive_bytes) is not int or not 0 < archive_bytes <= 1_073_741_824:
+        raise ValueError("Worker archive size pin invalid")
     return {
         "component": manifest["component"],
         "version": manifest["version"],
         "url": artifact["url"],
         "sha256": artifact["sha256"],
-        "bytes": {"mediamtx": 28583662, "caddy": 18479498}[name],
+        "bytes": archive_bytes,
         "executable": artifact["executable"],
         "executable_sha256": artifact["executable_sha256"],
         "executable_bytes": artifact["executable_bytes"],
         "license_sha256": manifest["license_sha256"],
+        "retained_files": artifact.get("retained_files", []),
     }
 
 
 def bundle_worker(payload: Path, source: Path, name: str) -> dict[str, object]:
-    """Seal exact official worker bytes and their original license at build time.
+    """Seal exact admitted worker bytes and their original notices at build time.
 
     Network access belongs solely to CI; installed users never fetch workers.
-    Both the supplied CI executable and the independent official archive must
+    Both the supplied CI executable and the independently admitted archive must
     match the existing fixed executable identity before packaging.
     """
     identity = worker_download(source, name)
@@ -490,12 +494,48 @@ def bundle_worker(payload: Path, source: Path, name: str) -> dict[str, object]:
         if len(license_entries) != 1:
             raise ValueError("Worker upstream license missing")
         license_info = copy_member("LICENSE", license_path, 65536, identity["license_sha256"])
+        retained = []
+        seen = set()
+        retained_files = identity.get("retained_files", [])
+        if not isinstance(retained_files, list) or len(retained_files) > 512:
+            raise ValueError("Worker retained notice inventory invalid")
+        for entry in retained_files:
+            member = entry.get("path")
+            relative = PurePosixPath(member) if isinstance(member, str) else None
+            if (
+                relative is None
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or "\\" in member
+                or ":" in member
+                or relative.as_posix() != member
+                or member in seen
+                or not (
+                    member.startswith(("licenses/", "provenance/"))
+                    or member == "notice-inventory.json"
+                )
+                or type(entry.get("bytes")) is not int
+                or not 0 < entry["bytes"] <= 2_000_000
+                or not isinstance(entry.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+            ):
+                raise ValueError("Worker retained notice identity invalid")
+            seen.add(member)
+            destination = payload / "licenses" / name / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            info = copy_member(member, destination, entry["bytes"], entry["sha256"])
+            if info["bytes"] != entry["bytes"]:
+                raise ValueError("Worker retained notice size mismatch")
+            retained.append({"path": destination.relative_to(payload).as_posix(), **info})
+        if identity["version"] == "v1.21.2-k5-monotonic1" and not retained:
+            raise ValueError("Derivative worker retained notices missing")
     admit(binary, pin)
     return {
         **identity,
         "payload_executable": binary.relative_to(payload).as_posix(),
         "payload_license": license_path.relative_to(payload).as_posix(),
         "payload_license_bytes": license_info["bytes"],
+        "payload_retained_files": retained,
     }
 
 
@@ -815,7 +855,7 @@ def build(args: argparse.Namespace) -> None:
         newline="\n",
     )
     licenses = payload / "licenses"
-    licenses.mkdir()
+    licenses.mkdir(exist_ok=True)
     phase("required_notices")
     for source in (
         "LICENSE",

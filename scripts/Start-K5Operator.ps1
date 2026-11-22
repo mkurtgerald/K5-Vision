@@ -231,11 +231,16 @@ function Get-K5PinnedTool {
         [string]$Python, [string]$Helper, [string]$ToolsRoot,
         [object]$Manifest, [string]$Component, [string]$Repository, [string]$Executable
     )
+    $derivative = $Component -ceq 'MediaMTX' -and
+        $Manifest.version -ceq 'v1.21.2-k5-monotonic1' -and
+        $Repository -ceq 'bluenviron/mediamtx' -and
+        $Manifest.release_repository -ceq 'mkurtgerald/K5-Vision'
     if ($Manifest.schema_version -cne '1' -or $Manifest.component -cne $Component -or
-        $Manifest.version -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+$' -or
+        (-not $derivative -and $Manifest.version -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') -or
         $Manifest.source -cne ('https://github.com/' + $Repository)) {
         throw 'Native tool manifest admission failed.'
     }
+    $releaseRepository = if ($derivative) { 'mkurtgerald/K5-Vision' } else { $Repository }
     $artifacts = @($Manifest.artifacts | Where-Object { $_.platform -ceq 'windows_amd64' })
     if ($artifacts.Count -ne 1) { throw 'Exactly one Windows artifact required.' }
     $artifact = $artifacts[0]
@@ -244,7 +249,7 @@ function Get-K5PinnedTool {
         $artifact.executable_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         $Manifest.license_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         $artifact.filename -cnotmatch '^[A-Za-z0-9_.-]+\.zip$' -or
-        $artifact.url -cne ('https://github.com/' + $Repository + '/releases/download/' + $Manifest.version + '/' + $artifact.filename)) {
+        $artifact.url -cne ('https://github.com/' + $releaseRepository + '/releases/download/' + $Manifest.version + '/' + $artifact.filename)) {
         throw 'Native tool artifact admission failed.'
     }
     $componentRoot = Join-Path $ToolsRoot $Component
@@ -253,7 +258,16 @@ function Get-K5PinnedTool {
     Assert-K5PrivateDirectory -Python $Python -Helper $Helper -Path $cache
     $target = Join-Path $cache $Executable
     $license = Join-Path $cache 'LICENSE'
+    # Keep the complete admitted derivative archive, including all original
+    # transitive notices and build provenance, beside the executable.
+    $retainedArchive = Join-Path $cache 'upstream-notices-and-provenance.zip'
     if (Test-Path -LiteralPath $target) {
+        if ($derivative) {
+            Assert-K5PrivateFile -Python $Python -Helper $Helper -Path $retainedArchive
+            if ((Get-K5Sha256 -Path $retainedArchive) -cne $artifact.sha256) {
+                throw 'Cached native tool notice archive identity mismatch.'
+            }
+        }
         Assert-K5PrivateFile -Python $Python -Helper $Helper -Path $target
         Assert-K5PrivateFile -Python $Python -Helper $Helper -Path $license
         if ((Get-K5Sha256 -Path $target) -cne $artifact.executable_sha256 -or
@@ -271,7 +285,7 @@ function Get-K5PinnedTool {
         $previousTls = [Net.ServicePointManager]::SecurityProtocol
         try {
             [Net.ServicePointManager]::SecurityProtocol = $previousTls -bor [Net.SecurityProtocolType]::Tls12
-            Get-K5PinnedArchive -Url $artifact.url -Repository $Repository -Version $Manifest.version `
+            Get-K5PinnedArchive -Url $artifact.url -Repository $releaseRepository -Version $Manifest.version `
                 -Filename $artifact.filename -ExpectedHash $artifact.sha256 -Archive $archive
         } finally { [Net.ServicePointManager]::SecurityProtocol = $previousTls }
         if ((Get-K5Sha256 -Path $archive) -cne $artifact.sha256) {
@@ -300,6 +314,19 @@ function Get-K5PinnedTool {
                 throw 'Existing native license identity mismatch.'
             }
         } else { [IO.File]::Move($licenseCandidate, $license) }
+        if ($derivative) {
+            $package.Dispose()
+            $package = $null
+            if (Test-Path -LiteralPath $retainedArchive) {
+                Assert-K5PrivateFile -Python $Python -Helper $Helper -Path $retainedArchive
+                if ((Get-K5Sha256 -Path $retainedArchive) -cne $artifact.sha256) {
+                    throw 'Existing native tool notice archive identity mismatch.'
+                }
+            } else {
+                Assert-K5PrivateFile -Python $Python -Helper $Helper -Path $archive
+                [IO.File]::Move($archive, $retainedArchive)
+            }
+        }
         [IO.File]::Move($candidate, $target)
         return $target
     } finally {

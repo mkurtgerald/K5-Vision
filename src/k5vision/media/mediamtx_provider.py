@@ -27,7 +27,7 @@ from uuid import UUID
 
 from k5vision.domain.streams import VideoCodec
 
-MEDIAMTX_VERSION = "v1.21.2"
+MEDIAMTX_VERSION = "v1.21.2-k5-monotonic1"
 MAX_RESPONSE_BYTES = 262_144
 # A full day of the generated worker's 60-second segments, including its open
 # segment, fits this bound. Playback queries independently cover at most one day.

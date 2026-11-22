@@ -1,2 +1,9 @@
 # The donor notice is admitted by its exact upstream bytes on every platform.
 third_party/licenses/WinSW-MIT.txt text eol=lf
+# These experimental donor build inputs are admitted by exact Git-blob hashes.
+third_party/patches/gortsplib-5.6.7-monotonic-tcp-watchdog.patch text eol=lf
+third_party/patches/gortsplib-5.6.7-monotonic-tcp-watchdog.json text eol=lf
+third_party/builds/mediamtx-clock-derivative.json text eol=lf
+third_party/licenses/gortsplib-MIT.txt text eol=lf
+third_party/licenses/hls.js-LICENSE.txt text eol=lf
+third_party/licenses/Apache-2.0.txt text eol=lf

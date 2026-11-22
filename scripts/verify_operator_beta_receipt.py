@@ -242,7 +242,7 @@ def verify(lane: str, path: Path) -> list[dict]:
                 _require(receipt.get("downloaded_workers") is True)
                 _require(receipt.get("installed_worker_digests") is True)
         elif group == "donor":
-            _require(receipt.get("version") == "v1.21.2")
+            _require(receipt.get("version") == "v1.21.2-k5-monotonic1")
             _require(receipt.get("media") == "locally_generated_h264")
             _require(receipt.get("production_camera_acceptance") is False)
             _require(receipt.get("analytics_acceptance") is False)

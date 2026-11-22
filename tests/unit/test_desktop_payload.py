@@ -722,3 +722,80 @@ def test_unclassified_new_served_asset_requires_explicit_source_inventory_update
     (source / "unclassified.js").write_bytes(b"new unreviewed asset")
     with pytest.raises(ValueError, match="source inventory differs"):
         builder.admit_operator_web_assets(packages)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_derivative_worker_seals_exact_supplemental_notices(
+    builder, tmp_path, monkeypatch, changed
+):
+    source = tmp_path / "worker.exe"
+    source.write_bytes(b"MZ reviewed derivative")
+    original_notice = b"Complete original copyright and permission notice\n"
+    member = "licenses/transitive-BSD.txt"
+    archive = io.BytesIO()
+    with ZipFile(archive, "w") as zipped:
+        zipped.writestr("mediamtx.exe", source.read_bytes())
+        zipped.writestr("LICENSE", b"Original MediaMTX MIT")
+        zipped.writestr(member, b"Changed upstream notice" if changed else original_notice)
+    raw = archive.getvalue()
+    identity = {
+        "component": "MediaMTX",
+        "version": "v1.21.2-k5-monotonic1",
+        "executable": "mediamtx.exe",
+        "executable_bytes": source.stat().st_size,
+        "executable_sha256": sha256(source.read_bytes()).hexdigest(),
+        "license_sha256": sha256(b"Original MediaMTX MIT").hexdigest(),
+        "url": "https://example.invalid/pinned-derivative.zip",
+        "bytes": len(raw),
+        "sha256": sha256(raw).hexdigest(),
+        "retained_files": [
+            {
+                "path": member,
+                "bytes": len(original_notice),
+                "sha256": sha256(original_notice).hexdigest(),
+            }
+        ],
+    }
+    monkeypatch.setattr(builder, "worker_download", lambda supplied, name: identity)
+    monkeypatch.setattr(builder, "urlopen", lambda url, timeout: io.BytesIO(raw))
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    if changed:
+        with pytest.raises(ValueError, match="Worker archive member identity mismatch"):
+            builder.bundle_worker(payload, source, "mediamtx")
+    else:
+        result = builder.bundle_worker(payload, source, "mediamtx")
+        retained = result["payload_retained_files"]
+        assert len(retained) == 1
+        assert (payload / retained[0]["path"]).read_bytes() == original_notice
+        assert retained[0]["sha256"] == sha256(original_notice).hexdigest()
+
+
+@pytest.mark.parametrize("member", ["../escape", "licenses/../../escape", "licenses/file:ads"])
+def test_worker_notice_inventory_refuses_unsafe_member_path(builder, tmp_path, monkeypatch, member):
+    source = tmp_path / "worker.exe"
+    source.write_bytes(b"MZ reviewed derivative")
+    archive = io.BytesIO()
+    with ZipFile(archive, "w") as zipped:
+        zipped.writestr("mediamtx.exe", source.read_bytes())
+        zipped.writestr("LICENSE", b"Original MediaMTX MIT")
+        zipped.writestr(member, b"notice")
+    raw = archive.getvalue()
+    identity = {
+        "component": "MediaMTX",
+        "version": "v1.21.2-k5-monotonic1",
+        "executable": "mediamtx.exe",
+        "executable_bytes": source.stat().st_size,
+        "executable_sha256": sha256(source.read_bytes()).hexdigest(),
+        "license_sha256": sha256(b"Original MediaMTX MIT").hexdigest(),
+        "url": "https://example.invalid/pinned-derivative.zip",
+        "bytes": len(raw),
+        "sha256": sha256(raw).hexdigest(),
+        "retained_files": [{"path": member, "bytes": 6, "sha256": sha256(b"notice").hexdigest()}],
+    }
+    monkeypatch.setattr(builder, "worker_download", lambda supplied, name: identity)
+    monkeypatch.setattr(builder, "urlopen", lambda url, timeout: io.BytesIO(raw))
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    with pytest.raises(ValueError, match="Worker retained notice identity invalid"):
+        builder.bundle_worker(payload, source, "mediamtx")

@@ -153,14 +153,25 @@ def test_fixed_get_routes_normalize_and_do_not_return_source_material() -> None:
             MediaWorkerErrorCode.VERSION_MISMATCH,
         ),
         (
-            b'{"version":"v1.21.2","started":"2026-10-11T12:00:00"}',
+            b'{"version":"v1.21.2","started":"2026-10-11T12:00:00Z"}',
+            MediaWorkerErrorCode.VERSION_MISMATCH,
+        ),
+        (
+            json.dumps({"version": MEDIAMTX_VERSION, "started": "2026-10-11T12:00:00"}).encode(),
             MediaWorkerErrorCode.INVALID_RESPONSE,
         ),
         (b'{"version":"v1.21.2","version":"v9"}', MediaWorkerErrorCode.INVALID_RESPONSE),
         (b'{"version":"v1.21.2","started":NaN}', MediaWorkerErrorCode.INVALID_RESPONSE),
         (b"x" * 262_145, MediaWorkerErrorCode.INVALID_RESPONSE),
     ],
-    ids=["version-mismatch", "naive-time", "duplicate-key", "non-finite", "oversized-body"],
+    ids=[
+        "version-mismatch",
+        "unpatched-worker",
+        "naive-time",
+        "duplicate-key",
+        "non-finite",
+        "oversized-body",
+    ],
 )
 def test_version_and_response_admission_fail_closed(body, expected) -> None:
     async def scenario():
@@ -959,7 +970,10 @@ def test_warm_history_uses_verified_worker_while_healthy_refresh_is_pending():
             b'{"version":"v9","started":"2026-10-11T12:00:00Z"}',
             MediaWorkerErrorCode.VERSION_MISMATCH,
         ),
-        (b'{"version":"v1.21.2","started":"naive"}', MediaWorkerErrorCode.INVALID_RESPONSE),
+        (
+            json.dumps({"version": MEDIAMTX_VERSION, "started": "naive"}).encode(),
+            MediaWorkerErrorCode.INVALID_RESPONSE,
+        ),
         (TimeoutError(), MediaWorkerErrorCode.TIMEOUT),
         (OSError(), MediaWorkerErrorCode.UNAVAILABLE),
     ],

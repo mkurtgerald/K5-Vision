@@ -889,7 +889,10 @@ namespace K5VisionDesktop
                 string executable = component == "MediaMTX" ? "mediamtx.exe" : "caddy.exe";
                 string name = component == "MediaMTX" ? "mediamtx" : "caddy";
                 string version = (string)artifact["version"];
-                if (version.Length > 32 || !System.Text.RegularExpressions.Regex.IsMatch(version, "^v[0-9]+[.][0-9]+[.][0-9]+$") ||
+                bool versionAdmitted = component == "MediaMTX"
+                    ? version == "v1.21.2-k5-monotonic1"
+                    : System.Text.RegularExpressions.Regex.IsMatch(version, "^v[0-9]+[.][0-9]+[.][0-9]+$");
+                if (version.Length > 32 || !versionAdmitted ||
                     (string)artifact["executable"] != executable) throw new InvalidOperationException();
                 string binary = Path.Combine(application, "workers", executable);
                 string license = Path.Combine(application, "workers", name + "-LICENSE");

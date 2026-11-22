@@ -99,6 +99,30 @@ the reviewed native executable. K5's surrounding source license does not
 restrict rights granted by the upstream MIT license. Native binary review and
 target Windows acceptance remain separate from the source/API evaluation.
 
+### Experimental MediaMTX monotonic-watchdog derivative
+
+The separate engineering build `v1.21.2-k5-monotonic1` uses exact MediaMTX
+`914e39535ece709919ac325aaeed98d394ed9093` and gortsplib `v5.6.7`, commit
+`09cc2060a7188c1f5f58498a8ede1e56338cd804`, with K5's narrowly scoped TCP
+inactivity-watchdog patch. It is a derivative build, not an unchanged official
+MediaMTX release. The patch preserves media UTC/RTCP timestamps and timeout
+values and retains monotonic elapsed time for that watchdog.
+
+Both upstream projects remain under their original MIT licenses. Complete
+unchanged notices are preserved in `third_party/licenses/MediaMTX-MIT.txt` and
+`third_party/licenses/gortsplib-MIT.txt`. The generated upstream hls.js `v1.7.3`
+asset remains under Apache-2.0. Its unchanged Dailymotion and Brightcove
+copyright/license notice is retained at `third_party/licenses/hls.js-LICENSE.txt`,
+with the complete Apache license at `third_party/licenses/Apache-2.0.txt`. Experimental binary artifacts retain these
+notices, the Go standard-library license, and the available notices from the
+exact Go module graph. Exact source, patch, toolchain, asset and executable
+identities are recorded in `third_party/builds/mediamtx-clock-derivative.json`
+and the artifact's build provenance. The candidate donor manifest pins these
+reviewed derivative archives. The installed payload retains their complete
+notices and source/build provenance, including the original per-file openpgp BSD
+notices. Binary regression and smoke evidence remains separate from installed
+product qualification.
+
 ### FFmpeg/ffprobe donor acceptance tools
 
 The native Windows donor acceptance job downloads the pinned Gyan FFmpeg 9.0.2
