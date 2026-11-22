@@ -76,7 +76,7 @@ jobs:
           if ((& git -C product-source rev-parse HEAD).Trim() -ne '7cc4e227fca152ebd04c5a7eae728e02fd4143aa' -or
               (& git -C diagnostic-source rev-parse HEAD).Trim() -ne '${{ github.sha }}') { throw 'Source identity mismatch' }
           & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:scripts/profile_windows_installer.py > installer-profile-admitted.py'
-          if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath installer-profile-admitted.py -Algorithm SHA256).Hash.ToLowerInvariant() -ne '830558ec46dde5b7b0877335f4bac09aa8aff4a8d1340ec9f9f777abafbec878') { throw 'Diagnostic controller byte identity mismatch' }
+          if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath installer-profile-admitted.py -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'd0da068943c2b6ef10dcf4276c060db35dd73314de39d12d145d3a01f5e00fd4') { throw 'Diagnostic controller byte identity mismatch' }
           $setup = Get-Item -LiteralPath profile-input/K5VisionSetup.exe
           $package = Get-Content -LiteralPath profile-input/desktop-package.json -Raw | ConvertFrom-Json
           $manifest = Get-Content -LiteralPath profile-input/payload-manifest.json -Raw | ConvertFrom-Json

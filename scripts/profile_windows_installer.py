@@ -34,6 +34,94 @@ OPERATIONS = {
     "--installation-service-remove": "guard_remove",
 }
 
+HASH_BENCHMARK = r"""
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Security.Cryptography;
+using System.Web.Script.Serialization;
+internal static class HashProfile {
+  private sealed class Totals { internal long Ticks; internal double Cpu; internal string Type; }
+  private static byte[] Hash(FileStream stream, bool cng, Totals totals, Process process) {
+    double cpu = process.TotalProcessorTime.TotalSeconds;
+    long start = Stopwatch.GetTimestamp();
+    byte[] result;
+    using (SHA256 hash = cng ? new SHA256Cng() : SHA256.Create()) {
+      string name = hash.GetType().Name;
+      totals.Type = name == "SHA256Managed" || name == "SHA256Cng" ||
+        name == "SHA256CryptoServiceProvider" ? name : "other";
+      result = hash.ComputeHash(stream);
+    }
+    totals.Ticks += Stopwatch.GetTimestamp() - start;
+    totals.Cpu += process.TotalProcessorTime.TotalSeconds - cpu;
+    return result;
+  }
+  private static string Hex(byte[] value) {
+    return BitConverter.ToString(value).Replace("-", "").ToLowerInvariant();
+  }
+  internal static int Main(string[] args) {
+    try {
+      if (args.Length != 3) return 1;
+      byte[] raw = File.ReadAllBytes(args[1]);
+      using (SHA256 hash = SHA256.Create())
+        if (Hex(hash.ComputeHash(raw)) !=
+          "a564b6b038da136a5378180e9e8d1164050c4a01eee010e9a5de884325c7e959") return 2;
+      JavaScriptSerializer json = new JavaScriptSerializer { MaxJsonLength = 4 * 1024 * 1024 };
+      var manifest = json.Deserialize<Dictionary<string, object>>(
+        System.Text.Encoding.UTF8.GetString(raw));
+      string root = Path.GetFullPath(args[0]);
+      var first = new Totals(); var second = new Totals();
+      int files = 0; long bytes = 0;
+      using (Process process = Process.GetCurrentProcess()) {
+        foreach (object entry in (IEnumerable)manifest["files"]) {
+          var row = (Dictionary<string, object>)entry;
+          string relative = (string)row["path"];
+          if (relative.Length == 0 || relative.Contains("\\") || relative.Contains(":") ||
+              relative.StartsWith("/")) return 3;
+          foreach (string part in relative.Split('/'))
+            if (part.Length == 0 || part == "." || part == "..") return 3;
+          string target = Path.Combine(root, relative.Replace('/', '\\'));
+          for (string current = target; current.Length >= root.Length;
+               current = Path.GetDirectoryName(current))
+            if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) return 4;
+          using (FileStream stream = new FileStream(
+            target, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+            long length = Convert.ToInt64(row["bytes"]);
+            if (stream.Length != length) return 5;
+            byte[] a, b;
+            if ((files & 1) == 0) {
+              a = Hash(stream, false, first, process); stream.Position = 0;
+              b = Hash(stream, true, second, process);
+            }
+            else {
+              b = Hash(stream, true, second, process); stream.Position = 0;
+              a = Hash(stream, false, first, process);
+            }
+            if (Hex(a) != (string)row["sha256"] || Hex(b) != (string)row["sha256"] ||
+                stream.Length != length) return 6;
+            bytes += length; files++;
+          }
+        }
+      }
+      var result = new Dictionary<string, object> {
+        { "schema_version", 1 }, { "diagnostic_only", true }, { "all_digests_match", true },
+        { "paired_read_locked_streams", true }, { "alternating_algorithm_order", true },
+        { "files", files }, { "payload_bytes", bytes },
+        { "default_algorithm_type", first.Type }, { "cng_algorithm_type", second.Type },
+        { "default_wall_seconds", (double)first.Ticks / Stopwatch.Frequency },
+        { "default_cpu_seconds", first.Cpu },
+        { "cng_wall_seconds", (double)second.Ticks / Stopwatch.Frequency },
+        { "cng_cpu_seconds", second.Cpu }
+      };
+      File.WriteAllText(args[2], json.Serialize(result));
+      return 0;
+    } catch { return 7; }
+  }
+}
+"""
+
 
 class ProfileFailure(RuntimeError):
     pass
@@ -112,6 +200,124 @@ def log_summary(path):
         if span is not None and 0 <= span <= 180
         else None,
     }
+
+
+def tree_summary(root, manifest):
+    """Classify leftovers read-only; unknown names and paths never leave here."""
+    result = {"root_present": None, "snapshot_complete": False}
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        return {"root_present": False, "snapshot_complete": True}
+    except OSError:
+        result["inspection_unavailable"] = True
+        return result
+    result["root_present"] = True
+    root_reparse = stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & 0x400
+    )
+    result["root_kind"] = (
+        "reparse"
+        if root_reparse
+        else (
+            "directory"
+            if stat.S_ISDIR(info.st_mode)
+            else "file"
+            if stat.S_ISREG(info.st_mode)
+            else "other"
+        )
+    )
+    bootstrap = {
+        "k5vision.exe",
+        "payload-manifest.json",
+        "k5visionrecorder.exe",
+        "k5visionrecorder.xml",
+        "unins000.exe",
+        "unins000.dat",
+        "unins000.msg",
+    }
+    known = {item["path"].casefold() for item in manifest["files"]}
+    known_directories = set()
+    for name in known:
+        parts = name.split("/")
+        known_directories.update("/".join(parts[:index]) for index in range(1, len(parts)))
+    result.update(
+        dict.fromkeys(
+            (
+                "entries",
+                "regular_files",
+                "directories",
+                "reparse_entries",
+                "other_entries",
+                "known_payload_files",
+                "known_bootstrap_files",
+                "unlisted_entries",
+                "empty_directories",
+            ),
+            0,
+        )
+    )
+    result["known_root_names"] = []
+    result["root_empty"] = None
+    deadline = time.monotonic() + 3
+    try:
+        require(
+            stat.S_ISDIR(info.st_mode) and not root_reparse,
+            "leftover_root_refused",
+        )
+        stack = [(root, "", (info.st_dev, info.st_ino))]
+        while stack:
+            require(time.monotonic() < deadline, "leftover_budget_exhausted")
+            directory, relative, expected = stack.pop()
+            current = directory.lstat()
+            require(
+                stat.S_ISDIR(current.st_mode)
+                and not getattr(current, "st_file_attributes", 0) & 0x400
+                and (current.st_dev, current.st_ino) == expected,
+                "leftover_directory_changed",
+            )
+            empty = True
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    require(
+                        result["entries"] < 4096 and time.monotonic() < deadline,
+                        "leftover_budget_exhausted",
+                    )
+                    empty = False
+                    result["entries"] += 1
+                    name = (relative + "/" if relative else "") + entry.name.casefold()
+                    item = entry.stat(follow_symlinks=False)
+                    if not relative and entry.name.casefold() in bootstrap:
+                        result["known_root_names"].append(entry.name.casefold())
+                    if stat.S_ISLNK(item.st_mode) or getattr(item, "st_file_attributes", 0) & 0x400:
+                        result["reparse_entries"] += 1
+                        continue
+                    if stat.S_ISDIR(item.st_mode):
+                        result["directories"] += 1
+                        if name not in known_directories:
+                            result["unlisted_entries"] += 1
+                        stack.append((Path(entry.path), name, (item.st_dev, item.st_ino)))
+                    elif stat.S_ISREG(item.st_mode):
+                        result["regular_files"] += 1
+                        if name in known:
+                            result["known_payload_files"] += 1
+                        elif not relative and name in bootstrap:
+                            result["known_bootstrap_files"] += 1
+                        else:
+                            result["unlisted_entries"] += 1
+                    else:
+                        result["other_entries"] += 1
+            after = directory.lstat()
+            require((after.st_dev, after.st_ino) == expected, "leftover_directory_changed")
+            if empty:
+                result["empty_directories"] += 1
+            if not relative:
+                result["root_empty"] = empty
+        result["snapshot_complete"] = True
+    except (OSError, RuntimeError):
+        result["inspection_unavailable"] = True
+    result["known_root_names"].sort()
+    return result
 
 
 class Pin:
@@ -332,6 +538,82 @@ class Profiler:
                 require(not cleanup_failed, "query_handle_cleanup_incomplete")
 
 
+def hash_benchmark(profiler, scratch, installed, manifest_path, manifest):
+    source = scratch / "HashProfile.cs"
+    executable = scratch / "HashProfile.exe"
+    output = scratch / "hash-profile.json"
+    source.write_text(HASH_BENCHMARK, encoding="utf-8")
+    compiler = Path(os.environ["SYSTEMROOT"]) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
+    profiler.run(
+        "hash_benchmark_compile",
+        [
+            str(compiler),
+            "/nologo",
+            "/target:exe",
+            "/platform:x64",
+            "/optimize+",
+            "/reference:System.dll",
+            "/reference:System.Core.dll",
+            "/reference:System.Web.Extensions.dll",
+            "/out:" + str(executable),
+            str(source),
+        ],
+        timeout=30,
+    )
+    profiler.run(
+        "hash_benchmark",
+        [str(executable), str(installed), str(manifest_path.resolve()), str(output)],
+        timeout=45,
+    )
+    require(output.stat().st_size <= 16384, "hash_benchmark_output_refused")
+    value = json.loads(output.read_bytes())
+    require(
+        set(value)
+        == {
+            "schema_version",
+            "diagnostic_only",
+            "all_digests_match",
+            "paired_read_locked_streams",
+            "alternating_algorithm_order",
+            "files",
+            "payload_bytes",
+            "default_algorithm_type",
+            "cng_algorithm_type",
+            "default_wall_seconds",
+            "default_cpu_seconds",
+            "cng_wall_seconds",
+            "cng_cpu_seconds",
+        }
+        and value["schema_version"] == 1
+        and all(
+            value[name] is True
+            for name in (
+                "diagnostic_only",
+                "all_digests_match",
+                "paired_read_locked_streams",
+                "alternating_algorithm_order",
+            )
+        )
+        and value["files"] == len(manifest["files"])
+        and value["payload_bytes"] == sum(row["bytes"] for row in manifest["files"])
+        and value["default_algorithm_type"]
+        in {"SHA256Managed", "SHA256Cng", "SHA256CryptoServiceProvider", "other"}
+        and value["cng_algorithm_type"] == "SHA256Cng",
+        "hash_benchmark_output_refused",
+    )
+    for name in (
+        "default_wall_seconds",
+        "default_cpu_seconds",
+        "cng_wall_seconds",
+        "cng_cpu_seconds",
+    ):
+        require(
+            type(value[name]) in {int, float} and 0 <= value[name] <= 90,
+            "hash_benchmark_timing_refused",
+        )
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
@@ -368,6 +650,14 @@ def main():
             setup.stat().st_size == SETUP_BYTES and digest(setup) == SETUP_SHA,
             "setup_bytes_refused",
         )
+        manifest_path = args.input / "payload-manifest.json"
+        require(
+            manifest_path.stat().st_size <= 4 * 1024**2
+            and digest(manifest_path)
+            == "a564b6b038da136a5378180e9e8d1164050c4a01eee010e9a5de884325c7e959",
+            "manifest_bytes_refused",
+        )
+        manifest = json.loads(manifest_path.read_bytes())
         installed = Path(os.environ.get("ProgramW6432", os.environ["ProgramFiles"])) / "K5 Vision"
         profile = Path(os.environ["PROGRAMDATA"]) / "K5Vision"
         require(not installed.exists() and not profile.exists(), "fresh_runner_required")
@@ -398,6 +688,9 @@ def main():
                     )
                     require(not (profile / "identity").exists(), "unexpected_site_initialized")
                     if label == "first_install":
+                        result["hash_benchmark"] = hash_benchmark(
+                            profiler, scratch, installed, manifest_path, manifest
+                        )
                         profiler.run(
                             "graceful_service_stop",
                             [str(installed / "K5Vision.exe"), "--installation-service-stop"],
@@ -418,22 +711,31 @@ def main():
                     log=log,
                 )
             finally:
-                if installed.exists() and (installed / "unins000.exe").exists():
-                    profiler.run(
-                        "cleanup_uninstall",
-                        [
-                            str(installed / "unins000.exe"),
-                            "/VERYSILENT",
-                            "/SUPPRESSMSGBOXES",
-                            "/NORESTART",
-                        ],
-                        timeout=45,
-                    )
-            require(not installed.exists(), "installed_tree_cleanup_incomplete")
+                try:
+                    if installed.exists() and (installed / "unins000.exe").exists():
+                        profiler.run(
+                            "cleanup_uninstall",
+                            [
+                                str(installed / "unins000.exe"),
+                                "/VERYSILENT",
+                                "/SUPPRESSMSGBOXES",
+                                "/NORESTART",
+                            ],
+                            timeout=45,
+                        )
+                finally:
+                    result["installed_tree_after_uninstall"] = tree_summary(installed, manifest)
+                    try:
+                        result["service_absent_after_uninstall"] = (
+                            profiler.service is not None and profiler.service.absent()
+                        )
+                    except (OSError, RuntimeError):
+                        result["service_absent_after_uninstall"] = None
             require(
-                profiler.service is not None and profiler.service.absent(),
-                "service_cleanup_incomplete",
+                result["installed_tree_after_uninstall"].get("root_present") is False,
+                "installed_tree_cleanup_incomplete",
             )
+            require(result["service_absent_after_uninstall"], "service_cleanup_incomplete")
             result["owned_cleanup"] = True
             result["site_data_preserved_without_account"] = (
                 profile.exists() and not (profile / "identity").exists()
