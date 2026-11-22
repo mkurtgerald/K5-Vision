@@ -2,6 +2,7 @@
 // the sealed Python engine and its private pipes; interactive clients own none
 // of the engine's handles. Credentials never enter arguments or environment.
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -673,10 +674,10 @@ namespace K5VisionDesktop
             if (info.Length < 1 || info.Length > 65536) throw new InvalidOperationException();
             Dictionary<string, object> value = Json.Parse(File.ReadAllText(marker, Encoding.UTF8));
             if (value.Count != 2 || !value.ContainsKey("schema_version") || !(value["schema_version"] is int) ||
-                (int)value["schema_version"] != 1 || !value.ContainsKey("profiles") || !(value["profiles"] is object[]))
+                (int)value["schema_version"] != 1 || !value.ContainsKey("profiles") || !(value["profiles"] is IList))
                 throw new InvalidOperationException();
-            object[] profiles = (object[])value["profiles"];
-            if (profiles.Length < 1 || profiles.Length > 256) throw new InvalidOperationException();
+            IList profiles = (IList)value["profiles"];
+            if (profiles.Count < 1 || profiles.Count > 256) throw new InvalidOperationException();
             HashSet<string> unique = new HashSet<string>(StringComparer.Ordinal);
             foreach (object item in profiles)
             {

@@ -498,7 +498,7 @@ namespace K5VisionDesktop
             if (existing)
             {
                 Dictionary<string, object> previous = Json.Parse(File.ReadAllText(marker, Encoding.UTF8));
-                foreach (object sid in (object[])previous["profiles"])
+                foreach (object sid in (IList)previous["profiles"])
                     if (!found.Contains((string)sid)) found.Add((string)sid);
             }
             if (found.Count == 0) return;
