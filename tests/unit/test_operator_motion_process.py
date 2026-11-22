@@ -6,6 +6,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -124,6 +125,14 @@ def worker(monkeypatch, request):
                 events.append("job_close")
 
     def start(args, **kwargs):
+        if kwargs.get("env") is not None:
+            # Keep only these generated test keys in failure diagnostics;
+            # the real test process may hold unrelated connector credentials.
+            kwargs["env"] = {
+                key: value
+                for key, value in kwargs["env"].items()
+                if key in {"OPENCV_FFMPEG_CAPTURE_OPTIONS", "K5_MOTION_TEST_ENV"}
+            }
         arguments.append((args, kwargs))
         events.append("spawn")
         process = Process(response(), events)
@@ -145,7 +154,7 @@ def worker(monkeypatch, request):
     # every host, and exercise both platform branches explicitly on Linux too.
     # The separate real-process tests retain the actual Windows Job boundary.
     monkeypatch.setattr(operator_native_process, "_WindowsJob", Job)
-    monkeypatch.setattr(motion, "os", SimpleNamespace(name=request.param))
+    monkeypatch.setattr(motion, "os", SimpleNamespace(name=request.param, environ=os.environ))
     instance = motion.LiveMotionWorker(URI)
     yield SimpleNamespace(
         instance=instance,
@@ -180,6 +189,36 @@ def test_refuses_noncanonical_or_untrusted_relay_without_leaking_it(uri):
     with pytest.raises(motion.MotionProcessError) as error:
         motion.LiveMotionWorker(uri)
     assert "127.0.0.2" not in str(error.value) and "fragment" not in str(error.value)
+
+
+@pytest.mark.parametrize("inherited", [None, "rtsp_transport;udp|fflags;untrusted"])
+def test_live_decoder_policy_is_child_only_and_overrides_inherited_options(
+    worker, monkeypatch, inherited
+):
+    key = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
+    if inherited is None:
+        monkeypatch.delenv(key, raising=False)
+    else:
+        monkeypatch.setenv(key, inherited)
+    monkeypatch.setenv("K5_MOTION_TEST_ENV", "preserved-test-value")
+    worker.instance.sample(policy())
+    options = worker.args[0][1]
+    assert options["env"][key] == "rtsp_transport;tcp|fflags;nobuffer"
+    assert options["env"]["K5_MOTION_TEST_ENV"] == "preserved-test-value"
+    assert os.environ.get(key) == inherited
+
+
+def test_mask_worker_does_not_change_parent_or_apply_live_decoder_policy(worker, monkeypatch):
+    key = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
+    monkeypatch.setenv(key, "mask-test-inherited-value")
+    mask = motion.MaskValidationWorker()
+    try:
+        mask._start("--mask-child")
+        assert worker.args[0][0][-1] == "--mask-child"
+        assert worker.args[0][1]["env"] is None
+        assert os.environ[key] == "mask-test-inherited-value"
+    finally:
+        mask.close()
 
 
 def test_private_source_stays_in_stdin_and_sample_is_immutable(worker):
@@ -260,7 +299,7 @@ def test_unreaped_owned_process_is_retained_for_cleanup_retry(worker):
 
 
 def test_windows_job_is_assigned_before_private_source_is_written(monkeypatch, worker):
-    monkeypatch.setattr(motion, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(motion, "os", SimpleNamespace(name="nt", environ=os.environ))
     monkeypatch.setattr(motion.subprocess, "CREATE_NO_WINDOW", 0x08000000)
     worker.instance.sample(policy())
     assert worker.events[:4] == ["job", "spawn", "assign", "write"]
@@ -295,7 +334,7 @@ def test_refused_windows_assignment_never_grants_private_source(monkeypatch, wor
             raise operator_native_process.NativeProcessError("PRIVATE_NATIVE_ERROR")
 
     monkeypatch.setattr(operator_native_process, "_WindowsJob", RefusedJob)
-    monkeypatch.setattr(motion, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(motion, "os", SimpleNamespace(name="nt", environ=os.environ))
     monkeypatch.setattr(motion.subprocess, "CREATE_NO_WINDOW", 0x08000000)
     with pytest.raises(motion.MotionProcessError, match="ownership is unavailable") as error:
         worker.instance.sample(policy())

@@ -301,6 +301,12 @@ class LiveMotionWorker:
         job = _WindowsJob() if os.name == "nt" else None
         process = None
         try:
+            environment = None
+            if child_mode == "--child":
+                # Pin only the live decoder's transport/buffering policy. The
+                # parent and image-only mask worker keep their environment.
+                environment = os.environ.copy()
+                environment["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer"
             process = subprocess.Popen(
                 [sys.executable, "-I", "-B", "-m", "k5vision.operator_motion_process", child_mode],
                 stdin=subprocess.PIPE,
@@ -310,6 +316,7 @@ class LiveMotionWorker:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 start_new_session=os.name != "nt",
                 close_fds=True,
+                env=environment,
             )
             if job is not None:
                 job.assign(process)
