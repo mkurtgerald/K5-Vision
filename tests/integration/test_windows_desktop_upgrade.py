@@ -261,6 +261,34 @@ def _status_text(api, form):
     return api.control_text(form, 1106).casefold()
 
 
+def _retained_timeline_play(browser_helpers, page, camera_id):
+    # The shared navigation helper admits four decoded frames. This witness
+    # requires eight, observed on the same player inside one existing budget.
+    deadline = time.monotonic() + 25
+    browser_helpers._timeline_play(page, "red", device_id=camera_id)
+    remaining = deadline - time.monotonic()
+    assert remaining > 0, "Retained playback exhausted its existing decode budget"
+    decoded = page.wait_for_function(
+        """() => {
+          const video=document.getElementById('playback-video');
+          if(!video || video.getBoundingClientRect().width<=0 || video.paused ||
+            video.readyState<2 || video.videoWidth!==320 || video.videoHeight!==240 ||
+            video.currentTime<=0.15 || video.getVideoPlaybackQuality().totalVideoFrames<8)
+            return false;
+          const canvas=document.createElement('canvas'); canvas.width=canvas.height=1;
+          const context=canvas.getContext('2d'); context.drawImage(video,0,0,1,1);
+          return {frames:video.getVideoPlaybackQuality().totalVideoFrames,
+            rgb:Array.from(context.getImageData(0,0,1,1).data).slice(0,3)};
+        }""",
+        timeout=max(1, int(remaining * 1000)),
+    ).json_value()
+    assert time.monotonic() <= deadline, "Retained playback exceeded its existing decode budget"
+    assert type(decoded["frames"]) is int and 8 <= decoded["frames"] <= 10000
+    red, green, blue = decoded["rgb"]
+    assert red > 180 and green < 70 and blue < 70, "Retained playback decoded a different camera"
+    return decoded["frames"]
+
+
 def _wizard(desktop, api, app_form, cohort):
     api.click(api.control(app_form, 1012))
 
@@ -557,7 +585,7 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
         )
         closed_hashes = sorted(value.hex() for value in closed.values())
         browser_helpers._open_camera_recordings(page, camera_id)
-        assert browser_helpers._timeline_play(page, "red", device_id=camera_id) >= 8
+        assert _retained_timeline_play(browser_helpers, page, camera_id) >= 8
         old_export = parent / "historical actual export.mp4"
         assert browser_helpers._download_recording(page, ffprobe, old_export, helpers, "red") >= 8
         exports_before = _export_hashes(profile)
@@ -768,7 +796,7 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
             recovery[4],
         )
         browser_helpers._open_camera_recordings(page, camera_id)
-        playback = browser_helpers._timeline_play(page, "red", device_id=camera_id)
+        playback = _retained_timeline_play(browser_helpers, page, camera_id)
         export_path = parent / "migrated actual export.mp4"
         decoded = browser_helpers._download_recording(page, ffprobe, export_path, helpers, "red")
         assert playback >= 8 and decoded >= 8

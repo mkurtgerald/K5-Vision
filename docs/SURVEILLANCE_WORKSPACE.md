@@ -1,9 +1,14 @@
 # Watch cameras, find footage and save a clip
 
 Open K5 Vision from the Start menu or desktop, choose **Open camera wall**, and
-sign in. The native window launches and supervises the engine; the browser
+sign in. The native client connects to the Windows recording service; the browser
 workspace contains the live views, recordings and camera controls. Engine ready
 does not mean a camera is already recording.
+
+This guide describes the unattended-service candidate. Check its exact installer's
+qualification before relying on reboot or sign-out recording; earlier public
+per-user installers have different behavior. See the
+[unattended recording status](WINDOWS_UNATTENDED_RECORDING.md).
 
 For installation, ONVIF account/profile setup and direct RTSP stream setup, follow the
 [Windows desktop guide](WINDOWS_DESKTOP_BETA.md). Download installers from
@@ -85,17 +90,34 @@ Keep downloaded footage private and follow the site's recording policy.
 
 ## Leave the recorder running
 
-Close the browser or native window to leave K5 in the Windows notification area.
-Reopen the Start/Desktop shortcut or use the tray's **Open camera wall** action
-to return. **Stop and quit**, Windows sign-out and shutdown end recording.
-Administrator pause/resume choices are preserved when the engine restarts.
+Close the browser while the Windows service continues recording. Closing the
+native window hides its client in the notification area; **Close K5 Vision** exits
+only that client. Reopen the Start/Desktop shortcut or use the tray's **Open
+camera wall** action to return. Windows lock and sign-out must leave recording
+active. Shutdown stops recording while the PC is off; automatic startup must
+restore the saved site before interactive sign-in. Actual reboot and sign-out
+receipts remain required for the exact candidate. Administrator pause/resume
+choices are preserved when the recorder restarts.
+
+The client shows when the recording service is recovering and reconnects
+automatically. Check recording confirmation for each camera after recovery.
+If the client requests a repair, rerun the graphical installer while preserving
+site data. Updates stop recording for maintenance; closing the client alone does
+not stop the service. Existing per-user sites use the authenticated
+[graphical migration flow](WINDOWS_DESKTOP_BETA.md#upgrade-removal-and-release-limits).
 
 Camera clock readings describe a relative offset with uncertainty. Reported NTP
-mode is not verified synchronization or absolute UTC accuracy. K5 does not alter
-Windows time, camera time or NTP settings; configure the approved source through
-the normal Windows and camera graphical settings.
+mode is not verified synchronization or absolute UTC accuracy. Administrators can
+use **Administration → Recorder settings → Time** to configure or resynchronize
+Windows Time and manage supported ONVIF camera time settings. Windows changes
+need explicit **Approve time change** in the native client and normal Windows
+elevation. Check measured synchronization separately from saved configuration;
+see [time administration](WINDOWS_TIME_ADMINISTRATION.md).
 
-This workspace requires the exact release's Windows qualification. Physical
+Administrators can also manage [storage](WINDOWS_STORAGE_ADMINISTRATION.md),
+local person detection, [external integrations](OPERATOR_INTEGRATIONS.md),
+and [motion recording and zones](CAMERA_MOTION_RECORDING.md). Their source
+availability does not replace matching installed-Windows qualification. Physical
 camera compatibility, independent NTP accuracy, measured capacity and endurance
-remain separate [beta gates](WINDOWS_BETA_FIELD_TEST.md). This increment does not
-add a boot service, bundled AI, PTZ, events or storage configuration.
+remain separate [beta gates](WINDOWS_BETA_FIELD_TEST.md). PTZ and advanced
+video-wall behavior remain roadmap work.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -82,6 +83,10 @@ def prepared(legacy, private_profile, monkeypatch):
     policy.close()
     cameras.close()
     registry.close()
+    if os.name == "posix":
+        # DeviceRegistry follows the caller's umask. This generated private
+        # snapshot fixture must meet the same 0600 admission as its other files.
+        (legacy.source / "devices.sqlite3").chmod(0o600)
     for factory in (
         OperatorRolePolicy,
         OperatorAuditStore,

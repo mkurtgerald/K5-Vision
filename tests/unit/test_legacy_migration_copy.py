@@ -13,7 +13,11 @@ import test_operator_time_admin as time_helpers
 
 from k5vision import identity_state
 from k5vision import legacy_migration_copy as copy
-from k5vision.windows_identity_security import AccessEntry, WindowsIdentitySecurityError
+from k5vision.windows_identity_security import (
+    _OWNER_RIGHTS,
+    AccessEntry,
+    WindowsIdentitySecurityError,
+)
 
 private_profile = time_helpers.private_profile
 _SERVICE = "S-1-5-80-1-2-3-4-5"
@@ -345,6 +349,63 @@ def test_target_policy_accepts_only_private_service_chain_and_inherited_descenda
     _policy()
     _policy(_acl(flags=0x13), protected=False, require_protected=False)
     _policy(_acl(flags=0), directory=False)
+
+
+def _python_private_acl(*, owner_mask=copy._FILE_ALL):
+    return (
+        AccessEntry(0, 3, copy._FILE_ALL, copy._SY),
+        AccessEntry(0, 3, copy._FILE_ALL, copy._BA),
+        AccessEntry(0, 3, owner_mask, _OWNER_RIGHTS),
+    )
+
+
+def test_service_owned_python_0700_owner_rights_are_effective_service_full_control():
+    # CPython3.12.10 os.mkdir(0700) emits SY/BA/OW, not a literal service ACE.
+    copy._target_policy(
+        _SERVICE,
+        _python_private_acl(),
+        _SERVICE,
+        protected=True,
+        require_protected=True,
+        directory=True,
+    )
+
+
+@pytest.mark.parametrize("owner", [_FOREIGN, copy._BA, copy._SY])
+def test_owner_rights_never_admit_foreign_owner_or_promote_another_owner_to_service(owner):
+    with pytest.raises(ValueError):
+        copy._target_policy(
+            owner,
+            _python_private_acl(),
+            _SERVICE,
+            protected=True,
+            require_protected=True,
+            directory=True,
+        )
+
+
+def test_owner_rights_do_not_admit_foreign_write_widening():
+    with pytest.raises(ValueError):
+        copy._target_policy(
+            _SERVICE,
+            _python_private_acl() + (AccessEntry(0, 3, 0x40000000, _FOREIGN),),
+            _SERVICE,
+            protected=True,
+            require_protected=True,
+            directory=True,
+        )
+
+
+def test_owner_rights_still_require_effective_service_full_control():
+    with pytest.raises(ValueError):
+        copy._target_policy(
+            _SERVICE,
+            _python_private_acl(owner_mask=0x120089),
+            _SERVICE,
+            protected=True,
+            require_protected=True,
+            directory=True,
+        )
 
 
 @pytest.mark.parametrize(

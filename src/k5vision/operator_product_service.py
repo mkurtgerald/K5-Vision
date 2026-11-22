@@ -350,6 +350,7 @@ class OperatorProductService:
                 )
                 self._motion.note_gate(path, preferences.get(path, False) and not paused)
             await self._storage_operation(self._write_media)
+            await self._storage_operation(self._storage.confirm_writer_pause, paused=paused)
             self._needs_reconcile = False
             self._ready = was_ready and not self._closing
 
@@ -482,6 +483,9 @@ class OperatorProductService:
             await self._motion.load(self._sources, prune=True)
             await self._spawn(self._start_media)
             await self._wait_media()
+            await self._storage_operation(
+                self._storage.confirm_writer_pause, paused=self._disk_full
+            )
             self._paths = {source.binding.path_name for source in sources}
             await self._spawn(self._start_gateway)
             await self._wait_gateway()
@@ -826,6 +830,9 @@ class OperatorProductService:
                             await asyncio.to_thread(self._media.stop)
                         await self._spawn(self._start_media)
                         await self._wait_media()
+                        await self._storage_operation(
+                            self._storage.confirm_writer_pause, paused=self._disk_full
+                        )
                         self._health_failures["media"] = 0
                         self._paths = {s.binding.path_name for s in self._sources}
                         self._needs_reconcile = False
@@ -940,6 +947,19 @@ class OperatorProductService:
                 except Exception:
                     break
         cleanup_failed = False
+        if self._storage is not None:
+            close_storage = asyncio.create_task(asyncio.to_thread(self._storage.close))
+            while not close_storage.done():
+                try:
+                    await asyncio.shield(close_storage)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break
+            try:
+                close_storage.result()
+            except Exception:
+                cleanup_failed = True
         motion_close = asyncio.create_task(self._motion.close())
         while not motion_close.done():
             try:

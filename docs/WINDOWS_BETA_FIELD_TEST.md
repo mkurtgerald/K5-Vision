@@ -6,6 +6,12 @@ Explorer or Task Manager. Follow [the desktop guide](WINDOWS_DESKTOP_BETA.md) fo
 setup; there is no terminal, separate Python installation or manual stream URL
 step.
 
+This procedure describes the unattended-service candidate source. Begin only with
+an installer whose matching native qualification is supplied. Actual reboot,
+sign-out and existing-site migration gates remain pending until observed for
+that installer. Earlier per-user releases do not contain this service
+architecture; see [unattended recording](WINDOWS_UNATTENDED_RECORDING.md).
+
 The released administration baseline at
 [`34a77a5`](https://github.com/mkurtgerald/K5-Vision/releases/tag/k5-windows-admin-integrations-34a77a5)
 passed [native graphical Windows acceptance, time administration and actual
@@ -39,11 +45,14 @@ and reference-time checks below.
    Internal beta candidates contain hash-verified native workers. Disconnected-network
    installation and startup still require separate field qualification.
    Later launches reuse the verified private cache.
-3. In the first-run window, choose an administrator username, enter a password
-   of at least 12 characters twice, and select **Create account**. Sign in to
-   the browser dashboard. An existing K5 account/profile is preserved. This
-   candidate is unsigned; report a Windows installation block as a delivery
-   issue instead of inventing a setup workaround.
+3. For a new site, select **Set up administrator**, approve the Windows permission
+   prompt, then enter an administrator username and a password of at least 12
+   characters twice and select **Create account**. Sign in to the dashboard.
+   For an existing per-user site, follow the desktop guide's
+   [authenticated migration](WINDOWS_DESKTOP_BETA.md#upgrade-removal-and-release-limits)
+   instead of creating a replacement account. Record migration as a separate
+   gate. This candidate is unsigned; report a Windows installation block as a
+   delivery issue instead of inventing a setup workaround.
 4. Choose two representative ONVIF cameras with clearly different scenes.
    Record each model, firmware and H.264 resolution/frame rate/bitrate. Enable
    ONVIF and an H.264 profile in each camera's own settings if required. Camera
@@ -53,9 +62,12 @@ and reference-time checks below.
    Choose an H.264 **Video stream** and select **Connect camera**. If discovery
    finds nothing, enter the numeric camera IP in the same screen. Set its camera
    settings port and HTTPS option when needed. K5 retrieves the stream address.
-6. Keep Windows signed in. Closing either window leaves recording active in the
-   notification area. **Stop and quit**, sign-out and shutdown end recording.
-   Test video must follow the site's consent and retention policy.
+6. Check that recording is confirmed before testing recovery. Closing the browser,
+   hiding the native window, or choosing **Close K5 Vision** must leave the service
+   recording. Windows lock and sign-out must also preserve recording. Shutdown
+   stops recording while the PC is off; startup must resume the saved site before
+   sign-in. These outcomes need actual observations, not a configured startup
+   setting. Test video must follow the site's consent and retention policy.
 
 Keep camera addresses, credentials, serial numbers, private source-store files,
 logs and recordings out of the public repository and CI artifacts. Public reports
@@ -125,7 +137,7 @@ a field-qualified Chrome compatibility claim.
 | Discover and connect both cameras through the account/profile wizard | Both names and connection/recording states appear; no password or stream URL is displayed; record whether discovery or IP fallback was used |
 | Test an incorrect camera password, then correct it | The camera error is clear, the K5 administrator stays signed in, and the correct account connects |
 | Switch cameras repeatedly during live viewing | The selected name matches the actual scene, video advances, and both cameras keep recording |
-| Close all browser windows and the K5 Vision window for five minutes | K5 remains in the notification area and records; opening its Start/Desktop shortcut restores the same application and history for that interval |
+| Close all browser windows and choose Close K5 Vision for five minutes | The client exits while the service records; reopening the Start/Desktop shortcut restores the same site and playable footage for that interval |
 | Disconnect one camera for at least 30 seconds | That camera becomes disconnected while the other stays live and recording |
 | Reconnect it without restarting K5 | Live video and recording recover; history represents the missing interval accurately |
 | Play and download intervals from both cameras around the outage | The correct scene appears, video advances, and an independent player opens the downloaded MP4 |
@@ -133,20 +145,27 @@ a field-qualified Chrome compatibility claim.
 | Open Remove camera, then select Keep camera | The named camera stays enrolled and its history stays available |
 | Confirm removal, then connect the camera again using its original name and host | Removal stops new viewing/recording; the other camera is unaffected; reconnecting restores the original identity and retained history, subject to retention |
 | Inspect connection help and service/storage status | Readiness and disk use match the station; guidance identifies network, ONVIF account, profile and storage checks |
-| Sign out with live or playback already open | The workspace and players clear, protected access ends for that session, and signing in restores authorized access |
-| Select Stop and quit, then reopen K5 Vision | The application and owned workers stop; the same account, cameras and retained history work after restart |
-| Open the Start/Desktop shortcut while K5 is already running | The existing application reopens; no duplicate recorder starts |
-| Stop K5, install the same candidate again and restart it | Account, camera identities and recordings survive; setup refuses to change application files while the recorder is running |
+| Sign out of the K5 workspace with live or playback already open | The workspace and players clear, protected access ends for that K5 session, and signing in restores authorized access while recording continues |
+| Sign out of Windows, wait five minutes, then sign in and reopen K5 | The same site returns and its history contains playable new footage from the signed-out interval; retain the separate native session-transition witness |
+| Restart Windows and wait five minutes before interactive sign-in | After sign-in, the same site has playable new footage from the pre-sign-in interval; retain the independent native boot-transition witness |
+| Open the Start/Desktop shortcut while K5 is already running | The existing client reopens; no duplicate recorder starts |
+| Close the client, install the same candidate again and reopen it | Setup safely stops the service for maintenance, preserves accounts/cameras/footage, and starts recording afterward; it must not replace a still-running recorder's files |
 
-Record outage recovery and restart times. Automatic camera recovery must work
-without re-enrollment. Windows sign-out and shutdown are stop events for this
-signed-in-user candidate; no boot-service or unattended-reboot claim is part of
-this qualification.
+Record outage recovery and restart times, with shutdown and network gaps shown
+honestly in history. Automatic camera recovery must work without re-enrollment.
+A graphical look at retained history is useful field evidence; it does not replace
+the native witness proving actual boot/sign-out transitions, the absence of an
+interactive sign-in, and newly recorded bytes in that interval. Keep each pending
+until the matching [unattended gate](WINDOWS_UNATTENDED_RECORDING.md#qualification-required-before-release)
+passes.
 
-For removal testing, use **Stop and quit**, then remove K5 through **Windows
-Settings → Apps → Installed apps**. Accounts, saved cameras and recordings remain
-in the separate private profile. Reinstall through the EXE and confirm that the
-same data returns. Perform this on the dedicated test station.
+For removal testing, close the client, then remove K5 through **Windows Settings
+→ Apps → Installed apps**. The uninstaller must safely stop and remove the service
+while preserving private machine-site data. Reinstall through the EXE and confirm
+that the same accounts, cameras and retained footage return. Perform this on the
+dedicated test station. A legacy migration requires its own cancellation,
+MFA/credential preservation, retained media and controlled reversal observations;
+ordinary reinstall testing does not qualify it.
 
 ## Measured capacity and retention
 
@@ -158,10 +177,11 @@ Report maximum observed values, sustained growth, unexpected disconnects and
 playback failures. A two-camera result qualifies that tested configuration;
 the 64-camera enrollment limit is not a hardware capacity guarantee.
 
-The desktop candidate uses a **20 GiB recording quota**. The time-critical
-increment replaces native wall-clock age deletion with a one-day elapsed-age
-policy based on K5's observation of unchanged, closed files. Freshly started K5
-must wait conservatively before
+The default recording quota is **20 GiB**; administrators can change it, the
+free-space reserve and retention under **Administration → Recorder settings →
+Storage**. Record the actual policy used for this run. The default one-day
+elapsed-age policy uses K5's observation of unchanged, closed files instead of
+native wall-clock age deletion. Freshly started K5 must wait conservatively before
 age-expiring previously unobserved recordings; restarting can extend retention.
 Each camera's newest segment stays protected, so a final clip can remain beyond
 one day.
@@ -176,18 +196,21 @@ leave quota retention pending. Do not fill or delete unrelated disk content to
 manufacture a low-space condition; a dedicated low-space station requires its
 own controlled test plan.
 
-The default private recording directory is
-`%LOCALAPPDATA%\K5VisionOperatorState\recordings`; open it in File Explorer.
-Keep its contents private. After the capacity run, restart K5 and recheck
-retained footage from the beginning and final hour. Confirming the new one-day
-age deletion requires more than 24 hours of eligible elapsed observation, not
-only advancing the Windows clock.
+The service's default private recording directory is
+`%ProgramData%\K5Vision\recordings`; the Storage panel names the actual active
+location. Ordinary users must not gain direct access to this private site data.
+Use dashboard storage totals and authorized playback for the operator checks;
+any administrator filesystem evidence remains private. After the capacity run,
+restart the recorder through a scheduled Windows restart and recheck retained
+footage from the beginning and final hour. Confirming one-day age deletion needs
+more than 24 hours of eligible elapsed observation, not only advancing the
+Windows clock.
 
 ## Endurance and beta decision
 
 Complete **at least a 24-hour recording run** at the proposed qualified capacity,
-including a camera outage and an application restart. Check timestamps,
-unexpected gaps, retained playback and sustained memory/disk growth. Extend the
+including a camera outage, a recorder restart and a Windows sign-out. Check
+timestamps, unexpected gaps, retained playback and sustained memory/disk growth. Extend the
 run when defects or drift require more evidence; eight hours alone does not
 satisfy this gate.
 
@@ -197,7 +220,7 @@ to run. Use actual observations and keep unfinished gates pending.
 
 ```json
 {
-  "schema_version": "3",
+  "schema_version": "4",
   "source_revision": "<exact installer source revision>",
   "setup_sha256": "<installer hash from release metadata>",
   "platform": "Windows",
@@ -220,8 +243,12 @@ to run. Use actual observations and keep unfinished gates pending.
   "physical_ui_and_media_gate": "pending",
   "camera_account_and_profile_gate": "pending",
   "source_reconnect_gate": "pending",
-  "tray_and_single_instance_gate": "pending",
-  "restart_signout_and_upgrade_gate": "pending",
+  "client_exit_and_single_instance_gate": "pending",
+  "service_recovery_gate": "pending",
+  "windows_signout_recording_gate": "pending",
+  "pre_signin_reboot_recording_gate": "pending",
+  "preserved_site_upgrade_gate": "pending",
+  "legacy_migration_and_reversal_gate": "pending",
   "capacity_8h_gate": "pending",
   "quota_retention_gate": "pending",
   "age_retention_24h_gate": "pending",
@@ -239,6 +266,7 @@ Keep the delivery a recording candidate until the required physical-camera,
 recovery, capacity, retention and endurance results pass without a blocking
 defect. A beta decision names the observed hardware, camera models, stream
 settings, count, duration and remaining limits. Automated workflows and finite
-receipts remain linked in [the sprint record](BETA_SPRINT_003.md); they do not
-substitute for field results. This bundled desktop recording candidate does
-not qualify optional person detection or model accuracy.
+receipts must identify the exact candidate and remain linked with the
+[unattended release gates](WINDOWS_UNATTENDED_RECORDING.md#qualification-required-before-release);
+they do not substitute for field results. Bundled detector availability does not
+qualify model accuracy for the site's scenes.

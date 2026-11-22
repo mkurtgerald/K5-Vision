@@ -24,7 +24,9 @@ _NAME = "2026-11-22_02-00-00-000000_+0530.mp4"
 _CAMERA = "k5_" + "a" * 64
 
 
-def _mkdir(stage, path, *, owner, protected=True, foreign=False, service_access=True):
+def _mkdir(
+    stage, path, *, owner, protected=True, foreign=False, service_access=True, owner_rights=False
+):
     """Create a new owned fixture directory; never change an existing ACL."""
     assert not os.path.lexists(path), "The native fixture must not adopt an existing path"
     trustees = (copy._SY, copy._BA)
@@ -32,6 +34,8 @@ def _mkdir(stage, path, *, owner, protected=True, foreign=False, service_access=
         trustees += (stage.service,)
     if owner not in trustees:
         trustees += (owner,)
+    if owner_rights:
+        trustees += (copy._OWNER_RIGHTS,)
     dacl = "D:P" if protected else "D:"
     sddl = "O:" + owner + dacl + "".join(f"(A;OICI;FA;;;{sid})" for sid in trustees)
     if foreign:
@@ -179,6 +183,32 @@ def test_native_migration_copy_windows_actual_security_and_io(record_property):
         target = destination / "recordings" / entry["relative"]
         assert target.read_bytes() == original
         assert target.stat().st_mtime_ns == _STAMP
+        # Exercise the real pinned Python producer, which emits OW instead of
+        # an explicit creator SID. This administrator-created control has no
+        # effective service FullControl and must remain inadmissible.
+        python_private = destination / "identity" / "python-0700-producer"
+        python_private.mkdir(mode=0o700)
+        python_owner, python_entries, python_protected = stage._descriptor(python_private)
+        assert python_protected and any(ace.sid == copy._OWNER_RIGHTS for ace in python_entries)
+        with pytest.raises(ValueError):
+            copy._target_policy(
+                python_owner,
+                python_entries,
+                stage.service,
+                protected=True,
+                require_protected=True,
+                directory=True,
+            )
+        # The native adapter test runs as the original administrator, not as
+        # the service. Give its new OW-bearing directory an explicit service
+        # FullControl ACE; full migration separately exercises service-owned
+        # CPython OW directories created by the real target actor.
+        owner_rights_camera = destination / "recordings" / ("k5_" + "c" * 64)
+        _mkdir(stage, owner_rights_camera, owner=copy._BA, owner_rights=True)
+        owner_entry = {**entry, "relative": owner_rights_camera.name + "/" + source.name}
+        copy.copy_to_service_stage(source, owner_entry, transfer)
+        assert (owner_rights_camera / source.name).read_bytes() == original
+        assert (owner_rights_camera / source.name).stat().st_mtime_ns == _STAMP
         for path, directory in ((target.parent, True), (target, False)):
             actual_owner, actual_entries, actual_protected = stage._descriptor(path)
             assert actual_owner == copy._BA and actual_protected

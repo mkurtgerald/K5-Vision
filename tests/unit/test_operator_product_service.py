@@ -78,6 +78,12 @@ class _Storage:
 
     prune = inspect
 
+    def close(self):
+        self.closed = True
+
+    def confirm_writer_pause(self, *, paused):
+        self.paused = paused
+
 
 @pytest.fixture
 def native(tmp_path, monkeypatch):
@@ -834,6 +840,43 @@ def test_stop_uses_one_shared_flush_budget_and_still_cleans_unresponsive_worker(
     asyncio.run(scenario())
 
 
+def test_cancelled_stop_joins_storage_iterator_close_before_releasing_workers(native, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    async def scenario():
+        service = native.service
+        await service.start(())
+        media, gateway = service._media, service._gateway
+        provider_closed = []
+
+        def held_close():
+            entered.set()
+            assert release.wait(3)
+            assert media.stopped == gateway.stopped == 0
+            assert not provider_closed
+
+        async def close_provider():
+            provider_closed.append(True)
+
+        monkeypatch.setattr(service._storage, "close", held_close)
+        monkeypatch.setattr(service.provider, "aclose", close_provider)
+        cleanup = asyncio.create_task(service.stop())
+        await _until(entered.is_set)
+        cleanup.cancel()
+        try:
+            await asyncio.sleep(0.02)
+            assert not cleanup.done()
+            assert media.stopped == gateway.stopped == 0
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+        assert provider_closed == [True]
+        assert media.stopped == gateway.stopped == 1
+
+    asyncio.run(scenario())
+
+
 def test_cancelled_stop_joins_flush_before_cleanup_or_return(native, monkeypatch):
     entered, release = threading.Event(), threading.Event()
 
@@ -1226,6 +1269,75 @@ def test_recording_preference_patches_only_writer_and_survives_worker_restart(na
             assert service._media.paths[second.binding.path_name]["record"] is True
             await service.apply_recording_preferences((first, second))
             assert service._media.paths[first.binding.path_name]["record"] is True
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", [None, "patch", "configuration_write"])
+def test_storage_pause_confirmation_waits_for_real_gates_and_survives_reconciliation(
+    native, monkeypatch, failure
+):
+    _fast_maintenance(native, monkeypatch)
+    _fake_mutations(native, monkeypatch)
+
+    async def scenario():
+        service = native.service
+        await service.start((_source(1), _source(2)))
+        service._task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await service._task
+        service._task = None
+        media = service._media
+        original_mutation = service._mutation
+        original_write = service._write_media
+        original_confirm = service._storage.confirm_writer_pause
+        failed = False
+        notifications = []
+
+        def mutation(*args, **kwargs):
+            nonlocal failed
+            if failure == "patch" and not failed:
+                failed = True
+                raise OperatorProductError("Controlled gate interruption")
+            return original_mutation(*args, **kwargs)
+
+        def write():
+            nonlocal failed
+            if failure == "configuration_write" and not failed:
+                failed = True
+                raise OperatorProductError("Controlled configuration interruption")
+            return original_write()
+
+        def confirm(*, paused):
+            if paused:
+                assert all(not value["record"] for value in service._media.paths.values())
+                saved = json.loads(service._media_file.read_text())["paths"]
+                assert all(not value["record"] for value in saved.values())
+                if failure is not None:
+                    assert service._media is not media
+                notifications.append(True)
+            return original_confirm(paused=paused)
+
+        monkeypatch.setattr(service, "_mutation", mutation)
+        monkeypatch.setattr(service, "_write_media", write)
+        monkeypatch.setattr(service._storage, "confirm_writer_pause", confirm)
+        _Storage.allowed = False
+        result = SimpleNamespace(recording_allowed=False, total_bytes=100, free_bytes=500)
+        try:
+            if failure is None:
+                await service._apply_storage_status(result)
+                assert notifications == [True] and not service._needs_reconcile
+            else:
+                with pytest.raises(OperatorProductError):
+                    await service._apply_storage_status(result)
+                assert notifications == [] and service._needs_reconcile
+                assert service.status() == "unavailable"
+                service._task = asyncio.create_task(service._maintain())
+                await _until(lambda: bool(notifications) and service.status() == "disk_full")
+                assert notifications == [True] and not service._needs_reconcile
+                assert media.stopped == 1
         finally:
             await service.stop()
 

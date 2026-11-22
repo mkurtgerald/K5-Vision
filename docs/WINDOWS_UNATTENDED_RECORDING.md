@@ -55,20 +55,44 @@ establish a supported remote-client or multi-recorder deployment.
 
 ## Existing installations
 
-A machine-service upgrade must preserve the existing site. Until an actual
-migration is qualified, an existing legacy per-user profile must produce a
-visible migration-required state rather than initialize an empty replacement
-site. The original profile and footage must remain intact.
+The candidate includes a graphical, authenticated migration for a legacy per-user
+site. Actual native upgrade, cancellation, retained playback/export and manual
+reversal qualification is still required; implementation alone is not a passing
+upgrade. An existing profile produces a visible migration-required state and
+must never silently initialize an empty replacement site.
 
-The eventual migration needs a stopped, leased, copy-first snapshot. It must
-preserve the site UUID, accounts and password verifiers, role/camera grants,
-camera sources, recording policy, security generations, recovery-code hashes,
-OIDC links, storage anchors, and recorded-file names and timestamps. Both MFA
-secrets and OIDC client secrets use the old Windows user's DPAPI protection;
-they must be decrypted in that user's context and protected again in the
-recorder account's context through an authenticated transfer. Copying their
-ciphertext or changing to machine-wide DPAPI is insufficient. Footage must be
-hash-verified before committing changed absolute storage paths.
+Use the same Windows account that owns the old profile, with administrator
+permission for that account. Close the previous K5 app, then select **Move existing
+K5 site** in the new client. Approve Windows elevation and sign in with the old
+site's K5 administrator account and its authenticator or recovery code when MFA
+is enabled. Elevation through a different Windows account is refused. This flow
+does not import a site belonging to another Windows user.
+
+The source is stopped and held under an exclusive lease while K5 makes a
+copy-first snapshot. The migration preserves the site UUID, accounts and password
+verifiers, role/camera grants, camera sources, recording policy, security
+generations, recovery-code hashes, OIDC links, storage anchors, and recorded-file
+names and timestamps. MFA secrets and OIDC client secrets are decrypted in the
+old Windows user's context and protected again in the recorder account's context
+through an authenticated private transfer. Their old ciphertext is not merely
+copied, and protection is not changed to machine-wide DPAPI.
+
+K5 checks capacity for the full recording/export copy plus a free-space reserve,
+hash-verifies copied footage, and rechecks the source and administrator authority
+before activating the target through a durable journal. The original profile and
+footage remain intact. A failed pre-activation transaction must preserve the
+original and recover its incomplete target instead of starting a blank site.
+Large sites may take time, and a fresh retry can need another full copy; this
+wizard does not promise resumable reuse of partial terabyte-scale transfers.
+
+**Cancel** waits for the owned migration work to retire and checks durable
+activation. If activation has already committed, cancellation or a lost final
+reply does not roll the active site back. Reopen K5 to check the service's actual
+state before retrying. Do not delete identity or journal files to clear a refusal.
+Returning to the old application requires a controlled stop/removal and reinstall
+procedure using the preserved original profile; new service footage and later
+account changes are not automatically merged back. Until that exact native
+reversal is qualified, do not present it as a general supported downgrade.
 
 ## Time integrity
 

@@ -2,8 +2,15 @@
 
 Use K5 Vision to watch cameras together, check whether recording is actually
 advancing, find footage on a UTC timeline and save an MP4 clip. The native Windows
-application starts the camera engine and stays in the notification area;
-**Open camera wall** opens the viewing and recording workspace in your browser.
+application connects to the Windows recording service; **Open camera wall**
+opens the viewing and recording workspace in your browser. The service owns
+recording independently of the desktop client.
+
+This guide describes the unattended-service candidate source. Its exact installer
+still needs matching Windows qualification, including actual reboot, sign-out
+and legacy migration results. Earlier public per-user installers do not gain
+these capabilities from this source change; see the
+[unattended recording status](WINDOWS_UNATTENDED_RECORDING.md).
 
 Download the Windows installer from [public GitHub Releases](https://github.com/mkurtgerald/K5-Vision/releases).
 Use the release notes and matching source revision, installer hash and Windows
@@ -20,8 +27,11 @@ installation, manual packages, Docker or WSL. The testing installer is unsigned.
 
 1. Double-click **K5VisionSetup.exe**, accept its software terms and choose
    **Install**. Leave **Launch K5 Vision** selected when choosing **Finish**.
-2. In the first-run window, choose an administrator username and enter a password
-   of at least 12 characters twice. Select **Create account**.
+2. On a new site, select **Set up administrator** and approve the Windows
+   permission prompt if offered. In the setup window, choose an administrator
+   username, enter a password of at least 12 characters twice, and select
+   **Create account**. An existing per-user site must use **Move existing K5
+   site** instead; follow the upgrade instructions below.
 3. Choose **Open camera wall** if the workspace has not opened, then sign in.
    Engine readiness means K5 is available; check each camera's recording state
    before relying on new footage.
@@ -137,17 +147,51 @@ Investigate clock-step warnings: recording timestamps can move when Windows time
 changes. Successful playback alone does not establish accurate chronology.
 See the [field time matrix](WINDOWS_BETA_FIELD_TEST.md#time-acceptance-matrix).
 
-Closing the browser or native window leaves the engine running in the
-notification area. Reopen the Start/Desktop shortcut or choose **Open camera
-wall** from the tray. **Stop and quit**, Windows sign-out and shutdown stop the
-engine. This is a signed-in-user application, not a boot service.
+Closing the browser leaves recording with the Windows service. Closing the native
+window hides the client in the notification area; **Close K5 Vision** exits that
+client while recording continues. Reopen the Start/Desktop shortcut or choose
+**Open camera wall** from the tray to return. Locking or signing out of Windows
+must also leave the service recording. Shutdown stops recording while the PC is
+off; automatic startup must restore the saved site before anyone signs in.
+These are candidate requirements until the exact installer passes the
+[service, reboot and sign-out gates](WINDOWS_UNATTENDED_RECORDING.md#qualification-required-before-release).
+
+The client reports service readiness and recovery. Check each camera's observed
+recording state as well. If recovery does not complete and the client requests a
+repair, rerun the graphical installer; preserve the existing site data.
 
 ## Upgrade, removal and release limits
 
-Choose **Stop and quit** before installing an update. Setup refuses a running
-recorder and preserves the account, cameras and recordings. Removing K5 through
-**Windows Settings → Apps → Installed apps** also preserves that private profile.
-Reinstalling can use it again.
+Close the desktop client before installing an update. The graphical installer
+stops and verifies its service before replacing application files, then starts it
+again. Schedule this maintenance because new recording stops during the update.
+Setup preserves the machine site's accounts, cameras and recordings. Removing K5
+through **Windows Settings → Apps → Installed apps** removes the service and
+application while preserving site data; reinstalling can use that data again.
+
+For an older per-user installation, sign in to Windows with the account that owns
+that K5 site, close the previous K5 app, and install the new candidate. This same
+Windows account must have administrator permission; approving elevation with a
+different Windows account is refused. In K5, select **Move existing K5 site**,
+approve the Windows permission prompt, and enter the existing **K5 administrator**
+username, password and authenticator or recovery code if MFA is enabled. Select
+**Move existing site** and keep the migration window open.
+
+Migration copies and verifies the site, recordings and exports before activating
+the service copy; the original per-user data is preserved. Allow free space for
+the full copy plus K5's reserve. Insufficient capacity or failed verification must
+leave the existing site intact instead of creating an empty replacement. Large
+sites can take time. **Cancel** waits while K5 checks the transaction; if activation
+has already completed, cancellation does not undo the new site. Reopen K5 to check
+its actual state before retrying. An interrupted retry can need a new full copy;
+partial-copy reuse is not a supported promise. See
+[existing-site migration and recovery limits](WINDOWS_UNATTENDED_RECORDING.md#existing-installations).
+
+Do not delete private state, copy protected credentials manually, or run both
+copies as independent active sites to work around a migration refusal. A return
+to the old version requires a controlled maintenance procedure; it does not merge
+new service recordings or account changes back into the old profile. Actual
+native migration and reversal qualification remains required before release.
 
 A release claiming this workspace must pass the real Windows installer and GUI
 journey, wall viewing, recording controls, UTC timeline, decoded playback and MP4
@@ -171,6 +215,7 @@ and endurance still require [field qualification](WINDOWS_BETA_FIELD_TEST.md).
 Motion recording and inclusion/exclusion zones are implemented in the candidate
 source; their dedicated installed-Windows motion receipt must qualify the exact
 installer before a release claims support. See the [motion recording guide](CAMERA_MOTION_RECORDING.md).
-A boot service, PTZ controls, custom tile layouts and adaptive main/sub streams
-remain on the [camera-setup](CAMERA_SETUP_ROADMAP.md) and
-[video-wall](VIDEO_WALL_ROADMAP.md) roadmaps.
+The boot service and existing-site migration are implemented in candidate source
+and remain subject to the unattended qualification gates above. PTZ controls,
+custom tile layouts and adaptive main/sub streams remain on the
+[camera-setup](CAMERA_SETUP_ROADMAP.md) and [video-wall](VIDEO_WALL_ROADMAP.md) roadmaps.

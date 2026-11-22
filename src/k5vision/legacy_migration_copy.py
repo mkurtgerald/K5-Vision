@@ -24,6 +24,7 @@ from k5vision.operator_recording_storage import _PATH_NAME, _segment_name
 from k5vision.operator_storage_settings import _descriptor_signature, _signature
 from k5vision.windows_identity_security import (
     _FILE_ALL,
+    _OWNER_RIGHTS,
     _acl_entries,
     _check_policy,
     _expanded_mask,
@@ -101,12 +102,13 @@ def _target_policy(owner, entries, service, *, protected, require_protected, dir
         raise ValueError
     service_full = service_inheritance = False
     for entry in entries:
-        if entry.kind != 0 or entry.sid not in trusted or entry.flags & ~0x1F:
+        sid = owner if entry.sid == _OWNER_RIGHTS else entry.sid
+        if entry.kind != 0 or sid not in trusted or entry.flags & ~0x1F:
             raise ValueError
         mask = _expanded_mask(entry.mask)
         if mask & ~_FILE_ALL:
             raise ValueError
-        if entry.sid == service and not entry.flags & 0x08 and mask & _FILE_ALL == _FILE_ALL:
+        if sid == service and not entry.flags & 0x08 and mask & _FILE_ALL == _FILE_ALL:
             service_full = True
             service_inheritance |= entry.flags & 0x03 == 0x03
     if not service_full or directory and not service_inheritance:
