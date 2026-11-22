@@ -1085,6 +1085,9 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
         receipt.update(dict.fromkeys(_TRUE_FLAGS, True))
     except BaseException as error:
         failed = True
+        if "client" in locals():
+            diagnostic["client_transport_failure"] = client.transport_failure
+            diagnostic["client_last_http_status"] = client.last_http_status
         diagnostic["failure_kind"] = (
             type(error).__name__
             if type(error).__name__
@@ -1181,6 +1184,8 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     "motion_saved_zone_counts",
                     "motion_observation",
                     "motion_clock_observation",
+                    "client_transport_failure",
+                    "client_last_http_status",
                     "cleanup_failures",
                     "cohort_failed_after_finish",
                     "installer_action",

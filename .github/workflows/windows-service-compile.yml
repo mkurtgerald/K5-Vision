@@ -53,7 +53,7 @@ jobs:
           $harnessHead = (& git -C diagnostic-source rev-parse HEAD).Trim()
           & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:scripts/probe_windows_motion_runtime.py > scripts/probe_windows_motion_runtime.py'
           $scriptSha = (Get-FileHash -LiteralPath scripts/probe_windows_motion_runtime.py -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne '5e6a16caf3a6bb29188a84b678b6c652c604e94d5890fd510e11b309b73730d2' -or
+          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne 'fa8126218870c378a43ca3fdae29308aded4e8be00c23e6dc83fa8c8f8c19a78' -or
               $harnessHead -ne $env:K5_DIAGNOSTIC_HARNESS_SHA -or $harnessHead -eq $env:K5_DESKTOP_HEAD_SHA) {
             throw 'Diagnostic runtime clock controller identity mismatch'
           }
@@ -86,6 +86,18 @@ jobs:
               @($evidence.clock_steps).Count -ne 2 -or $evidence.clock_guard.clock_restored -ne $true -or
               $evidence.clock_guard.services_restored -ne $true) {
             throw 'Runtime clock diagnostic scope, observation or restoration mismatch'
+          }
+          $clockSteps = @($evidence.clock_steps)
+          if ($clockSteps[0].offset_seconds -ne 172800 -or $clockSteps[1].offset_seconds -ne -172800) {
+            throw 'Runtime clock diagnostic did not observe both original clock offsets'
+          }
+          foreach ($clockStep in $clockSteps) {
+            if ($clockStep.shift.verified -ne $true -or $clockStep.immediate_state -ne 'post_capture' -or
+                $clockStep.post_capture_elapsed_seconds -lt 0.5 -or $clockStep.post_capture_elapsed_seconds -gt 8 -or
+                $clockStep.policy_wait.wanted -ne 'armed' -or $clockStep.policy_wait.last_status -ne 'armed' -or
+                $clockStep.restoration.restored -ne $true) {
+              throw 'Runtime clock diagnostic active hold transition or restoration mismatch'
+            }
           }
       - name: Retain parent-only clock observations without qualification or promotion
         if: always()
@@ -179,7 +191,7 @@ jobs:
               $package.payload_manifest_sha256 -ne 'd3d90edde5b69ba52a124ec34d176ef4fc0efe5e79e48f530a716451b52bdb8c' -or
               $package.launcher_sha256 -ne '7f0a48885feb936dffb14fe59d3f4efff1217e32dde98ab4068ab50241253317' -or
               $manifest.files.path -notcontains 'K5VisionRecorder.exe' -or $manifest.files.path -notcontains 'K5VisionRecorder.xml' -or
-              $overlaySha -ne 'df6ea09b506c018fd0cc95933d54a54b1b10d2f55d7247a8c15eb4921d66438a' -or
+              $overlaySha -ne '690f3e00542dbd189cbd5f075f2c2d84b711a79706a3914c419fc27ed5d899c7' -or
               $env:K5_MOTION_DIAGNOSTIC_HARNESS_SHA -eq $env:K5_DESKTOP_HEAD_SHA) {
             throw 'Diagnostic motion replay source or installer byte identity mismatch'
           }

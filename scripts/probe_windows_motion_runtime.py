@@ -34,6 +34,7 @@ def _port():
 def _instrument(product, receipt, phase, began):
     runtime = product.service._motion
     status, new_worker, get = runtime.status, runtime._new_worker, runtime.store.get
+    mutation = product.service._mutation
     workers = set()
 
     def stamp():
@@ -57,6 +58,12 @@ def _instrument(product, receipt, phase, began):
                     "sample_age_seconds": None if age is None else round(age, 4),
                     "sample_fresh": age is not None and 0 <= age <= 2,
                     "sample_inflight": path in runtime.inflight,
+                    "gate": runtime.gates.get(path),
+                    "pending_gate": runtime.pending_gates.get(path),
+                    "moving": runtime.moving.get(path),
+                    "hold_remaining_seconds": None
+                    if path not in runtime.holds
+                    else round(runtime.holds[path] - time.monotonic(), 4),
                 }
             )
         return result
@@ -106,7 +113,29 @@ def _instrument(product, receipt, phase, began):
                     }
                 )
 
+    def observed_mutation(method, route, payload=None, **kwargs):
+        if method != "PATCH" or type(payload) is not dict or set(payload) != {"record"}:
+            return mutation(method, route, payload, **kwargs)
+        started = time.monotonic()
+        note = {"phase": phase["name"], "record": payload["record"], "started_seconds": stamp()}
+        try:
+            result = mutation(method, route, payload, **kwargs)
+            note["outcome"] = "applied"
+            return result
+        except BaseException as error:
+            note.update(outcome="refused", kind=type(error).__name__)
+            for field in ("winerror", "errno", "code"):
+                value = getattr(error, field, None)
+                if type(value) is int:
+                    note[field] = value
+            raise
+        finally:
+            note["duration_seconds"] = round(time.monotonic() - started, 4)
+            if len(receipt["gate_mutations"]) < 256:
+                receipt["gate_mutations"].append(note)
+
     runtime.status, runtime._new_worker, runtime.store.get = projection, factory, durable
+    product.service._mutation = observed_mutation
     for worker in tuple(runtime.workers.values()):
         observe_worker(worker)
 
@@ -144,6 +173,7 @@ def main():
         "baseline_source_head": args.baseline_source_head,
         "source_progress": [],
         "clock_steps": [],
+        "gate_mutations": [],
     }
     product = upstream = publisher = None
     original_popen = subprocess.Popen
@@ -340,6 +370,36 @@ def main():
             native._login(client, username, password)
             poll("restart_idle", 20)
             if args.clock_steps:
+                desktop = _load("test_windows_desktop_app")
+
+                def wait_state(name, wanted, timeout, note):
+                    phase["name"] = name
+                    wait = {"wanted": wanted, "timeout_seconds": timeout, "states": []}
+                    note["policy_wait"] = wait
+
+                    def ready():
+                        started = time.monotonic()
+                        try:
+                            value = client.json(route)
+                            wait["last_status"] = value["status"]
+                            if len(wait["states"]) < 256:
+                                wait["states"].append(value["status"])
+                            receipt["polls"].append(
+                                {
+                                    "phase": name,
+                                    "status": value["status"],
+                                    "elapsed_seconds": round(time.monotonic() - began, 4),
+                                    "duration_seconds": round(time.monotonic() - started, 4),
+                                    "publisher_frames_written": publisher.frames_written,
+                                }
+                            )
+                            return value["status"] == wanted
+                        finally:
+                            wait["last_http_status"] = client.last_http_status
+                            wait["transport_failure"] = client.transport_failure
+
+                    desktop._wait(ready, "Actual clock motion state", timeout=timeout)
+
                 guard = _load("windows_vm_clock").WindowsVmClockGuard(
                     root / "runtime-clock-guard.json", watchdog_seconds=90
                 )
@@ -349,12 +409,40 @@ def main():
                             phase["name"] = "clock_" + label + "_before"
                             note = {"offset_seconds": offset, "before": source_snapshot()}
                             receipt["clock_steps"].append(note)
-                            note["shift"] = guard.shift(offset)
-                            poll("clock_" + label + "_shifted", 8)
-                            note["after_shift"] = source_snapshot()
-                            note["restoration"] = guard.restore()
-                            poll("clock_" + label + "_restored", 5)
-                            note["after_restore"] = source_snapshot()
+                            try:
+                                publisher.movement("outside")
+                                wait_state(
+                                    "clock_" + label + "_await_recording", "recording", 15, note
+                                )
+                                publisher.movement("idle")
+                                wait_state(
+                                    "clock_" + label + "_await_post_capture",
+                                    "post_capture",
+                                    10,
+                                    note,
+                                )
+                                hold_began = time.monotonic()
+                                note["shift"] = guard.shift(offset)
+                                note["immediate_state"] = client.json(route)["status"]
+                                if note["immediate_state"] != "post_capture":
+                                    raise RuntimeError(
+                                        "Clock step changed the live post-capture hold"
+                                    )
+                                note["source_after_step"] = source_snapshot()
+                                wait_state("clock_" + label + "_await_armed", "armed", 8, note)
+                                note["post_capture_elapsed_seconds"] = round(
+                                    time.monotonic() - hold_began, 4
+                                )
+                                if not 0.5 <= note["post_capture_elapsed_seconds"] <= 8:
+                                    raise RuntimeError(
+                                        "Clock hold elapsed outside its existing bounds"
+                                    )
+                                note["after_shift"] = source_snapshot()
+                                note["restoration"] = guard.restore()
+                                poll("clock_" + label + "_restored", 5)
+                                note["after_restore"] = source_snapshot()
+                            finally:
+                                note["after_wait"] = source_snapshot()
                 finally:
                     try:
                         receipt["clock_guard"] = guard.receipt()
