@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import math
 import os
 import secrets
 import shutil
@@ -265,6 +266,212 @@ def _process_issuer(pid):
         kernel.CloseHandle(handle)
 
 
+_FAILURE_CODES = {
+    "time_unavailable",
+    "time_unsupported",
+    "time_busy",
+    "time_ntp_unreachable",
+    "time_elevation_cancelled",
+    "time_operation_failed",
+    "time_operation_timeout",
+    "time_invalid_request",
+}
+_FAILURE_TYPES = {
+    "AssertionError",
+    "Failed",
+    "TimeAdministrationError",
+    "WindowsVmClockError",
+    "OSError",
+    "PermissionError",
+    "FileNotFoundError",
+    "RuntimeError",
+    "TimeoutError",
+    "TimeoutExpired",
+    "HTTPError",
+    "URLError",
+    "JSONDecodeError",
+}
+
+
+def _failure_error(error):
+    name = type(error).__name__
+    value = {"exception_type": name if name in _FAILURE_TYPES else "other"}
+    code = getattr(error, "code", None)
+    if type(code) is str and code in _FAILURE_CODES:
+        value["code"] = code
+    return value
+
+
+def _failure_http(status, payload):
+    detail = payload.get("detail") if type(payload) is dict else None
+    recognized = type(detail) is str and detail in _FAILURE_CODES
+    return {
+        "response_observed": True,
+        "status": status if type(status) is int and 100 <= status <= 599 else None,
+        "api_code": detail if recognized else None,
+        "detail_kind": "recognized" if recognized else "unrecognized_or_absent",
+    }
+
+
+def _failure_http_projection(value):
+    if type(value) is not dict or value.get("response_observed") is not True:
+        return {"response_observed": False}
+    code = value.get("api_code")
+    result = _failure_http(value.get("status"), {"detail": code})
+    return result
+
+
+def _failure_host(value):
+    if type(value) is not dict:
+        return {"observed": False}
+    mode, status, servers = value.get("mode"), value.get("status"), value.get("ntp_servers")
+    return {
+        "observed": True,
+        "mode": mode if type(mode) is str and mode in {"manual", "domain", "unknown"} else None,
+        "status": status
+        if type(status) is str and status in {"available", "unavailable", "unsupported"}
+        else None,
+        "service_running": value.get("service_running")
+        if type(value.get("service_running")) is bool
+        else None,
+        "server_count": min(len(servers), 5) if type(servers) is list else None,
+        "matches_requested_peer": servers == ["time.cloudflare.com"],
+    }
+
+
+def _failure_guard(value):
+    if type(value) is not dict:
+        return {"observed": False}
+    result = {"observed": True}
+    for key in (
+        "clock_restored",
+        "services_restored",
+        "time_configuration_restored",
+        "configuration_watchdog",
+    ):
+        result[key] = value.get(key) if type(value.get(key)) is bool else None
+    reason = value.get("reason")
+    result["reason"] = (
+        reason
+        if type(reason) is str
+        and reason
+        in {
+            "closed",
+            "parent_closed",
+            "watchdog_timeout",
+            "error",
+            "restore_failed",
+            "configuration_restore_failed",
+            "foreground_fallback",
+        }
+        else None
+    )
+    restored = value.get("last_restoration")
+    if type(restored) is dict:
+        result["restoration"] = {"restored": restored.get("restored") is True}
+        for key in ("baseline_residual_seconds", "residual_seconds", "elapsed_seconds"):
+            number = restored.get(key)
+            result["restoration"][key] = (
+                number
+                if type(number) in (int, float)
+                and math.isfinite(number)
+                and abs(number) <= 315576000
+                else None
+            )
+    return result
+
+
+def _failure_ownership(value):
+    if type(value) is not dict:
+        return {"observed": False}
+    result = {"observed": True, "processes": []}
+    for key in ("helper_count", "native_command_count"):
+        number = value.get(key)
+        result[key] = number if type(number) is int and 0 <= number <= 4096 else None
+    for key in ("helper_observed", "native_command_observed"):
+        result[key] = value.get(key) is True
+    processes = value.get("processes")
+    for item in processes[:16] if type(processes) is list else []:
+        if type(item) is not dict:
+            continue
+        kind, pid, birth = item.get("kind"), item.get("pid"), item.get("created_100ns")
+        if (
+            type(kind) is not str
+            or kind not in {"helper", "command"}
+            or type(pid) is not int
+            or not 1 <= pid <= 2**32 - 1
+            or type(birth) is not int
+            or not 1 <= birth <= 2**63 - 1
+        ):
+            continue
+        code = item.get("exit_code")
+        bound = item.get("identity_bound") is True
+        exit_observed = bound and item.get("exit_observed") is True
+        exited = item.get("exited") if bound and type(item.get("exited")) is bool else None
+        result["processes"].append(
+            {
+                "kind": kind,
+                "pid": pid,
+                "created_100ns": birth,
+                "identity_bound": bound,
+                "exit_observed": exit_observed,
+                "exited": exited,
+                "exit_code": code
+                if exit_observed and exited is True and type(code) is int and 0 <= code <= 2**32 - 1
+                else None,
+            }
+        )
+    return result
+
+
+def _record_time_failure(
+    record,
+    error,
+    *,
+    operations,
+    initial_host,
+    guard_result,
+    helper_ownership=None,
+    current_host=None,
+):
+    """Publish only fixed fields; never an exception string or private document."""
+    observations = []
+    for item in operations[:4] if type(operations) is list else []:
+        if type(item) is not dict:
+            continue
+        operation = item.get("operation")
+        observations.append(
+            {
+                "operation": operation
+                if type(operation) is str and operation in {"configure", "resync"}
+                else "unknown",
+                "snapshot_phase": "before_capability_revocation_and_fixture_cleanup",
+                "http": _failure_http_projection(item.get("http")),
+                "ownership": _failure_ownership(item.get("ownership")),
+                "windows_before_cleanup": _failure_host(item.get("windows")),
+            }
+        )
+    record(
+        "k5_native_time_failure_diagnostic",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "primary_error": _failure_error(error),
+                "initial_windows": _failure_host(initial_host),
+                "windows_after_guard_before_fixture_cleanup": _failure_host(current_host),
+                "operations": observations,
+                "helper_ownership": [_failure_ownership(value) for value in helper_ownership[:4]]
+                if type(helper_ownership) is list
+                else [],
+                "guard_restoration": _failure_guard(guard_result),
+                "qualification_passed": False,
+            },
+            sort_keys=True,
+            allow_nan=False,
+        ),
+    )
+
+
 def _time_request(client, operation):
     """Keep the existing API request open while a human-visible native approval runs."""
     configure = operation == "configure"
@@ -285,14 +492,24 @@ def _time_request(client, operation):
     except HTTPError as error:
         response = error
     with response:
-        raw = response.read(16385)
-        assert 0 < len(raw) <= 16384, "Time API response exceeded its finite byte budget"
-        result = json.loads(raw)
-        if response.code != 200:
-            code = result.get("detail") if type(result) is dict else None
-            raise TimeAdministrationError(code if type(code) is str else "time_operation_failed")
-        assert type(result) is dict
-        return result
+        result = None
+        try:
+            raw = response.read(16385)
+            assert 0 < len(raw) <= 16384, "Time API response exceeded its finite byte budget"
+            result = json.loads(raw)
+            if response.code != 200:
+                code = result.get("detail") if type(result) is dict else None
+                raise TimeAdministrationError(
+                    code if type(code) is str else "time_operation_failed"
+                )
+            assert type(result) is dict
+            return result
+        except BaseException as error:
+            try:
+                error._k5_time_failure_http = _failure_http(response.code, result)
+            except Exception:
+                pass
+            raise
 
 
 def _time_processes():
@@ -396,9 +613,74 @@ class _TimeHelperTracker:
             "native_command_observed": bool(self.commands),
         }
 
+    def failure_snapshot(self, operation):
+        """Query already-admitted identities on failure; never wait or terminate."""
+        result = {**self.evidence(operation), "processes": []}
+        api = self.native.api
+        for kind, identities in (("helper", self.helpers), ("command", self.commands)):
+            for pid, birth in sorted(identities):
+                if len(result["processes"]) >= 16:
+                    break
+                item = {
+                    "kind": kind,
+                    "pid": pid,
+                    "created_100ns": birth,
+                    "identity_bound": False,
+                    "exit_observed": False,
+                    "exited": None,
+                    "exit_code": None,
+                }
+                result["processes"].append(item)
+                handle = None
+                try:
+                    # QUERY_LIMITED_INFORMATION | SYNCHRONIZE only. A short
+                    # process may already be gone; unavailability stays honest.
+                    handle = api.OpenProcess(0x00101000, False, pid)
+                    if not handle:
+                        continue
+                    # Use the native reader's exact FILETIME ABI, including
+                    # for an exited process. Its live-only birth() is not used.
+                    filetime = api.GetProcessTimes.argtypes[1]._type_
+                    created, exited, kernel, user = (filetime() for _ in range(4))
+                    if not api.GetProcessTimes(
+                        handle,
+                        ctypes.byref(created),
+                        ctypes.byref(exited),
+                        ctypes.byref(kernel),
+                        ctypes.byref(user),
+                    ):
+                        continue
+                    if (created.high << 32) | created.low != birth:
+                        continue  # A reused PID cannot supply the old exit code.
+                    item["identity_bound"] = True
+                    waited = api.WaitForSingleObject(handle, 0)
+                    if waited == 258:
+                        item["exited"] = False
+                    elif waited == 0:
+                        code = api.GetExitCodeProcess.argtypes[1]._type_()
+                        if api.GetExitCodeProcess(handle, ctypes.byref(code)):
+                            item.update(exit_observed=True, exited=True, exit_code=code.value)
+                except Exception:
+                    pass  # Observation must not replace the original failure.
+                finally:
+                    if handle:
+                        api.CloseHandle(handle)
+        return result
+
 
 def _approve_time(
-    client, operation, *, desktop, api, app, form, profile, service, cohort, ownership
+    client,
+    operation,
+    *,
+    desktop,
+    api,
+    app,
+    form,
+    profile,
+    service,
+    cohort,
+    ownership,
+    failure_observations=None,
 ):
     """Exercise authenticated HTTP -> service capability -> native GUI approval."""
     before = service.observe()
@@ -406,6 +688,7 @@ def _approve_time(
     assert before["backend_account_verified"] and before["service_account_verified"]
     issuer = _process_issuer(before["backend_pid"])
     directory = profile / "identity" / "time-admin"
+    tracker = None
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_time_request, client, operation)
         try:
@@ -472,7 +755,22 @@ def _approve_time(
             finally:
                 ownership.append(tracker.evidence(operation))
             assert not request.exists(), "Completed time operation retained its admission token"
-        except BaseException:
+        except BaseException as error:
+            if failure_observations is not None:
+                observation = {
+                    "operation": operation,
+                    "http": getattr(error, "_k5_time_failure_http", None),
+                }
+                try:
+                    if tracker is not None:
+                        observation["ownership"] = tracker.failure_snapshot(operation)
+                except Exception:
+                    pass
+                try:
+                    observation["windows"] = windows_configuration()
+                except Exception:
+                    pass
+                failure_observations.append(observation)
             # Revoke this generated fixture's sole pending capability before
             # draining its bounded HTTP worker or restoring Windows settings.
             directory = profile / "identity" / "time-admin"
@@ -580,8 +878,9 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
     guard_path = parent / "time-restoration.json"
     api, runtime = desktop._Windows(), desktop._helpers("test_operator_product_runtime")
     cohort = desktop._Cohort(api)
-    app = form = primary_error = None
+    app = form = primary_error = guard = original_host = None
     time_ownership = []
+    failure_observations = []
     proof = {
         "schema_version": 2,
         "head_sha": os.environ.get("K5_DESKTOP_HEAD_SHA"),
@@ -707,6 +1006,7 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
                 service=service,
                 cohort=cohort,
                 ownership=time_ownership,
+                failure_observations=failure_observations,
             )
             assert configured["host"]["mode"] == "manual"
             assert configured["host"]["ntp_servers"] == ["time.cloudflare.com"]
@@ -732,6 +1032,7 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
                     service=service,
                     cohort=cohort,
                     ownership=time_ownership,
+                    failure_observations=failure_observations,
                 )
             except TimeAdministrationError as error:
                 if error.code == "time_ntp_unreachable":
@@ -775,6 +1076,23 @@ def test_native_windows_time_configuration_readback_and_resync_with_restoration(
         )
     except BaseException as error:
         primary_error = error
+        failure_host = None
+        try:
+            failure_host = windows_configuration()
+        except Exception:
+            pass
+        try:
+            _record_time_failure(
+                record_testsuite_property,
+                error,
+                operations=failure_observations,
+                initial_host=original_host,
+                guard_result=None if guard is None else guard.result,
+                helper_ownership=time_ownership,
+                current_host=failure_host,
+            )
+        except Exception:
+            pass  # Preserve the actual primary error if evidence I/O fails.
         raise
     finally:
 

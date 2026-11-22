@@ -6,6 +6,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Text;
 using System.Threading;
 using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
@@ -455,11 +456,11 @@ namespace K5VisionDesktop
             }
             finally { foreach (PinnedEntry entry in pinned.Values) entry.Dispose(); }
         }
-        private static void RequireNoLegacyProfiles()
+        private static List<string> LegacyProfiles()
         {
-            // Until migration is qualified, never replace an existing user's
-            // installation or silently start a blank machine site. Enumerate
-            // registered profiles, including the original user across UAC.
+            // Inventory only. The original per-user tree is never repaired,
+            // removed or opened under a substitute Windows user.
+            List<string> found = new List<string>();
             using (RegistryKey profiles = Registry.LocalMachine.OpenSubKey(
                 "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", false))
             {
@@ -468,17 +469,63 @@ namespace K5VisionDesktop
                 using (RegistryKey profile = profiles.OpenSubKey(name, false))
                 {
                     Require(profile != null);
+                    Require(new SecurityIdentifier(name).Value == name);
                     string image = profile.GetValue("ProfileImagePath", null, RegistryValueOptions.DoNotExpandEnvironmentNames) as string;
                     Require(!String.IsNullOrEmpty(image));
                     string legacy = Path.Combine(Custody.OrdinaryAbsolute(Environment.ExpandEnvironmentVariables(image)),
                         "AppData", "Local", "K5VisionOperatorState");
-                    try { File.GetAttributes(legacy); throw new InvalidOperationException(); }
+                    try
+                    {
+                        FileAttributes attributes = File.GetAttributes(legacy);
+                        Require((attributes & FileAttributes.ReparsePoint) == 0 &&
+                            (attributes & FileAttributes.Directory) != 0);
+                        Require(found.Count < 256); found.Add(name);
+                    }
                     catch (FileNotFoundException) { }
                     catch (DirectoryNotFoundException) { }
                     // Access denied, unavailable profile, and malformed paths
                     // remain ambiguous and fail closed instead of resetting.
                 }
             }
+            return found;
+        }
+        private static void MarkLegacyProfiles()
+        {
+            List<string> found = LegacyProfiles();
+            string data = Custody.OrdinaryAbsolute(DataRoot);
+            string marker = Path.Combine(data, MigrationPaths.LegacyMarker);
+            bool existing = MigrationPaths.Required(data);
+            if (existing)
+            {
+                Dictionary<string, object> previous = Json.Parse(File.ReadAllText(marker, Encoding.UTF8));
+                foreach (object sid in (object[])previous["profiles"])
+                    if (!found.Contains((string)sid)) found.Add((string)sid);
+            }
+            if (found.Count == 0) return;
+            Require(found.Count <= 256);
+            found.Sort(StringComparer.Ordinal);
+            byte[] bytes = new UTF8Encoding(false, true).GetBytes(Json.Serializer.Serialize(
+                new Dictionary<string, object> { { "schema_version", 1 }, { "profiles", found.ToArray() } }));
+            SecurityIdentifier service = (SecurityIdentifier)new NTAccount(Account).Translate(typeof(SecurityIdentifier));
+            FileSecurity security = new FileSecurity();
+            security.SetAccessRuleProtection(true, false);
+            security.SetOwner(new SecurityIdentifier("S-1-5-32-544"));
+            foreach (SecurityIdentifier principal in new[] { service,
+                new SecurityIdentifier("S-1-5-18"), new SecurityIdentifier("S-1-5-32-544") })
+                security.AddAccessRule(new FileSystemAccessRule(principal, FileSystemRights.FullControl,
+                    AccessControlType.Allow));
+            string pending = Path.Combine(data, ".legacy-profiles-" + Guid.NewGuid().ToString("N") + ".tmp");
+            try
+            {
+                using (FileStream output = new FileStream(pending, FileMode.CreateNew, FileSystemRights.Write,
+                    FileShare.None, 4096, FileOptions.WriteThrough, security))
+                { output.Write(bytes, 0, bytes.Length); output.Flush(true); }
+                Custody.AdmitMigrationData(pending);
+                if (existing) File.Replace(pending, marker, null);
+                else File.Move(pending, marker);
+                Require(MigrationPaths.Required(data));
+            }
+            finally { if (File.Exists(pending)) File.Delete(pending); }
         }
         private static void AdmitData(string directory, SecurityIdentifier service)
         {
@@ -549,7 +596,7 @@ namespace K5VisionDesktop
                     operation == "prepare" || operation == "seal" || operation == "legacy-check");
                 root = Custody.OrdinaryAbsolute(root);
                 Require(String.Equals(root, Custody.OrdinaryAbsolute(InstallRoot), StringComparison.OrdinalIgnoreCase));
-                if (operation == "legacy-check") { RequireNoLegacyProfiles(); return 0; }
+                if (operation == "legacy-check") { LegacyProfiles(); return 0; }
                 if (operation == "prepare") { PrepareCode(root); return 0; }
                 if (operation == "seal")
                 {
@@ -574,7 +621,7 @@ namespace K5VisionDesktop
                     Custody.VerifyPayload(root);
                     refusalPhase = RefusalPhase.ScmCreate;
                     service = CreateService(manager, Name, "K5 Vision Recorder", AllAccess,
-                        0x10, 2, 1, "\"" + Path.Combine(root, "K5VisionRecorder.exe") + "\"",
+                        0x10, 3, 1, "\"" + Path.Combine(root, "K5VisionRecorder.exe") + "\"",
                         null, IntPtr.Zero, null, Account, null);
                     RequireWin32(service != IntPtr.Zero);
                 }
@@ -587,11 +634,17 @@ namespace K5VisionDesktop
                 if (operation == "install")
                 {
                     refusalPhase = RefusalPhase.ScmConfiguration;
-                    RequireWin32(ChangeServiceConfig(service, 0xFFFFFFFF, 2, 0xFFFFFFFF, null,
+                    RequireWin32(ChangeServiceConfig(service, 0xFFFFFFFF, 3, 0xFFFFFFFF, null,
                         null, IntPtr.Zero, null, Account, null, "K5 Vision Recorder"));
                     ConfigureRecovery(service);
                     RegisterEventLog();
                     PrepareData();
+                    MarkLegacyProfiles();
+                    // Automatic boot is enabled only after the private legacy
+                    // guard is durable. An interrupted install cannot boot an
+                    // unmarked, empty replacement site.
+                    RequireWin32(ChangeServiceConfig(service, 0xFFFFFFFF, 2, 0xFFFFFFFF, null,
+                        null, IntPtr.Zero, null, Account, null, "K5 Vision Recorder"));
                     return 0;
                 }
                 refusalPhase = RefusalPhase.ScmStart;
@@ -618,7 +671,8 @@ namespace K5VisionDesktop
                             System.Collections.Generic.Dictionary<string, object> health = RecorderClient.Exchange(
                                 RecorderPaths.Request("status"), false);
                             string state = health["status"] as string;
-                            if (state == "account_required" || state == "running" || state == "preparing_recordings") return 0;
+                            if (state == "account_required" || state == "migration_required" || state == "running" ||
+                                state == "preparing_recordings") return 0;
                         }
                         catch (IOException error) { readinessError = NativeHResult(error.HResult); }
                         catch (UnauthorizedAccessException) { readinessError = 5; }

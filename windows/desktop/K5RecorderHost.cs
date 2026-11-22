@@ -12,6 +12,7 @@ using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
 namespace K5VisionDesktop
@@ -73,6 +74,8 @@ namespace K5VisionDesktop
     {
         internal const string ServiceName = "K5VisionRecorder";
         internal const int Port = 8000;
+        internal const int MigrationFrame = 131072;
+        internal const int MigrationLifetime = 86400000;
         internal const string StatusPipe = "K5VisionRecorder.Status.v1";
         internal const string AdminPipe = "K5VisionRecorder.Admin.v1";
         internal const string ControlPipe = "K5VisionRecorder.Control.v1";
@@ -145,6 +148,8 @@ namespace K5VisionDesktop
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out uint processId);
         [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetNamedPipeClientProcessId(SafePipeHandle pipe, out uint processId);
+        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern SafeProcessHandle OpenProcess(uint access, bool inherit, uint processId);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern bool QueryFullProcessImageName(SafeProcessHandle process, uint flags,
@@ -209,12 +214,13 @@ namespace K5VisionDesktop
                 throw new InvalidOperationException();
         }
 
-        internal static NamedPipeServerStream CreatePipe(string name, bool publicStatus)
+        internal static NamedPipeServerStream CreatePipe(string name, bool publicStatus, bool serviceOwner = true)
         {
             PipeSecurity security = new PipeSecurity();
-            security.SetOwner(new SecurityIdentifier(RecorderPaths.ServiceSid));
+            string owner = serviceOwner ? RecorderPaths.ServiceSid : WindowsIdentity.GetCurrent().User.Value;
+            security.SetOwner(new SecurityIdentifier(owner));
             security.SetAccessRuleProtection(true, false);
-            foreach (string sid in new[] { RecorderPaths.ServiceSid, "S-1-5-18", "S-1-5-32-544" })
+            foreach (string sid in new[] { owner, "S-1-5-18", "S-1-5-32-544" }.Distinct())
                 security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(sid), PipeAccessRights.FullControl,
                     AccessControlType.Allow));
             if (publicStatus)
@@ -249,6 +255,73 @@ namespace K5VisionDesktop
             uint pid;
             if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out pid) || pid == 0) throw new InvalidOperationException();
             return AdmitProcess(pid, "K5Vision.exe", allowTerminate);
+        }
+
+        internal static uint PipeClient(NamedPipeServerStream pipe)
+        {
+            uint pid;
+            if (!GetNamedPipeClientProcessId(pipe.SafePipeHandle, out pid) || pid == 0)
+                throw new InvalidOperationException();
+            return pid;
+        }
+
+        internal static MigrationPeer AdmitMigrationClient(NamedPipeServerStream pipe)
+        {
+            MigrationPeer result = null;
+            // Query the protected elevated GUI while using that authenticated
+            // pipe client's token. Retain only read/synchronize process rights.
+            pipe.RunAsClient(delegate {
+                using (WindowsIdentity identity = WindowsIdentity.GetCurrent(true))
+                {
+                    if (identity == null || identity.User == null ||
+                        !new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
+                        throw new InvalidOperationException();
+                    uint pid = PipeClient(pipe), session;
+                    SafeProcessHandle process = OpenProcess(0x00101000u, false, pid);
+                    try
+                    {
+                        if (process == null || process.IsInvalid || WaitForSingleObject(process, 0) != 0x102u ||
+                            !ProcessIdToSessionId(pid, out session) || session == 0)
+                            throw new InvalidOperationException();
+                        StringBuilder image = new StringBuilder(4096);
+                        uint length = (uint)image.Capacity;
+                        string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
+                        if (!QueryFullProcessImageName(process, 0, image, ref length) ||
+                            !String.Equals(Custody.OrdinaryAbsolute(image.ToString()),
+                                Custody.OrdinaryAbsolute(Path.Combine(root, "K5Vision.exe")), StringComparison.OrdinalIgnoreCase))
+                            throw new InvalidOperationException();
+                        Custody.AdmitCode(image.ToString(), root);
+                        SafeAccessTokenHandle token;
+                        if (!OpenProcessToken(process, 0x8u, out token)) throw new InvalidOperationException();
+                        using (token)
+                        {
+                            uint needed;
+                            GetTokenInformation(token, 1, IntPtr.Zero, 0, out needed);
+                            if (needed < IntPtr.Size || needed > 4096) throw new InvalidOperationException();
+                            IntPtr memory = Marshal.AllocHGlobal((int)needed);
+                            try
+                            {
+                                if (!GetTokenInformation(token, 1, memory, needed, out needed) ||
+                                    new SecurityIdentifier(Marshal.ReadIntPtr(memory)).Value != identity.User.Value)
+                                    throw new InvalidOperationException();
+                            }
+                            finally { Marshal.FreeHGlobal(memory); }
+                        }
+                        result = new MigrationPeer(pid, Created(process), session, identity.User.Value, process);
+                        process = null;
+                    }
+                    finally { if (process != null) process.Dispose(); }
+                }
+            });
+            if (result == null) throw new InvalidOperationException();
+            return result;
+        }
+
+        internal static bool PeerAlive(SafeProcessHandle process, uint pid, long birth)
+        {
+            try { return process != null && !process.IsClosed && !process.IsInvalid &&
+                WaitForSingleObject(process, 0) == 0x102u && GetProcessId(process) == pid && Created(process) == birth; }
+            catch { return false; }
         }
 
         internal static SafeProcessHandle AdmitParent()
@@ -584,6 +657,297 @@ namespace K5VisionDesktop
         }
     }
 
+    internal static class MigrationPaths
+    {
+        internal const string LegacyMarker = "legacy-profiles.json";
+        internal static bool Required(string data)
+        { return Owners(data) != null; }
+        internal static bool Allows(string data, string sid)
+        { HashSet<string> owners = Owners(data); return owners != null && owners.Contains(sid); }
+        private static HashSet<string> Owners(string data)
+        {
+            string marker = Path.Combine(data, LegacyMarker);
+            if (!File.Exists(marker) && !Directory.Exists(marker)) return null;
+            Custody.AdmitMigrationData(marker);
+            FileInfo info = new FileInfo(marker);
+            if (info.Length < 1 || info.Length > 65536) throw new InvalidOperationException();
+            Dictionary<string, object> value = Json.Parse(File.ReadAllText(marker, Encoding.UTF8));
+            if (value.Count != 2 || !value.ContainsKey("schema_version") || !(value["schema_version"] is int) ||
+                (int)value["schema_version"] != 1 || !value.ContainsKey("profiles") || !(value["profiles"] is object[]))
+                throw new InvalidOperationException();
+            object[] profiles = (object[])value["profiles"];
+            if (profiles.Length < 1 || profiles.Length > 256) throw new InvalidOperationException();
+            HashSet<string> unique = new HashSet<string>(StringComparer.Ordinal);
+            foreach (object item in profiles)
+            {
+                if (!(item is string) || !unique.Add((string)item) ||
+                    new SecurityIdentifier((string)item).Value != (string)item) throw new InvalidOperationException();
+            }
+            return unique;
+        }
+    }
+
+    internal sealed class MigrationCoordinator : IDisposable
+    {
+        private readonly object gate = new object();
+        private readonly string root;
+        private readonly Func<bool> canBegin;
+        private readonly Action<string> state;
+        private readonly Action completed;
+        private readonly Action reconcile;
+        private readonly Stopwatch poll = Stopwatch.StartNew();
+        private MigrationPeer peer;
+        private volatile MigrationWorker worker;
+        private int closing;
+        internal volatile int Progress;
+
+        internal MigrationCoordinator(string root, Func<bool> canBegin, Action<string> state, Action completed,
+            Action reconcile)
+        { this.root = root; this.canBegin = canBegin; this.state = state; this.completed = completed; this.reconcile = reconcile; }
+
+        private static Dictionary<string, object> Failure()
+        { return new Dictionary<string, object> { { "schema_version", 1 }, { "status", "refused" }, { "reason", "migration_unavailable" } }; }
+
+        internal Dictionary<string, object> Handle(Dictionary<string, object> envelope, NamedPipeServerStream pipe)
+        {
+            lock (gate)
+            {
+                if (Volatile.Read(ref closing) != 0) return Failure();
+                if (RecorderWire.Operation(envelope, "request") != "migration" ||
+                    !(envelope["request"] is Dictionary<string, object>)) throw new InvalidOperationException();
+                Dictionary<string, object> request = (Dictionary<string, object>)envelope["request"];
+                if (!request.ContainsKey("operation") || !(request["operation"] is string)) throw new InvalidOperationException();
+                string operation = (string)request["operation"];
+                if (!new[] { "begin", "protect", "verify", "snapshot", "entry", "capacity", "prepare", "status", "commit", "cancel", "rollback" }
+                    .Contains(operation)) throw new InvalidOperationException();
+                using (MigrationPeer admitted = RecorderNative.AdmitMigrationClient(pipe))
+                {
+                    if (worker == null)
+                    {
+                        if (operation != "begin" || !canBegin() ||
+                            !MigrationPaths.Allows(RecorderPaths.DataRoot, admitted.Sid)) return Failure();
+                        if (RecorderWire.Operation(request, "binding") != "begin" ||
+                            !(request["binding"] is Dictionary<string, object>)) throw new InvalidOperationException();
+                        Dictionary<string, object> binding = (Dictionary<string, object>)request["binding"];
+                        if (binding.Count != 3 || !binding.ContainsKey("site_id") || !binding.ContainsKey("transfer_id") ||
+                            !binding.ContainsKey("source_digest")) throw new InvalidOperationException();
+                        binding["source_owner_sid"] = admitted.Sid;
+                        // Retain a separate original lifetime handle for the
+                        // GUI; later pipe requests must match this exact peer.
+                        try
+                        {
+                            peer = RecorderNative.AdmitMigrationClient(pipe);
+                            worker = new MigrationWorker(root, true);
+                            if (Volatile.Read(ref closing) != 0) throw new ObjectDisposedException("MigrationCoordinator");
+                            state("migrating");
+                        }
+                        catch { DisposeWorker(); return Failure(); }
+                    }
+                    else if (peer == null || !peer.Same(admitted)) return Failure();
+                    try
+                    {
+                        Dictionary<string, object> response = worker.Exchange(request);
+                        Observe(response);
+                        return response;
+                    }
+                    catch { Abort(); return Failure(); }
+                }
+            }
+        }
+
+        private void Observe(Dictionary<string, object> response)
+        {
+            if (Convert.ToInt32(response["schema_version"]) != 1 || !(response["status"] is string))
+                throw new InvalidOperationException();
+            string status = (string)response["status"];
+            if (response.ContainsKey("progress"))
+            {
+                if (!(response["progress"] is int) || (int)response["progress"] < 0 || (int)response["progress"] > 100)
+                    throw new InvalidOperationException();
+                Progress = (int)response["progress"];
+            }
+            if (status == "working" || status == "prepared") state("preparing_recordings");
+            else if (status == "activated")
+            {
+                DisposeWorker();
+                completed();
+            }
+            else if (status == "refused") Abort();
+            else if (status != "ok") throw new InvalidOperationException();
+        }
+
+        internal void Poll()
+        {
+            lock (gate)
+            {
+                if (Volatile.Read(ref closing) != 0 || worker == null || poll.ElapsedMilliseconds < 500) return;
+                poll.Restart();
+                try
+                {
+                    peer.AssertCurrent();
+                    worker.AssertCurrent();
+                }
+                catch { Abort(); }
+            }
+        }
+
+        private void DisposeWorker()
+        {
+            try { if (worker != null) worker.Dispose(); }
+            finally { worker = null; if (peer != null) peer.Dispose(); peer = null; }
+        }
+
+        private void Abort()
+        {
+            try { if (worker != null) worker.Exchange(RecorderPaths.Request("cancel")); }
+            catch { }
+            finally { try { DisposeWorker(); } finally { reconcile(); } }
+        }
+
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref closing, 1);
+            MigrationWorker active = worker;
+            if (active != null) active.Cancel();
+            lock (gate) { if (worker != null) Abort(); else DisposeWorker(); }
+        }
+    }
+
+    internal sealed class MigrationPeer : IDisposable
+    {
+        internal readonly uint Pid, Session;
+        internal readonly long Birth;
+        internal readonly string Sid;
+        private SafeProcessHandle process;
+        internal MigrationPeer(uint pid, long birth, uint session, string sid, SafeProcessHandle process)
+        { Pid = pid; Birth = birth; Session = session; Sid = sid; this.process = process; }
+        internal void AssertCurrent()
+        { if (!RecorderNative.PeerAlive(process, Pid, Birth)) throw new InvalidOperationException(); }
+        internal bool Same(MigrationPeer other)
+        {
+            AssertCurrent(); other.AssertCurrent();
+            return Pid == other.Pid && Birth == other.Birth && Session == other.Session && Sid == other.Sid;
+        }
+        public void Dispose() { if (process != null) { process.Dispose(); process = null; } }
+    }
+
+    internal sealed class MigrationWorker : IDisposable
+    {
+        private readonly object gate = new object();
+        private readonly ManualResetEvent cancellation = new ManualResetEvent(false);
+        private readonly ProcessJob job = new ProcessJob();
+        private NamedPipeServerStream pipe;
+        private Process process;
+        private bool disposed;
+        private bool started, assigned;
+        private readonly Stopwatch lifetime = Stopwatch.StartNew();
+        private readonly bool service;
+
+        internal MigrationWorker(string root, bool service)
+        {
+            this.service = service;
+            try
+            {
+                root = Custody.OrdinaryAbsolute(root);
+                Custody.VerifyPayload(root);
+                int pid = Process.GetCurrentProcess().Id;
+                long birth = RecorderNative.CurrentCreated();
+                string role = service ? "Target" : "Source";
+                pipe = RecorderNative.CreatePipe("K5VisionMigration." + role + ".v1." + pid + "." + birth,
+                    false, service);
+                ProcessStartInfo start = new ProcessStartInfo(Path.Combine(root, "runtime", "python.exe"),
+                    "-I -B -m k5vision.legacy_migration_" + (service ? "service" : "source") + " " + pid + " " + birth);
+                start.WorkingDirectory = root; start.UseShellExecute = false; start.CreateNoWindow = true;
+                start.RedirectStandardInput = start.RedirectStandardOutput = start.RedirectStandardError = true;
+                start.EnvironmentVariables.Remove("PYTHONHOME"); start.EnvironmentVariables.Remove("PYTHONPATH");
+                process = new Process { StartInfo = start };
+                process.OutputDataReceived += delegate { }; process.ErrorDataReceived += delegate { };
+                Task connected = pipe.WaitForConnectionAsync();
+                if (!process.Start()) throw new InvalidOperationException();
+                started = true;
+                job.Assign(process); assigned = true;
+                process.StandardInput.Close(); process.BeginOutputReadLine(); process.BeginErrorReadLine();
+                if (!connected.Wait(10000))
+                {
+                    RecorderNative.Cancel(pipe); pipe.Dispose();
+                    try { connected.Wait(1000); } catch { }
+                    throw new TimeoutException();
+                }
+                connected.GetAwaiter().GetResult();
+                if (process.HasExited || RecorderNative.PipeClient(pipe) != (uint)process.Id)
+                    throw new InvalidOperationException();
+            }
+            catch { Dispose(); throw; }
+        }
+
+        internal Dictionary<string, object> Receive()
+        {
+            lock (gate)
+            {
+                // A final frame may already be buffered when the owned child
+                // exits normally. Read it under the same bounded pipe budget.
+                if (disposed || !started || process == null) throw new InvalidOperationException();
+                int remaining = RecorderPaths.MigrationLifetime - (int)lifetime.ElapsedMilliseconds;
+                if (remaining <= 0) throw new TimeoutException();
+                return RecorderWire.Read(pipe, RecorderPaths.MigrationFrame,
+                    Math.Min(service ? 30000 : RecorderPaths.MigrationLifetime, remaining), cancellation);
+            }
+        }
+
+        internal void AssertCurrent()
+        {
+            lock (gate)
+            {
+                if (disposed || !started || process == null || process.HasExited ||
+                    lifetime.ElapsedMilliseconds >= RecorderPaths.MigrationLifetime)
+                    throw new InvalidOperationException();
+            }
+        }
+
+        internal void Send(Dictionary<string, object> request)
+        {
+            lock (gate)
+            {
+                if (disposed || process == null || process.HasExited) throw new InvalidOperationException();
+                int remaining = RecorderPaths.MigrationLifetime - (int)lifetime.ElapsedMilliseconds;
+                if (remaining <= 0) throw new TimeoutException();
+                RecorderWire.Write(pipe, request, RecorderPaths.MigrationFrame, Math.Min(5000, remaining), cancellation);
+            }
+        }
+
+        internal Dictionary<string, object> Exchange(Dictionary<string, object> request)
+        {
+            lock (gate) { Send(request); return Receive(); }
+        }
+
+        internal void Cancel()
+        { try { cancellation.Set(); } catch (ObjectDisposedException) { } }
+
+        public void Dispose()
+        {
+            Cancel();
+            lock (gate)
+            {
+                if (disposed) return;
+                disposed = true; cancellation.Set();
+                try { if (pipe != null) pipe.Dispose(); }
+                finally
+                {
+                    // Assignment failure still owns this exact newly-created
+                    // child. Process.Dispose alone never terminates it.
+                    if (started && !assigned && process != null)
+                    { try { if (!process.HasExited) process.Kill(); } catch { } }
+                    job.Dispose();
+                    try
+                    {
+                        if (started && process != null && !process.WaitForExit(2000)) throw new InvalidOperationException();
+                    }
+                    finally { if (process != null) process.Dispose(); cancellation.Dispose(); }
+                }
+            }
+        }
+    }
+
     internal static class RecorderClient
     {
         internal static Dictionary<string, object> Exchange(Dictionary<string, object> request, bool administrative)
@@ -599,7 +963,15 @@ namespace K5VisionDesktop
             return ExchangeOwned(RecorderPaths.Request("pending-time"), true);
         }
 
-        private static Dictionary<string, object> ExchangeOwned(Dictionary<string, object> request, bool administrative)
+        internal static Dictionary<string, object> Migration(Dictionary<string, object> request)
+        {
+            Dictionary<string, object> envelope = RecorderPaths.Request("migration");
+            envelope["request"] = request;
+            return ExchangeOwned(envelope, true, RecorderPaths.MigrationFrame, RecorderPaths.MigrationFrame);
+        }
+
+        private static Dictionary<string, object> ExchangeOwned(Dictionary<string, object> request, bool administrative,
+            int replyMaximum = 2048, int requestMaximum = 32768)
         {
             using (ManualResetEvent cancellation = new ManualResetEvent(false))
             using (NamedPipeClientStream pipe = new NamedPipeClientStream(".", administrative ? RecorderPaths.AdminPipe :
@@ -610,8 +982,8 @@ namespace K5VisionDesktop
                 if (!administrative) RecorderNative.AdmitStatusOwner(pipe);
                 using (SafeProcessHandle server = administrative ? RecorderNative.AdmitServer(pipe, false) : null)
                 {
-                    RecorderWire.Write(pipe, request, administrative ? 32768 : 512, 5000, cancellation);
-                    Dictionary<string, object> response = RecorderWire.Read(pipe, 2048, administrative ? 40000 : 5000, cancellation);
+                    RecorderWire.Write(pipe, request, administrative ? requestMaximum : 512, 5000, cancellation);
+                    Dictionary<string, object> response = RecorderWire.Read(pipe, replyMaximum, administrative ? 40000 : 5000, cancellation);
                     if (!response.ContainsKey("schema_version") || !(response["schema_version"] is int) ||
                         (int)response["schema_version"] != 1 || !response.ContainsKey("status") || !(response["status"] is string))
                         throw new InvalidOperationException();
@@ -669,7 +1041,8 @@ namespace K5VisionDesktop
         private readonly bool publicStatus;
         private readonly int maximum;
         private readonly ManualResetEvent stopping;
-        private readonly Func<Dictionary<string, object>, Dictionary<string, object>> handler;
+        private readonly Func<Dictionary<string, object>, NamedPipeServerStream, Dictionary<string, object>> handler;
+        private readonly int replyMaximum;
         private readonly Action afterStopReply;
         private readonly Action infrastructureFailure;
         private readonly Thread thread;
@@ -678,8 +1051,17 @@ namespace K5VisionDesktop
 
         internal RecorderEndpoint(string name, bool publicStatus, int maximum, ManualResetEvent stopping,
             Func<Dictionary<string, object>, Dictionary<string, object>> handler, Action afterStopReply,
-            Action infrastructureFailure)
+            Action infrastructureFailure, int replyMaximum = 2048)
+            : this(name, publicStatus, maximum, stopping,
+                delegate(Dictionary<string, object> request, NamedPipeServerStream ignored) { return handler(request); },
+                afterStopReply, infrastructureFailure, replyMaximum) { }
+
+        internal RecorderEndpoint(string name, bool publicStatus, int maximum, ManualResetEvent stopping,
+            Func<Dictionary<string, object>, NamedPipeServerStream, Dictionary<string, object>> handler,
+            Action afterStopReply, Action infrastructureFailure, int replyMaximum = 2048)
         {
+            if (replyMaximum < 1 || replyMaximum > RecorderPaths.MigrationFrame) throw new InvalidOperationException();
+            this.replyMaximum = replyMaximum;
             this.publicStatus = publicStatus; this.maximum = maximum;
             this.stopping = stopping; this.handler = handler; this.afterStopReply = afterStopReply;
             this.infrastructureFailure = infrastructureFailure;
@@ -703,8 +1085,8 @@ namespace K5VisionDesktop
                     // only after data has been read. Authenticate before any
                     // handler can initialize an account or stop the service.
                     if (!publicStatus) RecorderNative.AdmitAdministrator(current);
-                    Dictionary<string, object> reply = handler(request);
-                    RecorderWire.Write(current, reply, 2048, 5000, stopping);
+                    Dictionary<string, object> reply = handler(request, current);
+                    RecorderWire.Write(current, reply, replyMaximum, 5000, stopping);
                     // DisconnectNamedPipe discards unread buffered replies.
                     // Existing clients validate the frame and close their end;
                     // wait for that EOF with a finite, cancellable read instead
@@ -790,6 +1172,7 @@ namespace K5VisionDesktop
         private string state = "starting";
         private int initializing;
         private Bridge backend;
+        private MigrationCoordinator migration;
         private volatile bool failed;
 
         internal RecorderLifetime(string root, string data, ManualResetEvent stopping)
@@ -808,13 +1191,29 @@ namespace K5VisionDesktop
 
         private void SetState(string value) { lock (gate) state = value; }
 
+        private void ReconcileMigration()
+        {
+            if (stopping.WaitOne(0)) { SetState("stopping"); return; }
+            try
+            {
+                Dictionary<string, object> observed = Setup(RecorderPaths.Request("status"));
+                if (Object.Equals(observed["status"], "ready"))
+                { SetState("starting"); startRequested.Set(); }
+                else if (Object.Equals(observed["status"], "migration_required") ||
+                    Object.Equals(observed["status"], "new")) SetState("migration_required");
+                else throw new InvalidOperationException();
+            }
+            catch { SetState("unavailable"); failed = true; }
+        }
+
         private Dictionary<string, object> Status(Dictionary<string, object> request)
         {
             if (RecorderWire.Operation(request) != "status") throw new InvalidOperationException();
             bool timePending = PendingTime()["status"].Equals("pending");
             lock (gate)
                 return new Dictionary<string, object> { { "schema_version", 1 }, { "status", state },
-                    { "port", RecorderPaths.Port }, { "progress", backend == null ? 0 : backend.RecordingsProgress },
+                    { "port", RecorderPaths.Port }, { "progress", backend == null ?
+                        (migration == null ? 0 : migration.Progress) : backend.RecordingsProgress },
                     { "time_approval_pending", timePending } };
         }
 
@@ -858,13 +1257,21 @@ namespace K5VisionDesktop
             return Initialize(request);
         }
 
+        private Dictionary<string, object> AdminConnected(Dictionary<string, object> request, NamedPipeServerStream pipe)
+        {
+            if (request != null && request.ContainsKey("operation") && Object.Equals(request["operation"], "migration"))
+                return migration.Handle(request, pipe);
+            return Admin(request);
+        }
+
         private Dictionary<string, object> Initialize(Dictionary<string, object> request)
         {
             if (RecorderWire.Operation(request, "username", "password", "confirmation") != "initialize")
                 throw new InvalidOperationException();
             lock (gate)
             {
-                if (state != "account_required" || Interlocked.CompareExchange(ref initializing, 1, 0) != 0)
+                if (state != "account_required" || MigrationPaths.Required(data) ||
+                    Interlocked.CompareExchange(ref initializing, 1, 0) != 0)
                     return Refused("setup_unavailable");
                 state = "initializing";
             }
@@ -923,16 +1330,23 @@ namespace K5VisionDesktop
             RecorderBootstrap.Advance("identity_probe");
             Dictionary<string, object> identity = Setup(RecorderPaths.Request("status"));
             if (Object.Equals(identity["status"], "ready")) startRequested.Set();
-            else if (Object.Equals(identity["status"], "new")) SetState("account_required");
+            else if (Object.Equals(identity["status"], "migration_required")) SetState("migration_required");
+            else if (Object.Equals(identity["status"], "new"))
+                SetState(MigrationPaths.Required(data) ? "migration_required" : "account_required");
             else throw new InvalidOperationException();
+            migration = new MigrationCoordinator(root,
+                delegate { lock (gate) return state == "migration_required" && backend == null && initializing == 0; },
+                SetState, delegate { SetState("starting"); startRequested.Set(); }, ReconcileMigration);
             if (stopping.WaitOne(0)) return 0;
             RecorderBootstrap.Advance("pipe_create");
             statusPipe = new RecorderEndpoint(RecorderPaths.StatusPipe, true, 512, stopping, Status, null, delegate { failed = true; });
-            adminPipe = new RecorderEndpoint(RecorderPaths.AdminPipe, false, 32768, stopping, Admin, null, delegate { failed = true; });
+            adminPipe = new RecorderEndpoint(RecorderPaths.AdminPipe, false, RecorderPaths.MigrationFrame, stopping,
+                AdminConnected, null, delegate { failed = true; }, RecorderPaths.MigrationFrame);
             if (Object.Equals(identity["status"], "new")) RecorderBootstrap.Advance("account_required");
             while (!stopping.WaitOne(0))
             {
                 if (failed) return 1;
+                migration.Poll();
                 if (startRequested.WaitOne(0))
                 {
                     if (backend != null) throw new InvalidOperationException();
@@ -958,6 +1372,7 @@ namespace K5VisionDesktop
             stopping.Set();
             if (statusPipe != null) statusPipe.Dispose();
             if (adminPipe != null) adminPipe.Dispose();
+            if (migration != null) migration.Dispose();
             job.Dispose();
             if (backend != null) backend.Dispose();
             // Background setup handlers might still be finishing their bounded

@@ -58,7 +58,10 @@ def test_failed_gui_analytics_does_not_skip_independent_upgrade_reversal():
     assert qualified not in upgrade
     # The independent upgrade test still executes real graphical install,
     # live-refusal, upgrade and manual reversal; it cannot assert beta release.
-    assert "Exercise real graphical baseline, live-refusal, upgrade and reversal" in upgrade
+    assert (
+        "Exercise native legacy authorization, media migration, cancellation and reversal"
+        in upgrade
+    )
 
 
 def test_historical_baseline_transport_retry_never_weakens_upgrade_admission():

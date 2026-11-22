@@ -61,11 +61,22 @@ class _Client:
         self.token = ""
         self.transport_failure = None
         self.last_http_status = None
+        self.last_api_error_code = None
 
-    def get(self, route, *, method="GET", data=None, media=False, max_bytes=1_048_576):
+    def get(
+        self,
+        route,
+        *,
+        method="GET",
+        data=None,
+        media=False,
+        max_bytes=1_048_576,
+        request_deadline_seconds=None,
+    ):
         __tracebackhide__ = True
         self.transport_failure = None
         self.last_http_status = None
+        self.last_api_error_code = None
         headers = {"Origin": self.origin}
         if self.token and not media:
             headers["Authorization"] = "Bearer " + self.token
@@ -74,9 +85,15 @@ class _Client:
             payload = json.dumps(data).encode()
             headers["Content-Type"] = "application/json"
         request = Request(self.origin + route, data=payload, headers=headers, method=method)
+        if request_deadline_seconds is not None and (
+            type(request_deadline_seconds) is not int or request_deadline_seconds != 7
+        ):
+            raise ValueError("Explicit preview deadline must be exactly seven seconds")
         began = time.monotonic()
         try:
-            response = self.opener.open(request, timeout=3)
+            response = self.opener.open(
+                request, timeout=3 if request_deadline_seconds is None else 7
+            )
         except HTTPError as error:
             response = error
         except OSError as error:
@@ -105,11 +122,21 @@ class _Client:
         with response:
             status = response.code
             self.last_http_status = status
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + 15 if request_deadline_seconds is None else began + 7
             body = bytearray()
             while len(body) <= max_bytes:
-                if time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     pytest.fail("Local operator response exceeded its deadline")
+                if request_deadline_seconds is not None:
+                    native = response.fp if isinstance(response, HTTPError) else response
+                    stream = getattr(native, "fp", None)
+                    if stream is not None:
+                        connection = getattr(getattr(stream, "raw", None), "_sock", None)
+                        if connection is None:
+                            raise RuntimeError("Explicit response deadline socket is unavailable")
+                        if connection.fileno() >= 0:
+                            connection.settimeout(remaining)
                 part = response.read1(min(65_536, max_bytes + 1 - len(body)))
                 if not part:
                     break
@@ -121,6 +148,28 @@ class _Client:
     def json(self, route, *, expected=200, **kwargs):
         __tracebackhide__ = True
         status, body, _ = self.get(route, **kwargs)
+        if status != expected and route.endswith("/motion-preview"):
+            try:
+                detail = json.loads(body).get("detail")
+            except (ValueError, AttributeError, TypeError):
+                detail = None
+            self.last_api_error_code = (
+                detail
+                if type(detail) is str
+                and detail
+                in {
+                    "motion_invalid_request",
+                    "motion_policy_conflict",
+                    "motion_source_changed",
+                    "motion_preview_expired",
+                    "motion_preview_unavailable",
+                    "motion_zones_empty",
+                    "motion_policy_unavailable",
+                    "motion_busy",
+                    "motion_permission_changed",
+                }
+                else "other"
+            )
         assert status == expected, "Operator API returned an unexpected status"
         return json.loads(body)
 

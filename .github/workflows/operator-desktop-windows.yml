@@ -13,6 +13,7 @@ on:
       - scripts/build_desktop_payload.py
       - scripts/compile_desktop_launcher.py
       - scripts/verify_windows_service_receipt.py
+      - scripts/verify_windows_legacy_migration_receipt.py
       - scripts/verify_desktop_receipt.py
       - src/k5vision/**
       - tests/integration/test_windows_desktop_app.py
@@ -32,6 +33,8 @@ on:
       - tests/unit/test_operator_service_time_approval.py
       - tests/unit/test_operator_security_revocation_progress.py
       - tests/integration/test_windows_desktop_upgrade.py
+      - tests/unit/test_windows_legacy_migration_receipt.py
+      - tests/unit/test_legacy_migration_copy_windows.py
       - tests/integration/test_windows_camera_video_settings.py
       - tests/integration/onvif_video_camera_fixture.py
       - scripts/verify_windows_camera_video_settings_receipt.py
@@ -749,7 +752,7 @@ jobs:
 
 
   cross-revision-upgrade:
-    name: Install baseline, qualify stopped upgrade and manual reversal
+    name: Qualify native legacy migration and stopped manual reversal
     needs: [native-desktop]
     permissions:
       contents: read
@@ -763,6 +766,8 @@ jobs:
     env:
       K5_DESKTOP_BASELINE_HEAD_SHA: b21cdfb1bb5b8605c77f7dac0957cc6651bd0bd5
       K5_DESKTOP_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
     steps:
       - name: Checkout exact candidate acceptance controller
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -891,6 +896,8 @@ jobs:
           if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "Baseline installer unavailable" }
           "K5_DESKTOP_BASELINE_SETUP=$setup" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           "K5_DESKTOP_BASELINE_SETUP_SHA256=$((Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant())" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Provision current pinned tools for generated migration cameras
+        uses: ./.github/actions/provision-operator-tools
       - name: Retrieve exact unqualified candidate for independent upgrade testing
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
@@ -918,18 +925,36 @@ jobs:
           "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           "K5_DESKTOP_SETUP_SHA256=$hash" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           "K5_DESKTOP_LAUNCHER_SHA256=$($meta.launcher_sha256)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
-      - name: Exercise real graphical baseline, live-refusal, upgrade and reversal
+      - name: Exercise native legacy authorization, media migration, cancellation and reversal
         shell: pwsh
-        timeout-minutes: 8
+        timeout-minutes: 15
         run: |
           python -m pytest tests/integration/test_windows_desktop_upgrade.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=180 --junitxml=desktop-upgrade-windows.xml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Require exact executed native copy and complete migration evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $copy = [xml](Get-Content -LiteralPath legacy-native-copy-windows.xml -Raw)
+          $suites = @($copy.testsuites.testsuite)
+          $cases = @($suites.testcase)
+          if ($suites.Count -ne 1 -or $cases.Count -ne 1 -or $suites[0].tests -cne "1" -or
+              $suites[0].errors -cne "0" -or $suites[0].failures -cne "0" -or $suites[0].skipped -cne "0" -or
+              $cases[0].name -cne "test_native_migration_copy_windows_actual_security_and_io" -or
+              $null -ne $cases[0].failure -or $null -ne $cases[0].error -or $null -ne $cases[0].skipped) {
+            throw "Native migration copy must actually execute and pass without skips"
+          }
+          python scripts/verify_windows_legacy_migration_receipt.py --junit desktop-upgrade-windows.xml --baseline-head $env:K5_DESKTOP_BASELINE_HEAD_SHA --head-sha $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256 --baseline-installer-sha256 $env:K5_DESKTOP_BASELINE_SETUP_SHA256 > legacy-migration-receipt.json
+          if ($LASTEXITCODE -ne 0) { throw "Actual native legacy migration evidence refused" }
       - name: Preserve bounded cross-revision acceptance only
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: desktop-upgrade-windows-witness-${{ github.run_id }}
-          path: desktop-upgrade-windows.xml
+          path: |
+            desktop-upgrade-windows.xml
+            legacy-native-copy-windows.xml
+            legacy-migration-receipt.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -1136,7 +1161,7 @@ jobs:
       - name: Verify strict native time receipt admission
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_windows_time_administration_receipt.py tests/unit/test_windows_time_staging.py -o addopts= --no-cov --tb=short
+          python -m pytest tests/unit/test_windows_time_administration_receipt.py tests/unit/test_windows_time_staging.py tests/unit/test_windows_time_failure_retention.py -o addopts= --no-cov --tb=short
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Exercise native Windows Time configuration and restoration
         timeout-minutes: 6

@@ -171,7 +171,7 @@ begin
   Result := '';
   if not Exec(ExpandConstant('{tmp}\K5VisionInstallGuard.exe'),
     '--installation-service-legacy-check', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then begin
-    Result := 'An existing K5 user site needs verified migration before installing this service candidate. No application files or recordings were changed. Keep using the previous installation until a migration-qualified upgrade is available.';
+    Result := 'K5 Vision could not safely inspect existing Windows profiles. No application files or recordings were changed. Sign in with the Windows account that owns the previous K5 site and try again.';
     exit;
   end;
   // Stop only after the operator chooses Install. Never replace live recorder

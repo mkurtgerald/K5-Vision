@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -136,6 +137,47 @@ def _fixed_request(request: dict[str, object], layout: _Layout) -> dict[str, obj
     return desktop_setup._request(json.dumps(result, ensure_ascii=True).encode("ascii"))
 
 
+def _migration_required(layout: _Layout) -> bool:
+    from k5vision import identity_state
+    from k5vision.legacy_migration_target import inspect_target
+
+    # A half-published identity cannot start simply because its manifest exists.
+    if inspect_target(layout.root)["status"] == "pending":
+        return True
+    marker = layout.root / "legacy-profiles.json"
+    if not marker.exists() and not marker.is_symlink():
+        return False
+    before = identity_state._regular_file(marker)
+    if not 1 <= before.st_size <= 65536:
+        raise ValueError
+    raw = marker.read_bytes()
+    after = identity_state._regular_file(marker)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise ValueError
+    value = json.loads(raw, object_pairs_hook=identity_state._unique_object)
+    if (
+        type(value) is not dict
+        or set(value) != {"schema_version", "profiles"}
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["profiles"]) is not list
+        or not 1 <= len(value["profiles"]) <= 256
+        or any(
+            type(sid) is not str or re.fullmatch(r"S-1-(?:[0-9]+-){1,16}[0-9]+", sid) is None
+            for sid in value["profiles"]
+        )
+        or len(set(value["profiles"])) != len(value["profiles"])
+    ):
+        raise ValueError
+    return not (layout.root / "identity").exists()
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -158,10 +200,16 @@ def main(
         except Exception:
             result = desktop_setup._response("refused", "service_identity_unavailable")
         else:
-            request = _fixed_request(request, layout)
-            if request["operation"] == "serve":
+            if _migration_required(layout):
+                result = desktop_setup._response(
+                    "migration_required" if request["operation"] == "status" else "refused",
+                    "legacy_upgrade_required",
+                )
+            elif request["operation"] == "serve":
+                request = _fixed_request(request, layout)
                 result = desktop_setup._serve(request, source, destination)
             else:
+                request = _fixed_request(request, layout)
                 result = desktop_setup.process_request(json.dumps(request).encode("utf-8"))
     except Exception:
         result = desktop_setup._response("refused", "invalid_request")
@@ -172,7 +220,7 @@ def main(
         destination.flush()
     except Exception:
         return 1
-    return 0 if result["status"] in ("ready", "new", "stopped") else 1
+    return 0 if result["status"] in ("ready", "new", "stopped", "migration_required") else 1
 
 
 if __name__ == "__main__":

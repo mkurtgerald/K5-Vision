@@ -10,10 +10,13 @@ import secrets
 from types import SimpleNamespace
 
 import pytest
+from test_operator_time_admin import private_profile as private_profile_fixture
 
 from k5vision import service_setup
 from k5vision.identity_state import load_identity_state
 from k5vision.services.user_registry import UserRegistry
+
+private_profile = private_profile_fixture
 
 
 def _payload(operation="status", **fields):
@@ -29,8 +32,8 @@ def _call(payload, *, arguments=()):
 
 
 @pytest.fixture
-def layout(tmp_path, monkeypatch):
-    root = tmp_path / "machine-private"
+def layout(tmp_path, private_profile, monkeypatch):
+    root = private_profile / "machine-private"
     root.mkdir(mode=0o700)
     value = service_setup._Layout(root, tmp_path / "immutable-application")
     monkeypatch.setattr(service_setup, "_layout", lambda: value)

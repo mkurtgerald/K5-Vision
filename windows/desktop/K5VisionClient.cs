@@ -46,6 +46,33 @@ namespace K5VisionDesktop
                 return WriteInstallationIdentity(arguments[1]);
             if (arguments.Length == 3 && arguments[0] == "--time-admin")
                 return TimeAdministration.Execute(arguments[1], arguments[2]);
+            if (arguments.Length == 2 && arguments[0] == "--migrate-legacy-admin")
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                try
+                {
+                    string expected = new SecurityIdentifier(arguments[1]).Value;
+                    using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+                        if (!IsAdministrator() || expected != arguments[1] || identity.User.Value != expected)
+                            throw new InvalidOperationException();
+                    Custody.VerifyPayload(root);
+                    if (!MigrationWindow.Available()) throw new InvalidOperationException();
+                    using (ClientInstance instance = new ClientInstance(true))
+                    {
+                        if (!instance.IsPrimary) return 0;
+                        using (MigrationWindow window = new MigrationWindow(root, instance.Activation))
+                            return window.ShowDialog() == DialogResult.OK ? 0 : 1;
+                    }
+                }
+                catch
+                {
+                    MessageBox.Show("Open K5 Vision using the Windows account that owns the existing site. " +
+                        "Migration needs administrator permission for that same Windows account. " +
+                        "The original site has been preserved.", "K5 Vision", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return 1;
+                }
+            }
             bool noBrowser = false, setup = false;
             foreach (string argument in arguments)
             {
@@ -188,7 +215,7 @@ namespace K5VisionDesktop
         private readonly Panel setup = new Panel();
         private readonly TextBox username = new TextBox(), password = new TextBox(), confirmation = new TextBox();
         private readonly TextBox diagnostic = new TextBox();
-        private readonly Button create = new Button(), open = new Button(), quit = new Button(), approveTime = new Button();
+        private readonly Button create = new Button(), open = new Button(), quit = new Button(), approveTime = new Button(), migrate = new Button();
         private readonly NotifyIcon tray = new NotifyIcon();
         private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer activationTimer = new System.Windows.Forms.Timer();
@@ -230,6 +257,10 @@ namespace K5VisionDesktop
             approveTime.Location = new Point(30, 285); approveTime.Size = new Size(240, 38);
             approveTime.Visible = false; SetId(approveTime, 1011);
             approveTime.Click += delegate { ApproveTime(); }; Controls.Add(approveTime);
+            migrate.Text = "Move existing K5 site"; migrate.Name = "MigrateExistingSite";
+            migrate.Location = new Point(30, 285); migrate.Size = new Size(250, 38);
+            migrate.Visible = false; SetId(migrate, 1012);
+            migrate.Click += delegate { MigrateLegacy(); }; Controls.Add(migrate);
             open.Text = "Open camera wall"; open.Name = "OpenOperator";
             open.Location = new Point(30, 383); open.Size = new Size(220, 42); open.Enabled = false; SetId(open, 1004);
             open.FlatStyle = FlatStyle.Flat; open.FlatAppearance.BorderSize = 0;
@@ -305,17 +336,18 @@ namespace K5VisionDesktop
                 phase = (string)result["status"]; ready = phase == "running"; open.Enabled = ready;
                 approveTime.Visible = result.ContainsKey("time_approval_pending") &&
                     result["time_approval_pending"] is bool && (bool)result["time_approval_pending"];
-                setup.Visible = false; create.Visible = false; help.Visible = true;
-                if (phase == "account_required")
+                setup.Visible = false; create.Visible = false; migrate.Visible = false; help.Visible = true;
+                if (phase == "migration_required" || (phase == "account_required" && legacyProfile))
                 {
-                    if (legacyProfile)
-                    {
-                        phase = "migration_required";
-                        status.Text = "Your existing K5 site needs a verified migration before this service can be used. Your account, cameras and recordings have been preserved.";
-                        help.Text = "This candidate cannot import an existing user profile yet. Do not create a replacement site. Use the previous installation until an upgrade with verified migration is available.";
-                    }
-                    else
-                    {
+                    phase = "migration_required";
+                    status.Text = "Move your existing K5 site before using the recording service. Your original account, cameras and recordings are preserved.";
+                    migrate.Visible = legacyProfile; migrate.Enabled = legacyProfile;
+                    help.Text = legacyProfile ?
+                        "Close the previous K5 Vision app, then select Move existing K5 site. Sign in with its K5 administrator account to copy the site and start recording with the Windows service." :
+                        "Sign in to Windows using the account that owns the existing K5 site, then open K5 Vision. No replacement site will be created.";
+                }
+                else if (phase == "account_required")
+                {
                         bool admin = ClientProgram.IsAdministrator();
                         setup.Visible = admin; help.Visible = !admin;
                         Control parent = admin ? (Control)setup : this;
@@ -325,7 +357,6 @@ namespace K5VisionDesktop
                         create.Visible = true; create.Enabled = true;
                         status.Text = admin ? "Create your administrator account to get started." : "This PC needs its first K5 administrator account.";
                         if (!admin) help.Text = "Select Set up administrator and approve the Windows permission prompt. Recording then runs independently of signed-in users.";
-                    }
                 }
                 else if (ready)
                 {
@@ -341,6 +372,11 @@ namespace K5VisionDesktop
                     int progress = Convert.ToInt32(result["progress"]);
                     if (progress < 0 || progress > 100) throw new InvalidOperationException();
                     status.Text = "Preparing recordings (" + progress + "%). Original footage is preserved.";
+                }
+                else if (phase == "migrating")
+                {
+                    status.Text = "Moving your existing K5 site. Keep the migration window open.";
+                    help.Text = "The original site is preserved while K5 checks accounts, copies recordings and prepares the recording service.";
                 }
                 else if (phase == "starting" || phase == "initializing") status.Text = "The recording service is preparing the camera engine…";
                 else if (phase == "stopping") status.Text = "The recording service is stopping for maintenance.";
@@ -427,6 +463,19 @@ namespace K5VisionDesktop
             }
             catch { status.Text = "Time approval was not opened. Select Approve time change to try again before the request expires."; }
         }
+        private void MigrateLegacy()
+        {
+            if (!checkedPayload || disposed || !legacyProfile || phase != "migration_required") return;
+            try
+            {
+                string sid;
+                using (WindowsIdentity identity = WindowsIdentity.GetCurrent()) sid = identity.User.Value;
+                using (Process launched = Process.Start(new ProcessStartInfo(Path.Combine(root, "K5Vision.exe"),
+                    "--migrate-legacy-admin " + sid) { UseShellExecute = true, Verb = "runas", WorkingDirectory = root })) { }
+                status.Text = "Complete the migration in the Windows permission window. This app will reconnect to the recording service.";
+            }
+            catch { status.Text = "Migration was not opened. Select Move existing K5 site to try again."; }
+        }
         private void ExitClient() { exitRequested = true; Close(); }
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
@@ -456,6 +505,242 @@ namespace K5VisionDesktop
                 disposed = true; activationTimer.Stop(); activationTimer.Dispose();
                 timer.Stop(); timer.Dispose(); tray.Visible = false; tray.Dispose();
                 password.Clear(); confirmation.Clear();
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    internal sealed class MigrationWindow : Form
+    {
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
+        private static extern IntPtr SetWindowLongPtr(IntPtr window, int index, IntPtr value);
+        private readonly string root;
+        private readonly TextBox username = new TextBox(), password = new TextBox(), factor = new TextBox();
+        private readonly Label status = new Label();
+        private readonly Button start = new Button(), cancel = new Button();
+        private readonly object workerGate = new object();
+        private readonly System.Windows.Forms.Timer activationTimer = new System.Windows.Forms.Timer();
+        private MigrationWorker worker;
+        private Task cancellationTask;
+        private volatile bool cancelRequested, disposed;
+        private bool running, closeRequested, allowClose;
+
+        internal static bool Available()
+        {
+            try
+            {
+                if (!ClientProgram.IsAdministrator()) return false;
+                string data = Custody.MachineDataRoot;
+                Custody.AdmitMigrationData(data);
+                string identity = Path.Combine(data, "identity");
+                if (File.Exists(identity)) return false;
+                if (Directory.Exists(identity)) Custody.AdmitMigrationData(identity);
+                // A pending transaction may already have published a manifest.
+                // Only the admitted service's guarded state can offer recovery;
+                // the target journal decides whether anything can be activated.
+                Dictionary<string, object> state = RecorderClient.Exchange(Request("status"), false);
+                if (!(state["schema_version"] is int) || (int)state["schema_version"] != 1 ||
+                    !Object.Equals(state["status"], "migration_required") ||
+                    !(state["port"] is int) || (int)state["port"] != 8000) return false;
+                string legacy = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "K5VisionOperatorState", "identity");
+                Custody.Admit(legacy, legacy);
+                string source = Path.Combine(legacy, "identity.json");
+                Custody.Admit(source, legacy);
+                return File.Exists(source);
+            }
+            catch { return false; }
+        }
+
+        internal MigrationWindow(string root) : this(root, null) { }
+        internal MigrationWindow(string root, EventWaitHandle activation)
+        {
+            this.root = root;
+            Text = "Move your K5 site"; Font = new Font("Segoe UI", 10);
+            ClientSize = new Size(580, 470); MinimumSize = MaximumSize = Size;
+            MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.CenterScreen;
+            BackColor = Color.FromArgb(248, 250, 253);
+            Controls.Add(new Label { Text = "Keep your cameras and recordings", Location = new Point(28, 22),
+                Size = new Size(525, 38), Font = new Font("Segoe UI", 17, FontStyle.Bold) });
+            Controls.Add(new Label { Text = "Close the previous K5 Vision app before continuing. Sign in with its K5 " +
+                "administrator account. K5 keeps the original site while it checks and copies your data.",
+                Location = new Point(30, 72), Size = new Size(520, 72) });
+            AddInput("Existing K5 administrator username", username, 148, false, 1101);
+            username.MaxLength = 64; username.Name = "LegacyAdministratorUsername";
+            AddInput("Existing K5 password", password, 210, true, 1102);
+            password.Name = "LegacyAdministratorPassword";
+            AddInput("Authenticator or recovery code (if enabled)", factor, 272, true, 1103);
+            factor.MaxLength = 64; factor.Name = "LegacyAdministratorFactor";
+            status.Location = new Point(30, 340); status.Size = new Size(520, 60);
+            status.Text = "Your original site will be preserved."; status.Name = "MigrationStatus";
+            SetId(status, 1106); Controls.Add(status);
+            start.Text = "Move existing site"; start.Name = "BeginMigration";
+            start.Location = new Point(30, 414); start.Size = new Size(250, 38);
+            start.BackColor = Color.FromArgb(27, 109, 159); start.ForeColor = Color.White;
+            start.FlatStyle = FlatStyle.Flat; start.FlatAppearance.BorderSize = 0;
+            start.UseVisualStyleBackColor = false; SetId(start, 1104);
+            start.Click += delegate { BeginMigration(); }; Controls.Add(start);
+            cancel.Text = "Cancel"; cancel.Name = "CancelMigration";
+            cancel.Location = new Point(340, 414); cancel.Size = new Size(210, 38);
+            SetId(cancel, 1105); cancel.Click += delegate { RequestClose(); }; Controls.Add(cancel);
+            AcceptButton = start; CancelButton = cancel;
+            // Modal CancelButton normally assigns DialogResult.Cancel itself.
+            // Wait for the owned actor to retire before allowing this close.
+            cancel.DialogResult = DialogResult.None;
+            if (activation != null)
+            {
+                activationTimer.Interval = 200;
+                activationTimer.Tick += delegate
+                {
+                    if (!disposed && activation.WaitOne(0))
+                    { Show(); WindowState = FormWindowState.Normal; Activate(); BringToFront(); }
+                };
+                activationTimer.Start();
+            }
+        }
+
+        private static void SetId(Control control, int id)
+        { control.HandleCreated += delegate { SetWindowLongPtr(control.Handle, -12, new IntPtr(id)); }; }
+        private void AddInput(string label, TextBox input, int y, bool secret, int id)
+        {
+            Controls.Add(new Label { Text = label, Location = new Point(30, y), Size = new Size(520, 23) });
+            input.Location = new Point(30, y + 24); input.Size = new Size(520, 27);
+            input.MaxLength = 256; input.UseSystemPasswordChar = secret; SetId(input, id); Controls.Add(input);
+        }
+        private static Dictionary<string, object> Request(string operation)
+        { return new Dictionary<string, object> { { "schema_version", 1 }, { "operation", operation } }; }
+        private void Progress(string phase)
+        {
+            string message;
+            switch (phase)
+            {
+                case "checking_site": message = "Checking your existing site…"; break;
+                case "copying_accounts": message = "Copying accounts and camera settings…"; break;
+                case "checking_recordings": message = "Checking retained recordings and exports…"; break;
+                case "copying_recordings": message = "Copying recordings and exports. Large sites can take time…"; break;
+                case "verifying_copy": message = "Verifying the copy before starting the recording service…"; break;
+                default: throw new InvalidOperationException();
+            }
+            if (disposed || !IsHandleCreated) return;
+            try { BeginInvoke((Action)delegate { if (!disposed && !cancelRequested) status.Text = message; }); }
+            catch (InvalidOperationException) { if (!disposed) throw; }
+        }
+        private Dictionary<string, object> RunActor(Dictionary<string, object> credentials)
+        {
+            MigrationWorker active = null;
+            try
+            {
+                if (!Available() || cancelRequested) throw new OperationCanceledException();
+                active = new MigrationWorker(root, false);
+                lock (workerGate) worker = active;
+                if (cancelRequested) { active.Cancel(); throw new OperationCanceledException(); }
+                try { active.Send(credentials); }
+                finally { credentials.Clear(); }
+                while (true)
+                {
+                    if (cancelRequested) throw new OperationCanceledException();
+                    Dictionary<string, object> message = active.Receive();
+                    if (!message.ContainsKey("schema_version") || !(message["schema_version"] is int) ||
+                        (int)message["schema_version"] != 1 || !message.ContainsKey("operation") ||
+                        !(message["operation"] is string)) throw new InvalidOperationException();
+                    string operation = (string)message["operation"];
+                    if (operation == "progress" && message.Count == 3 && message.ContainsKey("phase") &&
+                        message["phase"] is string)
+                    {
+                        Progress((string)message["phase"]);
+                        active.Send(new Dictionary<string, object> { { "schema_version", 1 }, { "status", "ok" } });
+                    }
+                    else if (operation == "service" && message.Count == 3 && message.ContainsKey("request") &&
+                        message["request"] is Dictionary<string, object>)
+                    {
+                        Dictionary<string, object> request = (Dictionary<string, object>)message["request"];
+                        Dictionary<string, object> reply = null;
+                        try { reply = RecorderClient.Migration(request); active.Send(reply); }
+                        finally { request.Clear(); if (reply != null) reply.Clear(); message.Clear(); }
+                    }
+                    else if (operation == "result" && message.Count == 4 && message.ContainsKey("status") &&
+                        message.ContainsKey("reason") && message["status"] is string && message["reason"] is string)
+                    {
+                        string state = (string)message["status"], reason = (string)message["reason"];
+                        if ((state == "ready" && reason == "migration_complete") ||
+                            (state == "refused" && (reason == "close_previous_app" ||
+                            reason == "authentication_not_accepted" || reason == "migration_unavailable"))) return message;
+                        throw new InvalidOperationException();
+                    }
+                    else throw new InvalidOperationException();
+                }
+            }
+            finally
+            {
+                credentials.Clear();
+                lock (workerGate) { if (worker == active) worker = null; }
+                if (active != null) active.Dispose();
+            }
+        }
+        private async void BeginMigration()
+        {
+            if (running || disposed) return;
+            if (username.Text.Length < 3 || password.Text.Length == 0)
+            { status.Text = "Enter your existing K5 administrator username and password."; return; }
+            Dictionary<string, object> credentials = Request("authorize");
+            credentials["username"] = username.Text; credentials["password"] = password.Text;
+            credentials["code"] = factor.Text;
+            password.Clear(); factor.Clear();
+            running = true; cancelRequested = false; closeRequested = false; cancellationTask = null;
+            username.Enabled = password.Enabled = factor.Enabled = start.Enabled = false;
+            status.Text = "Checking your existing administrator account…";
+            Dictionary<string, object> result = null;
+            try { result = await Task.Run(delegate { return RunActor(credentials); }); }
+            catch { /* Only finite operator messages are shown below. */ }
+            finally { credentials.Clear(); }
+            Task pendingCancellation = cancellationTask;
+            if (pendingCancellation != null) { try { await pendingCancellation; } catch { } }
+            if (disposed) return;
+            running = false;
+            bool complete = result != null && (string)result["status"] == "ready";
+            if (complete)
+            {
+                status.Text = "Your site has moved. The recording service is starting…";
+                allowClose = true; DialogResult = DialogResult.OK; Close(); return;
+            }
+            if (closeRequested) { allowClose = true; DialogResult = DialogResult.Cancel; Close(); return; }
+            string reason = result != null ? (string)result["reason"] : "";
+            status.Text = reason == "close_previous_app" ? "Close the previous K5 Vision app, then try again." :
+                reason == "authentication_not_accepted" ? "The administrator sign-in was not accepted. Check the password and any authenticator or recovery code." :
+                "The migration could not be confirmed. Your original site is preserved. Reopen K5 Vision to check the recorder.";
+            username.Enabled = password.Enabled = factor.Enabled = true;
+            bool available = await Task.Run(delegate { return Available(); });
+            if (!disposed) start.Enabled = available;
+        }
+        private void RequestClose()
+        {
+            if (!running) { allowClose = true; DialogResult = DialogResult.Cancel; Close(); return; }
+            closeRequested = true; cancelRequested = true;
+            MigrationWorker active;
+            lock (workerGate) active = worker;
+            // Cancel is intentionally outside both actor and publication locks.
+            if (active != null) active.Cancel();
+            if (cancellationTask == null)
+                cancellationTask = Task.Run(delegate { try { RecorderClient.Migration(Request("cancel")); } catch { } });
+            status.Text = "Cancelling and checking whether the migration has finished. Your original site is preserved…";
+            cancel.Enabled = false;
+        }
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (running && !allowClose && e.CloseReason == CloseReason.UserClosing)
+            { e.Cancel = true; RequestClose(); }
+            else if (running && !allowClose) RequestClose();
+            base.OnFormClosing(e);
+        }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && !disposed)
+            {
+                disposed = true; cancelRequested = true;
+                MigrationWorker active;
+                lock (workerGate) active = worker;
+                if (active != null) active.Cancel();
+                activationTimer.Stop(); activationTimer.Dispose(); password.Clear(); factor.Clear();
             }
             base.Dispose(disposing);
         }
